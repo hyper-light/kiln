@@ -315,8 +315,6 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
                     println!("No apps.");
                 }
                 for a in &apps {
-                    let differ = a.get("out_of_sync").and_then(Value::as_u64).unwrap_or(0);
-                    let total = a.get("resources").and_then(Value::as_u64).unwrap_or(0);
                     let mut flags = String::new();
                     if a.get("shadow").and_then(Value::as_bool) == Some(true) {
                         flags.push_str(" shadow");
@@ -324,7 +322,7 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
                     if let Some(e) = a.get("source_error").and_then(Value::as_str) {
                         flags.push_str(&format!(" source error: {e}"));
                     }
-                    println!("{:<40} {:<10} {:<11} {:>4}/{:<4} {}{}", s(a, "app"), s(a, "sync"), s(a, "health"), total - differ.min(total), total, s(a, "cluster"), flags);
+                    println!("{:<40} {:<10} {:<11} {:<34} {}{}", s(a, "app"), s(a, "sync"), s(a, "health"), what_differs(a), s(a, "cluster"), flags);
                 }
                 return Ok(());
             }
@@ -618,4 +616,23 @@ async fn wait_for(api: &Api, path: &str, json_out: bool, before: Option<u64>) ->
         crate::rt::sleep(Duration::from_millis(500)).await;
     }
     bail!("gave up waiting after 10 minutes")
+}
+
+/// What differs in an app, by what a sync does about it: `14 changed · 92 to take over · 3 to
+/// prune`, or how many objects it has when nothing differs.
+pub fn what_differs(a: &Value) -> String {
+    let n = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let (differ, total) = (n("out_of_sync"), n("resources"));
+    if differ == 0 {
+        return format!("{total} objects");
+    }
+    let (missing, prune, shared, unmarked) = (n("missing"), n("prune"), n("shared"), n("unmarked"));
+    let changed = differ.saturating_sub(missing + prune + shared + unmarked);
+    let mut parts = Vec::new();
+    for (count, word) in [(changed, "changed"), (missing, "missing"), (shared, "to take over"), (unmarked, "unmarked"), (prune, "to prune")] {
+        if count > 0 {
+            parts.push(format!("{count} {word}"));
+        }
+    }
+    parts.join(" · ")
 }

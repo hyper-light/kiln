@@ -509,6 +509,7 @@ pub async fn credentials(hub: &Hub, i: &Integration, w: &kiln_ci::oidc::Workload
     let session = session_name(&format!("kiln-{}", w.app.unwrap_or(w.source)));
     let c = assume_role_with_web_identity(&sts_endpoint(cfg("region").as_deref()), &role, &session, &token, LIFETIME_SECS).await.with_context(|| format!("assuming {role} as {}", claims.get("sub").and_then(Value::as_str).unwrap_or("kiln")))?;
     minted().lock().insert(key, c.clone());
+    crate::audit::exchange(hub, i, w, &role).await;
     Ok(c)
 }
 

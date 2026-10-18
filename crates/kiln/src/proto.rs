@@ -26,6 +26,9 @@ pub const LANE_REACH: u32 = 4;
 /// Observe's lane (`crate::observe`): the observe group's messages and writes, a queue of their own
 /// so replication never sheds a job's, a terminal's or sync's frames, nor waits behind them.
 pub const LANE_OBSERVE: u32 = 5;
+/// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
+/// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
+pub const LANE_CONVO: u32 = 6;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -122,9 +125,14 @@ pub enum AgentMsg {
     /// Reach: a question for the server (JSON `{"op": "directory"}`), answered by
     /// [`ServerMsg::ReachAnswer`]. Appended last: postcard encodes variants by index.
     ReachAsk { req: u64, json: String },
+    /// The conversation feed (`crate::convo::feed`, on [`LANE_CONVO`]): `json` a
+    /// [`crate::convo::feed::Msg`], `data` a batch's bytes (empty for the rest). Only from runners
+    /// announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
+    Convo { json: String, data: Vec<u8> },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
     /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
-    /// runners announcing [`CAP_OBSERVE`]. Appended last: postcard encodes variants by index.
+    /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
+    /// encodes variants by index.
     Observe { json: String, bytes: Vec<u8> },
 }
 
@@ -178,6 +186,11 @@ pub const CAP_FACTS: u32 = 1 << 15;
 pub const CAP_JOB_TTY: u32 = 1 << 16;
 /// The runner takes reach links ([`ServerMsg::Reach`], `crate::reach`).
 pub const CAP_REACH: u32 = 1 << 17;
+/// [`AgentMsg::Build`] capability: the runner keeps its agent sessions' conversations in a store
+/// and sends it to the server's ([`AgentMsg::Convo`], `crate::convo::feed`), so the server keeps
+/// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
+/// observe and updates take (128, 256, 512).
+pub const CAP_CONVO: u32 = 1 << 19;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -321,8 +334,23 @@ pub enum ServerMsg {
     /// its container), its output on terminal session `session` (docs/ci.md W17-R05). Only to
     /// runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
     JobExec { job: String, session: String, command: String },
+    /// The conversation feed (`crate::convo::feed`, on [`LANE_CONVO`]): as [`AgentMsg::Convo`].
+    /// Only to runners announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by
+    /// index.
+    Convo { json: String, data: Vec<u8> },
+    /// A piece of a session's package (`crate::harness::moving::Package`, JSON) for it to go on on
+    /// this machine, made from the server's conversation store (`crate::convo::resume`): its
+    /// machine is gone. Written at `offset`; on the last piece (`done`) the runner takes the
+    /// session over. On [`LANE_CONVO`]; only to runners announcing [`CAP_CONVO`]. Appended last:
+    /// postcard encodes variants by index.
+    HarnessPackage { session: String, offset: u64, data: Vec<u8>, done: bool },
+    /// Let go of this session: it went on on another machine since (its copy here is from an
+    /// earlier epoch). Its harness stops; it isn't closed. Only to runners announcing
+    /// [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
+    HarnessRelease { session: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
-    /// announcing [`CAP_OBSERVE`]. Appended last: postcard encodes variants by index.
+    /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
+    /// variants by index.
     Observe { json: String, bytes: Vec<u8> },
 }
 
@@ -491,16 +519,46 @@ mod tests {
 
     #[test]
     fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // Right after main's last (deployed first): the conversation feed's.
+        let last_server = encode(&ServerMsg::HarnessRelease { session: "s".into() })?;
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
-        assert_eq!(b.first(), Some(&33), "ServerMsg::Observe is variant 33 on the wire, after JobExec (main's, deployed)");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after HarnessRelease");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
+        let last_agent = encode(&AgentMsg::Convo { json: "{}".into(), data: Vec::new() })?;
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
         let b = encode(&a)?;
-        assert_eq!(b.first(), Some(&32), "AgentMsg::Observe is variant 32 on the wire, after ReachAsk");
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after Convo");
         assert_eq!(decode::<AgentMsg>(&b)?, a);
-        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_OUTPOST, CAP_REPOS, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
+        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_OUTPOST, CAP_REPOS, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH, CAP_CONVO];
         assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
+        const { assert!(LANE_OBSERVE != LANE_CONVO) };
+        Ok(())
+    }
+
+    #[test]
+    fn the_conversation_feed_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::JobExec { job: "j".into(), session: "s".into(), command: "c".into() })?;
+        let after = [
+            ServerMsg::Convo { json: "{}".into(), data: vec![1, 2] },
+            ServerMsg::HarnessPackage { session: "s".into(), offset: 3, data: vec![4], done: true },
+            ServerMsg::HarnessRelease { session: "s".into() },
+        ];
+        for (i, m) in after.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + i as u8), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::ReachAsk { req: 1, json: "{}".into() })?;
+        let convo = AgentMsg::Convo { json: "{}".into(), data: Vec::new() };
+        let b = encode(&convo)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Convo comes right after ReachAsk");
+        assert_eq!(decode::<AgentMsg>(&b)?, convo);
+        let all = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_REPOS, CAP_OUTPOST, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
+        assert!(CAP_CONVO.is_power_of_two() && all.iter().all(|c| c & CAP_CONVO == 0), "CAP_CONVO is a bit of its own");
+        // Observe's and updates' bits, taken elsewhere; a lane of its own, within the eight a peer has.
+        const { assert!(CAP_CONVO & (128 | 256 | 512) == 0) };
+        const { assert!(LANE_CONVO > LANE_REACH && LANE_CONVO != 5 && LANE_CONVO < 8) };
         Ok(())
     }
 }

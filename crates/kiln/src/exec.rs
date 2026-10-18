@@ -29,6 +29,9 @@ pub enum Up {
     /// The observe group (`crate::observe`), on its own lane: never buffered across a disconnect
     /// (Raft sends again, and a write is sent again until answered).
     Observe(AgentMsg),
+    /// The conversation feed (`crate::convo::feed`), on its own lane: never buffered across a
+    /// disconnect (the feed goes on from what the server says it has, on the next connection).
+    Convo(AgentMsg),
 }
 
 #[derive(Clone)]

@@ -3,9 +3,14 @@
 //! an update is durable within [`COMMIT_MS`] of its flush. Reads go through the same thread, in
 //! turn with the writes.
 //!
-//! The engine is behind [`Engine`]: Turso on a machine ([`super::turso`]), a map in tests.
+//! Every write gets the next number of the store (its revision), so another store can take what
+//! came after a number it has ([`Store::changes`], [`Store::take`]): that is how a runner's store
+//! reaches the server's (`super::feed`).
+//!
+//! The engine is behind [`Engine`]: Turso ([`super::turso`]).
 
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -63,9 +68,59 @@ pub struct Query {
 /// Most results one search returns.
 pub const SEARCH_MAX: usize = 500;
 
+/// A row as a feed sends it: its number in the store it is from, and its session's epoch there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Change {
+    pub rev: u64,
+    #[serde(default)]
+    pub epoch: u64,
+    pub row: Row,
+}
+
+/// What a feed reads at once: rows after a number, oldest first, and the number read through.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Changes {
+    pub rows: Vec<Change>,
+    pub upto: u64,
+}
+
+/// Where following one file of a session's record goes on: its last line kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub source: String,
+    pub n: u64,
+    pub end: u64,
+    pub line: String,
+}
+
+/// A session the store has that hasn't ended: what it is, as JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unended {
+    pub id: String,
+    pub info: String,
+    pub meta: Option<String>,
+    pub state: Option<String>,
+    /// The machine whose feed brought it (None: it came another way, `info` says where).
+    pub machine: Option<String>,
+}
+
+/// What a store did with a batch of a peer's feed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Took {
+    /// Through where it has the peer's feed now.
+    pub rev: u64,
+    pub applied: usize,
+    /// Rows of a session's former writer (a lower epoch than the one it has), left out.
+    pub fenced: usize,
+    /// The batch didn't follow what it had (`rev` says what it has): nothing was taken.
+    pub gap: bool,
+}
+
 /// A database the store keeps conversations in.
 pub trait Engine: Send + 'static {
-    /// The rows, in one transaction.
+    /// Who the store is to its peers: made once, kept in the database.
+    fn id(&self) -> String;
+    /// The rows, in one transaction, each with the next number.
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()>;
     /// What is kept of `session` (None: nothing). `last`: at most its last this many events.
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
@@ -73,27 +128,60 @@ pub trait Engine: Send + 'static {
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
     /// Events matching `q`, newest first.
     fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>>;
+    /// The rows written after number `from`, as they are now, oldest first, about `max_bytes`.
+    fn changes(&mut self, from: u64, max_bytes: usize) -> anyhow::Result<Changes>;
+    /// Take a batch of `peer`'s feed (a store of machine `machine`), which follows number `from`
+    /// of it, in one transaction: numbered here as this store's own writes, a session's rows from
+    /// its latest writer alone.
+    fn take(&mut self, peer: &str, machine: &str, from: u64, batch: &Changes) -> anyhow::Result<Took>;
+    /// Through where this store has taken `peer`'s feed (0: none of it).
+    fn peer(&mut self, peer: &str) -> anyhow::Result<u64>;
+    /// Each file of `session`'s record kept, with its last line.
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>>;
+    /// `limit` lines of `session`'s record from `source`, from line `from` on: `(n, line)`.
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
+    /// The sessions not ended, heard of since `since` (unix ms), oldest first.
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
 }
+
+type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
 
 enum Msg {
     Rows(Vec<Row>),
     /// Run on the engine, between commits (whatever was sent before it is committed first).
-    Read(Box<dyn FnOnce(&mut dyn Engine) + Send>),
+    Run(Job),
+}
+
+/// Who wants to know that something was committed (a feed with nothing left to send waits on it).
+type Watchers = Arc<Mutex<Vec<async_channel::Sender<()>>>>;
+
+fn notify(watchers: &Watchers) {
+    watchers.lock().unwrap_or_else(PoisonError::into_inner).retain(|w| !matches!(w.try_send(()), Err(async_channel::TrySendError::Closed(_))));
 }
 
 /// A handle to a machine's store: cheap to clone, usable from any thread.
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::SyncSender<Msg>,
-    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    id: Arc<str>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    watchers: Watchers,
 }
 
 impl Store {
     /// The store, its writer thread started on `engine`.
     pub fn start(engine: Box<dyn Engine>) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx))?;
-        Ok(Self { tx, dropped: Default::default() })
+        let id: Arc<str> = engine.id().into();
+        let watchers: Watchers = Arc::default();
+        let w = watchers.clone();
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w))?;
+        Ok(Self { tx, id, dropped: Arc::default(), watchers })
+    }
+
+    /// Who this store is to its peers.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// What `update` of `session` makes, to be committed with the next batch.
@@ -101,8 +189,8 @@ impl Store {
         self.put(rows::of(session, update, crate::util::now_ms()));
     }
 
-    /// Rows made elsewhere (a replica's entries), to be committed with the next batch. Never
-    /// blocks: when the writer can't keep up, they're dropped and counted.
+    /// Rows to be committed with the next batch. Never blocks: when the writer can't keep up,
+    /// they're dropped and counted.
     pub fn put(&self, rows: Vec<Row>) {
         if rows.is_empty() {
             return;
@@ -115,48 +203,103 @@ impl Store {
         }
     }
 
+    /// Rows to be committed with the next batch, waiting up to `READ_WAIT` for room: false when
+    /// they couldn't be handed over (whoever sends them sends them again). Blocking.
+    pub fn put_wait(&self, rows: Vec<Row>) -> bool {
+        rows.is_empty() || self.tx.send_wait(Msg::Rows(rows)).is_ok()
+    }
+
     /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
     /// most.
-    fn read<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+    fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
         let (rtx, rrx) = mpsc::channel();
         self.tx
-            .send_timeout_compat(Msg::Read(Box::new(move |e| {
+            .send_wait(Msg::Run(Box::new(move |e| {
                 let _ = rtx.send(f(e));
             })))
-            .map_err(|_| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
+            .map_err(|()| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
         rrx.recv_timeout(READ_WAIT).map_err(|_| anyhow::anyhow!("the conversation store didn't answer in time"))?
     }
 
     /// What is kept of `session`, with at most its last `last` events. Blocking.
     pub fn kept(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         let s = session.to_owned();
-        self.read(move |e| e.kept(&s, last))
+        self.run(move |e| e.kept(&s, last))
     }
 
     /// A session's events before event number `before`. Blocking.
     pub fn events(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         let s = session.to_owned();
-        self.read(move |e| e.events(&s, before, limit))
+        self.run(move |e| e.events(&s, before, limit))
     }
 
     /// Events matching `q`, newest first. Blocking.
     pub fn search(&self, q: Query) -> anyhow::Result<Vec<EventRow>> {
-        self.read(move |e| e.search(&q))
+        self.run(move |e| e.search(&q))
+    }
+
+    /// The rows written after number `from`, about `max_bytes` of them. Blocking.
+    pub fn changes(&self, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+        self.run(move |e| e.changes(from, max_bytes))
+    }
+
+    /// Take a batch of `peer`'s feed (a store of machine `machine`; it follows `from`). Blocking.
+    pub fn take(&self, peer: &str, machine: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
+        let (p, m) = (peer.to_owned(), machine.to_owned());
+        let w = self.watchers.clone();
+        self.run(move |e| {
+            let took = e.take(&p, &m, from, &batch)?;
+            if took.applied > 0 {
+                notify(&w);
+            }
+            Ok(took)
+        })
+    }
+
+    /// Through where this store has `peer`'s feed. Blocking.
+    pub fn peer(&self, peer: &str) -> anyhow::Result<u64> {
+        let p = peer.to_owned();
+        self.run(move |e| e.peer(&p))
+    }
+
+    /// Each file of `session`'s record kept, with its last line. Blocking.
+    pub fn marks(&self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        let s = session.to_owned();
+        self.run(move |e| e.marks(&s))
+    }
+
+    /// Lines of `session`'s record from `source`, from line `from` on. Blocking.
+    pub fn record(&self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        let (s, src) = (session.to_owned(), source.to_owned());
+        self.run(move |e| e.record(&s, &src, from, limit))
+    }
+
+    /// The sessions not ended, heard of since `since` (unix ms). Blocking.
+    pub fn unended(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.run(move |e| e.unended(since))
     }
 
     /// Wait until everything sent so far is committed. Blocking.
     pub fn sync(&self) -> anyhow::Result<()> {
-        self.read(|_| Ok(()))
+        self.run(|_| Ok(()))
+    }
+
+    /// Woken (once, however many commits came) after a commit: what a feed with nothing left to
+    /// send waits on.
+    pub fn watch(&self) -> async_channel::Receiver<()> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.watchers.lock().unwrap_or_else(PoisonError::into_inner).push(tx);
+        rx
     }
 }
 
-/// Sending a read: room is waited for, up to `READ_WAIT` (a full queue means a writer behind).
+/// Sending that waits for room, up to `READ_WAIT` (a full queue means a writer behind).
 trait SendWait {
-    fn send_timeout_compat(&self, m: Msg) -> Result<(), ()>;
+    fn send_wait(&self, m: Msg) -> Result<(), ()>;
 }
 
 impl SendWait for mpsc::SyncSender<Msg> {
-    fn send_timeout_compat(&self, mut m: Msg) -> Result<(), ()> {
+    fn send_wait(&self, mut m: Msg) -> Result<(), ()> {
         let until = Instant::now() + READ_WAIT;
         loop {
             match self.try_send(m) {
@@ -174,9 +317,9 @@ impl SendWait for mpsc::SyncSender<Msg> {
     }
 }
 
-/// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a read
+/// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers) {
     let mut pending: Vec<Row> = Vec::new();
     let mut since: Option<Instant> = None;
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
@@ -184,8 +327,9 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>) {
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
-        if let Err(e) = engine.apply(&rows) {
-            tracing::warn!(error = %format!("{e:#}"), rows = rows.len(), "conversation store: a batch couldn't be written");
+        match engine.apply(&rows) {
+            Ok(()) => notify(watchers),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), rows = rows.len(), "conversation store: a batch couldn't be written"),
         }
     };
     loop {
@@ -199,7 +343,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>) {
                     since = None;
                 }
             }
-            Ok(Msg::Read(f)) => {
+            Ok(Msg::Run(f)) => {
                 commit(&mut engine, &mut pending);
                 since = None;
                 f(engine.as_mut());
@@ -231,86 +375,12 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
     tx
 }
 
-/// An engine in memory, for tests: what Turso keeps, without a file.
-#[derive(Default)]
-pub struct Memory {
-    sessions: std::collections::BTreeMap<String, Kept>,
-}
-
-impl Engine for Memory {
-    fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
-        for row in rows {
-            match row {
-                Row::Session { session, info, meta, state, changes, at } => {
-                    let k = self.sessions.entry(session.clone()).or_default();
-                    for (slot, v) in [(&mut k.info, info), (&mut k.meta, meta), (&mut k.state, state), (&mut k.changes, changes)] {
-                        if v.is_some() {
-                            slot.clone_from(v);
-                        }
-                    }
-                    k.updated_at = *at;
-                }
-                Row::Event(e) => {
-                    let k = self.sessions.entry(e.session.clone()).or_default();
-                    match k.events.iter_mut().find(|x| x.id == e.id) {
-                        Some(x) => *x = (**e).clone(),
-                        None => k.events.push((**e).clone()),
-                    }
-                    k.events.sort_by_key(|x| x.seq);
-                }
-                Row::Reset { session, .. } => {
-                    if let Some(k) = self.sessions.get_mut(session) {
-                        k.events.clear();
-                    }
-                }
-                Row::Closed { session, at } => {
-                    if let Some(k) = self.sessions.get_mut(session) {
-                        k.closed_at = Some(*at);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
-        Ok(self.sessions.get(session).map(|k| {
-            let mut k = k.clone();
-            let skip = k.events.len().saturating_sub(last);
-            k.events.drain(..skip);
-            k
-        }))
-    }
-
-    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
-        let Some(k) = self.sessions.get(session) else { return Ok(Vec::new()) };
-        let older: Vec<EventRow> = k.events.iter().filter(|e| before.is_none_or(|b| e.seq < b)).cloned().collect();
-        let skip = older.len().saturating_sub(limit);
-        Ok(older.into_iter().skip(skip).collect())
-    }
-
-    fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>> {
-        let words: Vec<String> = q.q.split_whitespace().map(str::to_lowercase).collect();
-        let mut hits: Vec<EventRow> = self
-            .sessions
-            .iter()
-            .filter(|(s, _)| q.session.as_ref().is_none_or(|want| want == *s))
-            .flat_map(|(_, k)| k.events.iter())
-            .filter(|e| {
-                let text = e.text.to_lowercase();
-                words.iter().all(|w| text.contains(w.as_str()))
-                    && q.kind.as_ref().is_none_or(|k| &e.kind == k)
-                    && q.tool.as_ref().is_none_or(|t| e.tool.as_ref() == Some(t))
-                    && q.status.as_ref().is_none_or(|s| e.status.as_ref() == Some(s))
-                    && q.since.is_none_or(|s| e.at >= s)
-                    && q.until.is_none_or(|u| e.at < u)
-            })
-            .cloned()
-            .collect();
-        hits.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.seq.cmp(&a.seq)));
-        hits.truncate(q.limit.unwrap_or(100).min(SEARCH_MAX));
-        Ok(hits)
-    }
+/// A store on a new database in a temporary folder, for tests.
+#[cfg(test)]
+pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?))?;
+    Ok((dir, store))
 }
 
 #[cfg(test)]
@@ -324,7 +394,7 @@ mod tests {
 
     #[test]
     fn what_is_sent_is_kept_and_read_back_in_order() -> anyhow::Result<()> {
-        let store = Store::start(Box::<Memory>::default())?;
+        let (_dir, store) = scratch()?;
         store.send("a1", &Update::State { state: Box::new(State { title: "parser".into(), ..State::default() }) });
         for i in 1..=50u64 {
             store.send("a1", &said(&format!("m{i}"), i, &format!("reply {i}")));
@@ -344,7 +414,7 @@ mod tests {
 
     #[test]
     fn a_search_finds_words_newest_first() -> anyhow::Result<()> {
-        let store = Store::start(Box::<Memory>::default())?;
+        let (_dir, store) = scratch()?;
         store.send("a1", &said("m1", 1, "the parser fails on tabs"));
         store.send("a2", &said("m5", 5, "Parser fixed"));
         store.send("a2", &said("m6", 6, "unrelated"));
@@ -357,21 +427,33 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_drops_the_events_before_it() -> anyhow::Result<()> {
-        let store = Store::start(Box::<Memory>::default())?;
-        store.send("a1", &said("m1", 1, "one"));
-        store.send("a1", &said("m2", 2, "two"));
-        store.send("a1", &Update::Reset);
-        store.send("a1", &said("m1", 1, "one"));
-        let k = store.kept("a1", 100)?.ok_or_else(|| anyhow::anyhow!("nothing kept"))?;
-        assert_eq!(k.events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1"]);
+    fn a_reset_drops_the_events_from_its_number_on_and_keeps_the_history_before() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        for i in 1..=6u64 {
+            store.send("a1", &said(&format!("m{i}"), i, "x"));
+        }
+        // A restart: the timeline in memory held 4.. (the store holds the rest); it says so again.
+        store.send("a1", &Update::Reset { from: Some(4) });
+        for i in 4..=6u64 {
+            store.send("a1", &said(&format!("m{i}"), i, "x"));
+        }
+        let ids = |k: Option<Kept>| k.map(|k| k.events.into_iter().map(|e| e.id).collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(ids(store.kept("a1", 100)?), vec!["m1", "m2", "m3", "m4", "m5", "m6"]);
+        // A rewind to m5: from 4 again, but only m4 comes back.
+        store.send("a1", &Update::Reset { from: Some(4) });
+        store.send("a1", &said("m4", 4, "x"));
+        assert_eq!(ids(store.kept("a1", 100)?), vec!["m1", "m2", "m3", "m4"]);
+        // From the start: all of it goes.
+        store.send("a1", &Update::Reset { from: None });
+        store.send("a1", &said("n1", 1, "x"));
+        assert_eq!(ids(store.kept("a1", 100)?), vec!["n1"]);
         Ok(())
     }
 
     #[test]
     fn the_tee_keeps_and_passes_on_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
-            let store = Store::start(Box::<Memory>::default())?;
+            let (_dir, store) = scratch()?;
             let (sink, out) = async_channel::bounded(4);
             let tee = tee(sink, store.clone(), 4);
             for i in 1..=3u64 {

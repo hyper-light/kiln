@@ -46,6 +46,12 @@ pub struct Managed {
     pub requires_pruning: bool,
     /// Where it differs.
     pub why: Option<String>,
+    /// The app whose tracking the live object carries, when that isn't this one.
+    pub tracked_by: Option<String>,
+    /// Other apps that deploy it too.
+    pub shared_with: Vec<String>,
+    /// It differs only by tracking marks.
+    pub marks_only: bool,
     /// The live object as the cluster serves it (status and server metadata included).
     pub live: Option<Value>,
 }
@@ -63,6 +69,9 @@ impl Managed {
             missing: false,
             requires_pruning: false,
             why: None,
+            tracked_by: None,
+            shared_with: Vec::new(),
+            marks_only: false,
             live: None,
         }
     }
@@ -133,6 +142,16 @@ pub struct Node {
     pub requires_pruning: bool,
     /// Where it differs from git.
     pub why: Option<String>,
+    /// The app whose tracking the live object carries, when that isn't this one: a sync of
+    /// this one takes it over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_by: Option<String>,
+    /// Other apps that deploy it too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<String>,
+    /// It differs only by tracking marks: a sync changes nothing else in it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub marks_only: bool,
     /// `metadata.creationTimestamp`.
     pub created_at: Option<String>,
     /// A few pairs per kind, as Argo CD shows them.
@@ -194,6 +213,9 @@ pub fn build(managed: Vec<Managed>, listed: Vec<Value>) -> Tree {
             missing: m.missing,
             requires_pruning: m.requires_pruning,
             why: m.why,
+            tracked_by: m.tracked_by,
+            shared_with: m.shared_with,
+            marks_only: m.marks_only,
             ..node
         };
         // Two managed objects can't share a uid; if a list served one twice, the first stands.
@@ -349,6 +371,9 @@ fn base(key: &ResKey, version: String, live: Option<&Value>) -> Node {
         missing: false,
         requires_pruning: false,
         why: None,
+        tracked_by: None,
+        shared_with: Vec::new(),
+        marks_only: false,
         created_at: None,
         info: Vec::new(),
         status: None,

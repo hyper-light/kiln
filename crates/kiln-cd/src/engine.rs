@@ -340,6 +340,19 @@ pub struct Summary {
     pub resources: u32,
     /// Resources that differ (including missing and to-prune).
     pub out_of_sync: u32,
+    /// Resources it deploys whose live object another app's tracking names: shared, as Argo
+    /// CD's `SharedResourceWarning` says. A sync takes them over.
+    pub shared: u32,
+    /// Resources git has that the cluster doesn't.
+    pub missing: u32,
+    /// Live resources git no longer has, carrying the app's tracking: a sync that prunes
+    /// deletes them. Counted in `out_of_sync`, and not in `resources`.
+    pub prune: u32,
+    /// Resources that differ only by the app's own tracking marks, with no other app's on
+    /// them (one created by hand, a CRD Argo CD left unmarked): a sync adds the marks and
+    /// changes nothing else. `shared`, `unmarked`, `missing` and `prune` don't overlap; what
+    /// `out_of_sync` holds beyond them changes fields.
+    pub unmarked: u32,
     /// The running (or last) sync's state.
     pub operation: Option<OpStatus>,
     /// Why the status is what it is, when that isn't obvious (a render error, an unreachable
@@ -461,20 +474,65 @@ enum RenderSlot {
     Done(Arc<Render>),
 }
 
-/// One object in one cluster, as far as some app is concerned.
+/// One object in one cluster, as one app sees it. Every app that deploys an object, or whose
+/// tracking the live object carries, has its own, compared on its own as Argo CD compares each
+/// app; the cluster's index chains them by `sibling`.
 struct Res {
     key: ResKey,
-    /// The app it belongs to (desired by it, or tracked as applied by it).
+    /// The app it is for: one that deploys it, or one whose tracking the live object carries.
     app: Option<AppIx>,
+    /// Another app's resource of the same object.
+    sibling: Option<ResIx>,
     /// Its desired form: a render and the object's index in it.
     desired: Option<(Arc<Render>, u32)>,
     live: Option<Live>,
     /// The last comparison.
     state: ResState,
-    /// What it last added to its app's counts: (differs, health, desired).
-    counted: Option<(bool, Option<Health>, bool, bool)>,
+    /// What it last added to its app's counts.
+    counted: Option<Counted>,
     /// Where it differs, when it does.
     why: Option<Box<str>>,
+    /// It differs only by tracking marks (kiln's or Argo CD's): a sync changes nothing else.
+    marks: bool,
+}
+
+/// What a resource adds to its app's counts.
+#[derive(Clone, Copy, Default)]
+struct Counted {
+    differs: bool,
+    health: Option<Health>,
+    desired: bool,
+    unread: bool,
+    shared: bool,
+    missing: bool,
+    prune: bool,
+    marks: bool,
+}
+
+/// One object's resources in a cluster, one per app: rarely more than one, so kept inline.
+#[derive(Default)]
+struct Slots {
+    n: usize,
+    inline: [ResIx; 4],
+    more: Vec<ResIx>,
+}
+
+impl Slots {
+    fn push(&mut self, ix: ResIx) {
+        match self.inline.get_mut(self.n) {
+            Some(slot) => *slot = ix,
+            None => self.more.push(ix),
+        }
+        self.n += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = ResIx> + '_ {
+        self.inline.iter().take(self.n.min(4)).copied().chain(self.more.iter().copied())
+    }
 }
 
 struct Live {
@@ -484,6 +542,8 @@ struct Live {
     message: Option<Box<str>>,
     hook: bool,
     terminating: bool,
+    /// The app its tracking metadata names, if any.
+    tracked: Option<AppIx>,
 }
 
 /// What a resource counts as in its app's status.
@@ -532,6 +592,13 @@ pub struct ResourceView {
     pub hook: bool,
     /// Where it differs, when it does (`.spec.replicas differs`).
     pub why: Option<String>,
+    /// The app whose tracking the live object carries, when that isn't this one: a sync of this
+    /// one takes it over.
+    pub tracked_by: Option<Str>,
+    /// Other apps that deploy the same object.
+    pub shared_with: Vec<Str>,
+    /// It differs only by tracking marks: a sync changes nothing else in it.
+    pub marks_only: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -541,6 +608,13 @@ struct Counts {
     health: [u32; 6],
     /// Resources whose kind the cluster hasn't been read for yet.
     unread: u32,
+    /// Resources it deploys whose live object another app's tracking names.
+    shared: u32,
+    /// Resources not in the cluster, and live ones to prune.
+    missing: u32,
+    prune: u32,
+    /// Resources that differ only by kiln's tracking marks, no other app's on them.
+    unmarked: u32,
 }
 
 struct Op {
@@ -758,6 +832,9 @@ pub struct Engine {
     app_by_id: FxHashMap<Str, AppIx>,
     /// Apps by the name their objects' tracking metadata carries.
     app_by_tracking: FxHashMap<Str, AppIx>,
+    /// Field managers apps apply as, and those their ignore rules name, counted: a live object
+    /// keeps their `managedFields` entries, so every app that sees it can compare it.
+    managers: FxHashMap<Str, u32>,
     clusters: Vec<Cluster>,
     cluster_by_name: FxHashMap<Str, ClusterIx>,
     renders: FxHashMap<u64, RenderSlot>,
@@ -781,6 +858,7 @@ impl Engine {
             free_apps: Vec::new(),
             app_by_id: FxHashMap::default(),
             app_by_tracking: FxHashMap::default(),
+            managers: FxHashMap::default(),
             clusters: Vec::new(),
             cluster_by_name: FxHashMap::default(),
             renders: FxHashMap::default(),
@@ -808,7 +886,7 @@ impl Engine {
     pub fn footprint(&self) -> Footprint {
         let mut f = Footprint { apps: self.app_by_id.len(), ..Footprint::default() };
         for cl in &self.clusters {
-            f.resources += cl.index.len();
+            f.resources += cl.res.iter().filter(|r| r.is_some()).count();
             f.index_bytes += cl.index.capacity() * (std::mem::size_of::<ResKey>() + std::mem::size_of::<ResIx>() + 8);
             f.resource_bytes += cl.res.capacity() * std::mem::size_of::<Option<Res>>();
             for res in cl.res.iter().flatten() {
@@ -1005,6 +1083,10 @@ impl Engine {
                     self.app_by_tracking.remove(&old);
                 }
                 self.app_by_tracking.insert(cfg.tracked_as().into(), a);
+                if let Some(old) = self.app(a).map(|app| app.cfg.clone()) {
+                    self.count_managers(&old, false);
+                }
+                self.count_managers(&cfg, true);
                 if let Some(app) = self.app_mut(a) {
                     app.cfg = Arc::new(cfg);
                 }
@@ -1016,6 +1098,7 @@ impl Engine {
                 return;
             }
         }
+        self.count_managers(&cfg, true);
         let label: Str = app_label(&cfg.id).into();
         let app = App {
             label: label.clone(),
@@ -1065,13 +1148,19 @@ impl Engine {
         let Some(a) = self.app_by_id.remove(id) else { return };
         let Some(app) = self.apps.get_mut(a as usize).and_then(Option::take) else { return };
         self.app_by_tracking.remove(app.cfg.tracked_as());
+        self.count_managers(&app.cfg, false);
         let c = app.cluster;
         if let Some(cl) = self.clusters.get_mut(c as usize) {
             cl.by_label.remove(&app.label);
         }
         for r in app.resources {
+            let Some(key) = self.res(c, r).map(|res| res.key.clone()) else { continue };
+            // Deleted with the app only when it is the app's own (its tracking) and no other app
+            // deploys it.
+            let others = self.other_deployer(c, &key, a).is_some();
             let live_key = {
                 let Some(res) = self.res_mut(c, r) else { continue };
+                let own = res.live.as_ref().is_some_and(|l| l.tracked == Some(a));
                 res.app = None;
                 res.desired = None;
                 res.state = ResState::None;
@@ -1082,7 +1171,7 @@ impl Engine {
                     let o = sync::options_of(&v);
                     o.delete == Some(false) || o.delete_confirm == Some(true)
                 });
-                res.live.as_ref().filter(|_| !kept).map(|_| res.key.clone())
+                res.live.as_ref().filter(|_| own && !kept && !others).map(|_| res.key.clone())
             };
             if let (Some(p), Some(key)) = (cascade, live_key) {
                 let id = self.next_request_id();
@@ -1097,6 +1186,13 @@ impl Engine {
                 self.enqueue(c, id, Trigger::Manual);
             }
             self.gc_res(c, r);
+            // Its tracking names nobody now (its index goes to the next app made).
+            for s in self.slots(c, &key).iter().collect::<Vec<_>>() {
+                if let Some(l) = self.res_mut(c, s).and_then(|x| x.live.as_mut()).filter(|l| l.tracked == Some(a)) {
+                    l.tracked = None;
+                }
+            }
+            self.recompare_siblings(c, &key, r);
         }
         self.free_apps.push(a);
         self.pump(c);
@@ -1266,50 +1362,54 @@ impl Engine {
             if !kinds.contains(&gk) {
                 kinds.push(gk);
             }
-            let ix = self.res_for(c, key);
-            let taken = self.res(c, ix).is_some_and(|res| res.app.is_some_and(|other| other != a) && res.desired.is_some());
-            if taken {
-                // Another app already deploys this object; the first one keeps it.
-                continue;
-            }
+            // Its own resource of the object, whichever other apps deploy it too: each compares
+            // its own, as Argo CD does, and the tracking the object carries says who prunes it.
+            let (ix, made) = self.res_for(c, key.clone(), a);
             keep.insert(ix);
-            let changed = {
+            let (changed, gained) = {
                 let Some(res) = self.res_mut(c, ix) else { continue };
                 let before = res.desired.as_ref().map(|(r, i)| r.objects.get(*i as usize).map(|o| o.hash));
-                res.app = Some(a);
+                let gained = res.desired.is_none();
                 res.desired = Some((render.clone(), i as u32));
-                before != Some(Some(r.hash))
+                (made || before != Some(Some(r.hash)), gained)
             };
+            if made {
+                self.share_live(c, &key, ix);
+            }
             if changed {
                 self.recompare(c, ix);
             } else {
                 self.count(c, ix);
             }
+            if gained {
+                self.recompare_siblings(c, &key, ix);
+            }
         }
         if let Some(nr) = ns_render {
             let key = ResKey { group: self.interner.intern(""), kind: self.interner.intern("Namespace"), namespace: self.interner.intern(""), name: default_ns.clone() };
-            let ix = self.res_for(c, key.clone());
-            let free = self.res(c, ix).is_none_or(|res| res.app.is_none_or(|other| other == a));
-            if free {
-                keep.insert(ix);
-                if let Some(res) = self.res_mut(c, ix) {
-                    res.app = Some(a);
-                    res.desired = Some((nr, 0));
-                }
-                self.recompare(c, ix);
-                let gk = key.group_kind();
-                if !kinds.contains(&gk) {
-                    kinds.push(gk);
-                }
+            let (ix, made) = self.res_for(c, key.clone(), a);
+            keep.insert(ix);
+            if let Some(res) = self.res_mut(c, ix) {
+                res.desired = Some((nr, 0));
+            }
+            if made {
+                self.share_live(c, &key, ix);
+            }
+            self.recompare(c, ix);
+            let gk = key.group_kind();
+            if !kinds.contains(&gk) {
+                kinds.push(gk);
             }
         }
         for ix in old {
             if !keep.contains(&ix) {
-                if let Some(res) = self.res_mut(c, ix) {
-                    res.desired = None;
-                }
+                let dropped = self.res_mut(c, ix).and_then(|res| res.desired.take().map(|_| res.key.clone()));
                 self.recompare(c, ix);
                 self.gc_res(c, ix);
+                // Whether another app may prune it now depends on nobody deploying it.
+                if let Some(key) = dropped {
+                    self.recompare_siblings(c, &key, ix);
+                }
             }
         }
         if let Some(app) = self.app_mut(a) {
@@ -1350,12 +1450,77 @@ impl Engine {
         self.clusters.get_mut(c as usize)?.res.get_mut(r as usize)?.as_mut()
     }
 
-    fn res_for(&mut self, c: ClusterIx, key: ResKey) -> ResIx {
-        let Some(cl) = self.clusters.get_mut(c as usize) else { return 0 };
-        if let Some(&ix) = cl.index.get(&key) {
-            return ix;
+    /// Every app's resource of an object.
+    fn slots(&self, c: ClusterIx, key: &ResKey) -> Slots {
+        let mut out = Slots::default();
+        let mut next = self.clusters.get(c as usize).and_then(|cl| cl.index.get(key).copied());
+        while let Some(ix) = next {
+            out.push(ix);
+            // A chain is one resource per app; this only guards against a broken one.
+            if out.n > 4096 {
+                break;
+            }
+            next = self.res(c, ix).and_then(|r| r.sibling);
         }
-        let res = Res { key: key.clone(), app: None, desired: None, live: None, state: ResState::None, counted: None, why: None };
+        out
+    }
+
+    /// An app's resource of an object, if it has one.
+    fn res_of(&self, c: ClusterIx, key: &ResKey, a: AppIx) -> Option<ResIx> {
+        self.slots(c, key).iter().find(|ix| self.res(c, *ix).is_some_and(|r| r.app == Some(a)))
+    }
+
+    /// Another app that deploys an object (has it in its render), if one does.
+    fn other_deployer(&self, c: ClusterIx, key: &ResKey, a: AppIx) -> Option<Str> {
+        let res = self.slots(c, key).iter().filter_map(|ix| self.res(c, ix)).find(|r| r.app != Some(a) && r.desired.is_some())?;
+        res.app.and_then(|o| self.app(o)).map(|o| o.cfg.id.clone())
+    }
+
+    /// Compares again the other apps' resources of an object: whether one may prune it depends
+    /// on whether another deploys it.
+    fn recompare_siblings(&mut self, c: ClusterIx, key: &ResKey, ix: ResIx) {
+        for s in self.slots(c, key).iter().filter(|s| *s != ix).collect::<Vec<_>>() {
+            self.recompare(c, s);
+            self.gc_res(c, s);
+        }
+    }
+
+    /// A resource just made for an app takes the live object its siblings already read.
+    fn share_live(&mut self, c: ClusterIx, key: &ResKey, ix: ResIx) {
+        let from = self.slots(c, key).iter().filter(|s| *s != ix).find_map(|s| {
+            let l = self.res(c, s)?.live.as_ref()?;
+            // Hash 0: the next event for it is read in full, for this app's field manager.
+            Some(Live { blob: l.blob.clone(), hash: 0, health: l.health, message: l.message.clone(), hook: l.hook, terminating: l.terminating, tracked: l.tracked })
+        });
+        if let (Some(live), Some(res)) = (from, self.res_mut(c, ix)) {
+            res.live = Some(live);
+        }
+    }
+
+    /// Counts (or uncounts) the field managers an app brings: its own, and its ignore rules'.
+    fn count_managers(&mut self, cfg: &AppConfig, add: bool) {
+        let names: Vec<Str> = std::iter::once(cfg.manager.clone()).chain(cfg.ignore.iter().flat_map(|r| r.managers.iter().map(|m| Str::from(m.as_str())))).collect();
+        for m in names {
+            if add {
+                *self.managers.entry(m).or_insert(0) += 1;
+            } else if let Some(n) = self.managers.get_mut(&m) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.managers.remove(&m);
+                }
+            }
+        }
+    }
+
+    /// An app's resource of an object, made (and chained to the object's others) if it has none
+    /// yet; and whether it was just made.
+    fn res_for(&mut self, c: ClusterIx, key: ResKey, a: AppIx) -> (ResIx, bool) {
+        if let Some(ix) = self.res_of(c, &key, a) {
+            return (ix, false);
+        }
+        let Some(cl) = self.clusters.get_mut(c as usize) else { return (0, false) };
+        let head = cl.index.get(&key).copied();
+        let res = Res { key: key.clone(), app: Some(a), sibling: head, desired: None, live: None, state: ResState::None, counted: None, why: None, marks: false };
         let ix = match cl.free.pop() {
             Some(ix) => {
                 if let Some(slot) = cl.res.get_mut(ix as usize) {
@@ -1369,22 +1534,51 @@ impl Engine {
             }
         };
         cl.index.insert(key, ix);
-        ix
+        (ix, true)
     }
 
-    /// Frees a resource nobody desires or tracks any more.
+    /// Frees a resource its app no longer needs: the app deploys nothing there, and the live
+    /// object (if any) doesn't carry its tracking.
     fn gc_res(&mut self, c: ClusterIx, r: ResIx) {
+        let gone = self.res(c, r).is_some_and(|res| res.desired.is_none() && res.live.as_ref().is_none_or(|l| l.tracked.is_none() || l.tracked != res.app));
+        if !gone {
+            return;
+        }
+        self.uncount(c, r);
         let Some(cl) = self.clusters.get_mut(c as usize) else { return };
-        let gone = cl.res.get(r as usize).and_then(Option::as_ref).is_some_and(|res| res.desired.is_none() && res.live.is_none());
-        if gone
-            && let Some(res) = cl.res.get_mut(r as usize).and_then(Option::take) {
-                cl.index.remove(&res.key);
-                cl.free.push(r);
-                if let Some(a) = res.app
-                    && let Some(app) = self.apps.get_mut(a as usize).and_then(Option::as_mut) {
-                        app.resources.remove(&r);
-                    }
+        let Some(res) = cl.res.get_mut(r as usize).and_then(Option::take) else { return };
+        // Out of its object's chain.
+        if cl.index.get(&res.key) == Some(&r) {
+            match res.sibling {
+                Some(next) => {
+                    cl.index.insert(res.key.clone(), next);
+                }
+                None => {
+                    cl.index.remove(&res.key);
+                }
             }
+        } else {
+            let mut at = cl.index.get(&res.key).copied();
+            let mut guard = 0;
+            while let Some(i) = at {
+                guard += 1;
+                let Some(prev) = cl.res.get_mut(i as usize).and_then(Option::as_mut) else { break };
+                if prev.sibling == Some(r) {
+                    prev.sibling = res.sibling;
+                    break;
+                }
+                at = prev.sibling;
+                if guard > 4096 {
+                    break;
+                }
+            }
+        }
+        cl.free.push(r);
+        if let Some(a) = res.app
+            && let Some(app) = self.apps.get_mut(a as usize).and_then(Option::as_mut)
+        {
+            app.resources.remove(&r);
+        }
     }
 
     /// The object as an app applies it: the rendered form plus namespace and tracking.
@@ -1487,10 +1681,11 @@ impl Engine {
                 }
                 // The kind's first list: what waited for it and isn't there is missing.
                 if self.clusters.get_mut(c as usize).is_some_and(|cl| cl.listed.insert(kind.clone())) {
-                    let of_kind: Vec<ResIx> = match self.clusters.get(c as usize) {
-                        Some(cl) => cl.index.iter().filter(|(k, _)| k.group == kind.group && k.kind == kind.kind).map(|(_, ix)| *ix).collect(),
+                    let keys: Vec<ResKey> = match self.clusters.get(c as usize) {
+                        Some(cl) => cl.index.keys().filter(|k| k.group == kind.group && k.kind == kind.kind).cloned().collect(),
                         None => Vec::new(),
                     };
+                    let of_kind: Vec<ResIx> = keys.iter().flat_map(|k| self.slots(c, k).iter().collect::<Vec<_>>()).collect();
                     for ix in of_kind {
                         if self.res(c, ix).is_some_and(|r| r.state == ResState::Unread) {
                             self.recompare(c, ix);
@@ -1510,89 +1705,116 @@ impl Engine {
         self.stats.live_events += 1;
         let Some(key) = self.live_key(c, &v) else { return };
         let owner = self.owner_of(&key, &v);
-        let existing = self.clusters.get(c as usize).and_then(|cl| cl.index.get(&key).copied());
-        let ix = match (existing, owner) {
-            (Some(ix), _) => ix,
-            (None, Some(_)) => self.res_for(c, key.clone()),
-            (None, None) => return,
-        };
-        let cfg = owner.or_else(|| self.res(c, ix).and_then(|r| r.app)).and_then(|a| self.app(a)).map(|app| app.cfg.clone());
-        let manager: Str = cfg.as_ref().map(|c| c.manager.clone()).unwrap_or_else(|| "kiln".into());
-        let status = health::assess(&v, self.rules.as_ref())
-            .or_else(|| if self.cfg.generic_health { health::generic_conditions(&v) } else { None });
+        // The app its tracking names has a resource of it: to prune it, once nothing deploys it.
+        if let Some(o) = owner {
+            self.res_for(c, key.clone(), o);
+        }
+        let slots: Vec<ResIx> = self.slots(c, &key).iter().collect();
+        if slots.is_empty() {
+            return;
+        }
+        let status = health::assess(&v, self.rules.as_ref()).or_else(|| if self.cfg.generic_health { health::generic_conditions(&v) } else { None });
         let terminating = obj::get(&v, &["metadata", "deletionTimestamp"]).is_some_and(|t| !t.is_null());
-        let hash = diff::live_hash(&v, &manager);
         let (health, message) = (status.as_ref().map(|s| s.health), status.map(|s| s.message));
         let message = message.filter(|m| !m.is_empty()).map(String::into_boxed_str);
-        let mut moved = false;
-        let mut health_moved = false;
-        if let Some(res) = self.res_mut(c, ix) {
-            if res.app.is_none() {
-                res.app = owner;
+        let hook = sync::hook_of(&v).is_some();
+        // One copy for every app that sees it, keeping every app's field managers.
+        let mut blob: Option<Blob> = None;
+        for ix in slots {
+            let Some(a) = self.res(c, ix).and_then(|r| r.app) else { continue };
+            let Some(manager) = self.app(a).map(|app| app.cfg.manager.clone()) else { continue };
+            let hash = diff::live_hash(&v, &manager);
+            let same = self.res(c, ix).and_then(|r| r.live.as_ref()).is_some_and(|l| l.hash == hash);
+            if !same && blob.is_none() {
+                let managers = &self.managers;
+                blob = Some(Blob::encode(&recombine(LiveView::keeping(v.clone(), &manager, |m| managers.contains_key(m)))));
             }
-            match &mut res.live {
-                // Only status (or the server's bookkeeping) moved: no copy, no comparison.
-                Some(l) if l.hash == hash => {
-                    health_moved = l.health != health || l.terminating != terminating;
-                    l.health = health;
-                    l.message = message;
-                    l.terminating = terminating;
-                }
-                _ => {
-                    moved = true;
-                    let hook = sync::hook_of(&v).is_some();
-                    // Only kiln's own apply and the managers its ignore rules name are read again.
-                    let view = LiveView::keeping(v, &manager, |m| {
-                        cfg.as_ref().is_some_and(|c| c.ignore.iter().any(|r| r.managers.iter().any(|x| x == m)))
-                    });
-                    res.live = Some(Live { blob: Blob::encode(&recombine(view)), hash, health, message, hook, terminating });
+            let mut moved = false;
+            let mut health_moved = false;
+            if let Some(res) = self.res_mut(c, ix) {
+                match &mut res.live {
+                    // Only status (or the server's bookkeeping) moved: no copy, no comparison.
+                    Some(l) if l.hash == hash => {
+                        health_moved = l.health != health || l.terminating != terminating;
+                        l.health = health;
+                        l.message = message.clone();
+                        l.terminating = terminating;
+                        l.tracked = owner;
+                    }
+                    _ => {
+                        if let Some(b) = blob.clone() {
+                            moved = true;
+                            res.live = Some(Live { blob: b, hash, health, message: message.clone(), hook, terminating, tracked: owner });
+                        }
+                    }
                 }
             }
-        }
-        if let Some(a) = self.res(c, ix).and_then(|r| r.app)
-            && let Some(app) = self.app_mut(a) {
+            if let Some(app) = self.app_mut(a) {
                 app.resources.insert(ix);
             }
-        if moved {
-            self.recompare(c, ix);
-        } else {
-            self.stats.live_unchanged += 1;
-            if health_moved {
-                self.count(c, ix);
+            if moved {
+                self.recompare(c, ix);
+            } else {
+                self.stats.live_unchanged += 1;
+                if health_moved {
+                    self.count(c, ix);
+                }
             }
-        }
-        if let Some(a) = self.res(c, ix).and_then(|r| r.app)
-            && self.app(a).is_some_and(|app| app.op.is_some()) {
+            if self.app(a).is_some_and(|app| app.op.is_some()) {
                 self.mark(a);
             }
+        }
+        // An app's resource of an object now tracked as another's, which it doesn't deploy, goes.
+        for ix in self.slots(c, &key).iter().collect::<Vec<_>>() {
+            self.gc_res(c, ix);
+        }
     }
 
     fn delete_live(&mut self, c: ClusterIx, key: &ResKey) {
         self.stats.live_events += 1;
-        let Some(ix) = self.clusters.get(c as usize).and_then(|cl| cl.index.get(key).copied()) else { return };
-        if let Some(res) = self.res_mut(c, ix) {
-            res.live = None;
-        }
-        self.recompare(c, ix);
-        if let Some(a) = self.res(c, ix).and_then(|r| r.app) {
-            self.mark(a);
-        }
-        let keep = self.res(c, ix).is_some_and(|r| r.desired.is_some());
-        if !keep {
-            self.uncount(c, ix);
-            self.gc_res(c, ix);
+        for ix in self.slots(c, key).iter().collect::<Vec<_>>() {
+            if let Some(res) = self.res_mut(c, ix) {
+                res.live = None;
+            }
+            self.recompare(c, ix);
+            if let Some(a) = self.res(c, ix).and_then(|r| r.app) {
+                self.mark(a);
+            }
+            if self.res(c, ix).is_some_and(|r| r.desired.is_none()) {
+                self.gc_res(c, ix);
+            }
         }
     }
 
     /// Compares a resource again and updates its app's counts.
     fn recompare(&mut self, c: ClusterIx, ix: ResIx) {
         let (state, why) = self.classify(c, ix);
+        let marks = state == ResState::OutOfSync && self.marks_only(c, ix);
         self.uncount(c, ix);
         if let Some(res) = self.res_mut(c, ix) {
             res.state = state;
             res.why = why;
+            res.marks = marks;
         }
         self.count(c, ix);
+    }
+
+    /// Whether an app's object differs from the live one only by tracking marks (kiln's, and
+    /// Argo CD's): ignored fields left out, every field it sets otherwise as live has it.
+    fn marks_only(&self, c: ClusterIx, ix: ResIx) -> bool {
+        let Some(res) = self.res(c, ix) else { return false };
+        let Some(app) = res.app.and_then(|a| self.app(a)) else { return false };
+        let (Some(mut d), Some(mut live)) = (self.desired_object(app, res), res.live.as_ref().and_then(|l| l.blob.decode().ok())) else { return false };
+        let view = LiveView::new(live.clone(), &app.cfg.manager);
+        live = view.object.clone();
+        let (ignores, _) = Ignores::for_object(app.cfg.ignore.iter(), &d);
+        if !ignores.is_empty() {
+            ignores.strip(&mut d, Some(&view));
+            ignores.strip(&mut live, Some(&view));
+        }
+        strip_marks(&mut d);
+        strip_marks(&mut live);
+        matches!(diff::compare(&d, &live, None), Verdict::Synced)
     }
 
     fn classify(&mut self, c: ClusterIx, ix: ResIx) -> (ResState, Option<Box<str>>) {
@@ -1601,7 +1823,13 @@ impl Engine {
         let Some(app) = self.app(a) else { return (ResState::None, None) };
         match (&res.desired, &res.live) {
             (None, Some(l)) if l.hook => (ResState::None, None),
-            (None, Some(_)) => (ResState::Prune, Some("not in git: requires pruning".into())),
+            // Pruned only by the app whose tracking it carries, and only while no other app
+            // deploys it (Argo CD would prune it from under the other).
+            (None, Some(l)) if l.tracked != Some(a) => (ResState::None, None),
+            (None, Some(_)) => match self.other_deployer(c, &res.key, a) {
+                Some(other) => (ResState::None, Some(format!("not in git; app {other} deploys it").into())),
+                None => (ResState::Prune, Some("not in git: requires pruning".into())),
+            },
             (None, None) => (ResState::None, None),
             (Some(_), None) if !self.clusters.get(c as usize).is_some_and(|cl| cl.listed.contains(&res.key.group_kind())) => {
                 (ResState::Unread, Some("not read from the cluster yet".into()))
@@ -1611,6 +1839,7 @@ impl Engine {
                 let Some(d) = self.desired_object(app, res) else { return (ResState::OutOfSync, Some("the rendered object can't be read".into())) };
                 let Ok(live) = l.blob.decode() else { return (ResState::OutOfSync, Some("the live object can't be read".into())) };
                 let cfg = app.cfg.clone();
+                let tracked_by = l.tracked.filter(|t| *t != a).and_then(|t| self.app(t)).map(|t| t.cfg.id.clone());
                 self.stats.comparisons += 1;
                 let view = LiveView::new(live, &cfg.manager);
                 let owned = view.owned(&cfg.manager);
@@ -1623,15 +1852,16 @@ impl Engine {
                     ignores.strip(&mut l2, Some(&view));
                     diff::compare(&d2, &l2, owned.as_ref())
                 };
-                match verdict {
-                    Verdict::Synced => (ResState::Synced, None),
-                    Verdict::OutOfSync { path, why } => (ResState::OutOfSync, Some(differs(&path, why).into_boxed_str())),
+                match (verdict, tracked_by) {
+                    (Verdict::Synced, _) => (ResState::Synced, None),
+                    (Verdict::OutOfSync { .. }, Some(other)) => (ResState::OutOfSync, Some(format!("app {other}'s tracking is on it: a sync takes it over").into_boxed_str())),
+                    (Verdict::OutOfSync { path, why }, None) => (ResState::OutOfSync, Some(differs(&path, why).into_boxed_str())),
                 }
             }
         }
     }
 
-    fn contribution(&self, c: ClusterIx, ix: ResIx) -> Option<(AppIx, bool, Option<Health>)> {
+    fn contribution(&self, c: ClusterIx, ix: ResIx) -> Option<(AppIx, Counted)> {
         let res = self.res(c, ix)?;
         let a = res.app?;
         let health = match res.state {
@@ -1642,49 +1872,50 @@ impl Engine {
             ResState::Synced | ResState::OutOfSync => res.live.as_ref().and_then(|l| l.health),
             ResState::Unread => None,
         };
-        let differs = matches!(res.state, ResState::OutOfSync | ResState::Missing | ResState::Prune);
-        Some((a, differs, health))
+        Some((a, Counted {
+            differs: matches!(res.state, ResState::OutOfSync | ResState::Missing | ResState::Prune),
+            health,
+            desired: res.desired.is_some(),
+            unread: res.state == ResState::Unread,
+            shared: shared_with_other(res, a),
+            missing: res.state == ResState::Missing,
+            prune: res.state == ResState::Prune,
+            marks: res.marks && res.state == ResState::OutOfSync && !shared_with_other(res, a),
+        }))
     }
 
     fn count(&mut self, c: ClusterIx, ix: ResIx) {
         self.uncount(c, ix);
-        let Some((a, differs, health)) = self.contribution(c, ix) else { return };
-        let (desired, unread) = self.res(c, ix).map(|r| (r.desired.is_some(), r.state == ResState::Unread)).unwrap_or_default();
+        let Some((a, k)) = self.contribution(c, ix) else { return };
         if let Some(app) = self.app_mut(a) {
-            if desired {
-                app.counts.resources += 1;
+            let n = &mut app.counts;
+            for (on, slot) in [(k.desired, &mut n.resources), (k.differs, &mut n.out_of_sync), (k.unread, &mut n.unread), (k.shared, &mut n.shared), (k.missing, &mut n.missing), (k.prune, &mut n.prune), (k.marks, &mut n.unmarked)] {
+                if on {
+                    *slot += 1;
+                }
             }
-            if differs {
-                app.counts.out_of_sync += 1;
-            }
-            if unread {
-                app.counts.unread += 1;
-            }
-            if let Some(slot) = health.and_then(|h| app.counts.health.get_mut(h.index())) {
+            if let Some(slot) = k.health.and_then(|h| n.health.get_mut(h.index())) {
                 *slot += 1;
             }
         }
         if let Some(res) = self.res_mut(c, ix) {
-            res_counted_set(res, Some((differs, health, desired, unread)));
+            res_counted_set(res, Some(k));
         }
         self.mark(a);
     }
 
     fn uncount(&mut self, c: ClusterIx, ix: ResIx) {
         let Some(res) = self.res_mut(c, ix) else { return };
-        let Some((differs, health, desired, unread)) = res_counted_take(res) else { return };
+        let Some(k) = res_counted_take(res) else { return };
         let Some(a) = res.app else { return };
         if let Some(app) = self.app_mut(a) {
-            if desired {
-                app.counts.resources = app.counts.resources.saturating_sub(1);
+            let n = &mut app.counts;
+            for (on, slot) in [(k.desired, &mut n.resources), (k.differs, &mut n.out_of_sync), (k.unread, &mut n.unread), (k.shared, &mut n.shared), (k.missing, &mut n.missing), (k.prune, &mut n.prune), (k.marks, &mut n.unmarked)] {
+                if on {
+                    *slot = slot.saturating_sub(1);
+                }
             }
-            if differs {
-                app.counts.out_of_sync = app.counts.out_of_sync.saturating_sub(1);
-            }
-            if unread {
-                app.counts.unread = app.counts.unread.saturating_sub(1);
-            }
-            if let Some(slot) = health.and_then(|h| app.counts.health.get_mut(h.index())) {
+            if let Some(slot) = k.health.and_then(|h| n.health.get_mut(h.index())) {
                 *slot = slot.saturating_sub(1);
             }
         }
@@ -1737,6 +1968,10 @@ impl Engine {
             revision: app.revision.clone(),
             resources: app.counts.resources,
             out_of_sync: app.counts.out_of_sync,
+            shared: app.counts.shared,
+            missing: app.counts.missing,
+            prune: app.counts.prune,
+            unmarked: app.counts.unmarked,
             operation,
             message,
         })
@@ -1774,6 +2009,15 @@ impl Engine {
                 message: r.live.as_ref().and_then(|l| l.message.as_deref().map(str::to_owned)),
                 hook: r.live.as_ref().is_some_and(|l| l.hook),
                 why: r.why.as_deref().map(str::to_owned),
+                tracked_by: r.live.as_ref().and_then(|l| l.tracked).filter(|t| Some(*t) != r.app).and_then(|t| self.app(t)).map(|t| t.cfg.id.clone()),
+                shared_with: self
+                    .slots(app.cluster, &r.key)
+                    .iter()
+                    .filter_map(|s| self.res(app.cluster, s))
+                    .filter(|s| s.app != r.app && s.desired.is_some())
+                    .filter_map(|s| s.app.and_then(|x| self.app(x)).map(|x| x.cfg.id.clone()))
+                    .collect(),
+                marks_only: r.marks,
             })
             .collect();
         out.sort_by(|x, y| x.key.cmp(&y.key));
@@ -1784,8 +2028,7 @@ impl Engine {
     pub fn object(&self, id: &str, key: &ResKey) -> Option<(Option<Value>, Option<Value>)> {
         let a = *self.app_by_id.get(id)?;
         let app = self.app(a)?;
-        let cl = self.clusters.get(app.cluster as usize)?;
-        let res = self.res(app.cluster, *cl.index.get(key)?)?;
+        let res = self.res(app.cluster, self.res_of(app.cluster, key, a)?)?;
         Some((self.desired_object(app, res), res.live.as_ref().and_then(|l| l.blob.decode().ok())))
     }
 
@@ -1796,8 +2039,7 @@ impl Engine {
     pub fn change(&self, id: &str, key: &ResKey) -> Option<Change> {
         let a = *self.app_by_id.get(id)?;
         let app = self.app(a)?;
-        let cl = self.clusters.get(app.cluster as usize)?;
-        let res = self.res(app.cluster, *cl.index.get(key)?)?;
+        let res = self.res(app.cluster, self.res_of(app.cluster, key, a)?)?;
         let desired = self.desired_object(app, res);
         let live = res.live.as_ref().and_then(|l| l.blob.decode().ok()).map(|l| LiveView::new(l, &app.cfg.manager));
         Some(match (desired, live) {
@@ -1871,6 +2113,11 @@ impl Engine {
         if only_prune && !app.cfg.sync.prune {
             return;
         }
+        // An automatic sync never takes an object over from another app (two apps would take it
+        // from each other for ever): when only those differ, a person syncs.
+        if self.only_shared_differs(a) {
+            return;
+        }
         let content = app.content.unwrap_or(key);
         let trigger = match app.auto.attempted {
             Some((c, _)) if c != content => Trigger::Auto,
@@ -1896,6 +2143,16 @@ impl Engine {
         };
         let request = SyncRequest { prune: Some(app.cfg.sync.prune), trigger: Some(trigger), ..SyncRequest::default() };
         self.start_op(a, trigger, request);
+    }
+
+    /// Whether every object that differs carries another app's tracking.
+    fn only_shared_differs(&self, a: AppIx) -> bool {
+        let Some(app) = self.app(a) else { return false };
+        app.resources
+            .iter()
+            .filter_map(|ix| self.res(app.cluster, *ix))
+            .filter(|r| matches!(r.state, ResState::OutOfSync | ResState::Missing | ResState::Prune))
+            .all(|r| shared_with_other(r, a))
     }
 
     fn only_prune_differs(&self, a: AppIx) -> bool {
@@ -1927,6 +2184,7 @@ impl Engine {
         let prune = request.prune.unwrap_or(false);
         let selected: Option<FxHashSet<ResKey>> = request.resources.as_ref().map(|r| r.iter().cloned().collect());
         let c = app.cluster;
+        let automatic = matches!(trigger, Trigger::Auto | Trigger::SelfHeal);
         // Candidates: every resource of the app, plus its hooks.
         let mut keys: Vec<ResKey> = Vec::new();
         let mut desired: Vec<Option<Value>> = Vec::new();
@@ -1935,7 +2193,13 @@ impl Engine {
         let mut ixs: Vec<Option<ResIx>> = Vec::new();
         for ix in &app.resources {
             let Some(res) = self.res(c, *ix) else { continue };
-            if res.live.as_ref().is_some_and(|l| l.hook) && res.desired.is_none() {
+            // Of the live objects it doesn't deploy, only those it prunes: its own tracking, and
+            // no other app deploying them. Never another app's.
+            if res.desired.is_none() && (res.live.as_ref().is_some_and(|l| l.hook) || res.state != ResState::Prune) {
+                continue;
+            }
+            // Another app's object is taken over only when a person syncs.
+            if automatic && shared_with_other(res, a) {
                 continue;
             }
             keys.push(res.key.clone());
@@ -2010,6 +2274,9 @@ impl Engine {
         if !plan.held.is_empty() {
             op.message = format!("{} objects need pruning but are kept by their Prune option", plan.held.len());
         }
+        // Argo CD's FailOnSharedResource: nothing is applied while another app's tracking is on
+        // something this one deploys.
+        let shared = if options.fail_on_shared_resource == Some(true) { self.shared_note(a) } else { None };
         self.stats.syncs += 1;
         self.out.push_back(Action::Record(Record::Started {
             app: app_id,
@@ -2033,10 +2300,32 @@ impl Engine {
             app.op = Some(op);
             app.retry = None;
         }
+        if let Some(note) = shared {
+            self.finish_op(a, false, format!("Shared resource found: {note}"));
+            self.mark(a);
+            return;
+        }
         if dry_first {
             self.start_dry_run(a);
         }
         self.mark(a);
+    }
+
+    /// The first object an app deploys whose live object carries another app's tracking, as
+    /// Argo CD names it: `Kind/name is part of applications A and B`.
+    fn shared_note(&self, a: AppIx) -> Option<String> {
+        let app = self.app(a)?;
+        let mut shared: Vec<(&ResKey, AppIx)> = app
+            .resources
+            .iter()
+            .filter_map(|ix| self.res(app.cluster, *ix))
+            .filter(|r| r.desired.is_some())
+            .filter_map(|r| Some((&r.key, r.live.as_ref()?.tracked.filter(|t| *t != a)?)))
+            .collect();
+        shared.sort_by(|x, y| x.0.cmp(y.0));
+        let (key, other) = shared.first()?;
+        let other = self.app(*other).map(|o| o.cfg.id.clone()).unwrap_or_default();
+        Some(format!("{}/{} is part of applications {} and {other}", key.kind, key.name, app.cfg.id))
     }
 
     fn start_dry_run(&mut self, a: AppIx) {
@@ -2221,12 +2510,12 @@ impl Engine {
         let Some(app) = self.app(a) else { return out };
         let Some(op) = app.op.as_ref() else { return out };
         let c = app.cluster;
-        let index = self.clusters.get(c as usize).map(|cl| &cl.index);
         for (i, (t, s)) in op.tasks.iter().zip(&op.states).enumerate() {
             if *s != TaskState::Running && *s != TaskState::Done {
                 continue;
             }
-            let res = op.res.get(i).copied().flatten().or_else(|| index.and_then(|ix| ix.get(&t.key).copied()));
+            // The task's resource while it is still this app's of that object; else by key.
+            let res = op.res.get(i).copied().flatten().filter(|ix| self.res(c, *ix).is_some_and(|r| r.key == t.key && r.app == Some(a))).or_else(|| self.res_of(c, &t.key, a));
             let live = res.and_then(|ix| self.res(c, ix)).and_then(|r| r.live.as_ref());
             match t.action {
                 sync::Action::Prune => match live {
@@ -2274,12 +2563,11 @@ impl Engine {
         let Some(app) = self.app(a) else { return out };
         let Some(op) = app.op.as_ref() else { return out };
         let c = app.cluster;
-        let Some(cl) = self.clusters.get(c as usize) else { return out };
         for (i, (t, s)) in op.on_fail.iter().zip(&op.on_fail_states).enumerate() {
             if *s != TaskState::Done && *s != TaskState::Running {
                 continue;
             }
-            let health = cl.index.get(&t.key).and_then(|ix| self.res(c, *ix)).and_then(|r| r.live.as_ref()).map(|l| l.health);
+            let health = self.res_of(c, &t.key, a).and_then(|ix| self.res(c, ix)).and_then(|r| r.live.as_ref()).map(|l| l.health);
             match health {
                 Some(None | Some(Health::Healthy)) => out.push((i, TaskState::Settled)),
                 Some(Some(Health::Degraded)) => out.push((i, TaskState::Failed)),
@@ -2313,7 +2601,7 @@ impl Engine {
                     let Some(object) = self.task_object(app, op, i, fail_phase) else { continue };
                     if t.action == sync::Action::Hook {
                         let before = sync::hook_of(&object).is_some_and(|h| h.delete.before_creation);
-                        let exists = self.clusters.get(c as usize).is_some_and(|cl| cl.index.contains_key(&t.key));
+                        let exists = !self.slots(c, &t.key).is_empty();
                         if before && exists {
                             hook_cleanups.push(t.key.clone());
                         }
@@ -2812,11 +3100,35 @@ fn op_status(op: &Op) -> OpStatus {
 }
 
 /// What a resource last added to its app's counts.
-fn res_counted_set(res: &mut Res, v: Option<(bool, Option<Health>, bool, bool)>) {
+/// Takes the tracking marks off an object, kiln's and Argo CD's, and the maps they leave empty.
+fn strip_marks(v: &mut Value) {
+    let Some(meta) = v.get_mut("metadata").and_then(Value::as_object_mut) else { return };
+    for (part, keys) in [("labels", &[APP_LABEL, ARGO_INSTANCE][..]), ("annotations", &[TRACKING, ARGO_TRACKING, "argocd.argoproj.io/installation-id"][..])] {
+        let empty = match meta.get_mut(part).and_then(Value::as_object_mut) {
+            Some(m) => {
+                for k in keys {
+                    m.remove(*k);
+                }
+                m.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            meta.remove(part);
+        }
+    }
+}
+
+/// Whether a resource an app deploys carries another app's tracking.
+fn shared_with_other(res: &Res, a: AppIx) -> bool {
+    res.desired.is_some() && res.live.as_ref().is_some_and(|l| l.tracked.is_some_and(|t| t != a))
+}
+
+fn res_counted_set(res: &mut Res, v: Option<Counted>) {
     res.counted = v;
 }
 
-fn res_counted_take(res: &mut Res) -> Option<(bool, Option<Health>, bool, bool)> {
+fn res_counted_take(res: &mut Res) -> Option<Counted> {
     res.counted.take()
 }
 

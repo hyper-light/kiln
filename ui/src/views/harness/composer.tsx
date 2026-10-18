@@ -514,26 +514,14 @@ export function Composer({
         </ul>
       )}
 
-      <div
-        className={cn("hx-compose-box", running && "hx-compose-live")}
-        onDragOver={(e) => canAttach && e.preventDefault()}
-        onDrop={(e) => {
-          if (!canAttach || !e.dataTransfer.files.length) return;
-          e.preventDefault();
-          void add(e.dataTransfer.files);
-        }}
-      >
+      {/* Files dropped or pasted here are the agent page's to attach (it takes them anywhere on
+          the page); taking them here as well attached each one twice. */}
+      <div className={cn("hx-compose-box", running && "hx-compose-live")}>
         {chips}
         {canOverride && (withOpen || override.model || override.effort) && (
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
         )}
         <textarea
-          onPaste={(e) => {
-            if (canAttach && e.clipboardData.files.length) {
-              e.preventDefault();
-              void add(e.clipboardData.files);
-            }
-          }}
           ref={grow}
           className="hx-compose-input"
           rows={1}

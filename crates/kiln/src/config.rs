@@ -142,6 +142,8 @@ pub struct Retention {
     pub days: u32,
     /// Hard cap on a single job's log size.
     pub max_job_log_mb: u64,
+    /// How long the audit log keeps its rows (docs/ci.md W19-R05).
+    pub audit_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,7 +398,7 @@ impl Default for Observe {
 
 impl Default for Retention {
     fn default() -> Self {
-        Self { days: 30, max_job_log_mb: 256 }
+        Self { days: 30, max_job_log_mb: 256, audit_days: 400 }
     }
 }
 

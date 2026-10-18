@@ -546,7 +546,12 @@ impl Hub {
         if peers.is_empty() {
             return false;
         }
-        let kind = if lane == LANE_TERM { Kind::Term } else { Kind::Control };
+        let kind = match lane {
+            LANE_TERM => Kind::Term,
+            // The conversation lane's frames are bulk (a session's package goes in large pieces).
+            proto::LANE_CONVO => Kind::Log,
+            _ => Kind::Control,
+        };
         let b = match proto::encode(msg) {
             Ok(b) => b,
             Err(e) => {
@@ -682,7 +687,8 @@ impl Hub {
                     }
                 }
             }
-            NetEvent::Frame { peer, kind: Kind::Log, data, .. } => {
+            // Bulk frames are job output, but on the conversation feed's lane (messages, in bulk).
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO => {
                 let chunk: proto::LogChunk = proto::decode(&data)?;
                 if self.owns_job(peer, &chunk.job) {
                     self.logs.append(&chunk.job, chunk.idx, &chunk.data);
@@ -913,6 +919,11 @@ impl Hub {
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Observe { json, bytes } => crate::observe::hub::heard(&agent, json, bytes),
+            AgentMsg::Convo { json, data } => {
+                if let Some(f) = &self.harness.feed {
+                    f.heard(peer, &agent, json, data);
+                }
+            }
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {
@@ -973,8 +984,24 @@ impl Hub {
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
+                // A copy of a session that went on elsewhere since (an older epoch): its machine
+                // lets go of it, and nothing it says of it counts.
+                Ok(crate::harness::core::Update::Open { info }) if self.harness.stale(&session, info.epoch) => {
+                    tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
+                    // A runner from before letting go stops its copy instead (what it says of it
+                    // doesn't count either way).
+                    let lets_go = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
+                    let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
+                    self.send_peer(peer, &msg).await;
+                }
+                // The rest of what a copy left behind says (its machine was told to let go of it):
+                // none of it counts, and it doesn't take the session's messages from where it runs.
+                Ok(u) if !matches!(u, crate::harness::core::Update::Open { .. }) && !self.harness.runs_on(&session, &agent) => {}
                 Ok(u) => {
                     let closed = matches!(u, crate::harness::core::Update::Closed);
+                    // A runner process that sends its conversation store: the server keeps its
+                    // sessions from that.
+                    let shipped = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
                     {
                         let mut inst = self.instances.lock();
                         let what = crate::instances::Owned::Agent(session.clone());
@@ -984,7 +1011,7 @@ impl Hub {
                             inst.own(what, peer);
                         }
                     }
-                    self.harness.ingest(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u);
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u, shipped);
                     if closed {
                         self.check_retire().await;
                     }
@@ -993,6 +1020,9 @@ impl Hub {
             },
             AgentMsg::HarnessInventory { json } => match serde_json::from_str::<crate::harness::host::Inventory>(&json) {
                 Ok(mut inv) => {
+                    // A copy it kept of a session that went on elsewhere since isn't its own (it
+                    // lets go of it once it announces it).
+                    inv.sessions.retain(|id| self.harness.runs_on(id, &agent));
                     // This process's sessions are its own; another process of the machine keeps
                     // the ones it holds (the registry forgets sessions a report leaves out).
                     let others: Vec<String> = {
@@ -1805,6 +1835,7 @@ impl Hub {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = tick.tick().fuse() => {}
             }
+            crate::audit::prune(&self.store, self.cfg.retention.audit_days).await;
             let jobs = self.store.prune(self.cfg.retention.days).await?;
             if !jobs.is_empty() {
                 tracing::info!(jobs = jobs.len(), "pruned old runs");

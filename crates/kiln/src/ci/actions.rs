@@ -161,16 +161,20 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             if path.split('/').any(|s| s == ".." || s == ".git") {
                 return Err(format!("`{uses}`: the path must stay inside the repository"));
             }
+            let url = format!("/_kiln/actions/{}/{sha}.tar.gz?path={}", repo.name, encode_path(&path));
+            let mut a = ActionRef { repo: repo.name.clone(), sha: sha.to_owned(), path: path.clone(), url, ..ActionRef::default() };
             if let Some(meta) = own_metadata(hub, repo, sha, &path).await
                 && let (Some(action), _) = kiln_ci::wf::parse_action(&meta)
-                && action.runs.using == "composite"
             {
-                let mut inner = Vec::new();
-                steps_uses(&action.runs.steps, &mut inner);
-                todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+                // A kiln action's declarations (W07-R11, W09-R07).
+                a.declares(&action);
+                if action.runs.using == "composite" {
+                    let mut inner = Vec::new();
+                    steps_uses(&action.runs.steps, &mut inner);
+                    todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+                }
             }
-            let url = format!("/_kiln/actions/{}/{sha}.tar.gz?path={}", repo.name, encode_path(&path));
-            out.insert(uses.clone(), ActionRef { repo: repo.name.clone(), sha: sha.to_owned(), path, url });
+            out.insert(uses.clone(), a);
             continue;
         }
         let Some(r) = Remote::parse(&uses) else { continue };
@@ -186,16 +190,19 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
                 s
             }
         };
-        // A composite action's own actions are the run's too.
+        let mut a = ActionRef { repo: r.full(), sha: sha.clone(), path: r.path.clone(), url: format!("/_kiln/actions/{}/{}/{sha}.tar.gz", r.owner, r.repo), ..ActionRef::default() };
         if let Some(meta) = metadata(hub, &r, &sha).await
             && let (Some(action), _) = kiln_ci::wf::parse_action(&meta)
-            && action.runs.using == "composite"
         {
-            let mut inner = Vec::new();
-            steps_uses(&action.runs.steps, &mut inner);
-            todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+            a.declares(&action);
+            // A composite action's own actions are the run's too.
+            if action.runs.using == "composite" {
+                let mut inner = Vec::new();
+                steps_uses(&action.runs.steps, &mut inner);
+                todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+            }
         }
-        out.insert(uses.clone(), ActionRef { repo: r.full(), sha: sha.clone(), path: r.path.clone(), url: format!("/_kiln/actions/{}/{}/{sha}.tar.gz", r.owner, r.repo) });
+        out.insert(uses.clone(), a);
     }
     Ok(out)
 }

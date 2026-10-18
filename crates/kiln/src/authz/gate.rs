@@ -326,6 +326,11 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
     }
 }
 
+/// The scope `rule` is checked in for this request (W19-R05's audit rows name it).
+pub async fn scope_of(hub: &Hub, rule: &super::Rule, segs: &[&str], q: &HashMap<String, String>) -> Scope {
+    target(hub, rule.at, segs, q).await
+}
+
 /// A repository named by id or `owner/repo`, as a scope with its name.
 pub async fn repo_scope(hub: &Hub, s: &str) -> Scope {
     let key = s.to_owned();

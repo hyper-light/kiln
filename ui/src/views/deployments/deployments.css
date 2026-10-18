@@ -1635,3 +1635,92 @@ button.cd-gnode:hover {
     flex-wrap: wrap;
   }
 }
+
+/* Why an app differs from git: one row per kind of difference, with what a sync does about it. */
+.cd-differences {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid #2c2e34;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 1.5%);
+}
+.cd-differences-title {
+  margin: 0 0 8px;
+  color: #ededee;
+  font-size: 13px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+}
+.cd-fixes {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cd-fix {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  padding: 8px 0;
+  border-top: 1px solid #222429;
+}
+.cd-fix:first-child {
+  border-top: 0;
+}
+.cd-fix-text {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 320px;
+  flex-direction: column;
+  gap: 2px;
+}
+.cd-fix-what {
+  color: #e2e3e6;
+  font-size: 13px;
+}
+.cd-fix[data-fix="prune"] .cd-fix-what {
+  color: #d8c8b0;
+}
+.cd-fix-does {
+  color: #9a9ea8;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.cd-fix-acts {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+}
+.cd-owner {
+  padding: 0 6px;
+  border: 1px solid rgb(186 176 227 / 30%);
+  border-radius: 4px;
+  color: #c9c1ec;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+.cd-sync-options {
+  width: 100%;
+  margin-top: 2px;
+  color: #c8cad0;
+  font-size: 12.5px;
+}
+.cd-sync-options > summary {
+  width: max-content;
+  min-height: 32px;
+  line-height: 32px;
+  cursor: pointer;
+  color: #a9adb6;
+}
+.cd-sync-options > summary:hover {
+  color: #ededee;
+}
+.cd-sync-options > .cd-opt {
+  display: flex;
+}

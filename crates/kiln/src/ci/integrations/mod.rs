@@ -248,6 +248,17 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Integration> {
 
 const COLUMNS: &str = "id, kind, name, config, secret_ref, scope_kind, scope_id, created_by, created_at, updated_at, verified_at, last_error, last_used_at";
 
+/// Whether `repo`'s runs may use integration `i`: its scope holds the repository.
+pub fn usable_by(i: &Integration, repo: &crate::store::Repo) -> bool {
+    let owner = repo.name.split('/').next().unwrap_or_default();
+    match i.scope.split_once(':') {
+        None => i.scope == "server" || i.scope.is_empty(),
+        Some(("org", o)) => o.eq_ignore_ascii_case(owner),
+        Some(("repo", r)) => r == repo.id || r.eq_ignore_ascii_case(&repo.name),
+        _ => false,
+    }
+}
+
 pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
     hub.store
         .call(|c| {

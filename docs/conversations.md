@@ -1,11 +1,12 @@
 # Conversations: durable, replicated, searchable
 
-> **Spec, phase 2 of usage limits and durability (2026-10-18).** The status table at the end
-> says what is built. Phase 1, pausing at a usage limit and going on at the reset, is in
+> **Phase 2 of usage limits and durability (2026-10-18).** The status table at the end says what
+> is built. Phase 1, pausing at a usage limit and going on at the reset, is in
 > [agents.md](agents.md) ("Usage limits: pause and resume").
 
-An agent's conversation is kept per event, on disk, as it happens. It is replicated to the server,
-and to other runners if you want, so it can be:
+An agent's conversation is kept per event, on disk, as it happens. Each runner keeps its own
+sessions, and sends them to the server, which keeps every session from every machine. So a
+conversation can be:
 
 - **resumed** after any restart, exactly as it was, with every event's id, order and time;
 - **resumed on another machine**, even when the one it ran on is gone;
@@ -17,107 +18,149 @@ For each agent session (kiln's id):
 
 | Record | What | From |
 |---|---|---|
-| the session | its spec (what starts it again), info, meta, state (queue, pause, limits …), changeset | the session's updates (`Open`, `State`, `Meta`, `Changes`) |
-| its events | every timeline event, upserted by id: messages, thoughts, tool calls with output, notices | `Events` and `Stream` updates (stream text folded into its event) |
-| the harness's record | the harness's own transcript: Claude Code's JSONL lines; for Codex, its rollout's lines | read on the session's machine as it grows |
+| the session | info, meta, state (queue, pause, limits …), changeset, its epoch | the session's updates (`Open`, `State`, `Meta`, `Changes`) |
+| its events | every timeline event, upserted by id: messages, thoughts, tool calls with output, notices | `Events` updates (streamed text is kept once its event is whole) |
+| the harness's record | the harness's own transcript, line by line: Claude Code's JSONL, Codex's rollouts | followed on the session's machine as its files grow (`convo/record.rs`) |
 
-Large payloads stay as they are today: tool output is clipped to `TEXT_MAX` in the event, and a
-task's full output is read on its machine. A `Reset` (a rewind) drops the session's events after
-the rewind point, as the timeline does.
+- **Large payloads** stay as they are today. Tool output is clipped to `TEXT_MAX` in the event, and
+  a task's full output is read on its machine.
+- **A reset** (`Update::Reset { from }`) means the timeline starts over after a restart, a move or a
+  rewind. The store drops the session's events from number `from` on, then keeps the snapshot that
+  follows. Events before `from` stay: the timeline no longer holds them in memory (it holds
+  `MAX_EVENTS`, 4,000), but they are its history.
+- **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
+  those lines alone, so a copy of the file on another machine numbers them the same way. After a
+  restart, following a file goes on where the store's copy ends. The file is first checked: one
+  that was replaced since (shorter, or not ending with the line kept) starts over.
 
 ## The store: Turso, per machine
 
 Each machine keeps its conversations in a [Turso](https://github.com/tursodatabase/turso) database:
 the SQLite-compatible engine in Rust, embedded in kiln's binary and vendored in `vendor/turso`
-(`UPSTREAM.md`: the commit, the features kiln builds it with, the changes).
+(`UPSTREAM.md` lists the commit, the features kiln builds it with, and the changes). Rust only: no
+C, no SIMD, no FTS.
 
-- A runner's store is `<state>/conversations.db` and holds its own sessions.
-- The server's store is `<data_dir>/harness/conversations.db` and holds every session, from every
-  machine.
-- The file is SQLite's format. kiln holds it open exclusively, so `sqlite3` reads it when kiln isn't
-  running, or reads a copy of it together with its `-wal`.
-- `KILN_CONVERSATIONS=off` turns the store off on a machine, which then runs as it did without one.
-
+- **Where:**
+  - A runner's store is `<state>/conversations.db` and holds its own sessions. A runner beside
+    another one of its machine (`<state>/instances/<id>/`) has a store of its own.
+  - The server's store is `<data_dir>/harness/conversations.db` and holds every session, from every
+    machine.
+- **Reading it by hand:** the file is SQLite's format. kiln holds it open exclusively, so `sqlite3`
+  reads it when kiln isn't running, or reads a copy of it together with its `-wal`.
+- **Turning it off:** `KILN_CONVERSATIONS=off` turns the store off on a machine, which then runs as
+  it did without one.
 - **Per event.** Every update a session flushes also goes to the machine's store writer, which
   commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
-  batch reaches `COMMIT_ROWS`. One writer thread owns the database, and readers use their own
-  connections.
-- **Schema** (`convo/db.rs`, migrations by number):
-  - `sessions(id PRIMARY KEY, kind, machine, cwd, name, created_at, updated_at, closed_at, spec, info, meta, state, changes)`
-    holds JSON columns as the model serializes them.
-  - `events(session, id, seq, at, parent, by, kind, level, tool, status, text, body, PRIMARY KEY(session, id))`.
-    `text` holds what a search matches: a message's words, a tool's title and output, a notice's text.
-    There are indexes on `(session, seq)`, `(kind, at)` and `(tool, status)`.
-  - `records(session, n, line, PRIMARY KEY(session, n))` holds the harness's record, line by line.
-- **Restarts.** A session restored after a restart (`host::restore`) takes its timeline and
-  state from the store (`Core::adopt`), as a move does, instead of rebuilding them from the
-  harness's transcript. The harness still resumes its own conversation.
-- **Ended sessions** stay until removed (`DELETE /api/harness/sessions/:id` removes them from the
-  store too, after `KEEP_CLOSED`, 30 days, unless pinned).
+  batch reaches `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
+  never by lock.
+- **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
+  came after a number (see Replication). Each reset of a session's events is a row of its own in
+  `drops`, numbered like the writes, so a feed sends it in its place.
+- **Schema** (`convo/sql.rs`, migrations by number; one that shipped is never edited):
+  - `sessions(id, info, meta, state, changes, updated_at, closed_at, epoch, rev, machine)`. The JSON
+    columns hold the model as it serializes. `machine` is the machine whose feed brought the
+    session (the server's store).
+  - `events(session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev)`, keyed by
+    `(session, id)`. `text` holds what a search matches: a message's words, a tool's title and
+    output, a notice's text.
+  - `records(session, source, n, line_end, line, rev)`: the harness's record. `source` is Claude
+    Code's session id, or a Codex rollout's file name.
+  - `drops(rev, session, what, source, n, at)`: what was dropped.
+  - `peers(peer, rev, at)`: through where this store has each peer's feed.
+- **Restarts.** A session restored after a restart (`host::restore`) takes its timeline and state
+  from the store (`Core::adopt`), as a move does, instead of rebuilding them from the harness's
+  transcript. The harness still resumes its own conversation.
 
-## Replication
+## Replication: the feed
 
-**A first replica, from C1.** The server already receives every session's updates, from every machine, to show them. It keeps them in its own store as they come in, so it holds every conversation. A runner that was away re-announces its sessions in full when it reconnects, and the server's copy catches up. What C2 adds is guaranteed delivery, the harness's record, extra replicas and fencing.
+A runner's store sends the server's what it wrote after the number the server has, oldest first
+(`convo/feed.rs`). The server takes each batch in one transaction, with that number kept beside
+what it took, and says through where it has it.
 
-Each session's conversation is one **Raft group**: hyper-raft's core in hyper-durable's shell, its
-log on hyper-log. The machinery is repo sync's (`sync::group`), with its own log file on each
-machine (`<state>/convo.log`, laid out for `GROUPS` groups).
+- **The link.** The feed travels on the runner's link to the server: hyper-QUIC
+  (hyper-transport on hyper-rt), on a lane of its own (`LANE_CONVO`, bulk frames). There are no new
+  ports and no HTTP. The runner announces it with `CAP_CONVO`.
+- **The exchange:**
+  1. When the link comes up, the runner says hello with its store's id.
+  2. The server answers with the number it has (0 for a store it hasn't seen).
+  3. The runner sends batches from there, two ahead of what the server has acknowledged. A batch
+     larger than a frame goes in parts, so a transcript line of any size arrives whole.
+- **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
+  server's number says where to go on, and the runner's store still has everything after it.
+  Applying is idempotent: events upsert by id, record lines by number.
+- **What the server keeps from where.** A runner that sends its store is the one source of its
+  sessions in the server's store. The server stops keeping them from their updates, which a
+  reconnect sends again in full. A runner from before the feed is kept from its updates, as in C1.
+- **Why not a Raft group per session.** The server is the one voter, so Raft would add a second log
+  beside the store and whole-store images, without making anything safer. The feed gives the same
+  guarantees: ordered delivery, catching up, and fencing. Raft (hyper-raft) is the plan for
+  replicating the server itself.
 
-- **Members.** The server is the voter, and so the leader. The session's machine is a learner
-  that proposes through it. Other runners can hold a replica as learners
-  (`[conversations] replicas = n`, picked by availability, never a sleeping laptop).
-- **Entries.** Each entry is a batch of the session's records (updates and record lines), with the
-  writer's epoch. The server applies committed entries to its own store, so it holds every
-  conversation, and each learner applies them to its own.
-- **Fencing.** Only the current writer's entries apply: a session that moves bumps the epoch,
-  so the machine it left can't write into it any more, even if it comes back.
-- **Offline.** A runner that can't reach the server keeps writing its own store and proposes
-  what it holds once it's back. Applying is idempotent (events upsert by id, records by number).
-- **No new ports.** The group's messages travel on the runner's link to the server, on a lane of
-  their own (`ServerMsg::Convo` / `AgentMsg::Convo`), as repo sync's do. A runner without the
-  capability (`CAP_CONVO`) keeps its own store and isn't replicated.
+## Fencing: epochs
+
+A session's `epoch` (`State::epoch`, also in its `Info`) counts the times it went on on another
+machine. A move raises it as the session is taken over, and so does a resume from the server's
+store.
+
+- **In the server's store:** a session's rows from a lower epoch than the one it has are left out.
+  These are a former writer's late rows, after it went on elsewhere.
+- **In the registry:** a machine that announces a copy of a session from a lower epoch (it was away
+  when the session went on elsewhere) is told to let go of it (`HarnessRelease`). Its harness stops,
+  and the session isn't closed. A runner from before letting go has its copy closed instead.
+  Nothing a copy left behind says counts. Its updates, its inventory and its feed rows are left
+  out, and it never takes the session's messages from the machine it runs on.
 
 ## Resuming on another machine
 
-`POST /api/harness/sessions/:id/resume_on {machine, cwd?}`, or **Move** on a session whose machine
-is gone. The server packs the session from its store, as `moving::pack` does: the spec, the
-harness's record, events and state. It hands the package to the target runner, which installs it
-(`moving::install`) and starts the session under the same id. Its epoch goes up first, so the old
-machine's writes no longer count. A machine that comes back finds its copy of that session handed
-on and stops it, leaving the files as they are.
+**Move** on an agent whose machine is away (`POST /api/harness/sessions/:id/move {to}`) goes on from
+the server's store (`convo/resume.rs`):
+
+1. The server packs the session as a move does (`harness::moving::Package`):
+   - its settings as last chosen;
+   - its state, queue included;
+   - its timeline;
+   - the harness's record: Claude Code's transcript lines, or for Codex the conversation as a new
+     thread's history.
+2. It raises the session's epoch, here and in its store.
+3. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
+4. That runner installs the record where its harness looks for it, and takes the session over under
+   the same id, as it does a moved one.
+
+The agent's folder is mapped as a move maps it: a copy of its repository kept in step there, else
+the same place under that machine's home. Its files stay on the machine that's away. Its environment
+stays there too: the machine it goes to runs it with its own.
+
+**After a server restart**, the agents of machines that are away (not ended, heard of in the last 30
+days) are listed from the store, as away, with their recent timeline, so they can be moved on. A
+machine that comes back says what it has, and that wins. Removing an away agent ends it in the store
+too.
 
 ## Filtering and search
 
-- `GET /api/conversations/search?q=&kind=&tool=&status=&machine=&agent=&since=&until=&limit=` returns
-  matching events across every agent: `{agent, name, machine, event, snippet}`, newest first.
-  The server answers from its store.
-- `GET /api/harness/sessions/:id/events?before=&limit=` returns a session's history beyond what
-  the timeline keeps in memory (`MAX_EVENTS`), page by page, from the store.
-- **In the console:**
-  - Mission control's filter box also searches conversations. Its results open the agent at
-    that event.
-  - An agent's find bar (Ctrl F) searches its whole history, not only what is loaded.
+- `GET /api/conversations/search?q=&kind=&tool=&status=&agent=&since=&until=&limit=` returns
+  matching events across every agent, newest first: `{agent, name, machine, event}`. The server
+  answers from its store. Words match anywhere, in any case, all of them.
+- `GET /api/harness/sessions/:id/events?before=&limit=` returns a session's history beyond what the
+  timeline keeps in memory (`MAX_EVENTS`), page by page, from the store.
+- **In the console (C4, to come):**
+  - Mission control's filter box will also search conversations, and its results will open the
+    agent at that event.
+  - An agent's find bar will search its whole history, not only what is loaded.
 
 ## Settings
 
-C1 has one switch, the same on every machine: the environment variable `KILN_CONVERSATIONS`
-(`off` turns the store off). From C2, the server's `kiln.toml` sets replication:
-
-```toml
-[conversations]
-replicate = true      # runners replicate their sessions' conversations to the server
-replicas = 0          # extra runners holding each conversation, besides the server
-keep_closed_days = 30
-```
+One switch, the same on every machine: the environment variable `KILN_CONVERSATIONS` (`off` turns
+the store off). Replication to the server needs no setting: a runner with a store sends it.
 
 ## Milestones
 
 | | What | Done when |
 |---|---|---|
-| C1 | Turso embedded; each machine's store (a runner keeps its own sessions; the server keeps every session as its updates come in, so it is a first replica of all of them); the writer (per event, batched); restore from the store; `events?before=` paging | a session restarted keeps its whole timeline; 10k events written and read back in tests; musl, macOS and Windows builds |
-| C2 | Replication: the per-session group, the lane, epochs, the server's store of every conversation; the harness's record replicated | killing a runner loses nothing the server acknowledged; a runner offline catches up; tests with two members over the real group code |
-| C3 | Resuming on another machine from the server's store | a session whose machine is gone goes on elsewhere, its conversation and harness record intact; checked in the lab with a real Claude Code |
-| C4 | Search: the API and the console's filter box and find bar | search across agents, newest first, by words, tool, status, machine and time |
+| C1 | Turso embedded; each machine's store (a runner keeps its own sessions; the server keeps every session as its updates come in); the writer (per event, batched); restore from the store; `events?before=` paging | a session restarted keeps its whole timeline; 10k events written and read back in tests; musl, macOS and Windows builds |
+| C2 | Replication: the feed, the lane, epochs; the harness's record followed and replicated | killing a runner loses nothing; a server killed mid-turn catches up; a runner offline catches up; checked with a real Claude Code |
+| C3 | Resuming on another machine from the server's store; the copy left behind lets go | a session whose machine is gone goes on elsewhere, its conversation and harness record intact, also after a server restart; checked in the lab with a real Claude Code |
+| C4 | Search in the console: the filter box and the find bar | search across agents, newest first, by words, tool, status, machine and time |
+| C5 | Mirrors: other runners keep a copy of the server's store | the server's store lost and a runner gone too: nothing lost |
 
 ## Risks
 
@@ -125,14 +168,18 @@ keep_closed_days = 30
   its transcript, and the server holds a replica. The file is SQLite's, so it can be recovered with
   `sqlite3`. Turso is pinned by commit and vendored, with changes listed in its `UPSTREAM.md`.
 - **Lock order.** The writer never takes a session's lock: updates come to it by channel from
-  `flush`. See the lesson of c0ffda6 (agents.md).
-- **Disk.** Conversations grow: `keep_closed_days`, and records bounded per session.
+  `flush`. The recorder takes a session's locks one at a time (`Session::record_source`). See the
+  lesson of c0ffda6 (agents.md).
+- **Disk.** Conversations grow, and so do transcripts (a long Claude Code session's is tens of MB).
+  Ending and pruning them (`keep_closed_days`) is still to come.
+- **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status
 
 | Part | State |
 |---|---|
-| C1 store | built: the Turso engine (vendored, Rust only), each runner's store of its sessions, the server's store of every session, the writer (per event, in batches), restore from the store, search and paging API. Checked in the lab with a real Claude Code: a runner restart keeps the timeline, and follow-ups go on after it |
-| C2 replication | not yet |
-| C3 resume elsewhere | not yet |
-| C4 search | not yet |
+| C1 store | live (1a59fad, 2026-10-18): the Turso engine, each runner's store of its sessions, the server's store of every session, the writer, restore from the store, search and paging API |
+| C2 replication | built: revisions, the feed on its lane, the harness's record followed, epochs, resets that keep history. Lab with a real Claude Code: the server's store matches the runner's and the transcript line for line; a server killed mid-turn catches up; a runner killed comes back and goes on |
+| C3 resume elsewhere | built: Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context |
+| C4 search UI | not yet (the API is built) |
+| C5 mirrors | not yet |

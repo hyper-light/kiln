@@ -980,34 +980,18 @@ impl Store {
 
     // ---------------------------------------------------------------- misc
 
+    /// Records what `actor` did (docs/ci.md W19-R05). Within a request that changes
+    /// something, it becomes part of that request's one row; elsewhere (a leg reading secrets, a
+    /// background exchange, a GET's terminal session) it is a row of its own.
     pub async fn audit(&self, actor: String, action: String, detail: String) {
-        let r = self
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO audit (ts, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
-                    params![crate::util::now_unix(), actor, action, detail],
-                )?;
-                Ok(())
-            })
-            .await;
-        if let Err(e) = r {
-            tracing::warn!(error = %e, "audit write failed");
+        if crate::audit::note(&actor, &action, &detail) {
+            return;
         }
-    }
-
-    pub async fn audit_log(&self, limit: u32) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.call(move |c| {
-            let mut st =
-                c.prepare("SELECT ts, actor, action, detail FROM audit ORDER BY id DESC LIMIT ?1")?;
-            let rows = st.query_map([limit.min(1000)], |r| {
-                Ok(serde_json::json!({
-                    "ts": r.get::<_, i64>(0)?, "actor": r.get::<_, String>(1)?,
-                    "action": r.get::<_, String>(2)?, "detail": r.get::<_, String>(3)?,
-                }))
-            })?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .await
+        let (principal, on_behalf_of) = match actor.split_once(" for ").or_else(|| actor.split_once(" of ")) {
+            Some((p, b)) => (p.to_owned(), Some(b.to_owned())),
+            None => (actor, None),
+        };
+        crate::audit::write(self, crate::audit::Entry { principal, on_behalf_of, action, result: "ok".into(), detail, ..Default::default() }).await;
     }
 
     /// Delete runs (and their logs, via the returned job ids) older than `days`.
@@ -1026,7 +1010,6 @@ impl Store {
                 "DELETE FROM runs WHERE created_at < ?1 AND status NOT IN ('queued','running','pending')",
                 [cutoff],
             )?;
-            tx.execute("DELETE FROM audit WHERE ts < ?1", [cutoff])?;
             tx.commit()?;
             Ok(ids)
         })

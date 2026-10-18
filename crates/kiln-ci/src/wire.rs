@@ -80,8 +80,28 @@ pub struct AssignmentV2 {
     /// quarantined passes, with a warning.
     #[serde(default)]
     pub quarantine: bool,
+    /// kiln (W11-R03): the integrations its job, its steps and its `kiln/auth@v1` steps name.
+    #[serde(default)]
+    pub integrations: Vec<Integration>,
     pub debug: Debug,
     pub limits: Limits,
+}
+
+/// An integration a leg authenticates to (W11-R03): what the runner needs to give its steps the
+/// provider's own federation files and variables, or its stored token.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Integration {
+    pub name: String,
+    pub kind: String,
+    /// `oidc` (exchanged with the leg's ID token) or `token` (stored).
+    pub mode: String,
+    /// Its configuration, without secrets: a role, a provider, a tenant, a registry…
+    pub config: serde_json::Value,
+    /// A stored token or key (masked).
+    pub token: Option<String>,
+    /// The job's own `integrations:` named it: every step gets it.
+    pub job: bool,
 }
 
 /// The leg itself.
@@ -157,6 +177,43 @@ pub struct ActionRef {
     pub path: String,
     /// Where the runner downloads it (a tarball the server serves from its mirror).
     pub url: String,
+    /// A kiln action's declarations (W07-R11): the secrets it reads (name, required), the
+    /// constraints its steps need, and the permissions it needs (scope, level; `*` for all).
+    pub secrets: Vec<(String, bool)>,
+    pub requires: Vec<String>,
+    pub permissions: Vec<(String, String)>,
+}
+
+impl ActionRef {
+    /// Its declarations, from its metadata.
+    pub fn declares(&mut self, a: &crate::wf::ir::Action) {
+        self.secrets = a.secrets.iter().map(|d| (d.name.to_ascii_uppercase(), d.required)).collect();
+        self.requires = a.requires.clone();
+        self.permissions = match &a.permissions {
+            Some(crate::wf::ir::Permissions::ReadAll) => vec![("*".into(), "read".into())],
+            Some(crate::wf::ir::Permissions::WriteAll) => vec![("*".into(), "write".into())],
+            Some(crate::wf::ir::Permissions::Scopes(s)) => s.clone(),
+            None => Vec::new(),
+        };
+    }
+
+    /// The permissions it declares, as a job's would resolve.
+    pub fn needs(&self) -> Option<crate::plan::perms::Resolved> {
+        if self.permissions.is_empty() {
+            return None;
+        }
+        let p = match self.permissions.as_slice() {
+            [(all, level)] if all == "*" => {
+                if level == "write" {
+                    crate::wf::ir::Permissions::WriteAll
+                } else {
+                    crate::wf::ir::Permissions::ReadAll
+                }
+            }
+            s => crate::wf::ir::Permissions::Scopes(s.to_vec()),
+        };
+        Some(crate::plan::perms::resolve(Some(&p), None, crate::plan::perms::Default::Read, true))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

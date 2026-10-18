@@ -218,8 +218,11 @@ pub struct Existing {
     pub boot: String,
     pub system: bool,
     pub unit: String,
-    /// The binary it runs (`kiln`).
+    /// The binary it runs (`kiln`): what an upgrade replaces.
     pub bin: PathBuf,
+    /// The launcher its launchd job starts `bin` from (`<launcher> supervise --exe <bin> -- …`),
+    /// which upgrades leave alone (`crate::install::launcher_path`).
+    pub launcher: Option<PathBuf>,
     /// What follows `supervise --`: `agent --server … --name …`.
     pub args: Vec<String>,
     /// Its environment (`KEY=value`; never a join token): the new runner gets the same.
@@ -289,27 +292,50 @@ pub fn parse_unit(body: &str, unit: &str, system: bool) -> Option<Existing> {
         system,
         unit: unit.to_owned(),
         bin: PathBuf::from(bin),
+        launcher: None,
         args,
         env,
     })
 }
 
-/// Read a launchd job kiln wrote (`kiln install --agent` on macOS): the binary, and what follows
-/// `supervise --` in its `ProgramArguments`. Its environment stays with it (an upgrade there
-/// replaces the binary in place).
+/// Read a launchd job kiln wrote (`kiln install --agent` on macOS): the binary (the one
+/// `--exe` names when the job starts it from a launcher), what follows `supervise --` in its
+/// `ProgramArguments`, and its environment (`KEY=value`), for rewriting the job.
 pub fn parse_plist(body: &str, unit: &str, system: bool) -> Option<Existing> {
     let array = body.split("<key>ProgramArguments</key>").nth(1)?.split("</array>").next()?;
     let words: Vec<String> = array.split("<string>").skip(1).filter_map(|s| s.split("</string>").next()).map(xml_unescape).collect();
-    let (bin, rest) = words.split_first()?;
+    let (program, rest) = words.split_first()?;
     let sep = rest.iter().position(|w| w == "--")?;
     let args = rest.get(sep + 1..)?.to_vec();
+    let exe = rest.get(..sep).and_then(|opts| arg_value(opts, "--exe"));
+    let (bin, launcher) = match exe {
+        Some(e) => (PathBuf::from(e), Some(PathBuf::from(program))),
+        None => (PathBuf::from(program), None),
+    };
+    let env = body
+        .split("<key>EnvironmentVariables</key>")
+        .nth(1)
+        .and_then(|e| e.split("</dict>").next())
+        .map(|dict| {
+            dict.split("<key>")
+                .skip(1)
+                .filter_map(|kv| {
+                    let (k, rest) = kv.split_once("</key>")?;
+                    let v = rest.split("<string>").nth(1)?.split("</string>").next()?;
+                    Some(format!("{}={}", xml_unescape(k), xml_unescape(v)))
+                })
+                .filter(|kv| !kv.starts_with("KILN_JOIN_TOKEN="))
+                .collect()
+        })
+        .unwrap_or_default();
     (rest.first().map(String::as_str) == Some("supervise") && args.first().map(String::as_str) == Some("agent")).then(|| Existing {
         boot: "launchd".to_owned(),
         system,
         unit: unit.to_owned(),
-        bin: PathBuf::from(bin),
+        bin,
+        launcher,
         args,
-        env: Vec::new(),
+        env,
     })
 }
 
@@ -393,12 +419,13 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
     let existing = find_existing(unit).ok_or_else(|| {
         anyhow::anyhow!("no installed kiln agent service ({unit}) found to upgrade beside; install one with `kiln install --agent` first")
     })?;
-    // launchd (macOS) runs a runner that takes a new binary in place: the binary its job runs is
-    // replaced, and the runner (its supervisor first) re-executes itself from it once its jobs are
-    // done, keeping its terminals.
+    // launchd (macOS): the binary the job's runner runs is replaced (never its launcher, which
+    // macOS knows the job by), and the runner takes it up as a fresh process once its jobs are
+    // done, keeping its terminals; a runner from before launchers has launchd start it afresh,
+    // from a launcher, instead.
     if existing.boot == "launchd" {
         copy_atomic(&std::env::current_exe()?, &existing.bin).with_context(|| format!("install {}", existing.bin.display()))?;
-        say(format!("runner      {} (taken up in place once its jobs are done; it keeps its terminals)", existing.bin.display()));
+        say(format!("runner      {} (taken up once its jobs are done; it keeps its terminals)", existing.bin.display()));
         return Ok(());
     }
     let state_dir = arg_value(&existing.args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);

@@ -59,6 +59,17 @@ pub enum ToEngine {
     Input(Box<Input>),
     /// A question, answered on the engine's thread.
     Query(Box<dyn FnOnce(&Engine) + Send>),
+    /// Health rules: Argo CD's Lua library, and these settings' scripts
+    /// (`resource.customizations.health.<group>_<kind>`, the script).
+    Health(Vec<(String, String)>),
+}
+
+/// The settings that carry health scripts (Argo CD's `resource.customizations.health.*`).
+const HEALTH_SETTINGS: &str = "resource.customizations.health.";
+
+/// Health scripts from settings: each key and its script.
+fn health_settings(store: &Store) -> Vec<(String, String)> {
+    store.read(|d| d.settings.iter().filter(|(k, _)| k.starts_with(HEALTH_SETTINGS)).filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect())
 }
 
 /// An app as the server knows it: its definition and where its sources stand.
@@ -827,6 +838,7 @@ impl Cd {
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
+        apps::stamp_rollout(def, &mut objects);
         let _ = std::fs::remove_dir_all(&views);
         let (children, objects): (Vec<Value>, Vec<Value>) =
             objects.into_iter().partition(|o| obj::group(o) == "argoproj.io" && obj::kind(o) == "Application");
@@ -1236,6 +1248,10 @@ pub fn summary_json(s: &Summary) -> Value {
         "revision": s.revision.as_deref(),
         "resources": s.resources,
         "out_of_sync": s.out_of_sync,
+        "shared": s.shared,
+        "missing": s.missing,
+        "prune": s.prune,
+        "unmarked": s.unmarked,
         "message": s.message,
         "operation": s.operation.as_ref().map(|o| json!({
             "id": o.id,
@@ -1288,6 +1304,7 @@ fn engine_thread(rx: std::sync::mpsc::Receiver<ToEngine>, out: async_channel::Se
         match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ToEngine::Input(i)) => engine.handle(now_ms(), *i),
             Ok(ToEngine::Query(f)) => f(&engine),
+            Ok(ToEngine::Health(settings)) => set_health(&mut engine, &settings),
             Err(RecvTimeoutError::Timeout) => engine.handle(now_ms(), Input::Tick),
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -1296,6 +1313,7 @@ fn engine_thread(rx: std::sync::mpsc::Receiver<ToEngine>, out: async_channel::Se
             match rx.try_recv() {
                 Ok(ToEngine::Input(i)) => engine.handle(now_ms(), *i),
                 Ok(ToEngine::Query(f)) => f(&engine),
+                Ok(ToEngine::Health(settings)) => set_health(&mut engine, &settings),
                 Err(_) => break,
             }
         }
@@ -1305,6 +1323,15 @@ fn engine_thread(rx: std::sync::mpsc::Receiver<ToEngine>, out: async_channel::Se
                 return;
             }
         }
+    }
+}
+
+/// Gives the engine Argo CD's health checks for custom resources, settings' scripts first. An
+/// object's health follows the new rules the next time it changes.
+fn set_health(engine: &mut Engine, settings: &[(String, String)]) {
+    match kiln_cd::lua::LuaRules::from_settings(settings.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        Ok(rules) => engine.set_rules(Box::new(rules)),
+        Err(e) => tracing::warn!(error = %e, "deployments: no Lua for health checks; custom resources use built-in rules only"),
     }
 }
 
@@ -1318,6 +1345,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     let (etx, erx) = std::sync::mpsc::channel();
     let (atx, arx) = async_channel::unbounded();
     let ecfg = EngineConfig { wave_delay_ms: cfg.wave_delay_ms, cluster_qps: cfg.qps, cluster_burst: cfg.qps * 2.0, ..EngineConfig::default() };
+    let _ = etx.send(ToEngine::Health(health_settings(&store)));
     std::thread::Builder::new().name("kiln-cd-engine".into()).spawn(move || engine_thread(erx, atx, ecfg))?;
     let tools = Tools {
         helm: cfg.helm.clone().into(),
@@ -1390,6 +1418,9 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                         c2.clusters.write().remove(&name);
                     }
                     kiln_cd::state::Change::Pinned(_) => c2.kick(),
+                    kiln_cd::state::Change::Setting(k) if k.starts_with(HEALTH_SETTINGS) => {
+                        let _ = c2.engine.send(ToEngine::Health(health_settings(&c2.store)));
+                    }
                     _ => {}
                 }
             }
