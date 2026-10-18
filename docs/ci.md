@@ -176,7 +176,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance on the host (every `@actions/core` API, `getIDToken` included); the same on the other executors (W13-AC02) left |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
@@ -1970,9 +1970,10 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     JavaScript action on the current `@actions/core`, `@actions/exec` and `@actions/io`, with a
     post step, calls every API (inputs of each kind, outputs, `exportVariable`, `addPath`,
     `setSecret`, state, `debug`, groups, annotations with properties, summaries, `exec`,
-    `getExecOutput`, `mkdirP`, `which`, `isDebug`). `runtime::tests::toolkit_conformance`
+    `getExecOutput`, `mkdirP`, `which`, `isDebug`, `getIDToken`). `runtime::tests::toolkit_conformance`
     checks each effect on the host executor: in the step's log, in a later step, in the post
-    step and in the leg's events.
+    step and in the leg's events. `getIDToken` asks the leg's ID token endpoint for its
+    audience with the request token, and the token is masked from the moment it arrives.
   - R01's workspaces (`crates/kiln/src/runner/workspaces.rs`): a leg's `<work>/w/<8 hex>` is
     removed when the leg ends; until then they were kept forever, 12 GB of them on one runner.
     A failed leg with `keep_on_failure_minutes` (W17-R02) keeps its own until that runs out.

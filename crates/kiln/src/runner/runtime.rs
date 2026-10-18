@@ -3050,6 +3050,12 @@ mod tests {
     /// [`run_leg_in`], with `prepare` setting up the work directory first.
     #[cfg(unix)]
     fn run_leg_prepared(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
+        run_leg_with(workflow, secrets, dialect, prepare, &|_| {})
+    }
+
+    /// [`run_leg_prepared`], the assignment changed by `tweak` first.
+    #[cfg(unix)]
+    fn run_leg_with(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>, tweak: &dyn Fn(&mut AssignmentV2)) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
         let path = if dialect == Dialect::Kiln { ".kiln/t.yaml" } else { ".github/workflows/t.yml" };
         let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
@@ -3057,7 +3063,7 @@ mod tests {
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let tmp = tempfile::tempdir()?;
         prepare(tmp.path())?;
-        let a = AssignmentV2 {
+        let mut a = AssignmentV2 {
             job_id: "leg-1".into(),
             repo: "acme/app".into(),
             dialect: if dialect == Dialect::Kiln { "kiln".into() } else { "gha".into() },
@@ -3072,6 +3078,7 @@ mod tests {
             timeout_minutes: 5,
             ..AssignmentV2::default()
         };
+        tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = async_channel::unbounded();
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
@@ -3263,7 +3270,31 @@ jobs:
             std::os::unix::fs::symlink(&node, bin.join("node"))?;
             Ok(())
         };
-        let (r, logs, events) = run_leg_prepared(&wf, &[("ACTIONS_STEP_DEBUG", "true")], Dialect::Gha, &prepare)?;
+        // getIDToken's endpoint: a token for the audience asked, to the request's own token.
+        use base64::Engine as _;
+        let b64 = |v: serde_json::Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        let jwt = format!("{}.{}.sig-f20", b64(serde_json::json!({ "alg": "RS256", "typ": "JWT" })), b64(serde_json::json!({ "aud": "kiln-f20", "sub": "repo:acme/app:ref:refs/heads/main" })));
+        let issuer = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = issuer.local_addr()?.port();
+        let served = jwt.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for conn in issuer.incoming().flatten() {
+                let mut conn = conn;
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                let ok = head.contains("audience=kiln-f20") && head.to_ascii_lowercase().contains("authorization: bearer id-req-f20");
+                let body = if ok { serde_json::json!({ "value": served }).to_string() } else { "{}".to_owned() };
+                let status = if ok { "200 OK" } else { "401 Unauthorized" };
+                let _ = write!(conn, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let tweak = |a: &mut AssignmentV2| {
+            a.runtime.id_token_url = Some(format!("http://127.0.0.1:{port}/_kiln/oidc/token?api-version=1"));
+            a.runtime.id_token_request_token = Some("id-req-f20".into());
+        };
+        let (r, logs, events) = run_leg_with(&wf, &[("ACTIONS_STEP_DEBUG", "true")], Dialect::Gha, &prepare, &tweak)?;
         let all: String = logs.values().cloned().collect();
         assert_eq!(r.status, Status::Succeeded, "{r:?} {all}");
         let step = logs.get(&1).cloned().unwrap_or_default();
@@ -3286,6 +3317,9 @@ jobs:
         assert!(later.contains(r#"o1=v1 EXPORTED=e1 multi="line one\nline two""#), "{later}");
         assert!(later.contains("path first") && later.contains("the secret again: ***"), "{later}");
         assert!(all.contains("post: state=state-v"), "the post step reads the state: {all}");
+        // getIDToken: the token for its audience, masked from the moment it arrived.
+        assert!(step.contains("id token: aud=kiln-f20 sub=repo:acme/app:ref:refs/heads/main"), "{step}");
+        assert!(step.contains("the token itself: ***") && !all.contains(&jwt), "the token is masked: {step}");
         Ok(())
     }
 
