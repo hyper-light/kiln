@@ -36,5 +36,9 @@ harness = false
 name = "lz4"
 harness = false
 
+[[bench]]
+name = "logs"
+harness = false
+
 [lints]
 workspace = true

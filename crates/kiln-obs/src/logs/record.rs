@@ -128,23 +128,33 @@ fn cut(s: &str, max: usize) -> &str {
 
 /// Appends `r`'s row to `out`; `prev_ts` is the row before's time (0 for the first).
 pub fn put_row(out: &mut Vec<u8>, r: &Record, prev_ts: i64) {
-    varint::put(out, varint::zig(r.ts.wrapping_sub(prev_ts)));
-    out.push(r.severity);
-    for s in [&r.service, &r.host, &r.source] {
+    put_fields(out, r.ts, r.severity, [&r.service, &r.host, &r.source], &r.message, r.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())), r.attrs.len(), r.trace_id, r.span_id, prev_ts);
+}
+
+/// Appends a row read in place, without copying it out first.
+pub fn put_row_ref(out: &mut Vec<u8>, r: &RecordRef<'_>, prev_ts: i64) {
+    put_fields(out, r.ts, r.severity, [r.service, r.host, r.source], r.message, r.attrs(), r.attr_count, r.trace_id, r.span_id, prev_ts);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3], message: &str, attrs: impl Iterator<Item = (&'a str, &'a str)>, attr_count: usize, trace_id: Option<[u8; 16]>, span_id: Option<[u8; 8]>, prev_ts: i64) {
+    varint::put(out, varint::zig(ts.wrapping_sub(prev_ts)));
+    out.push(severity);
+    for s in names {
         put_str(out, cut(s, crate::batch::MAX_NAME_BYTES));
     }
-    put_str(out, cut(&r.message, MAX_MESSAGE_BYTES));
-    let attrs = r.attrs.len().min(crate::batch::MAX_TAGS);
-    varint::put(out, attrs as u64);
-    for (k, v) in r.attrs.iter().take(attrs) {
+    put_str(out, cut(message, MAX_MESSAGE_BYTES));
+    let n = attr_count.min(crate::batch::MAX_TAGS);
+    varint::put(out, n as u64);
+    for (k, v) in attrs.take(n) {
         put_str(out, cut(k, crate::batch::MAX_NAME_BYTES));
         put_str(out, cut(v, crate::batch::MAX_NAME_BYTES));
     }
-    out.push(u8::from(r.trace_id.is_some()) | (u8::from(r.span_id.is_some()) << 1));
-    if let Some(t) = r.trace_id {
+    out.push(u8::from(trace_id.is_some()) | (u8::from(span_id.is_some()) << 1));
+    if let Some(t) = trace_id {
         out.extend_from_slice(&t);
     }
-    if let Some(s) = r.span_id {
+    if let Some(s) = span_id {
         out.extend_from_slice(&s);
     }
 }

@@ -405,6 +405,33 @@ block's LZ4 text (37.8 KB on average):
 space for a fifth of the waste; from 1% to 0.1%: 4.1 points for a tenth), and RocksDB's default for the
 same trade (10 bits a key).
 
+### 12.8 Logs: ingest and search
+
+2026-10-18, same machine: `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs --bench logs`. The
+lines of §12.6 as 194,690 records (time, severity from the line, service from its source and
+format, logfmt pairs as attributes), ingested in batches of 1,000 with a cut every 50 batches into a
+store on disk, then searched for the newest 100 over the whole range, nine runs each.
+
+| | |
+| --- | --- |
+| ingest: build, apply, seal, cut | 579,154 records/s, 105.9 MB/s of lines, one core; 0.15 allocations a record (copying each row out to re-encode it at first: 8.96) |
+| batches | 0.21 bytes a byte of line |
+| on disk | 7.66 MB: 0.215 of the lines |
+| reopen | 0.4 ms; 0.50 MB of summaries in memory |
+
+| search | found | blocks pruned | rows read | p50 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| `*` | 100 | 0 of 111 | 690 | 0.23 ms | 0.26 ms |
+| `status:error` | 100 | 92 | 30,000 | 5.39 ms | 5.46 ms |
+| `service:kube status:warn` | 100 | 0 | 690 | 0.09 ms | 0.14 ms |
+| `"connection refused"` | 12 | 109 | 4,000 | 1.91 ms | 1.93 ms |
+| `@application:kiln-namespaces` | 100 | 0 | 10,690 | 1.70 ms | 1.82 ms |
+| `nosuchtokenanywhere` | 0 | 110 | 2,000 | 0.63 ms | 0.70 ms |
+| `service:argocd -status:info` | 0 | 111 | 0 | 0.01 ms | 0.07 ms |
+
+The absent word's one unpruned block is the token filter's false positive, as its 1% rate predicts
+for 111 blocks.
+
 ## 13. Scenarios
 
 Live, end to end: a kiln server and runners as separate processes, OTLP senders, mock Slack and

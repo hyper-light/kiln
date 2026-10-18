@@ -6,7 +6,7 @@
 //! every token of its messages and attribute values at a 1% false-positive rate (§12.7).
 
 use super::bloom::{Bloom, token_hashes, tokens};
-use super::record::{Record, RecordRef, RowError, Rows, put_row};
+use super::record::{Record, RecordRef, RowError, Rows, put_row, put_row_ref};
 use crate::lz4;
 use crate::varint;
 
@@ -73,7 +73,7 @@ impl LogBlock {
         let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
         for &i in &order {
             let Some(r) = records.get(i) else { continue };
-            put_row(&mut raw, &r.to_owned(), prev);
+            put_row_ref(&mut raw, r, prev);
             prev = r.ts;
             min_ts = min_ts.min(r.ts);
             max_ts = max_ts.max(r.ts);
