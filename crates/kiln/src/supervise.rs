@@ -26,6 +26,9 @@ const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEALTHY: Duration = Duration::from_secs(60);
 const GRACE: Duration = Duration::from_secs(20);
+/// A runner that takes up a new binary itself which still runs the old one this long after: it
+/// isn't going to (a build that can't). Restarted once nothing runs under it.
+const STALE_LIMIT: Duration = Duration::from_secs(20 * 60);
 
 pub struct Options {
     pub args: Vec<String>,
@@ -66,6 +69,44 @@ fn subcommand(args: &[String]) -> Option<&str> {
 /// supervisor must not restart them for an upgrade.
 fn upgrades_itself(args: &[String]) -> bool {
     crate::os::IN_PLACE_UPGRADE && subcommand(args) == Some("agent")
+}
+
+/// Whether the process `pid` still runs a binary that is no longer the one at `exe` (it hasn't
+/// taken up an upgrade). Linux only, where /proc says which file a process runs; elsewhere never.
+fn runs_old_binary(pid: u32, exe: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (Ok(running), Ok(on_disk)) = (std::fs::metadata(format!("/proc/{pid}/exe")), std::fs::metadata(exe)) else { return false };
+        (running.dev(), running.ino()) != (on_disk.dev(), on_disk.ino())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, exe);
+        false
+    }
+}
+
+/// Whether anything still runs under `root` (zombies aside): what restarting it would end.
+fn busy_under(root: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+    let root = Pid::from_u32(root);
+    sys.processes().values().any(|p| {
+        if p.status() == ProcessStatus::Zombie {
+            return false;
+        }
+        let mut up = p.parent();
+        for _ in 0..64 {
+            match up {
+                Some(x) if x == root => return true,
+                Some(x) => up = sys.process(x).and_then(sysinfo::Process::parent),
+                None => return false,
+            }
+        }
+        false
+    })
 }
 
 /// Wait for the child (in the platform layer: pidfd / poll, plus orphan reaping as PID 1).
@@ -161,6 +202,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         tracing::info!(generation, pid = ?control.pid(), "child started");
         let started = Instant::now();
         let mut upgrade_check = Interval::new(Duration::from_secs(10));
+        // Since when the child has run a binary that isn't the one on disk, and whether that was said.
+        let mut stale_since: Option<Instant> = None;
+        let mut stale_said = false;
 
         enum Exit {
             Child(String),
@@ -199,6 +243,29 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                             tracing::error!(error = %err, "supervisor re-exec failed; restarting the child instead");
                         }
                         break Exit::Upgrade;
+                    }
+                    // A child that takes up new binaries itself but still runs an old one long
+                    // after (a build that never does): restarted once nothing runs under it, so
+                    // nothing it runs is cut short.
+                    if upgrades_itself(&opts.args)
+                        && let Some(pid) = control.pid().and_then(|p| u32::try_from(p).ok())
+                    {
+                        if runs_old_binary(pid, &exe) {
+                            let since = *stale_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= STALE_LIMIT {
+                                if !std::mem::replace(&mut stale_said, true) {
+                                    let msg = format!("the runner (pid {pid}) still runs the binary it started with, {} minutes after a new one was installed: it restarts into the new one once nothing runs under it", STALE_LIMIT.as_secs() / 60);
+                                    tracing::warn!("{msg}");
+                                    crash_log(&opts.state_dir, &msg);
+                                }
+                                if !crate::rt::blocking(move || busy_under(pid)).await.unwrap_or(true) {
+                                    break Exit::Upgrade;
+                                }
+                            }
+                        } else {
+                            stale_since = None;
+                            stale_said = false;
+                        }
                     }
                 }
             }
@@ -250,5 +317,34 @@ async fn stop_child(exited: &mut oneshot::Receiver<String>, control: &mut ChildC
         tracing::warn!("child ignored the stop request for {GRACE:?}; killing");
         control.kill().await;
         let _ = crate::rt::timeout(Duration::from_secs(5), exited).await;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_still_on_a_replaced_binary_is_seen_and_so_is_what_runs_under_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let exe = dir.path().join("prog");
+        std::fs::copy("/bin/sh", &exe)?;
+        // A child running `exe` that starts a process of its own.
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new(&exe).args(["-c", "sleep 30 & wait"]).process_group(0).spawn()?;
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!runs_old_binary(pid, &exe), "it runs the binary on disk");
+        assert!(busy_under(pid), "its sleep runs under it");
+        // A new binary installed where it was (a new file, renamed into place): the child runs the old one.
+        let next = dir.path().join("prog.next");
+        std::fs::copy("/bin/sh", &next)?;
+        std::fs::rename(&next, &exe)?;
+        assert!(runs_old_binary(pid, &exe));
+        // It and its sleep, as a group.
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(i32::try_from(pid)?), nix::sys::signal::Signal::SIGKILL);
+        let _ = child.wait();
+        assert!(!busy_under(pid), "nothing runs under a process that is gone");
+        Ok(())
     }
 }
