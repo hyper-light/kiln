@@ -14,6 +14,7 @@ pub mod integrations;
 pub mod load;
 pub mod local;
 pub mod oidc;
+pub mod ops;
 pub mod preview;
 pub mod repo_config;
 pub mod rest;

@@ -122,6 +122,9 @@ const SIGTERM_GRACE: Duration = Duration::from_millis(2_500);
 const MAX_BACKGROUND: usize = 10;
 /// `cancel:` of a background step: SIGTERM, then SIGKILL after this.
 const BACKGROUND_GRACE: Duration = Duration::from_secs(10);
+/// How long post steps have once the job's steps are done, a cancelled or timed-out job's
+/// included (GitHub's `cancel-timeout-minutes`).
+const CLEANUP_TIME: Duration = Duration::from_secs(5 * 60);
 
 /// The paths of W06-R01.
 #[derive(Clone)]
@@ -245,6 +248,8 @@ fn str_map(m: &BTreeMap<String, String>) -> Value {
 struct State {
     /// The next step's title starts with this (a step rerun in place, W17-R04).
     rerun_label: Option<String>,
+    /// Post steps run: as on GitHub, a cancelled job's cleanup runs to its end, on time of its own.
+    cleanup: bool,
     dialect: Dialect,
     layout: Layout,
     /// The job's environment: the workflow's and the job's `env`, `env-from`, `$GITHUB_ENV`.
@@ -737,6 +742,7 @@ impl Leg {
         }
         let mut st = State {
             rerun_label: None,
+            cleanup: false,
             dialect,
             layout,
             env: BTreeMap::new(),
@@ -833,7 +839,7 @@ impl Leg {
             self.fold(&mut st, &mut bg, &rest);
         }
         self.job_outputs(&st).await;
-        self.post_steps(&mut st, deadline).await;
+        self.post_steps(&mut st).await;
         // A failed leg kept to look into keeps its containers up (W17-R02).
         let keep = (st.failed || timed_out) && !st.cancelled && a.debug.keep_on_failure_minutes.is_some_and(|m| m > 0);
         if let Some(c) = st.containers.take() {
@@ -1493,10 +1499,18 @@ impl Leg {
                 Stop,
                 Deadline,
             }
+            // Cleanup isn't cut short by the cancel it may follow.
+            let cleanup = st.cleanup;
+            let cancelled = std::pin::pin!(async {
+                if cleanup {
+                    futures::future::pending::<()>().await;
+                }
+                self.cancel.cancelled().await;
+            });
             let ev = futures::select_biased! {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
-                () = self.cancel.cancelled().fuse() => Ev::Cancel,
+                () = cancelled.fuse() => Ev::Cancel,
                 () = stopped => Ev::Stop,
                 () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
@@ -2246,8 +2260,10 @@ impl Leg {
 
     /// Post steps (W06-R11): in reverse order of the actions that ran, under `post-if` (default
     /// `always()`), with the `STATE_*` their main step saved.
-    async fn post_steps(&self, st: &mut State, deadline: Instant) {
+    async fn post_steps(&self, st: &mut State) {
         let posts = std::mem::take(&mut st.posts);
+        st.cleanup = true;
+        let deadline = Instant::now() + CLEANUP_TIME;
         for p in posts.into_iter().rev() {
             let run = match &p.cond {
                 Some(t) => st.condition(Some(t)).unwrap_or(false),
@@ -2530,6 +2546,62 @@ jobs:
         assert!(later.contains(r#"o1=v1 EXPORTED=e1 multi="line one\nline two""#), "{later}");
         assert!(later.contains("path first") && later.contains("the secret again: ***"), "{later}");
         assert!(all.contains("post: state=state-v"), "the post step reads the state: {all}");
+        Ok(())
+    }
+
+    /// A cancelled leg's post steps run to their end, as GitHub's do: the cancel stops the step
+    /// that was running, not the cleanup after it.
+    #[cfg(unix)]
+    #[test]
+    fn post_steps_run_after_a_cancel() -> anyhow::Result<()> {
+        let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file())) else { return Ok(()) };
+        if !std::process::Command::new(&node).arg("--version").output().is_ok_and(|v| String::from_utf8_lossy(&v.stdout).starts_with("v24.")) {
+            return Ok(());
+        }
+        let wf = r###"on: push
+jobs:
+  t:
+    runs-on: x
+    steps:
+      - run: |
+          mkdir -p .github/actions/slow
+          printf 'name: slow\nruns:\n  using: node24\n  main: main.js\n  post: post.js\n' > .github/actions/slow/action.yml
+          echo 'setTimeout(() => {}, 60000)' > .github/actions/slow/main.js
+          echo 'setTimeout(() => console.log("post: cleaned up"), 1500)' > .github/actions/slow/post.js
+      - uses: ./.github/actions/slow
+"###;
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", wf, Dialect::Gha);
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let tmp = tempfile::tempdir()?;
+        let bin = tmp.path().join("_externals/node24/bin");
+        std::fs::create_dir_all(&bin)?;
+        std::os::unix::fs::symlink(&node, bin.join("node"))?;
+        let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
+        let (tx, rx) = async_channel::unbounded();
+        let cancel = Shutdown::new();
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
+        let result = crate::rt::block_on(async move {
+            crate::rt::spawn(async move {
+                crate::rt::sleep(Duration::from_secs(3)).await;
+                cancel.cancel();
+            });
+            Ok::<_, anyhow::Error>(leg.run().await)
+        })?;
+        let (mut logs, mut events) = (String::new(), Vec::new());
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                crate::exec::Up::Log(c) => logs.push_str(&String::from_utf8_lossy(&c.data)),
+                crate::exec::Up::Msg(AgentMsg::JobEvent { json, .. }) => events.push(serde_json::from_str::<JobEventV2>(&json)?),
+                _ => {}
+            }
+        }
+        assert_eq!(result.status, Status::Cancelled, "{logs}");
+        assert!(logs.contains("post: cleaned up"), "the post step ran to its end: {logs}");
+        let post = events.iter().find_map(|e| match e {
+            JobEventV2::StepStarted { idx, kind, .. } if kind == "post" => Some(*idx),
+            _ => None,
+        });
+        assert_eq!(post.and_then(|i| finished(&events, i)).map(|f| f.1), Some(Conclusion::Success), "{events:?}");
         Ok(())
     }
 

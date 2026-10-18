@@ -25,11 +25,16 @@ use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 
 pub async fn route(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, body: hyper::body::Incoming) -> Result<Response, Fail> {
+    let b: Value = srv::body_json(body, 4 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    of(hub, caller, b).await
+}
+
+/// [`route`], its body read (`ci.workflows.plan_preview`, W20).
+pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value) -> Result<Response, Fail> {
     let bad = |m: String| (StatusCode::BAD_REQUEST, m);
     if !hub.ci.enabled() {
         return Err((StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled).".into()));
     }
-    let b: Value = srv::body_json(body, 4 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
     let name = b.get("repo").and_then(Value::as_str).ok_or_else(|| bad("`repo` is required".into()))?;
     let repos = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let repo = repos.into_iter().find(|r| r.name.eq_ignore_ascii_case(name)).ok_or_else(|| (StatusCode::NOT_FOUND, format!("No repository {name}")))?;

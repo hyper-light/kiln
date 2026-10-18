@@ -985,9 +985,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                         }
                     }
-                    // A terminal into a running or kept leg (docs/ci.md W17-R01): its workspace
-                    // and environment, or its container; the leg's secrets masked in what it shows.
-                    ServerMsg::JobTerminalOpen { job, session, cols, rows } => {
+                    // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
+                    // there (W17-R05): its workspace and environment, or its container; the leg's
+                    // secrets masked in what it shows.
+                    m @ (ServerMsg::JobTerminalOpen { .. } | ServerMsg::JobExec { .. }) => {
+                        let (job, session, cols, rows, command) = match m {
+                            ServerMsg::JobTerminalOpen { job, session, cols, rows } => (job, session, cols, rows, None),
+                            ServerMsg::JobExec { job, session, command } => (job, session, 200, 50, Some(command)),
+                            _ => continue,
+                        };
                         if !o.job_terminal {
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal disabled on this agent".into()) })).await.ok();
                             continue;
@@ -999,13 +1005,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
                             continue;
                         };
-                        let (program, env) = match &shell.exec {
-                            Some((argv, env)) => (Some(argv.clone()), env.clone()),
-                            None => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                        let (program, env) = match (&shell.exec, &command) {
+                            (Some(_), Some(c)) => shell.exec_with(c).map_or((None, Vec::new()), |(argv, env)| (Some(argv), env)),
+                            (Some((argv, env)), None) => (Some(argv.clone()), env.clone()),
+                            (None, _) => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
                         };
                         let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                         let cwd = program.is_none().then_some(shell.workdir.as_path());
-                        match terminal::spawn_at(o.shell.as_deref(), None, program.as_deref(), cwd, cols, rows, &env) {
+                        // A command runs as a step would, in bash; a terminal opens the runner's shell.
+                        let sh = if command.is_some() && !cfg!(windows) { Some("bash") } else { o.shell.as_deref() };
+                        let cmd = command.as_deref().filter(|_| program.is_none());
+                        match terminal::spawn_at(sh, cmd, program.as_deref(), cwd, cols, rows, &env) {
                             Ok((pty, rx)) => {
                                 let tx = term_tx.clone();
                                 let s = session.clone();

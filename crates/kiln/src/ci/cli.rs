@@ -120,7 +120,12 @@ impl Api {
 
     /// Any route of the API (`path` from `/api`).
     pub(crate) async fn call_api(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut req = self.client.request(method, &format!("{}{path}", self.url)).bearer(&self.token).timeout(Duration::from_secs(60));
+        self.call_for(method, path, body, Duration::from_secs(60)).await
+    }
+
+    /// [`Self::call_api`], waiting up to `wait` for the answer.
+    pub(crate) async fn call_for(&self, method: Method, path: &str, body: Option<Value>, wait: Duration) -> Result<Value> {
+        let mut req = self.client.request(method, &format!("{}{path}", self.url)).bearer(&self.token).timeout(wait);
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -163,6 +168,20 @@ enum OidcCmd {
         #[arg(long)]
         now: bool,
     },
+    /// The claims ID tokens' subjects are built from (W10-R09, GitHub's "customize subject
+    /// claims"), for the server, an organization (`org:<owner>`) or a repository
+    /// (`repo:<owner/name>`): shown, set with `--keys repo,context,kiln_trust`, GitHub's default
+    /// for a repository with `--default`, or inherited again with `--inherit`.
+    Subject {
+        #[arg(long, default_value = "server")]
+        scope: String,
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["default", "inherit"])]
+        keys: Vec<String>,
+        #[arg(long, conflicts_with = "inherit")]
+        default: bool,
+        #[arg(long)]
+        inherit: bool,
+    },
 }
 
 /// `kiln oidc`.
@@ -190,6 +209,26 @@ pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
         OidcCmd::Rotate { now } => {
             let v = api.call(Method::Post, "/oidc/rotate", Some(json!({ "now": now }))).await?;
             println!("a new signing key, signing from {}", when(v.get("sign_from").and_then(Value::as_i64)));
+        }
+        OidcCmd::Subject { scope, keys, default, inherit } => {
+            let path = format!("/oidc/subject?scope={}", enc(&scope));
+            let v = if inherit {
+                api.call(Method::Delete, &path, None).await?
+            } else if default || !keys.is_empty() {
+                api.call(Method::Put, &path, Some(json!({ "use_default": default, "include_claim_keys": keys }))).await?
+            } else {
+                api.call(Method::Get, &path, None).await?
+            };
+            let list = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            let own = if v.get("use_default").and_then(Value::as_bool) == Some(true) { "GitHub's default subject".to_owned() } else { list("include_claim_keys") };
+            println!("{}: {}", v.get("scope").and_then(Value::as_str).unwrap_or_default(), if own.is_empty() { "inherited".to_owned() } else { own });
+            match v.get("effective_claim_keys").and_then(Value::as_array) {
+                Some(_) => println!("subjects are built from: {}", list("effective_claim_keys")),
+                None => println!("subjects are GitHub's default: repo:<owner/name>:environment:<env>, :pull_request or :ref:<ref>"),
+            }
+            if let Some(e) = v.get("example_subject").and_then(Value::as_str) {
+                println!("a push to main: {e}");
+            }
         }
     }
     Ok(())
@@ -848,6 +887,17 @@ enum DebugCmd {
         /// The step, from 1 as the run page numbers them.
         step: u32,
     },
+    /// Run a command in a running or kept leg, as its terminal would (its workspace and
+    /// environment, or its container), and exit with its exit code: `kiln debug exec LEG -- ls`.
+    Exec {
+        leg: String,
+        /// Stop it after this many seconds (at most 600).
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// The command (shell text; several words are joined with spaces).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 /// `kiln debug`.
@@ -861,6 +911,22 @@ pub async fn debug(args: DebugArgs, cfg: &Config) -> Result<()> {
         DebugCmd::Release { leg } => {
             api.call(Method::Post, &format!("/legs/{}/release", enc(&leg)), Some(json!({}))).await?;
             println!("released {leg}");
+        }
+        DebugCmd::Exec { leg, timeout, command } => {
+            let body = json!({ "command": command.join(" "), "timeout": timeout });
+            let v = api.call_for(Method::Post, &format!("/api/ci/legs/{}/exec", enc(&leg)), Some(body), Duration::from_secs(timeout.min(600) + 30)).await?;
+            print!("{}", v.get("output").and_then(Value::as_str).unwrap_or_default());
+            if v.get("truncated").and_then(Value::as_bool) == Some(true) {
+                eprintln!("[kiln] the output was cut at 1 MiB");
+            }
+            if v.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                eprintln!("[kiln] stopped after {timeout} s");
+                return Err(anyhow::Error::new(crate::reach::cli::ExitWith(124)));
+            }
+            let code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(1);
+            if code != 0 {
+                return Err(anyhow::Error::new(crate::reach::cli::ExitWith(u8::try_from(code).unwrap_or(1))));
+            }
         }
         DebugCmd::RerunStep { leg, step } => {
             let v = api.call(Method::Post, &format!("/legs/{}/rerun-step", enc(&leg)), Some(json!({ "step": step }))).await?;

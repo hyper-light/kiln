@@ -230,6 +230,10 @@ async fn run(a: &RunArgs, cfg: &Config, shutdown: &Shutdown) -> Result<u8> {
     }
 }
 
+/// How long starting the runs may take: the server pins every remote action they use first,
+/// fetching what it hasn't mirrored.
+const START_WAIT: Duration = Duration::from_secs(900);
+
 fn say(s: &str) {
     let _ = writeln!(std::io::stderr(), "[kiln] {s}");
 }
@@ -241,7 +245,7 @@ async fn there(api: &Api, root: &Path, repo: &str, sha: &str, ask: Value, report
     if !heads.iter().any(|h| h == sha) {
         upload(api, root, repo, sha, &heads).await?;
     }
-    let started = api.call(Method::Post, &format!("/repos/{}/local-runs", enc(repo)), Some(ask)).await?;
+    let started = api.call_for(Method::Post, &format!("/api/ci/repos/{}/local-runs", enc(repo)), Some(ask), START_WAIT).await?;
     if started.get("trusted").and_then(Value::as_bool) == Some(false) {
         say("these runs are untrusted (you aren't the server's owner): a read-only token, and only the secrets you sent");
     }
@@ -390,9 +394,12 @@ fn server_config(dir: &Path, http: u16, quic: u16, executor: Option<&str>) -> Co
     c.ci.kiln_workflows = true;
     c.ci.github_labels = true;
     c.ci.local = true;
+    // Legs in containers get this machine's Docker, as GitHub's Ubuntu machines have one: it's
+    // yours, and so are these runs.
+    let docker = Some("socket".to_owned());
     c.ci.routing = match executor {
-        Some(e) => vec![kiln_ci::sched::routing::Rule { executor: vec![e.to_owned()], image: (e != "host").then(|| "kiln/runner-ubuntu-24.04".to_owned()), ..Default::default() }],
-        None => Vec::new(),
+        Some(e) => vec![kiln_ci::sched::routing::Rule { executor: vec![e.to_owned()], image: (e != "host").then(|| "kiln/runner-ubuntu-24.04".to_owned()), docker, ..Default::default() }],
+        None => vec![kiln_ci::sched::routing::Rule { docker, ..Default::default() }],
     };
     c
 }
@@ -438,7 +445,7 @@ async fn here_in(a: &RunArgs, root: &Path, ask: Value, dir: &Path, shutdown: &Sh
             crate::rt::sleep(Duration::from_millis(100)).await;
         }
         api.call_api(Method::Post, "/api/repos", Some(json!({ "name": repo, "clone_url": format!("file://{}", root.display()) }))).await?;
-        let started = api.call(Method::Post, &format!("/repos/{}/local-runs", enc(&repo)), Some(ask)).await?;
+        let started = api.call_for(Method::Post, &format!("/api/ci/repos/{}/local-runs", enc(&repo)), Some(ask), START_WAIT).await?;
         let code = follow(&api, &started, true, shutdown).await?;
         if let Some(p) = &a.report {
             write_report(&api, &started, p).await?;

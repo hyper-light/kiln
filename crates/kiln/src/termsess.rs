@@ -490,6 +490,15 @@ pub fn open_leg(hub: &Arc<Hub>, machine: String, job: &str, cols: u16, rows: u16
     session
 }
 
+/// A command in a leg's shell, its output on a session of its own (W17-R05): attach to it before
+/// anything can come.
+pub fn exec_leg(hub: &Arc<Hub>, machine: String, job: &str, command: &str) -> (Arc<Session>, Attachment) {
+    let (session, input) = Session::new(format!("leg:{job}"), Some(command.to_owned()), 200, 50);
+    let attached = session.attach();
+    run_agent(hub, machine, session.clone(), input, Some(ServerMsg::JobExec { job: job.to_owned(), session: session.id.clone(), command: command.to_owned() }));
+    (session, attached)
+}
+
 /// Take back a session an agent reports after a reconnect (it outlived the connection or this
 /// server): register it and fetch its replay. A no-op when the session is already known.
 pub fn adopt_agent(hub: &Arc<Hub>, machine: &str, info: &crate::proto::TermInfo) {

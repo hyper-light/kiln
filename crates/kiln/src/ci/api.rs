@@ -83,6 +83,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
         (&Method::GET, ["repos", repo, "workflows"]) => workflows::list(hub, repo, q).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,
+        // W10-R09: subjects per organization and repository.
+        (_, ["oidc", "subject"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = if method == Method::PUT { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+            super::oidc::subject(hub, &method, q, body, &by).await
+        }
         // W10-R12: the OIDC issuer's status, keys to publish, rotation.
         (_, ["oidc", tail @ ..]) => {
             let body: serde_json::Value = if method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
@@ -136,6 +142,11 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
             let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             super::runs_api::rerun_step(hub, id, &body, &by).await
+        }
+        (&Method::POST, ["legs", id, "exec"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::runs_api::exec(hub, id, &body, caller.as_ref()).await
         }
         (&Method::POST, ["legs", id, "release"]) => {
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());

@@ -65,6 +65,18 @@ pub fn shell(job: &str) -> Option<Shell> {
     LEGS.lock().get(job).map(|e| e.shell.clone())
 }
 
+impl Shell {
+    /// The program that runs `command` in a leg's container instead of opening its shell there
+    /// (`docker exec … sh -c <command>`), and the environment it needs.
+    pub fn exec_with(&self, command: &str) -> Option<(Vec<String>, Vec<(String, String)>)> {
+        let (mut argv, env) = self.exec.clone()?;
+        // The shell's argv ends `sh -c <script>`: the command takes the script's place.
+        let last = argv.last_mut()?;
+        command.clone_into(last);
+        Some((argv, env))
+    }
+}
+
 /// Whether `job` runs or is kept here: a terminal into it stays open while it is.
 pub fn live(job: &str) -> bool {
     LEGS.lock().contains_key(job)

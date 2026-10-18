@@ -307,6 +307,10 @@ pub enum ServerMsg {
     /// W17-R04). Only to runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes
     /// variants by index.
     JobRerunStep { job: String, step: u32, idx: u32 },
+    /// CI: run `command` in running or kept leg `job`'s shell (its workspace and environment, or
+    /// its container), its output on terminal session `session` (docs/ci.md W17-R05). Only to
+    /// runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
+    JobExec { job: String, session: String, command: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

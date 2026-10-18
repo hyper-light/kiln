@@ -126,6 +126,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         };
     }
     match (&method, rest) {
+        // W10-R09: how the repository's ID tokens' subjects are built, GitHub's shape.
+        (&Method::GET, ["repos", owner, repo, "actions", "oidc", "customization", "sub"]) => {
+            let Some(_) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            let keys = super::oidc::subject_keys(hub, &format!("{owner}/{repo}")).await;
+            Ok(srv::json(StatusCode::OK, &json!({ "use_default": keys.is_none(), "include_claim_keys": keys.unwrap_or_default() })))
+        }
         (&Method::GET, ["user"]) => Ok(repos::user(&origin)),
         (&Method::GET, ["rate_limit"]) => Ok(repos::rate_limit()),
         (&Method::GET, ["repos", owner, repo, "actions", "runs", run, "artifacts"]) => {

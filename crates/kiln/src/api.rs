@@ -171,9 +171,18 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
         (&Method::POST, ["api", "mcp"]) => {
-            let actor = crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers()));
-            return match actor {
-                Some(actor) => crate::mcp::http(&hub, actor, req.into_body()).await.map_err(|(c, m)| err(c, m)),
+            // The owner, by the admin token, its session or an MCP token kiln minted; else a
+            // user's session or token, whose operations the route table judges one by one.
+            let caller = match crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers())) {
+                Some(actor) => {
+                    let mut c = crate::authz::Caller::owner();
+                    c.name = actor;
+                    Some(c)
+                }
+                None => caller_of(&hub, req.headers()).await,
+            };
+            return match caller {
+                Some(caller) => crate::mcp::http(&hub, caller, req.into_body()).await.map_err(|(c, m)| err(c, m)),
                 None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
             };
         }

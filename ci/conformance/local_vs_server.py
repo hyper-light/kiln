@@ -58,8 +58,9 @@ def unrunnable(leg):
 
 
 def compare(server, here):
-    """The differences between the server's legs and steps and these."""
-    out = []
+    """The differences between the server's legs and steps and these, and the legs fail-fast
+    cancelled on one side only (which leg fails first is a race, on GitHub as here)."""
+    out, raced = [], []
     for key in sorted(set(server) | set(here)):
         s, h = server.get(key), here.get(key)
         if s is None or h is None:
@@ -67,14 +68,26 @@ def compare(server, here):
             continue
         if unrunnable(s) and unrunnable(h):
             continue
+        if (s["conclusion"] == "cancelled") != (h["conclusion"] == "cancelled"):
+            raced.append(key)
+            continue
+        if s["conclusion"] == h["conclusion"] == "cancelled":
+            continue  # how far each got before the cancel is timing too
         if s["conclusion"] != h["conclusion"]:
             out.append(f"`{key}`: {s['conclusion']} on the server, {h['conclusion']} here")
-        diff = [f"{n}: {sc} / {hc}" for (n, sc), (_, hc) in zip(s["steps"], h["steps"]) if sc != hc]
-        if len(s["steps"]) != len(h["steps"]):
-            diff.append(f"{len(s['steps'])} steps on the server, {len(h['steps'])} here")
+        # By name (and which of that name), not position: the server's older runs order a job
+        # container's setup after the steps.
+        def named(steps):
+            seen, out = {}, {}
+            for n, c in steps:
+                seen[n] = seen.get(n, 0) + 1
+                out[(n, seen[n])] = c
+            return out
+        sn, hn = named(s["steps"]), named(h["steps"])
+        diff = [f"{n}: {sn.get((n, i))} / {hn.get((n, i))}" for (n, i) in sorted(set(sn) | set(hn)) if sn.get((n, i)) != hn.get((n, i))]
         if diff:
             out.append(f"`{key}` steps: " + "; ".join(diff))
-    return out
+    return out, raced
 
 
 def main():
@@ -86,6 +99,7 @@ def main():
     ap.add_argument("--repo", required=True)
     ap.add_argument("--timeout", type=int, default=1800, help="seconds each run may take here")
     ap.add_argument("--only", nargs="*", help="only these starters (file names)")
+    ap.add_argument("--merge", action="store_true", help="keep the report's other rows: only the workflows run now change")
     args = ap.parse_args()
     api = starters.Api(args.server, open(args.token_file).read().strip())
     kiln = os.path.abspath(args.kiln)
@@ -126,15 +140,38 @@ def main():
                 rep = {}
         here_c, here_legs = here_side(rep)
         server_c, server_legs = server_side(api, run)
-        diffs = compare(server_legs, here_legs) if here_c else ["no report: " + " / ".join(tail)]
+        diffs, raced = compare(server_legs, here_legs) if here_c else (["no report: " + " / ".join(tail)], [])
         rate = any("rate limit" in line.lower() for line in tail)
-        results.append((n, server_c, here_c, diffs, took, rate))
+        results.append((n, server_c, here_c, diffs, took, rate, raced))
         print(f"  {n}: server {server_c}, here {here_c}, {'same' if not diffs else str(len(diffs)) + ' differences'} ({took}s)", flush=True)
-    write(results, sha)
+    write(results, sha, args.merge)
 
 
-def write(results, sha):
-    same = sum(1 for r in results if not r[3])
+def rows(results):
+    out = {}
+    for n, server_c, here_c, diffs, took, rate, raced in results:
+        notes = "; ".join(diffs) if diffs else "none"
+        if raced and not diffs:
+            notes = "none; fail-fast cancelled " + ", ".join(f"`{k}`" for k in raced) + " on one side only (which leg fails first is a race)"
+        if diffs and rate:
+            notes = "**github.com's limit on anonymous API reads**; " + notes
+        notes = notes.replace("|", "\\|")
+        out[n] = (not diffs, f"| `{n}` | {server_c} | {here_c or 'no run'} ({took}s) | {notes} |")
+    return out
+
+
+def write(results, sha, merge=False):
+    table = rows(results)
+    if merge and os.path.exists(OUT):
+        # The rows of workflows not run now stay as they were.
+        with open(OUT) as f:
+            for line in f:
+                cells = line.split(" | ")
+                if line.startswith("| `") and len(cells) == 4:
+                    n = cells[0].strip("| `")
+                    if n not in table:
+                        table[n] = (cells[3].strip().rstrip("|").strip().startswith("none"), line.rstrip("\n"))
+    same = sum(1 for ok, _ in table.values() if ok)
     lines = [
         "# CI conformance: `kiln workflow run` against the server",
         "",
@@ -142,20 +179,15 @@ def write(results, sha):
         + ": each starter workflow the server ran (`docs/ci-conformance.md`) run again with `kiln workflow run` on the same machine,"
         f" at the same commit (`{sha[:12]}`), and every leg's and step's conclusion compared with the server's run.",
         "",
-        f"**{same} of {len(results)} give the same step results.**",
+        f"**{same} of {len(table)} give the same step results.**",
         "",
         "| Workflow | Server | `kiln workflow run` | Differences |",
         "| --- | --- | --- | --- |",
     ]
-    for n, server_c, here_c, diffs, took, rate in results:
-        notes = "; ".join(diffs) if diffs else "none"
-        if diffs and rate:
-            notes = "**github.com's limit on anonymous API reads**; " + notes
-        notes = notes.replace("|", "\\|")
-        lines.append(f"| `{n}` | {server_c} | {here_c or 'no run'} ({took}s) | {notes} |")
+    lines += [table[n][1] for n in sorted(table)]
     with open(OUT, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"{same} of {len(results)} the same; wrote {os.path.relpath(OUT, ROOT)}")
+    print(f"{same} of {len(table)} the same; wrote {os.path.relpath(OUT, ROOT)}")
 
 
 if __name__ == "__main__":

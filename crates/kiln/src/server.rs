@@ -239,7 +239,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             reach: None,
             outpost: false,
         };
-        sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), shutdown_child()));
+        // `kiln workflow run`'s server stops its runner itself, once the runs it follows ended.
+        let agent_down = if cfg.ci.local { shutdown.clone() } else { shutdown_child() };
+        sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), agent_down.clone()));
     }
 
     tracing::info!(

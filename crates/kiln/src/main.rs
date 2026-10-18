@@ -628,8 +628,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Workflow(a) => {
-            shutdown_on_signals(shutdown.clone());
-            kiln::ci::local::workflow(a, &config::Config::load(&config_path).unwrap_or_default(), shutdown).await
+            // A signal stops the runs; the server and runner this process runs for them stop after.
+            let stop = Shutdown::new();
+            shutdown_on_signals(stop.clone());
+            kiln::ci::local::workflow(a, &config::Config::load(&config_path).unwrap_or_default(), stop).await
         }
         Cmd::Logs(a) => kiln::ci::cli::logs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Dispatch(a) => kiln::ci::cli::dispatch(a, &config::Config::load(&config_path).unwrap_or_default()).await,

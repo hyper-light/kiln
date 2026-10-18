@@ -371,6 +371,70 @@ pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<R
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "leg": id, "step": step, "idx": next })))
 }
 
+/// The most of a command's output `exec` answers with.
+const MAX_EXEC_OUTPUT: usize = 1 << 20;
+
+/// `POST /api/ci/legs/:id/exec` with `{ command, timeout }`: runs the command in a running or kept
+/// leg's shell, as its terminal would (W17-R05, for agents). Answers `{ output, exit_code,
+/// timed_out, truncated }`, the output masked as the leg's is. `timeout` is in seconds: 60 unless
+/// said, at most 600; past it the command is stopped.
+pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
+    use crate::termsess::Frame;
+    let command = body.get("command").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`command` is required".to_owned()))?.to_owned();
+    let seconds = body.get("timeout").and_then(Value::as_u64).unwrap_or(60).clamp(1, 600);
+    let leg = id.to_owned();
+    let row: Option<(Option<String>, Option<String>, String, Option<i64>)> = hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT agent, executor, status, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?))
+        .await
+        .map_err(internal)?;
+    let Some((agent, executor, status, kept_until)) = row else { return Err(missing("no such leg of the CI engine")) };
+    let kept = kept_until.is_some_and(|t| t > crate::util::now_unix());
+    let Some(agent) = agent.filter(|_| status == "running" || kept) else {
+        return Err((StatusCode::CONFLICT, "the leg isn't running or kept: a command runs in a running leg, or a failed one kept with keep-on-failure".into()));
+    };
+    let by = caller.map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    // On the host executor the leg's shell is a shell on the runner itself.
+    if executor.as_deref() == Some("host") && caller.is_some_and(|c| !c.can("runners.terminal", &crate::authz::Scope::Runner { runner: agent.clone() })) {
+        return Err((StatusCode::FORBIDDEN, format!("{by} may not run commands on runner {agent}: a host leg's shell needs runners.terminal there")));
+    }
+    hub.store.audit(by, "ci.legs.exec".into(), format!("{id}: {command}")).await;
+    let (session, mut seen) = crate::termsess::exec_leg(hub, agent, id, &command);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let (mut out, mut code, mut error, mut timed_out, mut truncated) = (Vec::new(), None, None, false, false);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match crate::rt::timeout(left, seen.live.recv()).await {
+            Ok(Ok(Frame::Data(d))) => {
+                let room = MAX_EXEC_OUTPUT.saturating_sub(out.len());
+                truncated |= d.len() > room;
+                out.extend_from_slice(d.get(..d.len().min(room)).unwrap_or_default());
+            }
+            Ok(Ok(Frame::Exit { code: c, error: e })) => {
+                (code, error) = (c, e);
+                break;
+            }
+            Ok(Ok(Frame::Size { .. })) => {}
+            Ok(Err(async_broadcast::RecvError::Overflowed(_))) => truncated = true,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                timed_out = true;
+                session.close();
+                break;
+            }
+        }
+    }
+    session.detach();
+    if let (None, Some(e)) = (code, &error)
+        && out.is_empty()
+        && !timed_out
+    {
+        return Err((StatusCode::CONFLICT, e.clone()));
+    }
+    let output = String::from_utf8_lossy(&out).replace("\r\n", "\n");
+    Ok(srv::json(StatusCode::OK, &json!({ "output": output, "exit_code": code, "timed_out": timed_out, "truncated": truncated })))
+}
+
 /// `GET /api/ci/legs/:id/logs?step=&from=`: from byte `from` on, for a follower.
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
