@@ -50,5 +50,9 @@ harness = false
 name = "group"
 harness = false
 
+[[bench]]
+name = "otlp"
+harness = false
+
 [lints]
 workspace = true

@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Wake, Waker};
@@ -32,7 +32,7 @@ use kiln_obs::manifest::{Point, plain_name};
 use kiln_obs::store::{Answer, snapshot_name};
 use serde::{Deserialize, Serialize};
 
-use super::ingest::Batcher;
+use super::ingest::{Batcher, WAITING_LOG_BYTES, WAITING_POINTS, record_bytes};
 use super::wire::{self, Joiner, Msg, Outcome, Status};
 use crate::http::client::Client;
 
@@ -137,11 +137,43 @@ enum Input {
     Verified { at: u64, digest: u64 },
 }
 
+/// What a node has taken to write and not yet cut into a write, against the batcher's bound: taken
+/// when a request is answered (by whoever answers it), released by the owner as its batcher's
+/// writes are cut. Both counts only grow; what is inside is their difference. A request is answered
+/// 200 only once its room is taken, so a flood is refused (503) and never taken and then dropped.
+#[derive(Default)]
+struct Admission {
+    points: AtomicU64,
+    log_bytes: AtomicU64,
+    left_points: AtomicU64,
+    left_log_bytes: AtomicU64,
+    /// Points and records of kiln's own refused at the bound itself.
+    refused: AtomicU64,
+}
+
+/// Takes room for `n` against `max`, or says there is none. One write bigger than the bound is taken
+/// when nothing waits: it could never be otherwise.
+fn reserve(taken: &AtomicU64, left: &AtomicU64, n: u64, max: u64) -> bool {
+    let mut cur = taken.load(Ordering::Acquire);
+    loop {
+        // `left` only grows, so a value read before `taken` changes overstates what is inside: a
+        // reservation is never wrongly granted.
+        let inside = cur.saturating_sub(left.load(Ordering::Acquire));
+        if inside > 0 && inside.saturating_add(n) > max {
+            return false;
+        }
+        match taken.compare_exchange_weak(cur, cur.saturating_add(n), Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+}
+
 /// The node's handle on the group.
 #[derive(Clone)]
 pub struct Observe {
     tx: Sender<Input>,
-    busy: Arc<AtomicBool>,
+    admission: Arc<Admission>,
     store: Arc<Mutex<Option<Shared>>>,
     view: Arc<Mutex<View>>,
     out: async_channel::Receiver<Out>,
@@ -165,10 +197,10 @@ impl Observe {
             Role::Server { key } => Some(key.clone()),
             Role::Runner { .. } => None,
         };
-        let busy = Arc::new(AtomicBool::new(false));
-        let handle = Self { tx: tx.clone(), busy: busy.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key };
+        let admission = Arc::new(Admission::default());
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, view, out_tx, tx, busy);
+            let mut owner = Owner::new(settings, store, view, out_tx, tx, admission);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
@@ -193,18 +225,68 @@ impl Observe {
         let _ = self.tx.send(Input::Up { machine: machine.to_owned(), up });
     }
 
-    /// Points to write.
+    /// Points of kiln's own to write (its hosts', CI's, CD's): taken up to the bound itself, else
+    /// refused and counted as dropped.
     pub fn write(&self, series: Vec<(SeriesKey, Vec<(i64, f64)>)>) {
-        if !series.is_empty() {
-            let _ = self.tx.send(Input::Series(series));
-        }
+        let _taken = self.write_within(series, WAITING_POINTS as u64, true);
     }
 
-    /// Log records to write.
-    pub fn log(&self, records: Vec<Record>) {
-        if !records.is_empty() {
-            let _ = self.tx.send(Input::Logs(records));
+    /// Points an exporter or a client sent: taken up to three quarters of the bound (the rest is
+    /// kiln's own), else not taken: answer 503, and it sends them again.
+    #[must_use]
+    pub fn offer(&self, series: Vec<(SeriesKey, Vec<(i64, f64)>)>) -> bool {
+        self.write_within(series, WAITING_POINTS as u64 / 4 * 3, false)
+    }
+
+    /// Takes `series` if their points fit under `max`; what is refused is counted as dropped when
+    /// `count` (kiln's own: no one sends it again).
+    fn write_within(&self, series: Vec<(SeriesKey, Vec<(i64, f64)>)>, max: u64, count: bool) -> bool {
+        let n: u64 = series.iter().map(|(_, p)| p.len() as u64).sum();
+        if n == 0 {
+            return true;
         }
+        let a = &self.admission;
+        if !reserve(&a.points, &a.left_points, n, max) {
+            if count {
+                a.refused.fetch_add(n, Ordering::Relaxed);
+            }
+            return false;
+        }
+        if self.tx.send(Input::Series(series)).is_err() {
+            // No owner to take them: the room goes back.
+            a.left_points.fetch_add(n, Ordering::AcqRel);
+        }
+        true
+    }
+
+    /// Log records of kiln's own (its events): taken up to the bound itself, else refused and
+    /// counted as dropped.
+    pub fn log(&self, records: Vec<Record>) {
+        let _taken = self.log_within(records, WAITING_LOG_BYTES as u64, true);
+    }
+
+    /// Log records an exporter or a client sent: as [`Observe::offer`].
+    #[must_use]
+    pub fn offer_logs(&self, records: Vec<Record>) -> bool {
+        self.log_within(records, WAITING_LOG_BYTES as u64 / 4 * 3, false)
+    }
+
+    fn log_within(&self, records: Vec<Record>, max: u64, count: bool) -> bool {
+        if records.is_empty() {
+            return true;
+        }
+        let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
+        let a = &self.admission;
+        if !reserve(&a.log_bytes, &a.left_log_bytes, n, max) {
+            if count {
+                a.refused.fetch_add(records.len() as u64, Ordering::Relaxed);
+            }
+            return false;
+        }
+        if self.tx.send(Input::Logs(records)).is_err() {
+            a.left_log_bytes.fetch_add(n, Ordering::AcqRel);
+        }
+        true
     }
 
     /// Cuts the store and compacts the group's log now, keeping nothing: a member behind takes an
@@ -219,9 +301,12 @@ impl Observe {
         let _ = self.tx.send(Input::Verify);
     }
 
-    /// Whether this node is too far behind on its writes to take more (`Batcher::busy`).
+    /// Whether an exporter's write would be refused now (three quarters of the bound taken): asked
+    /// before a request is decoded, so a flood costs the node no decoding.
     pub fn busy(&self) -> bool {
-        self.busy.load(Ordering::Relaxed)
+        let a = &self.admission;
+        let inside = |taken: &AtomicU64, left: &AtomicU64| taken.load(Ordering::Acquire).saturating_sub(left.load(Ordering::Acquire));
+        inside(&a.points, &a.left_points) >= WAITING_POINTS as u64 / 4 * 3 || inside(&a.log_bytes, &a.left_log_bytes) >= WAITING_LOG_BYTES as u64 / 4 * 3
     }
 
     /// The store, for queries, once it is open.
@@ -316,7 +401,7 @@ struct Owner {
     wakeup: Arc<Wakeup>,
     waker: Waker,
     input: Sender<Input>,
-    busy: Arc<AtomicBool>,
+    admission: Arc<Admission>,
     start: Instant,
     batcher: Batcher,
     joiner: Joiner,
@@ -352,7 +437,7 @@ fn now_ns(start: Instant) -> u64 {
 }
 
 impl Owner {
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, busy: Arc<AtomicBool>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -370,7 +455,7 @@ impl Owner {
             wakeup,
             waker,
             input,
-            busy,
+            admission,
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
             joiner: Joiner::default(),
@@ -512,7 +597,10 @@ impl Owner {
             self.writes();
             self.drive();
             self.periodic();
-            self.busy.store(self.batcher.busy(), Ordering::Relaxed);
+            // What left the batcher's waiting frees its room for the next requests.
+            let (points, log_bytes) = self.batcher.left();
+            self.admission.left_points.store(points, Ordering::Release);
+            self.admission.left_log_bytes.store(log_bytes, Ordering::Release);
         }
     }
 
@@ -896,7 +984,7 @@ impl Owner {
         let mut s = Status { error: self.error.clone(), at: crate::util::now_unix(), ..Status::default() };
         let (waiting, _) = self.batcher.backlog();
         s.queued = waiting;
-        s.dropped = self.batcher.dropped;
+        s.dropped = self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed);
         s.fetching = self.fetching.as_ref().map(|f| f.progress);
         s.verified = self.verified;
         if let Some(rep) = &self.rep {
@@ -914,7 +1002,7 @@ impl Owner {
 
     fn make_view(&self) -> View {
         let (waiting, _) = self.batcher.backlog();
-        let mut v = View { role: if self.is_server() { "server" } else { "runner" }, waiting, dropped: self.batcher.dropped, written: self.batcher.written, error: self.error.clone(), ..View::default() };
+        let mut v = View { role: if self.is_server() { "server" } else { "runner" }, waiting, dropped: self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed), written: self.batcher.written, error: self.error.clone(), ..View::default() };
         if let Some(rep) = &self.rep {
             let store = rep.r.machine().read();
             v.member = rep.r.id();
@@ -1130,4 +1218,71 @@ fn dir_bytes(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Eight threads take room as fast as they can while one frees it at its own pace: what is
+    /// inside never passes the bound, read where it can be read exactly (the freeing thread is the
+    /// only writer of what left: what it reads of the taken is what is inside at that moment).
+    #[test]
+    fn admission_never_takes_more_than_its_bound_whatever_the_race() {
+        const MAX: u64 = 10_000;
+        let (taken, left) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let takers: Vec<_> = (0..8u64)
+            .map(|t| {
+                let (taken, left) = (taken.clone(), left.clone());
+                std::thread::spawn(move || {
+                    let (mut x, mut got, mut refused) = (t.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 0u64, 0u64);
+                    for _ in 0..200_000 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let n = 1 + x % 500;
+                        if reserve(&taken, &left, n, MAX) {
+                            got += n;
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                    (got, refused)
+                })
+            })
+            .collect();
+        let freer = {
+            let (taken, left, stop) = (taken.clone(), left.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut most = 0;
+                while !stop.load(Ordering::Acquire) {
+                    let l = left.load(Ordering::Acquire);
+                    let inside = taken.load(Ordering::Acquire) - l;
+                    most = most.max(inside);
+                    assert!(inside <= MAX, "{inside} inside a bound of {MAX}");
+                    // Frees part of what is inside, as the owner cuts writes.
+                    left.fetch_add(inside / 3, Ordering::AcqRel);
+                    std::thread::yield_now();
+                }
+                most
+            })
+        };
+        let (mut got, mut refused) = (0, 0);
+        for t in takers {
+            let (g, r) = t.join().unwrap_or_default();
+            got += g;
+            refused += r;
+        }
+        stop.store(true, Ordering::Release);
+        let most = freer.join().unwrap_or(u64::MAX);
+        assert_eq!(taken.load(Ordering::Acquire), got, "every grant counted once");
+        assert!(most <= MAX && got > MAX * 10 && refused > 0, "a real race: {got} taken, {refused} refused, at most {most} inside");
+        // One write bigger than the bound is taken when nothing is inside, and only then.
+        let (t, l) = (AtomicU64::new(0), AtomicU64::new(0));
+        assert!(reserve(&t, &l, MAX * 3, MAX));
+        assert!(!reserve(&t, &l, 1, MAX));
+        l.store(MAX * 3, Ordering::Release);
+        assert!(reserve(&t, &l, 1, MAX));
+    }
 }

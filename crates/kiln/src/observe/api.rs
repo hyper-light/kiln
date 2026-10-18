@@ -544,7 +544,9 @@ fn post_event(e: EventIn) -> Result<Response, Fail> {
         attrs.push((k.to_owned(), v.to_owned()));
     }
     let message = if e.text.is_empty() { e.title.clone() } else { format!("{}\n\n{}", e.title, e.text) };
-    o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity, service, host: e.host.unwrap_or_default(), source: "kiln.event".into(), message, attrs: { attrs.push(("event.source".into(), e.source_type_name.unwrap_or_else(|| "api".into()))); attrs }, trace_id: None, span_id: None }]);
+    if !o.offer_logs(vec![Record { ts: ts.saturating_mul(1_000_000), severity, service, host: e.host.unwrap_or_default(), source: "kiln.event".into(), message, attrs: { attrs.push(("event.source".into(), e.source_type_name.unwrap_or_else(|| "api".into()))); attrs }, trace_id: None, span_id: None }]) {
+        return Ok(behind());
+    }
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "status": "ok" })))
 }
 
@@ -601,7 +603,9 @@ fn ingest_series(body: SeriesBody) -> Result<Response, Fail> {
         points += p.len();
         series.push((key, p));
     }
-    o.write(series);
+    if !o.offer(series) {
+        return Ok(behind());
+    }
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "points": points })))
 }
 
@@ -642,8 +646,16 @@ fn ingest_logs(body: Vec<LogIn>) -> Result<Response, Fail> {
             span_id: None,
         })
         .collect();
-    o.log(records);
+    if !o.offer_logs(records) {
+        return Ok(behind());
+    }
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "records": n })))
+}
+
+/// The node is too far behind on its writes to take these: nothing of them was taken; send them
+/// again in a second.
+fn behind() -> Response {
+    srv::with_header(srv::json(StatusCode::SERVICE_UNAVAILABLE, &json!({ "error": "behind on writes: nothing was taken; try again" })), header::RETRY_AFTER, "1")
 }
 
 /// `GET /api/observe/v1/snapshot/{snapshot}/{file}?machine=`: a snapshot's file for the machine

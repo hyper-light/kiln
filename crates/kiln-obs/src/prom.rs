@@ -94,7 +94,7 @@ fn sample(line: &str) -> Option<(&str, Vec<(String, String)>, f64, Option<i64>)>
 pub fn parse(text: &str, now_ms: i64, tags: &[(&str, &str)]) -> Scraped {
     let mut out = Scraped::default();
     let mut families: HashMap<&str, Family> = HashMap::new();
-    let mut at: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut at: HashMap<std::sync::Arc<[u8]>, usize> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -137,7 +137,7 @@ pub fn parse(text: &str, now_ms: i64, tags: &[(&str, &str)]) -> Scraped {
         };
         out.samples += 1;
         let point = (ts.unwrap_or(now_ms), value);
-        match at.get(&key.key) {
+        match at.get(&*key.key) {
             Some(&i) => {
                 if let Some(s) = out.series.get_mut(i) {
                     s.1.push(point);

@@ -124,12 +124,36 @@ pub fn fingerprint(key: &[u8]) -> u64 {
     u64::from_le_bytes(w)
 }
 
-/// A series' identity, made once on the node that takes its writes, and kept there.
+/// A series' identity, made once on the node that takes its writes, and kept there. Its key's
+/// bytes are shared: a key is copied by a count (the receiver's cache, the batcher, a write).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesKey {
     pub fp: u64,
-    pub key: Vec<u8>,
+    pub key: std::sync::Arc<[u8]>,
     pub kind: Kind,
+}
+
+/// A series' canonical key written into `out` (cleared first): its metric, the tags' count, then
+/// each tag's key and value, every string as its length and bytes. `tags` come sorted by key, each
+/// key once: what [`SeriesKey::new`] makes of them, so bytes written here equal its key's.
+pub fn put_canonical<'t>(out: &mut Vec<u8>, metric: &str, tags: impl ExactSizeIterator<Item = (&'t str, &'t str)>) {
+    put_canonical_head(out, metric, tags.len());
+    for (k, v) in tags {
+        put_canonical_tag(out, k, v);
+    }
+}
+
+/// [`put_canonical`] in parts: the metric and how many tags follow (`out` cleared first) ...
+pub fn put_canonical_head(out: &mut Vec<u8>, metric: &str, tags: usize) {
+    out.clear();
+    put_bytes(out, metric.as_bytes());
+    varint::put(out, tags as u64);
+}
+
+/// ... then each tag, in key order.
+pub fn put_canonical_tag(out: &mut Vec<u8>, k: &str, v: &str) {
+    put_bytes(out, k.as_bytes());
+    put_bytes(out, v.as_bytes());
 }
 
 impl SeriesKey {
@@ -160,13 +184,8 @@ impl SeriesKey {
             }
         }
         let mut key = Vec::with_capacity(metric.len() + pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum::<usize>() + 3);
-        put_bytes(&mut key, metric.as_bytes());
-        varint::put(&mut key, pairs.len() as u64);
-        for (k, v) in &pairs {
-            put_bytes(&mut key, k.as_bytes());
-            put_bytes(&mut key, v.as_bytes());
-        }
-        Ok(Self { fp: fingerprint(&key), key, kind })
+        put_canonical(&mut key, metric, pairs.iter().copied());
+        Ok(Self { fp: fingerprint(&key), key: key.into(), kind })
     }
 }
 
@@ -419,7 +438,7 @@ mod tests {
         assert!(b.finish().is_empty(), "the builder starts over");
         let mut r = Reader::new(&batch).unwrap();
         match r.next_item().unwrap().unwrap() {
-            Item::Def { fp, kind, key } => assert_eq!((fp, kind, key), (a.fp, Kind::Gauge, a.key.as_slice())),
+            Item::Def { fp, kind, key } => assert_eq!((fp, kind, key), (a.fp, Kind::Gauge, &*a.key)),
             Item::Run { .. } | Item::Logs { .. } => panic!("a definition first"),
         }
         match r.next_item().unwrap().unwrap() {

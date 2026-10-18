@@ -366,6 +366,13 @@ pub enum Answer {
     Busy,
 }
 
+/// The node's series keys, made once each, for every receiver of the node (the server's and a
+/// runner's, on whichever thread decodes).
+fn keys() -> &'static kiln_obs::otlp::metrics::Keys {
+    static KEYS: std::sync::OnceLock<kiln_obs::otlp::metrics::Keys> = std::sync::OnceLock::new();
+    KEYS.get_or_init(kiln_obs::otlp::metrics::Keys::new)
+}
+
 /// Takes an OTLP request's body: decompressed if gzip (bounded: a small body cannot unfold past
 /// [`MAX_BODY`]), decoded by its content type, written to `o`.
 pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &[u8], now_ns: i64) -> Answer {
@@ -402,10 +409,12 @@ pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &
         body
     };
     match signal {
-        Signal::Metrics => match kiln_obs::otlp::metrics::decode(pb, now_ns / 1_000_000) {
+        Signal::Metrics => match kiln_obs::otlp::metrics::decode_with(pb, now_ns / 1_000_000, keys()) {
             Ok(d) => {
                 let points = d.points;
-                o.write(d.series);
+                if !o.offer(d.series) {
+                    return Answer::Busy;
+                }
                 Answer::Ok { json, points }
             }
             Err(e) => Answer::Bad(e.to_string()),
@@ -413,7 +422,9 @@ pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &
         Signal::Logs => match kiln_obs::otlp::logs::decode(pb, now_ns) {
             Ok(d) => {
                 let n = d.records.len() as u64;
-                o.log(d.records);
+                if !o.offer_logs(d.records) {
+                    return Answer::Busy;
+                }
                 Answer::Ok { json, points: n }
             }
             Err(e) => Answer::Bad(e.to_string()),

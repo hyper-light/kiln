@@ -33,9 +33,12 @@ const DEFINED_FOR: Duration = Duration::from_secs(3600);
 const KNOWN: usize = 1 << 20;
 /// What a write's bytes may come to: the group's entry less its command.
 const ENTRY_BUDGET: usize = kiln_obs::group::ENTRY_BYTES - kiln_obs::command::WRITE_HEADER;
-/// Points waiting, at the most, and log bytes; past them, what comes is dropped and counted.
-const WAITING_POINTS: usize = 4 << 20;
-const WAITING_LOG_BYTES: usize = 64 << 20;
+/// Points waiting, at the most, and log bytes. The node takes no more than this to write
+/// (`super::owner::Observe::offer`, which answers 503 past three quarters of it, the rest kept for
+/// kiln's own figures): what is taken is never dropped for room. Past it a write would be dropped
+/// and counted, which admission keeps from happening.
+pub const WAITING_POINTS: usize = 4 << 20;
+pub const WAITING_LOG_BYTES: usize = 64 << 20;
 
 /// A write out: its place, its entry, when it was sent, and its series' points (to send again
 /// with their definitions if the group does not know them).
@@ -62,15 +65,20 @@ pub struct Batcher {
     known: HashMap<u64, Instant>,
     pub dropped: u64,
     pub written: u64,
+    /// Points and log bytes that have left what waits (cut into a write, or dropped), less those
+    /// that came back to wait again: what admission's bound is released by.
+    left_points: u64,
+    left_log_bytes: u64,
 }
 
-fn record_bytes(r: &Record) -> usize {
+/// A record's weight against [`WAITING_LOG_BYTES`].
+pub fn record_bytes(r: &Record) -> usize {
     32 + r.service.len() + r.host.len() + r.source.len() + r.message.len() + r.attrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>()
 }
 
 impl Batcher {
     pub fn new(sender: u64) -> Self {
-        Self { sender, seq: 0, builder: Builder::new(), waiting: HashMap::new(), waiting_points: 0, logs: VecDeque::new(), log_bytes: 0, first_waiting: None, out: None, known: HashMap::new(), dropped: 0, written: 0 }
+        Self { sender, seq: 0, builder: Builder::new(), waiting: HashMap::new(), waiting_points: 0, logs: VecDeque::new(), log_bytes: 0, first_waiting: None, out: None, known: HashMap::new(), dropped: 0, written: 0, left_points: 0, left_log_bytes: 0 }
     }
 
     pub fn sender(&self) -> u64 {
@@ -82,6 +90,7 @@ impl Batcher {
         for (key, points) in series {
             if self.waiting_points + points.len() > WAITING_POINTS {
                 self.dropped += points.len() as u64;
+                self.left_points += points.len() as u64;
                 continue;
             }
             self.waiting_points += points.len();
@@ -100,6 +109,7 @@ impl Batcher {
             let n = record_bytes(&r);
             if self.log_bytes + n > WAITING_LOG_BYTES {
                 self.dropped += 1;
+                self.left_log_bytes += n as u64;
                 continue;
             }
             self.log_bytes += n;
@@ -108,11 +118,9 @@ impl Batcher {
         }
     }
 
-    /// Whether this node is too far behind to take more: three quarters of what may wait, waiting.
-    /// An OTLP request is then answered 503, which its exporter retries, rather than taken and
-    /// dropped.
-    pub fn busy(&self) -> bool {
-        self.waiting_points > WAITING_POINTS / 4 * 3 || self.log_bytes > WAITING_LOG_BYTES / 4 * 3
+    /// Points and log bytes that have left what waits: see `left_points`.
+    pub fn left(&self) -> (u64, u64) {
+        (self.left_points, self.left_log_bytes)
     }
 
     /// Points and records waiting, and whether a write is out.
@@ -170,6 +178,7 @@ impl Batcher {
             let room = (ENTRY_BUDGET / 2).saturating_sub(self.builder.byte_len()) / 16;
             let rest = if points.len() > room.max(1) { points.split_off(room.max(1)) } else { Vec::new() };
             self.waiting_points = self.waiting_points.saturating_sub(points.len());
+            self.left_points += points.len() as u64;
             let defined = self.known.get(&fp).is_some_and(|t| now.duration_since(*t) < DEFINED_FOR);
             if !defined {
                 self.builder.define(&key);
@@ -194,6 +203,7 @@ impl Batcher {
             bytes += n;
             if let Some(r) = self.logs.pop_front() {
                 self.log_bytes = self.log_bytes.saturating_sub(n);
+                self.left_log_bytes += n as u64;
                 take.push(r);
             }
         }
@@ -234,7 +244,10 @@ impl Batcher {
                 self.known.remove(fp);
             }
             let again: Vec<(SeriesKey, Vec<(i64, f64)>)> = out.series.into_iter().filter(|(k, _)| outcome.unknown.contains(&k.fp)).collect();
+            // They wait again: their room is taken again (what `series` drops leaves again).
+            let back: u64 = again.iter().map(|(_, p)| p.len() as u64).sum();
             self.series(again, now);
+            self.left_points = self.left_points.saturating_sub(back);
         }
         // Refused and past the bound: those points go, counted.
         self.dropped += (outcome.refused.len() + outcome.over_limit.len()) as u64;
