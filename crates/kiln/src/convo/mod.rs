@@ -3,5 +3,7 @@
 //! resumed on another machine, and found again.
 //!
 //! - [`rows`]: what a session's updates become in the store (no engine in sight).
+//! - [`store`]: a machine's store, its writer thread, and the tee that feeds it from the sessions.
 
 pub mod rows;
+pub mod store;
