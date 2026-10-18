@@ -1,4 +1,4 @@
-//! Moving an agent session to another runner, as the server sees to it (`docs/reach.md` §9).
+//! Moving an agent session to another runner, as the server sees to it (`docs/reach.md` §8).
 //!
 //! The server checks the runner it goes to (connected, the same harness installed, reach on both
 //! ends), then sees to the folder: a session working in a git repository goes on in that

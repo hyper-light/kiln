@@ -1,4 +1,4 @@
-//! An agent session moving to another runner (`docs/reach.md` §9): what goes, and how it is
+//! An agent session moving to another runner (`docs/reach.md` §8): what goes, and how it is
 //! taken over there.
 //!
 //! The runner the session is on packs it once its turn is over ([`pack`]): the harness's own
