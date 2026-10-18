@@ -177,9 +177,9 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
-| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; `kiln://` and the other built-ins left |
+| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
-| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; environments, actions' declared secrets, the other stores, UI left |
+| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
@@ -2145,13 +2145,20 @@ Gives step execution for `uses:`.
     `GET /api/ci/actions?q=` (R12).
   - Verified end to end from a GitHub workflow: a sparse checkout held only what it asked for,
     and `kiln/test-results@v1` failed on a failed test with its counts as outputs.
+- *Done.* R11, kiln action metadata:
+  - **Recorded.** At run start each action's `secrets:`, `requires:` and `permissions:` are read
+    and kept with its pin.
+  - **`secrets:`** (W09-R07): checked, delivered, and alone visible inside the action.
+  - **`requires:`** joins the leg's routing constraints (W05-R22).
+  - **`permissions:`** above what the job grants fail the leg with `KCI4031`, which names the
+    scope and the grant to add.
+  - Verified end to end: an action needing `deployments: write`, used by a job that grants none.
 - *Left.*
   - R01's `kiln://`.
   - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
     tarballs in W08's store (today they are files under `<data>/actions/tar`).
   - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
-    `kiln/auth`, `kiln/deploy`, `kiln/attest`, `kiln/upload` and `kiln/download`,
-    each with its workstream; R11.
+    `kiln/deploy`, `kiln/attest`, `kiln/upload` and `kiln/download`, each with its workstream.
   - musl Node for Alpine job containers, with W13.
   - AC01 to AC06.
 
@@ -2504,9 +2511,22 @@ and masking), names to the editor's completion (W21; names only).
   - **Verified end to end:** a secret brokered from a Cloudflare integration reached the leg
     masked. One from Secrets Manager, through an AWS role that doesn't trust this server, left a
     warning naming AWS's refusal. A `vault:` source was refused when set.
+- *Done.* R07, kiln actions' declared secrets:
+  - **Recorded at run start.** When a run starts, each action's `secrets:` (with W07-R11's
+    `requires:` and `permissions:`) is read from its `action.yml` and kept with the pinned
+    action.
+  - **Checked.** A required one that doesn't resolve for the job using the action fails the run
+    then, with `KCI4040`. The message names the action, the job, the name `with-secrets` maps it
+    to, the scopes searched, and how to add it.
+  - **Delivered.** The leg gets the job's secrets those declarations read.
+  - **Seen inside.** Inside the action, `secrets` is exactly its declarations: each the job's
+    secret of that name, or the one `with-secrets` maps. The job's are back after it.
+  - **Verified end to end:**
+    - an action declaring `DEPLOY_KEY`, mapped from `PROD_DEPLOY_KEY`, read it (masked) and saw
+      nothing of the job's undeclared `OTHER`, which the job's own step read;
+    - a mapping to an unset secret failed the run at start with `KCI4040`.
 - *Left.*
   - Environment secrets after approval, `SecretsFor` (R04, AC07), with W15.
-  - R07 (kiln actions' declared secrets).
   - R08's other stores: Vault, Infisical, Doppler, 1Password (their integration kinds first).
   - The UI (W21).
   - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
