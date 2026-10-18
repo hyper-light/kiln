@@ -130,6 +130,10 @@ pub enum AgentMsg {
     /// `false` and the server never upgrades it, whatever its policy there. Sent on every
     /// (re)connect, and when it changes. Appended last: postcard encodes variants by index.
     UpdatePrefs { accept: bool },
+    /// This machine's battery (JSON [`crate::os::battery::Battery`]), when it has one: sent when it
+    /// changes, and every 10 minutes. A machine on battery sleeps when it runs out, and its runner
+    /// with it; the server says so first. Appended last: postcard encodes variants by index.
+    Power { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].

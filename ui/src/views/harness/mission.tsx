@@ -27,6 +27,7 @@ import { DEFAULT_VIEW, isFiltered, ListBar, useShownList, type ListView } from "
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
+import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
@@ -335,10 +336,16 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
     const r = runners.find((x) => x.name === machine);
     return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S ? [{ machine, count, since: r.last_seen }] : [];
   });
-  if (gone.length === 0) return null;
   const others = runners.filter((r) => r.connected && !r.ephemeral && !r.outpost).map((r) => r.name);
+  // A machine on battery that is low: its agents stop when it sleeps.
+  const agentsOn = (m: string) => {
+    const n = rows.filter(({ a, stand }) => stand !== "ended" && a.target !== "local" && machineName(a.target) === m).length;
+    return n > 0 ? `its ${n} agent${n === 1 ? "" : "s"}` : "";
+  };
+  if (gone.length === 0) return <LowBattery agents={runners} what={agentsOn} />;
   return (
     <>
+      <LowBattery agents={runners} what={agentsOn} />
       {gone.map((g) => (
         <RecoverMachine key={g.machine} {...g} others={others} />
       ))}
