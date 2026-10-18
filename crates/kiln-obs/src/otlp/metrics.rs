@@ -22,6 +22,7 @@ use hashbrown::HashTable;
 
 use super::pb::{Fields, PbError, doubles, fixed64s, varints};
 use crate::batch::{Kind, MAX_NAME_BYTES, MAX_TAGS, SeriesKey, put_canonical_head, put_canonical_tag};
+use crate::dist::{self, Bucket};
 use crate::hash::Keyed;
 
 /// OTLP's flag on a point that carries no value (`DataPointFlags.FLAG_NO_RECORDED_VALUE_MASK`).
@@ -106,7 +107,33 @@ const KEY_BYTES_MAX: usize = 64 << 20;
 pub struct Keys {
     hash: Keyed,
     shards: Vec<Mutex<Shard>>,
+    /// When the receiver began (Unix ns): a cumulative distribution begun after it is new to it.
+    started_ns: u64,
+    /// Cumulative distributions' last buckets, to give each next point's as a delta.
+    cumulative: Vec<Mutex<CumShard>>,
 }
+
+/// A cumulative distribution's last buckets by its series' hash: the OpenTelemetry Collector's
+/// `cumulativetodelta` (and the Datadog Agent's) for distributions, whose buckets, each a series of
+/// its own, would otherwise lose the counts of a bucket's first appearance (a series' first point
+/// has no increase). It holds as long as an exporter's series come to one receiver, as an app's to
+/// its runner's on its machine.
+#[derive(Default)]
+struct CumShard {
+    last: std::collections::HashMap<u64, Cum>,
+    bytes: usize,
+}
+
+struct Cum {
+    start_ns: u64,
+    at_ns: u64,
+    scale: i32,
+    buckets: Vec<(Bucket, u64)>,
+}
+
+/// What the cumulative distributions' state may hold, all shards: past a shard's share it starts
+/// again (each series then loses one interval).
+const CUMULATIVE_BYTES: usize = 32 << 20;
 
 #[derive(Default)]
 struct Shard {
@@ -127,7 +154,83 @@ fn key_hash(h: &Keyed, key: &[u8], kind: Kind) -> u64 {
 
 impl Keys {
     pub fn new() -> Self {
-        Self { hash: Keyed::new(), shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect() }
+        let started_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        Self::started_at(started_ns)
+    }
+
+    /// Keys of a receiver begun at `started_ns` (Unix ns).
+    pub fn started_at(started_ns: u64) -> Self {
+        Self { hash: Keyed::new(), shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(), started_ns, cumulative: (0..SHARDS).map(|_| Mutex::new(CumShard::default())).collect() }
+    }
+
+    /// A cumulative distribution's point (`buckets` at `scale`) as the delta since its last:
+    /// into `out`, none when it is the first this receiver has of a series begun before it (what
+    /// came before it is not known) or a point it has had.
+    fn delta(&self, id: u64, start_ns: u64, at_ns: u64, scale: i32, buckets: &[(Bucket, u64)], out: &mut Vec<(Bucket, u64)>) {
+        out.clear();
+        let Some(shard) = self.cumulative.get((id >> 60) as usize % SHARDS) else { return };
+        let mut guard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+        let CumShard { last: kept, bytes: held } = &mut *guard;
+        let entry = |scale: i32| Cum { start_ns, at_ns, scale, buckets: buckets.to_vec() };
+        let new_bytes = buckets.len() * std::mem::size_of::<(Bucket, u64)>() + std::mem::size_of::<Cum>();
+        match kept.get_mut(&id) {
+            Some(c) if c.start_ns == start_ns && at_ns <= c.at_ns => {}
+            Some(c) if c.start_ns == start_ns && scale <= c.scale => {
+                // The last at this point's scale (an SDK only ever makes a cumulative one coarser),
+                // each bucket's increase; a fall anywhere is a reset: all of it is new.
+                let k = u32::try_from(c.scale - scale).unwrap_or(0);
+                let mut last: Vec<(Bucket, u64)> = Vec::with_capacity(c.buckets.len());
+                for &(b, n) in &c.buckets {
+                    let b = b.coarser(k);
+                    match last.last_mut() {
+                        Some((l, m)) if *l == b => *m = m.saturating_add(n),
+                        _ => last.push((b, n)),
+                    }
+                }
+                let mut fell = false;
+                let mut j = 0;
+                for &(b, n) in buckets {
+                    while last.get(j).is_some_and(|(l, _)| l.order() < b.order()) {
+                        fell = true;
+                        j += 1;
+                    }
+                    let before = match last.get(j) {
+                        Some(&(l, m)) if l == b => {
+                            j += 1;
+                            m
+                        }
+                        _ => 0,
+                    };
+                    if n < before {
+                        fell = true;
+                    }
+                    if n > before {
+                        out.push((b, n - before));
+                    }
+                }
+                if fell || j < last.len() {
+                    out.clear();
+                    out.extend_from_slice(buckets);
+                }
+                *held = held.saturating_sub(c.buckets.len() * std::mem::size_of::<(Bucket, u64)>()).saturating_add(buckets.len() * std::mem::size_of::<(Bucket, u64)>());
+                *c = entry(scale);
+            }
+            _ => {
+                // First seen here, or begun again: what it holds is new if it began after this
+                // receiver did.
+                if start_ns >= self.started_ns {
+                    out.extend_from_slice(buckets);
+                }
+                if held.saturating_add(new_bytes) > CUMULATIVE_BYTES / SHARDS {
+                    kept.clear();
+                    *held = 0;
+                }
+                if let Some(old) = kept.insert(id, entry(scale)) {
+                    *held = held.saturating_sub(old.buckets.len() * std::mem::size_of::<(Bucket, u64)>() + std::mem::size_of::<Cum>());
+                }
+                *held += new_bytes;
+            }
+        }
     }
 
     /// The key of `key`'s bytes and `kind` (`h`, their hash): found, or made by `make` (outside
@@ -183,9 +286,23 @@ struct Sink<'a, 'k> {
     /// A histogram point's counts and bounds, a summary point's quantiles.
     counts: Vec<u64>,
     bounds: Vec<f64>,
+    /// An exponential histogram point's buckets, coarsened, and a cumulative one's delta.
+    buckets: Vec<(Bucket, u64)>,
+    delta: Vec<(Bucket, u64)>,
 }
 
 impl<'a> Sink<'a, '_> {
+    /// The series the point's tags make of `metric`, as its canonical key's hash: what a cumulative
+    /// distribution's state is kept by.
+    fn identity(&mut self, metric: &str) -> u64 {
+        let Self { keys, tags, key, .. } = self;
+        put_canonical_head(key, metric, tags.len());
+        for (k, v) in tags.iter() {
+            put_canonical_tag(key, k, v);
+        }
+        key_hash(&keys.hash, key, Kind::Count)
+    }
+
     /// A point's attribute (a `KeyValue`), for [`Sink::merge`].
     fn attr(&mut self, kv: &'a [u8]) -> Result<(), OtlpError> {
         if let Some(t) = key_value_ref(kv)? {
@@ -313,7 +430,7 @@ pub fn decode_into(body: &[u8], now_ms: i64, keys: &Keys, out: &mut Decoded) -> 
     d.samples.reserve(body.len() / 32);
     let Scratch { mut found, key, counts, bounds } = std::mem::take(&mut d.scratch);
     found.clear();
-    let mut sink = Sink { out: d, keys, found, attrs: Vec::new(), tags: Vec::new(), key, counts, bounds };
+    let mut sink = Sink { out: d, keys, found, attrs: Vec::new(), tags: Vec::new(), key, counts, bounds, buckets: Vec::new(), delta: Vec::new() };
     let mut read = || -> Result<(), OtlpError> {
         for f in Fields::new(body) {
             let (n, w) = f?;
@@ -377,7 +494,8 @@ struct Derived {
     min: String,
     max: String,
     each: String,
-    quantiles: [String; 4],
+    /// A distribution's buckets' (`crate::dist`).
+    dist: String,
     labels_of: Vec<f64>,
     labels: Vec<String>,
 }
@@ -390,7 +508,7 @@ impl Derived {
             min: format!("{name}.min"),
             max: format!("{name}.max"),
             each: format!("{name}.{each}"),
-            quantiles: ["p50", "p90", "p95", "p99"].map(|q| format!("{name}.{q}")),
+            dist: format!("{name}{}", dist::SUFFIX),
             labels_of: Vec::new(),
             labels: Vec::new(),
         }
@@ -538,13 +656,14 @@ fn histogram_point<'a>(msg: &'a [u8], d: &mut Derived, resource: &[Tag<'a>], cou
 }
 
 fn exponential_point<'a>(msg: &'a [u8], d: &mut Derived, resource: &[Tag<'a>], count_kind: Kind, now_ms: i64, sink: &mut Sink<'a, '_>) -> Result<(), OtlpError> {
-    let (mut t, mut flags) = (0u64, 0u64);
+    let (mut t, mut start, mut flags) = (0u64, 0u64, 0u64);
     let (mut count, mut sum, mut min, mut max, mut scale, mut zero) = (None, None, None, None, 0i64, 0u64);
     let (mut pos_off, mut pos, mut neg_off, mut neg) = (0i64, Vec::new(), 0i64, Vec::new());
     sink.attrs.clear();
     for f in Fields::new(msg) {
         match f? {
             (1, w) => sink.attr(w.bytes().unwrap_or(&[]))?,
+            (2, w) => start = w.u64().unwrap_or(0),
             (3, w) => t = w.u64().unwrap_or(0),
             (4, w) => count = w.u64(),
             (5, w) => sum = w.f64(),
@@ -577,12 +696,24 @@ fn exponential_point<'a>(msg: &'a [u8], d: &mut Derived, resource: &[Tag<'a>], c
     if let Some(v) = max {
         sink.point(&d.max, None, Kind::Gauge, ts, v);
     }
-    let h = ExpHist { scale: scale.clamp(-10, 20) as i32, zero, pos_off, pos: &pos, neg_off, neg: &neg };
-    for (name, q) in d.quantiles.iter().zip([0.50, 0.90, 0.95, 0.99]) {
-        if let Some(v) = h.quantile(q) {
-            sink.point(name, None, Kind::Gauge, ts, v);
-        }
+    // Its buckets, a distribution's: each a count of its interval, a series of its own, merged with
+    // others' and read as percentiles at query time (`crate::dist`).
+    let mut buckets = std::mem::take(&mut sink.buckets);
+    let at = dist::coarsened(i32::try_from(scale).unwrap_or(0), zero, pos_off, &pos, neg_off, &neg, &mut buckets);
+    let mut delta = std::mem::take(&mut sink.delta);
+    let counts: &[(Bucket, u64)] = if count_kind == Kind::Counter {
+        let id = sink.identity(&d.dist);
+        sink.keys.delta(id, start, t.max(1), at, &buckets, &mut delta);
+        &delta
+    } else {
+        &buckets
+    };
+    for &(b, n) in counts {
+        let tag = dist::tag_value(at, b);
+        sink.point(&d.dist, Some((dist::BUCKET_TAG, &tag)), Kind::Count, ts, n as f64);
     }
+    sink.buckets = buckets;
+    sink.delta = delta;
     Ok(())
 }
 
@@ -597,48 +728,6 @@ fn buckets(msg: &[u8], offset: &mut i64, counts: &mut Vec<u64>) -> Result<(), Ot
     Ok(())
 }
 
-/// An exponential histogram (OTel's `ExponentialHistogramDataPoint`).
-pub struct ExpHist<'a> {
-    pub scale: i32,
-    pub zero: u64,
-    pub pos_off: i64,
-    pub pos: &'a [u64],
-    pub neg_off: i64,
-    pub neg: &'a [u64],
-}
-
-impl ExpHist<'_> {
-    /// The `q` quantile (0–1): the bucket holding the rank's, at its midpoint in log space
-    /// (γ^(i+½), which bounds the relative error by (γ−1)/(γ+1)), negative buckets mirrored.
-    pub fn quantile(&self, q: f64) -> Option<f64> {
-        let total = self.pos.iter().chain(self.neg).fold(self.zero, |a, &c| a.saturating_add(c));
-        if total == 0 || !(0.0..=1.0).contains(&q) {
-            return None;
-        }
-        let rank = (q * (total - 1) as f64).floor() as u64;
-        let gamma_log2 = (2f64).powi(-self.scale);
-        let mid = |i: i64| (((i as f64) + 0.5) * gamma_log2).exp2();
-        // Ascending: the largest magnitudes of the negatives first, then zero, then positives.
-        let mut seen = 0u64;
-        for (j, &c) in self.neg.iter().enumerate().rev() {
-            seen = seen.saturating_add(c);
-            if rank < seen {
-                return Some(-mid(self.neg_off + j as i64));
-            }
-        }
-        seen = seen.saturating_add(self.zero);
-        if rank < seen {
-            return Some(0.0);
-        }
-        for (j, &c) in self.pos.iter().enumerate() {
-            seen = seen.saturating_add(c);
-            if rank < seen {
-                return Some(mid(self.pos_off + j as i64));
-            }
-        }
-        None
-    }
-}
 
 fn summary_point<'a>(msg: &'a [u8], d: &mut Derived, resource: &[Tag<'a>], now_ms: i64, sink: &mut Sink<'a, '_>) -> Result<(), OtlpError> {
     let (mut t, mut flags, mut count, mut sum) = (0u64, 0u64, None, None);
@@ -1077,39 +1166,97 @@ mod tests {
         assert_eq!(find(&d, "latency.bucket", Some(("le", "1"))).1[0].1, 2.0);
         assert_eq!(find(&d, "latency.bucket", Some(("le", "10"))).1[0].1, 7.0);
         assert_eq!(find(&d, "latency.bucket", Some(("le", "+Inf"))).1[0].1, 10.0);
-        // All 100 in the bucket (8, 16] at scale 0: every quantile its log-midpoint, 2^3.5.
-        let p50 = find(&d, "size.p50", None).1[0].1;
-        assert!((p50 - 2f64.powf(3.5)).abs() < 1e-9, "{p50}");
+        // All 100 in the bucket (8, 16] at scale 0: a distribution's bucket, its count.
+        assert_eq!(find(&d, "size.dist", Some((dist::BUCKET_TAG, "0:p3"))).1, vec![(1_700_000_000_000, 100.0)]);
         assert_eq!(find(&d, "rpc.quantile", Some(("quantile", "0.99"))).1[0].1, 9.5);
         assert_eq!(find(&d, "rpc.count", None).1[0].1, 7.0);
     }
 
+    /// One exponential histogram point of `lat` (host `h`): its temporality, start and time (ns),
+    /// scale, positive buckets from `pos.0` and negative ones from `neg.0`.
+    fn exponential(cumulative: bool, start: u64, t: u64, scale: i64, pos: (i64, &[u64]), neg: (i64, &[u64])) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.message(1, |rm| {
+            rm.message(1, |r| kv(r, 1, "host.name", "h"));
+            rm.message(2, |sm| {
+                sm.message(2, |m| {
+                    m.str(1, "lat");
+                    m.message(10, |h| {
+                        h.message(1, |p| {
+                            p.fixed64(2, start);
+                            p.fixed64(3, t);
+                            p.fixed64(4, pos.1.iter().chain(neg.1).sum());
+                            p.varint(6, crate::varint::zig(scale));
+                            p.message(8, |b| {
+                                b.varint(1, crate::varint::zig(pos.0));
+                                for &c in pos.1 {
+                                    b.varint(2, c);
+                                }
+                            });
+                            p.message(9, |b| {
+                                b.varint(1, crate::varint::zig(neg.0));
+                                for &c in neg.1 {
+                                    b.varint(2, c);
+                                }
+                            });
+                        });
+                        h.varint(2, if cumulative { 2 } else { 1 });
+                    });
+                });
+            });
+        });
+        w.buf
+    }
+
+    /// A decoding's distribution buckets: each bucket's tag and its counts' sum, ascending by value.
+    fn dist_buckets(d: &Decoded) -> Vec<(String, f64)> {
+        let mut out: Vec<(crate::dist::Bucket, String, f64)> = d
+            .series()
+            .into_iter()
+            .filter_map(|(k, pts)| {
+                let p = crate::batch::parse_key(&k.key).ok()?;
+                let tag = p.tags.iter().find(|(tk, _)| *tk == dist::BUCKET_TAG)?.1.to_owned();
+                (p.metric == "lat.dist").then(|| (dist::parse_tag_value(&tag).unwrap().1, tag, pts.iter().map(|x| x.1).sum()))
+            })
+            .collect();
+        out.sort_by_key(|(b, _, _)| b.order());
+        out.into_iter().map(|(_, t, n)| (t, n)).collect()
+    }
+
+    /// An exponential histogram's buckets are a distribution's: each a series, its count an
+    /// interval's, coarsened to scale 5 at the finest; a cumulative one's the increase since its
+    /// last point, and nothing for its first when it began before the receiver did (what came
+    /// before is not known); a fall, or a new start, is all of it anew.
     #[test]
-    fn exponential_histogram_quantiles_stay_within_their_relative_error() {
-        // Values 1..=1000 into scale-4 buckets: each quantile within (γ−1)/(γ+1) of the true one.
-        let scale = 4;
-        let gamma_log2 = (2f64).powi(-scale);
-        let mut pos = vec![0u64; 0];
-        let mut off = i64::MAX;
-        let idx = |v: f64| ((v.log2() / gamma_log2).ceil() as i64) - 1;
-        for v in 1..=1000 {
-            off = off.min(idx(v as f64));
-        }
-        for v in 1..=1000 {
-            let i = (idx(v as f64) - off) as usize;
-            if pos.len() <= i {
-                pos.resize(i + 1, 0);
-            }
-            pos[i] += 1;
-        }
-        let h = ExpHist { scale, zero: 0, pos_off: off, pos: &pos, neg_off: 0, neg: &[] };
-        let gamma = 2f64.powf(gamma_log2);
-        let bound = (gamma - 1.0) / (gamma + 1.0);
-        for q in [0.5, 0.9, 0.95, 0.99] {
-            let truth = (q * 999.0f64).floor() + 1.0;
-            let got = h.quantile(q).unwrap();
-            assert!(((got - truth) / truth).abs() <= bound + 1e-12, "q {q}: {got} vs {truth}, bound {bound}");
-        }
+    fn exponential_histograms_are_distributions_each_bucket_an_interval_s_count() {
+        let decode = |b: &[u8], keys: &Keys| decode_with(b, 0, keys).unwrap();
+        let tagged = |v: &[(&str, f64)]| v.iter().map(|(t, n)| ((*t).to_owned(), *n)).collect::<Vec<_>>();
+        // Delta at scale 7: buckets 40..44 are 10, 10, 10, 10 and 11 at scale 5 (i >> 2), counts summed;
+        // negatives ascending by value (bucket n11's values below n10's).
+        let keys = Keys::started_at(1_000);
+        let d = decode(&exponential(false, 0, 2_000_000_000, 7, (40, &[1, 2, 3, 4, 5]), (40, &[6, 0, 0, 0, 7])), &keys);
+        assert_eq!(dist_buckets(&d), tagged(&[("5:n11", 7.0), ("5:n10", 6.0), ("5:p10", 10.0), ("5:p11", 5.0)]));
+        // Cumulative, begun before the receiver: the first point tells nothing of an interval.
+        let keys = Keys::started_at(10_000_000_000);
+        let start = 5_000_000_000;
+        let first = decode(&exponential(true, start, 20_000_000_000, 3, (8, &[2, 5]), (2, &[1])), &keys);
+        assert!(dist_buckets(&first).is_empty());
+        assert_eq!(find(&first, "lat.count", None).0.kind, Kind::Counter, "the count, a counter as it was");
+        // The next: each bucket's increase, a bucket new to it whole.
+        let second = decode(&exponential(true, start, 30_000_000_000, 3, (8, &[3, 9, 1]), (2, &[4])), &keys);
+        assert_eq!(dist_buckets(&second), tagged(&[("3:n2", 3.0), ("3:p8", 1.0), ("3:p9", 4.0), ("3:p10", 1.0)]));
+        // The same point again (sent twice): nothing.
+        assert!(dist_buckets(&decode(&exponential(true, start, 30_000_000_000, 3, (8, &[3, 9, 1]), (2, &[4])), &keys)).is_empty());
+        // Coarser (the SDK widened its range): the last made as coarse (p8 and p9 are p4 at scale 2,
+        // 12; p10 is p5; n2 is n1), then the increase.
+        let coarser = decode(&exponential(true, start, 40_000_000_000, 2, (4, &[14, 1]), (1, &[5])), &keys);
+        assert_eq!(dist_buckets(&coarser), tagged(&[("2:n1", 1.0), ("2:p4", 2.0)]));
+        // A fall with no new start (a reset): all of it, anew.
+        let fell = decode(&exponential(true, start, 50_000_000_000, 2, (4, &[2]), (1, &[])), &keys);
+        assert_eq!(dist_buckets(&fell), tagged(&[("2:p4", 2.0)]));
+        // Begun again, after the receiver: its first point is all new.
+        let again = decode(&exponential(true, 45_000_000_000, 60_000_000_000, 2, (4, &[1]), (1, &[])), &keys);
+        assert_eq!(dist_buckets(&again), tagged(&[("2:p4", 1.0)]));
     }
 
     #[test]

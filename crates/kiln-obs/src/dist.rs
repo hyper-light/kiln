@@ -8,8 +8,7 @@
 //! is bucket `i >> k` at scale `s - k` (the floor of `i / 2^k`): histograms of different scales merge
 //! exactly at the coarser one. Kiln keeps a distribution's buckets at scale [`SCALE`] at the finest.
 //!
-//! Each bucket is a series of its own (`<metric>.dist{dist_scale:5,dist_bucket:p37}`, its count an
-//! interval), summed across series and time as any count is, and a percentile is read from the
+//! Each bucket is a series of its own (`<metric>.dist{dist_bucket:5:p37}`, its count an interval), summed across series and time as any count is, and a percentile is read from the
 //! merged counts at query time: the bucket holding the rank, at its geometric middle,
 //! `base^(i+½)`, within `(√base - 1)` of any value in it (1.09% at scale 5; Datadog's distributions
 //! promise 1%).
@@ -23,8 +22,8 @@ pub const SCALE: i32 = 5;
 /// The coarsest scale an SDK may send that kiln keeps as it came (OTel's least is -10).
 pub const MIN_SCALE: i32 = -10;
 
-/// The tags a bucket's series carries: its scale, and which bucket (`p<i>`, `n<i>`, `z`).
-pub const SCALE_TAG: &str = "dist_scale";
+/// The tag a bucket's series carries: its scale and which bucket, `<scale>:<bucket>` (`5:p37`,
+/// `5:n4`, `5:z`).
 pub const BUCKET_TAG: &str = "dist_bucket";
 /// The suffix of a distribution's buckets' metric.
 pub const SUFFIX: &str = ".dist";
@@ -67,8 +66,9 @@ impl Bucket {
         }
     }
 
-    /// Ascending by value: the negatives' larger magnitudes first, then zero, then the positives.
-    fn order(self) -> (u8, i64) {
+    /// Its place ascending by value: the negatives' larger magnitudes first, then zero, then the
+    /// positives (the derived order is the variants' and indices', not the values').
+    pub fn order(self) -> (u8, i64) {
         match self {
             Self::Neg(i) => (0, i.saturating_neg()),
             Self::Zero => (1, 0),
@@ -95,6 +95,44 @@ impl Bucket {
             Self::Zero => (0.0, 0.0),
         }
     }
+}
+
+/// A bucket's tag value: its scale and the bucket.
+pub fn tag_value(scale: i32, b: Bucket) -> String {
+    format!("{scale}:{}", b.tag())
+}
+
+/// [`tag_value`]'s inverse.
+pub fn parse_tag_value(s: &str) -> Option<(i32, Bucket)> {
+    let (scale, b) = s.split_once(':')?;
+    let scale: i32 = scale.parse().ok().filter(|s| (MIN_SCALE..=SCALE).contains(s))?;
+    Some((scale, Bucket::parse(b)?))
+}
+
+/// An exponential histogram's buckets at `scale` coarsened to at most [`SCALE`]: each with its
+/// count, in order, those of none left out, and the scale they are at.
+pub fn coarsened(scale: i32, zero: u64, pos_off: i64, pos: &[u64], neg_off: i64, neg: &[u64], out: &mut Vec<(Bucket, u64)>) -> i32 {
+    let to = scale.clamp(MIN_SCALE, SCALE);
+    let k = u32::try_from(scale.clamp(MIN_SCALE, 20) - to).unwrap_or(0);
+    out.clear();
+    let mut put = |b: Bucket, c: u64| {
+        if c == 0 {
+            return;
+        }
+        match out.last_mut() {
+            Some((last, n)) if *last == b => *n = n.saturating_add(c),
+            _ => out.push((b, c)),
+        }
+    };
+    // Ascending by value: negatives from the largest magnitude down.
+    for (j, &c) in neg.iter().enumerate().rev() {
+        put(Bucket::Neg(neg_off.saturating_add(j as i64)).coarser(k), c);
+    }
+    put(Bucket::Zero, zero);
+    for (j, &c) in pos.iter().enumerate() {
+        put(Bucket::Pos(pos_off.saturating_add(j as i64)).coarser(k), c);
+    }
+    to
 }
 
 /// The bucket `v` falls in at `scale` (OTel's mapping: `base^i < |v| ≤ base^(i+1)`).
