@@ -152,7 +152,15 @@ pub(crate) async fn ensure_commit(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::
     Ok(path)
 }
 
-/// Every `.kiln/*.yml|yaml` at `sha`, parsed. Parse failures are returned per file.
+/// kiln's configuration files under `.kiln/`, which aren't pipelines: deployments
+/// (docs/cd.md, docs/cd-targets.md), environments (docs/ci.md W15) and review (W14).
+fn is_config(file: &str) -> bool {
+    let stem = file.trim_start_matches(".kiln/").trim_end_matches(".yaml").trim_end_matches(".yml");
+    matches!(stem, "deploy" | "environments" | "review")
+}
+
+/// Every `.kiln/*.yml|yaml` at `sha` that is a pipeline, parsed. Parse failures are returned per
+/// file.
 pub async fn load_pipelines(
     hub: &Hub,
     repo: &Repo,
@@ -176,7 +184,7 @@ async fn load_pipelines_opt(
         .unwrap_or_default();
     let mut out = Vec::new();
     for file in String::from_utf8_lossy(&listing).lines() {
-        if !(file.ends_with(".yml") || file.ends_with(".yaml")) {
+        if !(file.ends_with(".yml") || file.ends_with(".yaml")) || is_config(file) {
             continue;
         }
         let src = run_git(hub, &["-C", &p, "show", &format!("{sha}:{file}")], LS_REMOTE_TIMEOUT).await?;

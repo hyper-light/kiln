@@ -50,6 +50,150 @@ pub struct AppDef {
     pub cascade: bool,
     /// Labels and annotations for a namespace it creates (`CreateNamespace=true`).
     pub managed_namespace: Option<ManagedNamespace>,
+    /// What it deploys that CI built (docs/cd-targets.md §1.3): images by name, resolved for each
+    /// revision to a digest, read in its sources as `${{ artifacts.<name> }}`.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, ArtifactSpec>,
+}
+
+/// An artifact an app deploys: an image, resolved for each revision to an immutable digest
+/// (docs/cd-targets.md §1.3, §7). Its fields may read `${{ git.sha }}` and `${{ git.short_sha }}`:
+/// they are the app's revision when it resolves, so a rollback deploys that revision's image.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ArtifactSpec {
+    /// The image: `docker.io/acme/kiln:${{ git.sha }}`, or a name with `tag` below.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image: String,
+    /// Instead of `image`: an image kiln publishes under this name, built by `pipeline` at each
+    /// commit. Where it lives (the local Docker that builds it, loaded into the cluster's nodes,
+    /// or a registry) is a server setting (Settings → Deployments → Images).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<String>,
+    /// The pipeline that builds a published image (default `image`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// Its tag, when `image` carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// The registry integration it is pulled with (by default the one set up for its registry, or
+    /// none: anonymously).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    /// A Secret (`kubernetes.io/dockerconfigjson`) kiln keeps beside the app with the registry's
+    /// credentials, to name in `imagePullSecrets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_secret: Option<String>,
+    /// Platforms its index must hold (`linux/amd64`): a revision whose image lacks one waits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+}
+
+impl ArtifactSpec {
+    /// The reference to resolve for `revision` (its `git.*` filled in).
+    pub fn reference(&self, revision: &str) -> String {
+        let mut scope = Scope::default();
+        scope.set("git.sha", Value::String(revision.to_owned()));
+        scope.set("git.short_sha", Value::String(revision.chars().take(7).collect()));
+        let image = scope.interpolate(&self.image);
+        match self.tag.as_deref().map(|t| scope.interpolate(t)).filter(|t| !t.is_empty()) {
+            Some(t) => format!("{image}:{t}"),
+            None => image,
+        }
+    }
+}
+
+/// An artifact as one revision resolved it.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    /// Its name in the app.
+    pub name: String,
+    /// The image pinned: `docker.io/acme/kiln@sha256:…`.
+    pub reference: String,
+    /// `docker.io/acme/kiln`.
+    pub repository: String,
+    /// The tag it was resolved from.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// `sha256:…`.
+    pub digest: String,
+}
+
+/// Replaces `${{ artifacts.<name> }}` (the pinned reference) and `${{ artifacts.<name>.digest }}`,
+/// `.repository` and `.tag` in `text`. A name no artifact has is an error, so a typo can't deploy
+/// an empty image.
+pub fn substitute_artifacts(text: &str, artifacts: &[ArtifactRef]) -> Result<String, DefError> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        out.push_str(rest.get(..start).unwrap_or(""));
+        let after = rest.get(start + 3..).unwrap_or("");
+        let Some(end) = after.find("}}") else {
+            out.push_str(rest.get(start..).unwrap_or(""));
+            return Ok(out);
+        };
+        let expr = after.get(..end).unwrap_or("").trim();
+        match expr.strip_prefix("artifacts.") {
+            Some(path) => {
+                let (name, field) = path.split_once('.').unwrap_or((path, ""));
+                let a = artifacts.iter().find(|a| a.name == name).ok_or_else(|| DefError(format!("`${{{{ {expr} }}}}`: the app has no artifact `{name}`")))?;
+                match field {
+                    "" | "reference" => out.push_str(&a.reference),
+                    "digest" => out.push_str(&a.digest),
+                    "repository" => out.push_str(&a.repository),
+                    "tag" => out.push_str(a.tag.as_deref().unwrap_or("")),
+                    other => return Err(DefError(format!("`${{{{ {expr} }}}}`: an artifact has no `{other}` (reference, digest, repository, tag)"))),
+                }
+            }
+            None => {
+                out.push_str("${{");
+                out.push_str(after.get(..end).unwrap_or(""));
+                out.push_str("}}");
+            }
+        }
+        rest = after.get(end + 2..).unwrap_or("");
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Fills `${{ artifacts.* }}` in every string of `v` (a rendered object, say).
+pub fn substitute_value(v: &mut Value, artifacts: &[ArtifactRef]) -> Result<(), DefError> {
+    match v {
+        Value::String(s) if s.contains("${{") => *s = substitute_artifacts(s, artifacts)?,
+        Value::Array(a) => {
+            for x in a {
+                substitute_value(x, artifacts)?;
+            }
+        }
+        Value::Object(m) => {
+            for x in m.values_mut() {
+                substitute_value(x, artifacts)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// An app's sources with its artifacts filled in, as a revision resolved them.
+pub fn with_artifacts(sources: &[Source], artifacts: &[ArtifactRef]) -> Result<Vec<Source>, DefError> {
+    let mut v = serde_json::to_value(sources).map_err(|e| DefError(format!("sources: {e}")))?;
+    substitute_value(&mut v, artifacts)?;
+    serde_json::from_value(v).map_err(|e| DefError(format!("sources: {e}")))
+}
+
+/// The Secret an artifact's `pull-secret` names: the registry's credentials as a Docker config.
+/// It goes first (wave -10), before anything that pulls with it.
+pub fn pull_secret(name: &str, namespace: &str, docker_config: &str) -> Value {
+    use base64::Engine as _;
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": name, "namespace": namespace, "annotations": { "argocd.argoproj.io/sync-wave": "-10" } },
+        "type": "kubernetes.io/dockerconfigjson",
+        "data": { ".dockerconfigjson": base64::engine::general_purpose::STANDARD.encode(docker_config) },
+    })
 }
 
 /// Labels and annotations for a created namespace.
@@ -476,6 +620,7 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
         history_limit: spec.get("revisionHistoryLimit").and_then(obj::as_i64).map(|n| n.clamp(0, 1000) as u32).unwrap_or(10),
         cascade,
         managed_namespace,
+        artifacts: BTreeMap::new(),
     })
 }
 
@@ -528,6 +673,9 @@ pub struct AppSpec {
     /// Labels.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Artifacts it deploys.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, ArtifactSpec>,
 }
 
 /// A source: a path, or more.
@@ -693,6 +841,22 @@ pub struct EnvironmentSpec {
     /// How long a revision must run healthy in `after` first.
     #[serde(default)]
     pub soak: Option<String>,
+    /// What agents may do in it (docs/cd-targets.md §6): nothing that changes what runs, unless
+    /// people say so.
+    #[serde(default)]
+    pub agents: AgentRights,
+}
+
+/// What agents may do in an environment. Off unless said (docs/cd-targets.md, D6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentRights {
+    /// Sync, roll back, take over and delete its apps.
+    #[serde(default)]
+    pub deploy: bool,
+    /// Approve what waits for approval there (ci.md W15's `agents-can-approve`).
+    #[serde(default)]
+    pub approve: bool,
 }
 
 /// What `${{ }}` in a deploy file can read.
@@ -731,8 +895,15 @@ impl Scope {
         Some(cur)
     }
 
-    /// Replaces every `${{ path }}` in `text`; unknown names are empty, as in pipelines.
+    /// Replaces every `${{ path }}` in `text`; unknown names are empty, as in pipelines. Only
+    /// `artifacts.*` is kept as written: it is known when a revision resolves, not when the file is
+    /// read.
     pub fn interpolate(&self, text: &str) -> String {
+        self.interpolate_keeping(text, &["artifacts"])
+    }
+
+    /// [`Self::interpolate`], keeping `${{ }}` whose first name is in `keep` as written.
+    pub fn interpolate_keeping(&self, text: &str, keep: &[&str]) -> String {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(start) = rest.find("${{") {
@@ -743,6 +914,14 @@ impl Scope {
                 return out;
             };
             let expr = after.get(..end).unwrap_or("");
+            let root = expr.trim().split('.').next().unwrap_or("");
+            if keep.contains(&root) {
+                out.push_str("${{");
+                out.push_str(expr);
+                out.push_str("}}");
+                rest = after.get(end + 2..).unwrap_or("");
+                continue;
+            }
             match self.lookup(expr) {
                 Some(Value::String(s)) => out.push_str(s),
                 Some(Value::Null) | None => {}
@@ -947,6 +1126,27 @@ fn app_from_spec(
         history_limit: 10,
         cascade: true,
         managed_namespace: None,
+        // `git.*` stays for the revision each resolves at (a rollback's, say); the rest (`env`,
+        // `app`) is known now.
+        artifacts: spec
+            .artifacts
+            .iter()
+            .map(|(n, a)| {
+                let k = |t: &str| scope.interpolate_keeping(t, &["git", "artifacts"]);
+                (
+                    n.clone(),
+                    ArtifactSpec {
+                        image: k(&a.image),
+                        published: a.published.as_deref().map(k),
+                        pipeline: a.pipeline.clone(),
+                        tag: a.tag.as_deref().map(k),
+                        registry: a.registry.as_deref().map(k),
+                        pull_secret: a.pull_secret.as_deref().map(k),
+                        platforms: a.platforms.clone(),
+                    },
+                )
+            })
+            .collect(),
     })
 }
 
@@ -1027,5 +1227,50 @@ apps:
         }
         assert!(from_deploy_file("apps: { x: { source: a, to: nowhere } }", "r", "main", &envs, &scope).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn artifacts_resolve_per_revision_and_fill_the_sources() -> Result<(), DefError> {
+        let text = r#"
+apps:
+  kiln:
+    source: deploy/helm/kiln
+    helm:
+      set: { image.repository: "${{ artifacts.image.repository }}", image.digest: "${{ artifacts.image.digest }}", image.ref: "${{ artifacts.image }}" }
+    artifacts:
+      image: { image: "docker.io/acme/kiln", tag: "${{ git.sha }}", registry: dockerhub, pull-secret: "kiln-${{ app.name }}" }
+    namespace: kiln
+"#;
+        let mut scope = Scope::default();
+        scope.set("git.sha", json!("1111111111111111111111111111111111111111"));
+        let apps = from_deploy_file(text, "hyper-light/kiln", "main", &BTreeMap::new(), &scope)?;
+        let app = apps.first().ok_or_else(|| DefError("no app".into()))?;
+        let a = app.artifacts.get("image").ok_or_else(|| DefError("no artifact".into()))?;
+        // `git.sha` waits for the revision; `app.name` is known when the file is read.
+        assert_eq!(a.tag.as_deref(), Some("${{ git.sha }}"));
+        assert_eq!(a.pull_secret.as_deref(), Some("kiln-kiln"));
+        assert_eq!(a.reference("2222222222222222222222222222222222222222"), "docker.io/acme/kiln:2222222222222222222222222222222222222222");
+        // The helm values keep `artifacts.*` until the revision resolves it.
+        let set = serde_json::to_string(&app.sources).unwrap_or_default();
+        assert!(set.contains("${{ artifacts.image.digest }}"), "{set}");
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let refs = [ArtifactRef { name: "image".into(), reference: format!("docker.io/acme/kiln@{digest}"), repository: "docker.io/acme/kiln".into(), tag: Some("2222222".into()), digest: digest.clone() }];
+        let filled = serde_json::to_string(&with_artifacts(&app.sources, &refs)?).unwrap_or_default();
+        assert!(filled.contains(&format!("docker.io/acme/kiln@{digest}")) && filled.contains("\"image.repository\"") && !filled.contains("${{"), "{filled}");
+        // A name no artifact has is an error, not an empty image.
+        assert!(substitute_artifacts("${{ artifacts.imgae }}", &refs).is_err_and(|e| e.0.contains("no artifact `imgae`")));
+        assert!(substitute_artifacts("${{ artifacts.image.size }}", &refs).is_err());
+        // Other expressions pass through.
+        assert_eq!(substitute_artifacts("a ${{ env.name }} b", &refs)?, "a ${{ env.name }} b");
+        Ok(())
+    }
+
+    #[test]
+    fn a_pull_secret_holds_the_docker_config() {
+        let s = pull_secret("kiln-registry", "kiln", r#"{"auths":{}}"#);
+        assert_eq!(obj::kind(&s), "Secret");
+        assert_eq!(s.pointer("/type").and_then(Value::as_str), Some("kubernetes.io/dockerconfigjson"));
+        assert_eq!(s.pointer("/data/.dockerconfigjson").and_then(Value::as_str), Some("eyJhdXRocyI6e319"));
+        assert_eq!(s.pointer("/metadata/annotations/argocd.argoproj.io~1sync-wave").and_then(Value::as_str), Some("-10"));
     }
 }

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -p tsconfig.app.json --noEmit && vite build",
+    "build": "tsc -p tsconfig.app.json --noEmit && vite build && node scripts/pack-ui-server.mjs",
+    "pack-ui-server": "node scripts/pack-ui-server.mjs",
     "serve": "bun server/main.ts",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",

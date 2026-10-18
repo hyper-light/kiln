@@ -2,8 +2,10 @@
 //! agents it can hand its own binary to (`GET /dl/kiln/<target>`) and which must fetch a release
 //! build instead; the commit it is built from (`KILN_COMMIT`), so every other platform's binary
 //! can be built from the same one (`crate::updates::in_step_loop`); and lists the store's migrations (`src/store/migrations/*.sql`, docs/ci.md
-//! §2.4) so that adding one is adding a file, never editing a shared list. Nothing else happens
-//! here: the UI is built separately (`ui/dist/client`, embedded).
+//! §2.4) so that adding one is adding a file, never editing a shared list; and embeds the UI server
+//! kiln carries (Bun and the UI server's files, packed by `npm run build` into `ui/dist/embed/`:
+//! vendor/bun/README.md). Nothing is built here: the UI is built separately (`ui/dist/client`,
+//! embedded by rust-embed).
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -40,6 +42,51 @@ fn main() {
     let dest = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default()).join("migrations.rs");
     if let Err(e) = std::fs::write(&dest, out) {
         println!("cargo:warning=could not write {}: {e}", dest.display());
+    }
+
+    ui_server();
+}
+
+/// The UI server this kiln carries: the packs for the platform it's built for, from
+/// `ui/dist/embed/` (or `KILN_UI_EMBED_DIR`), embedded under `cfg(kiln_ui_server)` with their paths
+/// in `KILN_UI_RUNTIME` and `KILN_UI_APP` (`crate::uiserver::carried`). Without both, kiln builds
+/// without one, and a release build says so; `KILN_UI_SERVER=off` builds without one quietly.
+fn ui_server() {
+    println!("cargo:rustc-check-cfg=cfg(kiln_ui_server)");
+    println!("cargo:rerun-if-env-changed=KILN_UI_SERVER");
+    println!("cargo:rerun-if-env-changed=KILN_UI_EMBED_DIR");
+    if std::env::var("KILN_UI_SERVER").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        return;
+    }
+    let os = match std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => return,
+    };
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let dir = std::env::var_os("KILN_UI_EMBED_DIR").map_or_else(|| manifest.join("../../ui/dist/embed"), PathBuf::from);
+    let runtime = dir.join(format!("runtime-{os}-{arch}.br"));
+    let app = dir.join("app.br");
+    // Watched only where they are: a path that isn't there would run this script on every build.
+    // The folder (or, before the first pack, ui/dist) is watched for packs that come.
+    let watch = if dir.is_dir() { Some(dir.clone()) } else { dir.parent().filter(|p| p.is_dir()).map(PathBuf::from) };
+    if let Some(w) = watch {
+        println!("cargo:rerun-if-changed={}", w.display());
+    }
+    if runtime.is_file() && app.is_file() {
+        println!("cargo:rerun-if-changed={}", runtime.display());
+        println!("cargo:rerun-if-changed={}", app.display());
+        println!("cargo:rustc-cfg=kiln_ui_server");
+        println!("cargo:rustc-env=KILN_UI_RUNTIME={}", runtime.display());
+        println!("cargo:rustc-env=KILN_UI_APP={}", app.display());
+    } else if std::env::var("PROFILE").is_ok_and(|p| p == "release") {
+        println!(
+            "cargo:warning=kiln is built without its UI server: {} and app.br aren't in {} (npm run build in ui/ packs them; KILN_UI_SERVER=off builds without one quietly)",
+            runtime.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            dir.display()
+        );
     }
 }
 

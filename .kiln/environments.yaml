@@ -1,0 +1,6 @@
+# kiln's environments (docs/ci.md W15; docs/cd-targets.md §10).
+production:
+  branches: [main]
+  # The cluster kiln runs in.
+  clusters: [in-cluster]
+  # People deploy here; agents plan and ask (add `agents: { deploy: true }` to let them).

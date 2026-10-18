@@ -1,13 +1,15 @@
 # syntax=docker/dockerfile:1.7
 #
-# kiln — single static binary (server, agent, supervisor, CLI) with the web UI embedded.
+# kiln — single static binary (server, agent, supervisor, CLI) with the web UI and its UI server
+# (Bun and its files, vendor/bun/README.md) embedded.
 #
 #   docker build --build-arg KILN_COMMIT=$(git rev-parse HEAD) -t kiln:dev .
 #   docker run --rm -p 7070:7070/tcp -p 7071:7071/udp -v kiln-data:/var/lib/kiln kiln:dev
 #
 # Stages:
 #   ui     – TanStack Start build of ui/: ui/dist/client (static files and the app's shell, embedded into
-#            the binary by rust-embed) and ui/dist/server (the UI server, run by Bun)
+#            the binary by rust-embed), and ui/dist/embed: the UI server (ui/dist/server) and the Bun
+#            that runs it, pinned in vendor/bun, packed for the binary to carry
 #   build  – static musl kiln binary (cargo registry + target dir are BuildKit cache mounts)
 #   final  – alpine with git/bash/ssh (the server shells out to git; the terminal needs a shell),
 #            and helm and kustomize, which render apps for Deployments (docs/cd.md)
@@ -15,10 +17,6 @@
 ARG NODE_IMAGE=node:24-alpine
 ARG RUST_IMAGE=rust:1-alpine
 ARG RUNTIME_IMAGE=alpine:3.24
-ARG BUN_IMAGE=oven/bun:1.4.3-alpine
-
-# The UI server's runtime (crate::uiserver runs ui/server/main.ts with it).
-FROM ${BUN_IMAGE} AS bun
 
 # ---------------------------------------------------------------------------- ui
 FROM ${NODE_IMAGE} AS ui
@@ -27,7 +25,11 @@ COPY ui/package*.json ./
 RUN --mount=type=cache,target=/root/.npm \
     if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 COPY ui/ ./
-RUN npm run build
+COPY vendor/bun/ /src/vendor/bun/
+# Packs the UI server for this image's platform: Bun is downloaded once per builder (the cache
+# mount) and checked against vendor/bun/bun.json; a pack that can't be made fails the build.
+RUN --mount=type=cache,target=/root/.cache/kiln \
+    KILN_UI_SERVER=require npm run build
 
 # ------------------------------------------------------------------------- build
 FROM ${RUST_IMAGE} AS build
@@ -66,7 +68,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ------------------------------------------------------------------------- final
 FROM ${RUNTIME_IMAGE}
 RUN set -eux; \
-    apk add --no-cache git bash openssh-client ca-certificates tzdata curl less ncurses-terminfo-base helm kustomize libstdc++ libgcc; \
+    apk add --no-cache git bash openssh-client ca-certificates tzdata curl less ncurses-terminfo-base helm kustomize; \
     addgroup -S -g 10001 kiln; \
     adduser -S -D -H -u 10001 -G kiln -h /var/lib/kiln -s /bin/bash kiln; \
     mkdir -p /etc/kiln /var/lib/kiln /cache; \
@@ -75,11 +77,8 @@ RUN set -eux; \
 COPY --from=build /out/kiln /usr/local/bin/kiln
 RUN ln -s /usr/local/bin/kiln /kiln
 COPY --chmod=0644 deploy/docker/kiln.toml /etc/kiln/kiln.toml
-# The UI server: TanStack Start's server build under Bun, which the kiln server runs and watches
-# (crate::uiserver). Without these, every page is the app's shell, rendered in the browser.
-COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
-COPY --from=ui /src/ui/dist/server /usr/local/lib/kiln/ui/dist/server
-COPY --from=ui /src/ui/server/main.ts /usr/local/lib/kiln/ui/server/main.ts
+# Nothing for the UI server: the binary carries it (Bun with the musl runtime it needs, and its
+# files) and unpacks it into /var/lib/kiln/ui-server/ the first time the server starts.
 
 ENV KILN_CONFIG=/etc/kiln/kiln.toml \
     KILN_DATA_DIR=/var/lib/kiln \

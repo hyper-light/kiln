@@ -18,7 +18,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
-import { handleAccounts, handleDemoSession } from "./accounts.ts";
+import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongSession, setLongEmit } from "./conversation.ts";
@@ -460,6 +460,7 @@ function emit(ev: ServerEvent) {
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
 setLongEmit((ev) => emit(ev as ServerEvent));
+setDemoEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;

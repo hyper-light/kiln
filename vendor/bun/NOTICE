@@ -1,0 +1,21 @@
+kiln carries Bun to run its UI server. This folder holds what that brings with it, and travels
+with it inside the kiln binary.
+
+Bun 1.4.3, the official release for this platform (https://github.com/oven-sh/bun/releases/tag/bun-v1.4.3)
+  Bun itself is MIT-licensed. It statically links JavaScriptCore and WebKit, which are LGPL-2
+  licensed, and other libraries under their own licenses: see licenses/bun-LICENSE.md. The patched
+  WebKit Bun links: https://github.com/oven-sh/webkit. Bun's source: https://github.com/oven-sh/bun
+  (tag bun-v1.4.3).
+
+On Linux, the musl runtime that Bun's musl build runs on, from Alpine Linux 3.24.2:
+
+musl 1.2.6 (Alpine package musl-1.2.6-r2): lib/ld-musl-<arch>.so.1
+  MIT license: see licenses/musl-COPYRIGHT. Source: https://musl.libc.org/releases/musl-1.2.6.tar.gz
+  and Alpine's build of it: https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/musl
+
+libstdc++ and libgcc_s from GCC 15.2.0 (Alpine packages libstdc++-15.2.0-r5 and libgcc-15.2.0-r5):
+lib/libstdc++.so.6 and lib/libgcc_s.so.1
+  GNU General Public License version 3 or later, with the GCC Runtime Library Exception 3.1: see
+  licenses/GPL-3.0 and licenses/GCC-RUNTIME-LIBRARY-EXCEPTION. Corresponding source:
+  https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz and Alpine's build of it:
+  https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/gcc

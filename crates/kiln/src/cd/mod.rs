@@ -12,6 +12,8 @@
 
 pub mod api;
 pub mod cli;
+pub mod guard;
+pub mod images;
 pub mod kube;
 pub mod live;
 pub mod ops;
@@ -23,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use kiln_cd::apps::{self, AppDef, Origin};
+use kiln_cd::apps::{self, AppDef, ArtifactRef, Origin};
 use kiln_cd::engine::{Action, Config as EngineConfig, Engine, Input, LiveChange, Record, Summary};
 use kiln_cd::git::{Auth as GitAuth, Mirror};
 use kiln_cd::model::Tracking;
@@ -34,6 +36,7 @@ use kiln_cd::store::Store;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
+use crate::ci::integrations::{self, oci};
 use crate::hub::Hub;
 use kube::Cluster;
 
@@ -90,6 +93,43 @@ pub struct Resolved {
     pub commits: Vec<Option<String>>,
     /// What each source's render reads.
     pub deps: Vec<Vec<Dep>>,
+    /// Its artifacts, pinned for this revision (docs/cd-targets.md §1.3).
+    pub artifacts: Vec<ArtifactRef>,
+    /// Pull secrets its artifacts ask for.
+    pub pull_secrets: Vec<PullSecret>,
+}
+
+impl Resolved {
+    /// Makes `artifacts` part of what this resolution stands for: they move its key and content
+    /// as a source's files do, so a new digest renders (and syncs) again, and an unchanged one
+    /// doesn't.
+    pub fn add_artifacts(&mut self, artifacts: Vec<ArtifactRef>, pull_secrets: Vec<PullSecret>) {
+        let mut h = 0u64;
+        for a in &artifacts {
+            h = h.wrapping_add(blake(&[b"artifact", a.name.as_bytes(), a.reference.as_bytes()]));
+        }
+        for p in &pull_secrets {
+            h = h.wrapping_add(blake(&[b"pull-secret", p.name.as_bytes(), crate::util::sha256_hex(p.config.as_bytes()).as_bytes()]));
+        }
+        self.key ^= h.rotate_left(13);
+        self.content ^= h.rotate_left(13);
+        self.artifacts = artifacts;
+        self.pull_secrets = pull_secrets;
+    }
+}
+
+/// A Secret of registry credentials an artifact asks for (`pull-secret`): its name and the
+/// Docker config it holds, which is never printed.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct PullSecret {
+    pub name: String,
+    pub config: String,
+}
+
+impl std::fmt::Debug for PullSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullSecret").field("name", &self.name).field("config", &"<redacted>").finish()
+    }
 }
 
 /// The deployments service.
@@ -120,6 +160,14 @@ pub struct Cd {
     pub live: live::Live,
     /// Renders plans made, kept by key.
     plans: plans::Renders,
+    /// Images resolved lately, by registry and reference, so apps sharing one ask once a minute.
+    artifacts: Mutex<HashMap<String, (crate::ci::integrations::oci::Resolved, Instant)>>,
+    /// Why a repository's deploy file doesn't read, by repository.
+    pub deploy_errors: Mutex<BTreeMap<String, String>>,
+    /// Each repository's environments (`.kiln/environments.yaml` at trunk), by its URL.
+    pub environments: RwLock<BTreeMap<String, BTreeMap<String, apps::EnvironmentSpec>>>,
+    /// The latest sync each app started, for a self-deploy's record.
+    pub started: Mutex<HashMap<String, guard::Started>>,
 }
 
 impl Cd {
@@ -226,7 +274,112 @@ impl Cd {
         }
     }
 
+    /// Apps from `.kiln/deploy.yaml` in kiln's repositories (cd.md, Defining applications): each
+    /// round reads the file, and `.kiln/environments.yaml`, at the commit trunk is at. An app is
+    /// registered when its definition changed, and removed (with its objects, as deleting an app
+    /// does) when the file no longer defines it. A file that doesn't read, or a repository that
+    /// can't be fetched, changes nothing: its apps stay as they were.
+    async fn refresh_deploy_files(self: &Arc<Self>) {
+        let repos = match self.hub.store.repos().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "deployments: can't list repositories");
+                return;
+            }
+        };
+        for repo in repos.into_iter().filter(|r| r.enabled) {
+            let trunk = repo.branches.first().cloned().unwrap_or_else(|| "main".into());
+            let (dir, auth, url, t) = (self.mirror_dir(&repo.clone_url), self.git_auth(&repo.clone_url), repo.clone_url.clone(), trunk.clone());
+            let read = crate::rt::blocking(move || -> Result<(String, Option<String>, Option<String>)> {
+                let m = Mirror::open(&dir, &url, auth)?;
+                m.fetch()?;
+                let commit = m.resolve(&t)?;
+                let text = |p: &str| -> Result<Option<String>> { Ok(m.read(&commit, p)?.map(|b| String::from_utf8_lossy(&b).into_owned())) };
+                let deploy = text(".kiln/deploy.yaml")?;
+                let envs = if deploy.is_some() { text(".kiln/environments.yaml")? } else { None };
+                Ok((commit, deploy, envs))
+            })
+            .await
+            .and_then(|r| r);
+            let (commit, deploy, envs) = match read {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::debug!(repo = %repo.name, error = %format!("{e:#}"), "deployments: can't read the repository's deploy file");
+                    continue;
+                }
+            };
+            let defs = match deploy {
+                // No file: none of its apps are left.
+                None => Vec::new(),
+                Some(text) => {
+                    let environments: BTreeMap<String, apps::EnvironmentSpec> = match envs.as_deref().map(serde_yaml::from_str).transpose() {
+                        Ok(e) => e.unwrap_or_default(),
+                        Err(e) => {
+                            self.deploy_file_error(&repo.name, Some(format!(".kiln/environments.yaml at {}: {e}", short(&commit))));
+                            continue;
+                        }
+                    };
+                    let mut scope = apps::Scope::default();
+                    scope.set("git.sha", json!(commit));
+                    scope.set("git.short_sha", json!(short(&commit)));
+                    scope.set("git.ref", json!(format!("refs/heads/{trunk}")));
+                    scope.set("repo.name", json!(repo.name));
+                    let parsed = apps::from_deploy_file(&text, &repo.clone_url, &trunk, &environments, &scope);
+                    if parsed.is_ok() {
+                        self.environments.write().insert(repo.clone_url.clone(), environments);
+                    }
+                    match parsed {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.deploy_file_error(&repo.name, Some(format!(".kiln/deploy.yaml at {}: {}", short(&commit), e.0)));
+                            continue;
+                        }
+                    }
+                }
+            };
+            self.deploy_file_error(&repo.name, None);
+            let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
+            for def in defs {
+                let changed = self.apps.read().get(&def.id()).is_none_or(|e| e.def != def);
+                if changed {
+                    tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: an app from a deploy file");
+                    self.register(def);
+                }
+            }
+            let gone: Vec<String> = self
+                .apps
+                .read()
+                .iter()
+                .filter(|(id, e)| matches!(&e.def.origin, Origin::Deploy { repo: r } if *r == repo.clone_url) && !ids.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in gone {
+                tracing::info!(app = %id, repo = %repo.name, "deployments: the deploy file no longer defines an app; removing it");
+                let cascade = self.apps.read().get(&id).is_some_and(|e| e.def.cascade);
+                self.unregister(&id, cascade);
+            }
+        }
+    }
+
+    /// Records (or clears) why a repository's deploy file doesn't read, once per change.
+    fn deploy_file_error(&self, repo: &str, error: Option<String>) {
+        let mut errors = self.deploy_errors.lock();
+        if errors.get(repo) == error.as_ref() {
+            return;
+        }
+        match error {
+            Some(e) => {
+                tracing::warn!(repo = %repo, error = %e, "deployments: a deploy file doesn't read; its apps stay as they were");
+                errors.insert(repo.to_owned(), e);
+            }
+            None => {
+                errors.remove(repo);
+            }
+        }
+    }
+
     async fn refresh_sources(self: &Arc<Self>) {
+        self.refresh_deploy_files().await;
         let apps: Vec<AppEntry> = self.apps.read().values().cloned().collect();
         // Each repository is fetched once a round.
         let mut urls: BTreeSet<String> = BTreeSet::new();
@@ -260,6 +413,7 @@ impl Cd {
             }
             let this = self.clone();
             let def = a.def.clone();
+            let def_for_artifacts = a.def.clone();
             // Renders read the cluster's version and API versions (Helm's .Capabilities), so an
             // app's inputs wait for its cluster: a render without them would differ from the one
             // after, and could be applied first.
@@ -279,6 +433,20 @@ impl Cd {
             })
             .await
             .and_then(|r| r);
+            // Artifacts resolve for each revision: the head's, and a rolled-back app's own.
+            let result = match result {
+                Ok((mut head, mut held)) => async {
+                    let (a, p) = self.resolve_artifacts(&def_for_artifacts, &head.revision).await?;
+                    head.add_artifacts(a, p);
+                    if let Some(h) = held.as_mut() {
+                        let (a, p) = self.held_artifacts(&def_for_artifacts, &id, h).await?;
+                        h.add_artifacts(a, p);
+                    }
+                    Ok::<_, anyhow::Error>((head, held))
+                }
+                .await,
+                Err(e) => Err(e),
+            };
             match result {
                 Ok((head, held)) => {
                     if seen.is_some() && held.is_none() {
@@ -415,7 +583,7 @@ impl Cd {
         if reads_cluster {
             key ^= cluster;
         }
-        Ok(Resolved { revision, key, content, commits, deps: all_deps })
+        Ok(Resolved { revision, key, content, commits, deps: all_deps, ..Resolved::default() })
     }
 
     fn ref_dep_hashes(&self, deps: &[Dep], refs: &HashMap<String, (Mirror, String)>) -> Result<u64> {
@@ -427,6 +595,127 @@ impl Cd {
             h = h.wrapping_add(blake(&[name.as_bytes(), d.path.as_bytes(), hash.as_deref().unwrap_or("-").as_bytes()]));
         }
         Ok(h)
+    }
+
+    // ---------------------------------------------------------------- artifacts
+
+    /// The registry an artifact is pulled from: its `registry` integration, else the one set up
+    /// for its registry, else none (anonymously).
+    async fn artifact_registry(&self, spec: &apps::ArtifactSpec, reference: &oci::Reference) -> Result<oci::Registry> {
+        match &spec.registry {
+            Some(name) => integrations::registry(&self.hub, name).await,
+            None => Ok(integrations::registry_for(&self.hub, &reference.registry).await?.unwrap_or_else(|| oci::Registry::for_name(&reference.registry, None, false))),
+        }
+    }
+
+    /// An app's artifacts for `revision`: each image's digest now, and the pull secrets they ask
+    /// for. An image not in its registry yet (CI hasn't pushed it) is an error that says so: the
+    /// app's inputs wait, and the next poll looks again.
+    pub(crate) async fn resolve_artifacts(&self, def: &AppDef, revision: &str) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
+        let mut refs = Vec::new();
+        for (name, given) in &def.artifacts {
+            // A published image: in a registry, an image like any other; local, ready when its
+            // pipeline's run at this commit succeeded, and run by its tag.
+            let spec = match (&given.published, self.published_spec(given)) {
+                (Some(_), Some(s)) => s,
+                (Some(p), None) => {
+                    let pipeline = given.pipeline.as_deref().unwrap_or("image");
+                    self.published_locally(def, pipeline, revision).await.with_context(|| format!("artifact {name}"))?;
+                    refs.push(ArtifactRef { name: name.clone(), reference: format!("{p}:{revision}"), repository: p.clone(), tag: Some(revision.to_owned()), digest: String::new() });
+                    continue;
+                }
+                (None, _) => given.clone(),
+            };
+            let spec = &spec;
+            let text = spec.reference(revision);
+            let reference = oci::parse_reference(&text).with_context(|| format!("artifact {name}"))?;
+            let registry = self.artifact_registry(spec, &reference).await.with_context(|| format!("artifact {name}"))?;
+            let who = registry.credentials.as_ref().map(|(u, _)| u.as_str()).unwrap_or("");
+            let key = format!("{}|{who}|{reference}", registry.name);
+            let cached = self.artifacts.lock().get(&key).filter(|(_, at)| at.elapsed() < Duration::from_secs(60)).map(|(r, _)| r.clone());
+            let resolved = match cached {
+                Some(r) => r,
+                None => {
+                    let r = oci::resolve(&registry, &reference)
+                        .await
+                        .with_context(|| format!("artifact {name}"))?
+                        .with_context(|| format!("waiting for {reference}: it isn't in {} yet", registry.name))?;
+                    self.artifacts.lock().insert(key, (r.clone(), Instant::now()));
+                    r
+                }
+            };
+            for want in &spec.platforms {
+                let has = resolved.platforms.is_empty() || resolved.platforms.iter().any(|p| p == want || p.starts_with(&format!("{want}/")));
+                anyhow::ensure!(has, "artifact {name}: {reference} isn't built for {want} (it has {})", resolved.platforms.join(", "));
+            }
+            refs.push(ArtifactRef { name: name.clone(), reference: reference.pinned(&resolved.digest), repository: reference.name(), tag: reference.tag.clone(), digest: resolved.digest.clone() });
+        }
+        Ok((refs, self.pull_secrets_of(def, revision).await?))
+    }
+
+    /// The pull secrets an app's artifacts ask for, with their registries' credentials now.
+    async fn pull_secrets_of(&self, def: &AppDef, revision: &str) -> Result<Vec<PullSecret>> {
+        let mut out = Vec::new();
+        for (name, given) in &def.artifacts {
+            // A local published image is on the nodes: nothing to pull with.
+            let spec = match (&given.published, self.published_spec(given)) {
+                (Some(_), Some(s)) => s,
+                (Some(_), None) => continue,
+                (None, _) => given.clone(),
+            };
+            let spec = &spec;
+            let Some(ps) = &spec.pull_secret else { continue };
+            let reference = oci::parse_reference(&spec.reference(revision)).with_context(|| format!("artifact {name}"))?;
+            let registry = self.artifact_registry(spec, &reference).await.with_context(|| format!("artifact {name}"))?;
+            let config = oci::docker_config(&registry)
+                .with_context(|| format!("artifact {name} asks for pull secret {ps}, but no registry integration holds credentials for {}", reference.registry))?;
+            out.push(PullSecret { name: ps.clone(), config });
+        }
+        Ok(out)
+    }
+
+    /// A rolled-back app's artifacts: exactly what its deployment recorded; else (a deployment
+    /// kept before artifacts were) its revision's now.
+    async fn held_artifacts(&self, def: &AppDef, id: &str, held: &Resolved) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
+        let recorded = self
+            .store
+            .read(|d| d.pins.get(id).and_then(|p| d.history.get(id).and_then(|h| h.iter().find(|x| x.id == p.to)).map(|x| x.artifacts.clone())))
+            .unwrap_or_default();
+        self.recorded_artifacts(def, recorded, &held.revision).await
+    }
+
+    /// `recorded` when it covers every artifact the app has, else the revision's resolved now.
+    pub(crate) async fn recorded_artifacts(&self, def: &AppDef, recorded: Vec<ArtifactRef>, revision: &str) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
+        if recorded.is_empty() || !def.artifacts.keys().all(|n| recorded.iter().any(|a| &a.name == n)) {
+            return self.resolve_artifacts(def, revision).await;
+        }
+        Ok((recorded, self.pull_secrets_of(def, revision).await?))
+    }
+
+    /// Artifacts for a plan, without asking any registry (a planned commit's image may not be
+    /// built yet): the app's own when the revision is one it resolved, else each image by its tag.
+    pub(crate) fn planned_artifacts(&self, def: &AppDef, revision: &str) -> (Vec<ArtifactRef>, Vec<PullSecret>) {
+        let apps = self.apps.read();
+        let entry = apps.get(&def.id());
+        if let Some(r) = entry.and_then(|e| e.resolved.iter().rev().find(|r| r.revision == revision && r.artifacts.len() == def.artifacts.len())) {
+            return (r.artifacts.clone(), r.pull_secrets.clone());
+        }
+        let secrets = entry.and_then(|e| e.resolved.back().map(|r| r.pull_secrets.clone())).unwrap_or_default();
+        let refs = def
+            .artifacts
+            .iter()
+            .map(|(name, given)| {
+                let spec = match (&given.published, self.published_spec(given)) {
+                    (Some(_), Some(s)) => s,
+                    (Some(p), None) => return ArtifactRef { name: name.clone(), reference: format!("{p}:{revision}"), repository: p.clone(), tag: Some(revision.to_owned()), digest: String::new() },
+                    (None, _) => given.clone(),
+                };
+                let text = spec.reference(revision);
+                let (repository, tag) = oci::parse_reference(&text).map(|r| (r.name(), r.tag.clone())).unwrap_or_else(|_| (text.clone(), None));
+                ArtifactRef { name: name.clone(), reference: text, repository, tag, digest: String::new() }
+            })
+            .collect();
+        (refs, secrets)
     }
 
     // ---------------------------------------------------------------- renders
@@ -484,8 +773,10 @@ impl Cd {
             m.extract(&commit, &wanted, &root)?;
             refs.insert(name.clone(), root);
         }
+        // The revision's artifacts, filled in (`${{ artifacts.<name> }}`).
+        let sources = apps::with_artifacts(&def.sources, &inputs.artifacts).map_err(|e| anyhow::anyhow!("{}", e.0))?;
         let mut objects = Vec::new();
-        for (i, s) in def.sources.iter().enumerate() {
+        for (i, s) in sources.iter().enumerate() {
             if s.as_ref.is_some() && s.chart.is_none() {
                 continue;
             }
@@ -509,6 +800,15 @@ impl Cd {
                 scratch: &views.join("scratch"),
             };
             objects.extend(render::render(&req, &self.tools)?);
+        }
+        // Plain manifests read them too: `image: ${{ artifacts.web }}` in a Deployment.
+        if !inputs.artifacts.is_empty() {
+            for o in &mut objects {
+                apps::substitute_value(o, &inputs.artifacts).map_err(|e| anyhow::anyhow!("{} {}: {}", obj::kind(o), obj::name(o), e.0))?;
+            }
+        }
+        for p in &inputs.pull_secrets {
+            objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
         let _ = std::fs::remove_dir_all(&views);
         let (children, objects): (Vec<Value>, Vec<Value>) =
@@ -618,8 +918,13 @@ impl Cd {
                     for (gk, r) in &d.kinds {
                         self.input(Input::Scope { cluster: def.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
                     }
-                    self.clusters.write().insert(def.name.clone(), cluster);
+                    self.clusters.write().insert(def.name.clone(), cluster.clone());
                     self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: true });
+                    // kiln's own cluster: a self-deploy in flight before this start finishes here.
+                    if def.name == apps::IN_CLUSTER {
+                        let this = self.clone();
+                        crate::rt::spawn(async move { this.finish_self_deploy(&cluster).await });
+                    }
                     self.connecting.lock().remove(&def.name);
                     self.kick();
                     return;
@@ -789,7 +1094,12 @@ impl Cd {
                                 let gk = GroupKind::new(obj::group(&object), obj::kind(&object));
                                 let wait = if dry_run { Duration::ZERO } else { Duration::from_secs(15) };
                                 this.serves(&c, &gk, wait).await;
-                                c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}"))
+                                // kiln's own Deployment: a guard watches the restart first.
+                                let guarded = if dry_run || cluster.as_ref() != apps::IN_CLUSTER { Ok(()) } else { this.before_self_apply(&object, &c).await };
+                                match guarded {
+                                    Ok(()) => c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}")),
+                                    Err(e) => Err(format!("not deploying kiln itself without its guard: {e:#}")),
+                                }
                             }
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
@@ -812,7 +1122,13 @@ impl Cd {
                     self.statuses.write().insert(app.clone(), s);
                     self.dirty.lock().insert(app);
                 }
-                Action::Record(r) => self.record(r),
+                Action::Record(r) => {
+                    if let kiln_cd::engine::Record::Started { app, op, revision, trigger, by, at_ms } = &r {
+                        let s = guard::Started { op: *op, revision: revision.as_ref().map(|r| r.to_string()), trigger: trigger.as_str().to_owned(), by: by.clone(), at_ms: *at_ms };
+                        self.started.lock().insert(app.to_string(), s);
+                    }
+                    self.record(r)
+                }
             }
         }
     }
@@ -822,11 +1138,13 @@ impl Cd {
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
         }
-        let (limit, commits) = {
+        let (limit, commits, artifacts) = {
             let apps = self.apps.read();
             let e = apps.get(app.as_ref());
-            let commits = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)).map(|r| r.commits.clone())).unwrap_or_default();
-            (e.map(|e| e.def.history_limit).unwrap_or(10), commits)
+            let r = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)));
+            let commits = r.map(|r| r.commits.clone()).unwrap_or_default();
+            let artifacts = r.map(|r| r.artifacts.clone()).unwrap_or_default();
+            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts)
         };
         let d = Deployment {
             app: app.to_string(),
@@ -843,6 +1161,7 @@ impl Cd {
             id: 0,
             commits,
             content,
+            artifacts,
         };
         let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
         crate::rt::spawn(async move {
@@ -895,6 +1214,11 @@ pub fn summary_json(s: &Summary) -> Value {
             "finished_ms": o.finished_ms,
         })),
     })
+}
+
+/// A commit's first seven characters.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
 }
 
 fn blake(parts: &[&[u8]]) -> u64 {
@@ -989,6 +1313,10 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         kick: crate::rt::Notify::new(),
         live: live::Live::default(),
         plans: plans::Renders::default(),
+        artifacts: Mutex::new(HashMap::new()),
+        deploy_errors: Mutex::new(BTreeMap::new()),
+        environments: RwLock::new(BTreeMap::new()),
+        started: Mutex::new(HashMap::new()),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

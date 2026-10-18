@@ -31,7 +31,8 @@ jobs:
     steps:
       - run: npm ci --prefix ui --no-audit --no-fund
       - run: npm run --prefix ui typecheck
-      - run: npm run --prefix ui build
+      # The UI only: packing Bun for the binary (vendor/bun) is the release builds' part.
+      - run: KILN_UI_SERVER=off npm run --prefix ui build
 
   release-binary:
     name: release build (bare metal)

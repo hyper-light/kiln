@@ -13,6 +13,7 @@ import { usePref } from "@/lib/prefs";
 import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { UpdatesHold, UpdatesPanel } from "@/views/settings-updates";
+import { DeploySettings } from "@/views/settings-deploy";
 
 const methodsRes: Res<{ password: boolean; token: boolean }> = { key: "auth/methods", fetch: (sig) => api.authMethods(sig) };
 
@@ -38,6 +39,7 @@ function SettingsPanels({ updates, password }: { updates: React.ReactNode; passw
   return (
     <div className="space-y-4">
       {updates}
+      <DeploySettings />
       <Panel eyebrow="Integrations" title="Grafana" description="Linked from the Metrics page. kiln ships dashboards as ConfigMaps under deploy/.">
         <form
           className="flex flex-wrap items-end gap-3"

@@ -1,0 +1,38 @@
+# kiln deploys itself (docs/cd-targets.md §10): its chart, the namespaces it runs in, and the
+# monitoring stack, into the cluster it runs in. Every app syncs when a person says so.
+apps:
+  kiln:
+    source: deploy/helm/kiln
+    helm:
+      release-name: kiln
+      values: [values.yaml, ../../argocd/values/kiln.yaml]
+      set:
+        image.repository: "${{ artifacts.image.repository }}"
+        image.tag: "${{ artifacts.image.tag }}"
+        image.digest: "${{ artifacts.image.digest }}"
+    artifacts:
+      # Built by .kiln/image.yaml at each commit; where it lives is set in the UI.
+      image: { published: kiln }
+    to: production
+    namespace: kiln
+    sync:
+      options: [CreateNamespace=true, SkipDryRunOnMissingResource=true]
+      retry: { limit: 10, backoff: 10s, factor: 2, max: 3m }
+
+  namespaces:
+    source: deploy/argocd/namespaces
+    to: production
+    namespace: kiln
+
+  kube-prometheus-stack:
+    sources:
+      - { repo: https://prometheus-community.github.io/helm-charts, chart: kube-prometheus-stack, version: 92.2.0 }
+      - { as: values }
+    helm:
+      release-name: kube-prometheus-stack
+      values: [$values/deploy/argocd/values/kube-prometheus-stack.yaml]
+    to: production
+    namespace: monitoring
+    sync:
+      options: [CreateNamespace=true, ServerSideApply=true]
+      retry: { limit: 10, backoff: 10s, factor: 2, max: 3m }
