@@ -14,6 +14,7 @@
 //! - [`obj`]: object identity, parsing, structural hashes, compressed storage.
 //! - [`model`]: app configuration, sync options and policies (Argo CD's spellings).
 //! - [`health`]: resource health, rule for rule as Argo CD assesses it.
+//! - [`lua`]: Argo CD's Lua health checks for custom resources (its resource customizations).
 //! - [`providers`]: every platform beyond Kubernetes, as clusters of objects (docs/cd-targets.md).
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
@@ -31,6 +32,7 @@ pub mod engine;
 pub mod git;
 pub mod harness;
 pub mod health;
+pub mod lua;
 pub mod kube;
 pub mod model;
 pub mod obj;
