@@ -26,7 +26,9 @@ import type {
   Run,
   SyncView,
   TailscaleView,
+  UpdateJob,
   UpdatesOverview,
+  UpgradeWaits,
 } from "../src/api/types.ts";
 import { hashStr, mulberry32, pick } from "./data.ts";
 
@@ -676,6 +678,69 @@ const PLANS = [
 
 const NEWEST = "94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901";
 
+/** How long upgrades are waited on: kiln.toml's, unless changed in Settings → Updates. */
+const WAITS_CONFIG: UpgradeWaits = { upgrade_minutes: 15, wait_for_jobs_minutes: 360, build_minutes: 60 };
+let waitsChosen: UpgradeWaits | null = null;
+/** Upgrades started from the page, by runner. */
+const started = new Map<string, UpdateJob>();
+
+/** The Mac's build that failed, and a Linux runner's upgrade kiln stopped waiting for: what Settings → Updates offers to remedy. */
+function failedJobs(ctx: PagesCtx): UpdateJob[] {
+  const agents = ctx.agents().filter((a) => !a.ephemeral && a.connected);
+  const mac = agents.find((a) => a.os === "macos");
+  const old = agents.find((a) => a.os !== "macos" && a.version !== ctx.version);
+  const out: UpdateJob[] = [];
+  if (mac)
+    out.push({
+      id: "9d2f61c08b7e4a55",
+      kind: "runner",
+      target: mac.name,
+      method: "build",
+      state: "failed",
+      started_at: T0 - 1500,
+      ended_at: T0 - 1180,
+      from_build: "0.0.9+0f1e2d3",
+      to_build: null,
+      commit: NEWEST,
+      reached: false,
+      log: [
+        `upgrading ${mac.name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped`,
+        "kiln checkout: /Users/ada/Projects/kiln (left as it is: the build is of 94f0847a1b2c, from the server)",
+        "fetching the source of 94f0847a1b2c from https://kiln.lan",
+        "   Compiling kiln-cd v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln-cd)",
+        "   Compiling kiln v0.2.0 (/Users/ada/.cache/kiln/self-build/src-9d2f61c08b7e4a55/crates/kiln)",
+        "cargo exited with 101. What it said that went wrong:",
+        "error: linking with `cc` failed: exit status: 1",
+        "error: could not compile `kiln` (bin \"kiln\") due to 1 previous error",
+        "failed: kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
+      ],
+      error: "kiln did not build (its full output is /Users/ada/.cache/kiln/self-build/build-9d2f61c08b7e4a55.log on this machine)",
+    });
+  if (old)
+    out.push({
+      id: "4b1e0c9a7d6f3e21",
+      kind: "runner",
+      target: old.name,
+      method: "native",
+      state: "failed",
+      started_at: T0 - 4200,
+      ended_at: T0 - 2300,
+      from_build: "0.0.9+0f1e2d3",
+      to_build: "0.1.0+a1b2c3d",
+      commit: NEWEST,
+      reached: false,
+      log: [
+        `upgrading ${old.name} to build 0.1.0+a1b2c3d (x86_64-unknown-linux-gnu); nothing it runs is stopped`,
+        "asked the runner to upgrade itself: the new build starts beside it and takes over",
+        `${old.name} waits for its running job before it switches`,
+        "failed: the new runner didn't report in within 15 minutes of its last job ending; see the runner's log",
+      ],
+      error: "the new runner didn't report in within 15 minutes of its last job ending; see the runner's log",
+      timed_out: "upgrade",
+    });
+  return out;
+}
+
 function updates(ctx: PagesCtx): UpdatesOverview {
   const runners = ctx
     .agents()
@@ -704,6 +769,21 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         next: up ? null : mac ? `builds ${NEWEST.slice(0, 12)} itself` : `downloads build 0.1.0+a1b2c3d (${NEWEST.slice(0, 12)})`,
         how: up ? null : mac ? ("build" as const) : ("download" as const),
         checkout: mac ? "/Users/ada/Projects/kiln" : null,
+        policy: "notify" as const,
+        locked: false,
+        from: up ? null : mac ? null : "built by release run #412",
+        ways:
+          up || !a.connected
+            ? []
+            : mac
+              ? [
+                  { way: "download" as const, ok: false, why: `no binary of ${NEWEST.slice(0, 12)} for aarch64-apple-darwin yet` },
+                  { way: "build" as const, ok: true, why: `builds ${NEWEST.slice(0, 12)} on the machine, from this server's source` },
+                ]
+              : [
+                  { way: "download" as const, ok: true, why: "downloads build 0.1.0+a1b2c3d" },
+                  { way: "build" as const, ok: false, why: "no kiln checkout on it to build from" },
+                ],
       };
     });
   return {
@@ -723,7 +803,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
       note: "This is the newest build: nothing to upgrade.",
     },
     runners,
-    jobs: [],
+    jobs: [...started.values(), ...failedJobs(ctx).filter((j) => !started.has(j.target))],
     binaries: [
       { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
       { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
@@ -732,6 +812,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
     build: { repo: "hyper-light/kiln", pipeline: "release", last: null, commit: NEWEST, in_step: false, behind: ["aarch64-apple-darwin"], keeps_in_step: true },
     newest: { commit: NEWEST, from: "server", since: T0 - 3600 },
     follow: true,
+    waits: { now: waitsChosen ?? WAITS_CONFIG, config: WAITS_CONFIG, changed: waitsChosen !== null },
   };
 }
 
@@ -863,6 +944,34 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   if (p === "/api/ai-sessions" && m === "GET") return (void json(res, 200, []), true);
   if (p === "/api/updates" && m === "GET") return (void json(res, 200, updates(ctx)), true);
   if (p === "/api/updates/check" && m === "POST") return (void json(res, 200, updates(ctx)), true);
+  if (p === "/api/updates/waits" && (m === "PUT" || m === "DELETE")) {
+    waitsChosen = m === "PUT" ? await ctx.body<UpgradeWaits>(req) : null;
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  if ((mm = p.match(/^\/api\/updates\/runners\/([^/]+)$/)) && m === "POST") {
+    const name = decodeURIComponent(mm[1] ?? "");
+    const ask = await ctx.body<{ way?: "download" | "build" }>(req);
+    const build = ask.way === "build";
+    const job: UpdateJob = {
+      id: hex(mulberry32(hashStr(name + Date.now())), 16),
+      kind: "runner",
+      target: name,
+      method: build ? "build" : "native",
+      state: "running",
+      started_at: now(),
+      ended_at: null,
+      from_build: "0.0.9+0f1e2d3",
+      to_build: build ? null : "0.1.0+a1b2c3d",
+      commit: NEWEST,
+      reached: false,
+      log: [build ? `upgrading ${name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped` : `upgrading ${name} to build 0.1.0+a1b2c3d; nothing it runs is stopped`],
+      error: null,
+    };
+    started.set(name, job);
+    return (void json(res, 202, job), true);
+  }
   if (p === "/api/front-doors" && m === "GET")
     return (
       void json(

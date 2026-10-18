@@ -38,8 +38,9 @@ use crate::proto::{AgentMsg, CAP_UPGRADE, LANE_CONTROL, ServerMsg};
 const KEEP_JOBS: usize = 40;
 /// Output lines kept per job.
 const KEEP_LINES: usize = 400;
-/// How long a runner has to finish an upgrade.
-const RUNNER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long `install --agent --upgrade` may take on a runner. How long the server waits on an
+/// upgrade is [`Waits`].
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How long the new runner has to report in after its install finished.
 const REPORT_IN: Duration = Duration::from_secs(90);
 /// How often GitHub is asked about releases (it allows 60 unauthenticated requests an hour).
@@ -90,6 +91,9 @@ pub struct Job {
     pub reached: bool,
     pub log: Vec<String>,
     pub error: Option<String>,
+    /// Kiln stopped waiting for it: which of its [`Waits`] ran out ("upgrade", "jobs" or "build").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<&'static str>,
     /// Its last log line is a progress line (a terminal's carriage return draws it over): the
     /// next line takes its place.
     #[serde(skip)]
@@ -160,6 +164,8 @@ pub struct Updates {
     checking_image: AtomicBool,
     /// A push to the release branch: the server's commit may be there now (`in_step_loop`).
     in_step_wake: crate::rt::Notify,
+    /// How long upgrades are waited on, once read (`waits`).
+    waits: Mutex<Option<Waits>>,
     /// Every runner on the newest kiln.
     pub fleet: crate::fleet::Fleet,
 }
@@ -860,31 +866,40 @@ impl Updates {
         hub.emit(&serde_json::json!({ "type": "updates" }));
     }
 
+    /// Kiln stops waiting for it: its `which` wait ([`Waits`]) ran out.
+    pub(crate) fn time_out(&self, hub: &Hub, id: &str, which: &'static str, error: String) {
+        self.update(hub, id, |j| j.timed_out = Some(which));
+        self.finish(hub, id, Err(error));
+    }
+
     /// [`AgentMsg::UpgradeLog`].
     pub fn on_log(&self, hub: &Hub, job: &str, line: String) {
         self.say(hub, job, line);
     }
 
     /// [`AgentMsg::UpgradeDone`]. A success completes the job once the new build has reported
-    /// in (the job's driver waits for that); a failure completes it now.
+    /// in (the job's driver waits for that); a failure completes it now. One kiln had stopped
+    /// waiting for is upgraded after all once it is through ([`Self::late`]).
     pub fn on_done(&self, hub: &Hub, job: &str, ok: bool, error: Option<String>) {
         if ok {
             self.update(hub, job, |j| {
                 j.handed_over = j.blue_green;
                 push_line(j, if j.blue_green { "the new build took over" } else { "the runner finished installing" }.to_owned());
             });
+            self.late(hub, job);
         } else {
             self.finish(hub, job, Err(error.unwrap_or_else(|| "the runner reported a failure".to_owned())));
         }
     }
 
-    /// [`AgentMsg::Build`] from a machine: an upgrade of it to that build has arrived.
+    /// [`AgentMsg::Build`] from a machine: an upgrade of it to that build has arrived, also one
+    /// kiln had stopped waiting for ([`Self::late`]).
     pub fn on_build(&self, hub: &Hub, machine: &str, build: &str) {
         let ids: Vec<String> = self
             .jobs
             .lock()
             .iter()
-            .filter(|j| j.kind == "runner" && j.target == machine && j.state == JobState::Running && !j.reached && j.to_build.as_deref() == Some(build))
+            .filter(|j| j.awaits(machine, build))
             .map(|j| j.id.clone())
             .collect();
         for id in ids {
@@ -892,7 +907,47 @@ impl Updates {
                 j.reached = true;
                 push_line(j, format!("{machine} is running build {build}"));
             });
+            self.late(hub, &id);
         }
+    }
+
+    /// A job kiln had stopped waiting for whose machine got through after all (the new build
+    /// reported in and, on a runner that upgrades blue/green, took over): it is upgraded, and
+    /// reads so.
+    fn late(&self, hub: &Hub, id: &str) {
+        let now = crate::util::now_unix();
+        let mut through = None;
+        self.update(hub, id, |j| {
+            if j.through_late(now) {
+                through = Some(j.clone());
+            }
+        });
+        if let Some(j) = through {
+            crate::fleet::on_job_end(hub, &j, None);
+            hub.emit(&serde_json::json!({ "type": "updates" }));
+        }
+    }
+}
+
+impl Job {
+    /// It waits for `machine` to run `build`: a runner's upgrade, not done (also one kiln stopped
+    /// waiting for), whose build hasn't reported in.
+    fn awaits(&self, machine: &str, build: &str) -> bool {
+        self.kind == "runner" && self.target == machine && self.state != JobState::Done && !self.reached && self.to_build.as_deref() == Some(build)
+    }
+
+    /// Kiln had stopped waiting for it, and its machine got through since (the new build reported
+    /// in and, upgrading blue/green, took over): it is done after all, and says so. Whether it was.
+    fn through_late(&mut self, now: i64) -> bool {
+        if self.state != JobState::Failed || !self.reached || (self.blue_green && !self.handed_over) {
+            return false;
+        }
+        let was = self.error.take().unwrap_or_default();
+        self.timed_out = None;
+        self.state = JobState::Done;
+        self.ended_at = Some(now);
+        push_line(self, format!("upgraded after all: it got there after kiln had stopped waiting ({was})"));
+        true
     }
 }
 
@@ -923,6 +978,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         reached: false,
         log: Vec::new(),
         error: None,
+        timed_out: None,
         progress: false,
         blue_green: false,
         handed_over: false,
@@ -973,7 +1029,29 @@ pub struct RunnerInfo {
     /// Where the build it would get comes from ("this server's own build", "built by release run
     /// #141", "built by adas-macbook", ...), when there is one.
     pub from: Option<String>,
+    /// The ways a person can have it upgraded to the newest kiln now, each with what it does or
+    /// why it can't (empty when it runs the newest, or kiln knows no newest).
+    pub ways: Vec<WayOpen>,
     pub instances: Vec<crate::instances::InstanceView>,
+}
+
+/// How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
+/// the machine itself, from the server's source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Way {
+    Download,
+    Build,
+}
+
+/// One way a runner can be upgraded now, or why it can't.
+#[derive(Debug, Clone, Serialize)]
+pub struct WayOpen {
+    pub way: Way,
+    pub ok: bool,
+    /// What it does ("downloads build 493003c712b0"), or why it can't ("no binary of 31c0bbaf734c
+    /// for aarch64-apple-darwin yet").
+    pub why: String,
 }
 
 /// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in Settings → Updates.
@@ -1023,6 +1101,113 @@ pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<(
     if p == Policy::default() { hub.store.kv_delete(policy_key(machine)).await } else { hub.store.kv_set(policy_key(machine), p.as_str().to_owned()).await }
 }
 
+/// How long kiln waits on a runner's upgrade before it calls it failed: `[updates]` in kiln.toml,
+/// unless changed in Settings → Updates. A change applies to upgrades under way too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Waits {
+    /// Minutes a runner has to switch to its new build and report in, once it has no jobs running.
+    pub upgrade_minutes: u64,
+    /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running.
+    pub wait_for_jobs_minutes: u64,
+    /// Minutes a machine has to build kiln itself, install included.
+    pub build_minutes: u64,
+}
+
+/// What each wait may be, in minutes.
+const WAIT_LIMITS: [(&str, u64, u64); 3] = [("upgrade_minutes", 1, 24 * 60), ("wait_for_jobs_minutes", 1, 7 * 24 * 60), ("build_minutes", 5, 24 * 60)];
+
+impl Waits {
+    /// As kiln.toml sets them.
+    pub fn of(u: &crate::config::Updates) -> Self {
+        Self { upgrade_minutes: u.upgrade_minutes, wait_for_jobs_minutes: u.wait_for_jobs_minutes, build_minutes: u.build_minutes }
+    }
+
+    fn values(self) -> [u64; 3] {
+        [self.upgrade_minutes, self.wait_for_jobs_minutes, self.build_minutes]
+    }
+
+    fn from_values([upgrade_minutes, wait_for_jobs_minutes, build_minutes]: [u64; 3]) -> Self {
+        Self { upgrade_minutes, wait_for_jobs_minutes, build_minutes }
+    }
+
+    /// Each one within what kiln takes.
+    pub fn check(self) -> anyhow::Result<()> {
+        for ((name, lo, hi), v) in WAIT_LIMITS.into_iter().zip(self.values()) {
+            anyhow::ensure!((lo..=hi).contains(&v), "{name} is {v}: it can be from {lo} to {hi} minutes");
+        }
+        Ok(())
+    }
+
+    /// Brought within what kiln takes (a kiln.toml can say anything).
+    fn clamped(self) -> Self {
+        let mut v = self.values();
+        for (x, (_, lo, hi)) in v.iter_mut().zip(WAIT_LIMITS) {
+            *x = (*x).clamp(lo, hi);
+        }
+        Self::from_values(v)
+    }
+
+    pub fn upgrade(self) -> Duration {
+        minutes(self.upgrade_minutes)
+    }
+
+    pub fn jobs(self) -> Duration {
+        minutes(self.wait_for_jobs_minutes)
+    }
+
+    pub fn build(self) -> Duration {
+        minutes(self.build_minutes)
+    }
+}
+
+fn minutes(m: u64) -> Duration {
+    Duration::from_secs(m.saturating_mul(60))
+}
+
+/// A wait as a person says it: "15 minutes", "an hour", "6 hours", "90 minutes".
+pub fn said(d: Duration) -> String {
+    let m = d.as_secs() / 60;
+    match m {
+        60 => "an hour".to_owned(),
+        1 => "a minute".to_owned(),
+        m if m >= 120 && m % 60 == 0 => format!("{} hours", m / 60),
+        m => format!("{m} minutes"),
+    }
+}
+
+/// Where the waits chosen in Settings → Updates are kept (none: kiln.toml's).
+const WAITS_KEY: &str = "updates/waits";
+
+/// How long upgrades are waited on now.
+pub async fn waits(hub: &Hub) -> Waits {
+    if let Some(w) = *hub.updates.waits.lock() {
+        return w;
+    }
+    let chosen = hub.store.kv_get(WAITS_KEY.to_owned()).await.ok().flatten().and_then(|v| serde_json::from_str::<Waits>(&v).ok());
+    let w = chosen.unwrap_or_else(|| Waits::of(&hub.cfg.updates)).clamped();
+    *hub.updates.waits.lock() = Some(w);
+    w
+}
+
+/// The waits were changed in Settings → Updates: kiln.toml's don't apply.
+pub async fn waits_changed(hub: &Hub) -> bool {
+    hub.store.kv_get(WAITS_KEY.to_owned()).await.ok().flatten().is_some()
+}
+
+/// Wait this long from now on (`None`: as kiln.toml says).
+pub async fn set_waits(hub: &Hub, w: Option<Waits>) -> anyhow::Result<()> {
+    match w {
+        Some(w) => {
+            w.check()?;
+            hub.store.kv_set(WAITS_KEY.to_owned(), serde_json::to_string(&w)?).await?;
+        }
+        None => hub.store.kv_delete(WAITS_KEY.to_owned()).await?,
+    }
+    *hub.updates.waits.lock() = None;
+    Ok(())
+}
+
 /// The runners' gauges (`crate::metrics`): up, behind, update policy and the kiln each runs.
 pub async fn measure(hub: &Arc<Hub>) {
     let rs = runners(hub).await;
@@ -1069,6 +1254,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 policy: Policy::default(),
                 locked: false,
                 from: None,
+                ways: Vec::new(),
                 target,
                 target_build,
                 build,
@@ -1108,15 +1294,19 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
             r.how = Some(how);
             r.next = Some(next);
         }
+        if r.connected && !r.up_to_date && !r.locked && r.how != Some("left") {
+            r.ways = crate::fleet::ways(hub, r, t).await;
+        }
     }
     out
 }
 
-/// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): a binary of it when
-/// kiln has one for its platform, else a build of it on the machine itself. With no newest known
+/// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): the `way` asked for, or
+/// a binary of it when kiln has one for its platform, else a build of it on the machine itself.
+/// A person asking now isn't held back by the wait between automatic tries. With no newest known
 /// (a server built without knowing its commit), to the build kiln has for its platform. Nothing it
 /// runs is stopped.
-pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job> {
+pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> anyhow::Result<Job> {
     if let Some(j) = hub.updates.running_for("runner", machine) {
         return Ok(j);
     }
@@ -1126,12 +1316,23 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job
     anyhow::ensure!(r.connected, "{machine} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
         anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
-        return match crate::fleet::plan(hub, &r, &t).await {
+        let plan = match way {
+            None => crate::fleet::plan(hub, &r, &t).await,
+            Some(w) => {
+                let open = crate::fleet::ways(hub, &r, &t).await.into_iter().find(|o| o.way == w);
+                match open {
+                    Some(o) if !o.ok => anyhow::bail!("{machine} can't be upgraded that way: {}", o.why),
+                    _ => crate::fleet::plan_by(hub, &r, &t, w)?,
+                }
+            }
+        };
+        return match plan {
             crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
             crate::fleet::Plan::Build(c) => crate::fleet::self_build(hub, &r, &t.commit, c, "admin").await,
             crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
         };
     }
+    anyhow::ensure!(way != Some(Way::Build), "{machine} can't build kiln itself while kiln knows no newest commit to build");
     let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
     let (sha256, size) = ensure_binary(hub, &target).await?;
     let b = binaries(hub).into_iter().find(|b| b.target == target && b.sha256 == sha256).unwrap_or_else(|| Binary {
@@ -1202,8 +1403,12 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     };
     u.update(hub, id, |j| j.blue_green = blue_green);
     u.say(hub, id, if blue_green { "asked the runner to upgrade itself: the new build starts beside it and takes over" } else { "asked the runner to upgrade itself" });
-    let deadline = Instant::now() + RUNNER_TIMEOUT;
-    while Instant::now() < deadline {
+    let since = Instant::now();
+    // The runner switches once its running jobs are done: that wait is theirs, not the upgrade's,
+    // so the upgrade's own starts once they are.
+    let mut idle_since = since;
+    let (mut waiting_on, mut waited) = (0, false);
+    loop {
         crate::rt::sleep(Duration::from_secs(1)).await;
         if !u.running(id) {
             return;
@@ -1212,8 +1417,26 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
             u.finish(hub, id, Ok(String::new()));
             return;
         }
+        let w = waits(hub).await;
+        let busy: usize = hub.runner_processes(machine).iter().map(|i| i.jobs).sum();
+        if busy > 0 {
+            if since.elapsed() > w.jobs() {
+                let e = format!("{machine} kept running jobs for {}, so it never switched; it does once it is idle", said(w.jobs()));
+                u.time_out(hub, id, "jobs", e);
+                return;
+            }
+            idle_since = Instant::now();
+            waited = true;
+            if busy != waiting_on {
+                u.say(hub, id, format!("{machine} waits for {} before it switches", if busy == 1 { "its running job".to_owned() } else { format!("its {busy} running jobs") }));
+            }
+        } else if idle_since.elapsed() > w.upgrade() {
+            let after = if waited { " of its last job ending" } else { "" };
+            u.time_out(hub, id, "upgrade", format!("the new runner didn't report in within {}{after}; see the runner's log", said(w.upgrade())));
+            return;
+        }
+        waiting_on = busy;
     }
-    u.finish(hub, id, Err("the new runner didn't report in within 15 minutes; see the runner's log".to_owned()));
 }
 
 /// The upgrade script for a runner from before [`CAP_UPGRADE`], run through its terminal support
@@ -1418,11 +1641,18 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
         }
     };
     feed(&String::from_utf8_lossy(&att.replay));
-    let deadline = Instant::now() + RUNNER_TIMEOUT;
+    let started = Instant::now();
+    let mut timed_out = false;
     let result = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let Ok(frame) = crate::rt::timeout(left, att.live.recv()).await else {
-            break Err("the upgrade didn't finish in 15 minutes".to_owned());
+        // Looked at again at least every minute: a longer wait chosen meanwhile applies.
+        let limit = waits(hub).await.upgrade();
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            timed_out = true;
+            break Err(format!("the upgrade didn't finish in {}", said(limit)));
+        }
+        let Ok(frame) = crate::rt::timeout(left.min(Duration::from_secs(60)), att.live.recv()).await else {
+            continue;
         };
         match frame {
             Ok(Frame::Data(d)) => feed(&String::from_utf8_lossy(&d)),
@@ -1443,10 +1673,12 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
     if let Err(e) = result
         && !ok_marked
     {
-        if e.contains("15 minutes") {
+        if timed_out {
             session.close();
+            u.time_out(hub, id, "upgrade", e);
+        } else {
+            u.finish(hub, id, Err(e));
         }
-        u.finish(hub, id, Err(e));
         return;
     }
     // Installed: the new runner reports its build when it connects, which completes the job.
@@ -1471,7 +1703,7 @@ pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     for r in runners(hub).await {
         // Runners whose updates are off are left alone, with the others too.
         if r.policy != Policy::Off && !r.locked && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
-            out.push(upgrade_runner(hub, &r.name).await.map_err(|e| format!("{}: {e:#}", r.name)));
+            out.push(upgrade_runner(hub, &r.name, None).await.map_err(|e| format!("{}: {e:#}", r.name)));
         }
     }
     out
@@ -1855,7 +2087,7 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
         if let Some(st) = exited {
             break st;
         }
-        if started.elapsed() > RUNNER_TIMEOUT {
+        if started.elapsed() > INSTALL_TIMEOUT {
             let _ = child.kill();
             let _ = std::fs::remove_file(&bin);
             anyhow::bail!("install --agent --upgrade didn't finish in 15 minutes");
@@ -1965,6 +2197,68 @@ pub fn outpost_build() -> AgentMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runner upgrade kiln gave up on: the machine got there later.
+    fn given_up(blue_green: bool) -> Job {
+        let mut j = new_job("runner", "adacachy", "native", Some("1e8fb739442b".into()), Some("493003c712b0".into()));
+        j.blue_green = blue_green;
+        j.state = JobState::Failed;
+        j.error = Some("the new runner didn't report in within 15 minutes; see the runner's log".into());
+        j.timed_out = Some("upgrade");
+        j
+    }
+
+    #[test]
+    fn an_upgrade_that_got_there_late_is_upgraded_after_all() {
+        let mut j = given_up(false);
+        assert!(j.awaits("adacachy", "493003c712b0"), "a job given up on still waits for its build");
+        assert!(!j.awaits("adacachy", "another"), "only for its own build");
+        assert!(!j.awaits("fedora", "493003c712b0"), "and its own machine");
+        j.reached = true;
+        assert!(j.through_late(42));
+        assert_eq!((j.state, j.error.as_deref(), j.timed_out, j.ended_at), (JobState::Done, None, None, Some(42)));
+        assert!(j.log.last().is_some_and(|l| l.starts_with("upgraded after all") && l.contains("15 minutes")), "{:?}", j.log);
+        assert!(!j.through_late(43), "once");
+        assert!(!j.awaits("adacachy", "493003c712b0"), "done: it waits for nothing");
+    }
+
+    #[test]
+    fn a_blue_green_upgrade_needs_its_handover_too() {
+        let mut j = given_up(true);
+        j.reached = true;
+        assert!(!j.through_late(1), "the new build reported in, but the old runner never said it took over");
+        assert_eq!(j.state, JobState::Failed);
+        j.handed_over = true;
+        assert!(j.through_late(2));
+        assert_eq!(j.state, JobState::Done);
+    }
+
+    #[test]
+    fn a_failure_its_machine_never_got_past_stays_failed() {
+        let mut j = given_up(false);
+        assert!(!j.through_late(1), "nothing reported in");
+        let mut running = given_up(false);
+        running.state = JobState::Running;
+        running.reached = true;
+        assert!(!running.through_late(1), "a running job finishes the usual way");
+    }
+
+    #[test]
+    fn waits_come_from_kiln_toml_and_stay_within_reason() {
+        let w = Waits::of(&crate::config::Updates::default());
+        assert_eq!((w.upgrade(), w.jobs(), w.build()), (Duration::from_secs(15 * 60), Duration::from_secs(6 * 3600), Duration::from_secs(3600)));
+        assert!(w.check().is_ok());
+        let odd = Waits { upgrade_minutes: 0, wait_for_jobs_minutes: 1_000_000, build_minutes: 2 };
+        assert!(odd.check().is_err_and(|e| e.to_string().contains("upgrade_minutes is 0")), "a change is refused");
+        assert_eq!(odd.clamped(), Waits { upgrade_minutes: 1, wait_for_jobs_minutes: 7 * 24 * 60, build_minutes: 5 }, "a kiln.toml is brought within");
+        assert!(serde_json::from_str::<Waits>(r#"{"upgrade_minutes": 30, "wait_for_jobs_minutes": 60, "build_minutes": 90, "other": 1}"#).is_err(), "nothing unknown");
+    }
+
+    #[test]
+    fn waits_read_as_a_person_says_them() {
+        let said_of = |m: u64| said(minutes(m));
+        assert_eq!([said_of(1), said_of(15), said_of(60), said_of(90), said_of(120), said_of(360)], ["a minute", "15 minutes", "an hour", "90 minutes", "2 hours", "6 hours"]);
+    }
 
     #[test]
     fn runners_announce_every_capability_they_have() -> anyhow::Result<()> {

@@ -118,6 +118,47 @@ Some runners still upgrade as before: those not under a supervisor (`kiln agent`
 Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
 terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.
 
+## When an upgrade fails
+
+Settings → Updates says what each runner does next, and what went wrong when an upgrade failed (its
+row reads *upgrade failed* or *build failed*, with the upgrade's output under it). From there:
+
+- **Retry** tries the same way again now, without waiting for kiln's next automatic try (a failed
+  automatic upgrade is tried again after 30 minutes, twice per commit).
+- **Download instead** / **Build it instead**: the other way, when it's open. A download needs a
+  binary of the newest kiln for the machine's platform; a build needs a kiln checkout on the
+  machine. A way that can't be taken now says why (no binary yet, a release run still building one,
+  no checkout, terminals turned off), so a runner kiln is waiting on can still be upgraded the
+  other way.
+- **Diagnose** opens New agents on that machine with a first message written for it: what kiln
+  knows (the build it runs and the one it was going to, the error, the upgrade's last lines) and
+  where to look (the runner's log, a build's whole output in
+  `~/.cache/kiln/self-build/build-<job>.log`, disk, memory, toolchains). It asks the agent to fix
+  the cause on the machine without stopping or reinstalling the runner, and to say what it changed.
+  Read and change the message before starting it; the agent asks before commands and edits unless
+  you choose otherwise.
+
+`POST /api/updates/runners/{name}` with `{"way": "download" | "build"}` does the same as the
+buttons (no body: the way kiln picks). `GET /api/updates` lists each runner's `ways`, each with `ok`
+and `why`.
+
+An upgrade kiln stopped waiting for can still finish: the runner switches once it's idle. When its
+new build reports in later (and, upgrading blue/green, takes over), the job reads as done after all
+and the runner as up to date.
+
+### How long kiln waits
+
+| | default | `[updates]` |
+|---|---|---|
+| for a runner to switch to its new build and report in, counted once it has no jobs running | 15 minutes | `upgrade_minutes` |
+| while a runner finishes the jobs it is running (it switches only once they end) | 6 hours | `wait_for_jobs_minutes` |
+| for a machine to build kiln itself, install included | 60 minutes | `build_minutes` |
+
+Settings → Updates → *How long kiln waits* changes them for this server (kept in its database; *Use
+kiln.toml's* goes back), and so does `PUT /api/updates/waits` with all three (`DELETE` goes back). A
+change applies to upgrades under way too. A job that ran out of time says which wait it was, with a
+link to change it.
+
 ## Every platform in step with the server
 
 A server built knowing its commit (`KILN_COMMIT`) keeps every platform in step with itself. Every

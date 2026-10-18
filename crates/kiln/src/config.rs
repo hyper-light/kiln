@@ -471,10 +471,28 @@ pub struct Updates {
     /// one, whatever the server's policy for it (`kiln config set updates.accept false`); the
     /// server shows it so.
     pub accept: bool,
+    /// Minutes a runner has to switch to its new build and report in, counted once it has no
+    /// jobs running. Settings → Updates can change it, and the two below.
+    pub upgrade_minutes: u64,
+    /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running (it
+    /// switches only once they are done).
+    pub wait_for_jobs_minutes: u64,
+    /// Minutes a machine has to build kiln itself, install included.
+    pub build_minutes: u64,
 }
 
 impl Default for Updates {
     fn default() -> Self {
-        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned(), in_step: true, follow: true, accept: true }
+        Self {
+            release_repo: "hyper-light/kiln".to_owned(),
+            release_pipeline: "release".to_owned(),
+            release_branch: "main".to_owned(),
+            in_step: true,
+            follow: true,
+            accept: true,
+            upgrade_minutes: 15,
+            wait_for_jobs_minutes: 6 * 60,
+            build_minutes: 60,
+        }
     }
 }

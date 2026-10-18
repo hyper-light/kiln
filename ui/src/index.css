@@ -2715,6 +2715,9 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 .upd-state[data-tone="cancelled"] {
   color: #7f8794;
 }
+.upd-state[data-tone="failed"] {
+  color: #d1aaad;
+}
 .upd-runner-detail {
   display: flex;
   flex-wrap: wrap;
@@ -2812,6 +2815,47 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   font-size: 11.5px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+/* Why a runner can't be upgraded any way now. */
+.upd-ways {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding-left: 16px;
+}
+/* Under a job kiln stopped waiting for. */
+.upd-job-note {
+  margin: 0;
+  padding: 0 12px 10px;
+}
+.upd-link {
+  color: #d6dbe2;
+  text-decoration: underline;
+  text-decoration-color: rgb(214 219 226 / 40%);
+  text-underline-offset: 2px;
+}
+.upd-link:hover {
+  text-decoration-color: currentColor;
+}
+.upd-link:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 80%);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.upd-waits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px 16px;
+  min-width: 0;
+}
+.upd-waits-actions {
+  grid-column: 1 / -1;
+}
+.upd-err-inline {
+  color: #d1aaad;
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 
 .runners-tools {
@@ -3024,7 +3068,8 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 }
 
 @media (max-width: 640px) {
-  .upd-runner-detail {
+  .upd-runner-detail,
+  .upd-ways {
     padding-left: 0;
   }
   .upd-procs,

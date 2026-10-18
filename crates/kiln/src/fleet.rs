@@ -45,8 +45,6 @@ const TRIES: u32 = 2;
 const RETRY: Duration = Duration::from_secs(30 * 60);
 /// A machine found without a kiln checkout isn't asked to build again for this long.
 const NO_CHECKOUT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// How long a build on a machine may take, install included.
-const BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// How long the new runner has to report in after its install finished.
 const REPORT_IN: Duration = Duration::from_secs(90);
 /// Builds remembered with their commit.
@@ -502,7 +500,7 @@ fn checkouts(hub: &Hub, machine: &str) -> Vec<String> {
 }
 
 /// Whether `r` can build kiln itself; else why not.
-fn can_build(hub: &Hub, r: &RunnerInfo) -> Result<Vec<String>, String> {
+pub(crate) fn can_build(hub: &Hub, r: &RunnerInfo) -> Result<Vec<String>, String> {
     if r.os != "linux" && r.os != "macos" {
         return Err("kiln builds itself only on Linux and macOS".to_owned());
     }
@@ -537,6 +535,43 @@ pub async fn plan(hub: &Hub, r: &RunnerInfo, t: &Target) -> Plan {
             None => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
         },
     }
+}
+
+/// The ways a person can have `r` upgraded to `t` now, each with what it does or why it can't.
+pub async fn ways(hub: &Hub, r: &RunnerInfo, t: &Target) -> Vec<crate::updates::WayOpen> {
+    use crate::updates::{Way, WayOpen};
+    let s = short(&t.commit);
+    let Some(target) = r.target.as_deref() else { return Vec::new() };
+    let download = match binary_for(hub, target, &t.commit) {
+        Some(_) if r.method != "native" && !r.terminal => {
+            WayOpen { way: Way::Download, ok: false, why: "its runner is too old to upgrade itself, and terminals are off on it".to_owned() }
+        }
+        Some(b) => WayOpen { way: Way::Download, ok: true, why: format!("downloads build {} of {s}", b.build) },
+        None => WayOpen {
+            way: Way::Download,
+            ok: false,
+            why: match release_building(hub, &t.commit, Some(target)).await {
+                Some(n) => format!("no binary of {s} for {target} yet: release run #{n} is building one"),
+                None => format!("no binary of {s} for {target} yet"),
+            },
+        },
+    };
+    let build = match can_build(hub, r) {
+        Ok(_) => WayOpen { way: Way::Build, ok: true, why: format!("builds {s} on the machine, from the server's source") },
+        Err(why) => WayOpen { way: Way::Build, ok: false, why },
+    };
+    vec![download, build]
+}
+
+/// How `r` catches up with `t` the way a person chose.
+pub fn plan_by(hub: &Hub, r: &RunnerInfo, t: &Target, way: crate::updates::Way) -> anyhow::Result<Plan> {
+    let target = r.target.as_deref().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
+    Ok(match way {
+        crate::updates::Way::Download => {
+            Plan::Download(binary_for(hub, target, &t.commit).ok_or_else(|| anyhow::anyhow!("no binary of {} for {target} yet", short(&t.commit)))?)
+        }
+        crate::updates::Way::Build => Plan::Build(can_build(hub, r).map_err(|why| anyhow::anyhow!("{} can't build kiln itself: {why}", r.name))?),
+    })
 }
 
 /// What `r` does next to reach `t`: how ("download", "build", "wait", "upgrading" while it does,
@@ -767,6 +802,7 @@ for b in {bases}; do
 done
 [ -n "$base" ] || fail "could not fetch the source of {s} from the server"
 find "$dir" -maxdepth 1 -name "src*" -mmin +120 -exec rm -rf {{}} + 2>/dev/null
+find "$dir" -maxdepth 1 -name "build-*.log" -mtime +7 -exec rm -f {{}} + 2>/dev/null
 src="$dir/src-{job}"
 rm -rf "$src" && mkdir -p "$src" && tar -xf "$dir/source-{job}.tar" -C "$src" || fail "could not unpack the source"
 rm -f "$dir/source-{job}.tar"
@@ -791,7 +827,16 @@ if command -v rustup >/dev/null 2>&1; then
   fi
 fi
 echo "building kiln {s} with $($cargo --version 2>/dev/null)"
-MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln || fail "kiln did not build"
+log="$dir/build-{job}.log"
+{{ MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln; echo "$?" >"$dir/rc-{job}"; }} 2>&1 | tee "$log"
+rc=$(cat "$dir/rc-{job}" 2>/dev/null || echo 1)
+rm -f "$dir/rc-{job}"
+if [ "$rc" != 0 ]; then
+  echo "cargo exited with $rc. What it said that went wrong:"
+  grep -E "^error|could not compile|Killed|signal: |No space left" "$log" | tail -n 40
+  grep -q -E "^error" "$log" || echo "cargo stopped without an error message: the machine may have run out of memory or slept, or the build was stopped"
+  fail "kiln did not build (its full output is $log on this machine)"
+fi
 bin="$dir/target/release/kiln"
 if command -v sha256sum >/dev/null 2>&1; then sum=$(sha256sum "$bin" | cut -d" " -f1); else sum=$(shasum -a 256 "$bin" | cut -d" " -f1); fi
 echo "{BUILT_MARK} $sum"
@@ -834,6 +879,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
     let mut att = session.attach();
     let mut screen = crate::updates::Screen::default();
     let (mut ok_marked, mut no_checkout) = (false, false);
+    let mut lost = false;
     let mut feed = |text: &str| {
         for shown in screen.feed(text) {
             let line = match shown {
@@ -872,11 +918,18 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
         }
     };
     feed(&String::from_utf8_lossy(&att.replay));
-    let deadline = Instant::now() + BUILD_TIMEOUT;
+    let started = Instant::now();
+    let mut timed_out = false;
     let result = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let Ok(frame) = crate::rt::timeout(left, att.live.recv()).await else {
-            break Err("the build didn't finish in an hour".to_owned());
+        // Looked at again at least every minute: a longer wait chosen meanwhile applies.
+        let limit = crate::updates::waits(hub).await.build();
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            timed_out = true;
+            break Err(format!("the build didn't finish in {}", crate::updates::said(limit)));
+        }
+        let Ok(frame) = crate::rt::timeout(left.min(Duration::from_secs(60)), att.live.recv()).await else {
+            continue;
         };
         match frame {
             Ok(Frame::Data(d)) => feed(&String::from_utf8_lossy(&d)),
@@ -889,7 +942,13 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
                     (c, None) => Err(format!("the build exited with {}", c.map_or_else(|| "a signal".to_owned(), |c| c.to_string()))),
                 };
             }
-            Ok(Frame::Size { .. }) | Err(async_broadcast::RecvError::Overflowed(_)) => {}
+            Ok(Frame::Size { .. }) => {}
+            // Faster than kept here: the build's own log on the machine has all of it.
+            Err(async_broadcast::RecvError::Overflowed(_)) => {
+                if !std::mem::replace(&mut lost, true) {
+                    u.say(hub, id, "(some of the build's output came faster than kiln kept it: the build log on the machine has all of it)");
+                }
+            }
             Err(async_broadcast::RecvError::Closed) => break Err("the build's terminal closed".to_owned()),
         }
     };
@@ -900,11 +959,12 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
     if let Err(e) = result
         && !ok_marked
     {
-        if e.contains("an hour") {
+        if timed_out {
             session.close();
+            u.time_out(hub, id, "build", e);
+        } else {
+            u.finish(hub, id, Err(if no_checkout { "no kiln checkout on this machine to build from".to_owned() } else { e }));
         }
-        let e = if no_checkout { "no kiln checkout on this machine to build from".to_owned() } else { e };
-        u.finish(hub, id, Err(e));
         return;
     }
     // Installed: the new runner reports its build when it connects, which completes the job.
