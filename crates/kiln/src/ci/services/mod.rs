@@ -49,6 +49,7 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
         })
         .await?;
     let evicted = cache_v1::evict(hub, None).await?;
+    crate::ci::token::prune(hub).await?;
     let collected = cas::collect(hub).await?;
     if expired + stale + evicted + collected.objects > 0 {
         tracing::info!(expired, stale, evicted, objects = collected.objects, chunks = collected.chunks, bytes = collected.bytes, "CI store upkeep");

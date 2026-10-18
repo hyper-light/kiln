@@ -154,6 +154,101 @@ pub fn of_request(hub: &Hub, headers: &http::HeaderMap) -> Option<Claims> {
     from_headers(headers).and_then(|t| verify(hub, &t))
 }
 
+// ------------------------------------------------------------------ job tokens (W10-R03, R04)
+
+/// The prefix of a job token: masking and secret scanners recognize it.
+pub const JOB_PREFIX: &str = "kiln_job_";
+
+/// A job token's facts: whose it is and what it may do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub leg: String,
+    pub run: String,
+    /// `repos.id`.
+    pub repo: String,
+    /// The job's resolved `permissions` (W04-R06).
+    pub permissions: std::collections::BTreeMap<String, kiln_ci::plan::perms::Level>,
+}
+
+impl Job {
+    /// Whether the token grants at least `need` on `scope` (`contents`, `actions`, …).
+    pub fn may(&self, scope: &str, need: kiln_ci::plan::perms::Level) -> bool {
+        self.permissions.get(scope).copied().unwrap_or(kiln_ci::plan::perms::Level::None) >= need
+    }
+}
+
+/// A leg attempt's `GITHUB_TOKEN`: `kiln_job_<leg>_<random>`, stored as its hash, with the job's
+/// permissions; it lives `ttl` seconds unless revoked first.
+pub async fn mint_job(hub: &Hub, leg: &str, run: &str, repo: &str, permissions: &kiln_ci::plan::perms::Resolved, ttl: i64) -> anyhow::Result<String> {
+    let secret = crate::util::random_token();
+    let token = format!("{JOB_PREFIX}{leg}_{secret}");
+    let hash = crate::util::sha256_hex(token.as_bytes());
+    let scopes = serde_json::json!({ "permissions": permissions, "repo": repo }).to_string();
+    let (leg, run) = (leg.to_owned(), run.to_owned());
+    hub.store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            c.execute(
+                "INSERT INTO tokens (id, kind, principal, on_behalf_of, hash, scopes, created_at, expires_at) VALUES (?1, 'job', ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![crate::util::new_id(), leg, run, hash, scopes, now, now + ttl],
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(token)
+}
+
+/// The job a token is, while it is live (not expired, not revoked).
+pub async fn job_of(hub: &Hub, token: &str) -> Option<Job> {
+    if !token.starts_with(JOB_PREFIX) {
+        return None;
+    }
+    let hash = crate::util::sha256_hex(token.trim().as_bytes());
+    hub.store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            let now = crate::util::now_unix();
+            let row: Option<(String, String, String, String)> = c
+                .query_row(
+                    "SELECT id, principal, COALESCE(on_behalf_of, ''), scopes FROM tokens WHERE hash = ?1 AND kind = 'job' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
+                    rusqlite::params![hash, now],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((id, leg, run, scopes)) = row else { return Ok(None) };
+            c.execute("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?;
+            let v: serde_json::Value = serde_json::from_str(&scopes).unwrap_or_default();
+            let permissions = v.get("permissions").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
+            let repo = v.get("repo").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            Ok(Some(Job { leg, run, repo, permissions }))
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The job token of a request (`Bearer`, `token`, or git's Basic password).
+pub async fn job_of_request(hub: &Hub, headers: &http::HeaderMap) -> Option<Job> {
+    let t = from_headers(headers)?;
+    job_of(hub, &t).await
+}
+
+/// Revokes a leg's job tokens: its attempt ended (W10-R03).
+pub async fn revoke_leg(hub: &Hub, leg: &str) -> anyhow::Result<()> {
+    let leg = leg.to_owned();
+    hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE kind = 'job' AND principal = ?1 AND revoked_at IS NULL", rusqlite::params![leg, crate::util::now_unix()]).map(|_| ())?)).await
+}
+
+/// Drops job tokens that ended over a day ago.
+pub async fn prune(hub: &Hub) -> anyhow::Result<usize> {
+    hub.store
+        .call(|c| {
+            let before = crate::util::now_unix() - 86_400;
+            Ok(c.execute("DELETE FROM tokens WHERE kind = 'job' AND (revoked_at < ?1 OR expires_at < ?1)", rusqlite::params![before])?)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

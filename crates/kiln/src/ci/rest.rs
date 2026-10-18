@@ -17,8 +17,10 @@ use http::{Method, StatusCode, header};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+use kiln_ci::plan::perms::Level;
+
 use super::services::blob::{self, Target};
-use super::token::Claims;
+use super::token::Job;
 use super::{Fail, runs, token};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
@@ -35,10 +37,23 @@ fn internal(e: anyhow::Error) -> Fail {
 
 /// `/api/v3/<rest>`.
 pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response, Fail> {
-    let Some(claims) = token::of_request(hub, req.headers()) else { return Ok(message(StatusCode::UNAUTHORIZED, "Bad credentials")) };
+    let Some(claims) = token::job_of_request(hub, req.headers()).await else { return Ok(message(StatusCode::UNAUTHORIZED, "Bad credentials")) };
     let method = req.method().clone();
     let q = srv::query(&req);
     let origin = blob::origin(&req);
+    // What the job's `permissions` must grant for the route (W10-R04), GitHub's mapping.
+    let need = match (&method, rest) {
+        (&Method::GET, ["repos", _, _, "actions", ..]) => Some(("actions", Level::Read)),
+        (&Method::DELETE, ["repos", _, _, "actions", ..]) | (&Method::POST, ["repos", _, _, "actions", "workflows", ..]) => Some(("actions", Level::Write)),
+        (&Method::POST, ["repos", _, _, "dispatches"]) => Some(("contents", Level::Write)),
+        _ => None,
+    };
+    if let Some((scope, level)) = need
+        && !claims.may(scope, level)
+    {
+        let word = if level == Level::Write { "write" } else { "read" };
+        return Ok(message(StatusCode::FORBIDDEN, &format!("Resource not accessible by integration: the job's token lacks `{scope}: {word}`")));
+    }
     match (&method, rest) {
         (&Method::GET, ["repos", owner, repo, "actions", "runs", run, "artifacts"]) => {
             let Some(r) = repo_run(hub, &claims, owner, repo, run).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
@@ -101,7 +116,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
 }
 
 /// The token's repository when its run is trusted (W03-R08): untrusted runs can't start others.
-async fn trusted_repo(hub: &Hub, claims: &Claims, owner: &str, repo: &str) -> Result<Option<crate::store::Repo>, Fail> {
+async fn trusted_repo(hub: &Hub, claims: &Job, owner: &str, repo: &str) -> Result<Option<crate::store::Repo>, Fail> {
     if repo_of(hub, claims, owner, repo).await?.is_none() {
         return Ok(None);
     }
@@ -116,20 +131,20 @@ async fn trusted_repo(hub: &Hub, claims: &Claims, owner: &str, repo: &str) -> Re
 
 /// `/api/graphql`.
 pub async fn graphql(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
-    let Some(claims) = token::of_request(hub, req.headers()) else { return Ok(message(StatusCode::UNAUTHORIZED, "Bad credentials")) };
+    let Some(claims) = token::job_of_request(hub, req.headers()).await else { return Ok(message(StatusCode::UNAUTHORIZED, "Bad credentials")) };
     not_implemented(hub, &claims, req.method(), "/api/graphql").await
 }
 
 /// 501, and a warning on the leg naming the route.
-async fn not_implemented(hub: &Hub, claims: &Claims, method: &Method, path: &str) -> Result<Response, Fail> {
+async fn not_implemented(hub: &Hub, claims: &Job, method: &Method, path: &str) -> Result<Response, Fail> {
     let what = format!("not implemented by kiln: {method} {path}");
-    tracing::info!(leg = %claims.sub, route = %path, "facade route not implemented");
-    let _ = runs::annotation(hub, &claims.sub, None, "warning", Some("GitHub API".into()), &format!("This job called GitHub's API at a route kiln doesn't implement yet ({method} {path}); it got 501."), None, None, None, None, None).await;
+    tracing::info!(leg = %claims.leg, route = %path, "facade route not implemented");
+    let _ = runs::annotation(hub, &claims.leg, None, "warning", Some("GitHub API".into()), &format!("This job called GitHub's API at a route kiln doesn't implement yet ({method} {path}); it got 501."), None, None, None, None, None).await;
     Ok(message(StatusCode::NOT_IMPLEMENTED, &what))
 }
 
 /// The run (`runs.id`) a `run_id` names, when it is the token's repository's.
-async fn repo_run(hub: &Hub, claims: &Claims, owner: &str, repo: &str, run: &str) -> Result<Option<String>, Fail> {
+async fn repo_run(hub: &Hub, claims: &Job, owner: &str, repo: &str, run: &str) -> Result<Option<String>, Fail> {
     let Some(repo_id) = repo_of(hub, claims, owner, repo).await? else { return Ok(None) };
     let Ok(rowid) = run.parse::<i64>() else { return Ok(None) };
     hub.store.call(move |c| Ok(c.query_row("SELECT id FROM runs WHERE rowid = ?1 AND repo_id = ?2", params![rowid, repo_id], |r| r.get::<_, String>(0)).optional()?)).await.map_err(internal)
@@ -137,7 +152,7 @@ async fn repo_run(hub: &Hub, claims: &Claims, owner: &str, repo: &str, run: &str
 
 /// The repository's id, when it is the one the token's run belongs to: a job's token reads its
 /// own repository only.
-async fn repo_of(hub: &Hub, claims: &Claims, owner: &str, repo: &str) -> Result<Option<String>, Fail> {
+async fn repo_of(hub: &Hub, claims: &Job, owner: &str, repo: &str) -> Result<Option<String>, Fail> {
     let full = format!("{owner}/{repo}");
     let repos = hub.store.repos().await.map_err(internal)?;
     Ok(repos.into_iter().find(|r| r.id == claims.repo && r.name.eq_ignore_ascii_case(&full)).map(|r| r.id))

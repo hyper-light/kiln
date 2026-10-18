@@ -579,8 +579,11 @@ impl Dispatch {
         let (cache_mode, cache) = cache_access(&l.spec, r);
         let ttl = (i64::from(l.spec.timeout_minutes) + 60) * 60;
         let token = super::token::mint(&self.hub, &super::token::Leg { leg, run: &l.run, repo: &r.repo.id, cache, cache_mode: cache_mode.as_str(), ttl });
-        let (secrets, used_ids, vars) = self.leg_secrets(l, r, &token).await;
-        let a = self.assignment(leg, l, r, attempt, executor.clone(), token, cache_mode, secrets, vars);
+        // GITHUB_TOKEN: a job token with the job's permissions, revoked when the attempt ends
+        // (W10-R03, R04).
+        let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
+        let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
+        let a = self.assignment(leg, l, r, attempt, executor.clone(), token, job_token, cache_mode, secrets, vars);
         let json = serde_json::to_string(&a)?;
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
@@ -655,7 +658,7 @@ impl Dispatch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
+    fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, token: String, job_token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
         let spec = &l.spec;
         let wf = &spec.workflow;
         let job = spec.def();
@@ -703,7 +706,7 @@ impl Dispatch {
                 // GitHub's API as GHES serves it (W14-R11).
                 api_url: "/api/v3".into(),
                 graphql_url: "/api/graphql".into(),
-                github_token: token,
+                github_token: job_token,
                 cache_mode: Some(cache_mode.as_str().into()),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
@@ -768,6 +771,10 @@ impl Dispatch {
     async fn finished(&mut self, agent: &str, r: JobResult) -> anyhow::Result<()> {
         self.hub.release_slot(agent, &r.job);
         self.hub.logs.finish(&r.job);
+        // The attempt's GITHUB_TOKEN dies with it (W10-R03).
+        if let Err(e) = super::token::revoke_leg(&self.hub, &r.job).await {
+            tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the job token could not be revoked");
+        }
         let Some(l) = self.legs.get(&r.job) else { return Ok(()) };
         let attempt = l.attempt;
         let outcome = match r.status {
