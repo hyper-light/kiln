@@ -60,8 +60,9 @@ fn kiln_host() -> String {
     KILN_HOST.to_owned()
 }
 
+/// The release repository's default name: a native repository of kiln's own (ci.md W14).
 fn releases() -> String {
-    "releases".to_owned()
+    "kiln/releases".to_owned()
 }
 
 fn main_branch() -> String {

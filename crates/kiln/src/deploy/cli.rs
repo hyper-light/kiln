@@ -192,8 +192,8 @@ enum EnvCmd {
     /// kiln's own git server.
     Add {
         env: String,
-        /// The release repository.
-        #[arg(long, default_value = "releases")]
+        /// The release repository on kiln's git server.
+        #[arg(long, default_value = "kiln/releases")]
         repo: String,
         #[arg(long, default_value = "main")]
         branch: String,
