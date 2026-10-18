@@ -29,6 +29,7 @@ pub mod secrets;
 pub mod services;
 pub mod token;
 pub mod uploads;
+pub mod webhooks;
 pub mod workflows;
 
 /// A failure: an HTTP status and why (as `cd::ops::Fail`).

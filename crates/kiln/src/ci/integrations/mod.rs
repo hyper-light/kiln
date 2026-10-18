@@ -144,7 +144,7 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { kind: "telegram", title: "Telegram", category: "notify", mode: Mode::Token, fields: &[f("chat_id", false, "the chat a rule that names none posts to")], secret: Some("bot token"), built: true },
     KindInfo { kind: "pagerduty", title: "PagerDuty", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Events API v2 routing key"), built: true },
     KindInfo { kind: "opsgenie", title: "Opsgenie", category: "notify", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true },
-    KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
+    KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON"), f("events", false, "kiln events to send as they happen: run, job, agent, queue, cd_plan, cd_apps, cd_app_deleted, or * (comma-separated); without, only notify rules use it")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
     KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true },
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false },
@@ -214,6 +214,9 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
         if obj.get(f.name).and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
             return Err(format!("{} needs `{}`: {}", info.title, f.name, f.help));
         }
+    }
+    if info.kind == "webhook" {
+        crate::ci::webhooks::check_events(config)?;
     }
     if info.kind == "oci"
         && let Some(r) = obj.get("registry").and_then(Value::as_str)

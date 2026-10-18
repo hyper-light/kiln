@@ -335,6 +335,7 @@ pub fn spawn(hub: Arc<Hub>) {
     let Some(rx) = hub.ci.rx.lock().take() else { return };
     hub.ci.on.store(true, Ordering::Relaxed);
     super::services::spawn_maintenance(Arc::clone(&hub));
+    super::webhooks::spawn(Arc::clone(&hub));
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {

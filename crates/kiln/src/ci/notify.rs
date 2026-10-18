@@ -270,7 +270,10 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, s: 
     if i.kind == "webhook"
         && let Some(key) = &secret
     {
-        req = req.header("x-kiln-signature-256", &format!("sha256={}", crate::util::hmac_hex(key.as_bytes(), &payload))).header("x-kiln-event", event);
+        req = req.header("x-kiln-signature-256", &format!("sha256={}", crate::util::hmac_hex(key.as_bytes(), &payload)));
+    }
+    if i.kind == "webhook" {
+        req = req.header("x-kiln-event", event).header("x-kiln-delivery", &crate::util::new_id());
     }
     let resp = req.send().await.map_err(|e| format!("{e:#}"))?;
     let status = resp.status();
@@ -324,6 +327,8 @@ async fn deliver(hub: &Hub, repo: &Repo, rule: &str, event: &str, s: &Subject, s
 
 /// Sends `event` about `s` through every rule of `repo` that takes it.
 pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
+    // For outgoing webhooks' subscribers too (W19-R07), and the UI.
+    hub.emit(&json!({ "type": event, "repo": { "id": repo.id, "name": repo.name }, "run": s.run_value(), "environments": s.environments }));
     for (name, rule) in rules_for(hub, repo).await {
         if !takes(&rule, event, s) {
             continue;

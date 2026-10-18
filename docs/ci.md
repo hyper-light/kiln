@@ -189,7 +189,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; insights, compare, log search, audit v2, outgoing webhooks left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights, compare, log search, audit v2 left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
@@ -3727,7 +3727,7 @@ rule-based notifications (G-30, G-31).
   Discord, email and webhook channels deliver (local fakes, then real ones). *Integration test.*
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
-**Progress.** In progress: R06 (with W11-R06's channels).
+**Progress.** In progress: R06 (with W11-R06's channels). Done: R07.
 
 - *R06* (`crates/kiln/src/ci/notify.rs`):
   - Rules come from trunk's `.kiln/notify.yaml` and the server's `[[ci.notify]]`, as written
@@ -3749,7 +3749,35 @@ rule-based notifications (G-30, G-31).
     - a failure again within the throttle sent nothing;
     - a deployment waiting for a reviewer sent `approval.waiting` to Discord;
     - a step's `kiln/notify@v1` reached both channels.
-- *Left*: R01 to R05, R07; email (SMTP), the inbox and issue trackers as channels; the other
+- *R07* (`crates/kiln/src/ci/webhooks.rs`, migration `20261018-1800_w19_webhooks.sql`):
+  - A subscription is a `webhook` integration with `events`:
+    - `run`, `job`, `agent`, `queue`, `cd_plan`, `cd_apps` and `cd_app_deleted`, as kiln's own
+      clients hear them;
+    - R06's `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and `approval.waiting`;
+    - or `*`, which is all of them but the busy `queue`.
+
+    Naming anything else is refused. Sign-in flows, terminals and host samples never leave.
+  - Its scope decides whose events it gets: the server's (all of them, runners and deployments
+    included), an organization's repositories', or one repository's.
+  - Each event is POSTed as JSON with `X-Kiln-Event`, `X-Kiln-Delivery` and
+    `X-Kiln-Signature-256` (HMAC-SHA256 of the body with the integration's secret).
+  - Delivery is in order for each subscriber, by a worker of its own:
+    - each attempt uses the integration as it is by then;
+    - attempts come after 0, 2, 15 and 60 seconds;
+    - 1,000 events may wait; beyond that they are logged as `dropped`.
+  - Every delivery is logged, with its body, before it is sent (14 days):
+    - a restart resumes the ones still `pending`;
+    - `GET /api/ci/webhooks/deliveries[/:id]` lists them;
+    - `POST …/:id/redeliver` sends one again, with the same delivery id.
+  - Verified end to end, against a local fake:
+    - run and job events reached a server-wide subscriber, every signature checked;
+    - an `org:other` subscriber got nothing;
+    - a subscriber answering 500 was tried four times per event, and logged `failed`;
+    - a restart mid-retry resumed the 22 pending deliveries;
+    - pointing that subscriber at a working URL sent the rest there;
+    - redelivering a failed delivery sent it there with its own delivery id;
+    - `run.failed` and `run.succeeded` arrived with their repository.
+- *Left*: R01 to R05; email (SMTP), the inbox and issue trackers as channels; the other
   events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC01 to AC06.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
@@ -4255,6 +4283,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/insights/{workflows,runners,repos}/:id` | `ci.insights.*` | runs.read | W19 |
 | GET/PUT | `/api/ci/notifications/rules?scope=` · GET `/api/inbox` | `ci.notifications.*` | settings.manage, — | W19 |
 | GET/POST/DELETE | `/api/webhooks[/:id]` · POST `/:id/redeliver` | `webhooks.*` | settings.manage | W19 |
+| GET · POST | `/api/ci/webhooks/deliveries[/:id]` · `/:id/redeliver` (built: subscriptions are `webhook` integrations with `events`) | `ci.webhooks.*` | integrations.manage | W19 |
+| GET | `/api/ci/notify/deliveries?run=` | `ci.notify.deliveries` | settings.manage | W19 |
 | POST | `/api/ci/hooks/:id` | inbound webhook (HMAC) | open, signed | W03 |
 | GET | `/api/audit?principal=&action=&target=&since=` | `audit.list` | audit.read | W19 |
 | GET/POST · DELETE · POST | `/api/tokens` · `/:id` · `/:id/rotate` | `tokens.*` (shown once; agent tokens rotate) | your own; anyone's with tokens.manage | W10 |

@@ -337,6 +337,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/integrations/kinds", "runs.read", At::Anywhere),
     any("/api/ci/integrations", "integrations.manage", At::Server),
     any("/api/ci/integrations/**", "integrations.manage", At::Server),
+    any("/api/ci/webhooks/**", "integrations.manage", At::Server),
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),
