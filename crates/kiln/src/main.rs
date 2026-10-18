@@ -101,6 +101,10 @@ enum Cmd {
     Agents(kiln::harness::cli::AgentsArgs),
     /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
     Cd(kiln::cd::cli::CdArgs),
+    /// CI secrets: set, list (names only), delete, import a dotenv file, rotate the data key.
+    Secrets(kiln::ci::cli::SecretsArgs),
+    /// CI variables (the `vars` context): set, list, delete.
+    Vars(kiln::ci::cli::VarsArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -495,6 +499,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             kiln::cd::cli::run(a, &cfg).await
+        }
+        Cmd::Secrets(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            kiln::ci::cli::secrets(a, &cfg).await
+        }
+        Cmd::Vars(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            kiln::ci::cli::vars(a, &cfg).await
         }
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

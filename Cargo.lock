@@ -1412,6 +1412,7 @@ dependencies = [
  "async-channel",
  "async-lock",
  "async-tungstenite",
+ "aws-lc-rs",
  "base64 0.23.1",
  "bytes",
  "clap",

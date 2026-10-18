@@ -107,6 +107,9 @@ struct V<'a> {
     dialect: Dialect,
     src: &'a str,
     diags: &'a mut Vec<Diag>,
+    /// A kiln workflow's declared secrets (W09-R06): when it declares any, the only ones it may
+    /// read.
+    declared: Option<std::collections::BTreeSet<String>>,
 }
 
 impl V<'_> {
@@ -125,7 +128,10 @@ impl V<'_> {
         for (a, b) in spans {
             let body = t.src.get(a..b).unwrap_or_default();
             match Expr::parse_with(body, &opts) {
-                Ok(e) => out.push(e),
+                Ok(e) => {
+                    self.undeclared(&e, t, a, body, path);
+                    out.push(e);
+                }
                 Err(e) => {
                     let r = locate(t, a, e.column);
                     let msg = if e.code == "KCI3001" { format!("{} is not available here ({path}): it may use {}", e.message, opts.contexts.as_deref().unwrap_or_default().join(", ")) } else { e.message };
@@ -134,6 +140,22 @@ impl V<'_> {
             }
         }
         out
+    }
+
+    /// `KCI4041`: a secret the workflow's `secrets:` doesn't declare.
+    fn undeclared(&mut self, e: &Expr, t: &Tpl, at: usize, body: &str, path: &str) {
+        let Some(declared) = &self.declared else { return };
+        for r in e.references().iter().filter(|r| r.root() == "secrets") {
+            if let Some(n) = r.name(1)
+                && !declared.contains(&n.to_ascii_uppercase())
+            {
+                // At the reference itself.
+                let lower = body.to_ascii_lowercase();
+                let off = lower.find(&format!("secrets.{}", n.to_ascii_lowercase())).or_else(|| lower.find("secrets")).unwrap_or_else(|| body.len() - body.trim_start().len());
+                let msg = format!("this workflow declares its secrets, and `{n}` isn't one of them: add it under `secrets:`, or it is never given");
+                self.diags.push(Diag::error("KCI4041", msg, locate(t, at + off, None)).at(path));
+            }
+        }
     }
 
     /// An `if:`: a bare expression or a template (GitHub accepts both).
@@ -181,7 +203,8 @@ impl V<'_> {
 /// Every check of W02 that needs the whole workflow. `src` is the file's text, for fixes that
 /// edit it.
 pub fn validate(wf: &Workflow, dialect: Dialect, src: &str, diags: &mut Vec<Diag>) {
-    let mut v = V { dialect, src, diags };
+    let declared = (dialect == Dialect::Kiln && !wf.secrets.is_empty()).then(|| wf.secrets.iter().map(|d| d.name.to_ascii_uppercase()).chain(["GITHUB_TOKEN".to_owned()]).collect());
+    let mut v = V { dialect, src, diags, declared };
     graph(wf, v.diags);
     if let Some(t) = &wf.run_name {
         v.tpl(t, Site::RunName, "run-name");
