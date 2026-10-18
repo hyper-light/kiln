@@ -77,11 +77,6 @@ impl Hosted {
         Self { root: data_dir.join("deploy").join("repos") }
     }
 
-    /// Where every hosted repository lives.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// A repository's directory. Names are one or more segments of letters, digits, `-`, `_` and
     /// `.`, never `..`: a name can't reach outside the hosted root.
     pub fn path(&self, repo: &str) -> anyhow::Result<PathBuf> {

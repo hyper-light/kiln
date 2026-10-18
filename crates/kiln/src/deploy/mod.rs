@@ -18,7 +18,6 @@ pub mod host;
 pub mod kilncd;
 pub mod model;
 pub mod repo;
-pub mod serve;
 pub mod store;
 
 use std::sync::Arc;

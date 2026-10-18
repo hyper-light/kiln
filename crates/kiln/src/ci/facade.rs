@@ -22,10 +22,6 @@ fn unauthorized() -> Response {
 
 /// `/_kiln/git/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`.
 pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response, Fail> {
-    // kiln's own repositories (docs/deploy-api.md §7), with readers' tokens of their own.
-    if let ["_hosted", hosted @ ..] = rest {
-        return crate::deploy::serve::git(hub, hosted, req).await;
-    }
     let [owner, name, tail @ ..] = rest else { return Err((StatusCode::NOT_FOUND, "no such repository".into())) };
     let name = name.trim_end_matches(".git");
     let full = format!("{owner}/{name}");
@@ -46,18 +42,12 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
     let repo = repos.into_iter().find(|r| r.id == run.repo_id).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
     let mirror = crate::gitops::ensure_commit(hub, &repo, &run.sha).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the mirror: {e:#}")))?;
     let (Some(root), Some(dir)) = (mirror.parent(), mirror.file_name()) else { return Err((StatusCode::INTERNAL_SERVER_ERROR, "the mirror's path".into())) };
-    backend(req, root, &dir.to_string_lossy(), tail).await
-}
-
-/// Serves a fetch from the bare repository `<root>/<dir>` with `git http-backend`: `tail` is
-/// `info/refs` or `git-upload-pack`.
-pub(crate) async fn backend(req: Request, root: &std::path::Path, dir: &str, tail: &[&str]) -> Result<Response, Fail> {
     let header = |h: &str| req.headers().get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let mut cmd = Command::new("git");
     cmd.args(["-c", "uploadpack.allowAnySHA1InWant=true", "-c", "uploadpack.allowFilter=true", "http-backend"])
         .env("GIT_PROJECT_ROOT", root)
         .env("GIT_HTTP_EXPORT_ALL", "1")
-        .env("PATH_INFO", format!("/{dir}/{}", tail.join("/")))
+        .env("PATH_INFO", format!("/{}/{}", dir.to_string_lossy(), tail.join("/")))
         .env("REQUEST_METHOD", req.method().as_str())
         .env("QUERY_STRING", req.uri().query().unwrap_or_default())
         .env("REMOTE_USER", "kiln")

@@ -353,8 +353,6 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/deploy/**", "runs.read", At::Server),
     r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
-    r("POST", "/api/deploy/readers", "integrations.manage", At::Server),
-    r("DELETE", "/api/deploy/readers/*", "integrations.manage", At::Server),
     any("/api/deploy/**", "environments.manage", At::Server),
     // Runners and machines.
     r("GET", "/api/agents", "runners.read", At::Server),

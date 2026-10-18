@@ -11,7 +11,6 @@
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
-//! | `GET /readers?repo=`, `POST /readers` `{repo, name}`, `DELETE /readers/{name}?repo=` | tokens that read a repository on kiln's git server |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -116,28 +115,6 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             let of = store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?;
             let to: RollbackAsk = body(req.into_body()).await?;
             created(&flow::release(&d, &actor, Ask { app: of.app, environment: of.environment, rollback: Some(to), ..Ask::default() }).await?)
-        }
-        (&Method::GET, ["readers"]) => ok(&json!({ "readers": super::serve::readers(&d.hub, q.get("repo").map(String::as_str)).await.map_err(internal)? })),
-        (&Method::POST, ["readers"]) => {
-            #[derive(serde::Deserialize)]
-            struct NewReader {
-                repo: String,
-                name: String,
-            }
-            let b: NewReader = body(req.into_body()).await?;
-            d.hosted.path(&b.repo).map_err(|e| bad(format!("{e:#}")))?;
-            let token = super::serve::add_reader(&d.hub, &b.repo, &b.name).await.map_err(|e| bad(format!("{e:#}")))?;
-            d.hub.store.audit(actor.clone(), "deploy.reader.add".into(), format!("{} for {}", b.name, b.repo)).await;
-            let url = format!("{}/_kiln/git/_hosted/{}.git", d.hub.cfg.server.public_url.trim_end_matches('/'), b.repo);
-            created(&json!({ "repo": b.repo, "name": b.name, "url": url, "token": token, "note": "the token is shown this once" }))
-        }
-        (&Method::DELETE, ["readers", name]) => {
-            let repo = q.get("repo").ok_or_else(|| bad("?repo= names the repository"))?;
-            if !super::serve::remove_reader(&d.hub, repo, name).await.map_err(internal)? {
-                return Err((StatusCode::NOT_FOUND, format!("{repo} has no reader {name}")));
-            }
-            d.hub.store.audit(actor.clone(), "deploy.reader.remove".into(), format!("{name} for {repo}")).await;
-            Ok(srv::status(StatusCode::NO_CONTENT))
         }
         _ => Err((StatusCode::NOT_FOUND, "not found".into())),
     }
