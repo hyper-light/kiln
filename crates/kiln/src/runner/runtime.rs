@@ -53,6 +53,46 @@ struct Ran {
     state: Vec<(String, String)>,
 }
 
+/// A secret or variable `name` set to `true` (W06-R13: `ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
+fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
+    let truthy = |v: &str| v.eq_ignore_ascii_case("true");
+    a.secrets.iter().any(|s| s.name == name && truthy(&s.value)) || a.contexts.vars.get(name).and_then(serde_json::Value::as_str).is_some_and(truthy)
+}
+
+/// Runner debug (`RUNNER_DEBUG=1`, `runner.debug`): a debug rerun, or `ACTIONS_RUNNER_DEBUG`.
+fn runner_debug(a: &AssignmentV2) -> bool {
+    a.debug.runner_debug || debug_flag(a, "ACTIONS_RUNNER_DEBUG")
+}
+
+/// The step outputs (step id, name) the job's secret outputs read (W04-R22).
+fn secret_feeds(a: &AssignmentV2, dialect: Dialect) -> std::collections::BTreeSet<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for (_, t) in a.outputs.iter().filter(|(k, _)| a.secret_outputs.contains(k)) {
+        let Ok(tpl) = Template::parse_with(&t.src, &options(Site::JobOutputs, dialect)) else { continue };
+        for r in tpl.references() {
+            if r.root() == "steps" && r.name(2) == Some("outputs")
+                && let (Some(step), Some(name)) = (r.name(1), r.name(3))
+            {
+                out.insert((step.to_owned(), name.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a program is on `PATH`.
+fn which(prog: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
+}
+
+/// GitHub's view of a typed output (W04-R20): its JSON, but a string as itself.
+fn json_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// An action's post step, run after the main steps in reverse order (W06-R11).
 #[derive(Clone)]
 struct Post {
@@ -141,6 +181,8 @@ enum End {
 struct Done {
     id: Option<String>,
     outputs: BTreeMap<String, String>,
+    /// Typed outputs (W04-R20): what the kiln dialect sees for these names.
+    json: BTreeMap<String, serde_json::Value>,
     outcome: Option<Conclusion>,
     conclusion: Option<Conclusion>,
 }
@@ -229,6 +271,13 @@ struct State {
     stop: Option<Shutdown>,
     /// Values `::add-mask::` added, for a background step's `wait` to carry into the leg.
     masks_added: Vec<String>,
+    /// The running step's typed outputs (`$KILN_OUTPUT_JSON`, W04-R20), for its `steps` entry.
+    step_json: BTreeMap<String, serde_json::Value>,
+    /// `$KILN_RUN_ENV` lines (W04-R21), for `run.env`.
+    run_env: Vec<(String, String)>,
+    /// Step outputs (step id, name) that feed a secret job output (W04-R22): masked the moment
+    /// their step ends, so they're never reported or kept in the clear.
+    sensitive: std::collections::BTreeSet<(String, String)>,
 }
 
 /// A background step that finished, and what it changed: applied to the leg at its `wait`, in
@@ -369,7 +418,7 @@ impl State {
             Some((
                 id,
                 Value::object([
-                    ("outputs".to_owned(), str_map(&d.outputs)),
+                    ("outputs".to_owned(), self.step_outputs(d)),
                     ("outcome".to_owned(), d.outcome.map_or(Value::Null, |c| Value::str(word(c)))),
                     ("conclusion".to_owned(), d.conclusion.map_or(Value::Null, |c| Value::str(word(c)))),
                 ]),
@@ -377,6 +426,14 @@ impl State {
         }));
         values.push(("steps", steps));
         Cx { values, status: StatusView { failed: self.failed, cancelled: self.cancelled, skipped: false }, workspace: &self.layout.workspace }
+    }
+
+    /// A step's outputs as this dialect sees them: kiln's typed ones as their JSON values.
+    fn step_outputs(&self, d: &Done) -> Value {
+        if self.dialect != Dialect::Kiln || d.json.is_empty() {
+            return str_map(&d.outputs);
+        }
+        Value::object(d.outputs.iter().map(|(k, v)| (k.clone(), d.json.get(k).map_or_else(|| Value::str(v), Value::from_json))))
     }
 
     fn render(&self, t: &Tpl, site: Site, what: &str) -> Result<String, String> {
@@ -539,7 +596,7 @@ impl Leg {
         set("AGENT_TOOLSDIRECTORY", l.tool_cache.to_string_lossy().to_string());
         set("RUNNER_WORKSPACE", l.runner_workspace.to_string_lossy().to_string());
         set("RUNNER_ENVIRONMENT", "self-hosted".into());
-        if a.debug.runner_debug {
+        if runner_debug(a) {
             set("RUNNER_DEBUG", "1".into());
         }
         let rt = &a.runtime;
@@ -579,17 +636,18 @@ impl Leg {
         })
         .await??;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
-        let mut masks: Vec<String> = secrets.values().cloned().collect();
+        let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();
         masks.extend(a.masks.iter().cloned());
         masks.push(a.runtime.github_token.clone());
         masks.push(a.runtime.runtime_token.clone());
-        let step_debug = a.debug.step_debug || secrets.get("ACTIONS_STEP_DEBUG").is_some_and(|v| v == "true");
+        let step_debug = a.debug.step_debug || debug_flag(a, "ACTIONS_STEP_DEBUG");
         let base = vec![
             ("vars", Value::from_json(&a.contexts.vars)),
             ("needs", Value::from_json(&a.contexts.needs)),
             ("strategy", Value::from_json(&a.contexts.strategy)),
             ("matrix", Value::from_json(&a.contexts.matrix)),
             ("inputs", Value::from_json(&a.contexts.inputs)),
+            ("run", Value::from_json(&a.contexts.run)),
             (
                 "runner",
                 Value::object([
@@ -598,7 +656,7 @@ impl Leg {
                     ("arch".to_owned(), Value::str(runner_arch())),
                     ("temp".to_owned(), Value::str(&layout.temp.to_string_lossy())),
                     ("tool_cache".to_owned(), Value::str(&layout.tool_cache.to_string_lossy())),
-                    ("debug".to_owned(), Value::str(if a.debug.runner_debug { "1" } else { "" })),
+                    ("debug".to_owned(), Value::str(if runner_debug(a) { "1" } else { "" })),
                     ("environment".to_owned(), Value::str("self-hosted")),
                 ]),
             ),
@@ -638,6 +696,9 @@ impl Leg {
             matchers: matchers::Job::default(),
             stop: None,
             masks_added: Vec::new(),
+            step_json: BTreeMap::new(),
+            run_env: Vec::new(),
+            sensitive: secret_feeds(a, dialect),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -666,6 +727,10 @@ impl Leg {
                 c.stop().await;
             }
             return Ok(Status::Failed);
+        }
+        // The kiln dialect's implicit checkout (W06-R14); GitHub's workflows never get one.
+        if a.checkout == "auto" && !self.implicit_checkout(&mut st).await {
+            st.failed = true;
         }
         self.pre_steps(&mut st, deadline).await;
         let turns = async_lock::Semaphore::new(MAX_BACKGROUND);
@@ -718,6 +783,86 @@ impl Leg {
         } else {
             Status::Succeeded
         })
+    }
+
+    /// `checkout: auto` (W06-R14): the run's commit in the workspace before the first step, as a
+    /// step of its own. A shallow git fetch through the server's git facade with the leg's token
+    /// (`.git` kept for tools that need it), else the facade's tarball of the commit.
+    async fn implicit_checkout(&self, st: &mut State) -> bool {
+        let idx = st.next_idx;
+        st.next_idx += 1;
+        self.start(idx, "Check out the commit", "internal", None).await;
+        let r = self.checkout_commit(st, idx).await;
+        if let Err(e) = &r {
+            self.annotate(idx, "error", &format!("Checking out the commit failed: {e:#}")).await;
+        }
+        let c = if r.is_ok() { Conclusion::Success } else { Conclusion::Failure };
+        self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
+        r.is_ok()
+    }
+
+    async fn checkout_commit(&self, st: &State, idx: u32) -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let a = &self.a;
+        let sha = a.contexts.github.get("sha").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("the run has no commit"))?.to_owned();
+        let ws = st.layout.workspace.clone();
+        let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
+        let token = a.runtime.github_token.clone();
+        if crate::rt::blocking(|| which("git")).await.unwrap_or(false) {
+            // The token rides in git's environment config, never on a command line.
+            let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
+            let w = ws.to_string_lossy().to_string();
+            let steps: [Vec<&str>; 4] = [
+                vec!["init", "--quiet", &w],
+                vec!["-C", &w, "fetch", "--quiet", "--depth=1", "--no-tags", &remote, &sha],
+                vec!["-C", &w, "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+                vec!["-C", &w, "remote", "add", "origin", &remote],
+            ];
+            for args in steps {
+                // As typed in the workspace: without `-C <workspace>`.
+                let shown: Vec<&str> = if args.first() == Some(&"-C") { args.iter().skip(2).copied().collect() } else { args.iter().copied().filter(|x| *x != w.as_str()).collect() };
+                self.note(idx, &format!("git {}", shown.join(" "))).await;
+                let mut cmd = Command::new("git");
+                cmd.args(&args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "http.extraheader").env("GIT_CONFIG_VALUE_0", &header);
+                let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
+                if !out.status.success() {
+                    anyhow::bail!("git {}: {}", args.get(2).copied().unwrap_or_default(), String::from_utf8_lossy(&out.stderr).trim());
+                }
+            }
+            return Ok(());
+        }
+        // No git: the commit's tarball from the REST facade, its top directory stripped.
+        let url = format!("{}/api/v3/repos/{}/tarball/{sha}", st.server_url.trim_end_matches('/'), a.repo);
+        self.note(idx, &format!("git isn't installed here: downloading {} at {}", a.repo, sha.get(..12).unwrap_or(&sha))).await;
+        let mut resp = self.http.get(&url).bearer(&token).timeout(Duration::from_secs(600)).send().await?;
+        if !resp.is_success() {
+            anyhow::bail!("the commit's tarball: HTTP {}", resp.status());
+        }
+        let mut bytes = Vec::new();
+        while let Some(c) = resp.chunk().await? {
+            bytes.extend_from_slice(&c);
+            anyhow::ensure!(bytes.len() < 8 << 30, "the commit is over 8 GiB");
+        }
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            std::fs::create_dir_all(&ws)?;
+            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
+            for entry in ar.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+                let rel: PathBuf = path.components().skip(1).collect();
+                if rel.as_os_str().is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    continue;
+                }
+                let target = ws.join(rel);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                entry.unpack(target)?;
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     /// Starts `step` in the background when it says so (W06-R17): on a copy of the leg's state,
@@ -1103,11 +1248,20 @@ impl Leg {
 
     #[allow(clippy::too_many_arguments)]
     async fn finish(&self, st: &mut State, idx: u32, id: Option<String>, outcome: Conclusion, conclusion: Conclusion, exit_code: Option<i32>, outputs: BTreeMap<String, String>, nested: bool) {
+        // A step output a secret job output reads is masked from here on (W04-R22).
+        if let Some(step) = &id {
+            for (k, v) in &outputs {
+                if !v.is_empty() && st.sensitive.contains(&(step.clone(), k.clone())) && st.masker.add(v) {
+                    self.event(&JobEventV2::Mask { value_sha256: crate::util::sha256_hex(v.as_bytes()) }).await;
+                }
+            }
+        }
         if !nested {
             let masked: BTreeMap<String, String> = outputs.iter().map(|(k, v)| (k.clone(), st.masker.mask(v))).collect();
             self.event(&JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs: masked }).await;
         }
-        st.steps.push(Done { id, outputs, outcome: Some(outcome), conclusion: Some(conclusion) });
+        let json = std::mem::take(&mut st.step_json);
+        st.steps.push(Done { id, outputs, json, outcome: Some(outcome), conclusion: Some(conclusion) });
     }
 
     async fn annotate(&self, idx: u32, level: &str, message: &str) {
@@ -1272,9 +1426,31 @@ impl Leg {
         let get = |k: &str| files.iter().find(|(x, _)| *x == k).map(|(_, p)| p.clone()).unwrap_or_default();
         let (envf, outf, pathf, statef, sumf, jsonf, runf) = (get("GITHUB_ENV"), get("GITHUB_OUTPUT"), get("GITHUB_PATH"), get("GITHUB_STATE"), get("GITHUB_STEP_SUMMARY"), get("KILN_OUTPUT_JSON"), get("KILN_RUN_ENV"));
         let texts = crate::rt::blocking(move || (read(&envf), read(&outf), read(&pathf), read(&statef), read(&sumf), read(&jsonf), read(&runf))).await?;
-        let (env_t, out_t, path_t, state_t, sum_t, _json_t, _run_t) = texts;
+        let (env_t, out_t, path_t, state_t, sum_t, json_t, run_t) = texts;
         let mut outputs = std::mem::take(&mut r.set_output);
         let mut failed_files = false;
+        // kiln's typed outputs (W04-R20): `{"name": …, "value": <any JSON>}` per line.
+        for (n, line) in json_t.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(line.trim());
+            match parsed.ok().and_then(|v| Some((v.get("name")?.as_str()?.to_owned(), v.get("value")?.clone()))) {
+                Some((name, value)) => {
+                    outputs.insert(name.clone(), json_text(&value));
+                    st.step_json.insert(name, value);
+                }
+                None => {
+                    self.annotate(idx, "error", &format!("$KILN_OUTPUT_JSON line {}: expected {{\"name\": …, \"value\": …}}", n + 1)).await;
+                    failed_files = true;
+                }
+            }
+        }
+        // `run.env` (W04-R21): name=value lines, as `$GITHUB_ENV` takes them.
+        match envfiles::env(&run_t) {
+            Ok(pairs) => st.run_env.extend(pairs),
+            Err(e) => {
+                self.annotate(idx, "error", &format!("$KILN_RUN_ENV: {e}")).await;
+                failed_files = true;
+            }
+        }
         match envfiles::env(&env_t) {
             Ok(pairs) => {
                 for (k, v) in pairs {
@@ -1501,20 +1677,55 @@ impl Leg {
     /// The job's outputs, after its steps (W06-R10); one holding a secret is not set, as GitHub
     /// doesn't.
     async fn job_outputs(&self, st: &State) {
-        if self.a.outputs.is_empty() {
+        let a = &self.a;
+        if a.outputs.is_empty() && a.exports_env.is_empty() && !(a.run_env && !st.run_env.is_empty()) {
             return;
         }
-        let mut outputs = BTreeMap::new();
-        for (k, t) in &self.a.outputs {
-            match st.render(t, Site::JobOutputs, &format!("outputs.{k}")) {
+        let (mut outputs, mut json_outputs, mut secret_values) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        for (k, t) in &a.outputs {
+            let what = format!("outputs.{k}");
+            // A secret output (W04-R22) keeps its value: it goes to the server to be sealed.
+            if a.secret_outputs.contains(k) {
+                match st.render(t, Site::JobOutputs, &what) {
+                    Ok(v) if !v.is_empty() => {
+                        secret_values.insert(k.clone(), v);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.annotate(0, "warning", &e).await,
+                }
+                continue;
+            }
+            match st.render(t, Site::JobOutputs, &what) {
                 Ok(v) if st.masker.mask(&v) != v => self.annotate(0, "warning", &format!("Skip output '{k}' since it may contain secret.")).await,
                 Ok(v) => {
+                    // kiln: a typed value stays typed for kiln consumers (W04-R20).
+                    if st.dialect == Dialect::Kiln
+                        && let Ok(tpl) = Template::parse_with(&t.src, &options(Site::JobOutputs, st.dialect))
+                        && tpl.single_expr().is_some()
+                        && let Ok(val) = expr::eval_value(&tpl, &st.cx(), &mut Budget::default())
+                        && !matches!(val, Value::String(_) | Value::Null)
+                    {
+                        json_outputs.insert(k.clone(), val.to_json());
+                    }
                     outputs.insert(k.clone(), v);
                 }
                 Err(e) => self.annotate(0, "warning", &e).await,
             }
         }
-        self.event(&JobEventV2::JobOutputs { outputs, json_outputs: BTreeMap::new(), env: BTreeMap::new(), run_env: Vec::new(), secret_outputs: Vec::new() }).await;
+        // `exports: { env }` (W04-R21): the final values, masked ones withheld.
+        let mut env = BTreeMap::new();
+        for name in &a.exports_env {
+            match st.env.get(name) {
+                Some(v) if st.masker.mask(v) != *v => self.annotate(0, "warning", &format!("Skip exporting '{name}' since it may contain secret.")).await,
+                Some(v) => {
+                    env.insert(name.clone(), v.clone());
+                }
+                None => {}
+            }
+        }
+        let run_env = if a.run_env { st.run_env.iter().filter(|(_, v)| st.masker.mask(v) == **v).cloned().collect() } else { Vec::new() };
+        let secret_outputs = secret_values.keys().cloned().collect();
+        self.event(&JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values }).await;
     }
 }
 
@@ -1950,14 +2161,25 @@ mod tests {
     /// `sh`, so they and their helpers are Unix-only.)
     #[cfg(unix)]
     fn run_leg(workflow: &str, secrets: &[(&str, &str)]) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
-        let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", workflow, Dialect::Gha);
+        run_leg_in(workflow, secrets, Dialect::Gha)
+    }
+
+    /// [`run_leg`] for a workflow of either dialect: a kiln one gets its job's kiln settings.
+    #[cfg(unix)]
+    fn run_leg_in(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
+        let path = if dialect == Dialect::Kiln { ".kiln/t.yaml" } else { ".github/workflows/t.yml" };
+        let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let run_env = w.as_ref().is_some_and(|w| w.run_env);
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let tmp = tempfile::tempdir()?;
         let a = AssignmentV2 {
             job_id: "leg-1".into(),
             repo: "acme/app".into(),
-            dialect: "gha".into(),
+            dialect: if dialect == Dialect::Kiln { "kiln".into() } else { "gha".into() },
+            exports_env: job.kiln.exports_env.clone(),
+            secret_outputs: job.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect(),
+            run_env,
             steps: job.steps.clone(),
             job_env: job.env.clone(),
             outputs: job.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect(),
@@ -2118,6 +2340,52 @@ jobs:
         assert_eq!(ann("Unable to process command '::add-matcher::nope.json' successfully.").map(|a| a.0), Some(4));
         assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Failure), "a disabled command fails its step");
         assert_eq!(ann("Unable to process command '::set-env name=A::b' successfully.").map(|a| a.0), Some(5));
+        Ok(())
+    }
+
+    /// W04-R20 to R22 on the runner: typed outputs, exported environment, `run.env`, and a secret
+    /// output whose value leaves only for sealing (the step output it reads is masked).
+    #[cfg(unix)]
+    #[test]
+    fn kiln_outputs() -> anyhow::Result<()> {
+        let wf = r###"name: t
+on: push
+run-env: true
+jobs:
+  build:
+    runs-on: x
+    outputs:
+      info: ${{ steps.meta.outputs.info }}
+      plain: ${{ steps.meta.outputs.plain }}
+      token: { value: "${{ steps.meta.outputs.secret }}", secret: true }
+    exports: { env: [BUILD_ID] }
+    steps:
+      - id: meta
+        run: |
+          echo '{"name": "info", "value": {"version": "1.2.3", "count": 3}}' >> "$KILN_OUTPUT_JSON"
+          echo "plain=hello" >> "$GITHUB_OUTPUT"
+          echo "secret=s3cr3t-value-123" >> "$GITHUB_OUTPUT"
+          echo "BUILD_ID=build-42" >> "$GITHUB_ENV"
+          echo "SHARED=from-build" >> "$KILN_RUN_ENV"
+      - run: echo "typed ${{ steps.meta.outputs.info.version }} ${{ steps.meta.outputs.info.count }}"
+"###;
+        let (r, logs, events) = run_leg_in(wf, &[], Dialect::Kiln)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&1).is_some_and(|l| l.contains("typed 1.2.3 3")), "the kiln dialect sees typed outputs: {logs:?}");
+        let outs = events.iter().find_map(|e| match e {
+            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values } => Some((outputs.clone(), json_outputs.clone(), env.clone(), run_env.clone(), secret_outputs.clone(), secret_values.clone())),
+            _ => None,
+        });
+        let Some((outputs, json_outputs, env, run_env, secret_outputs, secret_values)) = outs else { anyhow::bail!("no job outputs") };
+        assert_eq!(json_outputs.get("info"), Some(&serde_json::json!({"version": "1.2.3", "count": 3})));
+        assert_eq!(outputs.get("plain").map(String::as_str), Some("hello"));
+        assert!(!outputs.contains_key("token"), "a secret output never travels as a plain one");
+        assert_eq!((secret_outputs, secret_values.get("token").map(String::as_str)), (vec!["token".to_owned()], Some("s3cr3t-value-123")));
+        assert_eq!(env.get("BUILD_ID").map(String::as_str), Some("build-42"));
+        assert_eq!(run_env, vec![("SHARED".to_owned(), "from-build".to_owned())]);
+        // The step output the secret one reads was masked before it was reported.
+        let step = finished(&events, 0).map(|f| f.2).unwrap_or_default();
+        assert_eq!(step.get("secret").map(String::as_str), Some("***"), "{step:?}");
         Ok(())
     }
 

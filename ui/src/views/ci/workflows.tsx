@@ -1,0 +1,347 @@
+/**
+ * The workflow editor (docs/ci.md W21-R01, W21-R06): a repository's workflow in the code editor,
+ * checked as you type, with the plan it would make for an event beside it (W04-R29). The YAML is
+ * the source; Copy and Download take it away until saving to the repository arrives (W14).
+ */
+import * as React from "react";
+import { Download } from "lucide-react";
+import { api } from "@/api/client";
+import { ci, type CiOutline, type CiPreview } from "@/api/ci";
+import { Button } from "@/components/ui/button";
+import { Hold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
+import { useSearchParams } from "@/lib/router";
+import { useSuspenseResource } from "@/lib/resource";
+import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
+
+const CodeEditor = React.lazy(() => import("@/components/code/editor"));
+
+const EVENTS = ["push", "pull_request", "workflow_dispatch", "schedule"];
+
+/** GitHub's hosted labels, offered after `runs-on:` beside the runners' own. */
+const HOSTED = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-24.04-arm", "macos-latest", "macos-15", "windows-latest", "windows-2025", "self-hosted"];
+
+export default function Workflows() {
+  const [search, setSearch] = useSearchParams();
+  const repo = search.get("repo") ?? "";
+  const path = search.get("path") ?? "";
+  const ref = search.get("ref") ?? "";
+  const set = (next: Record<string, string>) => setSearch(Object.fromEntries(Object.entries({ repo, path, ref, ...next }).filter(([, v]) => v !== "")), { replace: true });
+  return (
+    <div className="container-console page">
+      <title>{path ? `${path.split("/").pop()} · Workflows · kiln` : "Workflows · kiln"}</title>
+      <Crumbs index={2} items={[{ label: "Runs", to: "/runs" }, { label: "Workflows" }]} />
+      <h1 className="mt-5 text-[clamp(26px,3vw,40px)] leading-[1.1] font-[450] tracking-[-0.04em]">Workflows</h1>
+      <p className="mt-3 max-w-2xl text-[14px] leading-[1.7] text-[#b0b4be]">Edit a workflow and see, as you type, what it would run and where.</p>
+      <Loadable label="the repositories" fallback={<Hold height={64} className="mt-6" />}>
+        <Picker repo={repo} path={path} gitRef={ref} onChange={set} />
+      </Loadable>
+      {repo && path ? (
+        <Loadable label="the workflow" fallback={<Hold height={420} className="mt-6" />}>
+          <WorkflowFile key={`${repo}\u0000${path}\u0000${ref}`} repo={repo} path={path} gitRef={ref} />
+        </Loadable>
+      ) : (
+        <div className="mt-8">
+          <EmptyState title="Choose a workflow.">Pick a repository and one of its workflows to edit it.</EmptyState>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Picker({ repo, path, gitRef, onChange }: { repo: string; path: string; gitRef: string; onChange: (next: Record<string, string>) => void }) {
+  const repos = useSuspenseResource("repos/", (s) => api.repos(s)).data;
+  const [branch, setBranch] = React.useState(gitRef);
+  return (
+    <div className="mt-6 flex flex-wrap items-end gap-3">
+      <SelectField
+        label="Repository"
+        value={repo}
+        onChange={(v) => onChange({ repo: v, path: "" })}
+        options={[{ value: "", label: "Choose a repository" }, ...repos.map((r) => ({ value: r.name, label: r.name }))]}
+        className="w-64"
+      />
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          onChange({ ref: branch.trim() });
+        }}
+      >
+        <TextField
+          label="Branch, tag or commit"
+          value={branch}
+          onChange={(e) => setBranch(e.target.value)}
+          onBlur={() => branch.trim() !== gitRef && onChange({ ref: branch.trim() })}
+          placeholder="default branch"
+          className="w-52"
+        />
+      </form>
+      {repo && (
+        <Loadable label="the workflows" fallback={<Hold height={40} className="w-72" />}>
+          <WorkflowSelect repo={repo} gitRef={gitRef} path={path} onChange={(p) => onChange({ path: p })} />
+        </Loadable>
+      )}
+    </div>
+  );
+}
+
+function WorkflowSelect({ repo, gitRef, path, onChange }: { repo: string; gitRef: string; path: string; onChange: (p: string) => void }) {
+  const list = useSuspenseResource(`ci-workflows/${repo}/${gitRef}`, (s) => ci.workflows(repo, gitRef, s)).data.workflows;
+  return (
+    <SelectField
+      label="Workflow"
+      value={path}
+      onChange={onChange}
+      options={[
+        { value: "", label: list.length ? "Choose a workflow" : "No workflows here" },
+        ...list.map((w) => ({ value: w.path, label: `${w.path}${w.errors ? ` · ${w.errors} error${w.errors === 1 ? "" : "s"}` : ""}` })),
+      ]}
+      className="w-80"
+    />
+  );
+}
+
+/** The job a position is in: the last `  <id>:` under `jobs:` before it. */
+function jobAt(text: string): string | null {
+  const lines = text.split("\n");
+  let inJobs = false;
+  let job: string | null = null;
+  for (const l of lines) {
+    if (/^jobs:\s*(#.*)?$/.test(l)) {
+      inJobs = true;
+      continue;
+    }
+    if (/^\S/.test(l)) inJobs = false;
+    const m = inJobs ? /^ {2}([A-Za-z_][\w-]*):\s*(#.*)?$/.exec(l) : null;
+    if (m?.[1]) job = m[1];
+  }
+  return job;
+}
+
+function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitRef: string }) {
+  const file = useSuspenseResource(`ci-workflow/${repo}/${path}/${gitRef}`, (s) => ci.workflow(repo, path, gitRef, s)).data;
+  const [text, setText] = React.useState(file.source);
+  const [counts, setCounts] = React.useState<{ errors: number; warnings: number } | null>(null);
+  const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
+  const [preview, setPreview] = React.useState<CiPreview | null>(null);
+  const [previewError, setPreviewError] = React.useState<string | null>(null);
+  const known = React.useRef<{ outline: CiOutline | null; names?: { secrets: string[]; variables: string[] }; catalog?: { label: string; detail: string }[]; timer?: number; asked?: number }>({
+    outline: file.outline,
+  });
+
+  const ask = (content: string, ev: string) => {
+    window.clearTimeout(known.current.timer);
+    known.current.timer = window.setTimeout(async () => {
+      const n = (known.current.asked ?? 0) + 1;
+      known.current.asked = n;
+      try {
+        const p = await ci.preview({ repo, ref: gitRef, sha: file.sha, path, content, event: ev });
+        if (known.current.asked === n) {
+          setPreview(p);
+          setPreviewError(null);
+        }
+      } catch (e) {
+        if (known.current.asked === n) setPreviewError(e instanceof Error ? e.message : String(e));
+      }
+    }, 400);
+  };
+
+  const lint = async (content: string): Promise<Diagnostic[]> => {
+    const r = await ci.validate(path, content);
+    known.current.outline = r.outline ?? known.current.outline;
+    const errors = r.diagnostics.filter((d) => d.severity === "error").length;
+    setCounts({ errors, warnings: r.diagnostics.length - errors });
+    if (errors === 0) ask(content, event);
+    const end = content.length;
+    const starts = [0];
+    for (let i = 0; i < content.length; i++) if (content[i] === "\n") starts.push(i + 1);
+    // Positions by line and column, which every diagnostic has.
+    const at = (p: { line: number; col: number }) => {
+      const line = starts[Math.max(0, p.line - 1)] ?? end;
+      const next = starts[p.line] ?? end + 1;
+      return Math.min(line + Math.max(0, p.col - 1), next - 1, end);
+    };
+    return r.diagnostics.map((d) => {
+      const from = at(d.range.start);
+      return {
+        from,
+        to: Math.min(Math.max(at(d.range.end), from + 1), end),
+        severity: d.severity === "error" ? "error" : d.severity === "warning" ? "warning" : "info",
+        message: `${d.code}: ${d.message}`,
+      };
+    });
+  };
+
+  const complete = async (ctx: CompletionContext): Promise<CompletionResult | null> => {
+    const outline = known.current.outline;
+    const before = ctx.state.doc.sliceString(0, ctx.pos);
+    const job = outline?.jobs.find((j) => j.id === jobAt(before));
+    // `needs.<job>.outputs.<name>`, then `needs.<job>.` and `steps.<id>.`, then the namespaces.
+    const out = ctx.matchBefore(/\bneeds\.([\w-]+)\.outputs\.[\w-]*$/);
+    if (out) {
+      const id = /needs\.([\w-]+)\./.exec(out.text)?.[1];
+      const names = outline?.jobs.find((j) => j.id === id)?.outputs ?? [];
+      return { from: out.to - (/[\w-]*$/.exec(out.text)?.[0].length ?? 0), options: names.map((label) => ({ label, detail: "output" })) };
+    }
+    const member = ctx.matchBefore(/\b(needs|steps)\.[\w-]+\.[\w-]*$/);
+    if (member) {
+      const fields = member.text.startsWith("needs") ? ["outputs", "result"] : ["outputs", "outcome", "conclusion"];
+      return { from: member.to - (/[\w-]*$/.exec(member.text)?.[0].length ?? 0), options: fields.map((label) => ({ label })) };
+    }
+    const ns = ctx.matchBefore(/\b(needs|steps|matrix|inputs|env|secrets|vars|jobs)\.[\w-]*$/);
+    if (ns) {
+      const space = ns.text.slice(0, ns.text.indexOf("."));
+      if ((space === "secrets" || space === "vars") && !known.current.names) known.current.names = await ci.names(repo, path).catch(() => ({ secrets: [], variables: [] }));
+      const names: Record<string, string[]> = {
+        needs: job?.needs.length ? job.needs : (outline?.jobs.map((j) => j.id).filter((id) => id !== job?.id) ?? []),
+        steps: job?.step_ids ?? [],
+        matrix: job?.matrix_axes ?? [],
+        inputs: outline?.inputs ?? [],
+        env: outline?.env ?? [],
+        secrets: ["GITHUB_TOKEN", ...(known.current.names?.secrets ?? [])],
+        vars: known.current.names?.variables ?? [],
+        jobs: outline?.jobs.map((j) => j.id) ?? [],
+      };
+      return { from: ns.from + space.length + 1, options: (names[space] ?? []).map((label) => ({ label, detail: space })) };
+    }
+    const uses = ctx.matchBefore(/\buses:\s*[\w./@-]*$/);
+    if (uses) {
+      if (!known.current.catalog) {
+        const list = await ci.catalog("").catch(() => ({ actions: [] }));
+        known.current.catalog = list.actions.flatMap((a) => a.versions.slice(0, 3).map((v) => ({ label: `${a.uses}@${v.ref}`, detail: a.action?.description?.split("\n")[0] ?? v.sha.slice(0, 12) })));
+      }
+      return { from: uses.from + (/^uses:\s*/.exec(uses.text)?.[0].length ?? 0), options: known.current.catalog };
+    }
+    const runsOn = ctx.matchBefore(/\bruns-on:\s*[\w.-]*$/);
+    if (runsOn) return { from: runsOn.from + (/^runs-on:\s*/.exec(runsOn.text)?.[0].length ?? 0), options: HOSTED.map((label) => ({ label, detail: "label" })) };
+    return null;
+  };
+
+  const download = () => {
+    const url = URL.createObjectURL(new Blob([text], { type: "text/yaml" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = path.split("/").pop() ?? "workflow.yml";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="mt-6 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)]">
+      <Panel
+        eyebrow={`${file.ref || "default branch"} · ${file.sha.slice(0, 7)}`}
+        title={path}
+        actions={
+          <>
+            <CopyButton text={text} label="Copy" />
+            <Button size="xs" variant="ghost" onClick={download}>
+              <Download /> Download
+            </Button>
+          </>
+        }
+        bodyClassName="px-0 pb-2"
+        caption={
+          counts && (counts.errors || counts.warnings ? `${counts.errors} error${counts.errors === 1 ? "" : "s"}, ${counts.warnings} warning${counts.warnings === 1 ? "" : "s"}` : "No problems.")
+        }
+      >
+        <React.Suspense fallback={<Hold height={420} />}>
+          <CodeEditor value={file.source} onChange={setText} lint={lint} complete={complete} label={`Editing ${path}`} />
+        </React.Suspense>
+      </Panel>
+      <PreviewPane
+        preview={preview}
+        error={previewError}
+        event={event}
+        onEvent={(ev) => {
+          setEvent(ev);
+          ask(text, ev);
+        }}
+      />
+    </div>
+  );
+}
+
+function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | null; error: string | null; event: string; onEvent: (e: string) => void }) {
+  const plan = preview?.plan;
+  const byJob = new Map<string, NonNullable<typeof plan>["legs"]>();
+  for (const l of plan?.legs ?? []) byJob.set(l.job, [...(byJob.get(l.job) ?? []), l]);
+  const title = !preview ? "Waiting for a clean check…" : !preview.runs ? "It wouldn't run" : `${plan?.legs.length ?? 0} leg${plan?.legs.length === 1 ? "" : "s"} would run`;
+  return (
+    <Panel
+      eyebrow="Plan preview"
+      title={title}
+      actions={<SelectField label="Event" hideLabel value={event} onChange={onEvent} options={EVENTS.map((e) => ({ value: e, label: e.replace(/_/g, " ") }))} className="w-44" />}
+    >
+      {error && <p className="font-mono text-[11.5px] text-[#d1aaad]">{error}</p>}
+      {preview && !preview.runs && (preview.why || preview.policy?.length) ? (
+        <ul className="mb-3 flex flex-col gap-1.5">
+          {preview.why && <li className="text-[13px] text-[#d4dde8]">{preview.why}</li>}
+          {preview.policy?.map((p) => (
+            <li key={p} className="font-mono text-[11.5px] text-[#d1aaad]">
+              {p}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {plan?.error && <p className="font-mono text-[11.5px] text-[#d1aaad]">{plan.error}</p>}
+      {plan && (
+        <div className="flex flex-col gap-4">
+          {[...byJob].map(([job, legs]) => (
+            <section key={job} aria-label={`Job ${job}`}>
+              {(legs.length > 1 || legs[0]?.key !== job) && (
+                <div className="label mb-1.5">
+                  {job}
+                  {legs.length > 1 ? ` · ${legs.length} legs` : ""}
+                </div>
+              )}
+              <ul className="flex flex-col gap-1">
+                {legs.map((l) => {
+                  const fits = l.routing?.runners.filter((r) => r.eligible) ?? [];
+                  const where = fits.length
+                    ? `runs on ${fits.map((r) => r.name).join(", ")}`
+                    : l.routing
+                      ? `no runner can take it now${l.routing.labels.length ? ` (needs ${l.routing.labels.join(", ")})` : ""}`
+                      : "";
+                  return (
+                    <li key={l.key} className="flex flex-col font-mono text-[11.5px] leading-[1.6]">
+                      <span className="text-[#d4dde8]">{l.key}</span>
+                      {where && <span className={fits.length ? "text-[#93a1b4]" : "text-[#d1aaad]"}>{where}</span>}
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+          ))}
+          {plan.decided.length > 0 && (
+            <section aria-label="Decided now">
+              <div className="label mb-1.5">Decided now</div>
+              <ul className="flex flex-col gap-1">
+                {plan.decided.map((d) => (
+                  <li key={`${d.job}-${d.leg ?? ""}`} className="font-mono text-[11.5px] leading-[1.6] text-[#a6b2c6]">
+                    {d.leg ?? d.job}: {d.reason}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+          {Object.keys(plan.removed).length > 0 && (
+            <section aria-label="Removed combinations">
+              <div className="label mb-1.5">Removed combinations</div>
+              <ul className="flex flex-col gap-1">
+                {Object.entries(plan.removed).flatMap(([job, list]) =>
+                  list.map(([combo, why], i) => (
+                    <li key={`${job}-${i}`} className="font-mono text-[11.5px] leading-[1.6] [overflow-wrap:anywhere] text-[#a6b2c6]">
+                      {job} {JSON.stringify(combo)}: {why}
+                    </li>
+                  )),
+                )}
+              </ul>
+            </section>
+          )}
+          {plan.later.length > 0 && <p className="font-mono text-[11.5px] leading-[1.6] text-[#93a1b4]">Decided when their needs finish: {plan.later.join(", ")}.</p>}
+        </div>
+      )}
+    </Panel>
+  );
+}

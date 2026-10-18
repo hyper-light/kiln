@@ -59,12 +59,7 @@ export function isAuthed() {
 
 /* ---------------------------- core fetch ---------------------------- */
 
-export async function request<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-  opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string } = {},
-): Promise<T> {
+export async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string } = {}): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "same-origin",
@@ -204,8 +199,7 @@ export const api = {
 
   repos: (signal?: AbortSignal) => get<Repo[]>("/api/repos", signal),
   sync: (signal?: AbortSignal) => get<SyncView>("/api/sync", signal),
-  syncCreate: (body: { name: string; copies: { machine: string; path: string }[]; exclude: string[] }) =>
-    post<{ id: string }>("/api/sync", body),
+  syncCreate: (body: { name: string; copies: { machine: string; path: string }[]; exclude: string[] }) => post<{ id: string }>("/api/sync", body),
   syncAddCopy: (id: string, copy: { machine: string; path: string }) => post<{ member: number }>(`/api/sync/${enc(id)}/copies`, copy),
   syncRemoveCopy: (id: string, member: number) => del<void>(`/api/sync/${enc(id)}/copies/${member}`),
   syncDelete: (id: string) => del<void>(`/api/sync/${enc(id)}`),
@@ -221,32 +215,28 @@ export const api = {
   addRepo: (repo: NewRepo) => post<Repo>("/api/repos", repo),
   deleteRepo: (id: string) => del<void>(`/api/repos/${enc(id)}`),
   pollRepo: (id: string) => post<void>(`/api/repos/${enc(id)}/poll`),
-  triggerRepo: (id: string, body: { branch?: string; pipeline?: string }) =>
-    post<Run[]>(`/api/repos/${enc(id)}/trigger`, body),
+  triggerRepo: (id: string, body: { branch?: string; pipeline?: string }) => post<Run[]>(`/api/repos/${enc(id)}/trigger`, body),
 
   runs: (params: { repo?: string; limit?: number; before?: string | number }, signal?: AbortSignal) =>
     get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before })}`, signal),
-  run: (id: string, signal?: AbortSignal) => get<RunDetail>(`/api/runs/${enc(id)}`, signal),
+  run: (id: string, signal?: AbortSignal, attempt?: number) => get<RunDetail>(`/api/runs/${enc(id)}${attempt ? `?attempt=${attempt}` : ""}`, signal),
   cancelRun: (id: string) => post<void>(`/api/runs/${enc(id)}/cancel`),
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),
 
   job: (id: string, signal?: AbortSignal) => get<Job>(`/api/jobs/${enc(id)}`, signal),
   jobLogsUrl: (id: string, step: number) => `/api/jobs/${enc(id)}/logs${qs({ step })}`,
-  jobLogs: (id: string, step: number) =>
-    request<string>("GET", `/api/jobs/${enc(id)}/logs${qs({ step })}`, undefined, { raw: true }),
+  jobLogs: (id: string, step: number) => request<string>("GET", `/api/jobs/${enc(id)}/logs${qs({ step })}`, undefined, { raw: true }),
 
   agents: (signal?: AbortSignal) => get<Agent[]>("/api/agents", signal),
   forgetAgent: (name: string) => del<void>(`/api/agents/${enc(name)}`),
   drainAgent: (name: string, draining: boolean) => post<void>(`/api/agents/${enc(name)}/drain`, { draining }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
   joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
-  approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) =>
-    post<{ id: string; status: string; name: string; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
+  approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) => post<{ id: string; status: string; name: string; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
   denyJoin: (id: string) => post<{ id: string; status: string; name: string }>(`/api/join-requests/${enc(id)}/deny`),
   discovery: (signal?: AbortSignal) => get<DiscoveryInfo>("/api/discovery", signal),
 
-  metricsHistory: (agent?: string, signal?: AbortSignal) =>
-    get<MetricsHistory>(`/api/metrics/history${qs({ agent })}`, signal),
+  metricsHistory: (agent?: string, signal?: AbortSignal) => get<MetricsHistory>(`/api/metrics/history${qs({ agent })}`, signal),
 
   system: (signal?: AbortSignal) => get<SystemInfo>("/api/system", signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
@@ -257,14 +247,12 @@ export const api = {
   /** Names a terminal session ("" takes its name away). */
   renameTerminalSession: (id: string, name: string) => request<void>("PUT", `/api/terminal/sessions/${enc(id)}/name`, { name }),
   /** Start a session without attaching (any device attaches by its id). */
-  createTerminalSession: (body: { target: string; cmd?: string; cols?: number; rows?: number }) =>
-    post<TerminalSessionInfo>("/api/terminal/sessions", body),
+  createTerminalSession: (body: { target: string; cmd?: string; cols?: number; rows?: number }) => post<TerminalSessionInfo>("/api/terminal/sessions", body),
 
   aiSessions: (signal?: AbortSignal) => get<AiSession[]>("/api/ai-sessions", signal),
   /** Connected runners too old to report AI sessions. */
   aiSilent: (signal?: AbortSignal) => get<{ machines: string[] }>("/api/ai-sessions/silent", signal),
-  aiTranscript: (machine: string, pid: number, signal?: AbortSignal) =>
-    get<AiTranscriptEntry[]>(`/api/ai-sessions/${enc(machine)}/${pid}/transcript`, signal),
+  aiTranscript: (machine: string, pid: number, signal?: AbortSignal) => get<AiTranscriptEntry[]>(`/api/ai-sessions/${enc(machine)}/${pid}/transcript`, signal),
   audit: (limit = 200, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit })}`, signal),
 
   /** Settings → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
@@ -293,8 +281,7 @@ export const api = {
  * What can't be listed (no such folder, permission denied) comes back in `error` with a 200; a
  * runner too old to list folders is a 409.
  */
-export const machineDirs = (target: string, path: string, signal?: AbortSignal) =>
-  get<DirListing>(`/api/machines/${enc(target)}/dirs${qs({ path })}`, signal);
+export const machineDirs = (target: string, path: string, signal?: AbortSignal) => get<DirListing>(`/api/machines/${enc(target)}/dirs${qs({ path })}`, signal);
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
@@ -306,8 +293,7 @@ export const frontDoorApi = {
   get: (runner: string, signal?: AbortSignal) => get<FrontDoorView>(`/api/runners/${enc(runner)}/front-door`, signal),
   save: (runner: string, settings: FrontDoorSettings) => request<FrontDoorView>("PUT", `/api/runners/${enc(runner)}/front-door`, settings),
   /** A certificate chain and its key for the runner (which keeps them; the key is never sent back). */
-  uploadCert: (runner: string, cert_pem: string, key_pem: string) =>
-    post<{ cert: CertInfo; front_door: FrontDoorView }>(`/api/runners/${enc(runner)}/front-door/cert`, { cert_pem, key_pem }),
+  uploadCert: (runner: string, cert_pem: string, key_pem: string) => post<{ cert: CertInfo; front_door: FrontDoorView }>(`/api/runners/${enc(runner)}/front-door/cert`, { cert_pem, key_pem }),
   /** A new key and self-signed certificate now (409 for your own certificate, or with HTTPS off). */
   renewCert: (runner: string) => post<FrontDoorView>(`/api/runners/${enc(runner)}/front-door/cert/renew`, {}),
   /** The certificate chain the runner serves, as a PEM download (certificates only, never the key). */

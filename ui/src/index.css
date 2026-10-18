@@ -1684,6 +1684,55 @@ html.fills-window body {
     stroke-dashoffset: -18;
   }
 }
+/* The code editor (docs/ci.md W21-R01): the text area first, quiet gutters. */
+.code-editor {
+  min-height: 420px;
+}
+.code-editor .cm-editor {
+  min-height: 420px;
+}
+/* A CI run's critical path (docs/ci.md W21-R04): the chain that took longest, drawn heavier. */
+.dag-edge[data-critical="true"] {
+  stroke: #8f96a3;
+  stroke-width: 2;
+}
+/* A matrix job's legs, one cell each, coloured by state. */
+.dag-cells {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 2px;
+  max-height: 16px;
+  overflow: hidden;
+}
+.dag-cell {
+  width: 7px;
+  height: 7px;
+  border-radius: 1.5px;
+  background: #7e818a;
+}
+.dag-cell[data-status="succeeded"] {
+  background: #a5c8b3;
+}
+.dag-cell[data-status="failed"] {
+  background: #d1aaad;
+}
+.dag-cell[data-status="timed_out"] {
+  background: #cbb69a;
+}
+.dag-cell[data-status="running"] {
+  background: #b8a6d5;
+}
+.dag-cell[data-status="queued"],
+.dag-cell[data-status="pending"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px #a6b2c6;
+}
+.dag-cell[data-status="cancelled"],
+.dag-cell[data-status="skipped"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px #7e818a;
+}
 
 }
 
