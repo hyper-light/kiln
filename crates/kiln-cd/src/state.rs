@@ -259,6 +259,18 @@ pub enum Command {
         /// The hold; none to follow git.
         pin: Option<Box<Pin>>,
     },
+    /// Keep a rollout (docs/cd-targets.md §5) as it stands now, or forget it.
+    Rollout {
+        /// [`rollout_id`].
+        id: String,
+        /// The record; none to forget it.
+        record: Option<Box<RolloutRecord>>,
+        /// Kept only while the record kept is at this [`RolloutRecord::version`]: whoever read
+        /// it last writes it, so a driver never overwrites what replaced or superseded its
+        /// rollout meanwhile ([`ROLLOUT_REPLACED`]).
+        #[serde(default)]
+        expect: Option<u64>,
+    },
     /// Keep what kiln last applied to a provider's object, or forget it once the object is gone
     /// (docs/cd-targets.md §2.4).
     Applied {
@@ -285,6 +297,56 @@ pub struct Applied {
     pub made: Value,
     /// When.
     pub at_ms: u64,
+}
+
+/// A rollout of one traffic-carrying object on a target (docs/cd-targets.md §5): what rolls out,
+/// between which versions, where its state machine stands, and the checks it runs. A finished
+/// one stays, as the record of how it went, until the object's next rollout replaces it.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct RolloutRecord {
+    /// The app, and the environment it deploys to.
+    pub app: String,
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// The target (its cluster name) and the object ([`applied_key`]).
+    pub target: String,
+    pub key: String,
+    /// The object as the sync applied it: where the traffic is going.
+    pub object: Value,
+    /// The revision rolling out, and the one that ran before.
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub previous: Option<String>,
+    /// The deployment that ran before (its history id): where `auto-rollback` takes the app.
+    #[serde(default)]
+    pub back_to: Option<u64>,
+    /// What had the traffic (blue) and what rolls out (green), as the provider names them
+    /// (a Lambda version, a Worker's version id).
+    pub blue: Value,
+    pub green: Value,
+    /// Green's own address while it has one, and the object's (production's).
+    #[serde(default)]
+    pub preview_url: Option<String>,
+    #[serde(default)]
+    pub stable_url: Option<String>,
+    /// The state machine.
+    pub rollout: crate::rollout::Rollout,
+    /// The checks it runs, by name.
+    #[serde(default)]
+    pub checks: BTreeMap<String, crate::rollout::CheckSpec>,
+    pub started_ms: u64,
+    pub updated_ms: u64,
+    /// Counts the writes of the object's rollouts, for [`Command::Rollout`]'s `expect`.
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// Why a [`Command::Rollout`] with `expect` wasn't kept: someone wrote it meanwhile.
+pub const ROLLOUT_REPLACED: &str = "the rollout changed meanwhile";
+
+/// A rollout's key in [`Data::rollouts`]: its target and object.
+pub fn rollout_id(target: &str, key: &str) -> String {
+    format!("{target}|{key}")
 }
 
 /// A provider object's key in [`Data::applied`]: `group/kind/namespace/name`.
@@ -315,6 +377,8 @@ pub enum Change {
     Pinned(String),
     /// What kiln applied to a target's object changed (by target).
     Applied(String),
+    /// A rollout moved on (by its id).
+    Rollout(String),
 }
 
 /// What is kept.
@@ -338,6 +402,9 @@ pub struct Data {
     /// What kiln last applied to each provider object, by target, then [`applied_key`].
     #[serde(default)]
     pub applied: BTreeMap<String, BTreeMap<String, Applied>>,
+    /// Rollouts, under way and the last of each object, by [`rollout_id`].
+    #[serde(default)]
+    pub rollouts: BTreeMap<String, RolloutRecord>,
 }
 
 impl Data {
@@ -455,6 +522,23 @@ impl Data {
                     }
                 }
                 changes.push(Change::Applied(target));
+            }
+            Command::Rollout { id, record, expect } => {
+                if let Some(v) = expect
+                    && self.rollouts.get(&id).map(|r| r.version) != Some(v)
+                {
+                    return Err(ROLLOUT_REPLACED.into());
+                }
+                match record {
+                    Some(mut r) => {
+                        r.version = self.rollouts.get(&id).map_or(0, |o| o.version) + 1;
+                        self.rollouts.insert(id.clone(), *r);
+                    }
+                    None => {
+                        self.rollouts.remove(&id);
+                    }
+                }
+                changes.push(Change::Rollout(id));
             }
         }
         Ok(())

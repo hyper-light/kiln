@@ -32,6 +32,8 @@ pub struct Config {
     pub ci: ci::Ci,
     /// kiln's own metrics, logs and events (docs/observe.md).
     pub observe: Observe,
+    /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
+    pub conversations: Conversations,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
@@ -144,6 +146,16 @@ pub struct Retention {
     pub max_job_log_mb: u64,
     /// How long the audit log keeps its rows (docs/ci.md W19-R05).
     pub audit_days: u32,
+}
+
+/// `[conversations]` (docs/conversations.md, "Mirrors").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Conversations {
+    /// How many runners keep a copy of the server's conversation store. 0: none.
+    pub mirrors: usize,
+    /// Runners to pick first, by name (each still has to keep a store of its own).
+    pub mirror_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +405,12 @@ pub struct Observe {
 impl Default for Observe {
     fn default() -> Self {
         Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0, host_seconds: 15 }
+    }
+}
+
+impl Default for Conversations {
+    fn default() -> Self {
+        Self { mirrors: 1, mirror_on: Vec::new() }
     }
 }
 

@@ -144,7 +144,10 @@ whose DNS you can't change.
 
 While a machine runs a second runner process beside its first (an upgrade that keeps the first
 one's terminals alive), the newest runs the front door. The server tells the others to stand by,
-so they release the ports.
+so they release the ports. The newest may try the ports before the old one has let go of them, so
+for 30 seconds after it starts or is told to run the front door, it tries ports still in use every
+250 ms, not only every 15 seconds: it takes them within a quarter of a second of the old one
+letting go.
 
 ## One-time setup on a Linux runner
 

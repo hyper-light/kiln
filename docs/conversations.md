@@ -135,6 +135,32 @@ days) are listed from the store, as away, with their recent timeline, so they ca
 machine that comes back says what it has, and that wins. Removing an away agent ends it in the store
 too.
 
+## Mirrors
+
+Other runners keep a copy of the server's whole store (`convo/mirror.rs`). A conversation then
+outlives the server's disk and its own machine both.
+
+- **How.** The server sends each mirror its store the way a runner sends the server its own: the
+  same feed, the other way, on the same lane. A mirror keeps the copy beside its own store, in
+  `<state>/mirror.db`, with where each session runs.
+- **Which runners.** `[conversations] mirrors` says how many (1 unless set; 0 for none). The server
+  picks them among the connected runners that keep a store:
+  1. those named in `mirror_on` (one named takes the place of one that wasn't);
+  2. then the ones connected the longest (a machine that sleeps reconnects often);
+  3. then the most free disk.
+
+  A mirror away for a day is replaced; its copy stays where it is.
+- **Seeing them.** `GET /api/conversations/mirrors` returns `{mirrors: [{machine, connected,
+  chosen_at, last_seen}]}`.
+- **Restoring the server's store from a mirror:**
+  1. Stop the server.
+  2. Copy the mirror's `<state>/mirror.db`, together with its `-wal`, to
+     `<data_dir>/harness/conversations.db`. While kiln runs on the mirror, copy both files as they
+     are.
+  3. Start the server. The agents of machines that are away are listed again from the copy, on the
+     machines they ran on, and can be moved on. Runners that are still there send their own stores
+     again, in full.
+
 ## Filtering and search
 
 - `GET /api/conversations/search?q=&kind=&tool=&status=&agent=&since=&until=&limit=` returns
@@ -142,15 +168,29 @@ too.
   answers from its store. Words match anywhere, in any case, all of them.
 - `GET /api/harness/sessions/:id/events?before=&limit=` returns a session's history beyond what the
   timeline keeps in memory (`MAX_EVENTS`), page by page, from the store.
-- **In the console (C4, to come):**
-  - Mission control's filter box will also search conversations, and its results will open the
-    agent at that event.
-  - An agent's find bar will search its whole history, not only what is loaded.
+- **In the console:**
+  - **Mission Control's filter box** also searches conversations, from three characters typed. Under
+    the agents, *In conversations* lists the matching events, newest first: which agent, which
+    machine, who said it, when, and the words around the match, marked. A match opens its agent
+    with the find bar already looking for the same words. An agent that ended and is forgotten has
+    its matches listed, but not as links.
+  - **An agent's find bar** finds what its timeline holds. When the timeline holds only the latest
+    events (`MAX_EVENTS`), the matches before them, from its history, are listed under the bar
+    (*N earlier, in its history*) to read in place.
+  - The UI mock answers the search too: `MOCK_DROPPED=n` gives its long conversation an earlier
+    history.
 
 ## Settings
 
-One switch, the same on every machine: the environment variable `KILN_CONVERSATIONS` (`off` turns
-the store off). Replication to the server needs no setting: a runner with a store sends it.
+- `KILN_CONVERSATIONS`, the same on every machine: `off` turns the store off. Replication to the
+  server needs no setting: a runner with a store sends it.
+- The server's `kiln.toml`:
+
+```toml
+[conversations]
+mirrors = 1          # runners that keep a copy of the server's store; 0: none
+mirror_on = []       # runners to pick first, by name
+```
 
 ## Milestones
 
@@ -159,7 +199,7 @@ the store off). Replication to the server needs no setting: a runner with a stor
 | C1 | Turso embedded; each machine's store (a runner keeps its own sessions; the server keeps every session as its updates come in); the writer (per event, batched); restore from the store; `events?before=` paging | a session restarted keeps its whole timeline; 10k events written and read back in tests; musl, macOS and Windows builds |
 | C2 | Replication: the feed, the lane, epochs; the harness's record followed and replicated | killing a runner loses nothing; a server killed mid-turn catches up; a runner offline catches up; checked with a real Claude Code |
 | C3 | Resuming on another machine from the server's store; the copy left behind lets go | a session whose machine is gone goes on elsewhere, its conversation and harness record intact, also after a server restart; checked in the lab with a real Claude Code |
-| C4 | Search in the console: the filter box and the find bar | search across agents, newest first, by words, tool, status, machine and time |
+| C4 | Search in the console: the filter box and the find bar | search across agents, newest first, by words; a match opens its agent where the words are |
 | C5 | Mirrors: other runners keep a copy of the server's store | the server's store lost and a runner gone too: nothing lost |
 
 ## Risks
@@ -181,5 +221,5 @@ the store off). Replication to the server needs no setting: a runner with a stor
 | C1 store | live (1a59fad, 2026-10-18): the Turso engine, each runner's store of its sessions, the server's store of every session, the writer, restore from the store, search and paging API |
 | C2 replication | built: revisions, the feed on its lane, the harness's record followed, epochs, resets that keep history. Lab with a real Claude Code: the server's store matches the runner's and the transcript line for line; a server killed mid-turn catches up; a runner killed comes back and goes on |
 | C3 resume elsewhere | built: Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context |
-| C4 search UI | not yet (the API is built) |
-| C5 mirrors | not yet |
+| C4 search UI | built: Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
+| C5 mirrors | built: the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |

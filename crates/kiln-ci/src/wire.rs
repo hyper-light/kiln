@@ -336,6 +336,20 @@ pub enum JobEventV2 {
     FailureClass { class: String },
     /// The failed leg is kept to look into until `until` (Unix seconds, W17-R02).
     Kept { until: i64 },
+    /// W18-R01: what an attest step (or the job's `attest:`) names, by digest. The server builds
+    /// and signs their provenance from what it knows of the run, and their SBOM's statement when
+    /// `sbom` (the document the runner uploaded under `nonce`).
+    Attest {
+        idx: u32,
+        /// The runner's random name for this report: its SBOM's upload and its bundles are
+        /// found by it (`/_kiln/attestations`).
+        nonce: String,
+        subjects: Vec<crate::attest::Subject>,
+        #[serde(default)]
+        provenance: bool,
+        #[serde(default)]
+        sbom: bool,
+    },
 }
 
 #[cfg(test)]

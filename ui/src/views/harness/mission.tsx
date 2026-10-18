@@ -22,6 +22,7 @@ import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
 import { DEFAULT_VIEW, isFiltered, ListBar, useShownList, type ListView } from "./list-tools";
+import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { useSeen } from "./seen";
@@ -430,6 +431,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           )}
         </>
       )}
+
+      {/* What was said that holds the words of the filter, in every agent's conversation. */}
+      {all.length > 0 && <SaidInConversations q={q} />}
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
       <React.Suspense fallback={null}>

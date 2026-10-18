@@ -208,6 +208,17 @@ pub fn ops() -> &'static [Op] {
                 }), &["app"]), run: rollback),
             op!("cd.apps.follow", "Let a rolled-back app follow git again (an automatic app then deploys what git says).", ro: false, destructive: false,
                 input: app_only, run: follow),
+            op!("cd.apps.rollout", "An app's rollouts on targets beyond Kubernetes (docs/cd-targets.md §5), the one under way first: each with where it stands (state, green's share, the step it's at), its steps, its checks and what they measured, what happened, and the approvals it waits for.", ro: true, destructive: false,
+                input: app_only, run: rollouts),
+            op!("cd.apps.rollout_act", "Act on an app's rollout: `promote` it past the step it waits at (`full`: past every step and check), `pause` or `resume` it, `abort` it (traffic back to blue; with auto-rollback the app goes back to the deployment before), `retry` an aborted one from its first step, or `approve` or `deny` an approval check it waits for (`check`).", ro: false, destructive: true,
+                input: || obj_schema(json!({
+                    "app": {"type": "string", "description": APP},
+                    "action": {"type": "string", "enum": ["promote", "pause", "resume", "abort", "retry", "approve", "deny"]},
+                    "full": {"type": "boolean", "description": "promote: past every step and check at once."},
+                    "check": {"type": "string", "description": "approve, deny: the approval check."},
+                    "reason": {"type": "string", "description": "abort: why, for the rollout's record."},
+                    "rollout": {"type": "string", "description": "Which rollout, by id (cd.apps.rollout), when the app has more than one under way."}
+                }), &["app", "action"]), run: rollout_act),
             op!("cd.apps.create", "Create or replace an app kept in kiln (an AppDef).", ro: false, destructive: true,
                 input: || obj_schema(json!({"definition": {"type": "object", "description": "The app: name, project, sources, destination, sync, ignore, tracking."}}), &["definition"]),
                 run: create),
@@ -306,6 +317,29 @@ fn agents_may(cx: &Cx, id: &str, what: &str) -> Result<(), Fail> {
             None => format!("agents may not {what} {id}: ask a person to, or have them allow agents to deploy ([cd] agents_deploy = true)"),
         },
     ))
+}
+
+/// Agents answer what waits for approval only where an environment lets them (`agents: {
+/// approve: true }`, ci.md W15's `agents-can-approve`); otherwise a person does.
+fn agents_may_approve(cx: &Cx, id: &str) -> Result<(), Fail> {
+    if !cx.actor.starts_with("agent:") {
+        return Ok(());
+    }
+    let (env, repo) = cx
+        .cd
+        .apps
+        .read()
+        .get(id)
+        .map(|e| (e.def.environment.clone(), if let Origin::Deploy { repo } = &e.def.origin { Some(repo.clone()) } else { None }))
+        .unwrap_or_default();
+    let allowed = match (&env, &repo) {
+        (Some(env), Some(repo)) => cx.cd.environments.read().get(repo).and_then(|m| m.get(env)).is_some_and(|e| e.agents.approve),
+        _ => false,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err((StatusCode::FORBIDDEN, format!("agents may not answer the approvals of {id}: a person does, unless its environment allows agents to (agents: {{ approve: true }})")))
 }
 
 fn exists(cd: &Cd, id: &str) -> Result<(), Fail> {
@@ -1032,14 +1066,24 @@ async fn take_over(cx: Cx, v: Value) -> Out {
 async fn rollback(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     agents_may(&cx, &id, "roll back")?;
-    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    let out = roll_back(&cx.cd, &id, v.get("to").and_then(Value::as_u64), v.get("prune").and_then(Value::as_bool), &cx.actor).await?;
+    audit(&cx, "cd.rollback", format!("{id} to deployment {}", out.get("to").and_then(Value::as_u64).unwrap_or(0))).await;
+    Ok(out)
+}
+
+/// Rolls an app back to an earlier deployment (`to`, by default the one before what runs now)
+/// and holds it there until git changes it: the rollback operation's, and a rollout's after it
+/// aborted (docs/cd-targets.md §5).
+pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Option<bool>, by: &str) -> Out {
+    let id = id.to_owned();
+    let def = cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     if super::is_shadow(&def) {
         return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
     }
-    ready_to_sync(&cx.cd, &id)?;
-    let history = cx.cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
+    ready_to_sync(cd, &id)?;
+    let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
     let current = history.iter().rev().find(|d| d.succeeded).and_then(|d| d.key);
-    let target = match v.get("to").and_then(Value::as_u64) {
+    let target = match to {
         Some(n) => history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?,
         None => history
             .iter()
@@ -1058,14 +1102,19 @@ async fn rollback(cx: Cx, v: Value) -> Out {
     } else {
         return Err(bad(format!("deployment {} of {id} was kept without its sources' commits, so it can't be rendered again", target.id)));
     };
-    let Some(cluster) = cx.cd.clusters.read().get(&def.destination.cluster).cloned() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, format!("cluster {} is not connected", def.destination.cluster)));
+    // A Kubernetes cluster's version and APIs shape the render; a target beyond Kubernetes has none.
+    let (kube_version, api_versions) = if kiln_cd::providers::is_target(&def.destination.cluster) {
+        (None, Vec::new())
+    } else {
+        let Some(cluster) = cd.clusters.read().get(&def.destination.cluster).cloned() else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, format!("cluster {} is not connected", def.destination.cluster)));
+        };
+        (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone())
     };
-    let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
-    let (cd, d2, at) = (cx.cd.clone(), def.clone(), commits.clone());
+    let (cd2, d2, at) = (cd.clone(), def.clone(), commits.clone());
     let (mut head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
-        let head = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
-        let back = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
+        let head = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
+        let back = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
         Ok((head, back))
     })
     .await
@@ -1073,21 +1122,93 @@ async fn rollback(cx: Cx, v: Value) -> Out {
     .map_err(|e| bad(format!("{e:#}")))?;
     // The head's artifacts as the source poll resolves them (the pin compares its content), and
     // the deployment's exactly as it recorded them.
-    let (a, p) = cx.cd.resolve_artifacts(&def, &head.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    let (a, p) = cd.resolve_artifacts(&def, &head.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     head.add_artifacts(a, p);
-    let (a, p) = cx.cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    let (a, p) = cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     back.add_artifacts(a, p);
-    let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(cx.actor.clone()), at_ms: super::now_ms() };
-    propose(&cx.cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
+    let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
+    propose(cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.
-    let request = SyncRequest { prune: v.get("prune").and_then(Value::as_bool), by: Some(cx.actor.clone()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
+    let request = SyncRequest { prune, by: Some(by.to_owned()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
     {
-        let _gate = cx.cd.inputs_gate.lock();
-        cx.cd.keep_inputs(&id, &back);
-        cx.cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
+        let _gate = cd.inputs_gate.lock();
+        cd.keep_inputs(&id, &back);
+        cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
     }
-    audit(&cx, "cd.rollback", format!("{id} to deployment {}", target.id)).await;
     Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision}))
+}
+
+/// An app's rollouts, the one under way first, then the newest.
+async fn rollouts(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    exists(&cx.cd, &id)?;
+    let mut list = cx.cd.rollouts_of(&id);
+    list.sort_by_key(|(_, r)| (r.rollout.finished(), std::cmp::Reverse(r.started_ms)));
+    let out: Vec<Value> = list
+        .into_iter()
+        .map(|(rid, rec)| {
+            let r = &rec.rollout;
+            json!({
+                "id": rid, "target": rec.target, "kind": obj::kind(&rec.object), "name": obj::name(&rec.object),
+                "revision": rec.revision, "previous_revision": rec.previous, "back_to": rec.back_to,
+                "environment": rec.environment, "blue": rec.blue, "green": rec.green, "preview_url": rec.preview_url, "stable_url": rec.stable_url,
+                "started_ms": rec.started_ms, "updated_ms": rec.updated_ms,
+                "status": r.summary(), "state": r.state, "steps": r.plan.steps, "step": r.step, "background": r.plan.background,
+                "auto_rollback": r.plan.auto_rollback, "ready": r.ready, "unready": r.unready, "moving": r.moving,
+                "checks": r.checks, "watching": r.background, "release": r.release,
+                "log": r.log, "dropped": r.dropped, "waiting": cx.cd.rollouts.waiting(&rid),
+            })
+        })
+        .collect();
+    Ok(json!({"app": id, "rollouts": out}))
+}
+
+/// What a person does to an app's rollout.
+async fn rollout_act(cx: Cx, v: Value) -> Out {
+    use kiln_cd::rollout::Event;
+    let id = app_id(&v)?;
+    exists(&cx.cd, &id)?;
+    let action = str_in(&v, "action").ok_or_else(|| bad("`action` is required"))?;
+    // Approvals are a person's unless the environment lets agents answer them; pausing changes
+    // nothing that runs.
+    match action {
+        "approve" | "deny" => agents_may_approve(&cx, &id)?,
+        "pause" => {}
+        _ => agents_may(&cx, &id, &format!("{action} the rollout of"))?,
+    }
+    // The rollout named, or the app's one under way (the newest when it has none).
+    let mine = cx.cd.rollouts_of(&id);
+    let rid = match str_in(&v, "rollout") {
+        Some(r) => mine.iter().find(|(rid, _)| rid == r).map(|(rid, _)| rid.clone()).ok_or_else(|| missing(format!("{id} has no rollout {r}")))?,
+        None => {
+            let active: Vec<&String> = mine.iter().filter(|(_, r)| !r.rollout.finished()).map(|(rid, _)| rid).collect();
+            match active.as_slice() {
+                [one] => (*one).clone(),
+                [] => mine.iter().max_by_key(|(_, r)| r.started_ms).map(|(rid, _)| rid.clone()).ok_or_else(|| missing(format!("{id} has no rollout")))?,
+                _ => return Err(bad(format!("{id} has {} rollouts under way: name one (`rollout`)", active.len()))),
+            }
+        }
+    };
+    let by = cx.actor.clone();
+    match action {
+        "approve" | "deny" => {
+            let check = str_in(&v, "check").ok_or_else(|| bad("`check` names the approval"))?;
+            cx.cd.rollout_approve(&rid, check, action == "approve", &by)?;
+        }
+        _ => {
+            let event = match action {
+                "promote" => Event::Promote { full: v.get("full").and_then(Value::as_bool).unwrap_or(false) },
+                "pause" => Event::Pause,
+                "resume" => Event::Resume,
+                "abort" => Event::Abort { why: str_in(&v, "reason").map_or_else(|| format!("aborted by {by}"), |r| format!("aborted by {by}: {r}")) },
+                "retry" => Event::Retry,
+                other => return Err(bad(format!("no rollout action {other}: promote, pause, resume, abort, retry, approve or deny"))),
+            };
+            cx.cd.rollout_event(&rid, event)?;
+        }
+    }
+    audit(&cx, "cd.rollout", format!("{action} {rid}")).await;
+    Ok(json!({"app": id, "rollout": rid, "action": action}))
 }
 
 async fn follow(cx: Cx, v: Value) -> Out {
