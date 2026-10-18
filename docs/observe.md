@@ -16,12 +16,12 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
-| O-4 | Query language: metrics done (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica); the HTTP API's first routes (§7); logs and events with O-6 | in progress |
-| O-5 | Ingestion: kiln itself, runners' hosts, OTLP/HTTP (protobuf and JSON), kiln CI and CD | planned |
-| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax; next: the store's log head, persistence, OTLP logs, facets, live tail, patterns | in progress |
-| O-7 | Monitors: threshold, change, anomaly, forecast, logs, events, CI/CD, composite; notifications | planned |
+| O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
+| O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
+| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets); next: live tail, patterns | in progress |
+| O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; next: anomaly, forecast, composite | in progress |
 | O-8 | Dashboards and explorers in the UI | planned |
-| O-9 | Integrations: Slack, Discord, Teams, PagerDuty, webhooks, GitHub, AWS, GCP, Azure | planned |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub done; next: AWS, GCP, Azure | in progress |
 | O-10 | Load, soak and fault scenarios end to end; profiles; allocation and fault passes | continuous |
 
 ## 1. Rules
@@ -258,9 +258,13 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `POST logs` | ingest records as Datadog's log intake takes them (`message`, `timestamp`, `status`, `service`, `hostname`, `ddsource`, `attributes`) |
 | `GET status` | the group: members, leader, term, applied and durable index, series, blocks, bytes, cutoff, this node's writes, each machine's replica, digests |
 | `POST compact`, `POST verify` | cut and compact the log now; take every replica's full digest (an operator's, or a test's, check that replicas agree) |
+| `POST logs/aggregate` | log analytics: `{query, from, to, by: [facets], measure, of}` → groups |
+| `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
+| `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups' |
+| `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
-To come: `GET logs/tail` (websocket), events, monitors, dashboards, integrations.
+To come: `GET logs/tail` (websocket), dashboards.
 
 OTLP/HTTP at its standard paths, `/v1/metrics` and `/v1/logs` (protobuf and JSON), on the server and
 on every runner at `127.0.0.1:4318`, so an app on a runner sends to its local runner as it would to
@@ -268,23 +272,65 @@ a collector (O-5).
 
 ## 8. Ingestion
 
-- kiln itself: CI runs, jobs, steps (durations, queue waits, outcomes), CD syncs and deploys,
-  runners' slots, the server's own HTTP, QUIC and process figures.
-- Runners' hosts: CPU (per state), memory, disk and network, load, processes, every
-  `HOST_SAMPLE_INTERVAL`.
-- OTLP from applications.
-- GitHub webhooks (pushes, pull requests, workflow runs, deployments) as events and metrics.
-- AWS CloudWatch, GCP Cloud Monitoring and Azure Monitor pulled on a schedule (§10).
-- Prometheus text endpoints scraped, for anything that only speaks that.
+Every node writes its own points (`crate::observe::ingest`: gathered by series, one write out at a
+time, sent again until answered; §5), from:
+
+- **OTLP/HTTP** (`POST /v1/metrics`, `/v1/logs`): protobuf or JSON (OTLP's JSON Protobuf Encoding,
+  put into protobuf's wire format and read by the one decoder), gzip or not, up to 20 MiB (the
+  OpenTelemetry Collector's default). The server asks the ingest token (`<data>/observe/
+  ingest.token`) or the admin's; every runner takes OTLP on `127.0.0.1:4318` (OTLP/HTTP's port;
+  `KILN_OTLP_ADDR`, or `off`) as a local collector would. A node three quarters full of waiting
+  points answers 503 with `Retry-After`, which exporters retry. Metrics map by type (gauges;
+  sums by temporality and monotonicity; histograms' count, sum, min, max and buckets;
+  exponential histograms' quantiles too; summaries); logs keep their time, severity, body,
+  attributes and trace context, `service` and `host` from the resource.
+- **The node's own host** (`crate::observe::host`, every 15 s, the Datadog Agent's interval), in
+  Datadog's names and units: CPU (the split over the interval; Linux), load, memory, swap, every
+  mount the process sees, disk I/O and network rates, uptime; in a container or a cgroup-limited
+  unit, its limits and use (`container.memory.*`, `container.cpu.*`, cgroup v2 or v1), tagged with
+  the container's id and the pod's namespace, name and node. Linux reads procfs and sysfs; macOS
+  and Windows ask the OS (sysinfo). Network file systems are never looked at (a dead mount's
+  `statvfs` never returns), on a thread of its own besides.
+- **The process** (`kiln.process.*`: memory, CPU, open files, threads).
+- **kiln's registry**, what `/metrics` serves Prometheus, scraped under its Prometheus names
+  (`kiln_prom`'s parser takes any text exposition).
+- **kiln CI**: each job's and run's duration, queue time, footprint and count by repo, pipeline,
+  job, status, runner, branch and trigger, and each an event.
+- **kiln CD**: each deploy (by app, trigger, result) and each change of an app's health or sync as
+  events; apps counted by health and sync.
+- **GitHub's webhooks**: pushes, pull requests, workflow runs and jobs (durations, conclusions),
+  releases, deployments, issues; events and counts.
+- **The API**: Datadog's v1 series (`POST series`), log intake (`POST logs`) and events (`POST
+  events`).
+
+To come: AWS CloudWatch, GCP Cloud Monitoring and Azure Monitor pulled on a schedule (§10);
+Prometheus endpoints scraped.
 
 ## 9. Monitors
 
-A monitor is a query, a condition and where to say so. Kinds: metric threshold; change (against a
-time shift); anomaly (a seasonal baseline learned from the series, §9.1); forecast; log count;
-event; kiln CI (failures, queue time); kiln CD (sync, health); runner offline; composite (a boolean
-of monitors). States: OK, WARN, ALERT, NO DATA, with recovery thresholds so a monitor does not flap,
-a renotify interval, mute windows and downtimes. Notifications are rendered from the monitor's
-message template with the triggering values and links back to kiln.
+A monitor is Datadog's (`kiln_obs::monitor`, `crate::observe::monitors`): a query, a message and
+options, so a monitor written for Datadog reads here.
+
+- **Queries**: `avg|sum|min|max|last(last_5m):<metric query> > 90`; change monitors
+  `change(avg(last_5m),last_1h):…` and `pct_change(…)`; log monitors
+  `logs("service:web status:error").rollup("count").by("host").last("5m") > 10` (count,
+  cardinality, sum, avg, min, max of a facet). A window is whole buckets of a step that divides it,
+  aligned to the step.
+- **States** move with hysteresis: a group alerts past the critical threshold and recovers only
+  past the recovery threshold (warnings the same), so a value at a threshold does not flap; NO DATA
+  after a timeframe when asked; groups silent a day are forgotten.
+- **Options**: thresholds (critical, warning, recoveries), `notify_no_data` and its timeframe,
+  `renotify_interval`, `evaluation_delay` (late data counts), `every` (60 s unless it says, 10 s
+  at the most often); mute until a time or unmuted.
+- **Messages** are Datadog's templates (`{{value}}`, `{{threshold}}`, `{{host.name}}`,
+  `{{#is_alert}}…{{/is_alert}}`, `{{^is_recovery}}`, …), their `@slack-<name>`,
+  `@discord-<name>`, `@teams-<name>`, `@pagerduty-<name>`, `@webhook-<name>` mentions naming
+  integrations (§10).
+- The server, the leader, evaluates each on the blocking pool; each group's change is an event
+  (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
+  are saved as they change.
+
+To come: anomaly, forecast, outlier and composite monitors (§9.1).
 
 ### 9.1 Anomalies and forecasts
 
@@ -300,12 +346,18 @@ scores are in §12.
 
 ## 10. Integrations
 
-Notifications: Slack (incoming webhook, Block Kit), Discord (webhook embeds), Microsoft Teams
-(incoming webhook), PagerDuty (Events API v2, trigger and resolve by dedup key), generic webhooks
-(signed with HMAC-SHA256 over the body). Sources: GitHub (webhooks verified by
-`X-Hub-Signature-256`), AWS CloudWatch (`GetMetricData`, Signature Version 4), GCP Cloud Monitoring
-(`timeSeries.list`, a service account's JWT, RS256), Azure Monitor (metrics REST, OAuth 2.0 client
-credentials). Each is a few hundred lines against its published API, on the HTTP client kiln has.
+Notifications (`crate::observe::notify`), each in its service's format: Slack (incoming webhook,
+Block Kit in a colored attachment), Discord (webhook embeds, within its limits), Microsoft Teams
+(an Adaptive Card, what Workflows webhooks take), PagerDuty (Events API v2: trigger while
+alerting, resolve on recovery, one dedup key a monitor's group), and generic webhooks (kiln's JSON
+signed HMAC-SHA256 over the body, `X-Kiln-Signature`, as GitHub signs its own). Delivered off a
+bounded queue, tried again with doubling backoff on errors, 429s (after `Retry-After`) and 5xx;
+each delivery an event and a count. Integrations are named (`PUT /api/observe/v1/integrations/
+<name>`), their secrets never shown, and testable.
+
+Sources: GitHub's webhooks (§8). To come: AWS CloudWatch (`GetMetricData`, Signature Version 4),
+GCP Cloud Monitoring (`timeSeries.list`, a service account's JWT), Azure Monitor (metrics REST,
+OAuth 2.0 client credentials).
 
 ## 11. UI
 
@@ -540,7 +592,15 @@ restart on schedules of their own, and to rewrites built apart while the store g
 held across entries, taken in later; a real maintenance thread beside the applying one): all agree
 at every checkpoint, over 1,000 seeds (`KILN_OBS_SEEDS=1000`), digests included.
 
-To come: OTLP senders, mock Slack and Discord endpoints, full disks, clock skew, load and soak.
+Also live: OTLP/JSON gzip to the server (a wrong token refused, a malformed body refused) and
+protobuf to a runner's receiver, which arrive and replicate; a CI pipeline run on a runner from a
+`file://` repository, its job's count, duration and event found; a monitor that alerts five
+integrations (services in the test) each in its format, a webhook refused once and delivered on
+its second try with its signature checked, a recovery that resolves PagerDuty's incident by the
+same key, and muted, a change of state with nothing said; GitHub's webhooks and posted events,
+searched and counted.
+
+To come: full disks, clock skew, load and soak.
 
 ## 14. References
 
