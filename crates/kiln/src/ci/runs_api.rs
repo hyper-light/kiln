@@ -79,7 +79,7 @@ async fn legs(hub: &Hub, run: &str) -> Result<Vec<Value>, Fail> {
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code
-                 FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL ORDER BY rowid",
+                 FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY rowid",
             )?;
             let rows = st.query_map([&run], |r| {
                 let json_col = |i: usize| -> rusqlite::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)) };
@@ -215,26 +215,32 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
 /// was (a new run; `{ mode: "all" }`, the default).
 pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> {
-    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("all");
-    if mode != "all" {
-        return Err((StatusCode::NOT_IMPLEMENTED, format!("rerun mode `{mode}` comes with docs/ci.md W05 (attempts); `all` works")));
+    use super::dispatch::RerunMode;
+    let mode = match body.get("mode").and_then(Value::as_str).unwrap_or("all") {
+        "all" => RerunMode::All,
+        "failed" => RerunMode::Failed,
+        "job" => RerunMode::Job(body.get("job").and_then(Value::as_str).filter(|j| !j.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "mode `job` names a `job`".to_owned()))?.to_owned()),
+        other => return Err((StatusCode::BAD_REQUEST, format!("rerun mode `{other}`: `all`, `failed` or `job`"))),
+    };
+    let debug = body.get("debug").and_then(Value::as_bool).unwrap_or(false);
+    // "Rerun with fresh actions" (W07-R02): pinned again now, instead of the run's pins.
+    let actions = if body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false) {
+        let run = id.to_owned();
+        let saved: Option<(String, String, String)> = hub.store.call(move |c| Ok(c.query_row("SELECT r.repo_id, r.sha, p.workflow FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = ?1", [&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)).await.map_err(internal)?;
+        let Some((repo_id, sha, model)) = saved else { return Err(missing("no such run of the CI engine")) };
+        let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id).ok_or_else(|| missing("the run's repository is gone"))?;
+        let wf: kiln_ci::wf::Workflow = serde_json::from_str(&model).map_err(|e| (StatusCode::CONFLICT, format!("the run's workflow can't be read again: {e}")))?;
+        Some(super::actions::resolve(hub, &repo, &sha, &wf).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?)
+    } else {
+        None
+    };
+    let (tx, rx) = async_channel::bounded(1);
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, actions, reply: tx });
+    match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+        Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
+        Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
+        _ => Err((StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned())),
     }
-    let run = id.to_owned();
-    let saved: Option<(String, String, String, String)> = hub
-        .store
-        .call(move |c| Ok(c.query_row("SELECT r.repo_id, r.workflow_id, p.workflow, p.input FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = ?1", [&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?))
-        .await
-        .map_err(internal)?;
-    let Some((repo_id, path, model, input)) = saved else { return Err(missing("no such run of the CI engine")) };
-    let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id).ok_or_else(|| missing("the run's repository is gone"))?;
-    let workflow: kiln_ci::wf::Workflow = serde_json::from_str(&model).map_err(|e| (StatusCode::CONFLICT, format!("the run's workflow can't be read again: {e}")))?;
-    let input: Value = serde_json::from_str(&input).unwrap_or_default();
-    let event: kiln_ci::trigger::Event = input.get("event").and_then(|e| serde_json::from_value(e.clone()).ok()).ok_or((StatusCode::CONFLICT, "the run predates saved events; it can't be run again".to_owned()))?;
-    let actions = input.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
-    let inputs = input.get("inputs").cloned().unwrap_or(Value::Null);
-    let (message, author) = crate::gitops::commit_info(hub, &repo, &event.sha).await;
-    hub.ci.send(super::dispatch::Msg::Start(Box::new(super::dispatch::Start { repo, event, path, workflow: std::sync::Arc::new(workflow), message, author, actions, inputs })));
-    Ok(srv::status(StatusCode::ACCEPTED))
 }
 
 /// `GET /api/ci/legs/:id`: the leg, its steps and annotations.
@@ -270,7 +276,15 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
 /// `GET /api/ci/legs/:id/logs?step=`.
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let data = hub.logs.read(id, step).await;
+    let mut data = hub.logs.read(id, step).await;
+    // A leg a rerun kept: the logs are those of the leg whose result it keeps (W05-R17).
+    if data.is_empty() {
+        let leg = id.to_owned();
+        let from: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&leg], |r| r.get(0)).optional()?.flatten())).await.map_err(internal)?;
+        if let Some(from) = from {
+            data = hub.logs.read(&from, step).await;
+        }
+    }
     Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
 }
 

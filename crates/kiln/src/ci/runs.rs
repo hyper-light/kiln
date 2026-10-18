@@ -112,7 +112,7 @@ pub async fn insert_leg(hub: &Hub, run: &str, id: &str, spec: &LegSpec, status: 
             // The legs of those jobs, by key, which is what the run's graph links (W21).
             let mut needs: Vec<String> = Vec::new();
             for n in &needed {
-                let mut q = tx.prepare("SELECT key FROM jobs WHERE run_id = ?1 AND job_id = ?2 ORDER BY rowid")?;
+                let mut q = tx.prepare("SELECT key FROM jobs WHERE run_id = ?1 AND job_id = ?2 AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY rowid")?;
                 for k in q.query_map(params![run, n], |r| r.get::<_, String>(0))? {
                     needs.push(k?);
                 }
@@ -123,8 +123,8 @@ pub async fn insert_leg(hub: &Hub, run: &str, id: &str, spec: &LegSpec, status: 
                 o.insert("needs".into(), serde_json::json!(needs));
             }
             tx.execute(
-                "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, attempt, queued_at, finished_at, error, job_id, matrix, leg_index, leg, concurrency_group)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?16, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, attempt, queued_at, finished_at, error, job_id, matrix, leg_index, leg, concurrency_group, run_attempt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?16, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, (SELECT attempt FROM runs WHERE id = ?2))",
                 params![id, run, key, display, status.as_str(), labels, planned.to_string(), (!terminal).then_some(now), terminal.then_some(now), error, job, matrix, index, leg, group, needs_json],
             )?;
             for (i, name) in steps.iter().enumerate() {
@@ -274,10 +274,54 @@ pub async fn finish_run(hub: &Hub, run: &str, status: Status, conclusion: &str, 
         .await
 }
 
-/// One report the plan took (W05-R25).
+/// One report the plan took (W05-R25), in the run's current attempt.
 pub async fn log(hub: &Hub, run: &str, seq: i64, kind: &str, leg: Option<String>, report: Option<String>) -> anyhow::Result<()> {
     let (run, kind) = (run.to_owned(), kind.to_owned());
-    hub.store.call(move |c| Ok(c.execute("INSERT INTO ci_plan_log (run_id, seq, kind, leg, report) VALUES (?1, ?2, ?3, ?4, ?5)", params![run, seq, kind, leg, report]).map(|_| ())?)).await
+    hub.store
+        .call(move |c| Ok(c.execute("INSERT INTO ci_plan_log (run_id, seq, kind, leg, report, attempt) VALUES (?1, ?2, ?3, ?4, ?5, (SELECT attempt FROM runs WHERE id = ?1))", params![run, seq, kind, leg, report]).map(|_| ())?))
+        .await
+}
+
+/// A new attempt of a finished run (W05-R17): its number, the run queued again.
+pub async fn start_attempt(hub: &Hub, run: &str) -> anyhow::Result<u32> {
+    let run = run.to_owned();
+    hub.store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            tx.execute("UPDATE runs SET attempt = attempt + 1, status = 'queued', conclusion = NULL, error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?1", [&run])?;
+            tx.execute("UPDATE ci_plans SET done = 0 WHERE run_id = ?1", [&run])?;
+            let n: u32 = tx.query_row("SELECT attempt FROM runs WHERE id = ?1", [&run], |r| r.get(0))?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .await
+}
+
+/// A leg the new attempt doesn't run again (W05-R17): a copy of the last attempt's, with its
+/// steps and result, `reused_from` naming it.
+pub async fn keep_leg(hub: &Hub, run: &str, old: &str, id: &str) -> anyhow::Result<()> {
+    let (run, old, id) = (run.to_owned(), old.to_owned(), id.to_owned());
+    hub.store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error,
+                                   job_id, matrix, leg_index, outputs, conclusion, requirements, routing, concurrency_group, priority, input_hash, reused_from, environment, leg, run_attempt)
+                 SELECT ?1, run_id, key, display, status, labels, needs, spec, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error,
+                        job_id, matrix, leg_index, outputs, conclusion, requirements, routing, concurrency_group, priority, input_hash, COALESCE(reused_from, id), environment, leg,
+                        (SELECT attempt FROM runs WHERE id = ?3)
+                 FROM jobs WHERE id = ?2",
+                params![id, old, run],
+            )?;
+            tx.execute(
+                "INSERT INTO steps (job_id, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt)
+                 SELECT ?1, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt FROM steps WHERE job_id = ?2",
+                params![id, old],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
 }
 
 /// The run of a leg.
