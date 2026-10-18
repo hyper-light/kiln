@@ -737,7 +737,7 @@ impl Dispatch {
                     self.actions(&run, held).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
-                Command::Assign { leg, runner, attempt, executor, image } => self.assign(&leg, &runner, attempt, executor, image).await,
+                Command::Assign { leg, runner, attempt, executor, image, docker } => self.assign(&leg, &runner, attempt, executor, image, docker).await,
                 Command::Cancel { leg, reason, .. } => {
                     if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
                         self.hub.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason }).await;
@@ -774,7 +774,7 @@ impl Dispatch {
     }
 
     /// Sends a leg to its runner (W05, W06).
-    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>, image: Option<String>) -> anyhow::Result<()> {
+    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String>) -> anyhow::Result<()> {
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
@@ -786,6 +786,11 @@ impl Dispatch {
         let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Docker inside the `docker` executor's container: the host's socket, for trusted runs
+        // only (W13-R04).
+        if let Some(d) = docker.filter(|_| r.trusted && a.executor.kind == "docker") {
+            a.executor.options = serde_json::json!({ "docker": d });
+        }
         // Needed jobs' secret outputs, as masked environment only (W04-R22).
         for (k, v) in secret_env {
             a.masks.push(v.clone());

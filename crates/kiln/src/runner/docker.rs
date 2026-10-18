@@ -71,6 +71,18 @@ pub struct Spec {
     pub user: Option<(u32, u32)>,
 }
 
+/// The group that owns the host's Docker socket.
+#[cfg(unix)]
+fn socket_group() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata("/var/run/docker.sock").ok().map(|m| m.gid())
+}
+
+#[cfg(not(unix))]
+fn socket_group() -> Option<u32> {
+    None
+}
+
 /// The user this runner runs as: (uid, gid).
 #[cfg(unix)]
 pub fn host_user() -> Option<(u32, u32)> {
@@ -86,7 +98,8 @@ pub fn host_user() -> Option<(u32, u32)> {
 /// GitHub's hosted Ubuntu runners have that most workflows count on. Besides the build and
 /// network basics, that's the toolchains workflows call without a `setup-*` action: CMake,
 /// Ninja, the autotools and Clang; a JDK with Maven, Ant and sbt (`JAVA_HOME` set); PHP with
-/// Composer; Ruby; Leiningen; pipx; Rust (rustup, with rustfmt and clippy); Node.js 22. Each
+/// Composer; Ruby and Bundler; Leiningen; pipx; Rust (rustup, with rustfmt and clippy); Node.js
+/// 22; the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04). Each
 /// comes from Ubuntu's archive or the project's own release server. apt assumes yes, as GitHub's
 /// images set it, so `sudo apt-get install x` works without `-y`. `-slim` (`kiln/runner-ubuntu-24.04-slim`) is
 /// the basics alone, for rules that want a small image.
@@ -119,6 +132,12 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              default-jdk-headless maven ant php-cli php-xml php-mbstring php-curl php-zip php-intl php-sqlite3 composer ruby-full ruby-bundler leiningen pipx \\\n    \
              && rm -rf /var/lib/apt/lists/*\n\
              RUN curl -fsSL https://github.com/sbt/sbt/releases/download/v1.10.7/sbt-1.10.7.tgz | tar -xz -C /usr/local && ln -s /usr/local/sbt/bin/sbt /usr/local/bin/sbt\n\
+             RUN case \"$(dpkg --print-architecture)\" in amd64) d=x86_64 b=amd64 ;; arm64) d=aarch64 b=arm64 ;; esac \\\n    \
+             && curl -fsSL \"https://download.docker.com/linux/static/stable/$d/docker-27.5.1.tgz\" | tar -xz -C /usr/local/bin --strip-components=1 docker/docker \\\n    \
+             && mkdir -p /usr/local/lib/docker/cli-plugins \\\n    \
+             && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \"https://github.com/docker/buildx/releases/download/v0.20.1/buildx-v0.20.1.linux-$b\" \\\n    \
+             && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \"https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-$d\" \\\n    \
+             && chmod +x /usr/local/lib/docker/cli-plugins/*\n\
              RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy --no-modify-path && chmod -R a+w \"$RUSTUP_HOME\" \"$CARGO_HOME\"\n\
              RUN case \"$(dpkg --print-architecture)\" in amd64) a=x64 ;; arm64) a=arm64 ;; *) a=\"$(dpkg --print-architecture)\" ;; esac \\\n    \
              && f=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | awk -v want=\"linux-$a.tar.xz\" 'substr($2, length($2) - length(want) + 1) == want { print $2 }') \\\n    \
@@ -134,7 +153,9 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n"
         ));
         if !slim {
-            d.push_str(&format!("RUN chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin\n"));
+            // And the directories setup actions install into without sudo, as GitHub's images
+            // let them (setup-dotnet's /usr/share/dotnet).
+            d.push_str(&format!("RUN mkdir -p /usr/share/dotnet && chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet\n"));
         }
     }
     Some(d)
@@ -406,6 +427,12 @@ impl Containers {
             }
             if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
                 args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
+                // The runner user reaches it through the socket's group, as the host's user does.
+                if user.is_some()
+                    && let Some(gid) = socket_group()
+                {
+                    args.extend([s("--group-add"), gid.to_string()]);
+                }
             }
             for m in map.mounts() {
                 args.extend([s("-v"), m]);
@@ -654,7 +681,7 @@ mod tests {
         // The full image: GitHub's toolchains that workflows call without a setup action.
         let full = runner_dockerfile("kiln/runner-ubuntu-24.04", None).unwrap_or_default();
         assert!(full.starts_with(&d), "the full image starts as the slim one");
-        for tool in ["cmake", "clang", "maven", "ant", "sbt", "composer", "ruby-full", "leiningen", "sh.rustup.rs", "nodejs.org/dist/latest-v22.x", "JAVA_HOME=", "Assume-Yes"] {
+        for tool in ["cmake", "clang", "maven", "ant", "sbt", "composer", "ruby-full", "ruby-bundler", "leiningen", "sh.rustup.rs", "nodejs.org/dist/latest-v22.x", "JAVA_HOME=", "Assume-Yes", "docker-buildx", "docker-compose"] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
         assert!(full.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {full}");
@@ -664,7 +691,7 @@ mod tests {
         // The host's user, with sudo; root stays root.
         let u = runner_dockerfile("kiln/runner-ubuntu-24.04", Some((1000, 1000))).unwrap_or_default();
         assert!(u.contains("useradd -m -u 1000 -g 1000 -s /bin/bash runner") && u.contains("NOPASSWD:ALL"), "{u}");
-        assert!(u.trim_end().ends_with("RUN chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin"), "{u}");
+        assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
     }
 

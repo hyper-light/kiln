@@ -518,9 +518,12 @@ impl Leg {
     pub async fn run(self) -> JobResult {
         let job = self.a.job_id.clone();
         let started = Instant::now();
-        let ws = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, self.hosted_image()).runner_workspace;
+        let layout = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, self.hosted_image());
+        let ws = layout.runner_workspace;
         super::workspaces::claim(&self.work_dir, &ws).await;
-        let r = std::panic::AssertUnwindSafe(self.run_inner()).catch_unwind().await;
+        let tools = super::workspaces::ToolCache::take(&layout.tool_cache);
+        let r = std::panic::AssertUnwindSafe(self.run_inner(tools.path())).catch_unwind().await;
+        drop(tools);
         let (status, error) = match r {
             Ok(Ok(s)) => (s, None),
             Ok(Err(e)) => (Status::Failed, Some(format!("{e:#}"))),
@@ -627,10 +630,10 @@ impl Leg {
         v
     }
 
-    async fn run_inner(&self) -> anyhow::Result<Status> {
+    async fn run_inner(&self, tool_cache: PathBuf) -> anyhow::Result<Status> {
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
-        let layout = Layout::new(&self.work_dir, &a.job_id, &a.repo, self.hosted_image());
+        let layout = Layout { tool_cache, ..Layout::new(&self.work_dir, &a.job_id, &a.repo, self.hosted_image()) };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         crate::rt::blocking(move || -> std::io::Result<()> {
@@ -647,6 +650,11 @@ impl Leg {
         masks.push(a.runtime.github_token.clone());
         masks.push(a.runtime.runtime_token.clone());
         let step_debug = a.debug.step_debug || debug_flag(a, "ACTIONS_STEP_DEBUG");
+        // The paths expressions see: the leg's own. In the `docker` executor's container (the
+        // leg's machine) they're the container's; a job's `container:` sees the host's, as on
+        // GitHub (`github.workspace` there is the runner's path).
+        let hosted = self.hosted_image().map(|_| self.container_map(&layout));
+        let seen = |p: &Path| hosted.as_ref().map_or_else(|| p.to_string_lossy().into_owned(), |m| m.translate(&p.to_string_lossy()));
         let base = vec![
             ("vars", Value::from_json(&a.contexts.vars)),
             ("needs", Value::from_json(&a.contexts.needs)),
@@ -660,8 +668,8 @@ impl Leg {
                     ("name".to_owned(), Value::str(&self.runner_name)),
                     ("os".to_owned(), Value::str(runner_os())),
                     ("arch".to_owned(), Value::str(runner_arch())),
-                    ("temp".to_owned(), Value::str(&layout.temp.to_string_lossy())),
-                    ("tool_cache".to_owned(), Value::str(&layout.tool_cache.to_string_lossy())),
+                    ("temp".to_owned(), Value::str(&seen(&layout.temp))),
+                    ("tool_cache".to_owned(), Value::str(&seen(&layout.tool_cache))),
                     ("debug".to_owned(), Value::str(if runner_debug(a) { "1" } else { "" })),
                     ("environment".to_owned(), Value::str("self-hosted")),
                 ]),
@@ -670,10 +678,10 @@ impl Leg {
         // The github context, completed with what only the runner knows.
         let mut github = a.contexts.github.clone();
         if let Some(m) = github.as_object_mut() {
-            m.insert("workspace".into(), serde_json::json!(layout.workspace.to_string_lossy()));
+            m.insert("workspace".into(), serde_json::json!(seen(&layout.workspace)));
             m.insert("token".into(), serde_json::json!(a.runtime.github_token));
             m.insert("job".into(), serde_json::json!(a.leg.job_id.rsplit('/').next().unwrap_or_default()));
-            m.insert("event_path".into(), serde_json::json!(layout.temp.join("_github_workflow").join("event.json").to_string_lossy()));
+            m.insert("event_path".into(), serde_json::json!(seen(&layout.temp.join("_github_workflow").join("event.json"))));
             m.insert("action".into(), serde_json::json!(""));
             // The server, as this runner reaches it.
             m.insert("server_url".into(), serde_json::json!(a.runtime.facade_url));
@@ -1206,31 +1214,47 @@ impl Leg {
         if a.job_container.is_none() && a.executor.kind == "docker" { a.executor.image.as_deref() } else { None }
     }
 
+    /// Whether the `docker` executor's container gets the host's Docker socket (W13-R04: the
+    /// routing rules' `docker: socket`, for trusted runs).
+    fn docker_inside(&self) -> bool {
+        self.hosted_image().is_some() && self.a.executor.options.get("docker").and_then(serde_json::Value::as_str) == Some("socket")
+    }
+
+    /// Where the leg's directories are inside its containers. With the host's Docker inside,
+    /// the workspace and temporary directories keep their host paths, so what a step bind-mounts
+    /// (`docker run -v $GITHUB_WORKSPACE:/src`) is what the host's daemon finds.
+    fn container_map(&self, l: &Layout) -> super::docker::PathMap {
+        let repo = self.a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
+        let work = &self.work_dir;
+        let same = self.docker_inside();
+        let at = |host: &Path, inside: String| if same { host.to_string_lossy().into_owned() } else { inside };
+        super::docker::PathMap::new(vec![
+            (l.workspace.clone(), at(&l.workspace, format!("/__w/{repo}/{repo}"))),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.temp.clone(), at(&l.temp, "/__w/_temp".into())),
+            (work.join("_actions"), at(&work.join("_actions"), "/__w/_actions".into())),
+            // The `docker` executor's container is the machine, laid out as GitHub's hosted
+            // runners are (prebuilt tools expect it); a job's `container:` gets `/__t`.
+            (l.tool_cache.clone(), if self.hosted_image().is_some() { "/opt/hostedtoolcache".into() } else { "/__t".into() }),
+            (work.join("_externals"), "/__e".into()),
+        ])
+    }
+
     async fn try_init_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
         let a = &self.a;
         let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("this job uses `container:` or `services:`, and this runner has no working Docker or Podman"))?;
         let config = st.layout.temp.join("_docker_config");
         let l = &st.layout;
-        let repo = a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
         let work = self.work_dir.clone();
         let dirs = [config.clone(), l.temp.join("_github_home"), l.temp.join("_github_workflow"), work.join("_actions"), l.tool_cache.clone(), work.join("_externals")];
         crate::rt::blocking(move || dirs.iter().try_for_each(std::fs::create_dir_all)).await??;
-        let map = super::docker::PathMap::new(vec![
-            (l.workspace.clone(), format!("/__w/{repo}/{repo}")),
-            (l.temp.join("_github_home"), "/github/home".into()),
-            (l.temp.join("_github_workflow"), "/github/workflow".into()),
-            (l.temp.clone(), "/__w/_temp".into()),
-            (work.join("_actions"), "/__w/_actions".into()),
-            // The `docker` executor's container is the machine, laid out as GitHub's hosted
-            // runners are (prebuilt tools expect it); a job's `container:` gets `/__t`.
-            (l.tool_cache.clone(), if self.hosted_image().is_some() { "/opt/hostedtoolcache".into() } else { "/__t".into() }),
-            (work.join("_externals"), "/__e".into()),
-        ]);
+        let map = self.container_map(l);
         let workdir = map.translate(&l.workspace.to_string_lossy());
         // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
         let job = match (&a.job_container, &a.executor.image) {
             (Some(c), _) => Some(super::docker::Spec { docker_socket: true, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
-            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), ..super::docker::Spec::default() }),
+            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: self.docker_inside(), ..super::docker::Spec::default() }),
             _ => None,
         };
         let mut services = Vec::new();

@@ -4,10 +4,48 @@
 //! behind: workspaces no running leg uses whose keep has run out, or that never had one (a runner
 //! stopped mid-leg). The tool cache, actions and Node runtimes beside them stay (W06-R01).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
+
+/// A running leg's own tool cache (W06-R01). GitHub's self-hosted runner runs one job at a time,
+/// so its tool cache is never written twice at once; a kiln runner runs several legs, and two
+/// `setup-python`s installing the same version into one cache break each other. Each running
+/// leg therefore holds one of the tool caches beside `base` (`base` itself, then `base-1`,
+/// `base-2`, …): the first free one, kept for the legs after it.
+pub struct ToolCache {
+    base: PathBuf,
+    n: usize,
+}
+
+static TOOL_LEASES: LazyLock<parking_lot::Mutex<HashMap<PathBuf, BTreeSet<usize>>>> = LazyLock::new(Default::default);
+
+impl ToolCache {
+    pub fn take(base: &Path) -> ToolCache {
+        let mut leases = TOOL_LEASES.lock();
+        let held = leases.entry(base.to_path_buf()).or_default();
+        let n = (0..).find(|n| !held.contains(n)).unwrap_or(0);
+        held.insert(n);
+        ToolCache { base: base.to_path_buf(), n }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        if self.n == 0 {
+            return self.base.clone();
+        }
+        let name = self.base.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        self.base.with_file_name(format!("{name}-{}", self.n))
+    }
+}
+
+impl Drop for ToolCache {
+    fn drop(&mut self) {
+        if let Some(held) = TOOL_LEASES.lock().get_mut(&self.base) {
+            held.remove(&self.n);
+        }
+    }
+}
 
 /// The file that keeps a failed leg's workspace, holding the Unix time it may go.
 pub const KEEP_FILE: &str = ".kiln-keep-until";
@@ -98,6 +136,20 @@ pub async fn release(ws: &Path, keep_minutes: Option<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w06_r01_legs_running_at_once_get_tool_caches_of_their_own() {
+        let base = PathBuf::from("/w/_tool/kiln-runner-ubuntu-24.04");
+        let a = ToolCache::take(&base);
+        let b = ToolCache::take(&base);
+        assert_eq!((a.path(), b.path()), (base.clone(), PathBuf::from("/w/_tool/kiln-runner-ubuntu-24.04-1")));
+        drop(a);
+        let c = ToolCache::take(&base);
+        assert_eq!(c.path(), base, "a free cache is taken again, with what it holds");
+        let other = ToolCache::take(Path::new("/w/_tool"));
+        assert_eq!(other.path(), PathBuf::from("/w/_tool"), "caches of another image are their own");
+        drop((b, c, other));
+    }
 
     #[test]
     fn w17_ac02_a_sweep_leaves_running_and_kept_workspaces() -> anyhow::Result<()> {

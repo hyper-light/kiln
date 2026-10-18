@@ -2,7 +2,9 @@
 //! - commit statuses (`POST /statuses/{sha}`, `GET /commits/{ref}/statuses`, `/status`);
 //! - check runs (`POST /check-runs`, `PATCH`/`GET /check-runs/{id}`, `GET /commits/{ref}/check-runs`);
 //! - releases (create, read, update, delete; by id, latest or tag) with assets uploaded to
-//!   `upload_url` (`/api/uploads/…`, GHES's path) and kept in the store (W08).
+//!   `upload_url` (`/api/uploads/…`, GHES's path) and kept in the store (W08);
+//! - dependency snapshots (`POST /dependency-graph/snapshots`), as build tools' submission
+//!   actions send them.
 //!
 //! For a repository kiln mirrors from GitHub they live in kiln, which doesn't write to GitHub
 //! (the App does that, W14-R10).
@@ -504,3 +506,44 @@ pub async fn upload_asset(s: &Site<'_>, release: &str, req: Request) -> Result<R
     };
     Ok(srv::json(StatusCode::CREATED, &asset_json(s, &r.1, &(id, name, label, ct, size, at, 0))))
 }
+
+// ------------------------------------------------------------------ dependency snapshots
+
+/// `POST /repos/{o}/{r}/dependency-graph/snapshots`: a build's resolved dependencies (Gradle's,
+/// Maven's, sbt's submission actions), validated as GitHub validates them and kept.
+pub async fn dependency_snapshot(s: &Site<'_>, body: &Value) -> Result<Response, Fail> {
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_owned);
+    if body.get("version").and_then(Value::as_i64).is_none() {
+        return Ok(invalid("version is required"));
+    }
+    let (Some(sha), Some(git_ref)) = (text(body.get("sha")), text(body.get("ref"))) else { return Ok(invalid("sha and ref are required")) };
+    let (Some(job), Some(detector)) = (body.get("job"), body.get("detector")) else { return Ok(invalid("job and detector are required")) };
+    let (Some(correlator), Some(name)) = (text(job.get("correlator")), text(detector.get("name"))) else { return Ok(invalid("job.correlator and detector.name are required")) };
+    if !git_ref.starts_with("refs/") {
+        return Ok(invalid("ref must be a fully qualified ref (refs/heads/…)"));
+    }
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(invalid("sha must be a full 40-character commit SHA"));
+    }
+    let manifests = body.get("manifests").and_then(Value::as_object).map_or(0, serde_json::Map::len);
+    let (repo, snap) = (s.repo.id.clone(), body.to_string());
+    let (sh, rf, jb, dt) = (sha, git_ref, correlator, name);
+    let (id, at) = s
+        .hub
+        .store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            c.execute(
+                "INSERT INTO ci_dependency_snapshots (repo_id, sha, git_ref, job, detector, manifests, snapshot, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![repo, sh, rf, jb, dt, i64::try_from(manifests).unwrap_or(i64::MAX), snap, now],
+            )?;
+            Ok((c.last_insert_rowid(), now))
+        })
+        .await
+        .map_err(internal)?;
+    Ok(srv::json(
+        StatusCode::CREATED,
+        &json!({ "id": id, "created_at": rfc3339(at), "result": "SUCCESS", "message": "Dependency results for the repo have been successfully updated." }),
+    ))
+}
+
