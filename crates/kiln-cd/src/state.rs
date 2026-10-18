@@ -195,6 +195,9 @@ pub struct Deployment {
     /// Its number in the app's history (1, 2, ...), given when it is recorded.
     #[serde(default)]
     pub id: u64,
+    /// The artifacts it deployed, pinned (docs/cd-targets.md §1.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<crate::apps::ArtifactRef>,
     /// Each source's commit: what a rollback renders again.
     #[serde(default)]
     pub commits: Vec<Option<String>>,
@@ -644,6 +647,7 @@ mod tests {
             history_limit: 10,
             cascade: true,
             managed_namespace: None,
+            artifacts: BTreeMap::new(),
         }
     }
 

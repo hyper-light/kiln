@@ -988,7 +988,7 @@ async fn rollback(cx: Cx, v: Value) -> Out {
     };
     let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
     let (cd, d2, at) = (cx.cd.clone(), def.clone(), commits.clone());
-    let (head, back) = crate::rt::blocking(move || -> anyhow::Result<_> {
+    let (mut head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
         let head = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
         let back = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
         Ok((head, back))
@@ -996,6 +996,12 @@ async fn rollback(cx: Cx, v: Value) -> Out {
     .await
     .and_then(|r| r)
     .map_err(|e| bad(format!("{e:#}")))?;
+    // The head's artifacts as the source poll resolves them (the pin compares its content), and
+    // the deployment's exactly as it recorded them.
+    let (a, p) = cx.cd.resolve_artifacts(&def, &head.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    head.add_artifacts(a, p);
+    let (a, p) = cx.cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    back.add_artifacts(a, p);
     let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(cx.actor.clone()), at_ms: super::now_ms() };
     propose(&cx.cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use kiln_cd::apps::{self, AppDef, Origin};
+use kiln_cd::apps::{self, AppDef, ArtifactRef, Origin};
 use kiln_cd::engine::{Action, Config as EngineConfig, Engine, Input, LiveChange, Record, Summary};
 use kiln_cd::git::{Auth as GitAuth, Mirror};
 use kiln_cd::model::Tracking;
@@ -34,6 +34,7 @@ use kiln_cd::store::Store;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
+use crate::ci::integrations::{self, oci};
 use crate::hub::Hub;
 use kube::Cluster;
 
@@ -90,6 +91,43 @@ pub struct Resolved {
     pub commits: Vec<Option<String>>,
     /// What each source's render reads.
     pub deps: Vec<Vec<Dep>>,
+    /// Its artifacts, pinned for this revision (docs/cd-targets.md §1.3).
+    pub artifacts: Vec<ArtifactRef>,
+    /// Pull secrets its artifacts ask for.
+    pub pull_secrets: Vec<PullSecret>,
+}
+
+impl Resolved {
+    /// Makes `artifacts` part of what this resolution stands for: they move its key and content
+    /// as a source's files do, so a new digest renders (and syncs) again, and an unchanged one
+    /// doesn't.
+    pub fn add_artifacts(&mut self, artifacts: Vec<ArtifactRef>, pull_secrets: Vec<PullSecret>) {
+        let mut h = 0u64;
+        for a in &artifacts {
+            h = h.wrapping_add(blake(&[b"artifact", a.name.as_bytes(), a.reference.as_bytes()]));
+        }
+        for p in &pull_secrets {
+            h = h.wrapping_add(blake(&[b"pull-secret", p.name.as_bytes(), crate::util::sha256_hex(p.config.as_bytes()).as_bytes()]));
+        }
+        self.key ^= h.rotate_left(13);
+        self.content ^= h.rotate_left(13);
+        self.artifacts = artifacts;
+        self.pull_secrets = pull_secrets;
+    }
+}
+
+/// A Secret of registry credentials an artifact asks for (`pull-secret`): its name and the
+/// Docker config it holds, which is never printed.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct PullSecret {
+    pub name: String,
+    pub config: String,
+}
+
+impl std::fmt::Debug for PullSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullSecret").field("name", &self.name).field("config", &"<redacted>").finish()
+    }
 }
 
 /// The deployments service.
@@ -120,6 +158,8 @@ pub struct Cd {
     pub live: live::Live,
     /// Renders plans made, kept by key.
     plans: plans::Renders,
+    /// Images resolved lately, by registry and reference, so apps sharing one ask once a minute.
+    artifacts: Mutex<HashMap<String, (crate::ci::integrations::oci::Resolved, Instant)>>,
 }
 
 impl Cd {
@@ -260,6 +300,7 @@ impl Cd {
             }
             let this = self.clone();
             let def = a.def.clone();
+            let def_for_artifacts = a.def.clone();
             // Renders read the cluster's version and API versions (Helm's .Capabilities), so an
             // app's inputs wait for its cluster: a render without them would differ from the one
             // after, and could be applied first.
@@ -279,6 +320,20 @@ impl Cd {
             })
             .await
             .and_then(|r| r);
+            // Artifacts resolve for each revision: the head's, and a rolled-back app's own.
+            let result = match result {
+                Ok((mut head, mut held)) => async {
+                    let (a, p) = self.resolve_artifacts(&def_for_artifacts, &head.revision).await?;
+                    head.add_artifacts(a, p);
+                    if let Some(h) = held.as_mut() {
+                        let (a, p) = self.held_artifacts(&def_for_artifacts, &id, h).await?;
+                        h.add_artifacts(a, p);
+                    }
+                    Ok::<_, anyhow::Error>((head, held))
+                }
+                .await,
+                Err(e) => Err(e),
+            };
             match result {
                 Ok((head, held)) => {
                     if seen.is_some() && held.is_none() {
@@ -415,7 +470,7 @@ impl Cd {
         if reads_cluster {
             key ^= cluster;
         }
-        Ok(Resolved { revision, key, content, commits, deps: all_deps })
+        Ok(Resolved { revision, key, content, commits, deps: all_deps, ..Resolved::default() })
     }
 
     fn ref_dep_hashes(&self, deps: &[Dep], refs: &HashMap<String, (Mirror, String)>) -> Result<u64> {
@@ -427,6 +482,102 @@ impl Cd {
             h = h.wrapping_add(blake(&[name.as_bytes(), d.path.as_bytes(), hash.as_deref().unwrap_or("-").as_bytes()]));
         }
         Ok(h)
+    }
+
+    // ---------------------------------------------------------------- artifacts
+
+    /// The registry an artifact is pulled from: its `registry` integration, else the one set up
+    /// for its registry, else none (anonymously).
+    async fn artifact_registry(&self, spec: &apps::ArtifactSpec, reference: &oci::Reference) -> Result<oci::Registry> {
+        match &spec.registry {
+            Some(name) => integrations::registry(&self.hub, name).await,
+            None => Ok(integrations::registry_for(&self.hub, &reference.registry).await?.unwrap_or_else(|| oci::Registry::for_name(&reference.registry, None, false))),
+        }
+    }
+
+    /// An app's artifacts for `revision`: each image's digest now, and the pull secrets they ask
+    /// for. An image not in its registry yet (CI hasn't pushed it) is an error that says so: the
+    /// app's inputs wait, and the next poll looks again.
+    pub(crate) async fn resolve_artifacts(&self, def: &AppDef, revision: &str) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
+        let mut refs = Vec::new();
+        for (name, spec) in &def.artifacts {
+            let text = spec.reference(revision);
+            let reference = oci::parse_reference(&text).with_context(|| format!("artifact {name}"))?;
+            let registry = self.artifact_registry(spec, &reference).await.with_context(|| format!("artifact {name}"))?;
+            let who = registry.credentials.as_ref().map(|(u, _)| u.as_str()).unwrap_or("");
+            let key = format!("{}|{who}|{reference}", registry.name);
+            let cached = self.artifacts.lock().get(&key).filter(|(_, at)| at.elapsed() < Duration::from_secs(60)).map(|(r, _)| r.clone());
+            let resolved = match cached {
+                Some(r) => r,
+                None => {
+                    let r = oci::resolve(&registry, &reference)
+                        .await
+                        .with_context(|| format!("artifact {name}"))?
+                        .with_context(|| format!("waiting for {reference}: it isn't in {} yet", registry.name))?;
+                    self.artifacts.lock().insert(key, (r.clone(), Instant::now()));
+                    r
+                }
+            };
+            for want in &spec.platforms {
+                let has = resolved.platforms.is_empty() || resolved.platforms.iter().any(|p| p == want || p.starts_with(&format!("{want}/")));
+                anyhow::ensure!(has, "artifact {name}: {reference} isn't built for {want} (it has {})", resolved.platforms.join(", "));
+            }
+            refs.push(ArtifactRef { name: name.clone(), reference: reference.pinned(&resolved.digest), repository: reference.name(), tag: reference.tag.clone(), digest: resolved.digest.clone() });
+        }
+        Ok((refs, self.pull_secrets_of(def, revision).await?))
+    }
+
+    /// The pull secrets an app's artifacts ask for, with their registries' credentials now.
+    async fn pull_secrets_of(&self, def: &AppDef, revision: &str) -> Result<Vec<PullSecret>> {
+        let mut out = Vec::new();
+        for (name, spec) in &def.artifacts {
+            let Some(ps) = &spec.pull_secret else { continue };
+            let reference = oci::parse_reference(&spec.reference(revision)).with_context(|| format!("artifact {name}"))?;
+            let registry = self.artifact_registry(spec, &reference).await.with_context(|| format!("artifact {name}"))?;
+            let config = oci::docker_config(&registry)
+                .with_context(|| format!("artifact {name} asks for pull secret {ps}, but no registry integration holds credentials for {}", reference.registry))?;
+            out.push(PullSecret { name: ps.clone(), config });
+        }
+        Ok(out)
+    }
+
+    /// A rolled-back app's artifacts: exactly what its deployment recorded; else (a deployment
+    /// kept before artifacts were) its revision's now.
+    async fn held_artifacts(&self, def: &AppDef, id: &str, held: &Resolved) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
+        let recorded = self
+            .store
+            .read(|d| d.pins.get(id).and_then(|p| d.history.get(id).and_then(|h| h.iter().find(|x| x.id == p.to)).map(|x| x.artifacts.clone())))
+            .unwrap_or_default();
+        self.recorded_artifacts(def, recorded, &held.revision).await
+    }
+
+    /// `recorded` when it covers every artifact the app has, else the revision's resolved now.
+    pub(crate) async fn recorded_artifacts(&self, def: &AppDef, recorded: Vec<ArtifactRef>, revision: &str) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
+        if recorded.is_empty() || !def.artifacts.keys().all(|n| recorded.iter().any(|a| &a.name == n)) {
+            return self.resolve_artifacts(def, revision).await;
+        }
+        Ok((recorded, self.pull_secrets_of(def, revision).await?))
+    }
+
+    /// Artifacts for a plan, without asking any registry (a planned commit's image may not be
+    /// built yet): the app's own when the revision is one it resolved, else each image by its tag.
+    pub(crate) fn planned_artifacts(&self, def: &AppDef, revision: &str) -> (Vec<ArtifactRef>, Vec<PullSecret>) {
+        let apps = self.apps.read();
+        let entry = apps.get(&def.id());
+        if let Some(r) = entry.and_then(|e| e.resolved.iter().rev().find(|r| r.revision == revision && r.artifacts.len() == def.artifacts.len())) {
+            return (r.artifacts.clone(), r.pull_secrets.clone());
+        }
+        let secrets = entry.and_then(|e| e.resolved.back().map(|r| r.pull_secrets.clone())).unwrap_or_default();
+        let refs = def
+            .artifacts
+            .iter()
+            .map(|(name, spec)| {
+                let text = spec.reference(revision);
+                let (repository, tag) = oci::parse_reference(&text).map(|r| (r.name(), r.tag.clone())).unwrap_or_else(|_| (text.clone(), None));
+                ArtifactRef { name: name.clone(), reference: text, repository, tag, digest: String::new() }
+            })
+            .collect();
+        (refs, secrets)
     }
 
     // ---------------------------------------------------------------- renders
@@ -484,8 +635,10 @@ impl Cd {
             m.extract(&commit, &wanted, &root)?;
             refs.insert(name.clone(), root);
         }
+        // The revision's artifacts, filled in (`${{ artifacts.<name> }}`).
+        let sources = apps::with_artifacts(&def.sources, &inputs.artifacts).map_err(|e| anyhow::anyhow!("{}", e.0))?;
         let mut objects = Vec::new();
-        for (i, s) in def.sources.iter().enumerate() {
+        for (i, s) in sources.iter().enumerate() {
             if s.as_ref.is_some() && s.chart.is_none() {
                 continue;
             }
@@ -509,6 +662,9 @@ impl Cd {
                 scratch: &views.join("scratch"),
             };
             objects.extend(render::render(&req, &self.tools)?);
+        }
+        for p in &inputs.pull_secrets {
+            objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
         let _ = std::fs::remove_dir_all(&views);
         let (children, objects): (Vec<Value>, Vec<Value>) =
@@ -822,11 +978,13 @@ impl Cd {
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
         }
-        let (limit, commits) = {
+        let (limit, commits, artifacts) = {
             let apps = self.apps.read();
             let e = apps.get(app.as_ref());
-            let commits = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)).map(|r| r.commits.clone())).unwrap_or_default();
-            (e.map(|e| e.def.history_limit).unwrap_or(10), commits)
+            let r = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)));
+            let commits = r.map(|r| r.commits.clone()).unwrap_or_default();
+            let artifacts = r.map(|r| r.artifacts.clone()).unwrap_or_default();
+            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts)
         };
         let d = Deployment {
             app: app.to_string(),
@@ -843,6 +1001,7 @@ impl Cd {
             id: 0,
             commits,
             content,
+            artifacts,
         };
         let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
         crate::rt::spawn(async move {
@@ -989,6 +1148,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         kick: crate::rt::Notify::new(),
         live: live::Live::default(),
         plans: plans::Renders::default(),
+        artifacts: Mutex::new(HashMap::new()),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

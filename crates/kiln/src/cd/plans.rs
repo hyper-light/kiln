@@ -444,9 +444,16 @@ struct Resolutions {
 
 fn resolutions(cd: &Cd, st: &Stack, def: &AppDef, kube_version: Option<&str>, api_versions: &[String]) -> anyhow::Result<Resolutions> {
     let moves = st.moves(def);
-    let trunk = cd.inputs_of(def, kube_version, api_versions, None)?;
+    // Artifacts as a plan sees them: no registry is asked (a planned commit's image may not exist
+    // yet).
+    let with_artifacts = |mut r: Resolved| {
+        let (a, p) = cd.planned_artifacts(def, &r.revision);
+        r.add_artifacts(a, p);
+        r
+    };
+    let trunk = with_artifacts(cd.inputs_of(def, kube_version, api_versions, None)?);
     let at = |c: &str| -> Vec<Option<String>> { trunk.commits.iter().zip(&moves).map(|(x, m)| if *m { Some(c.to_owned()) } else { x.clone() }).collect() };
-    let resolve = |c: &str| cd.inputs_of(def, kube_version, api_versions, Some(&at(c))).map_err(|e| format!("{e:#}"));
+    let resolve = |c: &str| cd.inputs_of(def, kube_version, api_versions, Some(&at(c))).map(with_artifacts).map_err(|e| format!("{e:#}"));
     // A step that changes nothing the app reads leaves its content as the step below had it.
     let same = |i: usize, below: &Resolved| !touches(def, &below.deps, &moves, st.changed.get(i).and_then(Option::as_ref));
     let base = st.base.as_deref().map(|b| if same(0, &trunk) { Ok(trunk.clone()) } else { resolve(b) });
