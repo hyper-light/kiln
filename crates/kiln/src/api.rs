@@ -163,6 +163,11 @@ fn segments(path: &str) -> Vec<String> {
 }
 
 async fn route(hub: Arc<Hub>, req: Request) -> R {
+    // A peered cluster's address (`peer-<slug>.<domain>`): every path there is the peer's.
+    if let Some((f, slug)) = crate::peers::route(&hub, &req) {
+        let secure = is_secure(&hub, &req);
+        return Ok(f.serve(&slug, req, secure).await);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let seg = segments(&path);
@@ -294,6 +299,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
     }
     match (&method, s.as_slice()) {
         (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
+        (&Method::GET, ["api", "peers"]) => crate::peers::list(&hub).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "peers", "open"]) => crate::peers::openable(&hub).map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers"]) => crate::peers::register(&hub, &caller.name, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers", "authorize"]) => crate::peers::authorize(&hub, &caller.name, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers", id, "complete"]) => {
+            let id = (*id).to_owned();
+            crate::peers::complete(&hub, &caller.name, &id, req).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::POST, ["api", "peers", id, "challenge"]) => crate::peers::rechallenge(&hub, &caller.name, id).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers", id, "frame"]) => {
+            let host = srv::header_str(&req, &header::HOST).unwrap_or_default().to_owned();
+            crate::peers::frame(&hub, &caller, id, &host, is_secure(&hub, &req)).map_err(|(c, m)| err(c, m))
+        }
+        (&Method::DELETE, ["api", "peers", id]) => crate::peers::remove(&hub, &caller.name, id).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
             let id = (*id).to_owned();
