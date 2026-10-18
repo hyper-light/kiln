@@ -219,6 +219,8 @@ pub struct Trigger {
     pub before: Option<String>,
     /// Restrict to one pipeline (manual runs).
     pub pipeline: Option<String>,
+    /// GitHub's payload, when a webhook delivered the change (docs/ci.md W03-R07).
+    pub payload: Option<std::sync::Arc<serde_json::Value>>,
 }
 
 /// Turn a trigger into runs: one per matching pipeline file.
@@ -351,7 +353,10 @@ pub async fn poll_repo(hub: &Hub, repo: &Repo) -> anyhow::Result<usize> {
         if old == Some(sha) {
             continue;
         }
-        hub.store.set_ref(repo.id.clone(), name.clone(), sha.clone()).await?;
+        // Whoever records a ref's move first triggers it; a webhook may have (docs/ci.md W03-R14).
+        if !hub.store.advance_ref(repo.id.clone(), name.clone(), sha.clone()).await? {
+            continue;
+        }
         if first_poll {
             continue; // adopt the current state silently; build from the next change on
         }
@@ -373,7 +378,7 @@ pub async fn poll_repo(hub: &Hub, repo: &Repo) -> anyhow::Result<usize> {
         let runs = trigger(
             hub,
             repo,
-            Trigger { event, branch, sha: sha.clone(), before: old.cloned(), pipeline: None },
+            Trigger { event, branch, sha: sha.clone(), before: old.cloned(), pipeline: None, payload: None },
         )
         .await?;
         triggered += runs.len();
@@ -397,7 +402,7 @@ pub async fn manual(hub: &Hub, repo: &Repo, branch: Option<String>, pipeline: Op
         .cloned()
         .or_else(|| (branch.len() == 40 && branch.chars().all(|c| c.is_ascii_hexdigit())).then(|| branch.clone()))
         .ok_or_else(|| anyhow::anyhow!("unknown branch, tag or sha `{branch}`"))?;
-    trigger(hub, repo, Trigger { event: "manual", branch, sha, before: None, pipeline }).await
+    trigger(hub, repo, Trigger { event: "manual", branch, sha, before: None, pipeline, payload: None }).await
 }
 
 /// Register repositories from config and org discovery.
@@ -568,7 +573,7 @@ pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 let Ok(p) = p else { continue };
                 if p.on.schedule.iter().any(|c| cron_matches(c, now)) {
                     let branch = head.trim_start_matches("refs/heads/").to_owned();
-                    let t = Trigger { event: "schedule", branch, sha: sha.clone(), before: None, pipeline: Some(file.clone()) };
+                    let t = Trigger { event: "schedule", branch, sha: sha.clone(), before: None, pipeline: Some(file.clone()), payload: None };
                     if let Err(e) = trigger(&hub, &repo, t).await {
                         tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "scheduled run failed");
                     }

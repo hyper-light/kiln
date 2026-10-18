@@ -1975,8 +1975,10 @@ fn install_powershell(hub: &Hub) -> Response {
 
 // ------------------------------------------------------------------ webhooks
 
-async fn github_hook(hub: &Hub, req: Request) -> R {
+async fn github_hook(hub: &Arc<Hub>, req: Request) -> R {
     let sig = srv::header_str(&req, &header::HeaderName::from_static("x-hub-signature-256")).unwrap_or("").to_owned();
+    let event = srv::header_str(&req, &header::HeaderName::from_static("x-github-event")).unwrap_or("").to_owned();
+    let delivery = srv::header_str(&req, &header::HeaderName::from_static("x-github-delivery")).map(str::to_owned);
     let body = srv::body_bytes(req.into_body(), 25 << 20).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     // A configured but absent secret file means "no secret" (e.g. an optional mounted Secret).
     let secret = match &hub.cfg.gitops.webhook_secret_file {
@@ -1992,8 +1994,15 @@ async fn github_hook(hub: &Hub, req: Request) -> R {
             return Err(err(StatusCode::UNAUTHORIZED, "bad signature"));
         }
     }
-    // A webhook only hints; the poll decides what changed (GitOps: state comes from git).
-    hub.gitops_kick.notify();
+    // Without the CI engine a webhook only hints; the poll decides what changed (GitOps: state
+    // comes from git). With it, GitHub's payload reaches the workflows (docs/ci.md W03-R07).
+    let hub = Arc::clone(hub);
+    crate::rt::spawn(async move {
+        if let Err(e) = crate::ci::hooks::github(&hub, &event, delivery, &body).await {
+            tracing::warn!(event = %event, error = %format!("{e:#}"), "webhook");
+            hub.gitops_kick.notify();
+        }
+    });
     Ok(srv::status(StatusCode::ACCEPTED))
 }
 

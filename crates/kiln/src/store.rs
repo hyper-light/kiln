@@ -385,6 +385,20 @@ impl Store {
         .await
     }
 
+    /// Records that `name` is now at `sha`, unless it already was: whether this call moved it. The
+    /// sources that watch refs (polls, webhooks) call this, so a move triggers once.
+    pub async fn advance_ref(&self, repo_id: String, name: String, sha: String) -> anyhow::Result<bool> {
+        self.call(move |c| {
+            let n = c.execute(
+                "INSERT INTO refs (repo_id, name, sha) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(repo_id, name) DO UPDATE SET sha = excluded.sha WHERE refs.sha IS NOT excluded.sha",
+                params![repo_id, name, sha],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
     pub async fn set_ref(&self, repo_id: String, name: String, sha: String) -> anyhow::Result<()> {
         self.call(move |c| {
             c.execute(

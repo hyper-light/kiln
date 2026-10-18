@@ -4,6 +4,7 @@
 //! - [`cron`]: schedules, with time zones.
 //! - [`dispatch`]: `workflow_dispatch` inputs, typed and checked.
 //! - [`event`]: the normalized event.
+//! - [`github`]: GitHub's webhook deliveries as events.
 //! - [`matcher`]: whether a workflow runs for an event, and why not.
 //! - [`pattern`]: GitHub's filter patterns.
 //! - [`skip`]: skip markers in commit messages.
@@ -12,6 +13,7 @@ pub mod context;
 pub mod cron;
 pub mod dispatch;
 pub mod event;
+pub mod github;
 pub mod matcher;
 pub mod pattern;
 pub mod skip;

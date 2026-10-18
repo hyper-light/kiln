@@ -7,6 +7,7 @@ pub mod api;
 pub mod dispatch;
 pub mod events;
 pub mod facade;
+pub mod hooks;
 pub mod load;
 pub mod rest;
 pub mod runs;

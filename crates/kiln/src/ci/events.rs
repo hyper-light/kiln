@@ -86,8 +86,34 @@ pub async fn facts(hub: &Hub, repo: &Repo) -> Facts {
     Facts { repo: ctx_repo, default_branch, mirror }
 }
 
-/// The event a v1 trigger stands for.
+/// The event a v1 trigger stands for. When a webhook delivered it, GitHub's payload is the
+/// event's (W03-R07); the changed files are still kiln's own diff.
 async fn event(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
+    let made = synthesize(hub, repo, t).await;
+    let Some(p) = &t.payload else { return made };
+    let name = match t.event {
+        "tag" => "push",
+        "manual" => "workflow_dispatch",
+        other => other,
+    };
+    let default_branch = facts(hub, repo).await.default_branch;
+    match kiln_ci::trigger::github::event(name, p, &default_branch, &t.sha) {
+        Some(mut e) => {
+            e.changed = made.changed;
+            if e.sha.is_empty() {
+                e.sha = t.sha.clone();
+            }
+            if e.message.is_none() {
+                e.message = made.message;
+            }
+            e
+        }
+        None => made,
+    }
+}
+
+/// The event kiln synthesizes for what it saw itself (polling, the UI).
+async fn synthesize(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
     let Facts { repo: ctx_repo, default_branch, mirror } = facts(hub, repo).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
     let mut e = Event { sha: t.sha.clone(), before: t.before.clone(), actor: author.clone(), trusted: true, source: Source::Poll, message: Some(message), ..Event::default() };

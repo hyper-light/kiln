@@ -374,7 +374,7 @@ fn short(commit: &str) -> &str {
 /// every other platform upgrade to once it succeeds (`adopts`).
 pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> anyhow::Result<crate::store::Run> {
     let u = &hub.cfg.updates;
-    let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()) };
+    let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()), payload: None };
     let runs = crate::gitops::trigger(hub, repo, t).await?;
     runs.into_iter().next().ok_or_else(|| anyhow::anyhow!("{} has no pipeline called {} at {}", u.release_repo, u.release_pipeline, short(commit)))
 }
