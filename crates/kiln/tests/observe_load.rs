@@ -530,3 +530,111 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
     anyhow::ensure!(first < Duration::from_secs(5), "refused only {first:?} after the server went away");
     Ok(())
 }
+
+/// Runs `docker` with `args`, its output.
+fn docker(args: &[&str]) -> anyhow::Result<String> {
+    let out = std::process::Command::new("docker").args(args).output()?;
+    anyhow::ensure!(out.status.success(), "docker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// A server whose disk fills (its data on a 96 MiB tmpfs in a container, a 30 MiB balloon file
+/// beside it): it refuses exporters before the disk is full (room kept for the cut that frees its
+/// log), never spins while refusing, takes again once room is freed, and stores everything it took.
+/// The container runs this machine's build with this machine's loader and libraries (mounted
+/// read-only), so it needs Docker and an image with a shell (`KOBS_FULLDISK_IMAGE`).
+#[test]
+#[ignore = "needs Docker; fills a disk"]
+fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() -> anyhow::Result<()> {
+    let image = std::env::var("KOBS_FULLDISK_IMAGE").unwrap_or_else(|_| "mcr.microsoft.com/playwright:v1.64.1-noble".into());
+    let port = common::free_port()?;
+    let dir = tempfile::tempdir()?;
+    let cfg = dir.path().join("kiln.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[server]\nhttp_addr = \"127.0.0.1:{port}\"\nquic_addr = \"127.0.0.1:{}\"\npublic_url = \"http://127.0.0.1:{port}\"\ndata_dir = \"/data/server\"\n[gitops]\nauto_pipelines = false\n[local_agent]\nenabled = false\n[discovery]\nenabled = false\n[kubernetes]\nenabled = false\n[cd]\nenabled = false\n[observe]\nenabled = true\nhost_seconds = 3600\n",
+            common::free_port()?
+        ),
+    )?;
+    let name = format!("kiln-fulldisk-{port}");
+    let bin = common::BIN;
+    let _ = docker(&["rm", "-f", &name]);
+    docker(&[
+        "run", "-d", "--name", &name, "--network", "host", "--user", "1000:1000", "--tmpfs", "/data:size=96m,mode=1777,uid=1000,gid=1000",
+        "-v", &format!("{bin}:/work/kiln:ro"), "-v", "/usr/lib:/hostlib:ro", "-v", &format!("{}:/cfg/kiln.toml:ro", cfg.display()), "-e", "HOME=/data/home",
+        // No UI server: the one kiln carries unpacks into its data folder, a third of this disk.
+        "-e", "KILN_UI_DIR=/nonexistent",
+        "--entrypoint", "/hostlib/ld-linux-x86-64.so.2", &image, "--library-path", "/hostlib", "/work/kiln", "--config", "/cfg/kiln.toml", "server",
+    ])?;
+    struct Gone(String);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker").args(["rm", "-f", &self.0]).output();
+        }
+    }
+    let _gone = Gone(name.clone());
+    let start = Instant::now();
+    while common::raw(port, "GET", "/healthz", "", b"").map_or(true, |(c, _)| c != 200) {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the server did not come up: {}", docker(&["logs", "--tail", "20", &name]).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let ingest = docker(&["exec", &name, "cat", "/data/server/observe/ingest.token"])?;
+    let admin = docker(&["exec", &name, "cat", "/data/server/admin.token"])?;
+    docker(&["exec", &name, "dd", "if=/dev/zero", "of=/data/balloon", "bs=1M", "count=30"])?;
+    let pid: u32 = docker(&["inspect", "-f", "{{.State.Pid}}", &name])?.parse()?;
+    let t0_ms = common::now_ms() - 7_200_000;
+    let flood = |from_i: u64, secs: u64| -> (u64, u64, u64) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let senders: Vec<_> = (0..2u64)
+            .map(|sender| {
+                let (stop, ingest) = (stop.clone(), ingest.clone());
+                std::thread::spawn(move || {
+                    let (mut taken, mut refused, mut i) = (0u64, 0u64, from_i);
+                    let mut conn = Conn::new(port);
+                    let headers = format!("Authorization: Bearer {ingest}\r\nContent-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n");
+                    while !stop.load(Ordering::Relaxed) {
+                        let body = gzip(&request(sender, 1000, (t0_ms as u64 + i) * 1_000_000)).unwrap_or_default();
+                        match conn.send("/v1/metrics", &headers, &body) {
+                            Ok(a) if a.code == 200 => {
+                                taken += 1000;
+                                i += 1;
+                            }
+                            Ok(a) if a.code == 503 => {
+                                refused += 1000;
+                                std::thread::sleep(Duration::from_millis(500));
+                            }
+                            _ => std::thread::sleep(Duration::from_millis(500)),
+                        }
+                    }
+                    (taken, refused, i)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(secs));
+        stop.store(true, Ordering::Relaxed);
+        senders.into_iter().filter_map(|t| t.join().ok()).fold((0, 0, 0), |a, (t, r, i)| (a.0 + t, a.1 + r, a.2.max(i)))
+    };
+    let (taken, refused, last_i) = flood(0, 25);
+    anyhow::ensure!(refused > 0, "never refused: {taken} taken on a 96 MiB disk");
+    // Refusing, it does not spin: under a tenth of a core over five seconds.
+    let (c0, _) = usage(pid);
+    std::thread::sleep(Duration::from_secs(5));
+    let (c1, _) = usage(pid);
+    anyhow::ensure!(c1 - c0 < 0.5, "{:.2} CPU s in 5 s while the disk was full", c1 - c0);
+    // Room freed: it takes again.
+    docker(&["exec", &name, "rm", "/data/balloon"])?;
+    let (more, _, _) = flood(last_i + 1, 15);
+    anyhow::ensure!(more > 0, "nothing taken once room was freed");
+    // Everything it took, stored.
+    let a = {
+        let body = serde_json::to_vec(&json!({ "query": "sum:load.v{*}.rollup(sum)", "from": t0_ms - 60_000, "to": t0_ms + 3_600_000, "points": 100 }))?;
+        let (code, b) = common::raw(port, "POST", "/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body)?;
+        anyhow::ensure!(code == 200, "{code}");
+        serde_json::from_slice::<serde_json::Value>(&b)?
+    };
+    let stored: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
+    anyhow::ensure!(stored.round() as u64 == taken + more, "{} taken, {stored} stored", taken + more);
+    eprintln!("\na full disk: {taken} points taken, then refused; idle while full ({:.2} CPU s in 5 s); {more} more once 30 MiB were freed; all {} stored", c1 - c0, taken + more);
+    Ok(())
+}

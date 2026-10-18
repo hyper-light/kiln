@@ -35,3 +35,19 @@ pub fn clock_ms() -> i64 {
     static SKEW: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     crate::util::now_ms().saturating_add(*SKEW.get_or_init(|| std::env::var("KILN_OBSERVE_CLOCK_SKEW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)))
 }
+
+/// Bytes free to this process on the volume `path` is on, where the system says.
+#[cfg(unix)]
+#[allow(clippy::useless_conversion)] // u64 on Linux, narrower elsewhere (macOS's block counts)
+pub fn disk_free(path: &std::path::Path) -> Option<u64> {
+    let s = nix::sys::statvfs::statvfs(path).ok()?;
+    Some(u64::from(s.blocks_available()).saturating_mul(u64::from(s.fragment_size())))
+}
+
+/// Bytes free on the volume `path` is on: the disk whose mount point holds it, nearest first.
+#[cfg(not(unix))]
+pub fn disk_free(path: &std::path::Path) -> Option<u64> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks.list().iter().filter(|d| path.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(sysinfo::Disk::available_space)
+}

@@ -45,9 +45,27 @@ const CHANGE_AGAIN: Duration = Duration::from_secs(10);
 const RETAIN_EVERY: Duration = Duration::from_secs(60);
 /// How often a runner says how its replica is doing, and the maintenance thread looks unasked.
 const STATUS_EVERY: Duration = Duration::from_secs(10);
+/// How often the room left on observe's disk is looked at, and what is kept free besides what a
+/// cut needs: a cut writes the head as blocks before the log can be trimmed, and blocks hold no
+/// more than the log entries they come of, so room for the log's compactable bytes, and this,
+/// lets the cut that frees the log always be made.
+const DISK_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const DISK_MARGIN: u64 = 16 << 20;
+/// A replica that stopped is opened again after a second, then twice as long each time it stops
+/// again, up to this; once it has run this long, from a second again.
+const REOPEN_MAX: Duration = Duration::from_secs(60);
 const MAINTAIN_EVERY: Duration = Duration::from_secs(60);
 /// How often the view the API shows is made again, at the most.
 const VIEW_EVERY: Duration = Duration::from_millis(500);
+/// Bytes as people say them: `512 MiB`, `3.2 GiB`.
+fn size(b: u64) -> String {
+    match b {
+        0..1_048_576 => format!("{} KiB", b / 1024),
+        1_048_576..1_073_741_824 => format!("{} MiB", b / 1_048_576),
+        _ => format!("{:.1} GiB", b as f64 / 1_073_741_824.0),
+    }
+}
+
 /// A span of ms as people say it, to the nearest second under two minutes, else minute: `90 s`,
 /// `45 min`, `1 h 0 min`.
 fn span(ms: u64) -> String {
@@ -132,6 +150,10 @@ pub struct View {
     pub digest_at: u64,
     pub verified: Option<(u64, u64)>,
     pub error: Option<String>,
+    /// Bytes free on observe's disk, and whether that is too little for the next cut (exporters
+    /// are refused until a cut frees room).
+    pub disk_free: Option<u64>,
+    pub disk_low: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -176,6 +198,8 @@ struct Admission {
     /// The queue has kept too long a wait (`Batcher::congested`): exporters are refused until it
     /// drains.
     congested: AtomicBool,
+    /// The disk has too little room for the next cut: exporters are refused until a cut frees it.
+    disk_low: AtomicBool,
 }
 
 /// Takes room for `n` against `max`, or says there is none. One write bigger than the bound is taken
@@ -273,7 +297,7 @@ impl Observe {
             return true;
         }
         let a = &self.admission;
-        if (!count && a.congested.load(Ordering::Acquire)) || !reserve(&a.points, &a.left_points, n, max) {
+        if (!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.points, &a.left_points, n, max) {
             if count {
                 a.refused.fetch_add(n, Ordering::Relaxed);
             }
@@ -295,7 +319,7 @@ impl Observe {
             return true;
         }
         let a = &self.admission;
-        if a.congested.load(Ordering::Acquire) || !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64 / 4 * 3) {
+        if a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire) || !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64 / 4 * 3) {
             return false;
         }
         if self.tx.send(Input::Samples(keys, samples)).is_err() {
@@ -322,7 +346,7 @@ impl Observe {
         }
         let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
         let a = &self.admission;
-        if (!count && a.congested.load(Ordering::Acquire)) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max) {
+        if (!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max) {
             if count {
                 a.refused.fetch_add(records.len() as u64, Ordering::Relaxed);
             }
@@ -351,7 +375,7 @@ impl Observe {
     pub fn busy(&self) -> bool {
         let a = &self.admission;
         let inside = |taken: &AtomicU64, left: &AtomicU64| taken.load(Ordering::Acquire).saturating_sub(left.load(Ordering::Acquire));
-        a.congested.load(Ordering::Acquire) || inside(&a.points, &a.left_points) >= WAITING_POINTS as u64 / 4 * 3 || inside(&a.log_bytes, &a.left_log_bytes) >= WAITING_LOG_BYTES as u64 / 4 * 3
+        a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire) || inside(&a.points, &a.left_points) >= WAITING_POINTS as u64 / 4 * 3 || inside(&a.log_bytes, &a.left_log_bytes) >= WAITING_LOG_BYTES as u64 / 4 * 3
     }
 
     /// The store, for queries, once it is open.
@@ -458,6 +482,13 @@ struct Owner {
     maintain: Option<Maintenance>,
     /// When the replica was last tried, while it is not open.
     tried: Option<Instant>,
+    /// Stops of the replica since it last ran well, and since when it runs.
+    stops: u32,
+    opened_at: Option<Instant>,
+    /// When the disk was last looked at, what was free, and whether too little.
+    disk_seen: Option<Instant>,
+    disk_free: Option<u64>,
+    disk_low: bool,
     compact_asked: bool,
     verified: Option<(u64, u64)>,
     /// When the replica asks to be driven again though nothing arrives (ns since `start`).
@@ -514,6 +545,11 @@ impl Owner {
             error: None,
             maintain: None,
             tried: None,
+            stops: 0,
+            opened_at: None,
+            disk_seen: None,
+            disk_free: None,
+            disk_low: false,
             compact_asked: false,
             verified: None,
             wake_at: None,
@@ -597,7 +633,8 @@ impl Owner {
                     let _ = rep.r.campaign();
                 }
                 *lock(&self.store) = Some(rep.r.machine().shared());
-                self.maintain = Some(Maintenance::start(rep.r.machine().shared()));
+                self.opened_at = Some(Instant::now());
+                self.maintain = Some(Maintenance::start(rep.r.machine().shared(), self.dir.clone()));
                 self.rep = Some(rep);
                 self.error = None;
             }
@@ -961,11 +998,14 @@ impl Owner {
         self.wake_at = pumped.as_ref().ok().copied().flatten().into_iter().chain(rep.r.deadline()).min();
         if let Err(e) = &pumped {
             let why = format!("{e:?}: {}", rep.r.machine().fault.clone().unwrap_or_default());
-            tracing::warn!(error = %why, "observe's replica stopped; it opens again");
+            // Opened again later, not at once: a fault that comes back (a full disk) would
+            // otherwise have the log replayed and fail again, over and over.
+            self.stops = self.stops.saturating_add(1);
+            tracing::warn!(error = %why, again_in = ?self.reopen_after(), "observe's replica stopped; it opens again");
             self.error = Some(why);
-            let id = rep.r.id();
             self.rep = None;
-            self.open(id);
+            self.maintain = None;
+            self.tried = Some(Instant::now());
             return;
         }
         let asked = self.compact_asked && rep.r.in_flight() == 0;
@@ -1021,10 +1061,57 @@ impl Owner {
         }
     }
 
+    /// How long after its last try a replica that is not open is tried again: a second after it
+    /// stopped once, doubling each stop since it last ran well, up to [`REOPEN_MAX`]; a replica
+    /// that never opened (another process holds its folder), every [`STATUS_EVERY`].
+    fn reopen_after(&self) -> Duration {
+        if self.stops == 0 {
+            return STATUS_EVERY;
+        }
+        Duration::from_secs(1u64 << self.stops.saturating_sub(1).min(6)).min(REOPEN_MAX)
+    }
+
+    /// Looks at the room left on observe's disk: too little for the next cut (the log's
+    /// compactable bytes, and [`DISK_MARGIN`]), exporters are refused and a compaction is asked
+    /// for, which cuts and frees the log; said once each way.
+    fn look_at_disk(&mut self) {
+        if self.disk_seen.is_some_and(|t| t.elapsed() < DISK_EVERY) {
+            return;
+        }
+        self.disk_seen = Some(Instant::now());
+        self.disk_free = super::disk_free(&self.dir);
+        let need = self.rep.as_ref().map_or(0, |r| r.r.compactable_bytes()).saturating_add(DISK_MARGIN);
+        // Two marks, as a watermark has: refused under what the next cut needs, taken again only
+        // once a margin more is free, so a cut that frees a little does not open and close the
+        // door every few seconds.
+        let low = self.disk_free.is_some_and(|f| if self.disk_low { f < need.saturating_add(DISK_MARGIN) } else { f < need });
+        if low && self.rep.as_ref().is_some_and(|r| r.r.compactable_bytes() > 0) {
+            self.compact_asked = true;
+        }
+        self.admission.disk_low.store(low, Ordering::Release);
+        if low != self.disk_low {
+            self.disk_low = low;
+            let free = self.disk_free.unwrap_or(0);
+            let (message, severity) = if low {
+                (format!("observe's disk has {} free, too little for its next cut ({} wanted): exporters are refused until a cut frees room", size(free), size(need)), 13)
+            } else {
+                (format!("observe's disk has room again ({} free)", size(free)), 9)
+            };
+            tracing::warn!("{message}");
+            let attrs = vec![("event.type".to_owned(), "observe.disk".to_owned()), ("disk_free".to_owned(), free.to_string())];
+            self.batcher.logs(vec![Record { ts: super::clock_ms().saturating_mul(1_000_000), severity, service: "kiln.observe".into(), host: crate::os::hostname(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }], Instant::now());
+        }
+    }
+
     fn periodic(&mut self) {
+        self.look_at_disk();
+        // A replica that has run well a while: its next stop is retried quickly again.
+        if self.rep.is_some() && self.opened_at.is_some_and(|t| t.elapsed() >= REOPEN_MAX) {
+            self.stops = 0;
+        }
         // A replica that did not open (its folder held by another process of this machine, or a
         // fault) is tried again.
-        if self.rep.is_none() && self.tried.is_none_or(|t| t.elapsed() >= STATUS_EVERY) {
+        if self.rep.is_none() && self.tried.is_none_or(|t| t.elapsed() >= self.reopen_after()) {
             match (&self.role, &self.me) {
                 (Role::Server { .. }, _) => self.open(SERVER),
                 (Role::Runner { .. }, Some(me)) => {
@@ -1109,6 +1196,7 @@ impl Owner {
             v.digest_at = store.applied();
         }
         v.disk_bytes = self.dir_bytes;
+        (v.disk_free, v.disk_low) = (self.disk_free, self.disk_low);
         v.verified = self.verified;
         if self.is_server() {
             v.machines = self.members.machines.iter().map(|(machine, &member)| MachineView { machine: machine.clone(), member, up: self.up.contains(machine), status: self.statuses.get(machine).cloned(), clock_skew_ms: self.skews.get(machine).map(|s| s.0) }).collect();
@@ -1201,9 +1289,9 @@ struct Maintenance {
 }
 
 impl Maintenance {
-    fn start(store: Shared) -> Self {
+    fn start(store: Shared, dir: PathBuf) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let thread = std::thread::Builder::new().name("kiln-observe-maintain".into()).spawn(move || maintain(&store, &rx));
+        let thread = std::thread::Builder::new().name("kiln-observe-maintain".into()).spawn(move || maintain(&store, &rx, &dir));
         if let Err(e) = &thread {
             tracing::warn!(error = %e, "observe's maintenance thread did not start");
         }
@@ -1226,7 +1314,7 @@ impl Drop for Maintenance {
     }
 }
 
-fn maintain(store: &Shared, rx: &Receiver<()>) {
+fn maintain(store: &Shared, rx: &Receiver<()>, dir: &Path) {
     {
         loop {
             match rx.recv_timeout(MAINTAIN_EVERY) {
@@ -1244,7 +1332,13 @@ fn maintain(store: &Shared, rx: &Receiver<()>) {
                     s.plan_merge().or_else(|| s.plan_retention())
                 };
                 let Some(plan) = plan else { break };
-                tracing::debug!(inputs = plan.input_bytes(), "observe's rewrite planned");
+                // A rewrite writes its block before its inputs go: only with room for it.
+                let inputs = plan.input_bytes();
+                if super::disk_free(dir).is_some_and(|f| f < inputs.saturating_add(DISK_MARGIN)) {
+                    tracing::debug!(inputs, "observe's rewrite waits for room on the disk");
+                    break;
+                }
+                tracing::debug!(inputs, "observe's rewrite planned");
                 match plan.build() {
                     Ok(built) => match store.write().unwrap_or_else(PoisonError::into_inner).commit(built) {
                         Ok(done) => tracing::debug!(?done, "observe's rewrite taken in"),

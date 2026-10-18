@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; next: anomaly, forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub done; next: AWS, GCP, Azure | in progress |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Next: full disks, clock skew, soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
 
 ## 1. Rules
 
@@ -751,7 +751,24 @@ stored exactly once, the replicas alike; and a runner flooded while its server i
 and later started again: it refuses in time (0.5 s at full rate, 2.4 s at 100 k points a second),
 its memory bounded, and everything it took is stored once the server is back.
 
-To come: full disks, clock skew, soak.
+**Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
+(`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is
+measured an hour ahead from its writes and said so once; its own figures, an hour ahead, are dropped
+and counted (`ahead`), not kept; points it takes with true times are stored; started again with a
+true clock, it is said to agree. Samples more than ten minutes past their write's time and log
+records more than two hours past it are dropped by every replica alike: the leader stamps every
+write it proposes with its clock.
+
+**A full disk** (`observe_load.rs`, with Docker: the server's data on a 96 MiB tmpfs and a 30 MiB
+balloon file beside it): it refuses exporters while the disk has less room than its next cut needs
+(the log's compactable bytes and 16 MiB; taken again once 16 MiB more is free), so the cut that
+frees its log can always be made; it does not spin (0.01 CPU s in 5 s while full); freed, it takes
+again; everything it took is stored (21.4 M, then 27.6 M more). Before, the first cut that met a
+full disk failed, the replica stopped and was opened again at once, the log replayed, the cut failed
+again: 83% CPU and a warning every 0.4 s. A replica that stops is now opened again after a second,
+twice as long each time it stops again (to a minute); a merge waits for room for its block.
+
+To come: soak.
 
 ## 14. References
 
