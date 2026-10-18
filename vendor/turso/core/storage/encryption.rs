@@ -1,4 +1,4 @@
-#![allow(unused_variables, dead_code)]
+#![allow(unused_variables, dead_code, unused_imports)] // kiln: unused_imports, as its build has no encryption
 use crate::storage::sqlite3_ondisk::PageSize;
 use crate::turso_assert;
 use crate::{LimboError, Result};

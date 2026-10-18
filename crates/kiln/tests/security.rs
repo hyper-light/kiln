@@ -112,6 +112,7 @@ fn w22_ac07_yaml_bombs() {
     refuses(".kiln/routing.yaml", &bomb("rules"), |t| kiln::ci::routing::parse_file(t.as_bytes()));
     refuses(".kiln/notify.yaml", &bomb("rules"), kiln::ci::notify::parse_rules);
     refuses(".kiln/config.yaml", &bomb("actions"), |t| serde_yaml::from_str::<kiln::ci::repo_config::RepoConfig>(t).map_err(|e| e.to_string()));
+    refuses(".kiln/review.yaml", &bomb("trunks"), |t| serde_yaml::from_str::<kiln::ci::hosting::Review>(t).map_err(|e| e.to_string()));
     refuses("pnpm-lock.yaml", &format!("lockfileVersion: '9.0'\n{}", bomb("packages")), |t| kiln_ci::sbom::parse(kiln_ci::sbom::Lock::Pnpm, t));
     refuses("yarn.lock (berry)", &format!("__metadata:\n  version: 6\n{}", bomb("\"x@npm:1\"")), |t| kiln_ci::sbom::parse(kiln_ci::sbom::Lock::Yarn, t));
 }
@@ -245,10 +246,15 @@ jobs:
 
     // What the API shows of it.
     let mut seen: Vec<(String, String)> = Vec::new();
-    for path in [format!("/api/ci/runs/{id}"), format!("/api/ci/runs/{id}/annotations"), format!("/api/ci/runs/{id}/summaries"), format!("/api/ci/runs/{id}/graph"), "/api/ci/runs?limit=5".into()] {
-        let (_, body) = http(s.port, "GET", &path, &s.admin, None)?;
+    for path in [format!("/api/ci/runs/{id}"), format!("/api/ci/runs/{id}/annotations"), format!("/api/ci/runs/{id}/summary"), format!("/api/ci/runs/{id}/graph"), "/api/ci/runs?limit=5".into()] {
+        let (status, body) = http(s.port, "GET", &path, &s.admin, None)?;
+        // A scan of an error page would prove nothing.
+        assert_eq!(status, 200, "{path}: {body}");
         seen.push((path, body));
     }
+    // What the secret went into, masked.
+    assert!(seen.iter().any(|(p, b)| p.ends_with("/summary") && b.contains("summary ***")), "the summary: {seen:?}");
+    assert!(seen.iter().any(|(p, b)| p.ends_with("/annotations") && b.contains("annotated ***")), "the annotation: {seen:?}");
     let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
     let legs: Vec<String> = serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).into_iter().flatten().filter_map(|l| l.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
     assert!(!legs.is_empty(), "{detail}");
@@ -258,7 +264,8 @@ jobs:
             let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
             logs.push_str(&body);
         }
-        let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+        let (status, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+        assert_eq!(status, 200, "the leg: {body}");
         seen.push((format!("/api/ci/legs/{leg}"), body));
     }
     // The secret was used: the logs show it masked.

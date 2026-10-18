@@ -1850,6 +1850,7 @@ impl BTreeCursor {
     /// [`BTreeCursor::move_to_root_nonblock`] so they can yield through spill
     /// IO instead of blocking inside the pager.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    #[allow(dead_code)] // kiln: unused in its build
     fn move_to_root(&mut self) -> Result<Option<Completion>> {
         let io = self.pager.io.clone();
         io.block(|| self.move_to_root_nonblock())
@@ -2140,6 +2141,7 @@ impl BTreeCursor {
     /// Move cursor to position using registers directly, avoiding record serialization.
     /// See `seek_unpacked` for rationale.
     #[instrument(skip(self, registers), level = Level::DEBUG)]
+    #[allow(dead_code)] // kiln: unused in its build
     fn indexbtree_move_to_unpacked(
         &mut self,
         registers: &[Register],

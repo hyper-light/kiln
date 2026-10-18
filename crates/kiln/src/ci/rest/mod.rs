@@ -30,6 +30,7 @@ use super::{Fail, runs, token};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 
+pub mod pulls;
 pub mod records;
 pub mod repos;
 
@@ -77,6 +78,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::GET, ["repos", _, _, "deployments" | "environments", ..]) => Some(("deployments", Level::Read)),
         (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
         (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
+        (&Method::GET, ["repos", _, _, "pulls", ..]) => Some(("pull-requests", Level::Read)),
         (&Method::POST, ["repos", _, _, "attestations"]) => Some(("attestations", Level::Write)),
         _ => None,
     };
@@ -124,6 +126,26 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::POST, ["deployments", id, "statuses"]) => records::deployment_statuses(&s, id, Some(&body(req).await?)).await,
             (&Method::GET, ["environments"]) => records::environments(&s, None).await,
             (&Method::GET, ["environments", name]) => records::environments(&s, Some(name)).await,
+            // W14-R11: pull requests are diffs and change requests.
+            (&Method::GET, ["pulls"]) => pulls::list(&s, &q).await,
+            (&Method::GET | &Method::PATCH | &Method::DELETE, ["pulls", "comments", id]) => {
+                let b = if method == Method::PATCH { Some(body(req).await?) } else { None };
+                pulls::comment(&s, id, &claims, &method, b.as_ref(), true).await
+            }
+            (&Method::GET, ["pulls", n]) => pulls::get(&s, n).await,
+            (&Method::GET, ["pulls", n, "files"]) => pulls::files(&s, n).await,
+            (&Method::GET, ["pulls", n, "commits"]) => pulls::commits(&s, n).await,
+            (&Method::GET, ["pulls", n, "comments"]) => pulls::review_comments(&s, n, &claims, None).await,
+            (&Method::POST, ["pulls", n, "comments"]) => pulls::review_comments(&s, n, &claims, Some(&body(req).await?)).await,
+            (&Method::GET, ["pulls", n, "reviews"]) => pulls::reviews(&s, n, &claims, None).await,
+            (&Method::POST, ["pulls", n, "reviews"]) => pulls::reviews(&s, n, &claims, Some(&body(req).await?)).await,
+            (&Method::GET | &Method::PATCH | &Method::DELETE, ["issues", "comments", id]) => {
+                let b = if method == Method::PATCH { Some(body(req).await?) } else { None };
+                pulls::comment(&s, id, &claims, &method, b.as_ref(), false).await
+            }
+            (&Method::GET, ["issues", n]) => pulls::issue(&s, n).await,
+            (&Method::GET, ["issues", n, "comments"]) => pulls::issue_comments(&s, n, &claims, None).await,
+            (&Method::POST, ["issues", n, "comments"]) => pulls::issue_comments(&s, n, &claims, Some(&body(req).await?)).await,
             // W18-R02: GitHub's attestations API.
             (&Method::GET, ["attestations", digest]) => crate::ci::attest::facade_list(hub, &s.repo.id, digest, q.get("predicate_type").map(String::as_str)).await,
             (&Method::POST, ["attestations"]) => crate::ci::attest::facade_create(hub, &claims, &body(req).await?).await,

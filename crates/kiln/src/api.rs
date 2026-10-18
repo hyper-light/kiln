@@ -300,6 +300,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        // W14: diffs and stacks.
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+            let segs: Vec<&str> = s.iter().skip(1).copied().collect();
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
@@ -1324,6 +1330,14 @@ struct NewRepo {
     #[serde(default)]
     branches: Vec<String>,
     poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (W14-R01); `upstream` (the default): kiln follows `clone_url`.
+    mode: Option<String>,
+    /// A native repository's history, copied from this URL (`kiln repo import`).
+    import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    default_branch: Option<String>,
+    /// A native repository's upstream, its trunk pushed there after each land (W14-R01).
+    mirror: Option<String>,
 }
 
 async fn add_repo(hub: &Hub, req: Request) -> R {
@@ -1332,11 +1346,33 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
     if name.split('/').count() != 2 || name.contains(char::is_whitespace) {
         return Err(err(StatusCode::BAD_REQUEST, "name must be owner/repo"));
     }
+    let native = match r.mode.as_deref() {
+        None => r.import.is_some(),
+        Some("native") => true,
+        Some("upstream") => false,
+        Some(m) => return Err(err(StatusCode::BAD_REQUEST, format!("mode `{m}`: `native` or `upstream`"))),
+    };
+    let default_branch = r.default_branch.clone().filter(|_| native).or_else(|| native.then(|| "main".to_owned()));
+    if let Some(m) = r.mirror.as_deref() {
+        if !native {
+            return Err(err(StatusCode::BAD_REQUEST, "a mirror is a native repository's upstream"));
+        }
+        crate::ci::hosting::importable(m).map_err(|e| err(StatusCode::BAD_REQUEST, e.replace("an import copies", "a mirror is")))?;
+    }
+    let clone_url = if native {
+        if let Some(url) = &r.import {
+            crate::ci::hosting::importable(url).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        }
+        let path = crate::ci::hosting::create(hub, &name, default_branch.as_deref().unwrap_or("main"), r.import.as_deref()).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        crate::ci::hosting::clone_url(&path)
+    } else {
+        r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git"))
+    };
     let repo = hub
         .store
         .upsert_repo(Repo {
             id: crate::util::new_id(),
-            clone_url: r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git")),
+            clone_url,
             name: name.clone(),
             branches: r.branches,
             poll_seconds: r.poll_seconds.unwrap_or(hub.cfg.gitops.poll_seconds),
@@ -1344,6 +1380,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
             created_at: crate::util::now_unix(),
             last_polled_at: None,
             last_error: None,
+            mode: if native { "native" } else { "upstream" }.into(),
+            default_branch,
+            mirror: r.mirror.clone(),
         })
         .await?;
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
