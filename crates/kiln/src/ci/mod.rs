@@ -8,6 +8,7 @@ pub mod attest;
 pub mod broker;
 pub mod cli;
 pub mod compare;
+pub mod cr;
 pub mod diffs;
 pub mod dispatch;
 pub mod environments;

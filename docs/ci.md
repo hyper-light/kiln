@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); change requests, review UI, App left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); review UI, App, REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -3331,8 +3331,8 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: native hosting, stacked diffs, review, policy and the land queue are
-built; change requests, the review UI, the App and the facade's REST half are left.
+**Progress.** In progress: native hosting, stacked diffs, change requests, review, policy and the
+land queue are built; the review UI, the App and the facade's REST half are left.
 
 - *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
   - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
@@ -3381,6 +3381,19 @@ built; change requests, the review UI, the App and the facade's REST half are le
   - Checked end to end with real git: W14-AC01 (`w14_ac01_stacks`: three commits as a stack,
     D2 amended, the stack rebased and reordered, an interdiff, the refusals, the options, the
     author's actions, the runs), and the CLI (`w14_r03_cli`).
+- *Done.* R04's change requests, in `crates/kiln/src/ci/cr.rs`: a branch reviewed against a
+  trunk as a whole (`CR4`, numbered with the diffs):
+  - opened by pushing `refs/for/<trunk>/branch/<name>` (`kiln cr open [branch]`, `-o title=`)
+    or `POST /api/repos/:repo/change-requests` for a branch already pushed;
+  - each later push of the branch is a version (rebase-only when its combined patch is the same
+    on a new base), said in git's report;
+  - the same review, threads, checks (`pull_request`), API (`/api/change-requests/:id/…`) and
+    queue as diffs; the commits it brings are listed;
+  - it lands by `squash` (the default: one commit), `merge` (a merge commit), `rebase` (each
+    commit replayed) or `ff-only`, each with a `Change-Request:` trailer where it writes a
+    commit;
+  - checked end to end (`w14_r04_change_requests`): every strategy's history, and ff-only refused
+    once the trunk moved on.
 - *Done.* R05's review, in `crates/kiln/src/ci/review.rs`:
   - threads anchored to a version, file, side and lines, that follow the code to the latest
     version (`git diff -U0` hunks) or show as outdated;
@@ -3457,7 +3470,6 @@ built; change requests, the review UI, the App and the facade's REST half are le
   - branch protection rules (R02, with R09);
   - R03's `kiln absorb`;
   - the rest of R11's REST subset and GraphQL;
-  - change requests (R04) and the strategies only they use (`squash`, `rebase`, `merge`);
   - suggestions applied as amends, replies by email or chat (R05);
   - R06's diffs UI and the review pages (with W21);
   - commit signing of landed commits (R07);

@@ -320,6 +320,83 @@ async fn pick_tree(hub: &Hub, path: &str, onto: &str, commit: &str, parent: &str
     result
 }
 
+/// The tree of `theirs` merged into `ours` (their merge base found by git), without a working
+/// tree.
+async fn merge_tree(hub: &Hub, path: &str, ours: &str, theirs: &str) -> Result<String, Refusal> {
+    if git_version(hub).await >= (2, 38) {
+        let r = diffs::git_run(hub, &["-C", path, "merge-tree", "--write-tree", "--no-messages", "--name-only", ours, theirs], &[], Vec::new()).await.map_err(|e| Refusal::Other(format!("{e:#}")))?;
+        let text = String::from_utf8_lossy(&r.out).into_owned();
+        let mut lines = text.lines();
+        let tree = lines.next().unwrap_or_default().trim().to_owned();
+        if r.ok && !tree.is_empty() {
+            return Ok(tree);
+        }
+        let files: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        return Err(if files.is_empty() { Refusal::Other(String::from_utf8_lossy(&r.err).trim().to_owned()) } else { Refusal::Conflict(files) });
+    }
+    let tmp = std::env::temp_dir().join(format!("kiln-land-{}", crate::util::new_id()));
+    let t = tmp.to_string_lossy().into_owned();
+    let result = match gitops::run_git(hub, &["-C", path, "worktree", "add", "--quiet", "--detach", &t, ours], LS_REMOTE_TIMEOUT).await {
+        Err(e) => Err(Refusal::Other(format!("{e:#}"))),
+        Ok(_) => match diffs::git_run(hub, &["-C", &t, "-c", "user.name=kiln", "-c", "user.email=kiln@localhost", "merge", "--no-commit", "--no-ff", "--quiet", theirs], &[], Vec::new()).await {
+            Ok(r) if r.ok => gitops::run_git(hub, &["-C", &t, "write-tree"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}"))),
+            Ok(_) => Err(Refusal::Conflict(gitops::run_git(hub, &["-C", &t, "diff", "--name-only", "--diff-filter=U"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default())),
+            Err(e) => Err(Refusal::Other(format!("{e:#}"))),
+        },
+    };
+    let _ = gitops::run_git(hub, &["-C", path, "worktree", "remove", "--force", &t], LS_REMOTE_TIMEOUT).await;
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// A change request applied onto `tip` by its strategy (W14-R07): `squash` (one commit), `merge`
+/// (a merge commit), `rebase` (each commit replayed), `ff-only` (the branch's head, when the
+/// trunk is its ancestor).
+async fn apply_change_request(hub: &Hub, path: &str, tip: &str, strategy: Strategy, d: &Diff, v: &diffs::Version, reviewers: &[String]) -> Result<Applied, Refusal> {
+    let other = |x: anyhow::Error| Refusal::Other(format!("{x:#}"));
+    let head = v.commit.clone();
+    let mut commits = BTreeMap::new();
+    let message = format!("{}\n\n{}", d.title, d.summary);
+    match strategy {
+        Strategy::FfOnly => {
+            if gitops::run_git(hub, &["-C", path, "merge-base", "--is-ancestor", tip, &head], LS_REMOTE_TIMEOUT).await.is_err() {
+                return Err(Refusal::Other(format!("ff-only: {} has moved past the branch; rebase it onto {} or land with another strategy", d.trunk, d.trunk)));
+            }
+            commits.insert(d.id.clone(), head.clone());
+            Ok(Applied { tip: head, commits })
+        }
+        Strategy::Merge => {
+            let tree = merge_tree(hub, path, tip, &head).await?;
+            let who = author(hub, path, &head).await.map_err(other)?;
+            let msg = land::landed_message(&format!("Merge {}: {}\n\n{}", d.name, d.title, d.summary), &d.name, reviewers);
+            let c = commit_tree(hub, path, &tree, &[tip, &head], &who, &msg).await.map_err(other)?;
+            commits.insert(d.id.clone(), c.clone());
+            Ok(Applied { tip: c, commits })
+        }
+        Strategy::Rebase => {
+            let list = gitops::run_git(hub, &["-C", path, "rev-list", "--reverse", "--topo-order", "--no-merges", &format!("{}..{head}", v.base)], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect::<Vec<_>>()).map_err(other)?;
+            let mut at = tip.to_owned();
+            for c in &list {
+                let parent = gitops::run_git(hub, &["-C", path, "rev-parse", &format!("{c}^")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(other)?;
+                let tree = pick_tree(hub, path, &at, c, &parent).await?;
+                let who = author(hub, path, c).await.map_err(other)?;
+                let msg = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%B", c], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+                at = commit_tree(hub, path, &tree, &[&at], &who, &land::landed_message(&msg, &d.name, reviewers)).await.map_err(other)?;
+            }
+            commits.insert(d.id.clone(), at.clone());
+            Ok(Applied { tip: at, commits })
+        }
+        // `squash`, the default.
+        _ => {
+            let tree = merge_tree(hub, path, tip, &head).await?;
+            let who = author(hub, path, &head).await.map_err(other)?;
+            let c = commit_tree(hub, path, &tree, &[tip], &who, &land::landed_message(&message, &d.name, reviewers)).await.map_err(other)?;
+            commits.insert(d.id.clone(), c.clone());
+            Ok(Applied { tip: c, commits })
+        }
+    }
+}
+
 /// The author of `commit`: name, email, date (raw).
 async fn author(hub: &Hub, path: &str, commit: &str) -> anyhow::Result<(String, String, String)> {
     let o = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%an%x00%ae%x00%ad", "--date=raw", commit], LS_REMOTE_TIMEOUT).await?;
@@ -357,6 +434,12 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
         let (policy, _) = super::review::policy(hub, path, &d.trunk).await;
         let reviewers: Vec<String> = f.accepting(&policy.land).into_iter().collect();
         chain.push((d, v, reviewers));
+    }
+    // A change request lands whole, by its own strategies.
+    if let [(d, v, reviewers)] = chain.as_slice()
+        && d.kind == "change_request"
+    {
+        return apply_change_request(hub, path, tip, e.strategy, d, v, reviewers).await;
     }
     let msg_of = |sha: &str| {
         let s = sha.to_owned();

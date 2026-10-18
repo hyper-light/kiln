@@ -104,9 +104,11 @@ pub struct Submission<'a> {
     pub options: review::Options,
 }
 
-/// What a submission did to one commit.
+/// What a submission did to one commit (or a change request's push).
 #[derive(Debug, Clone, Serialize)]
 pub struct Outcome {
+    /// `D12`, `CR4`.
+    pub name: String,
     pub number: u32,
     pub version: u32,
     /// `new`, `updated`, `rebased`, `reordered` or `unchanged`.
@@ -180,16 +182,18 @@ fn known(c: &rusqlite::Connection, repo: &str, trunk: &str, ids: &[String]) -> r
 
 /// A new version to keep and test: which diff, which version, of which commit.
 #[derive(Debug, Clone)]
-struct Fresh {
-    number: u32,
-    n: u32,
-    sha: String,
-    parent: String,
-    title: String,
-    summary: String,
-    message: String,
-    draft: bool,
-    rebase_only: bool,
+pub(crate) struct Fresh {
+    pub number: u32,
+    pub n: u32,
+    pub sha: String,
+    pub parent: String,
+    pub title: String,
+    pub summary: String,
+    pub message: String,
+    pub draft: bool,
+    pub rebase_only: bool,
+    /// A change request's branch (`None`: a diff).
+    pub branch: Option<String>,
 }
 
 /// Makes the submission's diffs and versions (W14-R03), refused whole, saying why, when any of its
@@ -236,7 +240,8 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                 let patch_id = patches.get(&p.sha).cloned().unwrap_or_default();
                 let (diff_id, number, n, kind, rebase_only) = match (&p.step, existing) {
                     (Step::New, _) => {
-                        let number: u32 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM diffs WHERE kind = 'diff'", [], |r| r.get(0))?;
+                        // Diffs and change requests share the numbers: no D12 beside a CR12.
+                        let number: u32 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM diffs", [], |r| r.get(0))?;
                         let id = crate::util::new_id();
                         let state = if opts.draft { State::Draft } else { State::NeedsReview };
                         tx.execute(
@@ -274,7 +279,7 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                         params![diff_id, n, p.sha, p.parent, base, patch_id, message, opts.message, rebase_only, pushed_by, now],
                     )?;
                     let draft: String = tx.query_row("SELECT state FROM diffs WHERE id = ?1", [&diff_id], |r| r.get(0))?;
-                    fresh.push(Fresh { number, n, sha: p.sha.clone(), parent: p.parent.clone(), title: p.title.clone(), summary: p.summary.clone(), message, draft: draft == "draft", rebase_only });
+                    fresh.push(Fresh { number, n, sha: p.sha.clone(), parent: p.parent.clone(), title: p.title.clone(), summary: p.summary.clone(), message, draft: draft == "draft", rebase_only, branch: None });
                 }
                 // `-o reviewer=` asks for review of what the push changed.
                 for r in opts.reviewers.iter().filter(|_| kind != "unchanged") {
@@ -297,7 +302,7 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
         }
     }
     let base_url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let out: Vec<Outcome> = outcomes.into_iter().map(|(number, version, kind, title)| Outcome { number, version, kind, title, url: format!("{base_url}/diffs/D{number}") }).collect();
+    let out: Vec<Outcome> = outcomes.into_iter().map(|(number, version, kind, title)| Outcome { name: format!("D{number}"), number, version, kind, title, url: format!("{base_url}/diffs/D{number}") }).collect();
     hub.store.audit(s.pushed_by.to_owned(), "diffs.submit".into(), format!("{} {}: {}", s.repo.name, s.trunk, out.iter().map(|o| format!("D{} v{} {}", o.number, o.version, o.kind)).collect::<Vec<_>>().join(", "))).await;
     // Their checks.
     let (hub2, repo, trunk, author, base_sha) = (hub.clone(), s.repo.clone(), s.trunk.to_owned(), s.author.clone(), trunk_sha);
@@ -312,7 +317,7 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
 }
 
 /// The events a new version is (W03-R09): `pull_request` (`opened` for v1, `synchronize` after)
-/// and kiln's `diff`, with the diff in the payload's `kiln.diff`.
+/// and, for a diff, kiln's `diff`, with it in the payload's `kiln.diff` (`kiln.change_request`).
 fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, author: &(String, &'static str), f: &Fresh, changed: Option<Vec<String>>) -> (Event, Event) {
     let pr = PullRequest {
         number: u64::from(f.number),
@@ -322,7 +327,7 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         state: "open".into(),
         author: Some(author.0.clone()),
         labels: Some(Vec::new()),
-        head: Side { branch: format!("D{}", f.number), sha: f.sha.clone(), repo: ctx.clone() },
+        head: Side { branch: f.branch.clone().unwrap_or_else(|| format!("D{}", f.number)), sha: f.sha.clone(), repo: ctx.clone() },
         base: Side { branch: trunk.to_owned(), sha: base_sha.to_owned(), repo: ctx.clone() },
     };
     let mut e = Event {
@@ -332,7 +337,7 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         git_ref: format!("refs/pull/{}/merge", f.number),
         sha: f.sha.clone(),
         base_ref: Some(trunk.to_owned()),
-        head_ref: Some(format!("D{}", f.number)),
+        head_ref: Some(f.branch.clone().unwrap_or_else(|| format!("D{}", f.number))),
         actor: author.0.clone(),
         trusted: true,
         source: Source::Native,
@@ -341,15 +346,17 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         ..Event::default()
     };
     e.payload = context::pull_request(&e, ctx, &pr);
+    let (key, name) = if f.branch.is_some() { ("change_request", format!("CR{}", f.number)) } else { ("diff", format!("D{}", f.number)) };
     if let Some(p) = e.payload.as_object_mut() {
-        p.insert("kiln".into(), json!({ "diff": { "number": f.number, "id": format!("D{}", f.number), "version": f.n, "author": author.0, "author_kind": author.1, "draft": f.draft, "rebase_only": f.rebase_only, "ref": format!("refs/kiln/diffs/D{}/v{}", f.number, f.n) } }));
+        p.insert("kiln".into(), json!({ key: { "number": f.number, "id": name, "version": f.n, "author": author.0, "author_kind": author.1, "draft": f.draft, "rebase_only": f.rebase_only, "ref": format!("refs/kiln/diffs/{name}/v{}", f.n), "branch": f.branch } }));
     }
     let d = Event { name: "diff".into(), action: String::new(), ..e.clone() };
     (e, d)
 }
 
-/// Starts a new version's workflows: those the engine runs whose `on` takes either event.
-async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, author: &(String, &'static str), f: &Fresh) -> anyhow::Result<()> {
+/// Starts a new version's workflows: those the engine runs whose `on` takes either event (a
+/// change request's: `pull_request`).
+pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, author: &(String, &'static str), f: &Fresh) -> anyhow::Result<()> {
     if !hub.ci.enabled() {
         return Ok(());
     }
@@ -358,7 +365,8 @@ async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, author: &(S
     let (pr, diff) = events_of(repo, &ctx, trunk, base_sha, author, f, changed);
     let commit = super::load::load(hub, repo, &f.sha).await?;
     for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
-        for e in [&pr, &diff] {
+        let both = [&pr, &diff];
+        for e in both.iter().take(if f.branch.is_some() { 1 } else { 2 }) {
             super::events::start(hub, repo, e, l, &f.message, &author.0, Value::Null).await?;
         }
     }
@@ -386,7 +394,7 @@ pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Dif
         .await?;
     gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/{}/v{n}", d.name), &v.commit], LS_REMOTE_TIMEOUT).await?;
     let (title, summary) = review::title_and_summary(&v.message);
-    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only };
+    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone() };
     let (hub2, repo2, trunk, author, base) = (hub.clone(), repo.clone(), d.trunk.clone(), (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" }), v.base.clone());
     crate::rt::spawn(async move {
         if let Err(e) = checks(&hub2, &repo2, &trunk, &base, &author, &f).await {
@@ -418,7 +426,7 @@ pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool) -> an
     let Some(v) = versions(hub, d).await?.pop() else { return Ok(()) };
     let ctx = super::events::facts(hub, repo).await.repo;
     let (title, summary) = (d.title.clone(), d.summary.clone());
-    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: false, rebase_only: v.rebase_only };
+    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: false, rebase_only: v.rebase_only, branch: d.branch.clone() };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
     let (mut e, _) = events_of(repo, &ctx, &d.trunk, &v.base, &author, &f, None);
     e.action = "closed".into();
@@ -457,6 +465,8 @@ pub struct Diff {
     pub topic: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// A change request's branch.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -474,7 +484,7 @@ pub struct Version {
     pub git_ref: String,
 }
 
-const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at";
+const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch";
 const DIFF_FROM: &str = "diffs d JOIN repos p ON p.id = d.repo_id LEFT JOIN diffs pd ON pd.id = d.parent_diff";
 
 fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
@@ -499,17 +509,25 @@ fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
         topic: r.get(13)?,
         created_at: r.get(14)?,
         updated_at: r.get(15)?,
+        branch: r.get(16)?,
     })
 }
 
-/// The diff `key` names: `D12`, `12`, or its id.
+/// What a key names: (kind, number) for `D12`, `CR4`, or a bare number (any kind).
+pub fn key_of(key: &str) -> (Option<&'static str>, Option<u32>) {
+    let k = key.trim().to_ascii_uppercase();
+    let (kind, num) = if let Some(n) = k.strip_prefix("CR") { (Some("change_request"), n) } else if let Some(n) = k.strip_prefix('D') { (Some("diff"), n) } else { (None, k.as_str()) };
+    (kind, num.parse().ok())
+}
+
+/// The diff or change request `key` names: `D12`, `CR4`, `12`, or its id.
 pub async fn find(hub: &Hub, key: &str) -> anyhow::Result<Option<Diff>> {
     let key = key.trim().to_owned();
-    let number: Option<u32> = key.strip_prefix(['D', 'd']).unwrap_or(&key).parse().ok();
+    let (kind, number) = key_of(&key);
     hub.store
         .call(move |c| {
-            let sql = format!("SELECT {DIFF_COLUMNS} FROM {DIFF_FROM} WHERE d.id = ?1 OR (d.kind = 'diff' AND d.number = ?2)");
-            Ok(c.query_row(&sql, params![key, number], diff_row).optional()?)
+            let sql = format!("SELECT {DIFF_COLUMNS} FROM {DIFF_FROM} WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))");
+            Ok(c.query_row(&sql, params![key, number, kind], diff_row).optional()?)
         })
         .await
 }
@@ -651,25 +669,25 @@ async fn stack(hub: &Hub, id: &str) -> Result<Value, Fail> {
     Ok(json!({ "id": ordered.first().and_then(|d| d.stack.clone()), "trunk": ordered.first().map(|d| d.trunk.clone()), "repo": ordered.first().map(|d| d.repo.clone()), "diffs": ordered }))
 }
 
-/// A repository's diffs, newest first: `state`, `author`, `reviewer` filter.
-async fn list(hub: &Hub, repo: &str, q: &HashMap<String, String>) -> Result<Value, Fail> {
+/// A repository's diffs (or change requests), newest first: `state`, `author`, `reviewer` filter.
+async fn list(hub: &Hub, repo: &str, q: &HashMap<String, String>, kind: &'static str) -> Result<Value, Fail> {
     let (repo, state, author, reviewer) = (repo.to_owned(), q.get("state").cloned(), q.get("author").cloned(), q.get("reviewer").cloned());
     let limit: i64 = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
     let rows = hub
         .store
         .call(move |c| {
             let sql = format!(
-                "SELECT {DIFF_COLUMNS} FROM {DIFF_FROM} WHERE (p.name = ?1 OR p.id = ?1) AND (?2 IS NULL OR d.state = ?2 OR (?2 = 'open' AND d.state NOT IN ('landed', 'abandoned')))
+                "SELECT {DIFF_COLUMNS} FROM {DIFF_FROM} WHERE (p.name = ?1 OR p.id = ?1) AND d.kind = ?6 AND (?2 IS NULL OR d.state = ?2 OR (?2 = 'open' AND d.state NOT IN ('landed', 'abandoned')))
                  AND (?3 IS NULL OR d.author = ?3) AND (?4 IS NULL OR EXISTS (SELECT 1 FROM diff_reviewers r WHERE r.diff_id = d.id AND r.reviewer = ?4))
                  ORDER BY d.number DESC LIMIT ?5"
             );
             let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params![repo, state, author, reviewer, limit], diff_row)?;
+            let rows = st.query_map(params![repo, state, author, reviewer, limit, kind], diff_row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
         .map_err(fail)?;
-    Ok(json!({ "diffs": rows }))
+    Ok(if kind == "diff" { json!({ "diffs": rows }) } else { json!({ "change_requests": rows }) })
 }
 
 /// A diff whole: it, its versions, its reviewers, and the runs on its latest version.
@@ -689,8 +707,15 @@ async fn get(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         })
         .await
         .map_err(fail)?;
+    let commits = match (d.kind.as_str(), vs.last(), home(hub, d).await) {
+        ("change_request", Some(l), Ok((_, path))) => json!(super::cr::commits(hub, &path, &l.base, &l.commit).await),
+        _ => Value::Null,
+    };
     let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
+        if !commits.is_null() {
+            o.insert("commits".into(), commits);
+        }
         o.insert("versions".into(), json!(vs));
         o.insert("reviewers".into(), json!(rs));
         o.insert("runs".into(), json!(runs));
@@ -732,13 +757,15 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
 pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<String, String>, caller: &Caller, body: &Value) -> Result<Response, Fail> {
     let ok = |v: Value| Ok(srv::json(StatusCode::OK, &v));
     match (method, segs) {
-        (&Method::GET, ["repos", repo, "diffs"]) => ok(list(hub, repo, q).await?),
+        (&Method::GET, ["repos", repo, "diffs"]) => ok(list(hub, repo, q, "diff").await?),
+        (&Method::GET, ["repos", repo, "change-requests"]) => ok(list(hub, repo, q, "change_request").await?),
+        (&Method::POST, ["repos", repo, "change-requests"]) => ok(super::cr::create(hub, repo, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => ok(super::review::inbox(hub, caller).await?),
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
-        (_, ["diffs", key, rest @ ..]) => {
+        (_, ["diffs" | "change-requests", key, rest @ ..]) => {
             let d = find(hub, key).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, format!("no diff {key}")))?;
             // A caller sees a diff where they may read diffs (the route table checked it there).
             if !caller.can("diffs.read", &Scope::Repo { repo: d.repo.clone() }) {

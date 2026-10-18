@@ -665,3 +665,143 @@ fn run_logs(s: &Server, diff: &str) -> String {
     }
     out
 }
+
+/// W14-R04 and AC02's other half: a change request opened by a push to
+/// `refs/for/main/branch/<name>`, its versions the branch's pushes, reviewed and landed whole by
+/// each strategy a change request lands by (`squash`: one commit; `merge`: a merge commit;
+/// `rebase`: each commit replayed; `ff-only`: the branch itself, refused once the trunk moved on);
+/// opened through the API and `kiln cr open` too.
+#[test]
+fn w14_r04_change_requests() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    let g = |args: &[&str]| must(git(&home, &work, args), &args.join(" "));
+    std::fs::write(work.join("README.md"), "app\n")?;
+    g(&["add", "."])?;
+    g(&["commit", "-qm", "first"])?;
+    g(&["push", "-q", "origin", "main"])?;
+    let plain = |file: &str, title: &str| -> anyhow::Result<()> {
+        std::fs::write(work.join(file), format!("{title}\n"))?;
+        g(&["add", file])?;
+        g(&["commit", "-qm", title])?;
+        Ok(())
+    };
+    let tip = || -> anyhow::Result<String> {
+        g(&["fetch", "-q", "origin"])?;
+        Ok(g(&["rev-parse", "origin/main"])?.trim().to_owned())
+    };
+    let wait_landed = |cr: &str| until(30, &format!("{cr} lands"), || Ok((text(&api(&s, &dev, "GET", &format!("/api/change-requests/{cr}"))?, "state") != "landed").then(|| "not yet".to_owned())));
+
+    // Opened by a push; its versions are the branch's pushes.
+    g(&["checkout", "-qb", "topic"])?;
+    plain("a.txt", "topic: a")?;
+    plain("b.txt", "topic: b")?;
+    let out = g(&["push", "-o", "title=Topic work", "origin", "topic:refs/for/main/branch/topic"])?;
+    assert!(out.contains("CR1 v1 (new)  Topic work"), "{out}");
+    let cr = api(&s, &dev, "GET", "/api/change-requests/CR1")?;
+    assert_eq!((text(&cr, "kind"), text(&cr, "branch"), text(&cr, "name")), ("change_request", "topic", "CR1"), "{cr}");
+    assert_eq!(cr.get("commits").and_then(Value::as_array).map(Vec::len), Some(2), "{cr}");
+    plain("c.txt", "topic: c")?;
+    let out = g(&["push", "origin", "topic"])?;
+    assert!(out.contains("CR1 v2 (updated)"), "a plain push of the branch: {out}");
+    let files = api(&s, &dev, "GET", "/api/change-requests/CR1/versions/2/files")?;
+    let names: Vec<&str> = files.get("files").and_then(Value::as_array).into_iter().flatten().map(|f| text(f, "path")).collect();
+    assert_eq!(names, ["a.txt", "b.txt", "c.txt"], "{files}");
+    let inter = api(&s, &dev, "GET", "/api/change-requests/CR1/interdiff?from=1&to=2")?;
+    assert!(text(&inter, "range_diff").contains("topic: c"), "{inter}");
+    let listed = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/change-requests")?;
+    assert_eq!(listed.get("change_requests").and_then(Value::as_array).map(Vec::len), Some(1), "{listed}");
+    let (st, r) = post(&s, &lead, "/api/change-requests/CR1/land", &json!({ "strategy": "stack" }))?;
+    assert!(st == 422 && r.to_string().contains("doesn't land a change request"), "{st} {r}");
+
+    // Each strategy, on its own change request.
+    let mut n = 1;
+    for strategy in ["squash", "merge", "rebase", "ff-only"] {
+        let before = tip()?;
+        if n > 1 {
+            g(&["checkout", "-qB", strategy, "origin/main"])?;
+            plain(&format!("{strategy}-1.txt"), &format!("{strategy}: one"))?;
+            plain(&format!("{strategy}-2.txt"), &format!("{strategy}: two"))?;
+            let out = g(&["push", "origin", &format!("{strategy}:refs/for/main/branch/{strategy}")])?;
+            assert!(out.contains(&format!("CR{n} v1 (new)")), "{out}");
+        }
+        let name = format!("CR{n}");
+        let (st, r) = post(&s, &rev, &format!("/api/change-requests/{name}/review"), &json!({ "action": "accept" }))?;
+        anyhow::ensure!(st == 200, "{name}: {r}");
+        let (st, e) = post(&s, &lead, &format!("/api/change-requests/{name}/land"), &json!({ "strategy": strategy }))?;
+        anyhow::ensure!(st == 200, "{name} {strategy}: {e}");
+        wait_landed(&name)?;
+        let after = tip()?;
+        let count = |range: &str, first_parent: bool| -> anyhow::Result<usize> {
+            let mut args = vec!["rev-list", "--count"];
+            if first_parent {
+                args.push("--first-parent");
+            }
+            args.push(range);
+            Ok(g(&args)?.trim().parse()?)
+        };
+        let range = format!("{before}..{after}");
+        let msg = g(&["log", "-1", "--format=%B", &after])?;
+        let parents = g(&["log", "-1", "--format=%P", &after])?.split_whitespace().count();
+        match strategy {
+            "squash" => {
+                assert_eq!((count(&range, false)?, parents), (1, 1), "{strategy}");
+                assert!(msg.contains("Change-Request: CR1") && msg.contains("Reviewed-by: user:rev") && msg.contains("Topic work"), "{msg}");
+            }
+            "merge" => {
+                assert_eq!((count(&range, true)?, count(&range, false)?, parents), (1, 3, 2), "{strategy}");
+                assert!(msg.starts_with(&format!("Merge {name}")) && msg.contains(&format!("Change-Request: {name}")), "{msg}");
+            }
+            "rebase" => {
+                assert_eq!((count(&range, false)?, parents), (2, 1), "{strategy}");
+                let both = g(&["log", "--format=%B", &range])?;
+                assert_eq!(both.matches(&format!("Change-Request: {name}")).count(), 2, "{both}");
+            }
+            _ => {
+                let head = g(&["rev-parse", strategy])?.trim().to_owned();
+                assert_eq!(after, head, "ff-only: the trunk is the branch itself");
+                assert!(!msg.contains("Change-Request"), "{msg}");
+            }
+        }
+        n += 1;
+    }
+
+    // ff-only, once the trunk moved on: refused, saying why.
+    g(&["checkout", "-qB", "late", "origin/main~2"])?;
+    plain("late.txt", "late: one")?;
+    let out = g(&["push", "origin", "late:refs/for/main/branch/late"])?;
+    assert!(out.contains("CR5 v1 (new)"), "{out}");
+    post(&s, &rev, "/api/change-requests/CR5/review", &json!({ "action": "accept" }))?;
+    let (_, e) = post(&s, &lead, "/api/change-requests/CR5/land", &json!({ "strategy": "ff-only" }))?;
+    let entry = text(&e, "entry").to_owned();
+    until(30, "CR5 is ejected", || {
+        let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
+        let mine = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| text(x, "id") == entry).cloned()).unwrap_or_default();
+        Ok((!(text(&mine, "state") == "ejected" && text(&mine, "reason").contains("ff-only"))).then(|| mine.to_string()))
+    })?;
+
+    // Opened through the API for a branch already pushed, and with `kiln cr open`.
+    g(&["checkout", "-qB", "pushed", "origin/main"])?;
+    plain("p.txt", "pushed: p")?;
+    g(&["push", "-q", "origin", "pushed"])?;
+    let (st, r) = post(&s, &dev, "/api/repos/acme%2Fapp/change-requests", &json!({ "branch": "pushed", "title": "Already there" }))?;
+    assert!(st == 200 && text(&r, "change_request") == "CR6", "{st} {r}");
+    g(&["checkout", "-qB", "cli", "origin/main"])?;
+    plain("q.txt", "cli: q")?;
+    let out = must(kiln(&home, &work, &s, &dev, &["cr", "open", "--title", "From the CLI"]), "kiln cr open")?;
+    assert!(out.contains("CR7 v1 (new)  From the CLI"), "{out}");
+    plain("r.txt", "cli: r")?;
+    let out = g(&["push"])?;
+    assert!(out.contains("CR7 v2 (updated)"), "the branch tracks the server's: {out}");
+    Ok(())
+}

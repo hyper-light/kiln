@@ -119,8 +119,9 @@ pub fn title_and_summary(message: &str) -> (String, String) {
     (title, body.join("\n\n"))
 }
 
-/// A push's options (`git push -o …`): `draft`, `reviewer=ada,agent:review` (repeatable),
-/// `message=…` (a note on the new versions), `topic=…`; unknown ones are said back.
+/// A push's options (`git push -o …`): `draft`, `ready`, `reviewer=ada,agent:review`
+/// (repeatable), `message=…` (a note on the new versions), `topic=…`, `title=…` (a change
+/// request's); unknown ones are said back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub draft: bool,
@@ -128,6 +129,8 @@ pub struct Options {
     pub reviewers: Vec<String>,
     pub message: Option<String>,
     pub topic: Option<String>,
+    /// A change request's title.
+    pub title: Option<String>,
     pub unknown: Vec<String>,
 }
 
@@ -142,6 +145,7 @@ pub fn options<S: AsRef<str>>(given: &[S]) -> Options {
             ("reviewer" | "reviewers" | "r", Some(v)) => o.reviewers.extend(v.split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned)),
             ("message" | "m", Some(v)) => o.message = Some(v.to_owned()),
             ("topic", Some(v)) if !v.is_empty() => o.topic = Some(v.to_owned()),
+            ("title", Some(v)) if !v.is_empty() => o.title = Some(v.to_owned()),
             _ => o.unknown.push(opt.to_owned()),
         }
     }

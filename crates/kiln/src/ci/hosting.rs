@@ -319,11 +319,14 @@ pub fn refused(pusher: &Pusher, repo: &str, review: &Review, trunks: &[String], 
         if u.deletes() {
             return Some("refs/for/<trunk> takes commits to review; there is nothing to delete".into());
         }
-        if target.contains("/branch/") {
-            return Some("change requests (refs/for/<trunk>/branch/<name>) come with W14-R04; submit diffs to refs/for/<trunk>".into());
+        let (trunk, branch) = target.split_once("/branch/").map_or((target, None), |(t, b)| (t, Some(b)));
+        if !trunks.iter().any(|t| t == trunk) {
+            return Some(format!("{trunk} isn't a trunk: submit to refs/for/<trunk> ({})", trunks.join(", ")));
         }
-        if !trunks.iter().any(|t| t == target) {
-            return Some(format!("{target} isn't a trunk: submit to refs/for/<trunk> ({})", trunks.join(", ")));
+        if let Some(b) = branch
+            && let Err(e) = super::cr::branch_ok(b, trunks)
+        {
+            return Some(e);
         }
         return (!may("diffs.submit", write)).then(|| "submitting diffs needs `diffs.submit` (a job's token: `contents: write`)".to_owned());
     }
@@ -475,15 +478,8 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         return Ok(srv::response(StatusCode::OK, "application/x-git-receive-pack-result", srv::full(bytes::Bytes::from(refusal(&all, &caps, &message)))));
     }
     let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
-    let Some(target) = submitted.first().map(|u| (*u).clone()) else {
-        let r = super::facade::backend(&cgi, head, Some(body)).await;
-        hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
-        // The poller takes the new refs now: events, runs.
-        hub.gitops_kick.notify();
-        return r;
-    };
-
-    // Diffs (W14-R03): the push's options follow its commands.
+    let target = submitted.first().map(|u| (*u).clone());
+    // The push's options follow its commands.
     let mut given: Vec<String> = Vec::new();
     if caps.iter().any(|c| c == "push-options") {
         loop {
@@ -497,9 +493,18 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
             }
         }
     }
+    // One submission at a time per repository (its `refs/for/*` is the way in).
     let lock = lock_of(&repo.id);
-    let _held = lock.lock().await;
-    clear_for_refs(hub, &p).await;
+    let _held = match target {
+        Some(_) => {
+            let g = lock.lock().await;
+            clear_for_refs(hub, &p).await;
+            Some(g)
+        }
+        None => None,
+    };
+    // git takes the push; its answer (a report, and its progress) is read before it's passed on,
+    // so kiln can say what the push made.
     let answer = super::facade::run(&cgi, head, Some(body)).await?;
     if answer.status != StatusCode::OK {
         let status = answer.status;
@@ -512,42 +517,68 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let band = band_of(&caps);
     let mut report = read_report(&raw, band.is_some());
     let mut said: Vec<String> = Vec::new();
-    let stored = format!("ok {}", target.name);
-    if let (Some(at), Some((trunk, suffix))) = (report.lines.iter().position(|l| *l == stored), for_ref(&target.name)) {
-        given.extend(suffix);
-        let options = kiln_ci::review::options(&given);
-        said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=); ignored")));
-        let author = match &who {
-            Pusher::Caller(c) => super::diffs::author_of(&c.name, Some(c.kind)),
-            Pusher::Job(j) => super::diffs::author_of(&format!("job:{}", j.leg), None),
-        };
-        let s = super::diffs::Submission { repo, path: &p, trunk, sha: &target.new, pushed_by: &user, author, options };
-        match super::diffs::submit(hub, s).await {
-            Ok(outcomes) => {
-                for o in outcomes {
-                    let what = match o.kind {
-                        "new" => "new",
-                        "rebased" => "rebased, nothing else changed",
-                        "reordered" => "moved in the stack",
-                        "unchanged" => "unchanged",
-                        _ => "updated",
-                    };
-                    said.push(format!("D{} v{} ({what})  {}", o.number, o.version, o.title));
-                    said.push(format!("  {}", o.url));
+    let author = match &who {
+        Pusher::Caller(c) => super::diffs::author_of(&c.name, Some(c.kind)),
+        Pusher::Job(j) => super::diffs::author_of(&format!("job:{}", j.leg), None),
+    };
+    // What git took (`ok <ref>`), before kiln says more.
+    let took: std::collections::HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
+    if let Some(target) = &target {
+        let at = report.lines.iter().position(|l| *l == format!("ok {}", target.name));
+        if let (Some(at), Some((spec, suffix))) = (at, for_ref(&target.name)) {
+            given.extend(suffix);
+            let options = kiln_ci::review::options(&given);
+            said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=, title=); ignored")));
+            let result = match spec.split_once("/branch/") {
+                // A change request (W14-R04): the branch is the commit pushed, then reviewed whole.
+                Some((trunk, branch)) => match crate::gitops::run_git(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), &target.new], crate::gitops::LS_REMOTE_TIMEOUT).await {
+                    Ok(_) => {
+                        let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
+                        super::cr::submit(hub, repo, &p, trunk, branch, &target.new, &by, &options).await.map(|o| vec![o])
+                    }
+                    Err(e) => Err(format!("the branch {branch}: {e:#}")),
+                },
+                None => super::diffs::submit(hub, super::diffs::Submission { repo, path: &p, trunk: spec, sha: &target.new, pushed_by: &user, author: author.clone(), options }).await,
+            };
+            match result {
+                Ok(outcomes) => {
+                    for o in outcomes {
+                        let what = match o.kind {
+                            "new" => "new",
+                            "rebased" => "rebased, nothing else changed",
+                            "reordered" => "moved in the stack",
+                            "unchanged" => "unchanged",
+                            _ => "updated",
+                        };
+                        said.push(format!("{} v{} ({what})  {}", o.name, o.version, o.title));
+                        said.push(format!("  {}", o.url));
+                    }
                 }
-            }
-            Err(why) => {
-                if let Some(l) = report.lines.get_mut(at) {
-                    *l = format!("ng {} {}", target.name, why.replace('\n', "; "));
+                Err(why) => {
+                    if let Some(l) = report.lines.get_mut(at) {
+                        *l = format!("ng {} {}", target.name, why.replace('\n', "; "));
+                    }
+                    said.push(why);
                 }
-                said.push(why);
             }
         }
+        // The ref was only the push's way in.
+        let _ = crate::gitops::run_git(hub, &["-C", &p, "update-ref", "-d", &target.name], crate::gitops::LS_REMOTE_TIMEOUT).await;
     }
-    // The ref was only the push's way in.
-    let _ = crate::gitops::run_git(hub, &["-C", &p, "update-ref", "-d", &target.name], crate::gitops::LS_REMOTE_TIMEOUT).await;
+    // Branches pushed (not trunks): their open change requests get the new heads as versions.
+    let branches: Vec<(String, String)> = updates
+        .iter()
+        .filter(|u| !u.deletes() && took.contains(&u.name))
+        .filter_map(|u| u.name.strip_prefix("refs/heads/").map(|b| (b.to_owned(), u.new.clone())))
+        .filter(|(b, _)| !trunk_list.iter().any(|t| t == b))
+        .collect();
+    if !branches.is_empty() {
+        let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
+        said.extend(super::cr::pushed(hub, repo, &p, &branches, &by).await);
+    }
     hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
-    if updates.len() > 1 {
+    // The poller takes the new refs now: events, runs.
+    if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {
         hub.gitops_kick.notify();
     }
     Ok(srv::response(StatusCode::OK, &ctype, srv::full(bytes::Bytes::from(write_report(&report, &said, band)))))
@@ -597,7 +628,9 @@ mod tests {
         assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main%topic=x,wip", ZERO, &b), false).is_none());
         assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/release", ZERO, &b), false).is_some_and(|w| w.contains("isn't a trunk")));
         assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main", &b, ZERO), false).is_some());
-        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main/branch/topic", ZERO, &b), false).is_some_and(|w| w.contains("W14-R04")));
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main/branch/topic", ZERO, &b), false).is_none(), "a change request");
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main/branch/main", ZERO, &b), false).is_some_and(|w| w.contains("is a trunk")));
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main/branch/a..b", ZERO, &b), false).is_some());
         // Someone with no rights.
         let nobody = Pusher::Caller(Caller::with(crate::authz::gate::Kind::Pat, "pat:x of user:ada", Some(crate::authz::Rights::default()), None));
         assert!(refused(&nobody, "acme/app", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_some());

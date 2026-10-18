@@ -307,10 +307,10 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
         At::Runner(i) => Scope::Runner { runner: seg(i) },
         At::Diff(i) => {
             let key = seg(i);
-            let number = key.strip_prefix(['D', 'd']).unwrap_or(&key).parse::<u32>().ok();
+            let (kind, number) = crate::ci::diffs::key_of(&key);
             let name = hub
                 .store
-                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.kind = 'diff' AND d.number = ?2)", rusqlite::params![key, number], |r| r.get::<_, String>(0)).optional()?))
+                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))", rusqlite::params![key, number, kind], |r| r.get::<_, String>(0)).optional()?))
                 .await
                 .ok()
                 .flatten();

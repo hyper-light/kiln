@@ -166,6 +166,8 @@ enum Cmd {
     Diffs(kiln::ci::review_cli::DiffsArgs),
     /// Check out a diff's version: `kiln checkout D12` (its latest) or `D12@v2`.
     Checkout(kiln::ci::review_cli::CheckoutArgs),
+    /// Change requests: `kiln cr open [branch]` reviews a branch against the trunk as a whole.
+    Cr(kiln::ci::review_cli::CrArgs),
     /// Land diffs (each with those below it) through the land queue: `kiln land D12 --strategy stack`.
     Land(kiln::ci::review_cli::LandArgs),
     /// A diff's review: what keeps it from landing and its open threads; or a review of it
@@ -710,6 +712,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
         Cmd::Diffs(a) => kiln::ci::review_cli::diffs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Checkout(a) => kiln::ci::review_cli::checkout(a),
+        Cmd::Cr(a) => kiln::ci::review_cli::cr(a),
         Cmd::Land(a) => kiln::ci::review_cli::land(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Review(a) => kiln::ci::review_cli::review(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Hook(a) => kiln::ci::review_cli::hook(a),

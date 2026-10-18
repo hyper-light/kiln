@@ -385,6 +385,63 @@ pub fn checkout(args: CheckoutArgs) -> Result<()> {
 }
 
 #[derive(clap::Args)]
+pub struct CrArgs {
+    #[command(subcommand)]
+    cmd: CrCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum CrCmd {
+    /// A change request for a branch (default: this one), reviewed against the trunk as a whole;
+    /// each push of the branch after it is a new version.
+    Open {
+        branch: Option<String>,
+        #[arg(long)]
+        trunk: Option<String>,
+        #[arg(long)]
+        remote: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        draft: bool,
+        #[arg(short = 'r', long = "reviewer")]
+        reviewers: Vec<String>,
+    },
+}
+
+/// `kiln cr open [branch]`: `git push <remote> <branch>:refs/for/<trunk>/branch/<branch>`, and
+/// the branch then tracks the remote's, so `git push` adds versions.
+pub fn cr(args: CrArgs) -> Result<()> {
+    let CrCmd::Open { branch, trunk, remote, title, draft, reviewers } = args.cmd;
+    let remote = remote_of(remote.as_deref())?;
+    let trunk = trunk_of(&remote, trunk.as_deref());
+    let branch = match branch {
+        Some(b) => b,
+        None => out(&["symbolic-ref", "--short", "HEAD"]).context("which branch? name it")?,
+    };
+    if branch == trunk {
+        bail!("{branch} is the trunk: a change request reviews another branch");
+    }
+    let mut push: Vec<String> = vec!["push".into(), remote.clone(), format!("{branch}:refs/for/{trunk}/branch/{branch}")];
+    let mut opt = |o: String| push.extend(["-o".to_owned(), o]);
+    if let Some(t) = &title {
+        opt(format!("title={t}"));
+    }
+    if draft {
+        opt("draft".into());
+    }
+    if !reviewers.is_empty() {
+        opt(format!("reviewer={}", reviewers.join(",")));
+    }
+    run(&push.iter().map(String::as_str).collect::<Vec<_>>())?;
+    // The branch follows the server's from here (best effort).
+    if out(&["fetch", "--quiet", &remote, &format!("{branch}:refs/remotes/{remote}/{branch}")]).is_ok() {
+        let _ = out(&["branch", "--quiet", &format!("--set-upstream-to={remote}/{branch}"), &branch]);
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
 pub struct LandArgs {
     #[command(flatten)]
     conn: Conn,
