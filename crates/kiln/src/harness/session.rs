@@ -1448,7 +1448,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
         note.push_str(n);
     }
     let env = spec.env.clone();
-    let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &note)).await.map_err(|e| format!("{e:#}"))??;
+    let timeline = events.clone();
+    let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)).await.map_err(|e| format!("{e:#}"))??;
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
     pkg.picks_up = mv.picks_up;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;

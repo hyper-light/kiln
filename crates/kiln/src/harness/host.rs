@@ -239,8 +239,8 @@ impl Host {
     /// (writes the record).
     pub fn adopt(&self, from: &str, data: &[u8]) -> Result<(), String> {
         let pkg: super::moving::Package = serde_json::from_slice(data).map_err(|e| format!("the session from {from} is unreadable: {e}"))?;
-        if pkg.version != super::moving::VERSION {
-            return Err(format!("a session packed as version {} (this runner takes {})", pkg.version, super::moving::VERSION));
+        if !super::moving::takes(pkg.version) {
+            return Err(format!("a session packed as version {} (this runner takes up to {})", pkg.version, super::moving::VERSION));
         }
         let kind = Kind::get(&pkg.spec.kind).ok_or_else(|| format!("this runner doesn't know {}", pkg.spec.kind))?;
         if !kind.available() {

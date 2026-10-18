@@ -227,9 +227,12 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    interrupted reply included, and a message saying it moved (`move {"now": true}`).
 3. **The hand-over** (`harness/moving.rs`). The runner packs the session — the harness's own record
    (Claude Code's transcript as it is; Codex's conversation as a new thread's history, as a switch of
-   harness carries it), kiln's timeline and state with its queue, its settings with the folder it goes
-   on in — and hands it over a reach link: end to end encrypted, in pieces within a window, started
-   over if the link drops (`Ask::Adopt`, `Say::AdoptGot`, `Say::Adopted`).
+   harness carries it; for ACP agents and Antigravity, whose own records kiln doesn't keep, the
+   conversation in words from kiln's timeline, given with the first message the harness gets there),
+   kiln's timeline and state with its queue, its settings with the folder it goes on in — and hands
+   it over a reach link: end to end encrypted, in pieces within a window, started over if the link
+   drops (`Ask::Adopt`, `Say::AdoptGot`, `Say::Adopted`). A package in words is version 2 of the
+   format; the others stay version 1, which older runners take.
 4. **The take-over** (the other runner). It puts the record where its harness looks for it, starts the
    session under the same id with its timeline as it was, and says so; the server follows the session
    there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
@@ -253,5 +256,7 @@ agent stays where it is.
   so `kiln run` and the `kiln` MCP server for agents on Windows runners.
 - Agents that agents start (`kiln spawn`): kiln doesn't record whom they act for yet, so on a kiln
   others sign in to they can't call kiln's operations (the machines they can).
-- Moving agents of ACP harnesses (Gemini, opencode, goose, amp): their sessions are the harness's own.
+- Moving agents of ACP harnesses (Gemini, opencode, goose, amp) and Antigravity keeps their
+  conversation, but not the harness's own record of it: kiln's timeline goes with them in words, and
+  the harness starts a new session there with it (`moving::Carry::Words`).
 - Moving the tasks an agent left running (shells, monitors): they stay, and stop, where they were.

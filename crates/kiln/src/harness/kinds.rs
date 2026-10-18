@@ -378,8 +378,14 @@ impl Adapter {
     /// Start with a conversation carried over from another harness, in the harness's own form
     /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript).
     pub fn seed(&mut self, items: Vec<serde_json::Value>) {
-        if let Self::Codex(a) = self {
-            a.seed(items);
+        // The conversation in words (`moving::Carry::Words`), for a harness that takes it only with
+        // its first message.
+        let words = || items.iter().find(|i| i.get("type").and_then(serde_json::Value::as_str) == Some(super::moving::CONTEXT)).and_then(|i| i.get("text")).and_then(serde_json::Value::as_str).map(str::to_owned);
+        match self {
+            Self::Codex(a) => a.seed(items),
+            Self::Acp(a) => a.offer_context(words()),
+            Self::Agy(a) => a.offer_context(words()),
+            Self::Claude(_) => {}
         }
     }
 
