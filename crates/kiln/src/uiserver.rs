@@ -31,18 +31,21 @@ const HOP: [&str; 8] = ["connection", "keep-alive", "proxy-authenticate", "proxy
 /// How long a start may take to accept connections.
 const STARTING: Duration = Duration::from_secs(20);
 
-/// The UI's answer to `req`: a static file, else the UI server's (any method), else the shell.
+/// The UI's answer to `req`: a static file, else the UI server's (any method), else, for a page,
+/// the shell. A server function or server component asked for while the UI server isn't there gets
+/// a 503, never the shell: the page asking would take HTML for its answer.
 pub async fn serve(req: Request) -> Response {
     let get = matches!(*req.method(), Method::GET | Method::HEAD);
     if get && let Some(r) = crate::ui::static_file(&req) {
         return r;
     }
+    let page = get && srv::header_str(&req, &header::ACCEPT).is_some_and(|a| a.contains("text/html"));
     let port = PORT.load(Ordering::Relaxed);
     if port == 0 {
-        return if get { crate::ui::shell(&req) } else { srv::text(StatusCode::SERVICE_UNAVAILABLE, "kiln's UI server isn't running") };
+        return if page { crate::ui::shell(&req) } else { srv::text(StatusCode::SERVICE_UNAVAILABLE, "kiln's UI server isn't running") };
     }
     // The shell stands in for a page the UI server couldn't answer (it's restarting, say).
-    let fallback = get.then(|| crate::ui::shell(&req));
+    let fallback = page.then(|| crate::ui::shell(&req));
     match forward(req, port).await {
         Ok(r) => r,
         Err(e) => {
