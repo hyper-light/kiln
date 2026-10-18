@@ -32,7 +32,14 @@ export interface Turn {
   outcome: Extract<HEvent, { kind: "assistant" }> | null;
   started: number;
   ended: number | null;
+  /** The harness that answered (a conversation switched between harnesses keeps who said what). */
+  by?: string;
+  /** Not a turn: the line where the conversation went on in another harness. */
+  divider?: Extract<HEvent, { kind: "notice" }>;
 }
+
+/** The notice kiln puts where a conversation went on in another harness (`harness-switch:` ids). */
+const switchOf = (e: HEvent): Extract<HEvent, { kind: "notice" }> | null => (e.kind === "notice" && e.id.startsWith("harness-switch:") ? e : null);
 
 const GROUP: Record<ToolKind, StepGroup> = {
   read: "explore",
@@ -72,8 +79,16 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
       open(e, e.at, e.id);
       continue;
     }
+    // A switch to another harness is a line between turns, not part of the one before it.
+    const divider = switchOf(e);
+    if (divider) {
+      turns.push({ key: e.id, prompt: null, items: [], outcome: null, started: e.at, ended: null, divider });
+      cur = null;
+      continue;
+    }
     const t: Turn = cur ?? open(null, e.at, `start-${e.id}`);
     t.ended = e.at;
+    if (e.by && !t.by && e.kind !== "notice") t.by = e.by;
     if (e.kind === "tool") {
       const g = GROUP[e.tool] ?? "tool";
       const last = t.items.at(-1);
@@ -93,6 +108,7 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
   // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
   for (const [ti, t] of turns.entries()) {
     if (openLast && ti === turns.length - 1) break;
+    if (t.divider) continue;
     for (let i = t.items.length - 1; i >= 0; i--) {
       const it = t.items[i];
       if (!it || it.type === "thought" || it.type === "notice") continue;

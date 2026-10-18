@@ -1247,7 +1247,7 @@ mod tests {
     use crate::harness::model::{Body, Event};
 
     fn said(id: usize, text: String) -> Event {
-        Event { id: format!("e{id}"), seq: id as u64, at: 0, parent: None, body: Body::Assistant { text, streaming: false } }
+        Event { id: format!("e{id}"), seq: id as u64, at: 0, parent: None, by: None, body: Body::Assistant { text, streaming: false } }
     }
 
     fn events(frame: &str) -> Vec<Event> {

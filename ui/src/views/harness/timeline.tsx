@@ -460,11 +460,20 @@ const TurnView = React.memo(function TurnView({
   const edits = React.useMemo(() => changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
+  if (turn.divider) {
+    return (
+      <section className="hx-turn hx-turn-switch">
+        <Notice e={turn.divider} />
+      </section>
+    );
+  }
+  // Who answered this turn: the harness it ran in (an earlier one, after a switch), else the agent's.
+  const label = turn.by ?? agentLabel;
   return (
     <section className="hx-turn">
       {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} onCommand={onCommand} />}
       <div className="hx-work">
-        {agentLabel && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{agentLabel}</div>}
+        {label && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{label}</div>}
         {turn.items.map((it) => (
           <ItemView key={it.key} item={it} cwd={cwd} onOpenTask={onOpenTask} />
         ))}

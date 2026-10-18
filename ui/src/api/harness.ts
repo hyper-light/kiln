@@ -68,7 +68,8 @@ export type Body =
   | ({ kind: "tool" } & ToolCall)
   | { kind: "notice"; level: Level; text: string };
 
-export type HEvent = { id: string; seq: number; at: number; parent?: string } & Body;
+/** `by`: the harness that was running when it appeared (a conversation switched between harnesses keeps who said what). */
+export type HEvent = { id: string; seq: number; at: number; parent?: string; by?: string } & Body;
 
 export interface AlwaysOption {
   label: string;

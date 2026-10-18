@@ -23,6 +23,10 @@ pub struct Event {
     /// The subagent run (its spawning tool call's id) this event belongs to; None for the main thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// The harness that was running when it appeared ("Claude Code", "Codex"): a conversation
+    /// switched between harnesses keeps who said what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
     #[serde(flatten)]
     pub body: Body,
 }
@@ -1421,6 +1425,7 @@ mod tests {
             seq: 1,
             at: 5,
             parent: None,
+            by: None,
             body: Body::Assistant { text: "hi".into(), streaming: false },
         };
         let v = serde_json::to_value(&e)?;

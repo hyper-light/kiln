@@ -1095,7 +1095,8 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         if left > 0 {
             text.push_str(&format!("; the {left} task(s) {} left running were stopped", from.name));
         }
-        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+        // `harness-switch:` marks it for viewers: a line between the turns of one harness and the next.
+        core.upsert(&format!("harness-switch:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
         core.touch_meta();
         core.touch_state();
     }
@@ -1117,8 +1118,9 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) {
-    // The harness it runs in (a switch changes it).
+    // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;
+    s.core.lock().harness = Some(kind.name.to_owned());
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
     let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
@@ -1182,6 +1184,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             spec.resume = None;
         }
         let mut adapter = kind.adapter(&spec);
+        s.core.lock().harness = Some(kind.name.to_owned());
         if let Some(items) = &seed {
             adapter.seed(items.clone());
         }

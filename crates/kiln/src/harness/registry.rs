@@ -358,17 +358,25 @@ impl Registry {
         let mut changed: Option<Info> = None;
         let mut gone = false;
         let mut save_names = false;
-        {
-            let mut g = self.mirrors.lock();
-            if let Update::Open { info } = &u {
-                let mut info = (**info).clone();
+        // Where it runs, and the name given here, are the server's to say: to the mirror and to
+        // viewers alike (a session announced again — a switch of harness, a reconnect — keeps its
+        // machine and its name). The machine's own name is kept aside: it counts once it changes it.
+        let mut reported = String::new();
+        let u = match u {
+            Update::Open { mut info } => {
                 info.target = from.target();
-                // The name given here, over whatever the machine has (a runner from before names
-                // has none); the machine's own counts once it changes it.
-                let reported = own_name(&info.name, &info.kind_name).unwrap_or_default().to_owned();
+                own_name(&info.name, &info.kind_name).unwrap_or_default().clone_into(&mut reported);
                 if let Some(n) = self.names.lock().get(id) {
                     info.name.clone_from(n);
                 }
+                Update::Open { info }
+            }
+            other => other,
+        };
+        {
+            let mut g = self.mirrors.lock();
+            if let Update::Open { info } = &u {
+                let info = (**info).clone();
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone()));
                 m.info = info.clone();
                 m.reported = reported;
