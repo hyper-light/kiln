@@ -491,8 +491,9 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     if let Some(m) = view.as_object_mut() {
                         m.insert("landed_at".into(), json!(since));
                     }
+                    let removed = view.get("removed").and_then(Value::as_bool) == Some(true);
                     r.provider = view;
-                    r.message = Some(format!("synced and healthy; settling for {settle}s"));
+                    r.message = Some(if removed { format!("removed; settling for {settle}s") } else { format!("synced and healthy; settling for {settle}s") });
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + settle.clamp(1, 5)).await?;
                 }
