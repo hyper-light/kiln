@@ -1103,6 +1103,8 @@ mod tests {
             ],
         );
         assert_eq!(core.state.todos.len(), 2);
+        // How the turn ended, for kiln's keep-going.
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref())), Some(("done", Some("end_turn"))));
         assert!(core.change_jobs.iter().any(|j| j.rel == "main.rs"));
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         // The queued message went out as the next prompt.
@@ -1142,6 +1144,7 @@ mod tests {
         assert!(w.iter().any(|v| v.pointer("/result/outcome/outcome").and_then(Value::as_str) == Some("cancelled")));
         assert!(core.state.approvals.is_empty());
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "cancelled"}})]);
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("stopped"), "you stopped it");
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str) == Some("stop, do this")));
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));

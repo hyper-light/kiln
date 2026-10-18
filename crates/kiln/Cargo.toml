@@ -28,6 +28,9 @@ parking_lot = "0.12.5"
 portable-pty = "0.9.0"
 rand = "0.10.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The conversation store's engine (docs/conversations.md): Turso, vendored (vendor/turso), Rust
+# only: no simd and pure-Rust crypto, so no C is compiled; no fts (it needs C on musl).
+turso_core = { path = "../../vendor/turso/core", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
 rust-embed = "8.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

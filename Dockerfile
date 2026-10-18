@@ -39,6 +39,8 @@ ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# Turso, vendored for the conversation store (vendor/turso/UPSTREAM.md); kiln depends on it by path.
+COPY vendor/turso/ vendor/turso/
 COPY --from=ui /src/ui/dist ui/dist
 # The UI is already built in the `ui` stage; a build.rs must not try to run npm again.
 # The final binary must be fully static (checked below): job pods copy /kiln into arbitrary images.
