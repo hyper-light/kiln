@@ -195,6 +195,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_put(&hub, &hash, req).await;
         }
+        (&Method::GET, ["api", "sync", "bundles", batch]) => {
+            let batch = (*batch).to_owned();
+            return sync_bundle_get(&hub, &batch, &req);
+        }
+        (&Method::PUT, ["api", "sync", "bundles", batch]) => {
+            let batch = (*batch).to_owned();
+            return sync_bundle_put(&hub, &batch, req).await;
+        }
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
@@ -328,6 +336,25 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member }).await
         }
         (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => sync_resolve(&hub, id, req).await,
+        (&Method::GET, ["api", "places"]) => Ok(srv::json(StatusCode::OK, &crate::sync::places::now(&hub).await?)),
+        (&Method::POST, ["api", "places", "look"]) => Ok(places_look(&hub).await),
+        (&Method::POST, ["api", "places", kind @ ("clone" | "sync" | "move" | "remove")]) => {
+            let kind = (*kind).to_owned();
+            places_start(&hub, &kind, req).await
+        }
+        (&Method::POST, ["api", "places", "tasks", id, "retry"]) => {
+            let tasks = crate::sync::tasks::retry(&hub, id).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+            hub.store.audit("admin".into(), "places.retry".into(), (*id).to_owned()).await;
+            Ok(srv::json(StatusCode::CREATED, &tasks))
+        }
+        (&Method::DELETE, ["api", "places", "tasks", id]) => {
+            if hub.tasks.dismiss(id) {
+                hub.emit(&json!({ "type": "places" }));
+                Ok(srv::status(StatusCode::NO_CONTENT))
+            } else {
+                Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
+            }
+        }
         (&Method::GET, ["api", "plans"]) => plans_list(&hub, &q).await,
         (&Method::POST, ["api", "plans"]) => plans_create(&hub, req).await,
         (&Method::GET, ["api", "plans", id]) => crate::plans::get(&hub, id).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
@@ -705,7 +732,7 @@ async fn sync_create(hub: &Hub, req: Request) -> R {
         known_machine(hub, &c.machine).await?;
     }
     let what = format!("{} ({} copies)", a.name, a.copies.len());
-    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude };
+    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude, transient: None };
     let id = hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), "sync.create".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "id": id })))
@@ -715,7 +742,7 @@ async fn sync_add_copy(hub: &Hub, id: &str, req: Request) -> R {
     let a: SyncCopyAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     known_machine(hub, &a.machine).await?;
     let what = format!("{id}: {}:{}", a.machine, a.path);
-    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path, adopt: false }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), "sync.copy.add".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "member": member.parse::<u64>().unwrap_or(0) })))
 }
@@ -738,6 +765,91 @@ async fn sync_ask(hub: &Hub, action: &str, id: &str, ask: crate::sync::server::A
     hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), action.to_owned(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+// ------------------------------------------------------------------ repositories on machines
+
+/// The largest bundle a machine sends (kiln's own mirrors' have no limit but the disk).
+const SYNC_BUNDLE_MAX: u64 = 64 << 30;
+
+/// A bundle's request: the machine it names (`?machine=`), when it carries that machine's token.
+fn bundle_machine(hub: &Hub, req: &Request) -> Option<String> {
+    let q = srv::query(req);
+    let machine = q.get("machine").filter(|m| !m.is_empty())?.clone();
+    bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(&machine).as_bytes())).then_some(machine)
+}
+
+/// A batch's bundle, for a machine it goes to.
+fn sync_bundle_get(hub: &Hub, batch: &str, req: &Request) -> R {
+    let machine = bundle_machine(hub, req).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad sync token"))?;
+    let (file, _, _) = hub.tasks.may_fetch(batch, &machine).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such bundle for that machine"))?;
+    let body = crate::rt::file_source(file).map_err(|_| err(StatusCode::NOT_FOUND, "no such bundle"))?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
+/// A batch's bundle, from the machine that makes it: kept whole, hashed as it comes, refused while
+/// the server's disk has less than [`SYNC_DISK_FLOOR`] free.
+async fn sync_bundle_put(hub: &Hub, batch: &str, req: Request) -> R {
+    use sha2::Digest as _;
+    let machine = bundle_machine(hub, &req).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad sync token"))?;
+    if !hub.tasks.may_send(batch, &machine) {
+        return Err(err(StatusCode::CONFLICT, format!("no bundle is wanted from {machine} for that")));
+    }
+    let file = hub.tasks.bundle_file(batch).ok_or_else(|| err(StatusCode::BAD_REQUEST, "no such batch"))?;
+    let length = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if length.is_some_and(|n| n > SYNC_BUNDLE_MAX) {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("bundles go up to {} GiB", SYNC_BUNDLE_MAX >> 30)));
+    }
+    if hub.sync.blobs().and_then(crate::sync::Blobs::free_bytes).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+        return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full"));
+    }
+    let tmp = file.with_extension("part");
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BUNDLE_MAX)?;
+    let mut h = sha2::Sha256::new();
+    let mut body = req.into_body();
+    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+        h.update(&chunk);
+        if sink.send(chunk).await.is_err() {
+            break;
+        }
+    }
+    drop(sink);
+    let size = match done.await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+        }
+    };
+    std::fs::rename(&tmp, &file).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let hash = hex::encode(h.finalize());
+    hub.tasks.sent(batch, hash.clone(), size);
+    Ok(srv::json(StatusCode::CREATED, &json!({ "hash": hash, "size": size })))
+}
+
+/// Starts a clone, sync, move or removal (`kind`) of a repository: its tasks, under way.
+async fn places_start(hub: &Arc<Hub>, kind: &str, req: Request) -> R {
+    let mut v: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("kind".into(), json!(kind));
+    }
+    let ask: crate::sync::tasks::Ask = serde_json::from_value(v).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let what = format!("{} to {}", ask.key, ask.to.iter().map(|t| format!("{}:{}", t.machine, t.path)).collect::<Vec<_>>().join(", "));
+    let tasks = crate::sync::tasks::start(hub, ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), format!("places.{kind}"), what).await;
+    Ok(srv::json(StatusCode::CREATED, &tasks))
+}
+
+/// Asks every connected machine that can to look at its repositories again now.
+async fn places_look(hub: &Hub) -> Response {
+    let mut asked = 0;
+    for a in hub.agent_list().await.into_iter().filter(|a| a.connected && !a.ephemeral) {
+        if hub.runner_caps(&a.name) & crate::proto::CAP_REPOS != 0 {
+            hub.sync.send(&a.name, crate::sync::wire::Msg::Look);
+            asked += 1;
+        }
+    }
+    srv::json(StatusCode::ACCEPTED, &json!({ "asked": asked }))
 }
 
 // ------------------------------------------------------------------ plans (crate::plans)

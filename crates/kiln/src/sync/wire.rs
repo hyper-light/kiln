@@ -2,6 +2,11 @@
 //! `AgentMsg::Sync` on a lane of their own: a [`Msg`] as JSON, so either side can add fields, and
 //! beside it the bytes of the hyper-raft message it carries, if any. Contents travel over HTTP
 //! instead (`GET`/`PUT /api/sync/blobs/:hash`), with the token [`Msg::Copies`] gives a machine.
+//!
+//! The same lane carries what machines say of the git repositories they hold ([`Msg::Repos`]) and
+//! the parts of moving repositories between them ([`Msg::Clone`], [`Msg::Bundle`], [`Msg::Delete`],
+//! answered by [`Msg::Task`]): only to runners announcing `CAP_REPOS`. A side that doesn't know a
+//! kind skips it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -44,6 +49,121 @@ pub enum Msg {
     Want { repo: String, hashes: Vec<String> },
     /// Runner → server: how a copy is doing.
     Status(CopyStatus),
+    /// Runner → server: the git repositories on this machine, whole (see [`Repos`]). Sent when it
+    /// connects, when they change, and when asked ([`Msg::Look`]).
+    Repos(Repos),
+    /// Server → runner: look at this machine's git repositories again now.
+    Look,
+    /// Server → runner: bundle the git repository at `path` (its branches, tags and `HEAD`) and
+    /// send it to the server for the batch of tasks `task` (`PUT /api/sync/bundles/:task`).
+    Bundle { task: String, path: String },
+    /// Server → runner: clone a repository into a folder (see [`CloneOrder`]).
+    Clone(CloneOrder),
+    /// Server → runner: task `task` moved the repository at `path` to another machine: its folder
+    /// goes. `origin`, when given, is the remote it must have (else it is left alone).
+    Delete {
+        task: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
+    /// Server → runner: kiln no longer keeps the clone at `path`; its files stay.
+    Forget { path: String },
+    /// Runner → server: how this machine's part of a task goes.
+    Task(TaskNews),
+}
+
+/// The git repositories on a machine, as it last looked: under its usual folders (`~/Projects`,
+/// `~/src`, …), the clones kiln made there, and its synced copies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Repos {
+    /// Its user's home: where `~` is on it.
+    pub home: String,
+    pub repos: Vec<Found>,
+    /// Why it couldn't look (no git), if it couldn't.
+    pub error: Option<String>,
+    /// Unix seconds.
+    pub at: i64,
+}
+
+/// One git repository on a machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Found {
+    /// Its folder, whole.
+    pub path: String,
+    /// `remote.origin.url`, without credentials.
+    pub origin: Option<String>,
+    /// The branch checked out; none: a detached `HEAD`.
+    pub branch: Option<String>,
+    /// The commit checked out; none: no commit yet.
+    pub head: Option<String>,
+    /// The branch it tracks, and how far ahead of and behind it the branch is.
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    /// Tracked files changed and not committed.
+    pub changed: u32,
+    /// When git last did something there (unix seconds).
+    pub active: i64,
+    /// kiln cloned it there.
+    pub kiln: bool,
+}
+
+/// Clone a repository into `path`, which must be absent or an empty folder: from a bundle the
+/// server holds for the task's batch (`GET /api/sync/bundles/:bundle`), or from `url` itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloneOrder {
+    pub task: String,
+    /// The repository's key (`crate::sync::places::key_of`), kept with the clone.
+    pub key: String,
+    pub path: String,
+    /// The bundle to fetch (its batch), its SHA-256 and size.
+    pub bundle: Option<String>,
+    pub hash: Option<String>,
+    pub size: u64,
+    pub url: Option<String>,
+    /// The branch to check out; none: the one the source has.
+    pub branch: Option<String>,
+    /// What `origin` is set to once cloned; none: the clone keeps no remote.
+    pub origin: Option<String>,
+    /// Every branch of the source becomes a branch here (a move), not only the one checked out.
+    pub all_branches: bool,
+}
+
+/// How a machine's part of a task goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskNews {
+    pub task: String,
+    /// `bundling`, `sending`, `fetching`, `cloning`, `deleting`, `done` or `failed`.
+    pub state: String,
+    /// What it is doing, in words.
+    pub detail: Option<String>,
+    pub error: Option<String>,
+    /// A bundle sent: its SHA-256 and size.
+    pub hash: Option<String>,
+    pub size: Option<u64>,
+    /// A clone made: the branch and commit it checked out.
+    pub branch: Option<String>,
+    pub head: Option<String>,
+}
+
+impl TaskNews {
+    pub fn new(task: &str, state: &str, detail: impl Into<String>) -> Self {
+        Self { task: task.to_owned(), state: state.to_owned(), detail: Some(detail.into()), ..Self::default() }
+    }
+
+    pub fn failed(task: &str, error: impl Into<String>) -> Self {
+        Self { task: task.to_owned(), state: "failed".to_owned(), error: Some(error.into()), ..Self::default() }
+    }
+
+    /// The task's part here is over.
+    pub fn over(&self) -> bool {
+        self.state == "done" || self.state == "failed"
+    }
 }
 
 /// A copy, as the server tells its machine.
@@ -58,6 +178,11 @@ pub struct CopySpec {
     pub exclude: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size: Option<u64>,
+    /// A folder kiln has just cloned for this copy: it takes the group's files once it has the
+    /// log through this index (what it holds that the group doesn't goes), proposing nothing till
+    /// then. Only for a copy whose machine has no state for it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt: Option<u64>,
 }
 
 /// How a copy is doing, as its machine says.
@@ -82,6 +207,11 @@ pub struct CopyStatus {
     pub error: Option<String>,
     /// Unix seconds.
     pub at: i64,
+    /// It has looked at its folder since it opened: what the folder held then is in the log, or
+    /// on its way (`unsent`).
+    pub looked: bool,
+    /// It waits to take the group's files (`CopySpec::adopt`).
+    pub adopting: bool,
 }
 
 /// A message as it goes on the wire: the JSON and the raft bytes beside it.
@@ -168,10 +298,23 @@ mod tests {
     }
 
     #[test]
-    fn messages_round_trip_as_json() {
+    fn messages_round_trip_as_json() -> anyhow::Result<()> {
         let m = Msg::Want { repo: "r".into(), hashes: vec!["ab".into()] };
         assert_eq!(decode(&encode(&m)), Some(m));
         // A field this side doesn't know is ignored.
         assert!(decode(r#"{"kind":"release","later":1}"#).is_some());
+        let order = Msg::Clone(CloneOrder { task: "t".into(), key: "github.com/a/b".into(), path: "/x".into(), bundle: Some("b".into()), hash: Some("ab".repeat(32)), size: 9, ..CloneOrder::default() });
+        assert_eq!(decode(&encode(&order)), Some(order));
+        let news = Msg::Task(TaskNews::new("t", "fetching", "9 bytes"));
+        assert_eq!(decode(&encode(&news)), Some(news));
+        // A kind this side doesn't know is skipped, as an older runner skips these.
+        assert_eq!(decode(r#"{"kind":"teleport","to":"mars"}"#), None);
+        // A copy's spec and status from before adopting read as they did.
+        let spec: CopySpec = serde_json::from_str(r#"{"repo":"r","name":"n","member":2,"path":"/p"}"#)?;
+        assert_eq!(spec.adopt, None);
+        assert!(!encode(&Msg::Copies { copies: vec![spec], token: String::new() }).contains("adopt"));
+        let status: CopyStatus = serde_json::from_str(r#"{"repo":"r","member":2,"applied":4}"#)?;
+        assert!(!status.looked && !status.adopting);
+        Ok(())
     }
 }

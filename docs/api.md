@@ -80,6 +80,11 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | DELETE | `/api/repos/:id` | |
 | POST | `/api/repos/:id/poll` | poll now |
 | POST | `/api/repos/:id/trigger` | `{ branch?, pipeline? }` → `Run[]` |
+| GET | `/api/places` | `{ repos: RepoRow[], machines: PlaceMachine[], tasks: PlaceTask[] }`: every repository (built, synced, on machines) with the folders it is in; see [sync.md](sync.md#repositories-on-machines) |
+| POST | `/api/places/{clone,sync,move,remove}` | `{ key, from?, branch?, to?: [{machine, path}], delete? }` → `PlaceTask[]` (one per machine) |
+| POST | `/api/places/look` | every machine looks at its repositories again → `{ asked }` |
+| POST | `/api/places/tasks/:id/retry` | → `PlaceTask[]` |
+| DELETE | `/api/places/tasks/:id` | forget a task that is over |
 | GET | `/api/runs?repo=&limit=50&before=` | `Run[]` newest first |
 | GET | `/api/runs/:id` | `{ run: Run, jobs: Job[] }` |
 | POST | `/api/runs/:id/cancel` | |
