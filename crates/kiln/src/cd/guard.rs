@@ -124,6 +124,12 @@ pub fn job(m: &Marker, template: &Value) -> Value {
             }
         }
     }
+    // kiln's container's own security settings, so the guard passes the namespace's pod security
+    // (kiln's is `restricted`) as kiln does.
+    let kiln = pod.get("containers").and_then(Value::as_array).and_then(|cs| cs.iter().find(|c| c.get("name").and_then(Value::as_str) == Some(m.container.as_str())));
+    if let (Some(sc), Some(c)) = (kiln.and_then(|c| c.get("securityContext")), spec.pointer_mut("/containers/0").and_then(Value::as_object_mut)) {
+        c.insert("securityContext".into(), sc.clone());
+    }
     json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -401,7 +407,12 @@ mod tests {
     #[test]
     fn the_guard_runs_the_previous_image_as_kiln() {
         let m = Marker { namespace: "kiln".into(), deployment: "kiln".into(), container: "kiln".into(), from: "acme/kiln@sha256:old".into(), to: "acme/kiln@sha256:new".into(), ..Marker::default() };
-        let template = json!({ "spec": { "serviceAccountName": "kiln", "imagePullSecrets": [{ "name": "kiln-registry" }], "containers": [] } });
+        let template = json!({ "spec": {
+            "serviceAccountName": "kiln",
+            "imagePullSecrets": [{ "name": "kiln-registry" }],
+            "securityContext": { "runAsNonRoot": true },
+            "containers": [{ "name": "kiln", "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } } }],
+        } });
         let j = job(&m, &template);
         assert_eq!(j.pointer("/spec/template/spec/containers/0/image").and_then(Value::as_str), Some("acme/kiln@sha256:old"));
         assert_eq!(j.pointer("/spec/template/spec/serviceAccountName").and_then(Value::as_str), Some("kiln"));
@@ -410,5 +421,8 @@ mod tests {
         assert_eq!(cmd.get(..3), Some(&["/kiln", "cd", "guard"][..]));
         assert!(cmd.windows(2).any(|w| w == ["--expect", "acme/kiln@sha256:new"]));
         assert_eq!(j.pointer("/spec/backoffLimit").and_then(Value::as_i64), Some(0));
+        // It meets the namespace's pod security as kiln's own pod does.
+        assert_eq!(j.pointer("/spec/template/spec/securityContext/runAsNonRoot").and_then(Value::as_bool), Some(true));
+        assert_eq!(j.pointer("/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation").and_then(Value::as_bool), Some(false));
     }
 }
