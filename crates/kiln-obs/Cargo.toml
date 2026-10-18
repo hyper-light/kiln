@@ -27,6 +27,8 @@ flate2 = "1.1.10"
 hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 # Only to read NAB's labels and results (benches/nab.rs); kiln has it already.
 serde_json = "1.0.154"
+# Only to run Loghub's benchmark with its own preprocessing (benches/loghub.rs); in the tree already.
+regex = "1"
 
 [[bench]]
 name = "codec"
@@ -58,6 +60,10 @@ harness = false
 
 [[bench]]
 name = "nab"
+harness = false
+
+[[bench]]
+name = "loghub"
 harness = false
 
 [lints]

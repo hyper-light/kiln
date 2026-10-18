@@ -2087,6 +2087,7 @@ dependencies = [
  "hyper-log",
  "hyper-measure",
  "hyper-raft",
+ "regex",
  "serde_json",
  "sha2",
  "tempfile",

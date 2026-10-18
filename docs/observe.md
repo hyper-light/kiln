@@ -18,7 +18,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
-| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); next: live tail, patterns | in progress |
+| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); next: live tail | in progress |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; next: forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
@@ -274,6 +274,12 @@ before the range on the range's grid (11,000 buckets in all at the most): the hi
 and the calibration are learned from, its gaps left out, its points' spacing their mean gap.
 `direction` (`both`, `above`, `below`) says which side of the band is anomalous.
 
+A search's records group into **patterns** (`kiln_obs::logs::patterns`): Drain (He et al., ICWS
+2017) over their messages, a number (its sign with it), `0x` hex and long hex ids masked where they
+stand apart, one setting for every system (depth 5, similarity 0.7, a masked variable alike where
+the template has a wildcard): on Loghub's 16 systems, 0.887 of lines grouped right, the setting
+chosen by leaving each system out (§12.13).
+
 Log search follows Datadog's log syntax: `service:web status:error @http.status_code:>=500
 "connection reset" -host:old-*`, with `AND`, `OR`, `NOT`, parentheses, wildcards and ranges, and
 log analytics `count() by {service}` over a search. A `-` that starts a term is NOT wherever it
@@ -296,6 +302,7 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `POST compact`, `POST verify` | cut and compact the log now; take every replica's full digest (an operator's, or a test's, check that replicas agree) |
 | `POST logs/aggregate` | log analytics: `{query, from, to, by: [facets], measure, of}` → groups; with `step` (ms), each group's value a bucket on a grid (the explorer's histogram) |
 | `POST logs/facets` | `{query, from, to, facets, top}` → each facet's most common values and how many it has, every facet in one pass |
+| `POST logs/patterns` | `{query, from, to}` → the search's newest records (10,000 at the most) grouped by their template (Drain, §12.13): each its count, first and last seen, newest message and its records by status, the most common first |
 | `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, read-only) and yours, kept in `<observe>/dashboards.json` |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups'; validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated |
@@ -860,6 +867,56 @@ at each); the calibration's detector learning an eighth or a quarter of the prob
 A point costs 0.36–0.46 µs (robust; the calibration's sorted window the larger part). `agile`'s
 ranking within files is as good (62.3 each file at its own threshold) but its errors' spread moves as
 its smoothing follows level shifts: next to be studied.
+
+### 12.13 Log patterns on Loghub
+
+`LOGHUB=<a checkout of github.com/logpai/loghub> cargo bench -p kiln-obs --bench loghub`: 16
+systems, 2,000 labelled lines each (Zhu et al., "Tools and Benchmarks for Automated Log Parsing",
+ICSE-SEIP 2019), scored by grouping accuracy (a line is right when its group holds exactly the
+lines of its true event).
+
+**The port** (`kiln_obs::logs::patterns`, from `logparser/Drain/Drain.py`): given the benchmark's
+own settings (each system's regexes, similarity and depth, `benchmark.py`), every system's accuracy
+is what Drain's README publishes, to the line (HDFS 0.9975 … Proxifier 0.5265; average 0.8654).
+
+**kiln's**: no system's rules, one masking for all (a number with its sign, between characters not
+letters or digits; `0x` hex; runs of 8+ hex digits with a digit), and two changes to how Drain reads
+masked messages: a token with a part masked goes the tree's wildcard way (masking
+`www.example.com:443` leaves no digit, and each host would be a branch of its own), and a masked
+variable where the template has a wildcard is alike (the reference counts no wildcard as alike, so a
+message of eleven tokens with four masked could be at most 7/11 like any template). The average
+accuracy over the 16, by similarity and depth:
+
+| similarity | depth 3 | depth 4 | depth 5 | depth 6 | depth 7 |
+| --- | --- | --- | --- | --- | --- |
+| 0.3 | 0.693 | 0.761 | 0.821 | 0.828 | 0.817 |
+| 0.5 | 0.724 | 0.769 | 0.825 | 0.830 | 0.817 |
+| 0.6 | 0.787 | 0.815 | 0.860 | 0.862 | 0.849 |
+| **0.7** | 0.830 | 0.849 | **0.887** | 0.879 | 0.863 |
+| 0.8 | 0.838 | 0.838 | 0.875 | 0.867 | 0.854 |
+
+Leaving each system out and choosing on the other fifteen, every fold chooses depth 5 and 0.7: 0.887
+on the system held out, the estimate for a system kiln has never seen, against the benchmark's
+0.865 with each system's own rules and settings. Each step was measured: masking alone at Drain's
+usual setting, 0.778; routing masked tokens as variables, 0.827 at the best of the grid; masked
+variables alike, 0.874; a number's sign with it (`blk_-…` and `blk_…` one token), 0.887.
+
+| system | kiln | Drain, tuned | | system | kiln | Drain, tuned |
+| --- | --- | --- | --- | --- | --- | --- |
+| HDFS | 0.998 | 0.998 | | Linux | 0.690 | 0.690 |
+| Hadoop | 0.974 | 0.948 | | Android | 0.918 | 0.911 |
+| Spark | 0.925 | 0.920 | | HealthApp | 1.000 | 0.780 |
+| Zookeeper | 0.989 | 0.967 | | Apache | 1.000 | 1.000 |
+| BGL | 0.985 | 0.963 | | Proxifier | 0.527 | 0.527 |
+| HPC | 0.906 | 0.887 | | OpenSSH | 0.995 | 0.788 |
+| Thunderbird | 0.961 | 0.955 | | OpenStack | 0.881 | 0.733 |
+| Windows | 0.695 | 0.997 | | Mac | 0.756 | 0.787 |
+
+Where it loses: Loghub labels some values as constants (`client SPP` and
+`client WindowsUpdateAgent`, `user=root` and `user=guest` are each two events), and a group with one
+line of another event is all wrong, so Windows' largest group (608 lines) falls with one line;
+Proxifier's `lifetime <1 sec` and `lifetime 00:01` are one event of different lengths, which Drain
+never joins (nor does the reference, given no rule for it). A line costs 0.2–0.8 µs.
 
 ## 13. Scenarios
 

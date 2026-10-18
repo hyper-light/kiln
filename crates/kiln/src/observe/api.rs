@@ -124,6 +124,8 @@ const INGEST_BODY: usize = 16 << 20;
 const LIST: usize = 10_000;
 /// Log records a search gives, at the most.
 const LOGS_MAX: usize = 1_000;
+/// Log records a search's patterns are found from, at the most (its newest).
+const PATTERN_RECORDS: usize = 10_000;
 
 fn fail(code: StatusCode, why: impl std::fmt::Display) -> Fail {
     (code, why.to_string())
@@ -183,6 +185,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["logs", "search"]) => search(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["logs", "aggregate"]) => aggregate(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["logs", "facets"]) => facets(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["logs", "patterns"]) => patterns(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["events"]) => post_event(read_json(req.into_body(), QUERY_BODY).await?),
         (&Method::POST, ["events", "search"]) => {
             let mut b: SearchBody = read_json(req.into_body(), QUERY_BODY).await?;
@@ -413,6 +416,67 @@ struct SearchBody {
     to: i64,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// A search's patterns (`kiln_obs::logs::patterns`, Drain): its newest records (10,000 at the most)
+/// grouped by template, oldest first as Drain reads a stream; each its count, when first and last
+/// seen, its newest message, and its records by status; the most common first.
+async fn patterns(body: SearchBody) -> Result<Response, Fail> {
+    use kiln_obs::logs::patterns::{Drain, Params, tokens};
+    reading(move |s| {
+        let started = std::time::Instant::now();
+        let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let ns = |ms: i64| ms.saturating_mul(1_000_000);
+        let found = s.search_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(PATTERN_RECORDS).clamp(1, PATTERN_RECORDS)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        #[derive(Default)]
+        struct Seen<'a> {
+            count: u64,
+            first: i64,
+            last: i64,
+            sample: &'a str,
+            statuses: std::collections::BTreeMap<&'static str, u64>,
+        }
+        let mut drain = Drain::new(Params::default());
+        let mut seen: Vec<Seen<'_>> = Vec::new();
+        for r in found.records.iter().rev() {
+            let id = drain.add(&tokens(&r.message));
+            if seen.len() <= id {
+                seen.resize_with(id + 1, Seen::default);
+            }
+            if let Some(g) = seen.get_mut(id) {
+                if g.count == 0 {
+                    g.first = r.ts;
+                }
+                g.count += 1;
+                g.last = r.ts;
+                g.sample = &r.message;
+                *g.statuses.entry(kiln_obs::logs::record::level(r.severity)).or_default() += 1;
+            }
+        }
+        // Templates that came out alike are one pattern.
+        let mut by_text: Vec<(String, Seen<'_>)> = Vec::new();
+        for (c, g) in drain.clusters().iter().zip(seen) {
+            let text = c.text();
+            match by_text.iter_mut().find(|(t, _)| *t == text) {
+                Some((_, into)) => {
+                    into.count += g.count;
+                    into.first = into.first.min(g.first);
+                    if g.last >= into.last {
+                        into.last = g.last;
+                        into.sample = g.sample;
+                    }
+                    for (k, v) in g.statuses {
+                        *into.statuses.entry(k).or_default() += v;
+                    }
+                }
+                None => by_text.push((text, g)),
+            }
+        }
+        by_text.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+        let patterns: Vec<Value> = by_text.iter().map(|(t, g)| json!({ "template": t, "count": g.count, "first_ns": g.first, "last_ns": g.last, "sample": g.sample, "statuses": g.statuses })).collect();
+        Ok(srv::json(StatusCode::OK, &json!({ "patterns": patterns, "records": found.records.len(), "rows_scanned": found.rows_scanned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
+    })
+    .await
 }
 
 async fn search(body: SearchBody) -> Result<Response, Fail> {
