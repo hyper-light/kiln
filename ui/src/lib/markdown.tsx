@@ -4,13 +4,40 @@
  * live conversation) and in server components (pages that send no markdown code at all).
  */
 import * as React from "react";
-import type { Element, Root, RootContent } from "hast";
+import type { Element, ElementContent, Root, RootContent } from "hast";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CopyBlock } from "@/components/ui/copy-block";
 
+/** A table cell keeps its words whole (harness.css), so a long run in one (a path, a URL, a digest)
+ *  gets places to wrap: after its slashes, then (where a piece is still long) its other separators,
+ *  then every 20 characters. */
+const LONG_RUN = /(\S{21,})/;
+const AFTER_SLASHES = /[^/\\]*[/\\]+|[^/\\]+/g;
+const AFTER_SEPARATORS = /[^._:?&=#@+,;|~-]*[._:?&=#@+,;|~-]+|[^._:?&=#@+,;|~-]+/g;
+const splitLong = (s: string, at: RegExp) => (s.length > 20 ? (s.match(at) ?? [s]) : [s]);
+const pieces = (run: string) =>
+  splitLong(run, AFTER_SLASHES)
+    .flatMap((p) => splitLong(p, AFTER_SEPARATORS))
+    .flatMap((p) => p.match(/.{1,20}/gu) ?? [p]);
+function breakRuns(n: Element) {
+  n.children = n.children.flatMap((c): ElementContent[] => {
+    if (c.type === "element") breakRuns(c);
+    if (c.type !== "text" || !LONG_RUN.test(c.value)) return [c];
+    const out: ElementContent[] = [];
+    c.value.split(LONG_RUN).forEach((part, i) => {
+      (i % 2 ? pieces(part) : [part]).forEach((value, j) => {
+        if (j) out.push({ type: "element", tagName: "wbr", properties: {}, children: [] });
+        if (value) out.push({ type: "text", value });
+      });
+    });
+    return out;
+  });
+}
+
 /** Marks tables for the narrow layout: each body cell carries its column's heading
- *  (`data-label`), and a table of three or more columns is `data-wide`. */
+ *  (`data-label`), and a table of three or more columns is `data-wide`. Long runs in its cells
+ *  get places to wrap. */
 function labelTables() {
   const text = (n: RootContent): string => (n.type === "text" ? n.value : "children" in n ? n.children.map(text).join("") : "");
   const kids = (n: Element | undefined, tag: string): Element[] =>
@@ -24,6 +51,7 @@ function labelTables() {
           td.properties = { ...td.properties, dataLabel: labels[i] ?? "" };
         });
       }
+      breakRuns(n);
     }
     for (const c of n.children) if (c.type === "element") walk(c);
   };
