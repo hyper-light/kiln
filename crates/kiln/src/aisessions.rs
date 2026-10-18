@@ -1549,7 +1549,7 @@ mod tests {
         }
         // Nothing to continue yet; a harness kiln cannot run as an agent session.
         assert_eq!(AiSession { id: String::new(), ..s.clone() }.takeover(true), TakeOver::NoId);
-        assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
+        assert_eq!(AiSession { tool: "no-such-harness".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
         assert_eq!(serde_json::to_value(TakeOver::NoId).ok(), Some(serde_json::json!("no_id")));
         assert_eq!(serde_json::to_value(TakeOver::Stop).ok(), Some(serde_json::json!("stop")));
     }
