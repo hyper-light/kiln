@@ -183,7 +183,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken); principals and roles left |
 | W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
-| W13 | Runners and executors | W06 | in progress | job containers, services, Docker actions on the host executor; probes, pools, microVMs, k8s left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
@@ -191,8 +191,8 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W18 | Supply chain, untrusted code | W10, W13 | blocked (W10) | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
-| W21 | UI | each backend it shows | ready (runs and DAG, editor) | |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02 first batch (16 actions: 11 green, 4 DNS, 1 needs Ubuntu) |
+| W21 | UI | each backend it shows | in progress | the CI API the pages read (runs, graph, legs, annotations, summaries, artifacts, routing explain); the pages left |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02 first batch (16 actions: 12 green, 4 hit a DNS outage) |
 
 ---
 
@@ -1905,7 +1905,10 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
   - `uses:` steps (W07), with pre and post steps (R11).
   - Runners announce `CAP_CI2` and `CAP_ACTIONS`.
 - *Left.*
-  - Background steps (R17), problem matchers, `KILN_OUTPUT_JSON` and `exports`.
+  - Background steps (R17). The plan: a background step's process runs in its own task, with
+    its own masker and command processor. Its environment, path and outputs are applied at its
+    `wait`, in declared order.
+  - Problem matchers, `KILN_OUTPUT_JSON` and `exports`.
   - Debug (R13).
   - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
 
@@ -2810,8 +2813,18 @@ enforcement points to W18, agent isolation to W20.
   - teardown;
   - Docker actions (W07-R06);
   - `CAP_DOCKER` announced when a CLI answers.
-- *Left.* R01's probes and R02, the `docker`, `firecracker`, `shards` and `k8s` executors (R04
-  to R07), R09 to R15, and the ACs.
+- *Done.* R04's `docker` executor:
+  - a leg runs in a fresh container of its routing rule's image, without the host's Docker
+    socket;
+  - GitHub's Ubuntu labels prefer it where the runner has Docker, and run on the host otherwise;
+  - `kiln/runner-ubuntu-24.04` and `-22.04` are built on the runner the first time a leg needs
+    one, from a Dockerfile kiln carries;
+  - an `ubuntu-latest` leg ran `setup-python` in it end to end.
+- *Left.*
+  - R01's probes and R02.
+  - The `firecracker`, `shards` and `k8s` executors (R05 to R07).
+  - Pools, opt-in Docker access and images built in kiln (R09 to R15).
+  - The ACs.
 
 ### W14 Code hosting, stacked diffs, review and landing
 
@@ -3544,7 +3557,20 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 - **W21-AC04** The runs list with 1,000,000 runs shows its first page in < 100 ms of server time and
   scrolls without blanking. *UI bench.*
 
-**Progress.** Not started.
+**Progress.** In progress: the data comes first.
+
+- *Done.* The API the pages read (§4.1), in `crates/kiln/src/ci/runs_api.rs`:
+  - runs, with filters and cursor paging;
+  - a run with its legs;
+  - the graph, with needs edges and the critical path;
+  - annotations, summaries and artifacts;
+  - cancel, and rerun (mode `all`);
+  - a leg with its steps and annotations, its logs, and routing explain;
+  - caches.
+- Legs of the engine already show on today's run page (steps, logs). Their graph edges come from
+  the needed legs' keys.
+- *Left.* Every page and component of this workstream: runs, the run graph, the leg page, the
+  editor and the rest, with the UI acceptance criteria in Chromium and WebKit.
 
 ### W22 Conformance, end-to-end and performance testing
 
@@ -3617,8 +3643,8 @@ live cluster, fault injection, security, performance, and mixed-version fleets.
     - `setup-buildx`, `cosign-installer`, `setup-deno` and `setup-zig`: the host's DNS failed
       during the run (to rerun).
     - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
-      host is not Ubuntu. It needs an Ubuntu environment: the `docker` executor with an Ubuntu
-      runner image (W13-R04, W05-R21).
+      host is not Ubuntu. *Fixed:* `ubuntu-latest` legs now run in kiln's Ubuntu runner image
+      (W13-R04), where it installs CPython 3.12.
 - *Left.* Everything else: AC01 and AC03 to AC09, `docs/ci-conformance.md`, and the rest of
   F-21.
 
