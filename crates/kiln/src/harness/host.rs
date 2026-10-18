@@ -319,9 +319,11 @@ impl Host {
             .lock()
             .values()
             .map(|s| {
+                // resume_spec takes the session's lock itself: before this one, never inside it.
+                let spec = s.resume_spec();
                 let core = s.core.lock();
                 let st = &core.state;
-                Saved { id: s.id.clone(), spec: s.resume_spec(), queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume }
+                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume }
             })
             .collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
@@ -456,6 +458,51 @@ mod tests {
             assert_eq!(host.inventory().sessions, vec!["a".to_owned()]);
             assert!(host.close("a"));
             assert!(host.list().is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_session_is_saved_and_restored_with_its_pause_without_deadlocking() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (tx, _rx) = async_channel::unbounded();
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let host = Host::new(tx, Some(file.clone()), Limits::default());
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Spec::default()
+            };
+            let s = host.open(Some("a".into()), spec)?;
+            {
+                let mut core = s.core.lock();
+                core.state.harness_session = Some("h1".into());
+                core.state.pause = Some(super::super::model::Pause { reason: "limit".into(), since: 7, auto: true, by: "harness".into(), checking: Some(9), ..Default::default() });
+                core.state.pause_at = Some(90);
+            }
+            // Saving takes each session's lock: it must never take one twice.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let saver = host.clone();
+            std::thread::spawn(move || {
+                saver.save_now();
+                let _ = done_tx.send(());
+            });
+            anyhow::ensure!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "saving the sessions deadlocked");
+            let saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let a = saved.first().ok_or_else(|| anyhow::anyhow!("nothing saved"))?;
+            assert_eq!(a.pointer("/spec/resume").and_then(serde_json::Value::as_str), Some("h1"));
+            assert_eq!(a.pointer("/pause/since").and_then(serde_json::Value::as_i64), Some(7));
+            assert_eq!(a.get("pause_at").and_then(serde_json::Value::as_u64), Some(90));
+            // Another start of the machine picks the pause up, its check under way asked again.
+            let (tx2, _rx2) = async_channel::unbounded();
+            let again = Host::new(tx2, Some(file.clone()), Limits::default());
+            again.restore();
+            let back = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let p = back.core.lock().state.pause.clone().ok_or_else(|| anyhow::anyhow!("pause not restored"))?;
+            assert_eq!((p.since, p.checking), (7, None));
+            assert_eq!(back.core.lock().state.pause_at, Some(90));
             Ok(())
         })
     }
