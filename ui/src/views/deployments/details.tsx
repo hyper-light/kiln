@@ -20,10 +20,13 @@ import { FileDiffView } from "@/views/harness/diff";
 import { age, compareText } from "./model";
 import { HealthPair, KindBadge, StatePair, SyncPair, appKey, objectLabel } from "./parts";
 
-type Show = "summary" | "live" | "desired" | "diff" | "events" | "logs";
+export type Show = "summary" | "live" | "desired" | "diff" | "events" | "logs";
 
 /** Kinds that run pods, whose logs are theirs. */
 const RUNS_PODS = new Set(["Pod", "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet", "Job", "CronJob"]);
+
+/** It has logs to read: it runs pods, and is in the cluster. */
+export const hasLogs = (n: CdNode) => RUNS_PODS.has(n.kind) && !n.missing;
 
 const when = (t: string | null | undefined) => {
   if (!t) return "";
@@ -45,15 +48,18 @@ export function ResourceDetails({
   node,
   onClose,
   onSelect,
+  initial,
 }: {
   appId: string;
   node: CdNode;
   onClose: () => void;
   /** Go to another node (an owner). */
   onSelect: (id: string) => void;
+  /** What it opens on (its logs, its events), when asked for. */
+  initial?: Show;
 }) {
   const now = useNow();
-  const logs = RUNS_PODS.has(node.kind) && !node.missing;
+  const logs = hasLogs(node);
   const options: { value: Show; label: string }[] = [
     { value: "summary", label: "Summary" },
     { value: "live", label: "Live manifest" },
@@ -61,7 +67,7 @@ export function ResourceDetails({
     { value: "events", label: "Events" },
     ...(logs ? [{ value: "logs" as const, label: "Logs" }] : []),
   ];
-  const [show, setShow] = React.useState<Show>(node.kind === "Pod" && (node.health === "Degraded" || (node.restarts ?? 0) > 0) ? "logs" : "summary");
+  const [show, setShow] = React.useState<Show>(initial ?? (node.kind === "Pod" && (node.health === "Degraded" || (node.restarts ?? 0) > 0) ? "logs" : "summary"));
   const current = options.some((o) => o.value === show) ? show : "summary";
 
   return (

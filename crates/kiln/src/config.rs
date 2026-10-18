@@ -32,6 +32,9 @@ pub struct Config {
     pub ci: ci::Ci,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
     pub conversations: Conversations,
+    /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
+    /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
+    pub agent: crate::runner::probe::Declared,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,

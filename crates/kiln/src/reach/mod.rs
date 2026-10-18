@@ -14,15 +14,27 @@ pub mod serve;
 pub mod sync;
 pub mod wire;
 
-/// How the timeline shows a call of reach's MCP tools (server `kiln-reach`, or `kiln_reach` as
-/// Codex names it): a command on another machine reads as a command, saying where.
+/// The MCP servers whose tools are reach's: a runner's own kiln server (`kiln`, `crate::reach::mcp`),
+/// and `kiln-reach` (`kiln_reach` as Codex names it) as sessions from before it called it.
+fn ours(server: &str) -> bool {
+    matches!(server, "kiln" | "kiln-reach" | "kiln_reach")
+}
+
+/// How the timeline shows a call of reach's MCP tools: a command on another machine reads as a
+/// command, saying where; a program reads as its first line.
 pub fn describe(server: &str, tool: &str, input: &serde_json::Value) -> Option<(crate::harness::model::ToolKind, String, Option<String>)> {
     use crate::harness::model::ToolKind;
-    if server != "kiln-reach" && server != "kiln_reach" {
+    if !ours(server) {
         return None;
     }
     let s = |k: &str| input.get(k).and_then(serde_json::Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
     Some(match tool {
+        "code_run" | "code_search" => {
+            let program = s("program").unwrap_or_default();
+            let first = program.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//")).unwrap_or("").chars().take(120).collect::<String>();
+            let what = if tool == "code_run" { "kiln program" } else { "kiln operations" };
+            (ToolKind::Mcp, if first.is_empty() { what.to_owned() } else { first }, Some(what.to_owned()))
+        }
         "run" => {
             let on = s("on").map_or_else(|| "on the best runner".to_owned(), |o| format!("on {o}"));
             let how = if input.get("background").and_then(serde_json::Value::as_bool) == Some(true) { " · in the background" } else { "" };
@@ -44,7 +56,7 @@ pub struct Shown {
 }
 
 pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
-    let tool = tool_name.strip_prefix("mcp__kiln-reach__").or_else(|| tool_name.strip_prefix("mcp__kiln_reach__"))?;
+    let tool = tool_name.strip_prefix("mcp__kiln__").or_else(|| tool_name.strip_prefix("mcp__kiln-reach__")).or_else(|| tool_name.strip_prefix("mcp__kiln_reach__"))?;
     if !matches!(tool, "run" | "output" | "stop") {
         return None;
     }

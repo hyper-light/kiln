@@ -476,6 +476,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
+        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => harness_recover(&hub, machine, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
             let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
@@ -2836,6 +2837,7 @@ struct HarnessOpen {
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
+    let opener = caller_of(hub, req.headers()).await.and_then(|c| c.opener());
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
@@ -2852,7 +2854,28 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`).
+    if let Some(o) = &opener {
+        for i in &infos {
+            let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;
+        }
+    }
     Ok(srv::json(StatusCode::OK, &infos))
+}
+
+/// Every agent of a machine that's gone goes on elsewhere, from the server's copy of its
+/// conversation (`harness::relocate::recover`): `{"to"?}` puts them all on one machine.
+async fn harness_recover(hub: &Arc<Hub>, machine: &str, req: Request) -> R {
+    #[derive(serde::Deserialize, Default)]
+    struct Body {
+        #[serde(default)]
+        to: Option<String>,
+    }
+    let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let moved = crate::harness::relocate::recover(hub, machine, b.to.as_deref()).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let ok = moved.iter().filter(|m| m.get("error").is_none()).count();
+    hub.store.audit("admin".into(), "agent.recover".into(), format!("{ok} of {} agents of {machine} go on elsewhere", moved.len())).await;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({ "moved": moved })))
 }
 
 /// One thing to many agents at once: a prompt or slash command, a command, or answers to every

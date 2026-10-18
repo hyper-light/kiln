@@ -316,6 +316,8 @@ struct State {
     refresh: Option<std::sync::Arc<super::auth::Refresh>>,
     /// Where the runner put its own binary, for `kiln auth` (W11-R04), last on steps' `PATH`.
     kiln_bin: Option<PathBuf>,
+    /// The leg's egress proxy (W18-R08), when it has a network policy.
+    egress: Option<std::sync::Arc<super::egress::Pool>>,
 }
 
 /// A background step that finished, and what it changed: applied to the leg at its `wait`, in
@@ -909,6 +911,7 @@ impl Leg {
             integrations: BTreeMap::new(),
             refresh: None,
             kiln_bin: None,
+            egress: None,
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -937,6 +940,23 @@ impl Leg {
                 c.stop().await;
             }
             return Ok(Status::Failed);
+        }
+        // A network policy with the leg's steps on the host (W18-R08): the proxy on loopback.
+        if let (Some(n), None) = (&a.network, &st.egress) {
+            match super::egress::Pool::local(self.egress_policy(n)).await {
+                Ok((pool, port)) => {
+                    let url = format!("http://127.0.0.1:{port}");
+                    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                        st.env.insert(k.into(), url.clone());
+                    }
+                    for k in ["NO_PROXY", "no_proxy"] {
+                        st.env.insert(k.into(), "localhost,127.0.0.1,::1".into());
+                    }
+                    st.egress = Some(std::sync::Arc::new(pool));
+                    self.annotate(0, "warning", "The job's network policy can't be enforced on the host: its steps are pointed at kiln's egress proxy (HTTP_PROXY), but a step may connect around it. A container or microVM contains it.").await;
+                }
+                Err(e) => self.note(0, &format!("Error: the egress proxy: {e:#}")).await,
+            }
         }
         self.report_facts(&st).await;
         if !a.integrations.is_empty() && !self.integrations(&mut st).await {
@@ -1102,25 +1122,7 @@ impl Leg {
             bytes.extend_from_slice(&c);
             anyhow::ensure!(bytes.len() < 8 << 30, "the commit is over 8 GiB");
         }
-        crate::rt::blocking(move || -> anyhow::Result<()> {
-            std::fs::create_dir_all(&ws)?;
-            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
-            for entry in ar.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?.into_owned();
-                let rel: PathBuf = path.components().skip(1).collect();
-                if rel.as_os_str().is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-                    continue;
-                }
-                let target = ws.join(rel);
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                entry.unpack(target)?;
-            }
-            Ok(())
-        })
-        .await??;
+        crate::rt::blocking(move || unpack_tree(&bytes, &ws)).await??;
         Ok(())
     }
 
@@ -1632,9 +1634,25 @@ impl Leg {
         let map = self.container_map(l);
         let workdir = map.translate(&l.workspace.to_string_lossy());
         // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
+        // A leg with a network policy never gets the host's Docker socket: it would get around it.
+        let open = a.network.is_none();
         let job = match (&a.job_container, &a.executor.image) {
-            (Some(c), _) => Some(super::docker::Spec { docker_socket: true, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
-            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: self.docker_inside(), ..super::docker::Spec::default() }),
+            (Some(c), _) => Some(super::docker::Spec { docker_socket: open, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
+            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: open && self.docker_inside(), ..super::docker::Spec::default() }),
+            _ => None,
+        };
+        // W18-R08: a job in a container is contained, its one way out the relay to the runner's
+        // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
+        // stops here; a trusted one runs as it would without its policy, and says so.
+        let egress = match (&a.network, &job) {
+            (Some(n), Some(_)) => match super::egress::relay_binary() {
+                Some(binary) => Some((super::docker::EgressSpec { binary, token: crate::util::random_token() }, n.clone())),
+                None if n.untrusted => anyhow::bail!("this untrusted leg's network can't be contained here: the runner has no static kiln for its egress relay (a musl build of kiln, or KILN_EGRESS_BINARY)"),
+                None => {
+                    self.annotate(idx, "warning", "The job's network policy isn't enforced: this runner has no static kiln for the egress relay (a musl build of kiln, or KILN_EGRESS_BINARY).").await;
+                    None
+                }
+            },
             _ => None,
         };
         let mut services = Vec::new();
@@ -1643,13 +1661,27 @@ impl Leg {
         }
         let said = parking_lot::Mutex::new(Vec::<String>::new());
         let say = |m: String| said.lock().push(m);
-        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, &say).await;
+        let keys: Vec<String> = services.iter().map(|(k, _)| k.clone()).collect();
+        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, egress.as_ref().map(|(e, _)| e), &say).await;
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{}\r\n", st.masker.mask(&line)).into_bytes()).await;
         }
-        st.containers = Some(started?);
+        let started = started?;
+        if let (Some((e, n)), Some((_, port))) = (egress, started.relay.as_ref()) {
+            st.egress = Some(std::sync::Arc::new(super::egress::Pool::start(*port, e.token, self.egress_policy(&n))));
+            st.env.extend(super::docker::proxy_env(keys.iter().map(String::as_str)));
+            self.note(idx, &format!("The leg's network is contained: out only through kiln's egress proxy, to kiln and {}", if n.allow.is_empty() { "nothing else".to_owned() } else { n.allow.join(", ") })).await;
+        }
+        st.containers = Some(started);
         Ok(())
+    }
+
+    /// What the leg's network policy lets it reach: kiln's server always, as this runner reaches it.
+    fn egress_policy(&self, n: &kiln_ci::wire::Network) -> super::egress::Policy {
+        let r = &self.a.runtime;
+        let urls: Vec<&str> = [r.results_url.as_str(), r.cache_url.as_str(), r.facade_url.as_str(), r.api_url.as_str(), r.graphql_url.as_str()].into_iter().chain(r.id_token_url.as_deref()).collect();
+        super::egress::Policy::new(n.allow.clone(), &urls)
     }
 
     async fn start(&self, idx: u32, name: &str, kind: &str, action: Option<String>) {
@@ -1667,6 +1699,10 @@ impl Leg {
             }
         }
         if !nested {
+            // What the leg's egress policy refused while it ran (W18-R08).
+            for what in st.egress.as_ref().map(|p| p.blocked()).unwrap_or_default() {
+                self.annotate(idx, "warning", &format!("blocked egress to {what}")).await;
+            }
             let masked: BTreeMap<String, String> = outputs.iter().map(|(k, v)| (k.clone(), st.masker.mask(v))).collect();
             self.event(&JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs: masked }).await;
         }
@@ -2183,6 +2219,52 @@ impl Leg {
         let run_env = if a.run_env { st.run_env.iter().filter(|(_, v)| st.masker.mask(v) == **v).cloned().collect() } else { Vec::new() };
         let secret_outputs = secret_values.keys().cloned().collect();
         self.event(&JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values, environment_url }).await;
+    }
+}
+
+/// A commit's tarball (`<prefix>/<path>…`, gzipped) unpacked into `ws`, its prefix dropped. No
+/// entry lands outside `ws` (docs/ci.md W22-AC07): none with `..`, and none whose directory a
+/// link earlier in the archive leads elsewhere. Links themselves are kept as git has them.
+pub(crate) fn unpack_tree(bytes: &[u8], ws: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(ws)?;
+    let root = ws.canonicalize()?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let rel: PathBuf = path.components().skip(1).collect();
+        if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            continue;
+        }
+        let target = ws.join(&rel);
+        if let Some(parent) = target.parent() {
+            if !stays_inside(&root, parent) {
+                tracing::warn!(path = %rel.display(), "a tarball entry would land outside the workspace; skipped");
+                continue;
+            }
+            std::fs::create_dir_all(parent)?;
+        }
+        // A link there is replaced, never written through.
+        if target.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+            std::fs::remove_file(&target)?;
+        }
+        entry.unpack(target)?;
+    }
+    Ok(())
+}
+
+/// Whether `dir`, made or yet to be made, is inside `root`: its deepest part that exists, with
+/// links resolved (a dangling one isn't).
+fn stays_inside(root: &Path, dir: &Path) -> bool {
+    let mut probe = dir;
+    loop {
+        if probe.symlink_metadata().is_ok() {
+            return probe.canonicalize().is_ok_and(|p| p.starts_with(root));
+        }
+        match probe.parent() {
+            Some(p) => probe = p,
+            None => return false,
+        }
     }
 }
 
@@ -2906,6 +2988,52 @@ impl Leg {
 mod tests {
     use super::*;
 
+    /// W22-AC07: a hostile tarball can't write outside the workspace, through `..`, a link to a
+    /// directory outside, or a link where a file goes.
+    #[cfg(unix)]
+    #[test]
+    fn w22_ac07_tarball_stays_in_the_workspace() -> anyhow::Result<()> {
+        type Tar = tar::Builder<flate2::write::GzEncoder<Vec<u8>>>;
+        let dir = tempfile::tempdir()?;
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("victim"), b"untouched")?;
+        let mut tar: Tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let file = |b: &mut Tar, path: &str, body: &[u8]| -> anyhow::Result<()> {
+            let mut h = tar::Header::new_old();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            // Its name as raw bytes: the builder itself refuses `..`.
+            h.as_old_mut().name.iter_mut().zip(path.as_bytes()).for_each(|(d, s)| *d = *s);
+            h.set_cksum();
+            b.append(&h, body)?;
+            Ok(())
+        };
+        let link = |b: &mut Tar, path: &str, to: &Path| -> anyhow::Result<()> {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            b.append_link(&mut h, path, to)?;
+            Ok(())
+        };
+        file(&mut tar, "repo-abc/ok.txt", b"fine")?;
+        file(&mut tar, "repo-abc/../../escape", b"no")?;
+        link(&mut tar, "repo-abc/out", &outside)?;
+        file(&mut tar, "repo-abc/out/evil", b"no")?;
+        file(&mut tar, "repo-abc/out/new/deeper", b"no")?;
+        link(&mut tar, "repo-abc/victim", &outside.join("victim"))?;
+        file(&mut tar, "repo-abc/victim", b"replaced")?;
+        let bytes = tar.into_inner()?.finish()?;
+        unpack_tree(&bytes, &ws)?;
+        assert_eq!(std::fs::read(ws.join("ok.txt"))?, b"fine");
+        assert!(!dir.path().join("escape").exists() && !outside.join("evil").exists() && !outside.join("new").exists());
+        assert_eq!(std::fs::read(outside.join("victim"))?, b"untouched", "a link replaced, not written through");
+        assert_eq!(std::fs::read(ws.join("victim"))?, b"replaced");
+        assert!(ws.join("out").symlink_metadata()?.file_type().is_symlink(), "links are kept as they are");
+        Ok(())
+    }
+
     /// A leg run here, with what it sent: logs by step, and events. (Its tests run `bash` and
     /// `sh`, so they and their helpers are Unix-only.)
     #[cfg(unix)]
@@ -2922,6 +3050,12 @@ mod tests {
     /// [`run_leg_in`], with `prepare` setting up the work directory first.
     #[cfg(unix)]
     fn run_leg_prepared(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
+        run_leg_with(workflow, secrets, dialect, prepare, &|_| {})
+    }
+
+    /// [`run_leg_prepared`], the assignment changed by `tweak` first.
+    #[cfg(unix)]
+    fn run_leg_with(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>, tweak: &dyn Fn(&mut AssignmentV2)) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
         let path = if dialect == Dialect::Kiln { ".kiln/t.yaml" } else { ".github/workflows/t.yml" };
         let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
@@ -2929,7 +3063,7 @@ mod tests {
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let tmp = tempfile::tempdir()?;
         prepare(tmp.path())?;
-        let a = AssignmentV2 {
+        let mut a = AssignmentV2 {
             job_id: "leg-1".into(),
             repo: "acme/app".into(),
             dialect: if dialect == Dialect::Kiln { "kiln".into() } else { "gha".into() },
@@ -2944,6 +3078,7 @@ mod tests {
             timeout_minutes: 5,
             ..AssignmentV2::default()
         };
+        tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = async_channel::unbounded();
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
@@ -3135,7 +3270,31 @@ jobs:
             std::os::unix::fs::symlink(&node, bin.join("node"))?;
             Ok(())
         };
-        let (r, logs, events) = run_leg_prepared(&wf, &[("ACTIONS_STEP_DEBUG", "true")], Dialect::Gha, &prepare)?;
+        // getIDToken's endpoint: a token for the audience asked, to the request's own token.
+        use base64::Engine as _;
+        let b64 = |v: serde_json::Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        let jwt = format!("{}.{}.sig-f20", b64(serde_json::json!({ "alg": "RS256", "typ": "JWT" })), b64(serde_json::json!({ "aud": "kiln-f20", "sub": "repo:acme/app:ref:refs/heads/main" })));
+        let issuer = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = issuer.local_addr()?.port();
+        let served = jwt.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for conn in issuer.incoming().flatten() {
+                let mut conn = conn;
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                let ok = head.contains("audience=kiln-f20") && head.to_ascii_lowercase().contains("authorization: bearer id-req-f20");
+                let body = if ok { serde_json::json!({ "value": served }).to_string() } else { "{}".to_owned() };
+                let status = if ok { "200 OK" } else { "401 Unauthorized" };
+                let _ = write!(conn, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let tweak = |a: &mut AssignmentV2| {
+            a.runtime.id_token_url = Some(format!("http://127.0.0.1:{port}/_kiln/oidc/token?api-version=1"));
+            a.runtime.id_token_request_token = Some("id-req-f20".into());
+        };
+        let (r, logs, events) = run_leg_with(&wf, &[("ACTIONS_STEP_DEBUG", "true")], Dialect::Gha, &prepare, &tweak)?;
         let all: String = logs.values().cloned().collect();
         assert_eq!(r.status, Status::Succeeded, "{r:?} {all}");
         let step = logs.get(&1).cloned().unwrap_or_default();
@@ -3158,6 +3317,9 @@ jobs:
         assert!(later.contains(r#"o1=v1 EXPORTED=e1 multi="line one\nline two""#), "{later}");
         assert!(later.contains("path first") && later.contains("the secret again: ***"), "{later}");
         assert!(all.contains("post: state=state-v"), "the post step reads the state: {all}");
+        // getIDToken: the token for its audience, masked from the moment it arrived.
+        assert!(step.contains("id token: aud=kiln-f20 sub=repo:acme/app:ref:refs/heads/main"), "{step}");
+        assert!(step.contains("the token itself: ***") && !all.contains(&jwt), "the token is masked: {step}");
         Ok(())
     }
 

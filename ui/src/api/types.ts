@@ -170,6 +170,28 @@ export interface Agent {
   instances?: RunnerInstance[];
   /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
   outpost?: boolean;
+  /** What its probes found and its administrator declared (docs/ci.md W13-R01, R02): what routing decides over. */
+  facts?: RunnerFacts;
+}
+
+/** A runner's facts (kiln_ci::facts::RunnerFacts). */
+export interface RunnerFacts {
+  os: string;
+  os_version: string | null;
+  os_distro: string | null;
+  kernel: string | null;
+  arch: string;
+  cpu: { model: string | null; cores: number; threads: number; flags: string[] };
+  mem: { total: number; free: number };
+  disk: { total: number; free: number };
+  gpus: { vendor: string; model: string; memory: number; driver: string | null }[];
+  virt: { kvm: boolean; hvf: boolean; nested: boolean };
+  executors: Record<string, { version: string | null; details: Record<string, string> }>;
+  binfmt: string[];
+  tools: Record<string, string>;
+  net: { egress: boolean; proxy: string | null };
+  custom: Record<string, string>;
+  probed_at: number;
 }
 
 /** One runner process of a machine (see `crates/kiln/src/instances.rs`). */

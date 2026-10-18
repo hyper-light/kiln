@@ -23,6 +23,7 @@ pub mod codex;
 pub mod core;
 pub mod diff;
 pub mod elicit;
+pub mod elsewhere;
 pub mod handoff;
 pub mod host;
 pub mod kinds;

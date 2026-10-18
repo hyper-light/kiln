@@ -35,11 +35,13 @@ fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "sha": r.get::<_, String>(8)?, "actor": r.get::<_, String>(9)?, "status": r.get::<_, String>(10)?, "conclusion": r.get::<_, Option<String>>(11)?,
         "trust": r.get::<_, String>(12)?, "attempt": r.get::<_, i64>(13)?, "created_at": r.get::<_, i64>(14)?, "started_at": r.get::<_, Option<i64>>(15)?,
         "finished_at": r.get::<_, Option<i64>>(16)?, "error": r.get::<_, Option<String>>(17)?, "message": r.get::<_, String>(18)?, "github_run_id": r.get::<_, i64>(19)?,
+        // W18-R06: `required` while an outside contributor's run waits for a maintainer.
+        "approval": r.get::<_, Option<String>>(20)?, "approved_by": r.get::<_, Option<String>>(21)?,
     }))
 }
 
 const RUN_SELECT: &str = "SELECT r.id, r.number, p.name, r.workflow_id, r.pipeline, r.run_name, r.event, r.branch, r.sha, r.actor, r.status, r.conclusion, r.trust, r.attempt,
-     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
+     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
 
 /// `GET /api/ci/runs?…`: the engine's runs, newest first, cursor-paged.
 pub async fn list(hub: &Hub, q: &HashMap<String, String>) -> Result<Response, Fail> {

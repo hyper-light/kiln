@@ -244,7 +244,8 @@ async fn send(hub: &Hub, out: &Out, waits: &[u64]) -> (&'static str, Option<u16>
             crate::rt::sleep(Duration::from_secs(*wait)).await;
         }
         attempts += 1;
-        let mut req = client.post(url).header("content-type", "application/json").header("user-agent", "kiln-webhooks").header("x-kiln-event", &out.kind).header("x-kiln-delivery", &out.delivery).body(body.clone()).timeout(Duration::from_secs(20));
+        // A URL someone gave kiln: never this machine or a private network unless allowed (W22-AC07).
+        let mut req = client.post(url).reaching(&hub.cfg.ci.reach()).header("content-type", "application/json").header("user-agent", "kiln-webhooks").header("x-kiln-event", &out.kind).header("x-kiln-delivery", &out.delivery).body(body.clone()).timeout(Duration::from_secs(20));
         if let Some(s) = &sig {
             req = req.header("x-kiln-signature-256", s);
         }

@@ -493,7 +493,12 @@ Every change is audited with its principal, and with the person it acted for.
    The import page shows, per app, whether kiln's sync and health agree with Argo CD's, and why
    when they don't.
 3. When they agree, take over an app, a project or everything. kiln adopts the objects (Argo CD's
-   tracking is read) and disables auto-sync in Argo CD for what it took. Nothing is recreated.
+   tracking is read). Nothing is recreated. Argo CD's own automation keeps running until you turn
+   it off there (`spec.syncPolicy.automated` of its Application): kiln doesn't write to Argo CD.
+   An app another app renders (Argo CD's app of apps) stays taken over: its parent rendering it
+   again changes nothing, and the parent never forgets it, or deletes its objects with it.
+4. Deleting a shadowed app only stops kiln comparing it: its objects are Argo CD's, and stay,
+   whatever the delete asks.
 
 ### Measured
 
@@ -527,7 +532,7 @@ and the network come on top, and are measured separately as they are built.
 | Argo CD Applications (import, app of apps, tracking, shadow mode, take-over) | built; ApplicationSets and AppProjects: not yet |
 | `.kiln/deploy.yaml` and environments | read from kiln's repositories at trunk each round (apps registered when they change, removed with the file); artifacts, published images, agents' rights: [cd-targets.md](cd-targets.md) |
 | `/api/cd`, `kiln cd` | built |
-| MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
+| MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; every agent kiln starts gets code mode on its runner (docs/reach.md §7) | built |
 | Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |
 | Plans of a commit, a stack or a pull request: the apps it touches, each diff's own change and the stack's, a sync's steps against what runs, the render and `Prune=false` checks (API, CLI, MCP, and Deployments → Plan a deploy) | built; kiln's own diffs, the land queue, previews, statuses and comments on pull requests, policy checks: not yet |
 | UI: the fleet list (windowed, filtered and sorted on the server, live; the console's filter field with counts per value, namespace included; the fleet's counts; row checkboxes for syncing or refreshing many) and an app's page (revision, last sync, source; the resource tree as a graph or an indented list, a list, pods by owner or node; one filter over every view; an object's summary, manifests, diff, events and logs, followed live; sync of chosen objects, rollback, refresh and hard refresh, take over, stop, delete, each confirmed in place) | built; environments board, previews, fleets, resource actions, the tree over a WebSocket: not yet |

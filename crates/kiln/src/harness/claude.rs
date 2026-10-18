@@ -658,7 +658,7 @@ impl Claude {
                 }
             }
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
                 core.state.effort = effort;
@@ -980,12 +980,14 @@ impl Claude {
         core.touch_state();
     }
 
-    /// Signed in as someone else: the old account's usage limits go, and a pause for one of them
-    /// ends; what the session cost so far stays, and adds up. The new account's limits are asked.
+    /// Signed in as someone else (here, or on the machine it moved to for room): the old account's
+    /// usage limits go, and a pause for one of them ends (reached, its stop point, or reached by
+    /// another session on it); what the session cost so far stays, and adds up. The new account's
+    /// limits are asked.
     fn switched_account(&mut self, core: &mut Core) {
         core.state.limits.clear();
         core.touch_state();
-        if core.state.pause.as_ref().is_some_and(|p| p.reason == super::pause::LIMIT)
+        if core.state.pause.is_some()
             && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
         {
             self.go_on(core, p);

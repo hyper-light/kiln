@@ -3,7 +3,7 @@ import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
 import { ChartLine, Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
+import type { Agent, Job, RunnerFacts, RunnerInstance, RunnerUpdate } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
@@ -529,6 +529,13 @@ function AgentDetails({
         />
       </div>
 
+      {agent.facts && (
+        <div className="mt-8">
+          <div className="label mb-2">Facts</div>
+          <RunnerFactsList facts={agent.facts} />
+        </div>
+      )}
+
       <div className="mt-8">
         <div className="label mb-2">Running jobs</div>
         {agent.running.length === 0 ? (
@@ -560,6 +567,31 @@ function AgentDetails({
       </div>
     </section>
   );
+}
+
+/** What a runner's probes found and its administrator declared (docs/ci.md W13-R01, R02): what
+ * routing decides over. Declared facts read as constraints name them (`custom.<name>`). */
+function RunnerFactsList({ facts }: { facts: RunnerFacts }) {
+  const os = [facts.os_distro ?? facts.os, facts.os_version].filter(Boolean).join(" ");
+  const executors = Object.entries(facts.executors).map(([name, e]) => [name, e.version, e.details?.rootless === "true" ? "rootless" : null].filter(Boolean).join(" "));
+  const items = [
+    { label: "System", value: [os, facts.arch, facts.kernel && `kernel ${facts.kernel}`].filter(Boolean).join(" · ") },
+    { label: "Processor", value: `${facts.cpu.model ?? "—"} · ${facts.cpu.cores} cores, ${facts.cpu.threads} threads` },
+    ...(facts.gpus.length > 0 ? [{ label: "GPU", value: facts.gpus.map((g) => [g.model, g.memory > 0 && formatBytes(g.memory)].filter(Boolean).join(" · ")).join(", ") }] : []),
+    { label: "Virtualization", value: [facts.virt.kvm && "KVM", facts.virt.nested && "nested", facts.virt.hvf && "Hypervisor.framework"].filter(Boolean).join(", ") || "none" },
+    { label: "Executors", value: executors.join(", ") },
+    {
+      label: "Tools",
+      value:
+        Object.entries(facts.tools)
+          .map(([n, v]) => `${n} ${v}`)
+          .join(", ") || "—",
+    },
+    { label: "Internet", value: facts.net.egress ? "direct" : facts.net.proxy ? `through ${facts.net.proxy}` : "none" },
+    ...Object.entries(facts.custom).map(([k, v]) => ({ label: `custom.${k}`, value: v })),
+    { label: "Probed", value: <RelTime ts={facts.probed_at} /> },
+  ];
+  return <Facts items={items} />;
 }
 
 /**

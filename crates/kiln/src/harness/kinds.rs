@@ -80,8 +80,9 @@ impl Kind {
         }
     }
 
-    /// The process to start for `spec` (cwd, environment and arguments).
-    pub fn launch(&self, spec: &Spec) -> anyhow::Result<Process> {
+    /// The process to start for session `session` of `spec` (cwd, environment and arguments).
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub fn launch(&self, spec: &Spec, session: &str) -> anyhow::Result<Process> {
         if self.protocol == Protocol::Terminal {
             anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program);
         }
@@ -100,16 +101,23 @@ impl Kind {
             Protocol::ClaudeStreamJson => {
                 let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
                 p.args(super::claude::args(spec, session_id.as_deref()));
-                // kiln's MCP server (code mode, deployments) and skills, where this machine's kiln
-                // serves them.
-                if let Some(kit) = crate::mcp::kit() {
-                    p.arg("--mcp-config").arg(&kit.claude_mcp_config);
-                    p.arg("--plugin-dir").arg(&kit.plugin_dir);
+                // kiln's MCP server: on a runner, its own (code mode over the kiln's machines and
+                // kiln's operations, through the runner); else the server's, where this machine's
+                // kiln serves it.
+                let local = local_tools(spec);
+                match (&local, crate::mcp::kit()) {
+                    #[cfg(unix)]
+                    (Some((kiln, sock, prefer)), _) => {
+                        p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(kiln, sock, *prefer, session));
+                    }
+                    (_, Some(kit)) => {
+                        p.arg("--mcp-config").arg(&kit.claude_mcp_config);
+                    }
+                    _ => {}
                 }
-                // Reach: commands on other runners, where this runner reaches them.
-                #[cfg(unix)]
-                if let Some((kiln, sock, prefer)) = reach_tools(spec) {
-                    p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(&kiln, sock, prefer));
+                // kiln's skills.
+                if let Some(dir) = crate::mcp::kit().map(|k| k.plugin_dir.as_path()).or_else(crate::mcp::plugin_dir) {
+                    p.arg("--plugin-dir").arg(dir);
                 }
                 // File snapshots before edits, so a rewind can restore them.
                 p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
@@ -118,8 +126,8 @@ impl Kind {
             Protocol::CodexAppServer => {
                 p.args(super::codex::args());
                 #[cfg(unix)]
-                if let Some((kiln, sock, prefer)) = reach_tools(spec) {
-                    p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer));
+                if let Some((kiln, sock, prefer)) = local_tools(spec) {
+                    p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
                 }
             }
             Protocol::Acp(args) => {
@@ -162,10 +170,10 @@ impl Kind {
     }
 }
 
-/// Whether a session gets reach's tools, and how to start them: this kiln binary, the runner's
-/// reach socket, the session's preferred runner.
+/// Whether a session gets the runner's own kiln MCP server (`crate::reach::mcp`), and how to
+/// start it: this kiln binary, the runner's reach socket, the session's preferred runner.
 #[cfg(unix)]
-fn reach_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
+fn local_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
     let pref = spec.reach.as_deref().map(str::trim).filter(|r| !r.is_empty());
     if pref == Some("off") {
         return None;
@@ -173,6 +181,22 @@ fn reach_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<
     let sock = crate::reach::local::socket()?;
     let kiln = std::env::current_exe().ok()?;
     Some((kiln, sock, pref))
+}
+
+/// Without Unix sockets there is no runner of the machine to talk to.
+#[cfg(not(unix))]
+fn local_tools(_spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
+    None
+}
+
+/// The MCP servers an ACP agent's session gets (`session/new`'s `mcpServers`): the runner's own.
+pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
+    #[cfg(unix)]
+    if let Some((kiln, sock, prefer)) = local_tools(spec) {
+        return vec![crate::reach::mcp::acp_config(&kiln, sock, prefer, session)];
+    }
+    let _ = (spec, session);
+    Vec::new()
 }
 
 /// The session's environment over the machine's: what its shell had (minus the shell's own
@@ -225,6 +249,14 @@ pub enum Frozen {
 }
 
 impl Adapter {
+    /// The MCP servers a session it opens gets, for an adapter that gives them over its protocol
+    /// (ACP); the others get theirs as they start ([`Kind::launch`]).
+    pub fn offer_mcp(&mut self, servers: Vec<serde_json::Value>) {
+        if let Self::Acp(a) = self {
+            a.offer_mcp(servers);
+        }
+    }
+
     /// Its state, whole, to go on with in the next image ([`Adapter::thaw`]).
     pub fn freeze(self) -> Frozen {
         match self {
@@ -346,8 +378,14 @@ impl Adapter {
     /// Start with a conversation carried over from another harness, in the harness's own form
     /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript).
     pub fn seed(&mut self, items: Vec<serde_json::Value>) {
-        if let Self::Codex(a) = self {
-            a.seed(items);
+        // The conversation in words (`moving::Carry::Words`), for a harness that takes it only with
+        // its first message.
+        let words = || items.iter().find(|i| i.get("type").and_then(serde_json::Value::as_str) == Some(super::moving::CONTEXT)).and_then(|i| i.get("text")).and_then(serde_json::Value::as_str).map(str::to_owned);
+        match self {
+            Self::Codex(a) => a.seed(items),
+            Self::Acp(a) => a.offer_context(words()),
+            Self::Agy(a) => a.offer_context(words()),
+            Self::Claude(_) => {}
         }
     }
 

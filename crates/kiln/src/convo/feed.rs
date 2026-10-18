@@ -39,11 +39,25 @@ pub enum Msg {
     /// Runner to server, when the link comes up (and when the server says nothing for too long):
     /// its store.
     Hello { store: String },
-    /// Server to runner: it has `store`'s feed through `rev`; send from there.
-    From { store: String, rev: u64 },
+    /// Server to runner: it has `store`'s feed through `rev`; send from there. `zip`: it takes
+    /// batches compressed (a taker from before says nothing, and gets them as they are).
+    From {
+        store: String,
+        rev: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        zip: bool,
+    },
     /// Runner to server: part `part` (from 0) of `parts` of a batch that follows `from` and reads
-    /// through `upto` (its bytes: JSON [`Changes`]).
-    Batch { store: String, from: u64, upto: u64, part: u32, parts: u32 },
+    /// through `upto` (its bytes: JSON [`Changes`], brotli-compressed when `zip`).
+    Batch {
+        store: String,
+        from: u64,
+        upto: u64,
+        part: u32,
+        parts: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        zip: bool,
+    },
     /// Server to runner: it has `store`'s feed through `rev`.
     Ack { store: String, rev: u64 },
 }
@@ -65,15 +79,38 @@ pub fn decode(json: &str) -> Option<Msg> {
     serde_json::from_str(json).ok()
 }
 
-/// A batch as the messages it travels in.
-pub fn parts(store: &str, from: u64, batch: &Changes) -> anyhow::Result<Vec<(Msg, Vec<u8>)>> {
-    let bytes = serde_json::to_vec(batch)?;
+/// Compression quality for a batch on the wire: fast, and most of the gain.
+const ZIP_QUALITY: u32 = 4;
+
+fn zip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut out = Vec::with_capacity(bytes.len() / 4 + 16);
+    {
+        let mut w = brotli::CompressorWriter::new(&mut out, 4096, ZIP_QUALITY, 22);
+        w.write_all(bytes)?;
+        w.flush()?;
+    }
+    Ok(out)
+}
+
+fn unzip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    brotli::Decompressor::new(bytes, 4096).take(BATCH_MAX as u64 + 1).read_to_end(&mut out)?;
+    anyhow::ensure!(out.len() <= BATCH_MAX, "a batch too large to take");
+    Ok(out)
+}
+
+/// A batch as the messages it travels in, compressed when the taker takes that (`zipped`).
+pub fn parts(store: &str, from: u64, batch: &Changes, zipped: bool) -> anyhow::Result<Vec<(Msg, Vec<u8>)>> {
+    let json = serde_json::to_vec(batch)?;
+    let bytes = if zipped { zip(&json)? } else { json };
     let chunks: Vec<&[u8]> = if bytes.is_empty() { vec![&[][..]] } else { bytes.chunks(PART).collect() };
     let n = u32::try_from(chunks.len())?;
     Ok(chunks
         .into_iter()
         .enumerate()
-        .map(|(i, c)| (Msg::Batch { store: store.to_owned(), from, upto: batch.upto, part: u32::try_from(i).unwrap_or(u32::MAX), parts: n }, c.to_vec()))
+        .map(|(i, c)| (Msg::Batch { store: store.to_owned(), from, upto: batch.upto, part: u32::try_from(i).unwrap_or(u32::MAX), parts: n, zip: zipped }, c.to_vec()))
         .collect())
 }
 
@@ -125,6 +162,8 @@ impl Shipper {
 struct Shipping {
     /// What the server has, once it said (None: it hasn't yet, on this link).
     acked: Option<u64>,
+    /// The server takes batches compressed (it said so).
+    zipped: bool,
     /// Read and sent through here.
     sent: u64,
     /// The batches sent and not yet acknowledged: their `upto`.
@@ -136,7 +175,7 @@ struct Shipping {
 async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>) {
     let me = store.id().to_owned();
     let mut up = false;
-    let mut st = Shipping { acked: None, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
+    let mut st = Shipping { acked: None, zipped: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
     let hello = |out: &async_channel::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone() }), Vec::new())).is_ok();
     loop {
         let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
@@ -147,7 +186,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
         match ev {
             Some(Link::Up) => {
                 up = true;
-                st = Shipping { acked: None, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
+                st = Shipping { acked: None, zipped: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
                 hello(&out);
             }
             Some(Link::Down) => {
@@ -155,9 +194,10 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
                 st.acked = None;
                 st.flight.clear();
             }
-            Some(Link::Heard(Msg::From { store, rev })) if store == me => {
+            Some(Link::Heard(Msg::From { store, rev, zip })) if store == me => {
                 // Where to go on from (a first answer, or after something went astray).
                 st.acked = Some(rev);
+                st.zipped = zip;
                 st.sent = rev;
                 st.flight.clear();
                 st.heard = Instant::now();
@@ -196,7 +236,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             if batch.rows.is_empty() {
                 break;
             }
-            let msgs = match parts(&me, from, &batch) {
+            let msgs = match parts(&me, from, &batch, st.zipped) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
@@ -232,6 +272,7 @@ struct Partial {
     upto: u64,
     parts: u32,
     got: u32,
+    zip: bool,
     bytes: Vec<u8>,
 }
 
@@ -287,21 +328,21 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
             partial.remove(&(peer, s.clone()));
             let rev = have(&s);
             tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
-            vec![Msg::From { store: s, rev }]
+            vec![Msg::From { store: s, rev, zip: true }]
         }
-        Some(Msg::Batch { store: s, from, upto, part, parts }) => {
+        Some(Msg::Batch { store: s, from, upto, part, parts, zip }) => {
             let key = (peer, s.clone());
             let fits = match partial.get(&key) {
                 None => part == 0,
-                Some(p) => p.from == from && p.upto == upto && p.parts == parts && p.got == part,
+                Some(p) => p.from == from && p.upto == upto && p.parts == parts && p.got == part && p.zip == zip,
             };
             if !fits {
                 // A part out of place (one went astray): start over from what the server has.
                 partial.remove(&key);
                 let rev = have(&s);
-                return vec![Msg::From { store: s, rev }];
+                return vec![Msg::From { store: s, rev, zip: true }];
             }
-            let p = partial.entry(key.clone()).or_insert_with(|| Partial { from, upto, parts, got: 0, bytes: Vec::new() });
+            let p = partial.entry(key.clone()).or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new() });
             p.got += 1;
             p.bytes.extend_from_slice(&data);
             if p.bytes.len() > BATCH_MAX {
@@ -313,17 +354,18 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                 return Vec::new();
             }
             let Some(done) = partial.remove(&key) else { return Vec::new() };
-            let batch: Changes = match serde_json::from_slice(&done.bytes) {
+            let read = if done.zip { unzip(&done.bytes) } else { Ok(done.bytes) };
+            let batch: Changes = match read.and_then(|b| serde_json::from_slice(&b).map_err(anyhow::Error::from)) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(%machine, error = %e, "conversation feed: an unreadable batch");
+                    tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: an unreadable batch");
                     let rev = have(&s);
-                    return vec![Msg::From { store: s, rev }];
+                    return vec![Msg::From { store: s, rev, zip: true }];
                 }
             };
             let theirs = (brings == Brings::TheirMachine).then_some(machine);
             match store.take(&peer_name(machine, &s), theirs, from, batch) {
-                Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev }],
+                Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev, zip: true }],
                 Ok(t) => {
                     if t.fenced > 0 {
                         tracing::info!(%machine, fenced = t.fenced, "conversation feed: rows of sessions that went on elsewhere were left out");
@@ -360,14 +402,14 @@ mod tests {
     fn feed_as(runner: &Store, server: &Store, machine: &str, brings: Brings, bytes: usize) -> anyhow::Result<u64> {
         let mut partial = HashMap::new();
         let hello = take(server, &mut partial, 7, machine, brings, &encode(&Msg::Hello { store: runner.id().to_owned() }), Vec::new());
-        let Some(Msg::From { mut rev, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
+        let Some(Msg::From { mut rev, zip, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
         loop {
             let batch = runner.changes(rev, bytes)?;
             if batch.rows.is_empty() {
                 return Ok(rev);
             }
             let mut answer = Vec::new();
-            for (m, data) in parts(runner.id(), rev, &batch)? {
+            for (m, data) in parts(runner.id(), rev, &batch, zip)? {
                 answer = take(server, &mut partial, 7, machine, brings, &encode(&m), data);
             }
             match answer.first() {
@@ -453,16 +495,16 @@ mod tests {
         let batch = runner.changes(2, 1 << 20)?;
         let mut partial = HashMap::new();
         let mut answer = Vec::new();
-        for (m, data) in parts(runner.id(), 2, &batch)? {
+        for (m, data) in parts(runner.id(), 2, &batch, true)? {
             answer = take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data);
         }
-        assert_eq!(answer, vec![Msg::From { store: runner.id().to_owned(), rev: 0 }]);
+        assert_eq!(answer, vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true }]);
         assert_eq!(server.kept("a1", 10)?, None);
         // A part out of place: the same.
-        let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
+        let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?, true)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
         let Msg::Batch { store, from, upto, parts: n, .. } = m else { anyhow::bail!("not a batch") };
-        let astray = Msg::Batch { store, from, upto, part: 1, parts: n + 1 };
-        assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data), vec![Msg::From { store: runner.id().to_owned(), rev: 0 }]);
+        let astray = Msg::Batch { store, from, upto, part: 1, parts: n + 1, zip: true };
+        assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data), vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true }]);
         Ok(())
     }
 

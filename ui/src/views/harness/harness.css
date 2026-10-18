@@ -2626,6 +2626,50 @@ textarea.hx-input {
   }
 }
 
+/* Copying what was said: a quiet icon on your messages and the agent's answer; on what it said
+   along the way, shown where a pointer rests or a finger taps. */
+.hx-msg-copy {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  color: var(--color-subtle);
+}
+.hx-msg-copy:hover {
+  color: var(--color-bright);
+}
+.hx-prompt-copy,
+.hx-outcome-copy {
+  margin-left: auto;
+}
+.hx-prompt-copy + .hx-turn-menu {
+  margin-left: 0;
+}
+.hx-outcome-foot {
+  align-items: center;
+}
+.hx-said {
+  position: relative;
+  outline: none;
+}
+.hx-said-copy {
+  position: absolute;
+  top: 6px;
+  right: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.hx-said:hover > .hx-said-copy,
+.hx-said:focus > .hx-said-copy,
+.hx-said-copy:focus-visible {
+  opacity: 1;
+}
+/* A touch screen takes a tap on it as a hover (as WebKit does for what looks tappable). */
+@media (pointer: coarse) {
+  .hx-said {
+    cursor: pointer;
+  }
+}
+
 /* ================================================================== */
 /* hyperlight-site language for the agent console                    */
 /* Near-square shapes (4–7px; 9px panels), hairlines instead of boxes, */

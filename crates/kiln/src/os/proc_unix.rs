@@ -306,8 +306,11 @@ pub struct Duplex {
     pub exit: oneshot::Receiver<Option<i32>>,
     /// The pipes' descriptors (stdin, stdout, stderr), for [`Duplex::detach`].
     fds: [i32; 3],
-    /// Dropped to stop the readers: they read nothing more.
+    /// Taken by [`Duplex::detach`], `stopped` set first, to stop the readers: they read nothing
+    /// more. Dropped otherwise (the `Duplex` let go of with its stdout taken elsewhere), the
+    /// readers read on to the end, as they always did.
     stop: Option<async_channel::Sender<()>>,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The writer has written everything sent to it, once stdin's sender closes.
     written: Option<oneshot::Receiver<()>>,
 }
@@ -346,6 +349,7 @@ impl Duplex {
         let input = copy(self.fds[0])?;
         let out = copy(self.fds[1])?;
         let err = copy(self.fds[2])?;
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
         self.stop.take();
         self.stdin.close();
         if let Some(w) = self.written.take() {
@@ -460,17 +464,31 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     }
     let fds = [input.as_raw_fd(), out.as_raw_fd(), err.as_raw_fd()];
     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader = |fd: OwnedFd, cap: usize| {
         let (tx, rx) = async_channel::bounded::<Vec<u8>>(cap);
-        let stop = stop_rx.clone();
+        let (stop, stopped) = (stop_rx.clone(), std::sync::Arc::clone(&stopped));
         crate::rt::spawn(async move {
             use futures::FutureExt as _;
             let mut buf = vec![0u8; CHUNK * 2];
+            // Whether the `Duplex` is still there to stop the readers.
+            let mut watching = true;
             loop {
-                // Stopped (handed over): nothing more is read, so nothing read is lost.
-                let read = futures::select_biased! {
-                    _ = stop.recv().fuse() => return,
-                    r = read_chunk(&fd, &mut buf).fuse() => r,
+                let read = if watching {
+                    futures::select_biased! {
+                        _ = stop.recv().fuse() => {
+                            // Stopped (handed over): nothing more is read, so nothing read is
+                            // lost. Only let go of: read on to the end.
+                            if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                                return;
+                            }
+                            watching = false;
+                            continue;
+                        },
+                        r = read_chunk(&fd, &mut buf).fuse() => r,
+                    }
+                } else {
+                    read_chunk(&fd, &mut buf).await
                 };
                 let Ok(Some(n)) = read else { return };
                 if tx.send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).await.is_err() {
@@ -493,12 +511,30 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         let _ = written_tx.send(());
         // Dropping the fd here closes the child's stdin (unless it was handed over: a copy holds it).
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, stop: Some(stop_tx), written: Some(written_rx) })
+    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, stop: Some(stop_tx), stopped, written: Some(written_rx) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn let_go_of_with_its_stdout_taken_a_process_is_read_to_the_end() -> anyhow::Result<()> {
+        // As the CI git endpoint does: stdout taken, the rest of the `Duplex` dropped at once.
+        crate::rt::block_on(async {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "for i in 1 2 3; do echo $i; sleep 0.2; done"]);
+            let p = spawn_duplex(cmd)?;
+            let out = p.stdout.clone();
+            drop(p);
+            let mut got = Vec::new();
+            while let Ok(Ok(c)) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await {
+                got.extend(c);
+            }
+            assert_eq!(got, b"1\n2\n3\n");
+            Ok(())
+        })
+    }
 
     #[test]
     fn a_harness_process_goes_on_after_it_is_handed_over() -> anyhow::Result<()> {

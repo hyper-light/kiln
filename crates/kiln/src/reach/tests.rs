@@ -108,8 +108,13 @@ async fn lab() -> anyhow::Result<Lab> {
                         deliver(&peers, &handle_of, to, sm).await;
                     }
                 }
-                AgentMsg::ReachAsk { req, .. } => {
-                    let json = serde_json::json!({ "runners": *directory.lock() }).to_string();
+                AgentMsg::ReachAsk { req, json: asked } => {
+                    // An agent's question for kiln's operations comes back as what it asked.
+                    let ask: serde_json::Value = serde_json::from_str(&asked).unwrap_or_default();
+                    let json = match ask.get("op").and_then(serde_json::Value::as_str) {
+                        Some("call") => serde_json::json!({"ok": {"name": ask.get("name"), "input": ask.get("input"), "session": ask.get("session")}}).to_string(),
+                        _ => serde_json::json!({ "runners": *directory.lock() }).to_string(),
+                    };
                     handle_of(from).feed(In::Answer { req, json }).await;
                 }
                 _ => {}
@@ -180,6 +185,37 @@ fn a_run_on_another_runner_streams_back_over_a_post_quantum_link() -> anyhow::Re
         assert!(s.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("linux"))));
         let l = lab.linux.status().await?;
         assert!(l.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("mac"))));
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn an_agents_question_for_the_server_goes_through_its_runner_and_back() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let ask = serde_json::json!({"op": "call", "session": "s1", "name": "ci.runs.list", "input": {"limit": 2}});
+        // Several at once, each answered as its own.
+        let (a, b) = futures::join!(lab.mac.query(ask.to_string()), lab.linux.query(ask.to_string()));
+        for answer in [a?, b?] {
+            let v: serde_json::Value = serde_json::from_str(&answer)?;
+            assert_eq!(v.pointer("/ok/name"), Some(&serde_json::json!("ci.runs.list")), "{v}");
+            assert_eq!(v.pointer("/ok/input/limit"), Some(&serde_json::json!(2)));
+            assert_eq!(v.pointer("/ok/session"), Some(&serde_json::json!("s1")));
+        }
+        // Away from the server: refused at once, not left to wait.
+        lab.ctl.send(Ctl::Drop("mac")).await?;
+        let mut refused = None;
+        for _ in 0..50 {
+            match lab.mac.query(ask.to_string()).await {
+                Err(e) => {
+                    refused = Some(format!("{e:#}"));
+                    break;
+                }
+                Ok(_) => crate::rt::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(refused.as_deref().is_some_and(|e| e.contains("not connected")), "{refused:?}");
         Ok(())
     })
 }

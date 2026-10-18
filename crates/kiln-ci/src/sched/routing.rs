@@ -579,6 +579,17 @@ pub struct LegRoute {
     pub requires: Vec<String>,
     /// Capability bits the leg needs (`CAP_CI2`, `CAP_ACTIONS`, …).
     pub caps: u64,
+    /// An untrusted leg's limits (W18-R07); `None` for a trusted one.
+    pub untrusted: Option<Untrusted>,
+}
+
+/// Where untrusted legs may run (`ci.untrusted`, W18-R07).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Untrusted {
+    /// The executors, in order; `host` only when listed.
+    pub executors: Vec<String>,
+    /// Docker even when its engine runs as root.
+    pub rootful_docker: bool,
 }
 
 /// A leg's requirement, resolved against the rules.
@@ -598,6 +609,8 @@ pub struct Requirement {
     pub docker: Option<String>,
     /// The rules that applied, by index, for explanations.
     pub rules: Vec<usize>,
+    /// Docker only when its engine runs rootless (an untrusted leg's, W18-R07).
+    pub rootless_docker: bool,
 }
 
 impl Requirement {
@@ -608,7 +621,7 @@ impl Requirement {
         labels.dedup();
         let mut cs: Vec<&str> = self.constraints.iter().map(|(s, _)| s.as_str()).collect();
         cs.sort_unstable();
-        format!("labels={};group={};req={};caps={:x};exec={}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","))
+        format!("labels={};group={};req={};caps={:x};exec={}{}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","), if self.rootless_docker { ";rootless" } else { "" })
     }
 }
 
@@ -661,6 +674,20 @@ pub fn resolve(leg: &LegRoute, rules: &[Rule]) -> Result<Requirement, String> {
     }
     for c in &leg.requires {
         req.constraints.push((c.clone(), Constraint::parse(c)?));
+    }
+    // An untrusted leg: only the executors the server lets untrusted code run on, whatever the
+    // rules would have chosen (W18-R07).
+    if let Some(u) = &leg.untrusted {
+        let chosen = std::mem::take(&mut req.executors);
+        req.executors = if chosen.is_empty() { u.executors.clone() } else { chosen.iter().filter(|e| u.executors.contains(e)).cloned().collect() };
+        if req.executors.is_empty() {
+            return Err(format!(
+                "untrusted legs run only on {} (`ci.untrusted.executors`), and the routing rules give this one {}",
+                if u.executors.is_empty() { "no executor".to_owned() } else { u.executors.join(", ") },
+                chosen.join(", ")
+            ));
+        }
+        req.rootless_docker = !u.rootful_docker;
     }
     Ok(req)
 }
@@ -716,9 +743,14 @@ pub fn checks(req: &Requirement, r: &RunnerView) -> Vec<Check> {
         out.push(Check { requirement: format!("capabilities {:#x}", req.caps), value: format!("has {:#x}", r.caps), pass: lacking == 0 });
     }
     if !req.executors.is_empty() {
-        let has: Vec<&String> = req.executors.iter().filter(|e| has_executor(&r.facts, e)).collect();
-        let shown = if r.facts.executors.is_empty() { "host".to_owned() } else { r.facts.executors.keys().cloned().collect::<Vec<_>>().join(", ") };
-        out.push(Check { requirement: format!("executor in [{}]", req.executors.join(", ")), value: format!("[{shown}]"), pass: !has.is_empty() });
+        let has: Vec<&String> = req.executors.iter().filter(|e| usable(req, &r.facts, e)).collect();
+        let shown = if r.facts.executors.is_empty() {
+            "host".to_owned()
+        } else {
+            r.facts.executors.iter().map(|(name, x)| if name == "docker" && rootless(x) { "docker (rootless)".to_owned() } else { name.clone() }).collect::<Vec<_>>().join(", ")
+        };
+        let wanted = req.executors.iter().map(|e| if e == "docker" && req.rootless_docker { "docker (rootless)".to_owned() } else { e.clone() }).collect::<Vec<_>>();
+        out.push(Check { requirement: format!("executor in [{}]", wanted.join(", ")), value: format!("[{shown}]"), pass: !has.is_empty() });
     }
     out
 }
@@ -727,6 +759,16 @@ pub fn checks(req: &Requirement, r: &RunnerView) -> Vec<Check> {
 /// runner can.
 pub fn has_executor(facts: &crate::facts::RunnerFacts, e: &str) -> bool {
     facts.executors.contains_key(e) || (e == "host" && facts.executors.is_empty())
+}
+
+fn rootless(x: &crate::facts::Executor) -> bool {
+    x.details.get("rootless").is_some_and(|v| v == "true")
+}
+
+/// Whether a runner's executor `e` can take a leg of `req`: it has it, and Docker runs rootless
+/// when the leg needs that (an untrusted leg's, W18-R07).
+pub fn usable(req: &Requirement, facts: &crate::facts::RunnerFacts, e: &str) -> bool {
+    has_executor(facts, e) && !(req.rootless_docker && e == "docker" && !facts.executors.get("docker").is_some_and(rootless))
 }
 
 pub fn eligible(req: &Requirement, r: &RunnerView) -> bool {
@@ -863,6 +905,36 @@ mod tests {
         assert!(resolve(&other, &[rule])?.rules.is_empty());
         // The same requirement, the same signature.
         assert_eq!(resolve(&leg, &github_label_rules())?.signature(), resolve(&LegRoute { job: "test".into(), ..leg }, &github_label_rules())?.signature());
+        Ok(())
+    }
+
+    /// W18-R07: an untrusted leg runs only on the executors untrusted code may use, Docker only
+    /// rootless unless the server allows otherwise, and never where the rules alone send it.
+    #[test]
+    fn w18_r07_untrusted_executors() -> Result<(), String> {
+        let untrusted = Untrusted { executors: vec!["firecracker".into(), "shards".into(), "docker".into()], rootful_docker: false };
+        let leg = LegRoute { labels: vec!["linux".into()], untrusted: Some(untrusted.clone()), ..LegRoute::default() };
+        let req = resolve(&leg, &[])?;
+        assert_eq!((req.executors.clone(), req.rootless_docker), (untrusted.executors.clone(), true));
+        let docker = |rootless: bool| RunnerView {
+            name: "r".into(),
+            labels: vec!["linux".into()],
+            facts: RunnerFacts {
+                os: "linux".into(),
+                executors: [("host".to_owned(), Executor::default()), ("docker".to_owned(), Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..Executor::default() })].into_iter().collect(),
+                ..RunnerFacts::default()
+            },
+            ..RunnerView::default()
+        };
+        assert!(eligible(&req, &docker(true)) && !eligible(&req, &docker(false)), "rootful Docker isn't for untrusted code");
+        assert!(checks(&req, &docker(false)).iter().any(|c| !c.pass && c.requirement.contains("docker (rootless)")));
+        assert!(eligible(&resolve(&LegRoute { untrusted: Some(Untrusted { rootful_docker: true, ..untrusted.clone() }), ..leg.clone() }, &[])?, &docker(false)));
+        // A rule that sends it to the host: refused, with why.
+        let host = Rule { matches: RuleMatch { labels: vec!["linux".into()], ..RuleMatch::default() }, executor: vec!["host".into()], ..Rule::default() };
+        let e = resolve(&leg, std::slice::from_ref(&host)).err().unwrap_or_default();
+        assert!(e.contains("untrusted legs run only on firecracker, shards, docker") && e.contains("host"), "{e}");
+        // A trusted leg goes where the rule says.
+        assert_eq!(resolve(&LegRoute { untrusted: None, ..leg }, &[host])?.executors, vec!["host".to_owned()]);
         Ok(())
     }
 

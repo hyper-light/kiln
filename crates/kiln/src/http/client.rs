@@ -92,6 +92,7 @@ impl Client {
             headers: Vec::new(),
             body: Payload::None,
             timeout: DEFAULT_TIMEOUT,
+            reach: None,
         }
     }
 
@@ -130,9 +131,16 @@ pub struct RequestBuilder<'c> {
     headers: Vec<(String, String)>,
     body: Payload,
     timeout: Duration,
+    reach: Option<super::io::Reach>,
 }
 
 impl RequestBuilder<'_> {
+    /// Only to where `reach` lets a request go: for a URL someone supplied (docs/ci.md W22-AC07).
+    pub fn reaching(mut self, reach: &super::io::Reach) -> Self {
+        self.reach = Some(reach.clone());
+        self
+    }
+
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
         self
@@ -203,7 +211,7 @@ impl RequestBuilder<'_> {
             req.headers_mut().append(name, value);
         }
 
-        let resp = super::io::send(&self.client.tls, &host, port, https, req).await?;
+        let resp = super::io::send_reaching(&self.client.tls, &host, port, https, req, self.reach.as_ref()).await?;
         Ok(Response { inner: resp })
     }
 }

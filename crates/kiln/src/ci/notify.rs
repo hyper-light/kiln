@@ -165,6 +165,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         "run.fixed" => format!("✓ {what} #{} is fixed on {}", s.number, s.branch),
         "run.succeeded" => format!("✓ {what} #{} succeeded on {}", s.number, s.branch),
         "run.cancelled" => format!("◌ {what} #{} was cancelled on {}", s.number, s.branch),
+        "approval.waiting" if s.environments.is_empty() => format!("⏸ {what} #{} waits for a maintainer's approval to run (an outside contributor's)", s.number),
         "approval.waiting" => format!("⏸ {what} #{} waits for approval to deploy to {}", s.number, s.environments.join(", ")),
         other => format!("{other}: {what} #{}", s.number),
     };
@@ -257,6 +258,11 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, s: 
     };
     let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
     let mut req = client.post(&url).header("content-type", "application/json").body(payload.clone()).timeout(Duration::from_secs(20));
+    // A URL someone gave kiln (a webhook's, not a service's own API): never this machine or a
+    // private network unless allowed (W22-AC07).
+    if matches!(i.kind.as_str(), "discord" | "teams" | "webhook") || (i.kind == "slack" && bearer.is_none()) {
+        req = req.reaching(&hub.cfg.ci.reach());
+    }
     if let Some(b) = bearer {
         // Opsgenie's scheme is its own; the rest are bearer tokens.
         req = if b.starts_with("GenieKey ") { req.header("authorization", &b) } else { req.bearer(&b) };

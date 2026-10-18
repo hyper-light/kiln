@@ -288,6 +288,27 @@ mod tests {
     })
     }
 
+    /// A program a signal ends has no exit code (portable-pty would say 1: a build killed from
+    /// outside read as a failed build); one that exits keeps its code.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_ended_by_a_signal_has_no_exit_code() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            for (command, want) in [("echo bye; kill -TERM $$; sleep 5", None), ("exit 3", Some(3))] {
+                let (_s, rx) = spawn(Some("/bin/sh"), Some(command), 80, 24)?;
+                let code = loop {
+                    match crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await.map_err(|_| anyhow::anyhow!("pty timed out"))? {
+                        Ok(PtyOut::Data(_)) => {}
+                        Ok(PtyOut::Exit(c)) => break c,
+                        Err(_) => anyhow::bail!("no exit for {command}"),
+                    }
+                };
+                assert_eq!(code, want, "{command}");
+            }
+            Ok(())
+        })
+    }
+
     /// A shell handed over by the runner process before this one is not this process's child
     /// (macOS upgrades): its exit is still seen, without a status.
     #[cfg(unix)]

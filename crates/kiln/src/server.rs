@@ -239,6 +239,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             config: None,
             reach: None,
             outpost: false,
+            declared: cfg.agent.clone(),
         };
         // `kiln workflow run`'s server stops its runner itself, once the runs it follows ended.
         let agent_down = if cfg.ci.local { shutdown.clone() } else { shutdown_child() };

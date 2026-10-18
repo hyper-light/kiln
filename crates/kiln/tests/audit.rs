@@ -7,122 +7,10 @@
 
 #![cfg(unix)]
 
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
+use common::{Options, Server, concrete, http, start};
 use serde_json::{Value, json};
-
-/// A port free now.
-fn free_port() -> anyhow::Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
-/// One HTTP/1.1 request: the status and the body.
-fn http(port: u16, method: &str, path: &str, token: &str, body: Option<&Value>) -> anyhow::Result<(u16, String)> {
-    let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    s.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let payload = body.map(Value::to_string).unwrap_or_default();
-    write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())?;
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let status: u16 = head.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") { dechunk(rest) } else { rest.to_owned() };
-    Ok((status, body))
-}
-
-fn dechunk(mut s: &str) -> String {
-    let mut out = String::new();
-    while let Some((size, rest)) = s.split_once("\r\n") {
-        let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        out.push_str(rest.get(..n).unwrap_or(rest));
-        s = rest.get(n + 2..).unwrap_or("");
-    }
-    out
-}
-
-struct Server {
-    child: Child,
-    port: u16,
-    admin: String,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start(dir: &Path) -> anyhow::Result<Server> {
-    let (port, quic) = (free_port()?, free_port()?);
-    let data = dir.join("data");
-    let config = format!(
-        r#"[server]
-http_addr = "127.0.0.1:{port}"
-quic_addr = "127.0.0.1:{quic}"
-public_url = "http://127.0.0.1:{port}"
-quic_advertise = "127.0.0.1:{quic}"
-data_dir = "{data}"
-https = false
-
-[gitops]
-auto_pipelines = false
-
-[local_agent]
-enabled = false
-
-[kubernetes]
-enabled = false
-
-[terminal]
-enabled = false
-
-[discovery]
-enabled = false
-announce = false
-browse = false
-join_requests = false
-tailscale = false
-
-[cd]
-enabled = false
-
-[ci]
-enabled = true
-"#,
-        data = data.display()
-    );
-    let cfg = dir.join("kiln.toml");
-    std::fs::write(&cfg, config)?;
-    let home = dir.join("home");
-    std::fs::create_dir_all(&home)?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
-    cmd.args(["--config", &cfg.to_string_lossy(), "server"]).env("HOME", &home).stdout(Stdio::null()).stderr(Stdio::null());
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG"] {
-        cmd.env_remove(var);
-    }
-    let child = cmd.spawn()?;
-    let mut server = Server { child, port, admin: String::new() };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Ok(t) = std::fs::read_to_string(data.join("admin.token"))
-            && let Ok((200, _)) = http(port, "GET", "/healthz", "", None)
-        {
-            server.admin = t.trim().to_owned();
-            return Ok(server);
-        }
-        anyhow::ensure!(Instant::now() < deadline, "the server didn't start");
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
 
 /// The audit rows after `after` (by id), oldest first.
 fn rows_after(s: &Server, after: i64) -> anyhow::Result<Vec<Value>> {
@@ -138,19 +26,10 @@ fn last_id(s: &Server) -> anyhow::Result<i64> {
     Ok(rows_after(s, -1)?.last().and_then(|r| r.get("id")).and_then(Value::as_i64).unwrap_or(0))
 }
 
-/// A concrete path for a pattern: `*` an id, `**` two segments.
-fn concrete(pattern: &str) -> String {
-    pattern.split('/').map(|p| match p {
-        "*" => "x0",
-        "**" => "x1/x2",
-        p => p,
-    }).collect::<Vec<_>>().join("/")
-}
-
 #[test]
 fn w19_ac04_every_change_writes_one_row() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let s = start(dir.path())?;
+    let s = start(dir.path(), &Options::default())?;
     // A user, and an agent acting for her that may only look.
     let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "ada", "grants": ["viewer"] })))?;
     anyhow::ensure!((200..300).contains(&st), "user: {st} {body}");

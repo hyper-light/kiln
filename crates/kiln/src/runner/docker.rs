@@ -54,6 +54,26 @@ pub fn available() -> bool {
     })
 }
 
+/// Whether this machine's engine runs rootless, probed once (for `CAP_DOCKER_ROOTLESS`: untrusted
+/// legs use Docker only so, docs/ci.md W18-R07).
+pub fn rootless_engine() -> bool {
+    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rootless = find().is_some_and(|bin| {
+                let format = if bin.ends_with("podman") { "{{.Host.Security.Rootless}}" } else { "{{json .SecurityOptions}}" };
+                std::process::Command::new(&bin).args(["info", "--format", format]).stderr(std::process::Stdio::null()).output().is_ok_and(|o| {
+                    let out = String::from_utf8_lossy(&o.stdout);
+                    o.status.success() && (out.trim() == "true" || out.contains("rootless"))
+                })
+            });
+            let _ = tx.send(rootless);
+        });
+        rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+    })
+}
+
 /// A container to start, its keys evaluated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Spec {
@@ -379,6 +399,42 @@ pub struct Containers {
     pub label: String,
     pub job: Option<JobContainer>,
     pub services: Vec<Service>,
+    /// A contained leg's relay (W18-R08): the network its published port is on, and that port
+    /// on the host's loopback.
+    pub relay: Option<(String, u16)>,
+}
+
+/// A leg whose network is contained (docs/ci.md W18-R08): the static kiln its relay runs, and the
+/// token the runner's connections to it carry.
+pub struct EgressSpec {
+    pub binary: PathBuf,
+    pub token: String,
+}
+
+/// Why `options:` would take a contained leg out of its network, or give it the host: `None`
+/// when it wouldn't.
+pub fn escapes(options: &str) -> Option<String> {
+    const FLAGS: &[&str] = &["--network", "--net", "--privileged", "--cap-add", "--device", "--pid", "--ipc", "--uts", "--userns", "--cgroupns", "--security-opt", "--add-host", "--dns"];
+    for word in split_options(options) {
+        let flag = word.split('=').next().unwrap_or_default();
+        if FLAGS.contains(&flag) {
+            return Some(format!("`{flag}` would let it around its network policy"));
+        }
+        if word.contains("docker.sock") {
+            return Some("the host's Docker socket would let it around its network policy".into());
+        }
+    }
+    None
+}
+
+/// The proxy settings a contained leg's containers get: everything through the relay but their
+/// own loopback and the leg's services.
+pub fn proxy_env<'a>(services: impl Iterator<Item = &'a str>) -> Vec<(String, String)> {
+    let url = format!("http://{}:{}", super::egress::ALIAS, super::egress::CLIENT_PORT);
+    let mut skip = vec!["localhost".to_owned(), "127.0.0.1".to_owned(), "::1".to_owned()];
+    skip.extend(services.map(str::to_owned));
+    let none = skip.join(",");
+    ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].iter().map(|k| ((*k).to_owned(), url.clone())).chain(["NO_PROXY", "no_proxy"].iter().map(|k| ((*k).to_owned(), none.clone()))).collect()
 }
 
 fn s(x: &str) -> String {
@@ -405,19 +461,36 @@ impl Containers {
     /// Starts the leg's network, its services (awaited until healthy) and its job container.
     /// `say` reports progress for the leg's "Initialize containers" log.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start(cli: Cli, leg: &str, map: PathMap, workdir: &str, job: Option<Spec>, services: Vec<(String, Spec)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Containers> {
+    pub async fn start(cli: Cli, leg: &str, map: PathMap, workdir: &str, job: Option<Spec>, services: Vec<(String, Spec)>, egress: Option<&EgressSpec>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Containers> {
         // The whole leg id (ids made in the same instant share their start) and a suffix of this
         // start's own, so a retry never meets what an earlier attempt left.
         let start = crate::util::new_id();
         let short = format!("{leg}_{}", start.get(start.len().saturating_sub(6)..).unwrap_or(&start));
         let label = format!("kiln.leg={leg}");
-        let shared = host_network();
+        // A contained leg never shares the host's network: its own leads nowhere.
+        let shared = host_network() && egress.is_none();
         let network = if shared { s("host") } else { format!("kiln_{short}") };
         let none = BTreeMap::new();
-        if !shared {
-            cli.run(&[s("network"), s("create"), s("--label"), label.clone(), network.clone()], &none, QUICK).await?;
+        if let Some(why) = egress.and_then(|_| services.iter().map(|(_, x)| x).chain(job.iter()).find_map(|x| x.options.as_deref().and_then(escapes).or_else(|| x.volumes.iter().any(|v| v.contains("docker.sock")).then(|| "the host's Docker socket would let it around its network policy".to_owned())))) {
+            anyhow::bail!("the leg's network is contained (`network:`, or untrusted code): {why}");
         }
-        let mut c = Containers { cli, network, label, job: None, services: Vec::new() };
+        if !shared {
+            let mut create = vec![s("network"), s("create"), s("--label"), label.clone()];
+            if egress.is_some() {
+                create.push(s("--internal"));
+            }
+            create.push(network.clone());
+            cli.run(&create, &none, QUICK).await?;
+        }
+        let mut c = Containers { cli, network, label, job: None, services: Vec::new(), relay: None };
+        // The relay first, so the leg's way out is there before anything in it starts.
+        if let Some(e) = egress {
+            let image = job.as_ref().map(|j| j.image.clone()).or_else(|| services.first().map(|(_, x)| x.image.clone())).unwrap_or_default();
+            say(format!("Starting the egress relay (in {image})"));
+            let image = c.prepare(&image, None, say).await?;
+            c.relay = Some(c.start_relay(&short, e, &image).await?);
+        }
+        let proxy = if egress.is_some() { proxy_env(services.iter().map(|(k, _)| k.as_str())) } else { Vec::new() };
         for spec in services.iter().map(|(_, x)| x).chain(job.iter()) {
             if let Some((u, p)) = &spec.credentials {
                 c.cli.login(&spec.image, u, p)?;
@@ -437,7 +510,10 @@ impl Containers {
                     args.extend([s("-p"), p.clone()]);
                 }
             }
-            let env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
+            let mut env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
+            for (k, v) in &proxy {
+                env.entry(k.clone()).or_insert_with(|| v.clone());
+            }
             for k in env.keys() {
                 args.extend([s("-e"), k.clone()]);
             }
@@ -627,6 +703,30 @@ impl Containers {
     }
 
     /// Removes everything the leg started.
+    /// A contained leg's relay (W18-R08): a static kiln in `image`, on a network of its own whose
+    /// one port is published on the host's loopback for the runner, and on the leg's network as
+    /// `kiln-egress`. Its network and host port.
+    async fn start_relay(&self, short: &str, e: &EgressSpec, image: &str) -> anyhow::Result<(String, u16)> {
+        let none = BTreeMap::new();
+        let out = format!("kiln_{short}_out");
+        self.cli.run(&[s("network"), s("create"), s("--label"), self.label.clone(), out.clone()], &none, QUICK).await?;
+        let args = vec![
+            s("create"), s("--name"), format!("kiln_{short}_egress"), s("--label"), self.label.clone(), s("--network"), out.clone(),
+            s("-p"), format!("127.0.0.1::{}", super::egress::RUNNER_PORT), s("-e"), s("KILN_EGRESS_TOKEN"),
+            s("-v"), format!("{}:/kiln-egress:ro", e.binary.display()), s("--entrypoint"), s("/kiln-egress"),
+            // Nothing it needs but its two ports.
+            s("--user"), s("65534:65534"), s("--read-only"), s("--cap-drop"), s("ALL"), s("--security-opt"), s("no-new-privileges"),
+            image.to_owned(), s("egress-relay"),
+        ];
+        let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), e.token.clone())].into();
+        let id = self.cli.run(&args, &env, QUICK).await?;
+        self.cli.run(&[s("network"), s("connect"), s("--alias"), s(super::egress::ALIAS), self.network.clone(), id.clone()], &none, QUICK).await?;
+        self.cli.run(&[s("start"), id.clone()], &none, QUICK).await?;
+        let ports = parse_ports(&self.cli.run(&[s("port"), id], &none, QUICK).await?);
+        let port = ports.get(&super::egress::RUNNER_PORT.to_string()).and_then(|p| p.parse().ok()).ok_or_else(|| anyhow::anyhow!("the egress relay's port wasn't published"))?;
+        Ok((out, port))
+    }
+
     pub async fn stop(&self) {
         let none = BTreeMap::new();
         let ids = self.cli.run(&[s("ps"), s("-aq"), s("--filter"), format!("label={}", self.label)], &none, QUICK).await.unwrap_or_default();
@@ -638,10 +738,11 @@ impl Containers {
                 tracing::warn!(error = %format!("{e:#}"), "the leg's containers could not be removed");
             }
         }
-        if self.network != "host"
-            && let Err(e) = self.cli.run(&[s("network"), s("rm"), self.network.clone()], &none, QUICK).await
-        {
-            tracing::warn!(error = %format!("{e:#}"), "the leg's network could not be removed");
+        let relay = self.relay.as_ref().map(|(n, _)| n.clone());
+        for network in std::iter::once(self.network.clone()).filter(|n| n != "host").chain(relay) {
+            if let Err(e) = self.cli.run(&[s("network"), s("rm"), network], &none, QUICK).await {
+                tracing::warn!(error = %format!("{e:#}"), "the leg's network could not be removed");
+            }
         }
     }
 }
