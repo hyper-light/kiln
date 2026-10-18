@@ -71,6 +71,8 @@ pub enum Kind {
     Directory,
     /// A plugin.
     Plugin,
+    /// A provider's definition (docs/cd-targets.md §4).
+    Provider,
 }
 
 const KUSTOMIZATIONS: [&str; 3] = ["kustomization.yaml", "kustomization.yml", "Kustomization"];
@@ -83,6 +85,7 @@ pub fn kind_of(source: &Source, has_file: &dyn Fn(&str) -> bool) -> Kind {
         Engine::Kustomize(_) => Kind::Kustomize,
         Engine::Directory(_) => Kind::Directory,
         Engine::Plugin(_) => Kind::Plugin,
+        Engine::Provider(_) => Kind::Provider,
         Engine::Auto if source.chart.is_some() => Kind::Helm,
         Engine::Auto => {
             let at = |f: &str| join(&source.path, f).is_some_and(|p| has_file(&p));
@@ -137,6 +140,12 @@ pub fn deps(source: &Source, kind: Kind, read: &dyn Fn(&str) -> Option<String>) 
     }
     match kind {
         Kind::Directory | Kind::Plugin => out.push(own(source.path.clone())),
+        // What the definition names: its files, not the whole source.
+        Kind::Provider => {
+            if let Engine::Provider(p) = &source.engine {
+                out.extend(crate::providers::files(&p.provider, &p.spec).iter().filter_map(|f| join(&source.path, f)).map(own));
+            }
+        }
         Kind::Helm => {
             out.push(own(source.path.clone()));
             if let Engine::Helm(h) = &source.engine {
@@ -321,7 +330,26 @@ pub fn render(req: &Request<'_>, tools: &Tools) -> Result<Vec<Value>> {
             };
             plugin(req, &p, tools)
         }
+        Kind::Provider => {
+            let Engine::Provider(p) = &req.source.engine else { bail!("not a provider's source") };
+            provider(req, p)
+        }
     }
+}
+
+/// A provider's objects: its definition, with the revision's `git.*` filled in, rendered by the
+/// provider from the source's files.
+fn provider(req: &Request<'_>, p: &crate::apps::ProviderSource) -> Result<Vec<Value>> {
+    let mut scope = crate::apps::Scope::default();
+    scope.set("git.sha", Value::String(req.revision.to_owned()));
+    scope.set("git.short_sha", Value::String(req.revision.get(..7).unwrap_or(req.revision).to_owned()));
+    let spec = scope.interpolate_value_keeping(&p.spec, &["artifacts"]);
+    let read = |rel: &str| -> Option<Vec<u8>> {
+        let path = join(&req.source.path, rel)?;
+        std::fs::read(req.root.join(path)).ok()
+    };
+    let input = crate::providers::RenderInput { spec: &spec, target: &p.target, app: req.app, namespace: req.namespace, revision: req.revision, read: &read };
+    crate::providers::render(&p.provider, &input).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn expand_braces(pattern: &str) -> Vec<String> {

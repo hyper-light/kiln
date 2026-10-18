@@ -92,6 +92,8 @@ pub fn built_in(obj: &Value) -> Option<Status> {
         ("", "Pod") => Some(versioned(api_version, "v1", "Pod", pod(obj))),
         ("batch", "Job") => Some(versioned(api_version, "batch/v1", "Job", job(obj))),
         ("autoscaling", "HorizontalPodAutoscaler") => hpa(obj, api_version),
+        // A provider's objects (docs/cd-targets.md §2.5): its own rules.
+        (g, _) if g.ends_with("kiln.dev") => crate::providers::health(obj),
         _ => None,
     }
 }
