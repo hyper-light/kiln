@@ -612,6 +612,12 @@ impl RunPlan {
             .collect()
     }
 
+    /// The leg keyed `key`, as the plan made it (its workflow, a called one's included): what a
+    /// restarted dispatcher gives the legs it takes back (W05-R25).
+    pub fn spec_of(&self, key: &str) -> Option<&LegSpec> {
+        self.nodes.iter().flat_map(|n| n.legs.iter()).find(|l| l.spec.key == key).map(|l| &l.spec)
+    }
+
     /// The combinations `exclude` and `where:` removed, by job, with why (W04-R29).
     pub fn removed(&self) -> &BTreeMap<String, Vec<(serde_json::Value, String)>> {
         &self.removed

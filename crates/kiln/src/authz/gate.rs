@@ -362,8 +362,8 @@ pub async fn check(hub: &Hub, caller: &Caller, method: &Method, segs: &[&str], q
     if decide(caller, rule, scope.as_ref()) {
         return Ok(());
     }
-    let where_ = scope.map_or_else(|| "anywhere".to_owned(), |s| s.text());
-    Err((StatusCode::FORBIDDEN, format!("{} may not {method} /{}: that needs {} on {where_}", caller.name, segs.join("/"), rule.capability)))
+    let on = scope.map(|s| format!(" on {}", s.text())).unwrap_or_default();
+    Err((StatusCode::FORBIDDEN, format!("{} may not {method} /{}: that needs {}{on}", caller.name, segs.join("/"), rule.capability)))
 }
 
 #[cfg(test)]

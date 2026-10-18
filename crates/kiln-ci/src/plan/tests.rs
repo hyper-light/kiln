@@ -615,6 +615,21 @@ fn preview_matches_what_a_run_queues() -> Result<(), String> {
     Ok(())
 }
 
+/// W05-R25: a restarted dispatcher takes legs back with what the plan made of them, the
+/// environment (its protection holds them), permissions and concurrency included.
+#[test]
+fn a_leg_s_spec_comes_back_whole_from_the_plan() -> Result<(), String> {
+    let src = "on: push\njobs:\n  deploy:\n    runs-on: x\n    environment: { name: production, url: 'https://example.com' }\n    permissions: { contents: write }\n    concurrency: deploy\n    steps: [{run: d}]\n";
+    let (plan, _) = RunPlan::start(workflow(src, Dialect::Gha), RunInput { trusted: true, ..RunInput::default() }, Settings::default(), &NoSource)?;
+    let spec = plan.spec_of("deploy").ok_or("the leg")?;
+    assert_eq!(spec.environment.as_ref().map(|e| e.name.as_str()), Some("production"));
+    assert_eq!(spec.permissions.level("contents"), perms::Level::Write);
+    assert_eq!(spec.concurrency.as_ref().map(|g| g.group.as_str()), Some("deploy"));
+    assert!(spec.def().is_some_and(|j| j.id == "deploy"), "its job, to run");
+    assert!(plan.spec_of("nope").is_none());
+    Ok(())
+}
+
 /// A matrix from a job's outputs is decided when that job finishes: the preview's empty outputs
 /// don't make it a failure, nor skip the jobs after it.
 #[test]

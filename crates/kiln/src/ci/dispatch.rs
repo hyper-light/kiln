@@ -89,6 +89,25 @@ fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute
     }
 }
 
+/// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
+fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec) -> LegIn {
+    let job = spec.def();
+    let route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name);
+    let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+    let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
+    LegIn {
+        id: id.to_owned(),
+        run: run.to_owned(),
+        repo: r.repo.name.clone(),
+        route,
+        priority: priority(&r.event.name),
+        exclusive: job.is_some_and(|j| j.kiln.exclusive),
+        group,
+        retry,
+        ..LegIn::default()
+    }
+}
+
 /// The hub's handle on the dispatcher.
 pub struct Handle {
     tx: async_channel::Sender<Msg>,
@@ -790,21 +809,7 @@ impl Dispatch {
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
-        let job = spec.def();
-        let route = route_of(&spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name);
-        let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
-        let leg = LegIn {
-            id: id.clone(),
-            run: run.to_owned(),
-            repo: r.repo.name.clone(),
-            route,
-            priority: priority(&r.event.name),
-            exclusive: job.is_some_and(|j| j.kiln.exclusive),
-            group,
-            retry,
-            ..LegIn::default()
-        };
+        let leg = leg_in(r, run, &id, &spec);
         self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None });
         self.hub.emit_job(&id).await;
         // A leg bound to an environment starts when its protection lets it (W15-R04).
@@ -1283,11 +1288,18 @@ impl Dispatch {
             if s.is_terminal() {
                 continue;
             }
-            let Some(spec) = leg.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()) else { continue };
-            let spec = rebuild_spec(&wf, &spec);
+            // The leg as the replayed plan made it (environment, permissions, concurrency, a
+            // called workflow's steps and all), else as its row kept it.
+            let spec = match st.plan.spec_of(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let Some(v) = leg.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()) else { continue };
+                    rebuild_spec(&wf, &v)
+                }
+            };
             self.hub.ci.legs.lock().insert(id.clone());
             self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None });
-            let li = LegIn { id: id.clone(), run: run.to_owned(), repo: repo.name.clone(), route: LegRoute { job: spec.job.clone(), labels: spec.runs_on.labels.clone(), requires: spec.requires.clone(), caps: u64::from(CAP_CI2), ..LegRoute::default() }, priority: priority(&row.event), ..LegIn::default() };
+            let li = leg_in(&st, run, &id, &spec);
             match (s, agent) {
                 (Status::Running, Some(a)) => {
                     let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a.clone(), attempt: attempt.max(1) }, now_ms());
