@@ -285,10 +285,11 @@ export function Histogram({ h, range, height = 120 }: { h: LogHistogram; range: 
 
 export const statusRes: Res<ObserveStatus> = { key: "observe/status", fetch: (s) => observeApi.status(s), opts: { pollMs: 15_000 } };
 export const monitorsRes: Res<Monitor[]> = { key: "observe/monitors", fetch: (s) => observeApi.monitors(s), opts: { pollMs: 30_000 } };
-export const monitorRes = (id: string): Res<Monitor> => ({ key: `observe/monitors/${id}`, fetch: (s) => observeApi.monitor(id, s), opts: { pollMs: 30_000 } });
+// One item's key is not under its list's: a list refreshed after a delete must not refresh the item deleted.
+export const monitorRes = (id: string): Res<Monitor> => ({ key: `observe/monitor/${id}`, fetch: (s) => observeApi.monitor(id, s), opts: { pollMs: 30_000 } });
 export const integrationsRes: Res<Integration[]> = { key: "observe/integrations", fetch: (s) => observeApi.integrations(s) };
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };
-export const dashboardRes = (id: string): Res<Dashboard> => ({ key: `observe/dashboards/${id}`, fetch: (s) => observeApi.dashboard(id, s) });
+export const dashboardRes = (id: string): Res<Dashboard> => ({ key: `observe/dashboard/${id}`, fetch: (s) => observeApi.dashboard(id, s) });
 export const tagValuesRes = (tag: string): Res<string[]> => ({ key: `observe/tags/${tag}`, fetch: (s) => observeApi.tagValues(tag, s).then((r) => r.values), opts: { pollMs: 300_000 } });
 
 /** The newest records a search finds over the range (a dashboard's log and event widgets). */
