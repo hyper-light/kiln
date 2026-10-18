@@ -32,6 +32,12 @@ For each agent session (kiln's id):
   `State::cleared` holds that line's number. The events before it stay in the store, where search
   finds them, but a timeline taken up again from the store (after a restart, a move, or in the
   server's list of agents whose machine is away) leaves them out.
+- **Transcripts are kept compressed.** They are nearly all of what a store holds: on the first
+  server, 5.4 GB of 6.5 GB, in 15 transcripts of long-running agents. A line of 256 bytes or more
+  is kept brotli-compressed (quality 5) when that saves a tenth or more, about 3× overall. Lines
+  kept before that are compressed in the background, a few thousand at a time while the store has
+  nothing else to do, under the same numbers, so no feed sends them again. Feed batches travel
+  compressed too, to a taker that says it takes them (`zip` in its answer).
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
@@ -214,8 +220,10 @@ mirror_on = []       # runners to pick first, by name
 - **Lock order.** The writer never takes a session's lock: updates come to it by channel from
   `flush`. The recorder takes a session's locks one at a time (`Session::record_source`). See the
   lesson of c0ffda6 (agents.md).
-- **Disk.** Conversations grow, and so do transcripts (a long Claude Code session's is tens of MB).
-  Ending and pruning them (`keep_closed_days`) is still to come.
+- **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
+  MB. They are kept compressed. A compressed store doesn't shrink its file by itself: the space
+  freed is used again for what comes next (Turso's `VACUUM INTO` makes a compact copy). Pruning
+  ended sessions' transcripts (`keep_closed_days`) is still to come.
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status

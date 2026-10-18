@@ -30,6 +30,8 @@ pub struct Turso {
     id: String,
     /// The last number given to a write.
     rev: u64,
+    /// Record lines written before this number may still be kept uncompressed (0: none are).
+    squeeze_below: u64,
 }
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
@@ -68,7 +70,7 @@ impl Turso {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
         let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn, id: String::new(), rev: 0 };
+        let mut t = Self { io, _db: db, conn, id: String::new(), rev: 0, squeeze_below: 0 };
         t.migrate(schema)?;
         if schema < 2 {
             return Ok(t);
@@ -86,6 +88,12 @@ impl Turso {
             rev = rev.max(t.one_int(q, &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0));
         }
         t.rev = rev;
+        // Where compressing the lines kept before lines were compressed is (a store that never
+        // started: from its newest line down).
+        t.squeeze_below = match t.meta("squeeze_below")?.and_then(|v| v.parse::<u64>().ok()) {
+            Some(b) => b,
+            None => rev + 1,
+        };
         Ok(t)
     }
 
@@ -271,6 +279,51 @@ fn txt(s: &str) -> Value {
     Value::from_text(s.to_owned())
 }
 
+/// A line of a harness's record shorter than this is kept as it is.
+const SQUEEZE_MIN: usize = 256;
+/// A kept line's first byte, when it is a blob: how the rest is compressed.
+const CODEC_BROTLI: u8 = 1;
+/// Compression quality: fast, and most of brotli's gain on JSON.
+const SQUEEZE_QUALITY: u32 = 5;
+
+/// A record line as the store keeps it: brotli-compressed behind a codec byte when that saves a
+/// tenth or more (a blob), else as it is (text). Transcripts are most of what a store holds.
+fn squeeze(line: &str) -> Value {
+    use std::io::Write as _;
+    if line.len() >= SQUEEZE_MIN {
+        let mut out = Vec::with_capacity(line.len() / 3 + 1);
+        out.push(CODEC_BROTLI);
+        let written = {
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, SQUEEZE_QUALITY, 22);
+            w.write_all(line.as_bytes()).and_then(|()| w.flush())
+        };
+        if written.is_ok()
+            && out.len() * 10 <= line.len() * 9
+            && let Ok(v) = Value::from_slice(&out)
+        {
+            return v;
+        }
+    }
+    txt(line)
+}
+
+/// A record line as [`squeeze`] kept it.
+fn unsqueeze(v: &Value) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    if let Some(t) = v.to_text() {
+        return Ok(t.to_owned());
+    }
+    let b = v.to_blob().ok_or_else(|| anyhow::anyhow!("a record line that is neither text nor a blob"))?;
+    match b.split_first() {
+        Some((&CODEC_BROTLI, rest)) => {
+            let mut out = String::new();
+            brotli::Decompressor::new(rest, 4096).read_to_string(&mut out)?;
+            Ok(out)
+        }
+        _ => anyhow::bail!("a record line kept in an unknown encoding"),
+    }
+}
+
 impl Turso {
     fn writes(&self) -> anyhow::Result<Writes> {
         Ok(Writes {
@@ -325,7 +378,7 @@ impl Turso {
                 self.run(&mut w.dropped, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
             }
             Row::Closed { session, at } => self.run(&mut w.close, &[txt(session), int(*at), r], none)?,
-            Row::Record(rec) => self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), txt(&rec.line), r], none)?,
+            Row::Record(rec) => self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), squeeze(&rec.line), r], none)?,
             Row::RecordReset { session, source, at } => {
                 self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
                 self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
@@ -401,7 +454,7 @@ impl Engine for Turso {
                 Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
             })?,
             self.feed_page(sql::FEED_RECORDS, from, |r| {
-                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line: s(r, 4).unwrap_or_default() };
+                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line: unsqueeze(r.get_value(4))? };
                 Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
             })?,
             self.feed_page(sql::FEED_DROPS, from, |r| {
@@ -526,7 +579,7 @@ impl Engine for Turso {
         for (source, n) in last {
             let mut found = None;
             self.run(&mut line, &[txt(session), txt(&source), seq(n)], |r| {
-                found = Some((u(r, 0), r.get::<String>(1).unwrap_or_default()));
+                found = Some((u(r, 0), unsqueeze(r.get_value(1))?));
                 Ok(())
             })?;
             if let Some((end, l)) = found {
@@ -540,10 +593,44 @@ impl Engine for Turso {
         let mut stmt = self.prepare(sql::RECORD_LINES)?;
         let mut out = Vec::new();
         self.run(&mut stmt, &[txt(session), txt(source), seq(from), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
-            out.push((u(r, 0), r.get::<String>(1).unwrap_or_default()));
+            out.push((u(r, 0), unsqueeze(r.get_value(1))?));
             Ok(())
         })?;
         Ok(out)
+    }
+
+    fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool> {
+        if self.squeeze_below == 0 {
+            return Ok(false);
+        }
+        let mut below = self.prepare(sql::RECORDS_BELOW)?;
+        let mut rows: Vec<(String, String, u64, String, u64)> = Vec::new();
+        let mut lowest = self.squeeze_below;
+        self.run(&mut below, &[seq(self.squeeze_below), int(i64::try_from(limit).unwrap_or(500))], |r| {
+            let rev = u(r, 4);
+            lowest = lowest.min(rev);
+            // Only lines kept as text, long enough to be worth it.
+            if let (Ok(session), Ok(source), Ok(line)) = (r.get::<String>(0), r.get::<String>(1), r.get::<String>(3))
+                && line.len() >= SQUEEZE_MIN
+            {
+                rows.push((session, source, u(r, 2), line, rev));
+            }
+            Ok(())
+        })?;
+        // Nothing below: every line kept before lines were compressed has been looked at.
+        let next = if lowest == self.squeeze_below { 0 } else { lowest };
+        self.transaction(|t| {
+            let mut set = t.prepare(sql::RECORD_SQUEEZE)?;
+            for (session, source, n, line, _) in &rows {
+                let v = squeeze(line);
+                if v.to_blob().is_some() {
+                    t.run(&mut set, &[txt(session), txt(source), seq(*n), v], |_| Ok(()))?;
+                }
+            }
+            t.set_meta("squeeze_below", &next.to_string())
+        })?;
+        self.squeeze_below = next;
+        Ok(next > 0)
     }
 
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
@@ -672,6 +759,67 @@ mod tests {
         let t = Turso::open(&path)?;
         assert_eq!(t.id(), id);
         assert_eq!(t.rev, next.upto);
+        Ok(())
+    }
+
+    fn record(n: u64, line: &str) -> Row {
+        Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n, end: (n + 1) * 1000, line: line.into() }))
+    }
+
+    #[test]
+    fn transcript_lines_are_kept_compressed_and_read_back_whole() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("c.db"))?;
+        let long = format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}", "the retry loop read the clock twice; ".repeat(40));
+        let short = "{\"type\":\"summary\"}";
+        let before = t.rev;
+        t.apply(&[record(0, &long), record(1, short)])?;
+        // The long one is a blob, the short one text; both read back as they were, everywhere.
+        assert_eq!(t.one_int("SELECT count(*) FROM records WHERE typeof(line) = 'blob'", &[])?, Some(1));
+        assert_eq!(t.one_int("SELECT count(*) FROM records WHERE typeof(line) = 'text'", &[])?, Some(1));
+        assert!(t.one_int("SELECT length(line) FROM records WHERE n = 0", &[])?.is_some_and(|b| (b as usize) < long.len() / 3));
+        assert_eq!(t.record("s1", "cc", 0, 10)?, vec![(0, long.clone()), (1, short.to_owned())]);
+        assert_eq!(t.marks("s1")?.first().map(|m| m.line.clone()), Some(short.to_owned()));
+        let fed: Vec<String> = t.changes(before, 1 << 20)?.rows.into_iter().filter_map(|c| if let Row::Record(r) = c.row { Some(r.line) } else { None }).collect();
+        assert_eq!(fed, vec![long, short.to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn lines_kept_before_compression_are_compressed_in_the_background_and_keep_their_numbers() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let long = |i: u64| format!("{{\"n\":{i},\"text\":\"{}\"}}", "tool output, the same words again and again. ".repeat(30));
+        {
+            // As a store from before compression kept them: text, and nothing yet compressed.
+            let mut t = Turso::open(&path)?;
+            let mut put = t.prepare(sql::RECORD_UPSERT)?;
+            t.exec("BEGIN")?;
+            for i in 0..5_000u64 {
+                t.rev += 1;
+                let r = t.rev;
+                t.run(&mut put, &[txt("s1"), txt("cc"), seq(i), seq(i), txt(&long(i)), seq(r)], |_| Ok(()))?;
+            }
+            t.exec("COMMIT")?;
+            let top = t.rev;
+            t.set_meta("rev", &top.to_string())?;
+            t.set_meta("squeeze_below", &(top + 1).to_string())?;
+        }
+        let mut t = Turso::open(&path)?;
+        let revs = t.one_int("SELECT sum(rev) FROM records", &[])?;
+        let mut passes = 0;
+        while t.squeeze_some(2_000)? {
+            passes += 1;
+            assert!(passes < 10, "the pass never ends");
+        }
+        assert_eq!(t.one_int("SELECT count(*) FROM records WHERE typeof(line) = 'text'", &[])?, Some(0));
+        // The same lines, under the same numbers: nothing for a feed to send again.
+        assert_eq!(t.one_int("SELECT sum(rev) FROM records", &[])?, revs);
+        assert_eq!(t.record("s1", "cc", 4_321, 1)?, vec![(4_321, long(4_321))]);
+        // Done, and it stays done after reopening.
+        drop(t);
+        let mut again = Turso::open(&path)?;
+        assert!(!again.squeeze_some(2_000)?);
         Ok(())
     }
 
