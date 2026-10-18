@@ -129,6 +129,10 @@ host_seconds = 3600
         };
         // A clean environment and a home of its own: nothing of this machine's leaks in.
         c.env_clear().env("HOME", home).env("PATH", "/usr/local/bin:/usr/bin:/bin").env("LANG", "C.UTF-8").env("RUST_LOG", "info,kiln::observe=debug");
+        // The C library's allocator tuned from outside, for a test that measures it.
+        if let Ok(t) = std::env::var("GLIBC_TUNABLES") {
+            c.env("GLIBC_TUNABLES", t);
+        }
         Ok(c)
     }
 

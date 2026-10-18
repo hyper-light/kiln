@@ -47,12 +47,28 @@ pub struct Dropped {
     pub tags: u64,
 }
 
-/// A request's series and their samples.
+/// A request's series and their samples: each series' key once, and the samples flat, each with
+/// its series' place in `keys` (a request allocates for its samples once, not once a series).
 #[derive(Debug, Default)]
 pub struct Decoded {
-    pub series: Vec<(SeriesKey, Vec<(i64, f64)>)>,
+    pub keys: Vec<SeriesKey>,
+    /// Each sample's series (its place in `keys`), time and value, in the request's order.
+    pub samples: Vec<(u32, i64, f64)>,
     pub points: u64,
     pub dropped: Dropped,
+}
+
+impl Decoded {
+    /// Each series with its samples, in the order series came.
+    pub fn series(&self) -> Vec<(SeriesKey, Vec<(i64, f64)>)> {
+        let mut out: Vec<(SeriesKey, Vec<(i64, f64)>)> = self.keys.iter().map(|k| (k.clone(), Vec::new())).collect();
+        for &(i, ts, v) in &self.samples {
+            if let Some(s) = out.get_mut(i as usize) {
+                s.1.push((ts, v));
+            }
+        }
+        out
+    }
 }
 
 /// Shards of [`Keys`]: a receiver decodes on several threads at once.
@@ -135,7 +151,7 @@ const UNIFIED: [(&str, &[&str]); 3] = [("service", &["service.name"]), ("env", &
 struct Sink<'a, 'k> {
     out: Decoded,
     keys: &'k Keys,
-    /// This request's series by their keys' hashes: their places in `out.series`.
+    /// This request's series by their keys' hashes: their places in `out.keys`.
     found: HashTable<usize>,
     /// A point's attributes as read; its tags, merged and sorted; its canonical key.
     attrs: Vec<Tag<'a>>,
@@ -197,22 +213,22 @@ impl<'a> Sink<'a, '_> {
             put_canonical_tag(key, k, v);
         }
         let h = key_hash(&keys.hash, key, kind);
-        let series = &mut out.series;
-        if let Some(&i) = found.find(h, |&i| series.get(i).is_some_and(|(k, _)| k.kind == kind && *k.key == key[..])) {
-            if let Some(s) = series.get_mut(i) {
-                s.1.push((ts, v));
-                out.points += 1;
+        let made = &mut out.keys;
+        let place = match found.find(h, |&i| made.get(i).is_some_and(|k| k.kind == kind && *k.key == key[..])) {
+            Some(&i) => i,
+            None => {
+                let Some(k) = keys.get_or_make(h, key, kind, || SeriesKey::new(metric, merged(), kind).ok()) else {
+                    out.dropped.invalid += 1;
+                    return;
+                };
+                debug_assert_eq!(*k.key, key[..], "the canonical key as SeriesKey makes it");
+                let hash = keys.hash;
+                found.insert_unique(h, made.len(), |&i| made.get(i).map_or(0, |k| key_hash(&hash, &k.key, k.kind)));
+                made.push(k);
+                made.len() - 1
             }
-            return;
-        }
-        let Some(made) = keys.get_or_make(h, key, kind, || SeriesKey::new(metric, merged(), kind).ok()) else {
-            out.dropped.invalid += 1;
-            return;
         };
-        debug_assert_eq!(*made.key, key[..], "the canonical key as SeriesKey makes it");
-        let hash = keys.hash;
-        found.insert_unique(h, series.len(), |&i| series.get(i).map_or(0, |(k, _)| key_hash(&hash, &k.key, k.kind)));
-        series.push((made, vec![(ts, v)]));
+        out.samples.push((place as u32, ts, v));
         out.points += 1;
     }
 }
@@ -256,7 +272,9 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Decoded, OtlpError> {
 /// [`decode`] with a receiver's [`Keys`]: what a node's receivers decode with, so a series' key is
 /// made once in the node's life.
 pub fn decode_with(body: &[u8], now_ms: i64, keys: &Keys) -> Result<Decoded, OtlpError> {
-    let mut sink = Sink { out: Decoded::default(), keys, found: HashTable::new(), attrs: Vec::new(), tags: Vec::new(), key: Vec::new(), counts: Vec::new(), bounds: Vec::new() };
+    // A sample takes some 32 bytes of a request: room for them all at once, most of the time.
+    let out = Decoded { keys: Vec::with_capacity(body.len() / 32), samples: Vec::with_capacity(body.len() / 32), ..Decoded::default() };
+    let mut sink = Sink { out, keys, found: HashTable::new(), attrs: Vec::new(), tags: Vec::new(), key: Vec::new(), counts: Vec::new(), bounds: Vec::new() };
     for f in Fields::new(body) {
         let (n, w) = f?;
         if n == 1 {
@@ -949,9 +967,9 @@ mod tests {
         w.buf
     }
 
-    fn find<'a>(d: &'a Decoded, metric: &str, tag: Option<(&str, &str)>) -> &'a (SeriesKey, Vec<(i64, f64)>) {
-        d.series
-            .iter()
+    fn find(d: &Decoded, metric: &str, tag: Option<(&str, &str)>) -> (SeriesKey, Vec<(i64, f64)>) {
+        d.series()
+            .into_iter()
             .find(|(k, _)| {
                 let parsed = crate::batch::parse_key(&k.key).unwrap();
                 parsed.metric == metric && tag.is_none_or(|t| parsed.tags.contains(&t))
@@ -964,7 +982,7 @@ mod tests {
         let d = decode(&request(), 5).unwrap();
         let (k, s) = find(&d, "temp", Some(("room", "a")));
         assert_eq!(k.kind, Kind::Gauge);
-        assert_eq!(s, &vec![(1_700_000_000_000, 21.5)]);
+        assert_eq!(s, vec![(1_700_000_000_000, 21.5)]);
         let tags = crate::batch::parse_key(&k.key).unwrap().tags;
         for t in [("service", "api"), ("host", "web-1"), ("service.name", "api"), ("host.name", "web-1")] {
             assert!(tags.contains(&t), "{t:?} in {tags:?}");

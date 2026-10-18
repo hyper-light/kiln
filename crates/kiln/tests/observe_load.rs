@@ -10,7 +10,7 @@
 //! It starts real processes and loads them, so it is not run by default:
 //! `cargo test --release -p kiln --test observe_load -- --ignored --nocapture`, with
 //! `KOBS_LOAD_SECS` (20), `KOBS_LOAD_SENDERS` (8), `KOBS_LOAD_SERIES` (1000 a sender: points a
-//! request), `KOBS_LOAD_GZIP` (1); `KOBS_LOAD_HOLD=<seconds>` waits that long before the flood, the
+//! request), `KOBS_LOAD_GZIP` (1), `KOBS_LOAD_READ` (1: a reader alongside; 0: none); `KOBS_LOAD_HOLD=<seconds>` waits that long before the flood, the
 //! server's and the runner's pids written to `KOBS_LOAD_PIDS`, for a profiler to attach;
 //! `KOBS_PROFILE=<folder>` runs each node under samply (`SAMPLY`: its path), its profile saved
 //! there as `server.json.gz` and `r1.json.gz`.
@@ -166,7 +166,13 @@ struct Sent {
     latencies_us: Vec<u64>,
 }
 
-/// A process's CPU seconds so far and its peak resident memory (Linux's /proc).
+thread_local! {
+    /// The minor page faults the last `usage` read.
+    static MINFLT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A process's CPU seconds so far and its peak resident memory (Linux's /proc); its minor page
+/// faults so far in `MINFLT`.
 fn usage(pid: u32) -> (f64, u64) {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
     // Fields after the command's closing parenthesis: utime and stime are the 12th and 13th.
@@ -174,6 +180,7 @@ fn usage(pid: u32) -> (f64, u64) {
     let f: Vec<&str> = after.split_whitespace().collect();
     let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let cpu = (ticks(11) + ticks(12)) / 100.0;
+    MINFLT.with(|m| m.set(ticks(7) as u64));
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     let hwm = status.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     (cpu, hwm * 1024)
@@ -239,7 +246,9 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
         std::thread::sleep(Duration::from_secs(hold));
     }
     let (s_cpu0, _) = usage(server_pid);
+    let s_flt0 = MINFLT.with(std::cell::Cell::get);
     let (r_cpu0, _) = usage(runner_pid);
+    let r_flt0 = MINFLT.with(std::cell::Cell::get);
     let (s_threads0, r_threads0) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
 
     // Points stand 10 ms apart in each series, from ten minutes ago: each request's its own time.
@@ -290,7 +299,7 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
         std::thread::spawn(move || -> (Vec<u64>, Vec<u64>, Vec<String>) {
             let (mut one, mut all, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             let mut conn = Conn::new(port);
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) && env("KOBS_LOAD_READ", 1) == 1 {
                 let now = common::now_ms();
                 for (q, into) in [("avg:load.v{host:load-0,s:7}", &mut one), ("sum:load.v{*} by {host}", &mut all)] {
                     let body = serde_json::to_vec(&json!({ "query": q, "from": now - 900_000, "to": now, "points": 120 })).unwrap_or_default();
@@ -339,7 +348,9 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     anyhow::ensure!(dropped == 0, "{dropped} points dropped for room after being taken\n{}", f.logs());
     anyhow::ensure!(have == all.taken, "{} points taken, {have} stored\n{}", all.taken, f.logs());
     let (s_cpu1, s_rss) = usage(server_pid);
+    let s_flt = MINFLT.with(std::cell::Cell::get) - s_flt0;
     let (r_cpu1, r_rss) = usage(runner_pid);
+    let r_flt = MINFLT.with(std::cell::Cell::get) - r_flt0;
     let (s_threads1, r_threads1) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
     let (index, digest) = f.verify(2)?;
 
@@ -354,10 +365,21 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     eprintln!("  readable   all of it {:.2} s after the last was taken", lag.as_secs_f64());
     eprintln!("  one series p50 {:.2} ms, p99 {:.2} ms ({} reads)", ms(pct(&one, 0.5)), ms(pct(&one, 0.99)), one.len());
     eprintln!("  by host    p50 {:.2} ms, p99 {:.2} ms ({} reads, {} series)", ms(pct(&every, 0.5)), ms(pct(&every, 0.99)), every.len(), senders * series);
-    eprintln!("  server     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB", s_cpu1 - s_cpu0, (s_cpu1 - s_cpu0) / flood.as_secs_f64(), s_rss as f64 / 1048576.0);
+    eprintln!("  server     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.3} minor faults a point", s_cpu1 - s_cpu0, (s_cpu1 - s_cpu0) / flood.as_secs_f64(), s_rss as f64 / 1048576.0, s_flt as f64 / all.taken.max(1) as f64);
     eprintln!("    by thread: {}", spent(&s_threads0, &s_threads1));
-    eprintln!("  runner     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB", r_cpu1 - r_cpu0, (r_cpu1 - r_cpu0) / flood.as_secs_f64(), r_rss as f64 / 1048576.0);
+    eprintln!("  runner     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.3} minor faults a point", r_cpu1 - r_cpu0, (r_cpu1 - r_cpu0) / flood.as_secs_f64(), r_rss as f64 / 1048576.0, r_flt as f64 / all.taken.max(1) as f64);
     eprintln!("    by thread: {}", spent(&r_threads0, &r_threads1));
+    // What each holds once the flood is over and its writes are done: memory kept, not used.
+    std::thread::sleep(Duration::from_secs(5));
+    let rss = |pid: u32| -> (f64, f64) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let kib = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0;
+        (kib("VmRSS:"), kib("RssAnon:"))
+    };
+    let ((s_now, s_anon), (r_now, r_anon)) = (rss(server_pid), rss(runner_pid));
+    eprintln!("  after it   the server holds {s_now:.0} MiB ({s_anon:.0} anonymous), the runner {r_now:.0} MiB ({r_anon:.0} anonymous)");
+    let mib = |k: &str| at(&s, &[k]).as_u64().unwrap_or(0) as f64 / 1048576.0;
+    eprintln!("  the server's store in memory: symbols {:.1} MiB, index {:.1} MiB, head samples {:.1} MiB", mib("heap_symbols"), mib("heap_index"), mib("heap_samples"));
     eprintln!("  replicas   agree at index {index}: {digest:016x}");
     // Under a profiler (KOBS_PROFILE), each node stops gently so its profile is saved.
     f.stop_gently();

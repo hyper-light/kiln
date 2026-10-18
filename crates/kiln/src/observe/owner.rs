@@ -97,6 +97,11 @@ pub struct View {
     /// Bytes observe's folder holds on this machine (`dir_bytes`), and of them its logs files.
     pub disk_bytes: u64,
     pub log_bytes: u64,
+    /// Bytes the store holds in memory, by part (`kiln_obs::store::Heap`): its symbols, its
+    /// index (series, blocks' and logs files' summaries), its head's samples.
+    pub heap_symbols: u64,
+    pub heap_index: u64,
+    pub heap_samples: u64,
     pub cutoff_ms: i64,
     /// This node's writes: points waiting, points dropped, writes applied.
     pub waiting: u64,
@@ -127,6 +132,8 @@ enum Input {
     Heard { machine: String, json: String, bytes: Vec<u8> },
     Up { machine: String, up: bool },
     Series(Vec<(SeriesKey, Vec<(i64, f64)>)>),
+    /// Samples as a request decoded them: keys once, samples flat.
+    Samples(Vec<SeriesKey>, Vec<(u32, i64, f64)>),
     Logs(Vec<Record>),
     Staged { generation: u64, msg: Box<Message>, ok: bool },
     Fetched { generation: u64, done: u64, of: u64 },
@@ -254,6 +261,24 @@ impl Observe {
         }
         if self.tx.send(Input::Series(series)).is_err() {
             // No owner to take them: the room goes back.
+            a.left_points.fetch_add(n, Ordering::AcqRel);
+        }
+        true
+    }
+
+    /// Samples an exporter sent, as a request decoded them (`kiln_obs::otlp::metrics::Decoded`):
+    /// as [`Observe::offer`].
+    #[must_use]
+    pub fn offer_samples(&self, keys: Vec<SeriesKey>, samples: Vec<(u32, i64, f64)>) -> bool {
+        let n = samples.len() as u64;
+        if n == 0 {
+            return true;
+        }
+        let a = &self.admission;
+        if !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64 / 4 * 3) {
+            return false;
+        }
+        if self.tx.send(Input::Samples(keys, samples)).is_err() {
             a.left_points.fetch_add(n, Ordering::AcqRel);
         }
         true
@@ -624,6 +649,7 @@ impl Owner {
                 }
             }
             Input::Series(series) => self.batcher.series(series, Instant::now()),
+            Input::Samples(keys, samples) => self.batcher.samples(keys, &samples, Instant::now()),
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::Staged { generation, msg, ok } => {
                 if self.fetching.as_ref().is_some_and(|f| f.generation == generation) {
@@ -1013,6 +1039,8 @@ impl Owner {
             v.series = store.series_count() as u64;
             v.blocks = store.block_count() as u64;
             v.log_bytes = store.log_bytes();
+            let heap = store.heap();
+            (v.heap_symbols, v.heap_index, v.heap_samples) = (heap.symbols as u64, heap.index as u64, heap.samples as u64);
             v.cutoff_ms = store.cutoff();
             v.voters = rep.r.configuration().voters.clone();
             v.learners = rep.r.configuration().learners.clone();

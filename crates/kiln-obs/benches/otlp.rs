@@ -154,7 +154,7 @@ fn main() {
     for (name, body) in [("flat, 1,000 series", flat(1000)), ("an SDK's, 50 routes", sdk(50)), ("an SDK's, 500 routes", sdk(500))] {
         let now_ms = (NS / 1_000_000) as i64;
         let d = decode(&body, now_ms).unwrap();
-        let points = d.series.iter().map(|(_, p)| p.len()).sum::<usize>() as u64;
+        let points = d.samples.len() as u64;
         // Warm, then the median of 51 decodes.
         for _ in 0..20 {
             std::hint::black_box(decode(&body, now_ms).unwrap());
@@ -203,7 +203,7 @@ fn main() {
                 .collect(),
         );
         // The series keys' part: each one made again from its canonical parts.
-        let keys: Vec<(String, Vec<(String, String)>)> = d.series.iter().map(|(k, _)| canonical(&k.key)).collect();
+        let keys: Vec<(String, Vec<(String, String)>)> = d.keys.iter().map(|k| canonical(&k.key)).collect();
         let key_ns = median(
             (0..21)
                 .map(|_| {

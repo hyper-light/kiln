@@ -40,27 +40,48 @@ const ENTRY_BUDGET: usize = kiln_obs::group::ENTRY_BYTES - kiln_obs::command::WR
 pub const WAITING_POINTS: usize = 4 << 20;
 pub const WAITING_LOG_BYTES: usize = 64 << 20;
 
-/// A write out: its place, its entry, when it was sent, and its series' points (to send again
-/// with their definitions if the group does not know them).
+/// A write out: its place, its entry, when it was sent, and what it holds of each series (its
+/// points, a range of `points`, to send again with their definitions if the group does not know
+/// them). Kept, buffers and all, for the next write once answered.
+#[derive(Default)]
 struct Out {
     seq: u64,
     entry: Vec<u8>,
     sent: Option<Instant>,
-    series: Vec<(SeriesKey, Vec<(i64, f64)>)>,
+    series: Vec<(SeriesKey, std::ops::Range<usize>)>,
+    points: Vec<(i64, f64)>,
     defines: Vec<u64>,
+}
+
+/// A buffer kept for reuse past what it holds, halved when it holds a quarter of its room: a burst
+/// passes and its memory with it.
+fn settle<T>(v: &mut Vec<T>) {
+    if v.capacity() > 1 << 16 && v.len() < v.capacity() / 4 {
+        v.shrink_to(v.capacity() / 2);
+    }
 }
 
 pub struct Batcher {
     sender: u64,
     seq: u64,
     builder: Builder,
-    /// Points waiting, by series.
-    waiting: HashMap<u64, (SeriesKey, Vec<(i64, f64)>)>,
+    /// The series points wait for, each with how many: by fingerprint, their places here.
+    slots: Vec<(SeriesKey, u32)>,
+    by_fp: HashMap<u64, u32>,
+    /// Points waiting, each with its series' place, as they came: one buffer, kept.
+    points: Vec<(u32, i64, f64)>,
     waiting_points: usize,
     logs: VecDeque<Record>,
     log_bytes: usize,
     first_waiting: Option<Instant>,
     out: Option<Out>,
+    /// The last write answered: its buffers, for the next.
+    spare: Out,
+    /// Reused to cut a write: the series in the order they go; where each one's points start,
+    /// and next go; the points sorted by series.
+    order: Vec<u32>,
+    starts: Vec<u32>,
+    sorted: Vec<(i64, f64)>,
     /// Series a write of this sender defined, and when it was applied.
     known: HashMap<u64, Instant>,
     pub dropped: u64,
@@ -78,29 +99,93 @@ pub fn record_bytes(r: &Record) -> usize {
 
 impl Batcher {
     pub fn new(sender: u64) -> Self {
-        Self { sender, seq: 0, builder: Builder::new(), waiting: HashMap::new(), waiting_points: 0, logs: VecDeque::new(), log_bytes: 0, first_waiting: None, out: None, known: HashMap::new(), dropped: 0, written: 0, left_points: 0, left_log_bytes: 0 }
+        Self {
+            sender,
+            seq: 0,
+            builder: Builder::new(),
+            slots: Vec::new(),
+            by_fp: HashMap::new(),
+            points: Vec::new(),
+            waiting_points: 0,
+            logs: VecDeque::new(),
+            log_bytes: 0,
+            first_waiting: None,
+            out: None,
+            spare: Out::default(),
+            order: Vec::new(),
+            starts: Vec::new(),
+            sorted: Vec::new(),
+            known: HashMap::new(),
+            dropped: 0,
+            written: 0,
+            left_points: 0,
+            left_log_bytes: 0,
+        }
     }
 
     pub fn sender(&self) -> u64 {
         self.sender
     }
 
+    /// The place of `key`'s series in `slots`, made if new (the key kept, or dropped as a copy).
+    fn slot(&mut self, key: SeriesKey) -> u32 {
+        if let Some(&i) = self.by_fp.get(&key.fp) {
+            return i;
+        }
+        let i = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+        self.by_fp.insert(key.fp, i);
+        self.slots.push((key, 0));
+        i
+    }
+
     /// Points of series, waiting for the next write.
     pub fn series(&mut self, series: Vec<(SeriesKey, Vec<(i64, f64)>)>, now: Instant) {
         for (key, points) in series {
+            if points.is_empty() {
+                continue;
+            }
             if self.waiting_points + points.len() > WAITING_POINTS {
                 self.dropped += points.len() as u64;
                 self.left_points += points.len() as u64;
                 continue;
             }
-            self.waiting_points += points.len();
-            match self.waiting.get_mut(&key.fp) {
-                Some((_, held)) => held.extend(points),
-                None => {
-                    self.waiting.insert(key.fp, (key, points));
-                }
-            }
+            let slot = self.slot(key);
+            self.take(slot, points.iter().copied());
             self.first_waiting.get_or_insert(now);
+        }
+    }
+
+    /// Samples as a request decoded them (`kiln_obs::otlp::metrics::Decoded`): each with its
+    /// series' place in `keys`, waiting for the next write.
+    pub fn samples(&mut self, keys: Vec<SeriesKey>, samples: &[(u32, i64, f64)], now: Instant) {
+        if samples.is_empty() {
+            return;
+        }
+        if self.waiting_points + samples.len() > WAITING_POINTS {
+            self.dropped += samples.len() as u64;
+            self.left_points += samples.len() as u64;
+            return;
+        }
+        // Each key's place here, by its place there.
+        let places: Vec<u32> = keys.into_iter().map(|k| self.slot(k)).collect();
+        for &(i, ts, v) in samples {
+            let Some(&slot) = places.get(i as usize) else { continue };
+            self.push(slot, ts, v);
+        }
+        self.first_waiting.get_or_insert(now);
+    }
+
+    fn take(&mut self, slot: u32, points: impl Iterator<Item = (i64, f64)>) {
+        for (ts, v) in points {
+            self.push(slot, ts, v);
+        }
+    }
+
+    fn push(&mut self, slot: u32, ts: i64, v: f64) {
+        if let Some(s) = self.slots.get_mut(slot as usize) {
+            s.1 += 1;
+            self.points.push((slot, ts, v));
+            self.waiting_points += 1;
         }
     }
 
@@ -162,34 +247,95 @@ impl Batcher {
 
     /// The next write from what waits, as much as one entry holds; the rest waits on.
     fn build(&mut self, now: Instant, now_ms: i64) {
-        let mut series = Vec::new();
-        let mut defines = Vec::new();
-        // Oldest-defined first is no order to keep: series in fingerprint order, so a write's bytes
-        // do not depend on the map's.
-        let mut fps: Vec<u64> = self.waiting.keys().copied().collect();
-        fps.sort_unstable();
-        for fp in fps {
+        let mut out = std::mem::take(&mut self.spare);
+        out.series.clear();
+        out.points.clear();
+        out.defines.clear();
+        // Series in fingerprint order, so a write's bytes do not depend on the order points came.
+        self.order.clear();
+        self.order.extend(self.slots.iter().enumerate().filter(|(_, s)| s.1 > 0).map(|(i, _)| i as u32));
+        let slots = &self.slots;
+        self.order.sort_unstable_by_key(|&i| slots.get(i as usize).map_or(0, |s| s.0.fp));
+        // The points by series, each series' in the order they came: a counting sort.
+        self.starts.clear();
+        self.starts.resize(self.slots.len(), 0);
+        let mut at = 0u32;
+        for &i in &self.order {
+            if let (Some(st), Some(s)) = (self.starts.get_mut(i as usize), self.slots.get(i as usize)) {
+                *st = at;
+                at += s.1;
+            }
+        }
+        self.sorted.clear();
+        self.sorted.resize(self.points.len(), (0, 0.0));
+        for &(slot, ts, v) in &self.points {
+            if let Some(st) = self.starts.get_mut(slot as usize) {
+                if let Some(p) = self.sorted.get_mut(*st as usize) {
+                    *p = (ts, v);
+                }
+                *st += 1;
+            }
+        }
+        // Series while the entry has room; one too big for what is left goes in part. A sample
+        // takes at most 16 bytes in a run (two 64-bit words, Gorilla's worst).
+        let mut start = 0usize;
+        let mut taken_to = 0usize;
+        for &i in &self.order {
+            let Some((key, n)) = self.slots.get(i as usize) else { continue };
+            let n = *n as usize;
             if self.builder.byte_len() >= ENTRY_BUDGET / 2 {
                 break;
             }
-            let Some((key, mut points)) = self.waiting.remove(&fp) else { continue };
-            // A series' points past what one write should hold go in parts: a sample takes at most
-            // 16 bytes in a run (two 64-bit words, Gorilla's worst).
-            let room = (ENTRY_BUDGET / 2).saturating_sub(self.builder.byte_len()) / 16;
-            let rest = if points.len() > room.max(1) { points.split_off(room.max(1)) } else { Vec::new() };
-            self.waiting_points = self.waiting_points.saturating_sub(points.len());
-            self.left_points += points.len() as u64;
-            let defined = self.known.get(&fp).is_some_and(|t| now.duration_since(*t) < DEFINED_FOR);
+            let room = ((ENTRY_BUDGET / 2).saturating_sub(self.builder.byte_len()) / 16).max(1);
+            let take = n.min(room);
+            let points = self.sorted.get(start..start + take).unwrap_or_default();
+            let defined = self.known.get(&key.fp).is_some_and(|t| now.duration_since(*t) < DEFINED_FOR);
             if !defined {
-                self.builder.define(&key);
-                defines.push(fp);
+                self.builder.define(key);
+                out.defines.push(key.fp);
             }
-            self.builder.run(fp, points.iter().copied());
-            if !rest.is_empty() {
-                self.waiting.insert(fp, (key.clone(), rest));
+            self.builder.run(key.fp, points.iter().copied());
+            out.series.push((key.clone(), out.points.len()..out.points.len() + take));
+            out.points.extend_from_slice(points);
+            taken_to = start + take;
+            start += n;
+            if take < n {
+                break;
             }
-            series.push((key, points));
         }
+        let taken = out.points.len();
+        self.waiting_points -= taken;
+        self.left_points += taken as u64;
+        // What was not taken waits on, in the order it goes: the rest of a series cut in part,
+        // then every series after it. Places start again with them.
+        self.points.clear();
+        let mut kept: Vec<(SeriesKey, u32)> = Vec::new();
+        if taken_to < self.sorted.len() {
+            let mut at = 0usize;
+            for &i in &self.order {
+                let Some((key, n)) = self.slots.get(i as usize) else { continue };
+                let (from, to) = (at, at + *n as usize);
+                at = to;
+                let from = from.max(taken_to);
+                if from >= to {
+                    continue;
+                }
+                let place = kept.len() as u32;
+                kept.push((key.clone(), (to - from) as u32));
+                for &(ts, v) in self.sorted.get(from..to).unwrap_or_default() {
+                    self.points.push((place, ts, v));
+                }
+            }
+        }
+        self.slots.clear();
+        self.by_fp.clear();
+        for (key, n) in kept {
+            self.by_fp.insert(key.fp, self.slots.len() as u32);
+            self.slots.push((key, n));
+        }
+        settle(&mut self.points);
+        settle(&mut self.sorted);
+        settle(&mut self.slots);
         // Log records, as many as fit: LZ4's worst case is a little over its input (the block
         // format's bound, n + n/255 + 16), so rows of the room left fit whatever they compress to.
         let room = ENTRY_BUDGET.saturating_sub(self.builder.byte_len()) * 255 / 256;
@@ -210,24 +356,27 @@ impl Batcher {
         if !take.is_empty() {
             self.builder.logs(&take);
         }
-        if self.waiting.is_empty() && self.logs.is_empty() {
+        if self.points.is_empty() && self.logs.is_empty() {
             self.first_waiting = None;
             self.waiting_points = 0;
         } else {
             self.first_waiting = Some(now);
         }
         if self.builder.items() == 0 {
+            self.spare = out;
             return;
         }
         self.seq += 1;
-        let entry = self.builder.finish_write(self.sender, self.seq, now_ms);
-        self.out = Some(Out { seq: self.seq, entry, sent: None, series, defines });
+        out.seq = self.seq;
+        out.entry = self.builder.finish_write(self.sender, self.seq, now_ms);
+        out.sent = None;
+        self.out = Some(out);
     }
 
     /// What write `seq` came to. A series the group does not know waits again, its points to be
     /// sent with its definition; a write applied (now or before) is done.
     pub fn answered(&mut self, seq: u64, outcome: &Outcome, now: Instant) {
-        let Some(out) = self.out.take_if(|o| o.seq == seq) else { return };
+        let Some(mut out) = self.out.take_if(|o| o.seq == seq) else { return };
         if outcome.applied {
             self.written += 1;
             if self.known.len() + out.defines.len() > KNOWN {
@@ -243,14 +392,25 @@ impl Batcher {
             for fp in &outcome.unknown {
                 self.known.remove(fp);
             }
-            let again: Vec<(SeriesKey, Vec<(i64, f64)>)> = out.series.into_iter().filter(|(k, _)| outcome.unknown.contains(&k.fp)).collect();
-            // They wait again: their room is taken again (what `series` drops leaves again).
-            let back: u64 = again.iter().map(|(_, p)| p.len() as u64).sum();
-            self.series(again, now);
+            // They wait again: their room is taken again.
+            let mut back = 0u64;
+            for (key, range) in &out.series {
+                if outcome.unknown.contains(&key.fp) {
+                    let points = out.points.get(range.clone()).unwrap_or_default();
+                    back += points.len() as u64;
+                    let slot = self.slot(key.clone());
+                    self.take(slot, points.iter().copied());
+                    self.first_waiting.get_or_insert(now);
+                }
+            }
             self.left_points = self.left_points.saturating_sub(back);
         }
         // Refused and past the bound: those points go, counted.
         self.dropped += (outcome.refused.len() + outcome.over_limit.len()) as u64;
+        // Its buffers for the next write (its entry went to whoever sent it).
+        out.entry = Vec::new();
+        settle(&mut out.points);
+        self.spare = out;
     }
 }
 
@@ -330,6 +490,57 @@ mod tests {
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
         fresh.read(id, i64::MIN, i64::MAX, &mut ts, &mut vs)?;
         anyhow::ensure!(ts == vec![2], "{ts:?}");
+        Ok(())
+    }
+
+    /// Every write the batcher makes of `b`'s waiting points, flushed and answered as applied.
+    fn writes(b: &mut Batcher, t0: Instant) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut now = t0;
+        while b.backlog().0 > 0 {
+            now += FLUSH;
+            if let Some((seq, entry)) = b.poll(now, 0) {
+                b.answered(seq, &Outcome { applied: true, ..Outcome::default() }, now);
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_write_is_the_same_bytes_whatever_order_its_points_came_in_and_however_they_came() -> anyhow::Result<()> {
+        // 3,000 series of 40 points of values that do not compress: more than one write holds, so
+        // series are cut in part too.
+        let val = |k: u32, t: i64| (u64::from(k).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (t as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)) as f64;
+        let keys: Vec<SeriesKey> = (0..3000).map(|h| key(&format!("h{h}"))).collect::<anyhow::Result<_>>()?;
+        let mut all: Vec<(u32, i64, f64)> = (0..3000u32).flat_map(|k| (0..40i64).map(move |t| (k, t * 10, val(k, t)))).collect();
+        let t0 = Instant::now();
+        let mut grouped = Batcher::new(9);
+        grouped.series(keys.iter().enumerate().map(|(k, key)| (key.clone(), (0..40i64).map(|t| (t * 10, val(k as u32, t))).collect())).collect(), t0);
+        let want = writes(&mut grouped, t0);
+        anyhow::ensure!(want.len() > 1, "{} writes", want.len());
+        // The same points as a request decodes them, in two other orders, each series' own order kept.
+        for seed in [1u64, 2] {
+            let mut x = seed;
+            let mut shuffled = all.clone();
+            for i in (1..shuffled.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                shuffled.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            // Each series' points in their order again, the series interleaved as shuffled.
+            let mut next = vec![0i64; 3000];
+            for p in &mut shuffled {
+                let n = &mut next[p.0 as usize];
+                *p = (p.0, *n * 10, val(p.0, *n));
+                *n += 1;
+            }
+            let mut flat = Batcher::new(9);
+            flat.samples(keys.clone(), &shuffled, t0);
+            anyhow::ensure!(writes(&mut flat, t0) == want, "the writes of order {seed} differ");
+        }
+        all.clear();
         Ok(())
     }
 

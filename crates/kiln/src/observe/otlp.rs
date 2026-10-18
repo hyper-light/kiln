@@ -412,7 +412,7 @@ pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &
         Signal::Metrics => match kiln_obs::otlp::metrics::decode_with(pb, now_ns / 1_000_000, keys()) {
             Ok(d) => {
                 let points = d.points;
-                if !o.offer(d.series) {
+                if !o.offer_samples(d.keys, d.samples) {
                     return Answer::Busy;
                 }
                 Answer::Ok { json, points }
@@ -528,11 +528,12 @@ mod tests {
     fn the_specification_s_metrics_example_reads_as_its_protobuf_would() -> anyhow::Result<()> {
         let pb = json_to_pb(METRICS_JSON.as_bytes(), Signal::Metrics)?;
         let d = kiln_obs::otlp::metrics::decode(&pb, 0)?;
-        let names: std::collections::BTreeSet<String> = d.series.iter().filter_map(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok().map(|p| p.metric.to_owned())).collect();
+        let names: std::collections::BTreeSet<String> = d.series().iter().filter_map(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok().map(|p| p.metric.to_owned())).collect();
         for want in ["my.counter", "my.gauge", "my.histogram.count", "my.histogram.sum", "my.histogram.bucket", "my.exponential.histogram.count", "my.exponential.histogram.p50"] {
             anyhow::ensure!(names.contains(want), "{want} missing from {names:?}");
         }
-        let gauge = d.series.iter().find(|(k, _)| kiln_obs::batch::parse_key(&k.key).is_ok_and(|p| p.metric == "my.gauge")).ok_or_else(|| anyhow::anyhow!("the gauge"))?;
+        let series = d.series();
+        let gauge = series.iter().find(|(k, _)| kiln_obs::batch::parse_key(&k.key).is_ok_and(|p| p.metric == "my.gauge")).ok_or_else(|| anyhow::anyhow!("the gauge"))?;
         anyhow::ensure!(gauge.1 == vec![(1_544_712_660_300, 10.0)], "{:?}", gauge.1);
         let tags = kiln_obs::batch::parse_key(&gauge.0.key)?.tags;
         anyhow::ensure!(tags.contains(&("service", "my.service")) && tags.contains(&("my.gauge.attr", "some value")), "{tags:?}");
