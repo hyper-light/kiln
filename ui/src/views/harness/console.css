@@ -55,8 +55,9 @@
   padding: 18px 24px 14px;
   border-bottom: 1px solid #1d1f23;
 }
-/* A phone's keyboard is up: the conversation gets the room the agent's name and state took. */
-html[data-window="short"] .ag-head {
+/* A phone's keyboard is up for the composer: the conversation gets the room the agent's name and
+   state took. Not when it's up for something in them (renaming): hiding that would close it. */
+html[data-window="short"] .ag-head:not(:focus-within) {
   display: none;
 }
 .ag-top {
