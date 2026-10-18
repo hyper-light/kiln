@@ -314,6 +314,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
         (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
         (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
+        (&Method::PUT, ["api", "updates", "runners", name]) => set_runner_policy(&hub, name, req).await,
+        (&Method::PUT, ["api", "updates", "policy"]) => set_policies(&hub, req).await,
         (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
         (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
@@ -478,6 +480,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
+        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => harness_recover(&hub, machine, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
             let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
@@ -2252,6 +2255,50 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str) -> R {
     }
 }
 
+#[derive(Deserialize)]
+struct RunnerPolicy {
+    policy: crate::updates::Policy,
+}
+
+/// `PUT /api/updates/runners/{name}` `{"policy": "auto" | "notify" | "off"}`: what that machine's
+/// runner does with a newer kiln (Notify unless chosen otherwise).
+async fn set_runner_policy(hub: &Arc<Hub>, name: &str, req: Request) -> R {
+    let b: RunnerPolicy = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    apply_policy(hub, &[name.to_owned()], b.policy).await
+}
+
+#[derive(Deserialize)]
+struct Policies {
+    policy: crate::updates::Policy,
+    /// These runners; or every one, with `all`.
+    #[serde(default)]
+    runners: Vec<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// `PUT /api/updates/policy` `{"policy": "off", "runners": ["a", "b"]}` (or `"all": true`): the same
+/// update policy for any number of runners at once.
+async fn set_policies(hub: &Arc<Hub>, req: Request) -> R {
+    let b: Policies = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let names = if b.all { crate::updates::runners(hub).await.into_iter().map(|r| r.name).collect() } else { b.runners };
+    if names.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name the runners, or say all"));
+    }
+    apply_policy(hub, &names, b.policy).await
+}
+
+async fn apply_policy(hub: &Arc<Hub>, names: &[String], policy: crate::updates::Policy) -> R {
+    for name in names {
+        crate::updates::set_policy(hub, name, policy).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    }
+    hub.store.audit("admin".into(), "upgrade.policy".into(), format!("updates {} for {}", policy.as_str(), names.join(", "))).await;
+    hub.emit(&json!({ "type": "updates" }));
+    // Its gauges at once, and an automatic one brought up to date.
+    hub.updates.fleet.wake();
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 /// `POST /api/updates/runners`: upgrade every connected runner that isn't up to date.
 async fn upgrade_all_runners(hub: &Arc<Hub>) -> Response {
     let mut jobs = Vec::new();
@@ -2777,6 +2824,7 @@ struct HarnessOpen {
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
+    let opener = caller_of(hub, req.headers()).await.and_then(|c| c.opener());
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
@@ -2793,7 +2841,28 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`).
+    if let Some(o) = &opener {
+        for i in &infos {
+            let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;
+        }
+    }
     Ok(srv::json(StatusCode::OK, &infos))
+}
+
+/// Every agent of a machine that's gone goes on elsewhere, from the server's copy of its
+/// conversation (`harness::relocate::recover`): `{"to"?}` puts them all on one machine.
+async fn harness_recover(hub: &Arc<Hub>, machine: &str, req: Request) -> R {
+    #[derive(serde::Deserialize, Default)]
+    struct Body {
+        #[serde(default)]
+        to: Option<String>,
+    }
+    let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let moved = crate::harness::relocate::recover(hub, machine, b.to.as_deref()).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let ok = moved.iter().filter(|m| m.get("error").is_none()).count();
+    hub.store.audit("admin".into(), "agent.recover".into(), format!("{ok} of {} agents of {machine} go on elsewhere", moved.len())).await;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({ "moved": moved })))
 }
 
 /// One thing to many agents at once: a prompt or slash command, a command, or answers to every

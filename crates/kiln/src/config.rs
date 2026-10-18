@@ -472,14 +472,19 @@ pub struct Updates {
     /// (`crate::updates::in_step_loop`), so every runner can be upgraded to what the server runs.
     /// Needs a server built knowing its commit (`KILN_COMMIT`).
     pub in_step: bool,
-    /// Every runner follows the newest kiln (`crate::fleet`): when the server or a runner runs a
-    /// newer commit of the release branch, every other connected runner is brought to it, by a
-    /// binary of it, or by building it itself on a machine with a kiln checkout.
+    /// Runners whose update policy is Automatic follow the newest kiln (`crate::fleet`): when the
+    /// server or a runner runs a newer commit of the release branch, they are brought to it, by a
+    /// binary of it, or by building it itself on a machine with a kiln checkout. `false`: none is,
+    /// whatever its policy.
     pub follow: bool,
+    /// On a runner's machine: it takes upgrades from its server. `false`: its runner refuses every
+    /// one, whatever the server's policy for it (`kiln config set updates.accept false`); the
+    /// server shows it so.
+    pub accept: bool,
 }
 
 impl Default for Updates {
     fn default() -> Self {
-        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned(), in_step: true, follow: true }
+        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned(), in_step: true, follow: true, accept: true }
     }
 }

@@ -119,6 +119,30 @@ impl CounterVec {
     }
 }
 
+/// A label-keyed gauge family, measured whole each time: what isn't measured any more (a runner
+/// that went) goes from it.
+pub struct GaugeVec {
+    keys: &'static [&'static str],
+    series: RwLock<BTreeMap<Vec<String>, i64>>,
+}
+
+impl GaugeVec {
+    pub fn new(keys: &'static [&'static str]) -> Self {
+        Self { keys, series: RwLock::new(BTreeMap::new()) }
+    }
+
+    /// Every series, as just measured: label values (in `keys` order) and value.
+    pub fn replace(&self, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
+        *self.series.write() = series.into_iter().collect();
+    }
+
+    fn render(&self, out: &mut String, name: &str) {
+        for (vals, v) in self.series.read().iter() {
+            let _ = writeln!(out, "{name}{{{}}} {v}", labels(self.keys, vals));
+        }
+    }
+}
+
 fn escape(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
@@ -152,6 +176,14 @@ pub struct Metrics {
     pub panics_caught: Counter,
     pub quic_streams: Counter,
     pub k8s_pods_launched: CounterVec,
+    /// Each runner, connected (1) or not (0).
+    pub runner_up: GaugeVec,
+    /// Each runner, behind the newest kiln (1) or not (0).
+    pub runner_behind: GaugeVec,
+    /// Each runner's update policy (1 for the one it has).
+    pub runner_update_policy: GaugeVec,
+    /// The kiln each runner runs (1).
+    pub runner_version_info: GaugeVec,
     /// The CI engine's (docs/ci.md W19-R02): cache lookups by result and saves (W08-R13),
     /// attempts by conclusion and failure class, queue seconds by wait reason, and how far
     /// behind the rollups are.
@@ -184,6 +216,10 @@ pub fn global() -> &'static Metrics {
         panics_caught: Counter::default(),
         quic_streams: Counter::default(),
         k8s_pods_launched: CounterVec::new(&["result"]),
+        runner_up: GaugeVec::new(&["runner"]),
+        runner_behind: GaugeVec::new(&["runner"]),
+        runner_update_policy: GaugeVec::new(&["runner", "policy"]),
+        runner_version_info: GaugeVec::new(&["runner", "version"]),
         ci_cache: CounterVec::new(&["result"]),
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
@@ -248,6 +284,14 @@ pub fn render() -> String {
     m.gitops_polls.render(&mut o, "kiln_gitops_polls_total");
     help(&mut o, "kiln_k8s_pods_total", "counter", "Agent pods launched.");
     m.k8s_pods_launched.render(&mut o, "kiln_k8s_pods_total");
+    help(&mut o, "kiln_runner_up", "gauge", "Runners connected (1) or not (0).");
+    m.runner_up.render(&mut o, "kiln_runner_up");
+    help(&mut o, "kiln_runner_behind", "gauge", "Runners behind the newest kiln (1) or not (0).");
+    m.runner_behind.render(&mut o, "kiln_runner_behind");
+    help(&mut o, "kiln_runner_update_policy", "gauge", "Each runner's update policy: auto, notify or off (1).");
+    m.runner_update_policy.render(&mut o, "kiln_runner_update_policy");
+    help(&mut o, "kiln_runner_version_info", "gauge", "The kiln each runner runs: its commit, else its build (1).");
+    m.runner_version_info.render(&mut o, "kiln_runner_version_info");
     help(&mut o, "kiln_ci_cache_total", "counter", "CI cache lookups (hit, miss) and saves.");
     m.ci_cache.render(&mut o, "kiln_ci_cache_total");
     help(&mut o, "kiln_ci_attempts_total", "counter", "CI leg attempts by conclusion and failure class.");

@@ -78,6 +78,59 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool) -> Result<serd
     Ok(serde_json::json!({ "moving": to }))
 }
 
+/// Recover every agent of machine `from`, which is gone (not connected): each goes on on another
+/// machine from the server's copy of its conversation ([`start`]), on `to` when it's given, else on
+/// the machine that suits it best (connected, not a job's, its harness installed there; one of
+/// `from`'s platform first, then the one running the fewest agents). Agents that ended stay where
+/// they were. What became of each: `{id, name, to?, error?}`.
+pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+    use std::collections::HashMap;
+    let from = from.strip_prefix("agent:").unwrap_or(from).to_owned();
+    let (connected, os) = {
+        let g = hub.agents.lock();
+        let a = g.get(&from);
+        (a.is_some_and(|a| a.connected), a.map(|a| a.os.clone()).unwrap_or_default())
+    };
+    if connected {
+        return Err(format!("{from} is connected: its agents move one at a time (Move to…), its runner handing each over"));
+    }
+    let to = to.map(|t| t.strip_prefix("agent:").unwrap_or(t).trim().to_owned()).filter(|t| !t.is_empty());
+    let all = hub.harness.list();
+    let on = |id: &str| match hub.harness.location(id) {
+        Some(Location::Machine(m)) => Some(m),
+        _ => None,
+    };
+    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited).cloned().collect();
+    let kinds = hub.harness.kinds();
+    let runners: Vec<(String, String)> = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral && !a.outpost && a.name != from).map(|a| (a.name.clone(), a.os.clone())).collect();
+    let mut load: HashMap<String, usize> = HashMap::new();
+    for i in &all {
+        if let Some(m) = on(&i.id) {
+            *load.entry(m).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for a in agents {
+        let fits = |m: &str| kinds.get(&format!("agent:{m}")).is_some_and(|ks| ks.iter().any(|k| k.id == a.kind && k.available));
+        let pick = match &to {
+            Some(t) => Some(t.clone()),
+            None => runners.iter().filter(|(m, _)| fits(m)).min_by_key(|(m, mos)| (*mos != os, load.get(m).copied().unwrap_or(0), m.clone())).map(|(m, _)| m.clone()),
+        };
+        let Some(t) = pick else {
+            out.push(serde_json::json!({"id": a.id, "name": a.name, "error": format!("no connected machine has {} installed", a.kind_name)}));
+            continue;
+        };
+        match start(hub, &a.id, &t, false).await {
+            Ok(_) => {
+                *load.entry(t.clone()).or_default() += 1;
+                out.push(serde_json::json!({"id": a.id, "name": a.name, "to": t}));
+            }
+            Err(e) => out.push(serde_json::json!({"id": a.id, "name": a.name, "to": t, "error": e})),
+        }
+    }
+    Ok(out)
+}
+
 async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
     let _ = hub.harness.command(hub, id, Command::Moving { text: text.to_owned() }).await;
 }

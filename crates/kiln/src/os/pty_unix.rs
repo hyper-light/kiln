@@ -25,6 +25,8 @@ impl AsRawFd for RawNumber {
 /// The I/O side of a PTY session: an owned, non-blocking duplicate of the master.
 pub struct PtyIo {
     fd: Arc<OwnedFd>,
+    /// Stops reading its output (the session went to another process).
+    stop: (async_channel::Sender<()>, async_channel::Receiver<()>),
 }
 
 impl PtyIo {
@@ -36,17 +38,17 @@ impl PtyIo {
         let file = dup.as_file().map_err(|e| anyhow::anyhow!("PTY master as file: {e}"))?;
         let fd = OwnedFd::from(file);
         nonblocking(&fd).context("non-blocking PTY master")?;
-        Ok(Self { fd: Arc::new(fd) })
+        Ok(Self { fd: Arc::new(fd), stop: async_channel::bounded(1) })
     }
 
     /// What it takes to hand this session to a re-executed kiln: the master and the shell's pid.
     pub fn handle(&self, pid: u32) -> Handle {
-        Handle { fd: Arc::clone(&self.fd), pid }
+        Handle { fd: Arc::clone(&self.fd), pid, stop: self.stop.0.clone() }
     }
 
     /// Pump PTY output (then the exit status) into `out`, and `input` into the PTY.
     pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
-        pump(&self.fd, &out, input);
+        pump(&self.fd, &out, input, self.stop.1.clone());
         // The exit status, after the last output has had a moment to drain.
         let pid = child.process_id();
         crate::rt::spawn(async move {
@@ -71,16 +73,23 @@ fn exit_code(pid: u32, st: &portable_pty::ExitStatus) -> Option<i32> {
     i32::try_from(st.exit_code()).ok()
 }
 
-/// PTY → `out` (until EOF/EIO: the shell exited or the master closed) and `input` → PTY.
-fn pump(fd: &Arc<OwnedFd>, out: &async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
+/// PTY → `out` (until EOF/EIO: the shell exited or the master closed, or `stop`: the session went
+/// to another process, which reads on) and `input` → PTY.
+fn pump(fd: &Arc<OwnedFd>, out: &async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>, stop: async_channel::Receiver<()>) {
     {
         let fd = Arc::clone(fd);
         let out = out.clone();
         crate::rt::spawn(async move {
+            use futures::FutureExt as _;
             let mut buf = vec![0u8; 32 * 1024];
-            while let Ok(Some(n)) = read_chunk(&fd, &mut buf).await {
+            loop {
+                let read = futures::select_biased! {
+                    _ = stop.recv().fuse() => return,
+                    r = read_chunk(&fd, &mut buf).fuse() => r,
+                };
+                let Ok(Some(n)) = read else { return };
                 if out.send(PtyOut::Data(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default())).await.is_err() {
-                    break;
+                    return;
                 }
             }
         });
@@ -101,9 +110,17 @@ fn pump(fd: &Arc<OwnedFd>, out: &async_channel::Sender<PtyOut>, input: async_cha
 pub struct Handle {
     fd: Arc<OwnedFd>,
     pid: u32,
+    stop: async_channel::Sender<()>,
 }
 
 impl Handle {
+    /// Let the session go to another process (a blue/green upgrade): nothing more is read from it
+    /// here, and a copy of its master is returned for that process.
+    pub fn hand_off(&self) -> std::io::Result<OwnedFd> {
+        let _ = self.stop.try_send(());
+        rustix::io::fcntl_dupfd_cloexec(&*self.fd, 3).map_err(std::io::Error::from)
+    }
+
     pub fn raw_fd(&self) -> i32 {
         self.fd.as_raw_fd()
     }
@@ -133,28 +150,36 @@ impl Handle {
     }
 }
 
-/// Take over a session handed over before this process started: its master (already
-/// non-blocking) and its shell. After a re-exec the shell is still our child; after a handover to
-/// a fresh process (macOS) it is not (its parent was the runner before this one), so its exit is
-/// seen without a status. Output and the exit flow as for a spawned session.
-pub fn adopt(fd: OwnedFd, pid: u32, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) -> Handle {
+/// Take over a session handed over before this process started, or by another runner process of
+/// this machine: its master (already non-blocking) and its shell. After a re-exec the shell is
+/// still our child; after a handover to a fresh process (macOS) it is not (its parent was the
+/// runner before this one), so its exit is seen without a status. `foreign`: another runner of
+/// this machine still reaps it (a blue/green handover), so its exit is only watched. Output and
+/// the exit flow as for a spawned session.
+pub fn adopt(fd: OwnedFd, pid: u32, foreign: bool, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) -> Handle {
     // Nothing this process starts (a job, another shell) may inherit this terminal.
     let _ = crate::os::close_on_exec(&fd);
     let fd = Arc::new(fd);
-    pump(&fd, &out, input);
+    let stop = async_channel::bounded(1);
+    pump(&fd, &out, input, stop.1.clone());
     crate::rt::spawn(async move {
-        let code = wait_pid_exit(pid, || match crate::os::try_reap(pid) {
-            Ok(st) => Ok(st.map(|(code, _)| code)),
-            Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD) => Ok((!crate::os::pid_alive(pid)).then_some(None)),
-            Err(e) => Err(e),
-        })
-        .await
-        .ok()
-        .flatten();
+        let code = if foreign {
+            crate::os::proc::wait_foreign_exit(pid).await;
+            None
+        } else {
+            wait_pid_exit(pid, || match crate::os::try_reap(pid) {
+                Ok(st) => Ok(st.map(|(code, _)| code)),
+                Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD) => Ok((!crate::os::pid_alive(pid)).then_some(None)),
+                Err(e) => Err(e),
+            })
+            .await
+            .ok()
+            .flatten()
+        };
         crate::rt::sleep(Duration::from_millis(50)).await;
         let _ = out.send(PtyOut::Exit(code)).await;
     });
-    Handle { fd, pid }
+    Handle { fd, pid, stop: stop.0 }
 }
 
 /// Close a PTY master (quick on Unix).

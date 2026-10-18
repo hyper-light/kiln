@@ -412,8 +412,32 @@ async fn prepare(files: &Files, c: Command) -> Command {
 enum Ctl {
     Cmd(Box<Command>),
     Close,
+    /// This image of the process ends next (an in-place upgrade): the harness process, still
+    /// running, goes to the next one.
+    HandOver(futures::channel::oneshot::Sender<Option<Box<Handed>>>),
     /// It went on on another machine: it stops here, and isn't closed.
     LetGo,
+}
+
+/// A session handed from this image of the process to the next (an in-place upgrade) with its
+/// harness process still running: the next image goes on with that very process, where this one
+/// stopped, so nothing the agent was doing is cut short.
+#[derive(Serialize, Deserialize)]
+pub struct Handed {
+    /// The harness it runs in now (a switch may have changed it from its spec's).
+    pub kind: String,
+    pub process: crate::proc::Detached,
+    pub core: super::core::Frozen,
+    pub adapter: super::kinds::Frozen,
+    /// What the harness wrote after its last whole line (base64): the rest of that line follows.
+    pub partial: String,
+}
+
+/// A harness process taken over from this process's previous image, still running.
+struct Adopt {
+    process: crate::proc::Detached,
+    adapter: super::kinds::Adapter,
+    partial: Vec<u8>,
 }
 
 /// A running session, as its machine holds it.
@@ -450,6 +474,15 @@ impl Session {
 
     pub fn close(&self) {
         let _ = self.ctl.try_send(Ctl::Close);
+    }
+
+    /// Hand its harness process to this process's next image (an in-place upgrade, next):
+    /// `None` when none runs, or it couldn't be handed over (it was stopped then, and starts again
+    /// in the next image, continuing its conversation).
+    pub async fn hand_over(&self) -> Option<Box<Handed>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ctl.send(Ctl::HandOver(tx)).await.ok()?;
+        rx.await.ok().flatten()
     }
 
     /// It went on on another machine since: its harness here stops and this machine lets go of
@@ -585,10 +618,20 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
     start_seeded(id, spec, sink, on_change, files, None)
 }
 
+/// Go on with a session this process's previous image handed over ([`Session::hand_over`]): its
+/// timeline and state as they were, and its harness process, still running.
+pub fn start_handed(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
+    use base64::Engine as _;
+    let kind = Kind::get(&h.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", h.kind))?;
+    let h = *h;
+    let core = Core::thaw(h.core);
+    let adopt = Adopt { process: h.process, adapter: super::kinds::Adapter::thaw(h.adapter), partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
+    begin(id, spec, kind, core, sink, on_change, files, None, Some(adopt))
+}
+
 /// Start a session, seeded with what it had on another machine when it moved here.
 pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
-    let now = crate::util::now_ms();
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
     core.state.cwd.clone_from(&cwd);
@@ -627,6 +670,15 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         items = sd.items;
     }
     core.state.reach.clone_from(&spec.reach);
+    begin(id, spec, kind, core, sink, on_change, files, items, None)
+}
+
+/// A session with this core, its task started (`adopt`: going on with a harness process the
+/// previous image of this process handed over).
+#[allow(clippy::too_many_arguments)]
+fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+    let now = crate::util::now_ms();
+    let cwd = core.state.cwd.clone();
     let info = Info {
         id: id.clone(),
         kind: kind.id.to_owned(),
@@ -687,7 +739,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
         let id = run.id.clone();
-        if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items)).catch_unwind().await {
+        if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items, adopt)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");
         }
     });
@@ -1406,7 +1458,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
         note.push_str(n);
     }
     let env = spec.env.clone();
-    let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &note)).await.map_err(|e| format!("{e:#}"))??;
+    let timeline = events.clone();
+    let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)).await.map_err(|e| format!("{e:#}"))??;
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
     pkg.picks_up = mv.picks_up;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
@@ -1415,18 +1468,24 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
 }
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
-async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>) {
+#[allow(clippy::too_many_arguments)]
+async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
     // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;
     s.core.lock().harness = Some(kind.name.to_owned());
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
     let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
+    // Going on with the process the previous image of this process ran: its timeline came with it.
+    let mut adopt = adopt;
+    let handed = adopt.is_some();
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
-    let _ = takeover_ready(&s, &sink, TAKEOVER_WAIT).await;
+    if !handed {
+        let _ = takeover_ready(&s, &sink, TAKEOVER_WAIT).await;
+    }
     // A resumed Claude Code session starts from its transcript (its history), not empty.
-    if kind.protocol == super::kinds::Protocol::ClaudeStreamJson {
+    if kind.protocol == super::kinds::Protocol::ClaudeStreamJson && !handed {
         let (resume, env, upto) = {
             let sp = s.spec.lock();
             (sp.resume.clone(), sp.env.clone(), sp.resume_at.clone())
@@ -1448,7 +1507,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     for u in s.snapshot() {
         let _ = sink.send((s.id.clone(), u)).await;
     }
-    let mut first = true;
+    let mut first = !handed;
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
@@ -1510,31 +1569,56 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if seed.is_some() {
             spec.resume = None;
         }
-        let mut adapter = kind.adapter(&spec);
         s.core.lock().harness = Some(kind.name.to_owned());
-        if let Some(items) = &seed {
-            adapter.seed(items.clone());
-        }
-        let started = Instant::now();
-        let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
-        let spawned = match blocked {
-            Some(why) => Err(anyhow::anyhow!(why)),
-            // Marked as this session's, and so is everything it starts (`survivors`).
-            None => kind
-                .launch(&spec)
-                .map(|mut p| {
-                    p.env(super::survivors::MARK, &s.id);
-                    p
-                })
-                .and_then(crate::proc::spawn_duplex),
+        // The process the previous image handed over, still running; else a new one.
+        let (mut adapter, spawned, partial, adopted) = match adopt.take() {
+            Some(a) => match crate::proc::adopt_duplex(a.process) {
+                Ok(p) => {
+                    tracing::info!(session = %s.id, pid = p.pid, "agent session went on with its process across the upgrade");
+                    (a.adapter, Ok(p), a.partial, true)
+                }
+                Err(e) => {
+                    // Its process can't be reached: stopped, and started again (its conversation
+                    // goes on), so two of it never run.
+                    tracing::warn!(session = %s.id, error = %format!("{e:#}"), "couldn't take over the agent's process after the upgrade: it starts again");
+                    crate::proc::terminate_tree(i32::try_from(a.process.pid).unwrap_or(0), Duration::from_secs(2)).await;
+                    continue;
+                }
+            },
+            None => {
+                let mut adapter = kind.adapter(&spec);
+                adapter.offer_mcp(super::kinds::acp_servers(&spec, &s.id));
+                if let Some(items) = &seed {
+                    adapter.seed(items.clone());
+                }
+                let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                let spawned = match blocked {
+                    Some(why) => Err(anyhow::anyhow!(why)),
+                    // Marked as this session's, and so is everything it starts (`survivors`).
+                    None => kind
+                        .launch(&spec, &s.id)
+                        .map(|mut p| {
+                            p.env(super::survivors::MARK, &s.id);
+                            p
+                        })
+                        .and_then(crate::proc::spawn_duplex),
+                };
+                (adapter, spawned, Vec::new(), false)
+            }
         };
+        let started = Instant::now();
         let mut code = None;
         let mut error = None;
         match spawned {
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
                 *s.pid.lock() = Some(p.pid);
-                {
+                if adopted {
+                    let mut core = s.core.lock();
+                    for c in carry.drain(..) {
+                        adapter.command(&mut core, c);
+                    }
+                } else {
                     let mut core = s.core.lock();
                     core.state.exit = None;
                     core.set_status(Status::Starting);
@@ -1549,7 +1633,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 }
                 on_change();
                 let mut jobs = flush(&s, &sink, Some(&p.stdin)).await;
-                let mut buf: Vec<u8> = Vec::new();
+                let mut buf: Vec<u8> = partial;
                 let mut stderr_tail: Vec<u8> = Vec::new();
                 let mut out_open = true;
                 let mut err_open = true;
@@ -1745,6 +1829,44 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 }
                             }
                         },
+                        Ev::Ctl(Some(Ctl::HandOver(reply))) => {
+                            // This image of the process ends next (an in-place upgrade): the next
+                            // one goes on with this very process. What it has said so far is taken
+                            // in here, and nothing more is read, so nothing it says is lost.
+                            let _ = flush(&s, &sink, Some(&p.stdin)).await;
+                            // A switch, move or setting waiting for the turn to end is this image's
+                            // alone: such a session starts again in the next one instead.
+                            let waiting = switching.is_some() || moving.is_some() || reloading;
+                            let detached = if waiting { None } else { p.detach().await };
+                            let Some(process) = detached else {
+                                // It can't be handed over: stopped, so the next image starts it again
+                                // (its conversation goes on) without two of it running.
+                                p.terminate(Duration::from_secs(2));
+                                let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                                *s.pid.lock() = None;
+                                let _ = reply.send(None);
+                                return;
+                            };
+                            while let Ok(Some(chunk)) = crate::rt::timeout(Duration::from_secs(1), p.stdout.recv()).await.map(Result::ok) {
+                                buf.extend_from_slice(&chunk);
+                            }
+                            let (updates, core) = {
+                                let mut core = s.core.lock();
+                                while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+                                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                                    adapter.line(&mut core, &String::from_utf8_lossy(&line));
+                                }
+                                (core.take_out(), core.freeze())
+                            };
+                            for u in updates {
+                                let _ = sink.send((s.id.clone(), u)).await;
+                            }
+                            *s.pid.lock() = None;
+                            use base64::Engine as _;
+                            let partial = base64::engine::general_purpose::STANDARD.encode(&buf);
+                            let _ = reply.send(Some(Box::new(Handed { kind: kind.id.to_owned(), process, core, adapter: adapter.freeze(), partial })));
+                            return;
+                        }
                         Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                             // Ending the agent ends what it left running: stopped through the
                             // harness first, then whatever is still under it (shells and
@@ -1970,6 +2092,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
+                // No process to hand over: the next image starts it from its record.
+                Ev::Ctl(Some(Ctl::HandOver(reply))) => {
+                    let _ = reply.send(None);
+                }
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     // Ending the agent ends what it left running that kiln took back over.
                     let left = std::mem::take(&mut *s.left.lock());
