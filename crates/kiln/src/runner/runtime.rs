@@ -59,9 +59,10 @@ fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
     a.secrets.iter().any(|s| s.name == name && truthy(&s.value)) || a.contexts.vars.get(name).and_then(serde_json::Value::as_str).is_some_and(truthy)
 }
 
-/// Runner debug (`RUNNER_DEBUG=1`, `runner.debug`): a debug rerun, or `ACTIONS_RUNNER_DEBUG`.
+/// Debug logging (`RUNNER_DEBUG=1`, `runner.debug`, what `core.isDebug()` reads): a debug rerun,
+/// or `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` set.
 fn runner_debug(a: &AssignmentV2) -> bool {
-    a.debug.runner_debug || debug_flag(a, "ACTIONS_RUNNER_DEBUG")
+    a.debug.runner_debug || a.debug.step_debug || debug_flag(a, "ACTIONS_RUNNER_DEBUG") || debug_flag(a, "ACTIONS_STEP_DEBUG")
 }
 
 /// The step outputs (step id, name) the job's secret outputs read (W04-R22).
@@ -2167,12 +2168,19 @@ mod tests {
     /// [`run_leg`] for a workflow of either dialect: a kiln one gets its job's kiln settings.
     #[cfg(unix)]
     fn run_leg_in(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
+        run_leg_prepared(workflow, secrets, dialect, &|_| Ok(()))
+    }
+
+    /// [`run_leg_in`], with `prepare` setting up the work directory first.
+    #[cfg(unix)]
+    fn run_leg_prepared(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
         let path = if dialect == Dialect::Kiln { ".kiln/t.yaml" } else { ".github/workflows/t.yml" };
         let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
         let run_env = w.as_ref().is_some_and(|w| w.run_env);
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let tmp = tempfile::tempdir()?;
+        prepare(tmp.path())?;
         let a = AssignmentV2 {
             job_id: "leg-1".into(),
             repo: "acme/app".into(),
@@ -2340,6 +2348,68 @@ jobs:
         assert_eq!(ann("Unable to process command '::add-matcher::nope.json' successfully.").map(|a| a.0), Some(4));
         assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Failure), "a disabled command fails its step");
         assert_eq!(ann("Unable to process command '::set-env name=A::b' successfully.").map(|a| a.0), Some(5));
+        Ok(())
+    }
+
+    /// W06-AC01: the toolkit conformance action (F-20, built on the current `@actions/core`,
+    /// `exec` and `io`), each effect seen by a later step, its post step, or the leg's events.
+    /// Runs on this machine's Node 24 instead of downloading one; skipped without it.
+    #[cfg(unix)]
+    #[test]
+    fn toolkit_conformance() -> anyhow::Result<()> {
+        let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file())) else { return Ok(()) };
+        let version = std::process::Command::new(&node).arg("--version").output()?;
+        if !String::from_utf8_lossy(&version.stdout).starts_with("v24.") {
+            return Ok(());
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolkit-action");
+        let wf = format!(
+            r###"on: push
+jobs:
+  t:
+    runs-on: x
+    steps:
+      - run: mkdir -p .github/actions && cp -r "{}" .github/actions/toolkit
+      - id: t
+        uses: ./.github/actions/toolkit
+        with:
+          required: yes-req
+      - run: |
+          echo "o1=${{{{ steps.t.outputs.o1 }}}} EXPORTED=$EXPORTED" 'multi=${{{{ toJSON(steps.t.outputs.multi) }}}}'
+          case "$PATH" in /opt/f20-bin:*) echo "path first" ;; esac
+          echo "the secret again: super-secret-f20"
+"###,
+            fixture.display()
+        );
+        let prepare = |work: &Path| -> anyhow::Result<()> {
+            let bin = work.join("_externals/node24/bin");
+            std::fs::create_dir_all(&bin)?;
+            std::os::unix::fs::symlink(&node, bin.join("node"))?;
+            Ok(())
+        };
+        let (r, logs, events) = run_leg_prepared(&wf, &[("ACTIONS_STEP_DEBUG", "true")], Dialect::Gha, &prepare)?;
+        let all: String = logs.values().cloned().collect();
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {all}");
+        let step = logs.get(&1).cloned().unwrap_or_default();
+        assert!(step.contains(r#"inputs: required=yes-req missing=[] padded=[spaced] raw=[  spaced  ] flag=true lines=["a","b","c"]"#), "{step}");
+        assert!(step.contains("required absent: Input required and not supplied: absent"), "{step}");
+        assert!(step.contains("printing the secret: ***") && !all.contains("super-secret-f20"), "setSecret masks from then on");
+        assert!(step.contains("a debug line"), "debug shows with ACTIONS_STEP_DEBUG: {step}");
+        assert!(step.contains("from exec") && step.contains("exec output: captured (exit 0)"), "{step}");
+        assert!(step.contains("which sh: true") && step.contains("is debug: true"), "{step}");
+        assert!(events.iter().any(|e| matches!(e, JobEventV2::Group { op, title, .. } if op == "start" && title.as_deref() == Some("G"))));
+        let ann = |m: &str| events.iter().find_map(|e| match e {
+            JobEventV2::Annotation { level, message, title, file, line, end_line, col, end_col, .. } if message == m => Some((level.clone(), title.clone(), file.clone(), *line, *end_line, *col, *end_col)),
+            _ => None,
+        });
+        assert_eq!(ann("a notice"), Some(("notice".into(), Some("N".into()), Some("README.md".into()), Some(1), None, None, None)));
+        assert_eq!(ann("a warning"), Some(("warning".into(), None, Some("README.md".into()), Some(2), Some(3), Some(1), Some(4))));
+        assert!(ann("Error: an error object").is_some_and(|a| a.0 == "error"), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, JobEventV2::Summary { markdown, .. } if markdown.contains("<h1>F-20</h1>") && markdown.contains("<th>name</th>") && markdown.contains("<td>v1</td>"))));
+        let later = logs.get(&2).cloned().unwrap_or_default();
+        assert!(later.contains(r#"o1=v1 EXPORTED=e1 multi="line one\nline two""#), "{later}");
+        assert!(later.contains("path first") && later.contains("the secret again: ***"), "{later}");
+        assert!(all.contains("post: state=state-v"), "the post step reads the state: {all}");
         Ok(())
     }
 
