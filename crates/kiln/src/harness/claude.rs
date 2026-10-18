@@ -1516,6 +1516,7 @@ impl Claude {
                                 label: str_of(m, "displayName").unwrap_or("").to_owned(),
                                 description: str_of(m, "description").unwrap_or("").to_owned(),
                                 efforts: m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+                                default: false,
                             })
                         })
                         .collect();

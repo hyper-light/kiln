@@ -673,7 +673,7 @@ pub struct ModeOption {
     pub dangerous: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelOption {
     pub id: String,
     pub label: String,
@@ -682,6 +682,20 @@ pub struct ModelOption {
     /// The effort levels it takes, lowest first, when the harness says.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub efforts: Vec<String>,
+    /// The harness's default model: what a session started without one runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+}
+
+/// An effort level as people read it: "xhigh" is "Extra high", the rest as they are, capitalized.
+pub fn effort_label(id: &str) -> String {
+    match id {
+        "xhigh" => "Extra high".to_owned(),
+        _ => {
+            let mut c = id.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+        }
+    }
 }
 
 /// One entry of a harness's command catalog (`Meta::commands`): every slash command it has, and

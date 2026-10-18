@@ -582,7 +582,7 @@ impl Acp {
                             ms.iter()
                                 .filter_map(|m| {
                                     let id = m.get("modelId")?.as_str()?.to_owned();
-                                    Some(ModelOption { label: m.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned(), description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), id, efforts: Vec::new() })
+                                    Some(ModelOption { label: m.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned(), description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), id, ..ModelOption::default() })
                                 })
                                 .collect()
                         })

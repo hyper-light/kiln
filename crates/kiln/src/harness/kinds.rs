@@ -398,11 +398,6 @@ fn yes() -> bool {
     true
 }
 
-/// "xhigh" → "Xhigh", as the adapters name their levels.
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
-}
 
 impl Kind {
     /// Its permission modes, and the one a new session starts in.
@@ -428,17 +423,18 @@ impl Kind {
         matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer)
     }
 
-    /// The effort levels a new session can start at, before the harness says which its model has.
+    /// The effort levels a new session can start at, before the harness says which its model has:
+    /// Codex's, those of its default model on this machine.
     pub fn efforts(&self) -> Vec<super::model::ControlOption> {
-        let levels: &[&str] = match self.protocol {
-            Protocol::ClaudeStreamJson => super::claude::EFFORTS,
-            Protocol::CodexAppServer => super::codex::EFFORTS,
-            Protocol::AgyStreamJson => super::antigravity::EFFORTS,
-            Protocol::Acp(_) | Protocol::Terminal => &[],
+        let levels: Vec<String> = match self.protocol {
+            Protocol::ClaudeStreamJson => super::claude::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
+            Protocol::CodexAppServer => super::codex::default_efforts(),
+            Protocol::AgyStreamJson => super::antigravity::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
+            Protocol::Acp(_) | Protocol::Terminal => Vec::new(),
         };
         levels
             .iter()
-            .map(|e| super::model::ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false })
+            .map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false })
             .collect()
     }
 }
@@ -511,6 +507,11 @@ pub fn models_of(kind: &str) -> Vec<super::model::ModelOption> {
     if let Some(m) = SEEN.lock().models.get(kind).filter(|m| !m.is_empty()) {
         return m.clone();
     }
+    known_models(kind)
+}
+
+/// The models harness `kind` is known to have, its default first.
+fn known_models(kind: &str) -> Vec<super::model::ModelOption> {
     let known: &[(&str, &str, &[&str])] = match kind {
         // Claude Code's aliases: each the newest of its family.
         "claude" => &[("opus", "Opus", super::claude::EFFORTS), ("sonnet", "Sonnet", super::claude::EFFORTS), ("haiku", "Haiku", &[])],
@@ -522,15 +523,33 @@ pub fn models_of(kind: &str) -> Vec<super::model::ModelOption> {
         ],
         _ => &[],
     };
+    // The first is the harness's default.
     known
         .iter()
-        .map(|(id, label, efforts)| super::model::ModelOption { id: (*id).to_owned(), label: (*label).to_owned(), description: String::new(), efforts: efforts.iter().map(|e| (*e).to_owned()).collect() })
+        .enumerate()
+        .map(|(i, (id, label, efforts))| super::model::ModelOption {
+            id: (*id).to_owned(),
+            label: (*label).to_owned(),
+            efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+            default: i == 0,
+            ..super::model::ModelOption::default()
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_offers_every_effort_its_default_model_takes() {
+        let known = known_models("codex");
+        let default = known.iter().find(|m| m.default);
+        assert_eq!(default.map(|m| m.id.as_str()), Some("gpt-6.1-sol"));
+        assert_eq!(default.map(|m| m.efforts.clone()), Some(["low", "medium", "high", "xhigh", "max", "ultra"].map(str::to_owned).to_vec()));
+        let labels: Vec<String> = ["low", "xhigh", "max", "ultra"].iter().map(|e| super::super::model::effort_label(e)).collect();
+        assert_eq!(labels, ["Low", "Extra high", "Max", "Ultra"]);
+    }
 
     /// Each adapter, started (its first requests to the harness under way), is written out and read
     /// back whole: what an in-place upgrade hands the next image of the runner.

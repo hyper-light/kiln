@@ -690,7 +690,7 @@ fn parse_models(output: &str) -> Vec<ModelOption> {
         .filter_map(|l| {
             let (id, label) = l.split_once('\t')?;
             let id = id.trim();
-            (!id.is_empty() && !id.contains(' ')).then(|| ModelOption { id: id.to_owned(), label: label.trim().to_owned(), description: String::new(), efforts: Vec::new() })
+            (!id.is_empty() && !id.contains(' ')).then(|| ModelOption { id: id.to_owned(), label: label.trim().to_owned(), ..ModelOption::default() })
         })
         .collect()
 }
