@@ -85,6 +85,8 @@ pub enum ReachCmd {
     Status,
     /// Forget a runner's pinned key (after reinstalling it): its next key is trusted on first use.
     Forget { runner: String },
+    /// Serve reach as MCP tools on stdin/stdout (kiln gives these to the agents it starts).
+    Mcp,
 }
 
 fn in_git_repo(dir: &std::path::Path) -> bool {
@@ -305,6 +307,10 @@ pub fn reach(a: ReachArgs) -> anyhow::Result<()> {
             }
             other => anyhow::bail!("unexpected answer {other:?}"),
         },
+        #[cfg(unix)]
+        ReachCmd::Mcp => super::mcp::serve(),
+        #[cfg(not(unix))]
+        ReachCmd::Mcp => anyhow::bail!("reach needs a Unix machine for now"),
         ReachCmd::Forget { runner } => match ask(&Req::Forget { runner: runner.clone() })? {
             Ev::Forgot(true) => {
                 println!("Forgot {runner}'s key; the next one it presents is trusted.");

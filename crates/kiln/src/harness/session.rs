@@ -63,6 +63,11 @@ pub struct Spec {
     /// it to quit, then kills it) rather than only waiting for it to end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub takeover_stop: bool,
+    /// Reach (`crate::reach`): the agent's tools for running commands on other runners. None:
+    /// it has them; `"off"`: it does not; anything else: where its commands go unless it says
+    /// otherwise (a runner's name, or `linux/amd64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 fn yes() -> bool {
@@ -92,6 +97,7 @@ impl Default for Spec {
             fork: false,
             takeover_pid: None,
             takeover_stop: false,
+            reach: None,
         }
     }
 }

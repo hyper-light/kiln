@@ -112,6 +112,7 @@ pub struct Handle {
     net: async_channel::Sender<In>,
     tx: async_channel::Sender<In>,
     announce: Announce,
+    busy: Arc<AtomicU64>,
 }
 
 impl Handle {
@@ -122,6 +123,12 @@ impl Handle {
 
     pub fn fingerprint(&self) -> &str {
         &self.announce.fingerprint
+    }
+
+    /// Runs under way: those this runner does for others and those it follows elsewhere. A
+    /// restart or an in-place upgrade loses them, so it waits while there are any.
+    pub fn busy(&self) -> usize {
+        usize::try_from(self.busy.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
     }
 
     /// From the agent: a frame, an answer, the server coming or going. Never waits.
@@ -217,6 +224,8 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         peers: HashMap::new(),
         served: HashMap::new(),
     };
+    let busy = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&busy);
     // Kept open by the node itself, so local tools going away never ends it.
     let keep = tx.clone();
     crate::rt::spawn(async move {
@@ -245,9 +254,10 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
                 }
             }
             node.flush().await;
+            counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce, busy }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1220,6 +1230,12 @@ impl Node {
                 let _ = reply.send(self.pins.forget(&runner));
             }
         }
+    }
+
+    fn busy(&self) -> u64 {
+        let doing: usize = self.served.values().map(|s| s.runs.values().filter(|r| r.exit.is_none()).count() + s.syncs.len()).sum();
+        let following: usize = self.peers.values().map(|p| p.follows.len() + p.syncs.len()).sum();
+        u64::try_from(doing + following).unwrap_or(u64::MAX)
     }
 
     fn status(&self) -> Value {

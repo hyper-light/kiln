@@ -103,12 +103,21 @@ impl Kind {
                     p.arg("--mcp-config").arg(&kit.claude_mcp_config);
                     p.arg("--plugin-dir").arg(&kit.plugin_dir);
                 }
+                // Reach: commands on other runners, where this runner reaches them.
+                #[cfg(unix)]
+                if let Some((kiln, sock, prefer)) = reach_tools(spec) {
+                    p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(&kiln, sock, prefer));
+                }
                 // File snapshots before edits, so a rewind can restore them.
                 p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
             }
             // Model, mode and resume go over the protocol (thread/start, turn/start).
             Protocol::CodexAppServer => {
                 p.args(super::codex::args());
+                #[cfg(unix)]
+                if let Some((kiln, sock, prefer)) = reach_tools(spec) {
+                    p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer));
+                }
             }
             Protocol::Acp(args) => {
                 p.args(args);
@@ -144,6 +153,19 @@ impl Kind {
         p.stdin(std::process::Stdio::null());
         Ok(p)
     }
+}
+
+/// Whether a session gets reach's tools, and how to start them: this kiln binary, the runner's
+/// reach socket, the session's preferred runner.
+#[cfg(unix)]
+fn reach_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
+    let pref = spec.reach.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if pref == Some("off") {
+        return None;
+    }
+    let sock = crate::reach::local::socket()?;
+    let kiln = std::env::current_exe().ok()?;
+    Some((kiln, sock, pref))
 }
 
 /// The session's environment over the machine's: what its shell had (minus the shell's own

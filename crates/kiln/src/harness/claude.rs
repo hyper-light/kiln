@@ -3206,7 +3206,7 @@ pub fn describe(name: &str, input: &Value, cwd: &str) -> (ToolKind, String, Opti
             let mut parts = n.splitn(3, "__").skip(1);
             let server = parts.next().unwrap_or("").to_owned();
             let tool = parts.next().unwrap_or("").to_owned();
-            (ToolKind::Mcp, format!("{server} · {tool}"), None)
+            crate::reach::describe(&server, &tool, input).unwrap_or_else(|| (ToolKind::Mcp, format!("{server} · {tool}"), None))
         }
         _ => {
             let title = ["description", "command", "file_path", "path", "query", "url", "name", "prompt"]

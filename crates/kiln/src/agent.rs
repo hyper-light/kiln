@@ -423,7 +423,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // Agent sessions mid-turn get up to ten minutes to finish it; then they are
                     // stopped and continue (resumed) in the new image.
-                    let agents_busy = harness.as_ref().map_or(0, |h| h.busy());
+                    // Reach runs (for other runners, or followed on them) count like agents mid-turn.
+                    let agents_busy = harness.as_ref().map_or(0, |h| h.busy()) + reach.as_ref().map_or(0, crate::reach::node::Handle::busy);
                     if upgrade_pending && agents_busy > 0 {
                         harness_wait.get_or_insert_with(Instant::now);
                     }

@@ -2288,12 +2288,13 @@ impl Codex {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .or_else(|| item.get("result").map(|r| clip_middle(&r.to_string(), OUTPUT_MAX).0));
+                let reach = crate::reach::describe(server, tool_name, item.get("arguments").unwrap_or(&Value::Null));
                 let call = ToolCall {
                     tool_id: id.clone(),
                     name: format!("mcp__{server}__{tool_name}"),
-                    tool: if ty == "mcpToolCall" { ToolKind::Mcp } else { ToolKind::Other },
-                    title: if server.is_empty() { tool_name.to_owned() } else { format!("{server} · {tool_name}") },
-                    detail: None,
+                    tool: reach.as_ref().map(|r| r.0).unwrap_or(if ty == "mcpToolCall" { ToolKind::Mcp } else { ToolKind::Other }),
+                    title: reach.as_ref().map(|r| r.1.clone()).unwrap_or_else(|| if server.is_empty() { tool_name.to_owned() } else { format!("{server} · {tool_name}") }),
+                    detail: reach.and_then(|r| r.2),
                     input: clip_json(item.get("arguments").unwrap_or(&Value::Null), 16 * 1024),
                     status,
                     output,
