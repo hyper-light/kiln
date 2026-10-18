@@ -1028,6 +1028,40 @@ pub struct State {
     /// A pause ends only when a person resumes it, not by itself at the reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual_resume: bool,
+    /// How its last turn ended (`Core::end_turn`): what kiln's keep-going reads (`goals::keep`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<TurnEnd>,
+    /// Turns in a row kiln started to keep it going (`Core::note_sent`), since a person last said
+    /// something.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub kept: u32,
+}
+
+/// How a turn ended (`Core::end_turn`): enough for kiln to tell a turn that's done from one that
+/// stopped part-way through the work (`goals::keep`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TurnEnd {
+    /// Unix ms.
+    pub at: i64,
+    /// "done": it ended as turns do; "cut": it stopped part-way (an unexpected stop, out of
+    /// output, an error); "stopped": you stopped it; "limit": a turn or budget limit ended it;
+    /// "refused": the model wouldn't go on.
+    pub how: String,
+    /// The harness's own word for it ("end_turn", "stop_sequence", "max_tokens", "failed" …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// The tools it called in the turn.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools: u32,
+    /// Its last step was a tool that failed, with nothing said after it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub after_error: bool,
+    /// Its last words ask you something.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub asks: bool,
+    /// `State::kept` when it ended: kiln started it and that many before it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub kept: u32,
 }
 
 /// Why a session waits, and until when (`State::pause`).

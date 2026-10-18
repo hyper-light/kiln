@@ -240,7 +240,7 @@ let effort = "high";
 // A long think under way, as the harness reports it (`doing`, since `turn_started`); an interrupt
 // doesn't take (so a stop can be forced), and a forced stop ends the turn.
 let running = !PAUSED;
-const turnStarted = Date.now() - 134_000;
+const turnStarted = Date.now() - Number(process.env.MOCK_TURN_AGE_MS ?? 134_000);
 const state = (): State => ({
   status: running ? "running" : "idle",
   doing: running ? "Thinking" : undefined,

@@ -2,7 +2,7 @@
 import * as React from "react";
 import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
-import { MoreHorizontal } from "lucide-react";
+import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
@@ -14,9 +14,15 @@ import { SpawnDialog } from "./spawn";
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
-export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach">, after?: { onGone?: () => void }) {
+export function useAgentActions(
+  a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off">,
+  after?: { onGone?: () => void },
+) {
   const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
+  // Kiln keeps it going when it stops part-way unless switched off here (shown at once, kept on the server).
+  const [keepSet, setKeepSet] = React.useState<boolean | null>(null);
+  const keeping = keepSet ?? !a.keep_off;
   // Renaming from the menu: the menu mustn't hand focus back to its button, the name field takes it.
   const renameNext = React.useRef(false);
   const live = a.status !== "exited";
@@ -81,6 +87,21 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
                 <span className="flex-1">{i.label}</span>
               </DropdownMenu.Item>
             ))}
+          <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
+          <DropdownMenu.CheckboxItem
+            className="menu-item"
+            checked={keeping}
+            onSelect={(e) => e.preventDefault()}
+            onCheckedChange={(on) => {
+              setKeepSet(on);
+              void command({ type: "control", id: "keep_going", value: on }, on ? "keep it going" : "stop keeping it going");
+            }}
+          >
+            <span className="flex-1">Keep it going when it stops part-way</span>
+            <DropdownMenu.ItemIndicator>
+              <Check size={14} aria-hidden="true" />
+            </DropdownMenu.ItemIndicator>
+          </DropdownMenu.CheckboxItem>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>

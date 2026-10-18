@@ -187,6 +187,11 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   color: #8f929b;
   white-space: nowrap;
 }
+/* The clock keeps its width as it ticks ("59m 59s", "1h 02m"): nothing after it moves. */
+.ag-turn-time {
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
+}
 .ag-cwd {
   max-width: 40ch;
   overflow: hidden;

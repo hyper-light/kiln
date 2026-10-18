@@ -374,6 +374,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
       left_behind: state?.left_behind ?? info?.left_behind,
       // Its live state says where its commands run (absent: anywhere it needs).
       reach: state ? state.reach : info?.reach,
+      keep_off: info?.keep_off,
     },
     { onGone: () => navigate("/agents") },
   );
