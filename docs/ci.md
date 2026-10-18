@@ -187,12 +187,12 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
-| W17 | Debugging | W06, W13 | blocked (W06) | |
+| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place; MCP, `kiln run`, log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 22 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
 
 ---
 
@@ -3412,7 +3412,42 @@ reruns, rerunning a failed step in place, and running workflows locally with `ki
 - **W17-AC04 `kiln run`.** The jobs of F-03 that need no secrets give the same step results with
   `kiln run` as on the server. *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress: R01, R02 and R04 on the `host` and `docker` executors. R03 is W06-R13's
+debug reruns.
+
+- *R01, terminals* (`runner/kept.rs`, the agent's `JobTerminalOpen`, `GET /api/ci/legs/:id/terminal`):
+  - A running or kept leg says what a terminal into it opens. On `host` that is a shell in its
+    workspace with its environment, which also needs `runners.terminal`; in a container it is
+    `docker exec` into the job container.
+  - Output is masked with the leg's secrets. What could start a secret is held back until output
+    pauses for 25 ms.
+  - Sessions are audited, and a terminal closes when its leg ends or is let go.
+  - Runners announce it with `CAP_JOB_TTY` and offer it when `[terminal]` is enabled.
+- *R02, keep on failure*:
+  - `debug: { keep-on-failure: 30m }`, or "Keep failed legs" when rerunning
+    (`kiln rerun --keep-failed`).
+  - A kept leg's processes stop; its workspace and containers stay for that long, at most a day.
+  - The run page shows the time left, Open terminal, "Keep 30 more minutes" and Release
+    (`kiln debug keep|release`).
+  - The server remembers kept legs across a restart. A restarted runner forgets their shells
+    (their environments held secrets, and nothing is written to disk) and sweeps their workspaces
+    when the keep runs out.
+- *R04*: `kiln debug rerun-step <leg> <step>`, `POST /api/ci/legs/:id/rerun-step`, or the failed
+  step's "Rerun this step in place" runs the step again with the environment, paths and outputs
+  the leg ended with, as a new section of its log ("Rerun: …"). A second rerun while one runs is
+  refused.
+- *Verified end to end*:
+  - AC01 on `host` and `docker`: `pwd` and the environment are the leg's, an echoed secret shows
+    `***`, and the terminal closes when the leg ends.
+  - A maintainer without `runners.terminal` is refused a host leg's terminal; a viewer is refused
+    any.
+  - AC02: kept for 5 minutes, then the workspace is removed and an open terminal closes. Extend
+    works, and Release stops the containers and removes the workspace.
+  - AC03: a step that failed on a missing file passed when rerun after the file was created in the
+    kept leg's terminal.
+  - The run page's controls in Chromium and WebKit, at desktop and phone widths.
+- *Left*: R05 (W20's MCP tools), R06 `kiln run` and AC04, R07 (W19), and terminals in microVMs and
+  on k8s (with W13's executors).
 
 ### W18 Supply chain and untrusted code
 
@@ -3905,6 +3940,8 @@ and AC02.
     - Docker inside legs;
     - the toolchains the image lacked;
     - `/usr/share/dotnet` for setup-dotnet.
+  - Two more (`ci_pylint`, `ci_python-package`) passed once github.com's limit on anonymous API
+    reads (below) had reset: 24 of 33.
   - The rest fail the same way on GitHub:
     - pinned actions that predate Ubuntu 24.04 (setup-beam, setup-ruby);
     - Python 3.7, which has no Ubuntu 24.04 build;

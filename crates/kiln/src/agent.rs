@@ -478,6 +478,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         exe_mtime = now;
                     }
                 }
+                // Terminals into legs close once their leg ends, or is let go when kept (W17-AC01).
+                let gone: Vec<String> = terms.iter().filter(|(_, (_, st))| st.target.strip_prefix("leg:").is_some_and(|job| !crate::runner::kept::live(job))).map(|(id, _)| id.clone()).collect();
+                for session in gone {
+                    terms.remove(&session);
+                    uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg ended".into()) })).await.ok();
+                }
                 // A dial that never resolves (no Connected / Closed / Unreachable) would leave the
                 // agent waiting forever, e.g. after dialing before the network existed at boot.
                 // Treat it as failed: rebuild the endpoint on a fresh socket and dial again.

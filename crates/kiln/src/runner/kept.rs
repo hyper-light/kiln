@@ -65,6 +65,11 @@ pub fn shell(job: &str) -> Option<Shell> {
     LEGS.lock().get(job).map(|e| e.shell.clone())
 }
 
+/// Whether `job` runs or is kept here: a terminal into it stays open while it is.
+pub fn live(job: &str) -> bool {
+    LEGS.lock().contains_key(job)
+}
+
 /// A failed leg to be kept leaves its containers running here instead of stopping them.
 pub fn hold(job: &str, containers: Containers) {
     if let Some(e) = LEGS.lock().get_mut(job) {
@@ -86,6 +91,7 @@ pub async fn ended(job: &str, ws: PathBuf, keep_minutes: Option<u32>) -> Option<
         }
         None => {
             LEGS.lock().remove(job);
+            super::runtime::unpark(job);
             if let Some(c) = held {
                 c.stop().await;
             }
@@ -157,14 +163,14 @@ mod tests {
             assert!(ws.exists() && shell("leg-kept").is_some(), "kept: workspace and shell");
             let later = extend("leg-kept", 30).ok_or_else(|| anyhow::anyhow!("extended"))?;
             assert!(later > until && kept_until("leg-kept") == Some(later));
-            assert!(release("leg-kept").await && !ws.exists() && shell("leg-kept").is_none(), "released");
+            assert!(release("leg-kept").await && !ws.exists() && shell("leg-kept").is_none() && !live("leg-kept"), "released");
             assert!(!release("leg-kept").await, "once");
             // A leg that isn't kept goes at once.
             let ws2 = dir.path().join("w").join("aaaa0002");
             std::fs::create_dir_all(&ws2)?;
             running("leg-done", Shell::default());
             assert_eq!(ended("leg-done", ws2.clone(), None).await, None);
-            assert!(!ws2.exists() && shell("leg-done").is_none());
+            assert!(!ws2.exists() && !live("leg-done"));
             Ok(())
         })
     }
