@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); diffs, review, landing left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -606,7 +606,7 @@ wait reason says so (W05).
 | `/_kiln/proxy/<ecosystem>/…` | Package registry proxies (W12) | job token or PAT |
 | `/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`, `/api/v3/…`, `/api/graphql` | The facade: GitHub-compatible git and REST for jobs (W14) | job token as `GITHUB_TOKEN` |
 | `/<owner>/<repo>/actions/runs/<id>…` | GitHub-shaped page links that actions print, redirected to kiln's pages (W14) | open (the pages ask for a session) |
-| `/git/<owner>/<repo>.git` | Native git hosting (W14) | PAT, agent token |
+| `/git/<owner>/<repo>.git` | Native git hosting (W14): clone, fetch and push | PAT, agent token, job token |
 
 The facade lives at the **root** of the server's origin, because `actions/checkout` builds its
 URLs from the origin of `GITHUB_SERVER_URL` and drops any path. Its paths can't collide with
@@ -3331,8 +3331,28 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: the facade's git half, and the start of its REST half.
+**Progress.** In progress: native hosting, the facade's git half, and the start of its REST half.
 
+- *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
+  - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
+    from the mirrors), made empty (`POST /api/repos` with `mode: native`, `kiln repo create`,
+    `[[repos]] mode = "native"`) or copied from upstream (`import`, `kiln repo import <url>`,
+    from network URLs only); `repos` gains `mode` and `default_branch` (R13's first part);
+  - clone and push over HTTPS at `/git/<owner>/<repo>.git` (and at the root, for legs), with a
+    PAT or an agent token as git's password, or a leg's `GITHUB_TOKEN`;
+  - fetches need `diffs.read` (a leg: `contents: read`, its own repository only);
+  - a push's ref updates are read before git sees the pack, and the push is refused whole, in
+    git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
+    - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),
+      writes a trunk;
+    - a trunk is never deleted, nor written in another case;
+    - an empty repository takes its first trunk from anyone who may push;
+    - other branches need `diffs.submit`, tags `diffs.land`; a leg needs `contents: write`;
+    - `refs/kiln/*` and `refs/pull/*` are kiln's;
+  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once.
+  - Checked end to end with real git (`crates/kiln/tests/hosting.rs`): clone and push by
+    developer, viewer, owner and powerless tokens, trunk refusals, whole-push refusal, and the
+    push's run.
 - *Done.* R11's git half, in `crates/kiln/src/ci/facade.rs`:
   - smart HTTP over the server's mirror, served by `git http-backend` (protocols v0 to v2,
     gzipped requests, fetches by SHA, filters);
@@ -3361,8 +3381,12 @@ adapts [review.md](review.md), which it replaces.
     - `docker/metadata-action`;
     - `softprops/action-gh-release` with an asset;
     - `actions/checkout` unpacking the tarball where git is missing.
-- *Left.* Everything else: the rest of R11's REST subset and GraphQL, hosting (R01, R02), review,
-  landing, the App, the schema, and AC01 to AC07.
+- *Left.* Everything else:
+  - `native + mirror` (R01), with the land queue that moves trunk;
+  - `refs/for/<trunk>` diffs and branch protection rules (R02, with R03 and R09);
+  - the rest of R11's REST subset and GraphQL;
+  - review, landing, the App, the rest of the schema;
+  - AC01 to AC07.
 
 ### W15 Environments and deployments
 

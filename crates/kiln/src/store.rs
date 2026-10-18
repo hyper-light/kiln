@@ -82,6 +82,16 @@ pub struct Repo {
     pub created_at: i64,
     pub last_polled_at: Option<i64>,
     pub last_error: Option<String>,
+    /// `upstream` (kiln follows `clone_url`) or `native` (kiln hosts it, docs/ci.md W14-R01).
+    #[serde(default = "upstream")]
+    pub mode: String,
+    /// A native repository's trunk when it was made.
+    #[serde(default)]
+    pub default_branch: Option<String>,
+}
+
+fn upstream() -> String {
+    "upstream".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,11 +307,12 @@ impl Store {
                 tracing::info!(repo = %r.name, from = %url, to = %r.clone_url, "repository moved: adopting its new remote's branches and tags as they are");
             }
             c.execute(
-                "INSERT INTO repos (id, name, clone_url, branches, poll_seconds, enabled, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO repos (id, name, clone_url, branches, poll_seconds, enabled, created_at, mode, default_branch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(name) DO UPDATE SET clone_url = excluded.clone_url,
                    branches = excluded.branches, poll_seconds = excluded.poll_seconds,
-                   enabled = excluded.enabled",
+                   enabled = excluded.enabled, mode = excluded.mode,
+                   default_branch = COALESCE(excluded.default_branch, repos.default_branch)",
                 params![
                     r.id,
                     r.name,
@@ -309,7 +320,9 @@ impl Store {
                     json(&r.branches),
                     r.poll_seconds,
                     r.enabled,
-                    r.created_at
+                    r.created_at,
+                    r.mode,
+                    r.default_branch
                 ],
             )?;
             let id: String =
@@ -331,7 +344,7 @@ impl Store {
         self.call(|c| {
             let mut st = c.prepare(
                 "SELECT id, name, clone_url, branches, poll_seconds, enabled, created_at,
-                        last_polled_at, last_error FROM repos ORDER BY name",
+                        last_polled_at, last_error, mode, default_branch FROM repos ORDER BY name",
             )?;
             let rows = st.query_map([], |r| {
                 Ok(Repo {
@@ -344,6 +357,8 @@ impl Store {
                     created_at: r.get(6)?,
                     last_polled_at: r.get(7)?,
                     last_error: r.get(8)?,
+                    mode: r.get(9)?,
+                    default_branch: r.get(10)?,
                 })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1193,6 +1208,8 @@ mod tests {
                 created_at: 0,
                 last_polled_at: None,
                 last_error: None,
+                mode: "upstream".into(),
+                default_branch: None,
             };
             let repo = s.upsert_repo(at("http://kiln-git/kiln.git")).await?;
             s.set_ref(repo.id.clone(), "refs/heads/main".into(), "a1".into()).await?;
@@ -1243,6 +1260,8 @@ mod tests {
                 created_at: 0,
                 last_polled_at: None,
                 last_error: None,
+                mode: "upstream".into(),
+                default_branch: None,
             })
             .await?;
         let p = pipeline::parse(

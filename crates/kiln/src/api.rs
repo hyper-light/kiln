@@ -1317,6 +1317,12 @@ struct NewRepo {
     #[serde(default)]
     branches: Vec<String>,
     poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (W14-R01); `upstream` (the default): kiln follows `clone_url`.
+    mode: Option<String>,
+    /// A native repository's history, copied from this URL (`kiln repo import`).
+    import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    default_branch: Option<String>,
 }
 
 async fn add_repo(hub: &Hub, req: Request) -> R {
@@ -1325,11 +1331,27 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
     if name.split('/').count() != 2 || name.contains(char::is_whitespace) {
         return Err(err(StatusCode::BAD_REQUEST, "name must be owner/repo"));
     }
+    let native = match r.mode.as_deref() {
+        None => r.import.is_some(),
+        Some("native") => true,
+        Some("upstream") => false,
+        Some(m) => return Err(err(StatusCode::BAD_REQUEST, format!("mode `{m}`: `native` or `upstream`"))),
+    };
+    let default_branch = r.default_branch.clone().filter(|_| native).or_else(|| native.then(|| "main".to_owned()));
+    let clone_url = if native {
+        if let Some(url) = &r.import {
+            crate::ci::hosting::importable(url).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        }
+        let path = crate::ci::hosting::create(hub, &name, default_branch.as_deref().unwrap_or("main"), r.import.as_deref()).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        crate::ci::hosting::clone_url(&path)
+    } else {
+        r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git"))
+    };
     let repo = hub
         .store
         .upsert_repo(Repo {
             id: crate::util::new_id(),
-            clone_url: r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git")),
+            clone_url,
             name: name.clone(),
             branches: r.branches,
             poll_seconds: r.poll_seconds.unwrap_or(hub.cfg.gitops.poll_seconds),
@@ -1337,6 +1359,8 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
             created_at: crate::util::now_unix(),
             last_polled_at: None,
             last_error: None,
+            mode: if native { "native" } else { "upstream" }.into(),
+            default_branch,
         })
         .await?;
     hub.store.audit("admin".into(), "repo.add".into(), name).await;

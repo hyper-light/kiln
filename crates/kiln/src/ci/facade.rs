@@ -20,11 +20,19 @@ fn unauthorized() -> Response {
     srv::with_header(r, http::header::WWW_AUTHENTICATE, "Basic realm=\"kiln\"")
 }
 
-/// `/_kiln/git/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`.
+/// `/_kiln/git/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`; a native repository's
+/// (W14-R02) are [`super::hosting`]'s, pushes too.
 pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response, Fail> {
     let [owner, name, tail @ ..] = rest else { return Err((StatusCode::NOT_FOUND, "no such repository".into())) };
     let name = name.trim_end_matches(".git");
     let full = format!("{owner}/{name}");
+    let repos = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Some((repo, path)) = repos.iter().find(|r| r.name.eq_ignore_ascii_case(&full)).and_then(|r| super::hosting::native_path(hub, r).map(|p| (r, p))) {
+        if !matches!(tail, ["info", "refs"] | ["git-upload-pack"] | ["git-receive-pack"]) {
+            return Err((StatusCode::NOT_FOUND, "not a git request".into()));
+        }
+        return super::hosting::serve(hub, repo, &path, tail, req).await;
+    }
     if !matches!(tail, ["info", "refs"] | ["git-upload-pack"]) {
         return Err((StatusCode::FORBIDDEN, "this code host serves fetches only".into()));
     }
@@ -38,19 +46,42 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
     if !run.repo_name.eq_ignore_ascii_case(&full) {
         return Err((StatusCode::FORBIDDEN, format!("this leg's token reads {} only", run.repo_name)));
     }
-    let repos = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let repo = repos.into_iter().find(|r| r.id == run.repo_id).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
     let mirror = crate::gitops::ensure_commit(hub, &repo, &run.sha).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the mirror: {e:#}")))?;
     let (Some(root), Some(dir)) = (mirror.parent(), mirror.file_name()) else { return Err((StatusCode::INTERNAL_SERVER_ERROR, "the mirror's path".into())) };
-    let header = |h: &str| req.headers().get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let path_info = format!("/{}/{}", dir.to_string_lossy(), tail.join("/"));
+    let cgi = Cgi { root, path_info: &path_info, configs: &["uploadpack.allowAnySHA1InWant=true", "uploadpack.allowFilter=true"], user: "kiln", method: req.method().as_str().to_owned(), query: req.uri().query().unwrap_or_default().to_owned(), headers: req.headers().clone() };
+    let body = srv::body_bytes(req.into_body(), 64 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    backend(&cgi, body.to_vec(), None).await
+}
+
+/// A request for `git http-backend`: the repositories' root, the path below it, `-c` settings and
+/// the CGI's request variables.
+pub(crate) struct Cgi<'a> {
+    pub root: &'a std::path::Path,
+    pub path_info: &'a str,
+    pub configs: &'a [&'a str],
+    pub user: &'a str,
+    pub method: String,
+    pub query: String,
+    pub headers: http::HeaderMap,
+}
+
+/// What `git http-backend` answers, its request body `prefix` and then, when given, the rest of
+/// the request as it arrives (a push's pack, never held whole).
+pub(crate) async fn backend(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<hyper::body::Incoming>) -> Result<Response, Fail> {
+    let header = |h: &str| cgi.headers.get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let mut cmd = Command::new("git");
-    cmd.args(["-c", "uploadpack.allowAnySHA1InWant=true", "-c", "uploadpack.allowFilter=true", "http-backend"])
-        .env("GIT_PROJECT_ROOT", root)
+    for c in cgi.configs {
+        cmd.args(["-c", c]);
+    }
+    cmd.arg("http-backend")
+        .env("GIT_PROJECT_ROOT", cgi.root)
         .env("GIT_HTTP_EXPORT_ALL", "1")
-        .env("PATH_INFO", format!("/{}/{}", dir.to_string_lossy(), tail.join("/")))
-        .env("REQUEST_METHOD", req.method().as_str())
-        .env("QUERY_STRING", req.uri().query().unwrap_or_default())
-        .env("REMOTE_USER", "kiln")
+        .env("PATH_INFO", cgi.path_info)
+        .env("REQUEST_METHOD", &cgi.method)
+        .env("QUERY_STRING", &cgi.query)
+        .env("REMOTE_USER", cgi.user)
         .env("REMOTE_ADDR", "127.0.0.1");
     if let Some(ct) = header("content-type") {
         cmd.env("CONTENT_TYPE", ct);
@@ -61,14 +92,29 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
     if let Some(p) = header("git-protocol") {
         cmd.env("GIT_PROTOCOL", p);
     }
-    let body = srv::body_bytes(req.into_body(), 64 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    cmd.env("CONTENT_LENGTH", body.len().to_string());
+    // The whole body's length: what was read, or what the request said it would send.
+    match (&rest, header("content-length")) {
+        (None, _) => {
+            cmd.env("CONTENT_LENGTH", prefix.len().to_string());
+        }
+        (Some(_), Some(n)) => {
+            cmd.env("CONTENT_LENGTH", n);
+        }
+        (Some(_), None) => {}
+    }
     let d = crate::proc::spawn_duplex(cmd).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git http-backend: {e:#}")))?;
     let stdin = d.stdin.clone();
     drop(d.stdin);
     crate::rt::spawn(async move {
-        if !body.is_empty() {
-            let _ = stdin.send(body.to_vec()).await;
+        if !prefix.is_empty() && stdin.send(prefix).await.is_err() {
+            return;
+        }
+        if let Some(mut body) = rest {
+            while let Ok(Some(chunk)) = srv::next_chunk(&mut body).await {
+                if stdin.send(chunk.to_vec()).await.is_err() {
+                    return;
+                }
+            }
         }
         drop(stdin);
     });

@@ -13,6 +13,7 @@ pub mod environments;
 pub mod events;
 pub mod facade;
 pub mod hooks;
+pub mod hosting;
 pub mod insights;
 pub mod integrations;
 pub mod load;

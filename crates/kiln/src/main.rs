@@ -152,6 +152,8 @@ enum Cmd {
     Routing(kiln::ci::cli::RoutingArgs),
     /// CI environments: list, create (with protection), delete, deployments.
     Env(kiln::ci::cli::EnvArgs),
+    /// Repositories: list them; create one kiln hosts, or import one from upstream.
+    Repo(kiln::ci::cli::RepoArgs),
     /// Approve (or reject) a run's deployments waiting for review.
     Approve(kiln::ci::cli::ApproveArgs),
     /// A kept CI leg: keep it longer, or release it.
@@ -680,6 +682,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Repo(a) => kiln::ci::cli::repo(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Debug(a) => kiln::ci::cli::debug(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
