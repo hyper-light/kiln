@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build kiln for every platform it ships, from one Linux machine.
+# Build kiln for the platforms it ships: every one from one Linux machine, or macOS's on a Mac.
 #
 #   ci/release/build.sh [target ...]          (default: every target below)
 #
-# zig is the cross toolchain throughout (through cargo-zigbuild):
+# On Linux, zig is the cross toolchain throughout (through cargo-zigbuild):
 # - Linux: static musl binaries.
 # - Windows: built with the GNU ABI and shipped as the `x86_64-pc-windows-msvc` download the
 #   install script asks for. It needs only DLLs that come with Windows 10 and later.
@@ -11,6 +11,8 @@
 #   kiln imports from CoreFoundation, IOKit and libobjc; macOS binds them to the real libraries
 #   at load time, so no Apple SDK is needed. If a dependency starts importing a new symbol,
 #   regenerate the stubs with ci/release/regen-macos-stubs.sh. The minimum OS is macOS 11.
+# On a Mac, the macOS targets are built natively instead, with its own toolchain and SDK (what
+# .kiln/release.yaml does); other targets still need Linux.
 #
 # Expects ui/dist/client to exist (`npm run --prefix ui build`). Each binary carries the UI server
 # for its platform: Bun and the UI server's files, packed here first (ui/scripts/pack-ui-server.mjs,
@@ -25,6 +27,16 @@ all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aa
 targets=("$@")
 [ ${#targets[@]} -gt 0 ] || targets=("${all[@]}")
 
+native_mac=false
+if [ "$(uname -s)" = Darwin ]; then
+  native_mac=true
+  # Run by a launchd service (a kiln runner), PATH has none of the usual tools in it.
+  export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  for t in "${targets[@]}"; do
+    case $t in *-apple-darwin) ;; *) echo "on a Mac only the macOS targets build: $t needs Linux" >&2; exit 1 ;; esac
+  done
+fi
+
 [ -f ui/dist/client/_shell.html ] || { echo "ui/dist is missing: run npm run --prefix ui build first" >&2; exit 1; }
 
 # The UI server each binary carries: Bun for every target (downloaded once per machine, into
@@ -33,6 +45,22 @@ if [ "${KILN_UI_SERVER:-}" != off ]; then
   packs=()
   for t in "${targets[@]}"; do packs+=(--target "$t"); done
   node ui/scripts/pack-ui-server.mjs --require "${packs[@]}"
+fi
+
+target_dir=${CARGO_TARGET_DIR:-$root/target}
+dist=${KILN_DIST:-$root/dist}
+mkdir -p "$dist"
+
+# On a Mac: its own toolchain and SDK, no zig.
+if $native_mac; then
+  for t in "${targets[@]}"; do
+    echo "::: $t"
+    rustup target add "$t" >/dev/null
+    MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --locked -p kiln --target "$t"
+    cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
+  done
+  (cd "$dist" && shasum -a 256 kiln-* > SHA256SUMS && cat SHA256SUMS)
+  exit 0
 fi
 
 # zig and cargo-zigbuild, pinned, in a private virtualenv (both are published on PyPI).
@@ -80,9 +108,6 @@ printf '#!/bin/sh\nexec "%s" zig ar -- "$@"\n' "$zigbuild" > "$zig_home/macos11/
 chmod +x "$zig_home/macos11/ar"
 stubs=${KILN_MACOS_STUBS:-$root/ci/release/macos-stubs}
 
-target_dir=${CARGO_TARGET_DIR:-$root/target}
-dist=${KILN_DIST:-$root/dist}
-mkdir -p "$dist"
 for t in "${targets[@]}"; do
   echo "::: $t"
   case $t in

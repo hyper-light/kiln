@@ -424,17 +424,30 @@ pub enum Plan {
 }
 
 /// A run of the release pipeline building `commit` right now (a job of it running): its number.
-async fn release_building(hub: &Hub, commit: &str) -> Option<i64> {
+/// With `target`, only one whose job for that platform is the one running.
+async fn release_building(hub: &Hub, commit: &str, target: Option<&str>) -> Option<i64> {
     let u = &hub.cfg.updates;
     let repo = release_repo(hub).await?;
     let runs = hub.store.runs(Some(repo.id.clone()), 50, None).await.ok()?;
     for run in runs.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit) && !r.status.is_terminal()) {
         let jobs = hub.store.jobs(run.id.clone(), false).await.unwrap_or_default();
-        if jobs.iter().any(|j| j.status == crate::store::Status::Running) {
+        if jobs.iter().any(|j| j.status == crate::store::Status::Running && target.is_none_or(|t| j.key == platform_job(t))) {
             return Some(run.number);
         }
     }
     None
+}
+
+/// The release pipeline's job that builds `target`'s binary, on a machine of that platform
+/// (`.kiln/release.yaml`).
+pub fn platform_job(target: &str) -> &'static str {
+    if target.ends_with("-apple-darwin") {
+        "macos"
+    } else if target.contains("-windows-") {
+        "windows"
+    } else {
+        "linux"
+    }
 }
 
 /// Where a machine's kiln checkout may be: its synced copies of kiln, where its agents work (the
@@ -492,12 +505,18 @@ pub async fn plan(hub: &Hub, r: &RunnerInfo, t: &Target) -> Plan {
     if let Some(b) = binary_for(hub, target, &t.commit) {
         return Plan::Download(b);
     }
-    if let Some(n) = release_building(hub, &t.commit).await {
+    // The release build's job for its platform is under way: that binary comes soon.
+    if let Some(n) = release_building(hub, &t.commit, Some(target)).await {
         return Plan::Wait(format!("waits for the release build of {s} (run #{n})"));
     }
+    // Otherwise a machine that can build itself does so now, rather than wait on a build of every
+    // platform at once on another machine, which can take hours.
     match can_build(hub, r) {
         Ok(c) => Plan::Build(c),
-        Err(why) => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
+        Err(why) => match release_building(hub, &t.commit, None).await {
+            Some(n) => Plan::Wait(format!("waits for the release build of {s} (run #{n})")),
+            None => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
+        },
     }
 }
 
@@ -762,18 +781,31 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
     let u = &hub.updates;
     let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
     let mut att = session.attach();
-    let mut pending = String::new();
+    let mut screen = crate::updates::Screen::default();
     let (mut ok_marked, mut no_checkout) = (false, false);
     let mut feed = |text: &str| {
-        pending.push_str(&crate::updates::plain(text));
-        while let Some(i) = pending.find('\n') {
-            let line: String = pending.drain(..=i).collect();
+        for shown in screen.feed(text) {
+            let line = match shown {
+                crate::updates::Shown::Line(line) => line,
+                // cargo's progress bar, as it is now (it draws over itself, never ending its line).
+                crate::updates::Shown::Progress(p) => {
+                    if !crate::updates::marked(&p) && !p.starts_with(BUILT_MARK) && !p.starts_with(NO_CHECKOUT_MARK) {
+                        u.progress(hub, id, p.trim());
+                    }
+                    continue;
+                }
+            };
             let line = line.trim_end();
-            if line.is_empty() || line.starts_with(crate::updates::HIDDEN_MARK) {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(crate::updates::HIDDEN_MARK) {
+                u.end_progress(hub, id);
                 continue;
             }
             if line.contains(crate::updates::OK_MARK) {
                 ok_marked = true;
+                u.end_progress(hub, id);
                 continue;
             }
             if line.starts_with(NO_CHECKOUT_MARK) {
@@ -781,6 +813,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
             }
             if let Some(sum) = line.strip_prefix(BUILT_MARK) {
                 u.set_to_build(hub, id, &crate::updates::build_id(sum.trim()));
+                u.end_progress(hub, id);
                 continue;
             }
             let line = line.strip_prefix(crate::updates::FAIL_MARK).or_else(|| line.strip_prefix(NO_CHECKOUT_MARK)).map_or(line, str::trim);

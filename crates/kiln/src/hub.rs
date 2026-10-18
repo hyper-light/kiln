@@ -262,7 +262,7 @@ impl Hub {
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
     /// each other platform's runners upgrade to now.
-    async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
+    pub(crate) async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
         // The server's commit, or the newest one a runner runs (`crate::fleet`).
         let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
         if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {

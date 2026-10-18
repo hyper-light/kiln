@@ -90,6 +90,10 @@ pub struct Job {
     pub reached: bool,
     pub log: Vec<String>,
     pub error: Option<String>,
+    /// Its last log line is a progress line (a terminal's carriage return draws it over): the
+    /// next line takes its place.
+    #[serde(skip)]
+    progress: bool,
 }
 
 /// A binary kiln can hand out for a platform.
@@ -371,6 +375,8 @@ fn in_step_of(others: &[&str], kept: &[Binary], commit: &str) -> InStep {
 struct Starts {
     /// Unix seconds.
     last: Option<i64>,
+    /// Release jobs whose binaries were kept here already (`keep_in_step`).
+    kept: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -447,7 +453,15 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
     let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| anyhow::anyhow!("kiln doesn't build {} (no repository of that name)", u.release_repo))?;
     let runs: Vec<crate::store::Run> =
         hub.store.runs(Some(repo.id.clone()), 200, None).await?.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit)).collect();
-    if next(&runs, starts, crate::util::now_unix()) != Next::Build {
+    // Built when it was pushed, before this server ran it (nothing then took it): kept now.
+    for run in &runs {
+        for job in hub.store.jobs(run.id.clone(), false).await.unwrap_or_default() {
+            if job.status == crate::store::Status::Succeeded && starts.kept.insert(job.id.clone()) {
+                hub.adopt_release(&job.id, run).await;
+            }
+        }
+    }
+    if in_step(hub, commit).in_step || next(&runs, starts, crate::util::now_unix()) != Next::Build {
         return Ok(());
     }
     match build_commit(hub, &repo, commit).await {
@@ -777,6 +791,26 @@ impl Updates {
         self.update(hub, id, |j| push_line(j, line));
     }
 
+    /// The line a terminal is drawing over (a progress bar): shown last, in place of the one before.
+    pub(crate) fn progress(&self, hub: &Hub, id: &str, line: impl Into<String>) {
+        let line = line.into();
+        self.update(hub, id, |j| {
+            push_line(j, line);
+            j.progress = true;
+        });
+    }
+
+    /// The progress line showing, if any, goes: what was drawn there finished as a hidden line.
+    pub(crate) fn end_progress(&self, hub: &Hub, id: &str) {
+        if self.jobs.lock().iter().any(|j| j.id == id && j.progress) {
+            self.update(hub, id, |j| {
+                if std::mem::take(&mut j.progress) {
+                    j.log.pop();
+                }
+            });
+        }
+    }
+
     /// A build job's machine says which build it made: the job is reached when that reports in.
     pub(crate) fn set_to_build(&self, hub: &Hub, id: &str, build: &str) {
         self.update(hub, id, |j| j.to_build = Some(build.to_owned()));
@@ -844,6 +878,10 @@ impl Updates {
 }
 
 fn push_line(j: &mut Job, line: String) {
+    // A progress line gives way to the next line (the terminal draws it again after).
+    if std::mem::take(&mut j.progress) {
+        j.log.pop();
+    }
     j.log.push(line);
     if j.log.len() > KEEP_LINES {
         let cut = j.log.len() - KEEP_LINES;
@@ -866,6 +904,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         reached: false,
         log: Vec::new(),
         error: None,
+        progress: false,
     }
 }
 
@@ -1129,8 +1168,62 @@ fn download_urls(hub: &Hub, target: &str, build: &str) -> Vec<String> {
     server_bases(hub).into_iter().map(|base| format!("{base}/dl/kiln/{target}/{build}")).collect()
 }
 
-/// Terminal output without escape sequences or carriage returns.
-pub(crate) fn plain(s: &str) -> String {
+/// Terminal output line by line, as the terminal shows it: a carriage return starts the line over,
+/// so a progress bar that keeps drawing itself is one line, its latest drawing.
+#[derive(Default)]
+pub(crate) struct Screen {
+    line: String,
+    /// A carriage return came last: what follows draws over the line.
+    back: bool,
+    /// The line under way has been drawn over.
+    redrawn: bool,
+}
+
+/// What [`Screen::feed`] shows.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// A line a newline ended.
+    Line(String),
+    /// The line being drawn over (a progress bar), as it is now.
+    Progress(String),
+}
+
+impl Screen {
+    /// The lines `text` ends, then the line under way when it's being drawn over.
+    pub(crate) fn feed(&mut self, text: &str) -> Vec<Shown> {
+        let mut out = Vec::new();
+        for c in strip(text).chars() {
+            match c {
+                '\n' => {
+                    out.push(Shown::Line(std::mem::take(&mut self.line)));
+                    self.back = false;
+                    self.redrawn = false;
+                }
+                '\r' => self.back = true,
+                c => {
+                    if std::mem::take(&mut self.back) {
+                        self.redrawn |= !self.line.trim().is_empty();
+                        self.line.clear();
+                    }
+                    self.line.push(c);
+                }
+            }
+        }
+        if (self.back || self.redrawn) && !self.line.trim().is_empty() {
+            out.push(Shown::Progress(self.line.clone()));
+        }
+        out
+    }
+}
+
+/// A line of an upgrade's script that is kiln's own: never shown as it's being drawn.
+pub(crate) fn marked(line: &str) -> bool {
+    line.starts_with(HIDDEN_MARK) || line.contains(OK_MARK) || line.contains(FAIL_MARK)
+}
+
+/// Terminal output without escape sequences or control characters, but for line ends (`\n`, and
+/// `\r`, for [`Screen`]) and tabs.
+fn strip(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1158,7 +1251,7 @@ pub(crate) fn plain(s: &str) -> String {
                     chars.next();
                 }
             },
-            '\n' | '\t' => out.push(c),
+            '\n' | '\r' | '\t' => out.push(c),
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -1179,18 +1272,30 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
     let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
     u.say(hub, id, "this runner predates upgrade commands: running the upgrade in a terminal on it (not listed anywhere)");
     let mut att = session.attach();
-    let mut pending = String::new();
+    let mut screen = Screen::default();
     let mut ok_marked = false;
     let mut feed = |text: &str| {
-        pending.push_str(&plain(text));
-        while let Some(i) = pending.find('\n') {
-            let line: String = pending.drain(..=i).collect();
+        for shown in screen.feed(text) {
+            let line = match shown {
+                Shown::Line(line) => line,
+                Shown::Progress(p) => {
+                    if !marked(&p) {
+                        u.progress(hub, id, p.trim());
+                    }
+                    continue;
+                }
+            };
             let line = line.trim_end();
-            if line.is_empty() || line.starts_with(HIDDEN_MARK) {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(HIDDEN_MARK) {
+                u.end_progress(hub, id);
                 continue;
             }
             if line.contains(OK_MARK) {
                 ok_marked = true;
+                u.end_progress(hub, id);
                 continue;
             }
             u.say(hub, id, line.strip_prefix(FAIL_MARK).map_or(line, str::trim));
@@ -1780,9 +1885,9 @@ mod tests {
         assert_eq!(next(&[run(Failed, Some(now - 3600))], &none, now), Next::Build);
         // A start that failed (the commit wasn't pushed yet) waits 10 minutes, then tries again, for
         // as long as it takes: only builds that ran and failed count.
-        assert_eq!(next(&[], &Starts { last: Some(now - 60) }, now), Next::Wait);
-        assert_eq!(next(&[], &Starts { last: Some(now - 11 * 60) }, now), Next::Build);
-        assert_eq!(next(&[run(Failed, Some(now - 7200))], &Starts { last: Some(now - 11 * 60) }, now), Next::Build);
+        assert_eq!(next(&[], &Starts { last: Some(now - 60), ..Starts::default() }, now), Next::Wait);
+        assert_eq!(next(&[], &Starts { last: Some(now - 11 * 60), ..Starts::default() }, now), Next::Build);
+        assert_eq!(next(&[run(Failed, Some(now - 7200))], &Starts { last: Some(now - 11 * 60), ..Starts::default() }, now), Next::Build);
         let failed3 = [run(Failed, Some(now - 9000)), run(Failed, Some(now - 8000)), run(Failed, Some(now - 7200))];
         assert_eq!(next(&failed3, &none, now), Next::Nothing);
     }
@@ -1929,8 +2034,35 @@ mod tests {
 
     #[test]
     fn terminal_output_becomes_plain_lines() {
-        assert_eq!(plain("\x1b[2mhello\x1b[0m\r\nworld\x1b]0;title\x07!"), "hello\nworld!");
-        assert_eq!(plain("a\x1b]2;t\x1b\\b"), "ab");
+        let mut screen = Screen::default();
+        assert_eq!(screen.feed("\x1b[2mhello\x1b[0m\r\nworld\x1b]0;title\x07!\n"), [Shown::Line("hello".into()), Shown::Line("world!".into())]);
+        assert_eq!(screen.feed("a\x1b]2;t\x1b\\b\n"), [Shown::Line("ab".into())]);
+    }
+
+    #[test]
+    fn a_progress_bar_is_one_line_that_keeps_up() {
+        // cargo's: drawn, then drawn over (a carriage return), lines it finishes printed above it.
+        let mut screen = Screen::default();
+        assert_eq!(screen.feed("   Building [=> ] 1/364: a\r"), [Shown::Progress("   Building [=> ] 1/364: a".into())]);
+        assert_eq!(screen.feed("   Building [==> ] 2/364: b\r"), [Shown::Progress("   Building [==> ] 2/364: b".into())]);
+        assert_eq!(
+            screen.feed("\x1b[K   Compiling kiln\n   Building [===> ] 363/364: kiln\r"),
+            [Shown::Line("   Compiling kiln".into()), Shown::Progress("   Building [===> ] 363/364: kiln".into())]
+        );
+        // A line's CR and LF in two reads: the line, once it ends.
+        let mut screen = Screen::default();
+        assert_eq!(screen.feed("done\r"), [Shown::Progress("done".into())]);
+        assert_eq!(screen.feed("\n"), [Shown::Line("done".into())]);
+        // In the job's log it's the last line, drawn over in place, and gives way to the next line.
+        let mut j = new_job("runner", "m", "build", None, None);
+        push_line(&mut j, "Compiling a".into());
+        for p in ["Building 1/3", "Building 2/3"] {
+            push_line(&mut j, p.into());
+            j.progress = true;
+        }
+        assert_eq!(j.log, ["Compiling a", "Building 2/3"]);
+        push_line(&mut j, "Compiling b".into());
+        assert_eq!(j.log, ["Compiling a", "Compiling b"]);
     }
 
     #[test]
