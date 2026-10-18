@@ -360,6 +360,32 @@ over the corpus's whole day (a grid of at most 1,200 points a series), fifteen r
 | `avg:node_*{*} by {instance}` | 7 | 2.93 M | 27.0 ms | 27.3 ms | 9.2 | 95 (a group key a series at first: 1,116) |
 | `sum:*{job:apiserver}` | 1 | 2.18 M | 20.2 ms | 20.9 ms | 9.3 | 48 |
 
+### 12.6 Log text: LZ4 against deflate
+
+2026-10-18, same machine: `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs --bench lz4`. 43.4 MB
+of kiln's logs: the runner's journal and every pod's in the cluster (ArgoCD's logfmt, JSON,
+Kubernetes' klog, kiln's tracing), 231,561 lines. LZ4 is `kiln_obs::lz4` (safe code); deflate is
+flate2's (miniz_oxide). Throughput is of the uncompressed bytes.
+
+| block | codec | ratio | compress | decompress |
+| --- | --- | --- | --- | --- |
+| 64 KiB | LZ4 | 6.60 | 1,029 MB/s | 3,701 MB/s |
+| 64 KiB | deflate-1 | 8.59 | 640 MB/s | 1,468 MB/s |
+| 64 KiB | deflate-6 | 11.85 | 179 MB/s | 1,938 MB/s |
+| 256 KiB | LZ4 | 6.92 | 1,052 MB/s | 3,802 MB/s |
+| 256 KiB | deflate-1 | 8.81 | 848 MB/s | 1,565 MB/s |
+| 256 KiB | deflate-6 | 12.72 | 147 MB/s | 2,026 MB/s |
+| 1 MiB | LZ4 | 7.00 | 1,022 MB/s | 3,171 MB/s |
+| 1 MiB | deflate-6 | 12.96 | 130 MB/s | 1,883 MB/s |
+| 4 MiB | LZ4 | 7.03 | 891 MB/s | 3,608 MB/s |
+| 4 MiB | deflate-6 | 13.02 | 125 MB/s | 1,863 MB/s |
+
+Decompressing allocates nothing. The choice follows how blocks are used: recent blocks, searched
+most, are LZ4 (twice deflate's decompression rate); blocks compaction rewrites, searched rarely and
+holding most of the bytes, are deflate-6 (1.86× smaller), as ClickHouse pairs LZ4 for hot parts
+with a stronger codec for cold. A block's text is 256 KiB: the smallest within 2% of LZ4's ratio
+plateau, so a search that hits one row decompresses at most 256 KiB (about 70 µs).
+
 ## 13. Scenarios
 
 Live, end to end: a kiln server and runners as separate processes, OTLP senders, mock Slack and

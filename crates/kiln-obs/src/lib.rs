@@ -12,6 +12,7 @@ pub mod crc32c;
 pub mod hash;
 pub mod head;
 pub mod index;
+pub mod lz4;
 pub mod manifest;
 pub mod otlp;
 pub mod query;

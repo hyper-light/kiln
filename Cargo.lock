@@ -1575,6 +1575,7 @@ dependencies = [
 name = "kiln-obs"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hashbrown 0.17.1",
  "hyper-measure",
  "sha2",
