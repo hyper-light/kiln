@@ -260,6 +260,8 @@ struct Held {
     env: String,
     /// When it could first have started: the wait timer counts from here.
     ready_at: i64,
+    /// Whether `approval.waiting` went out for it (W19-R06).
+    announced: bool,
 }
 
 /// Reusable workflows: read at the run's commit from the repository's mirror (W04-R24; remote
@@ -760,6 +762,8 @@ impl Dispatch {
                 }
                 PlanAction::Finish(c) => {
                     runs::finish_run(&self.hub, run, status_of(c), c.result(), None).await?;
+                    // W19-R06: who wants to hear of it.
+                    crate::rt::spawn(super::notify::run_finished(Arc::clone(&self.hub), run.to_owned()));
                     let cmds = self.sched.handle(Input::RunFinished { run: run.to_owned() }, now_ms());
                     if let Some(r) = self.runs.remove(run) {
                         self.workflow_run(&r, "completed", Some(c.result()));
@@ -894,6 +898,14 @@ impl Dispatch {
                 let reason = if reviewers.is_empty() { "wait-timer" } else { "approval" };
                 runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until })).await?;
                 self.hub.emit_job(id).await;
+                // W19-R06: the first time it waits for a reviewer, who wants to hear of it.
+                if !reviewers.is_empty()
+                    && let Some(h) = self.held.get_mut(id)
+                    && !h.announced
+                {
+                    h.announced = true;
+                    crate::rt::spawn(super::notify::approval_waiting(Arc::clone(&self.hub), run.clone(), vec![def.name.clone()]));
+                }
                 if let Some(t) = until {
                     self.timers.insert(t * 1000);
                 }
@@ -914,7 +926,7 @@ impl Dispatch {
         self.hub.emit_job(&id).await;
         // A leg bound to an environment starts when its protection lets it (W15-R04).
         if let Some(env) = self.legs.get(&id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
-            self.held.insert(id.clone(), Held { leg, env, ready_at: crate::util::now_unix() });
+            self.held.insert(id.clone(), Held { leg, env, ready_at: crate::util::now_unix(), announced: false });
             return self.gate(&id).await;
         }
         let cmds = self.sched.handle(Input::LegQueued(Box::new(leg)), now_ms());
@@ -1459,7 +1471,8 @@ impl Dispatch {
             if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
                 let id = li.id.clone();
                 let ready_at = runs::queued_at(&self.hub, &id).await.unwrap_or_else(|_| crate::util::now_unix());
-                self.held.insert(id.clone(), Held { leg: li, env, ready_at });
+                // Announced before the server stopped, or not: once more at worst.
+                self.held.insert(id.clone(), Held { leg: li, env, ready_at, announced: true });
                 if let Err(e) = self.gate(&id).await {
                     tracing::warn!(leg = %id, error = %format!("{e:#}"), "an environment's protection could not be checked");
                 }

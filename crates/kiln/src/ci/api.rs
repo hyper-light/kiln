@@ -42,6 +42,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         ["_kiln", "oidc", "token"] => Some(super::oidc::token(hub, &req).await),
         // W16: test reports from legs.
         ["_kiln", "test-results"] => Some(super::results::ingest(hub, req).await),
+        // W19: a step's message (`kiln/notify@v1`).
+        ["_kiln", "notify"] => Some(super::notify::from_leg(hub, req).await),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -135,6 +137,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs", id, "tests"]) => super::results::of(hub, Some(id), None, q).await,
         (&Method::GET, ["legs", id, "tests"]) => super::results::of(hub, None, Some(id), q).await,
         (&Method::GET, ["repos", repo, "tests"]) => super::results::repo(hub, repo, q).await,
+        // W19-R06: what notifications went out.
+        (&Method::GET, ["notify", "deliveries"]) => super::notify::deliveries(hub, q).await,
         // W16-R07, R08: benchmark metrics and their trends.
         (&Method::GET, ["runs", id, "metrics"]) => super::results::run_metrics(hub, id).await,
         (&Method::GET, ["repos", repo, "metrics"]) => super::results::repo_metrics(hub, repo, q).await,

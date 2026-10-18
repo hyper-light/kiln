@@ -187,9 +187,9 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
-| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server; MCP, log search, microVM and k8s terminals left |
+| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
-| W19 | Insights, audit, notifications | W05 | blocked (W05) | |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; insights, compare, log search, audit v2, outgoing webhooks left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
@@ -2133,6 +2133,8 @@ Gives step execution for `uses:`.
     `commit`. The kiln dialect's implicit checkout is the same code.
   - `kiln/test-results@v1`: W16's reports as a step of its own, failing on failed tests
     (quarantined ones excepted under `enforce`), with `failed` and `passed` as outputs.
+  - `kiln/notify@v1`: a message through the repository's channels (W19-R06), failing only when
+    no channel took it.
   - Inputs are checked as JavaScript actions' are (required ones, GitHub's "Unexpected
     input(s)" warning). Their metadata is at `GET /api/ci/actions/kiln`, and they lead
     `GET /api/ci/actions?q=` (R12).
@@ -2143,7 +2145,7 @@ Gives step execution for `uses:`.
   - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
     tarballs in W08's store (today they are files under `<data>/actions/tar`).
   - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
-    `kiln/auth`, `kiln/deploy`, `kiln/attest`, `kiln/notify`, `kiln/upload` and `kiln/download`,
+    `kiln/auth`, `kiln/deploy`, `kiln/attest`, `kiln/upload` and `kiln/download`,
     each with its workstream; R11.
   - musl Node for Alpine job containers, with W13.
   - AC01 to AC06.
@@ -3725,7 +3727,30 @@ rule-based notifications (G-30, G-31).
   Discord, email and webhook channels deliver (local fakes, then real ones). *Integration test.*
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
-**Progress.** Not started.
+**Progress.** In progress: R06 (with W11-R06's channels).
+
+- *R06* (`crates/kiln/src/ci/notify.rs`):
+  - Rules come from trunk's `.kiln/notify.yaml` and the server's `[[ci.notify]]`, as written
+    above: `on`, `where` (an expression over `github` and `run`), `to` and `throttle`.
+  - Events so far: `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and
+    `approval.waiting`, announced once per leg.
+  - Channels are W11-R06's integration kinds (`slack`, `discord`, `teams`, `telegram`,
+    `pagerduty`, `opsgenie`, `webhook`), named `kind:target`: the integration called `target`,
+    or the first the repository may use, with `target` as its channel or chat.
+    - Slack takes an incoming webhook or a bot token.
+    - PagerDuty triggers an incident on a failure, and resolves it on the fix.
+    - Webhooks are signed with `X-Kiln-Signature-256` (HMAC-SHA256 of the body).
+  - Deliveries retry after 2 and 15 seconds and are recorded (`GET /api/ci/notify/deliveries`).
+    An integration's Verify sends a test message.
+  - `kiln/notify@v1` sends a step's own message (W07-R10).
+  - Verified end to end, against a local fake:
+    - `run.failed` reached Slack and a webhook whose signature checked;
+    - the fix sent `run.fixed`;
+    - a failure again within the throttle sent nothing;
+    - a deployment waiting for a reviewer sent `approval.waiting` to Discord;
+    - a step's `kiln/notify@v1` reached both channels.
+- *Left*: R01 to R05, R07; email (SMTP), the inbox and issue trackers as channels; the other
+  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC01 to AC06.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 

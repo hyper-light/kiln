@@ -34,6 +34,17 @@ pub struct Ci {
     pub artifacts: Artifacts,
     pub oidc: Oidc,
     pub actions: Actions,
+    /// `[[ci.notify]]`: the server's notification rules (docs/ci.md W19-R06), before each
+    /// repository's `.kiln/notify.yaml`:
+    ///
+    /// ```toml
+    /// [[ci.notify]]
+    /// on = ["run.failed", "run.fixed"]
+    /// where = "github.ref_name == 'main'"
+    /// to = ["slack:#ci"]
+    /// throttle = "10m"
+    /// ```
+    pub notify: Vec<crate::ci::notify::Rule>,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]

@@ -2304,6 +2304,30 @@ impl Leg {
                 }
                 !(fail_on && r.failed > 0 && !excused)
             }
+            "notify" => {
+                let to: Vec<String> = get("to").unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+                let message = st.masker.mask(&get("message").unwrap_or_default());
+                let url = format!("{}/_kiln/notify", self.a.runtime.results_url.trim_end_matches('/'));
+                let body = serde_json::to_vec(&serde_json::json!({ "to": to, "message": message }))?;
+                let resp = self.http.post(&url).bearer(&self.a.runtime.runtime_token).header("content-type", "application/json").body(body).timeout(Duration::from_secs(120)).send().await?;
+                let status = resp.status();
+                let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+                anyhow::ensure!((200..300).contains(&status), "{}", v.get("error").and_then(serde_json::Value::as_str).unwrap_or("the server refused the message"));
+                let mut sent = 0;
+                for r in v.get("sent").and_then(serde_json::Value::as_array).into_iter().flatten() {
+                    let to = r.get("to").and_then(serde_json::Value::as_str).unwrap_or_default();
+                    match r.get("error").and_then(serde_json::Value::as_str) {
+                        Some(e) => self.annotate(idx, "warning", &format!("{to}: {e}")).await,
+                        None => {
+                            sent += 1;
+                            self.note(idx, &format!("sent to {to}")).await;
+                        }
+                    }
+                }
+                outputs.insert("sent".to_owned(), sent.to_string());
+                // It fails only when no channel took it.
+                sent > 0
+            }
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
         };
         Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })

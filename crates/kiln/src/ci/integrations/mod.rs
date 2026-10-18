@@ -137,6 +137,14 @@ pub const KINDS: &[KindInfo] = &[
         built: true,
     },
     KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
+    // Chat, paging and webhooks: where notifications go (docs/ci.md W11-R06, W19-R06).
+    KindInfo { kind: "slack", title: "Slack", category: "notify", mode: Mode::Token, fields: &[f("channel", false, "the channel a bot token posts to when a rule names none (#ci)")], secret: Some("incoming webhook URL, or a bot token (xoxb-…)"), built: true },
+    KindInfo { kind: "discord", title: "Discord", category: "notify", mode: Mode::Token, fields: &[], secret: Some("webhook URL"), built: true },
+    KindInfo { kind: "teams", title: "Microsoft Teams", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Workflows webhook URL"), built: true },
+    KindInfo { kind: "telegram", title: "Telegram", category: "notify", mode: Mode::Token, fields: &[f("chat_id", false, "the chat a rule that names none posts to")], secret: Some("bot token"), built: true },
+    KindInfo { kind: "pagerduty", title: "PagerDuty", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Events API v2 routing key"), built: true },
+    KindInfo { kind: "opsgenie", title: "Opsgenie", category: "notify", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true },
+    KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
     KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true },
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false },
@@ -447,6 +455,7 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
                 Err(e) => Err(format!("{e:#}")),
             },
             "aws" | "gcp" | "azure" => verify_federated(hub, &i, as_).await,
+            k if crate::ci::notify::CHANNELS.contains(&k) => crate::ci::notify::verify(hub, &i).await,
             "vercel" => match secret(hub, &i).await {
                 Ok(Some(token)) => vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
                 Ok(None) => Err("no token stored".into()),

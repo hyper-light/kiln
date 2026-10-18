@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod integrations;
 pub mod load;
 pub mod local;
+pub mod notify;
 pub mod oidc;
 pub mod ops;
 pub mod preview;

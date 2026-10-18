@@ -50,6 +50,15 @@ pub const BUILTINS: &[Builtin] = &[
         ],
         outputs: &[("failed", "How many tests failed."), ("passed", "How many passed.")],
     },
+    Builtin {
+        name: "notify",
+        description: "Send a message through the repository's channels: Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie or a webhook (W19).",
+        inputs: &[
+            Input { name: "to", description: "Channels, one a line: `slack:#ci`, `discord:team-hook`, `webhook:audit`, …", default: None, required: true },
+            Input { name: "message", description: "What to say.", default: None, required: true },
+        ],
+        outputs: &[("sent", "How many channels took it.")],
+    },
 ];
 
 /// `kiln/<name>@<version>`: the built-in it names, when it is one (`v1`, or any version
