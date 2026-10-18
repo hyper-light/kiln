@@ -956,7 +956,7 @@ fn w14_r05_suggestions_mirror_signing() -> anyhow::Result<()> {
     }
     until(30, "the mirror has the trunk", || {
         let up = must(git(&home, &work, &["ls-remote", &url(&s.admin, "upstream"), "refs/heads/main"]), "ls-remote")?;
-        Ok((!up.starts_with(&landed)).then(|| up))
+        Ok((!up.starts_with(&landed)).then_some(up))
     })?;
 
     // A patch series without git: `git format-patch` output, submitted over the API.
