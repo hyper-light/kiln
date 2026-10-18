@@ -129,7 +129,8 @@ function GoalPanel({
       setEditing(null);
   };
 
-  const state = !stack || items.length === 0 ? "empty" : stack.state;
+  // Not read yet (the stand-in while it loads), or it couldn't be: not "no goals", which it may have.
+  const state = !stack ? (readError ? "unread" : "reading") : items.length === 0 ? "empty" : stack.state;
   const chip =
     state === "running"
       ? `Running · ${met} of ${items.length} met`
@@ -137,7 +138,11 @@ function GoalPanel({
         ? `Done · ${met} of ${items.length} met`
         : state === "paused"
           ? `Paused · ${met} of ${items.length} met`
-          : "No goals yet";
+          : state === "reading"
+            ? "Reading…"
+            : state === "unread"
+              ? "Couldn't read it"
+              : "No goals yet";
 
   return (
     <section className="gs-panel" aria-label="Goal stack">
@@ -215,7 +220,7 @@ function GoalPanel({
             <div className="field">
               <input id={`gs-add-${agent}`} value={adding} placeholder={items.length ? "Add the next goal" : "Add a goal"} onChange={(e) => setAdding(e.target.value)} />
             </div>
-            <Button size="sm" variant="secondary" type="submit" disabled={busy || !adding.trim()}>
+            <Button size="sm" variant="secondary" type="submit" disabled={busy || !adding.trim() || !onStack}>
               Add
             </Button>
           </form>
