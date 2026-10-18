@@ -27,9 +27,16 @@ the rewind point, as the timeline does.
 
 ## The store: Turso, per machine
 
-Each machine keeps its conversations in a [Turso](https://github.com/tursodatabase/turso) database
-(`<state>/conversations.db`): the SQLite-compatible engine in Rust, embedded in kiln's binary.
-The file is SQLite's format, so `sqlite3` reads it.
+Each machine keeps its conversations in a [Turso](https://github.com/tursodatabase/turso) database:
+the SQLite-compatible engine in Rust, embedded in kiln's binary and vendored in `vendor/turso`
+(`UPSTREAM.md`: the commit, the features kiln builds it with, the changes).
+
+- A runner's store is `<state>/conversations.db` and holds its own sessions.
+- The server's store is `<data_dir>/harness/conversations.db` and holds every session, from every
+  machine.
+- The file is SQLite's format. kiln holds it open exclusively, so `sqlite3` reads it when kiln isn't
+  running, or reads a copy of it together with its `-wal`.
+- `KILN_CONVERSATIONS=off` turns the store off on a machine, which then runs as it did without one.
 
 - **Per event.** Every update a session flushes also goes to the machine's store writer, which
   commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
@@ -93,10 +100,12 @@ on and stops it, leaving the files as they are.
 
 ## Settings
 
+C1 has one switch, the same on every machine: the environment variable `KILN_CONVERSATIONS`
+(`off` turns the store off). From C2, the server's `kiln.toml` sets replication:
+
 ```toml
 [conversations]
-enabled = true        # keep conversations in the store (per machine)
-replicate = true      # replicate to the server (runners) / hold every conversation (server)
+replicate = true      # runners replicate their sessions' conversations to the server
 replicas = 0          # extra runners holding each conversation, besides the server
 keep_closed_days = 30
 ```
@@ -123,7 +132,7 @@ keep_closed_days = 30
 
 | Part | State |
 |---|---|
-| C1 store | in progress |
+| C1 store | built: the Turso engine (vendored, Rust only), each runner's store of its sessions, the server's store of every session, the writer (per event, in batches), restore from the store, search and paging API. Checked in the lab with a real Claude Code: a runner restart keeps the timeline, and follow-ups go on after it |
 | C2 replication | not yet |
 | C3 resume elsewhere | not yet |
 | C4 search | not yet |
