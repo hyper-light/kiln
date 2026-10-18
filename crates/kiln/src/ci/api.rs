@@ -76,6 +76,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,
         // W09: secrets (names only) and variables.
         (_, ["secrets", ..] | ["variables", ..]) => super::secrets::route(hub, &method, rest, q, req.into_body()).await,
+        // W11: integrations, shared by jobs and deployments (docs/cd-targets.md §6, §7.1).
+        (_, ["integrations", ..]) => super::integrations::route(hub, &method, rest, q, req.into_body()).await,
         // §4.1: the engine's runs, legs and caches (W21's data).
         (&Method::GET, ["runs"]) => super::runs_api::list(hub, q).await,
         (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id).await,

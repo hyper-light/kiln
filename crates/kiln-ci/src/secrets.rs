@@ -25,6 +25,9 @@ pub enum ScopeKind {
     /// One workflow file of one repository: the pipeline scope (W09-R06).
     Workflow,
     Environment,
+    /// One integration's own credential (W11-R01): read by the server for that integration,
+    /// never resolved for a leg, and not a scope people name.
+    Integration,
 }
 
 impl ScopeKind {
@@ -35,6 +38,7 @@ impl ScopeKind {
             ScopeKind::Repository => "repository",
             ScopeKind::Workflow => "workflow",
             ScopeKind::Environment => "environment",
+            ScopeKind::Integration => "integration",
         }
     }
 
