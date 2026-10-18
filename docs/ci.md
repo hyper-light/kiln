@@ -3771,9 +3771,11 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/DELETE | `/api/ci/repos/:repo/caches[/:id]` | `ci.caches.list`, `.delete` | runs.read, caches.write | W08 |
 | GET/PUT/DELETE | `/api/ci/secrets?scope=` · `/:name` | `ci.secrets.list`, `.set`, `.delete` (values write-only) | secrets.manage | W09 |
 | GET/PUT/DELETE | `/api/ci/variables?scope=` · `/:name` | `ci.variables.*` | variables.manage | W09 |
-| GET | `/api/ci/integrations/kinds` | `ci.integrations.kinds` | runs.read | W11 |
-| GET/POST/PATCH/DELETE | `/api/ci/integrations[/:id]` | `ci.integrations.*` | integrations.manage | W11 |
-| POST | `/api/ci/integrations/:id/verify` | `ci.integrations.verify` | integrations.manage | W11 |
+| GET | `/api/ci/integrations/kinds` | `ci.integrations.kinds` (the catalog: fields, how each authenticates, what's built) | runs.read | W11 |
+| GET | `/api/ci/integrations` | `ci.integrations.list` (every integration, never its secret, with the kinds) | integrations.manage | W11 |
+| POST | `/api/ci/integrations` | `ci.integrations.create` (`{ kind, name, config, secret?, scope? }`; the secret write-only) | integrations.manage | W11 |
+| GET/PATCH/DELETE | `/api/ci/integrations/:name` | `ci.integrations.get`, `.update` (`{ config?, secret? }`), `.delete` | integrations.manage | W11 |
+| POST | `/api/ci/integrations/:name/verify` | `ci.integrations.verify` (a real exchange: `{ ok, message \| error }`) | integrations.manage | W11 |
 | GET | `/api/ci/oidc` · POST `/rotate` · POST `/publish` · GET `/jwks-export` | `ci.oidc.*` | settings.manage | W10 |
 | GET | `/api/ci/actions?q=` · `/kiln` · POST `/sync` | `ci.actions.*` | runs.read, settings.manage | W07 |
 | GET | `/api/ci/runners` · `/:name` · POST `/:name/probe` | `ci.runners.*` | runners.read, runners.manage | W13 |

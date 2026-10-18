@@ -10,6 +10,7 @@
 //!   that federate (AWS, Google Cloud, Azure) exchange kiln's OIDC identity for short-lived
 //!   credentials; the rest use a stored token.
 
+pub mod aws;
 pub mod oci;
 
 use std::collections::HashMap;
@@ -219,6 +220,15 @@ pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
+}
+
+/// Whether any integration federates kiln's identity (`aws`, `gcp`, `azure`): then the issuer's
+/// documents are served, since those accounts' syncs mint tokens. Only reads.
+pub async fn federates(hub: &Hub) -> bool {
+    hub.store
+        .call(|c| Ok(c.query_row("SELECT 1 FROM ci_integrations WHERE kind IN ('aws', 'gcp', 'azure') LIMIT 1", [], |_| Ok(())).optional()?.is_some()))
+        .await
+        .unwrap_or(false)
 }
 
 pub async fn get(hub: &Hub, name: &str) -> anyhow::Result<Option<Integration>> {
@@ -442,6 +452,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
             let i = create(hub, &c.kind, &c.name, config, c.secret.as_deref(), c.scope.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             Ok(srv::json(StatusCode::CREATED, &i))
         }
+        (&Method::GET, ["integrations", "kinds"]) => Ok(srv::json(StatusCode::OK, &json!({ "kinds": KINDS }))),
         (&Method::GET, ["integrations", name]) => match get(hub, name).await.map_err(internal)? {
             Some(i) => Ok(srv::json(StatusCode::OK, &i)),
             None => Err(fail(StatusCode::NOT_FOUND, format!("no integration `{name}`"))),

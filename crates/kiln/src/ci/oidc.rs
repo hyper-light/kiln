@@ -42,6 +42,14 @@ fn issuer_path(hub: &Hub) -> String {
     after_scheme.find('/').and_then(|p| after_scheme.get(p..)).unwrap_or("/oidc").trim_end_matches('/').to_owned()
 }
 
+/// Whether the issuer's documents are served: while the CI engine runs (its jobs' tokens), or
+/// while an account federates kiln's identity (an `aws`, `gcp` or `azure` integration, whose CD
+/// syncs mint tokens). Only reads: fetching the keys makes the first one, so with neither,
+/// nothing is served and no key is made.
+pub async fn active(hub: &Hub) -> bool {
+    hub.ci.enabled() || crate::ci::integrations::federates(hub).await
+}
+
 /// Whether `seg` is one of the issuer's documents here.
 pub fn is_issuer(hub: &Hub, seg: &[&str]) -> Option<&'static str> {
     let path = format!("/{}", seg.join("/"));
