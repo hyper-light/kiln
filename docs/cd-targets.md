@@ -546,8 +546,15 @@ Registries are integrations (W11) of kind `oci`, and there can be any number of 
   - Kubernetes: an `imagePullSecrets` Secret per namespace;
   - ECS: `repositoryCredentials`;
   - the registry credentials of Container Apps, Cloud Run, Railway, Render, Fly and DigitalOcean.
-- **Docker Hub first.** kiln's own image goes to Docker Hub (§10). Its rate limits are respected:
-  pulls are cached by digest, and anonymous pulls are never used where an account exists.
+- **Docker Hub first.** Docker Hub is the first registry kiln works with. Its rate limits are
+  respected: pulls are cached by digest, and anonymous pulls are never used where an account
+  exists.
+- **Published images.** An image a pipeline builds at each commit (an artifact's
+  `published: <name>`) lives where people set it in the UI (Settings → Deployments → Images):
+  - the local Docker of the machine that builds it, by default. The pipeline loads it into the
+    cluster's nodes, and a revision's image is ready when its commit's run succeeded;
+  - or any registry. The pipeline pushes it by commit (`KILN_IMAGE_<NAME>` in its environment is
+    the repository), and kiln resolves the commit's tag to its digest, as for any image.
 
 ## 8. The UI
 
@@ -636,9 +643,15 @@ and skills for deploying to a new platform, adopting from an account, and runnin
 
 **Then:**
 
-1. **Registry.** Docker Hub (D7), private if you choose, through an `oci` integration. A workflow
-   builds the image on every push to main with `KILN_COMMIT`, pushes it, and leaves its digest as
-   its artifact. The cluster pulls with the integration's credentials.
+1. **The image.** A pipeline (`.kiln/image.yaml`) builds kiln's image at every push to main, with
+   `KILN_COMMIT`. Where it goes is set in the UI (§7.1), local Docker by default:
+   - **Local Docker.** The pipeline loads the image into the cluster's nodes
+     (`deploy/cluster/load-image.sh`), and the revision is ready when its commit's run succeeded.
+     The newest 20 stay on the machine and the nodes, with any image a pod uses
+     (`deploy/cluster/prune-images.sh`). Rolling back further builds that commit again.
+   - **A registry.** Docker Hub or any other, private through an `oci` integration. The pipeline
+     pushes the image by commit, and its digest is the revision's artifact. The cluster pulls
+     with the integration's credentials.
 2. **Definitions.**
    - `.kiln/deploy.yaml` defines the apps: kiln's chart with `image: ${{ artifacts.image }}`, the
      namespaces, and kube-prometheus-stack pinned. No root app is needed.
