@@ -197,6 +197,26 @@ const scenarios = {
     await page.getByRole("dialog").getByRole("button", { name: "Remove" }).click();
     await until("the integration gone", async () => !(await api("GET", "/api/observe/v1/integrations")).body.integrations.some((i) => i.name === name));
   },
+  /** A search's patterns: the seed's message shapes grouped, and a pattern a click from its records. */
+  async "a search's records group into patterns, and a pattern narrows the search to its own"() {
+    await page.goto(`${BASE}/observe/logs?view=patterns&range=4h&q=${encodeURIComponent("source:seed")}`);
+    const rows = page.getByRole("region", { name: "Patterns" }).getByRole("listitem");
+    await until("the patterns", async () => (await rows.count()) >= 5, 20_000);
+    const refused = rows.filter({ hasText: "connection refused by db-" });
+    await refused.first().waitFor();
+    await refused.first().getByRole("button").click();
+    await page.waitForURL((u) => !u.searchParams.has("view") && (u.searchParams.get("q") ?? "").includes('"refused"'));
+    const q = new URL(page.url()).searchParams.get("q");
+    await page.getByRole("region", { name: "Records" }).waitFor();
+    const to = Date.now();
+    const found = await api("POST", "/api/observe/v1/logs/search", { query: `-source:kiln.event (${q})`, from: to - 4 * 3_600_000, to, limit: 200 });
+    expect(found.status === 200 && found.body.records.length > 0, `the narrowed search finds records: ${JSON.stringify(found.body).slice(0, 200)}`);
+    expect(
+      found.body.records.every((r) => /^connection refused by db-\d+:\d+$/.test(r.message)),
+      `every record the pattern narrows to is of it: ${found.body.records.map((r) => r.message).slice(0, 5)}`,
+    );
+  },
+
   /**
    * A cloud added from the form (a key that is not one refused; the server's own credentials tested,
    * the test saying why they are not there), and one the API made against a stand-in for CloudWatch

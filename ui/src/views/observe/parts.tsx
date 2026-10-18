@@ -69,6 +69,26 @@ export function useParam(name: string, fallback = ""): [string, (v: string) => v
   return [value, set];
 }
 
+/** A way to change several of the page's search params at once (in place): two `useParam` setters
+ * called together would each start from the params as they were, the second undoing the first. A
+ * param set to `null` is taken out. */
+export function useParams(): (changes: Record<string, string | null>) => void {
+  const [, setParams] = useSearchParams();
+  return (changes) =>
+    React.startTransition(() =>
+      setParams(
+        (p) => {
+          for (const [k, v] of Object.entries(changes)) {
+            if (v === null) p.delete(k);
+            else p.set(k, v);
+          }
+          return p;
+        },
+        { replace: true },
+      ),
+    );
+}
+
 /** The page's time range (`?range=`): the last hour unless it says. */
 export function useRange(fallback: Range = "1h"): [Range, (r: Range) => void] {
   const [r, set] = useParam("range", fallback);

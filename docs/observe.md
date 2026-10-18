@@ -527,6 +527,10 @@ time range and the search in the address (a page is a link).
   most; with no query, every metric kiln keeps, found by name. A query goes onto a dashboard, or
   into a monitor, in a step. An `anomalies()` series is drawn with its band beneath it, in its color,
   its points past the band marked (every chart: a dashboard's, a monitor's).
+- **Patterns** (the logs explorer's and the event stream's other view, `?view=patterns`): the
+  search's records grouped by their template (Drain), the most common first, each its count, its
+  worst status, its template (variables a quiet `*`) and when last seen; a click narrows the search
+  to the pattern's fixed text and shows its records.
 - **Logs explorer and event stream**: a search, a histogram of its records by status (stacked, a
   bucket of a round size, about 60 to the range), each facet's most common values (a click narrows
   the search to one, again widens it), the newest 100 records (and 100 more on asking), each opened
@@ -975,6 +979,8 @@ runs of four.
 its top): a query explored and put on a new dashboard, which is then given a note, saved and
 deleted; kiln's own dashboard narrowed by its template variable, then copied; logs searched,
 narrowed by a facet and by an attribute of a record, the API answering the page's search alike; a
+search's patterns, one of them clicked, the search it narrows to finding its records alone (checked
+through the API); a
 monitor made from the form, muted, unmuted and deleted; a signed webhook added, tested (the
 receiver checks the signature) and removed. Each checked through the API, not the page. 2026-10-18:
 all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch); and every Observe page

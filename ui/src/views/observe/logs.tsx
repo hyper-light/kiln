@@ -2,17 +2,37 @@
  * The logs explorer, and as events the event stream (events are records of source `kiln.event`):
  * a search (docs/observe.md §4.6), how its records fall over the range by status, each facet's
  * most common values (a click narrows the search to one, again widens it), and the newest
- * records, each opened to its attributes.
+ * records, each opened to its attributes; or their patterns (Drain, §12.13), each a click from
+ * its records.
  */
 import * as React from "react";
-import { observeApi, type LogFacets, type LogRecord } from "@/api/observe";
+import { observeApi, type LogFacets, type LogPatterns, type LogRecord } from "@/api/observe";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro } from "@/components/ui/misc";
+import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { cn } from "@/lib/utils";
-import { Histogram, ObserveNav, RANGES, RangePicker, STATUS_COLOR, firstLine, histogramRes, logsOnly, pollFor, recordsRes, useParam, useRange, when, within, type Range } from "./parts";
+import {
+  Histogram,
+  ObserveNav,
+  RANGES,
+  RangePicker,
+  STATUS_COLOR,
+  STATUS_ORDER,
+  firstLine,
+  histogramRes,
+  logsOnly,
+  pollFor,
+  recordsRes,
+  useParam,
+  useParams,
+  useRange,
+  when,
+  within,
+  type Range,
+} from "./parts";
 
 /** The newest records a page shows at first, each "more" adds, and shows at the most (the API's). */
 const LIMIT = 100;
@@ -42,6 +62,23 @@ const facetsRes = (query: string, range: Range, facets: readonly string[]): Res<
   opts: { pollMs: pollFor(range) },
 });
 
+const patternsRes = (query: string, range: Range): Res<LogPatterns> => ({
+  key: `observe/patterns/${range}/${query}`,
+  fetch: (signal) => {
+    const to = Date.now();
+    return observeApi.patterns({ query, from: to - RANGES[range], to }, signal);
+  },
+  opts: { pollMs: pollFor(range) },
+});
+
+/** A template's fixed text, as search phrases: each token's pieces between its variables (eight at
+ * the most), so its records are found whatever their spacing. */
+function pieces(template: string): string[] {
+  const out: string[] = [];
+  for (const token of template.split(/\s+/)) for (const piece of token.split("<*>")) if (/[A-Za-z0-9]/.test(piece)) out.push(`"${piece.replace(/["\\]/g, "\\$&")}"`);
+  return out.slice(0, 8);
+}
+
 /** `facet:value` as a search term, quoted when it must be. */
 function term(facet: string, value: string) {
   return /^[\w.\-/:@]+$/.test(value) ? `${facet}:${value}` : `${facet}:"${value.replace(/["\\]/g, "\\$&")}"`;
@@ -62,6 +99,8 @@ function toggle(q: string, t: string) {
 export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
   const k = KINDS[kind];
   const [q, setQ] = useParam("q");
+  const [view, setView] = useParam("view", "records");
+  const setParams = useParams();
   const [range, setRange] = useRange();
   const query = kind === "events" ? within(k.base, q) : logsOnly(q);
   return (
@@ -80,9 +119,27 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
         <Loadable key={`f/${query}`} label="the facets" fallback={<RowsHold rows={8} rowHeight={32} />}>
           <Facets query={query} range={range} facets={k.facets} q={q} onToggle={(t) => setQ(toggle(q, t))} />
         </Loadable>
-        <Loadable key={`r/${query}`} label="the records" fallback={<RowsHold rows={10} rowHeight={36} />}>
-          <Records query={query} range={range} onFilter={(t) => setQ(toggle(q, t))} />
-        </Loadable>
+        <div className="min-w-0">
+          <Segmented
+            label="Show"
+            className="mb-3"
+            value={view === "patterns" ? "patterns" : "records"}
+            onChange={(v) => setView(v)}
+            options={[
+              { value: "records", label: "Records" },
+              { value: "patterns", label: "Patterns" },
+            ]}
+          />
+          {view === "patterns" ? (
+            <Loadable key={`p/${query}`} label="the patterns" fallback={<RowsHold rows={10} rowHeight={36} />}>
+              <Patterns query={query} range={range} onPick={(terms) => setParams({ q: terms.reduce((acc, t) => (acc.split(/\s+/).includes(t) ? acc : toggle(acc, t)), q), view: null })} />
+            </Loadable>
+          ) : (
+            <Loadable key={`r/${query}`} label="the records" fallback={<RowsHold rows={10} rowHeight={36} />}>
+              <Records query={query} range={range} onFilter={(t) => setQ(toggle(q, t))} />
+            </Loadable>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -209,6 +266,57 @@ function Records({ query, range, onFilter }: { query: string; range: Range; onFi
           </Button>
         )}
       </div>
+    </section>
+  );
+}
+
+/** A template, its variables quiet. */
+function Template({ text }: { text: string }) {
+  const parts = text.split("<*>");
+  return (
+    <>
+      {parts.map((s, i) => (
+        <React.Fragment key={i}>
+          {s}
+          {i < parts.length - 1 && <span className="text-[#6f7380]">*</span>}
+        </React.Fragment>
+      ))}
+    </>
+  );
+}
+
+/** A search's patterns, the most common first: each its count, its worst status, its template, when
+ * last seen; a click shows its records. */
+function Patterns({ query, range, onPick }: { query: string; range: Range; onPick: (terms: string[]) => void }) {
+  const p = useRes(patternsRes(query, range)).data;
+  if (p.patterns.length === 0) return <p className="empty-line py-16 text-center">Nothing matches in this range.</p>;
+  return (
+    <section aria-label="Patterns">
+      <ol className="divide-y divide-[#1d1f23] border-y border-[#1d1f23]">
+        {p.patterns.map((x) => {
+          const worst = STATUS_ORDER.filter((s) => x.statuses[s]).at(-1) ?? "info";
+          const said = Object.entries(x.statuses)
+            .map(([s, n]) => `${s} ${n.toLocaleString()}`)
+            .join(", ");
+          return (
+            <li key={x.template}>
+              <button type="button" onClick={() => onPick(pieces(x.template))} title={x.sample} className="flex w-full items-baseline gap-3 px-2 py-2 text-left hover:bg-[#101114]">
+                <span className="w-12 shrink-0 text-right font-mono text-[11px] text-[#c8cad0] tabular-nums">{x.count.toLocaleString()}</span>
+                <span className="inline-block size-2 shrink-0 translate-y-[-1px] rounded-full" style={{ background: STATUS_COLOR[worst] }} title={said} aria-label={said} />
+                <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[#d6d8dd]">
+                  <Template text={x.template} />
+                </span>
+                <time className="hidden shrink-0 font-mono text-[10.5px] text-[#8c8f98] tabular-nums sm:inline" dateTime={new Date(x.last_ns / 1e6).toISOString()}>
+                  {when(x.last_ns)}
+                </time>
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+      <p className="mt-3 font-mono text-[10px] text-[#7b7e88]">
+        {p.patterns.length.toLocaleString()} {p.patterns.length === 1 ? "pattern" : "patterns"} in the newest {p.records.toLocaleString()} records · {p.took_ms.toFixed(1)} ms
+      </p>
     </section>
   );
 }

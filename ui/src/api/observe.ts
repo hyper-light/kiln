@@ -61,6 +61,26 @@ export interface LogFacets {
   took_ms: number;
 }
 
+/** A search's records grouped by their template (Drain): the most common first. */
+export interface LogPattern {
+  /** The template, its variables `<*>`. */
+  template: string;
+  count: number;
+  first_ns: number;
+  last_ns: number;
+  /** Its newest record's message. */
+  sample: string;
+  statuses: Record<string, number>;
+}
+
+export interface LogPatterns {
+  patterns: LogPattern[];
+  /** The newest records they were found in. */
+  records: number;
+  rows_scanned: number;
+  took_ms: number;
+}
+
 /** What one replica says of itself (the server's view of each machine's). */
 export interface ReplicaStatus {
   member: number;
@@ -291,6 +311,7 @@ export const observeApi = {
   histogram: (body: { query: string; from: number; to: number; step: number; by?: string[] }, signal?: AbortSignal) => request<LogHistogram>("POST", `${BASE}/logs/aggregate`, body, { signal }),
   facets: (body: { query: string; from: number; to: number; facets: string[]; top?: number }, signal?: AbortSignal) => request<LogFacets>("POST", `${BASE}/logs/facets`, body, { signal }),
   events: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/events/search`, body, { signal }),
+  patterns: (body: { query: string; from: number; to: number }, signal?: AbortSignal) => request<LogPatterns>("POST", `${BASE}/logs/patterns`, body, { signal }),
   status: (signal?: AbortSignal) => request<ObserveStatus>("GET", `${BASE}/status`, undefined, { signal }),
   verify: () => request<unknown>("POST", `${BASE}/verify`, {}),
   monitors: (signal?: AbortSignal) => request<{ monitors: Monitor[] }>("GET", `${BASE}/monitors`, undefined, { signal }).then((r) => r.monitors),
