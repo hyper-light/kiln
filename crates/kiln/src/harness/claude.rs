@@ -641,7 +641,8 @@ impl Claude {
                 self.request(core, Pending::Suggest(client), json!({"subtype": "file_suggestions", "query": query}));
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
-            Command::Restart | Command::Snapshot => {}
+            // The session itself does these (a move is not the harness's business).
+            Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));

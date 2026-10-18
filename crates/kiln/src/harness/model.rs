@@ -1148,6 +1148,19 @@ pub enum Command {
     SetEffort {
         effort: String,
     },
+    /// Go on on runner `to`, in its folder `cwd` (a path there, or `~/…`), once the turn under way
+    /// ends: the session moves there, conversation, timeline and queue alike (`harness::moving`).
+    MoveTo {
+        to: String,
+        cwd: String,
+        /// What came along of the folder, said in the timeline ("its repository, kept in step").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// How a move is getting on before it starts (its repository being copied over): shown.
+    Moving {
+        text: String,
+    },
     /// Set a control's value, or run an action (its argument, if any, in `value`).
     Control {
         id: String,
