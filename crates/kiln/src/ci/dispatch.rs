@@ -65,6 +65,8 @@ pub enum Msg {
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
     RunnerLost { agent: String },
+    /// A runner's probes reported (W13-R01): it is routed by what they found.
+    RunnerFacts { agent: String },
     Event { agent: String, leg: String, json: String },
     Finished { agent: String, result: JobResult },
     Rejected { agent: String, leg: String },
@@ -475,6 +477,10 @@ impl Dispatch {
                 self.runner_up(&agent, &running).await;
                 Ok(())
             }
+            Msg::RunnerFacts { agent } => {
+                self.runner_facts(&agent).await;
+                Ok(())
+            }
             Msg::RunnerLost { agent } => {
                 let cmds = self.sched.handle(Input::RunnerLost { runner: agent }, now_ms());
                 self.commands(cmds).await;
@@ -570,18 +576,38 @@ impl Dispatch {
         self.commands(cmds).await;
     }
 
+    /// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
+    /// announced; never an executor its build didn't.
+    fn runner_view(&self, a: &crate::hub::AgentLive) -> RunnerView {
+        let caps = self.hub.runner_caps(&a.name);
+        let mut facts = match &a.facts {
+            Some(f) => (**f).clone(),
+            None => {
+                let mut executors = std::collections::BTreeMap::new();
+                if caps & CAP_DOCKER != 0 {
+                    let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
+                    executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
+                }
+                kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() }
+            }
+        };
+        if caps & CAP_DOCKER == 0 {
+            facts.executors.remove("docker");
+        }
+        facts.executors.entry("host".to_owned()).or_default();
+        RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
+    }
+
+    async fn runner_facts(&mut self, agent: &str) {
+        let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: None };
+        let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
+        self.commands(cmds).await;
+    }
+
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        // Executors it has: the host always, Docker when it announced it (W13-R01's probes, for now).
-        let mut executors = std::collections::BTreeMap::new();
-        executors.insert("host".to_owned(), kiln_ci::facts::Executor::default());
-        let caps = self.hub.runner_caps(agent);
-        if caps & CAP_DOCKER != 0 {
-            let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
-            executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
-        }
-        let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() };
-        let view = RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(self.hub.runner_caps(agent)) };
+        let view = self.runner_view(&a);
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.

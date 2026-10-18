@@ -183,7 +183,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
-| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; probes, pools, microVMs, k8s left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
@@ -3073,6 +3073,27 @@ enforcement points to W18, agent isolation to W20.
   *E2E, user-assisted for the VM.*
 
 **Progress.** In progress.
+- **Facts (R01, R02, AC01).** A runner probes when it connects, every 10 minutes and on
+  `ServerMsg::ProbeFacts`, one probe at a time. It sends all of `RunnerFacts`:
+  - OS, distribution, kernel, architecture;
+  - CPU model, cores, threads and feature flags (as the standard library detects them);
+  - memory, and the work directory's own volume (`statvfs`, a `tmpfs` included);
+  - GPUs (`nvidia-smi`, `system_profiler`);
+  - KVM, nesting and Hypervisor.framework, and QEMU's registered platforms;
+  - the executors it can run (host; Docker or Podman with its version and whether it's
+    rootless), tools' versions, and whether the internet is reachable directly or through which
+    proxy.
+
+  `[agent.facts]` and `[agent.probes]` (the server's `kiln.toml` for its own runner, a `kiln
+  agent`'s config file) add `custom.*`; nothing else is guessed. The server keeps the last report,
+  routes by it (`requires: ["custom.location == rack-2", "gpu.count >= 1"]`, never an executor the
+  build didn't announce), and shows it on the runner's page.
+
+  AC01 is an integration test that checks the probe against the machine's own answers:
+  `/proc/meminfo`, `uname -r`, `/etc/os-release`, `df`, `/proc/cpuinfo`, `git --version` and
+  `docker version`. Exactly the declared fact and the answering probe appear.
+
+  Firecracker and shards are reported as tools until the runner can run legs on them.
 
 - *Done.* `crates/kiln/src/runner/docker.rs`, on the host executor through Docker or Podman
   (R03, R08), as GitHub's self-hosted runner does it:

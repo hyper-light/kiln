@@ -435,6 +435,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
                 outpost: false,
+                // `[agent.facts]` and `[agent.probes]` of its config file (docs/ci.md W13-R02).
+                declared: kiln::runner::probe::Declared::from_file(&config_path),
             };
             let result = run_agent(opts, shutdown).await;
             if let Some(ann) = announcer {
@@ -476,6 +478,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 // It runs no other machine's commands (reach), and for now sends none.
                 reach: None,
                 outpost: true,
+                declared: kiln::runner::probe::Declared::default(),
             };
             run_agent(opts, shutdown).await
         }

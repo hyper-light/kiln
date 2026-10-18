@@ -9,5 +9,6 @@ pub mod docker;
 pub mod egress;
 pub mod hashfiles;
 pub mod kept;
+pub mod probe;
 pub mod runtime;
 pub mod workspaces;
