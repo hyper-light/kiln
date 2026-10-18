@@ -886,6 +886,8 @@ impl Registry {
                         pause: None,
                         last_turn: None,
                         keep_off: false,
+                        move_on_limit: false,
+                        pause_at: None,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);

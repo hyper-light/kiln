@@ -279,7 +279,7 @@ impl Acp {
             Command::SetEffort { .. } | Command::Control { .. } => {}
             Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
             // servers when the session opens); its commands run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
