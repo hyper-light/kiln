@@ -12,12 +12,13 @@
 #   irm @@KILN_SERVER@@/install.ps1 | iex
 #   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Join [-Labels windows] [-Name box1]
 #
-# With -Outpost and a one-time invite (Machines -> Add an outpost), nothing is installed: kiln, its
-# certificate and its files go in %LOCALAPPDATA%\kiln-outpost, nothing starts at logon, and it runs
-# in this window as an outpost until you stop it (Ctrl-C). Its terminals, AI sessions and agents
-# show up in kiln; it takes no jobs.
+# With -Outpost, nothing is installed: kiln, its certificate and its files go in
+# %LOCALAPPDATA%\kiln-outpost, nothing starts at logon, and it runs in this window as an outpost
+# until you stop it (Ctrl-C). Its terminals, AI sessions and agents show up in kiln; it takes no
+# jobs. With a one-time invite (Machines -> Add an outpost) it joins at once; without one it asks
+# to join, as -Join does.
 #
-#   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Outpost -Token <invite> [-Name box1]
+#   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Outpost [-Token <invite>] [-Name box1]
 param(
   [string]$Token = $env:KILN_JOIN_TOKEN,
   [string]$Server = $(if ($env:KILN_SERVER) { $env:KILN_SERVER } else { '@@KILN_SERVER@@' }),

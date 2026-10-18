@@ -12,12 +12,12 @@
 #
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --join [--labels baremetal,bench] [--name box1]
 #
-# With `--outpost` and a one-time invite (Machines -> Add an outpost), nothing is installed: kiln,
-# its certificate and its files go in ~/.kiln-outpost, nothing starts on boot, and it runs in this
-# terminal as an outpost until you stop it (Ctrl-C). Its terminals, AI sessions and agents show up
-# in kiln; it takes no jobs.
+# With `--outpost`, nothing is installed: kiln, its certificate and its files go in ~/.kiln-outpost,
+# nothing starts on boot, and it runs in this terminal as an outpost until you stop it (Ctrl-C). Its
+# terminals, AI sessions and agents show up in kiln; it takes no jobs. With a one-time invite
+# (Machines -> Add an outpost) it joins at once; without one it asks to join, as `--join` does.
 #
-#   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --outpost --token <invite> [--name box1]
+#   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --outpost [--token <invite>] [--name box1]
 set -eu
 
 SERVER="@@KILN_SERVER@@"
