@@ -12,6 +12,8 @@
 //! - Codex: the conversation, as items for a new thread (the record of a thread is Codex's own
 //!   database's), as a switch of harness carries it.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -97,21 +99,44 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
     Package { version: VERSION, id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms() }
 }
 
+/// Every message of transcript `had` is among `lines`: `had` is an earlier copy of the same
+/// conversation (records without an id of their own, such as summaries, don't count).
+fn holds_all_of(lines: &[String], had: &str) -> bool {
+    let id = |l: &str| serde_json::from_str::<Value>(l).ok().and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned));
+    let coming: HashSet<String> = lines.iter().filter_map(|l| id(l)).collect();
+    had.lines().filter_map(id).all(|u| coming.contains(&u))
+}
+
 /// Put the harness's record where the harness here looks for it (blocking: writes files).
 /// Returns the history a new thread starts with, for a harness that takes one.
 pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
     match &pkg.carry {
         Carry::ClaudeLines { session, lines } => {
             let config = super::transcript::config_dir(&pkg.spec.env);
-            if super::transcript::find(&config, session).is_some() {
-                return Err(format!("Claude Code here already has a session {session}"));
+            // A record of the session here already is the one it left moving away (it comes back):
+            // the one coming holds all of it and what came since, and takes its place. One with
+            // turns of its own (resumed here meanwhile) is never written over.
+            let left = super::transcript::find(&config, session);
+            if let Some(old) = &left {
+                let had = std::fs::read_to_string(old).map_err(|e| format!("read {}: {e}", old.display()))?;
+                if !holds_all_of(lines, &had) {
+                    return Err(format!("Claude Code here has turns of session {session} that the one coming doesn't, and they are never written over"));
+                }
             }
             let dir = super::handoff::claude_project_dir(&config, cwd);
             std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
             let path = dir.join(format!("{session}.jsonl"));
+            let part = dir.join(format!(".{session}.jsonl.part"));
             let mut body = lines.join("\n");
             body.push('\n');
-            std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+            if let Err(e) = std::fs::write(&part, body).and_then(|()| std::fs::rename(&part, &path)) {
+                let _ = std::fs::remove_file(&part);
+                return Err(format!("write {}: {e}", path.display()));
+            }
+            // The one it left in the folder it was in then: one record of a session, not two.
+            if let Some(old) = left.filter(|o| *o != path) {
+                let _ = std::fs::remove_file(old);
+            }
             Ok(None)
         }
         Carry::Seed { items } => Ok(Some(items.clone())),
@@ -160,8 +185,30 @@ mod tests {
         let found = super::super::transcript::find(config.path(), "abc").ok_or_else(|| anyhow::anyhow!("not found"))?;
         assert!(found.starts_with(super::super::handoff::claude_project_dir(config.path(), &cwd)));
         assert_eq!(std::fs::read_to_string(found)?.lines().count(), 2);
-        // Twice is refused: a session is never written over.
-        assert!(install(&p, &cwd).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn coming_back_it_takes_the_place_of_the_record_it_left_never_of_one_with_turns_of_its_own() -> anyhow::Result<()> {
+        let config = tempfile::tempdir()?;
+        let (then, now) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (then, now) = (then.path().to_string_lossy().into_owned(), now.path().to_string_lossy().into_owned());
+        let spec = Spec { kind: "claude".into(), env: vec![("CLAUDE_CONFIG_DIR".into(), config.path().to_string_lossy().into_owned())], ..Spec::default() };
+        let msg = |u: &str| format!(r#"{{"type":"user","uuid":"{u}"}}"#);
+        let carry = |lines: Vec<String>| Carry::ClaudeLines { session: "abc".into(), lines };
+        let put = |cwd: &str, lines: Vec<String>| install(&pack("k1", spec.clone(), cwd, "beta", "/elsewhere", carry(lines), Vec::new(), State::default()), cwd);
+        // Here once, in one folder; it moved away and went on there.
+        put(&then, vec![msg("u1"), msg("u2")]).map_err(|e| anyhow::anyhow!(e))?;
+        // Back, with all of it and what came since (and a summary of its own), into another folder.
+        put(&now, vec![r#"{"type":"summary","leafUuid":"u3"}"#.into(), msg("u1"), msg("u2"), msg("u3")]).map_err(|e| anyhow::anyhow!(e))?;
+        let found = super::super::transcript::find(config.path(), "abc").ok_or_else(|| anyhow::anyhow!("not found"))?;
+        assert!(found.starts_with(super::super::handoff::claude_project_dir(config.path(), &now)));
+        assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
+        assert!(!super::super::handoff::claude_project_dir(config.path(), &then).join("abc.jsonl").exists(), "one record of a session, not two");
+        // A record here with a turn the one coming doesn't have stays as it is.
+        let err = put(&now, vec![msg("u1"), msg("u2")]).err().unwrap_or_default();
+        assert!(err.contains("never written over"), "{err}");
+        assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
         Ok(())
     }
 }
