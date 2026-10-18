@@ -638,7 +638,7 @@ impl Codex {
             }
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             Command::StopTask { task } => self.stop_terminal(core, &task),

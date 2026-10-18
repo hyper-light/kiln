@@ -1408,6 +1408,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut next_tick = Instant::now() + TICK;
                 // It is being ended for a switch (it is idle).
                 let mut ending = false;
+                // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
+                let mut forcing = false;
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -1470,6 +1472,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
                             Command::Restart => {}
+                            Command::ForceStop => {
+                                let text = format!("Stopped by force: {} starts again, the conversation going on; what it was running stopped with it", kind.name);
+                                s.core.lock().upsert(&format!("force-stop:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                forcing = true;
+                            }
                             Command::Snapshot => {
                                 for u in s.snapshot() {
                                     let _ = sink.send((s.id.clone(), u)).await;
@@ -1596,6 +1603,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     if rewind_to.is_some() {
                         p.terminate(Duration::from_secs(2));
                         let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        break;
+                    }
+                    if forcing {
+                        p.terminate(Duration::from_secs(2));
+                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        ending = true;
                         break;
                     }
                     // A switch, now that nothing is under way: the harness ends by itself once its

@@ -1138,6 +1138,9 @@ pub enum Command {
         choices: Option<Vec<ChoiceAnswer>>,
     },
     Interrupt,
+    /// The turn didn't stop when asked: the harness starts again at once, the conversation going
+    /// on, and what it was running in the turn stops with it.
+    ForceStop,
     SetMode {
         mode: String,
     },

@@ -155,6 +155,32 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A turn under way: what it's doing, its effort while it thinks, how long it's been going. */
+.ag-state > .ag-turn {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.ag-turn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.ag-turn-what.sg-label {
+  min-width: 0;
+  max-width: 44ch;
+  overflow: hidden;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+.ag-turn-meta {
+  flex: none;
+  color: #8f929b;
+  white-space: nowrap;
+}
 .ag-cwd {
   max-width: 40ch;
   overflow: hidden;
@@ -449,6 +475,14 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   transition:
     border-color 0.2s,
     color 0.2s;
+}
+/* A stop that didn't take, to force; one asked, waiting. */
+.cp-stop[data-force] {
+  color: var(--color-fail);
+}
+.cp-stop:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 .cp-stop:hover {
   border-color: #8a5d64;

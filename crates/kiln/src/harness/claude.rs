@@ -603,6 +603,10 @@ impl Claude {
             Command::Interrupt => {
                 if self.busy(core) {
                     self.request(core, Pending::Interrupt, json!({"subtype": "interrupt"}));
+                } else {
+                    // Nothing is under way here: a page asking to stop it shows what no longer is,
+                    // so it's sent the state as it is.
+                    core.touch_state();
                 }
             }
             Command::SetMode { mode } => {
@@ -642,7 +646,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));

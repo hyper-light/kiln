@@ -277,7 +277,7 @@ impl Acp {
                 core.reply(client, json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}));
             }
             Command::SetEffort { .. } | Command::Control { .. } => {}
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
             // servers when the session opens); its commands run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {

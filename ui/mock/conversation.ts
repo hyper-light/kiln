@@ -197,8 +197,14 @@ const meta: Meta = {
 
 let activity = "Running cargo test";
 let effort = "high";
+// A long think under way, as the harness reports it (`doing`, since `turn_started`); an interrupt
+// doesn't take (so a stop can be forced), and a forced stop ends the turn.
+let running = true;
+const turnStarted = Date.now() - 134_000;
 const state = (): State => ({
-  status: "running",
+  status: running ? "running" : "idle",
+  doing: running ? "Thinking" : undefined,
+  turn_started: running ? turnStarted : undefined,
   cwd: info.cwd,
   model: info.model,
   mode: info.mode,
@@ -313,6 +319,7 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
     if (c.type === "set_mode" && c.mode) info.mode = c.mode;
     else if (c.type === "set_model" && c.model) info.model = c.model;
     else if (c.type === "set_effort" && c.effort) effort = c.effort;
+    else if (c.type === "force_stop") running = false;
     else if (c.type === "send" && c.text) {
       const e = add({ id: `L-sent-${seq}`, at: Date.now(), kind: "user", text: c.text, client_id: c.id });
       // Steered and sent-now messages show where they went in; a queued one would wait (not modeled).

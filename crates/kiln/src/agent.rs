@@ -1075,7 +1075,9 @@ const HARNESS_FRAME: usize = 512 * 1024;
 
 /// An agent-session update as frames that fit: a long run of events goes in parts (events are
 /// upserts by id, so the parts mean what the whole did), and an event too large on its own has
-/// its longest texts cut, saying so. Anything else too large is dropped, and logged.
+/// its longest texts cut, saying so. Anything else too large (a state, the changeset) is cut the
+/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck.
+/// Only what still doesn't fit is dropped, and logged.
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
@@ -1083,8 +1085,17 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
         return vec![json];
     }
     let Update::Events { events } = u else {
-        tracing::warn!(session, bytes = json.len(), "agent session update too large to send; dropped");
-        return Vec::new();
+        let fitted = serde_json::to_value(u).ok().map(|v| cut_value(v, HARNESS_FRAME - 1024)).and_then(|v| serde_json::to_string(&v).ok());
+        return match fitted {
+            Some(j) if j.len() <= HARNESS_FRAME => {
+                tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session update cut to fit");
+                vec![j]
+            }
+            _ => {
+                tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
+                Vec::new()
+            }
+        };
     };
     let one = HARNESS_FRAME - 1024;
     let mut frames = Vec::new();
@@ -1119,7 +1130,12 @@ fn json_len<T: Serialize>(v: &T) -> usize {
 
 /// An event cut to about `budget` bytes of JSON: its longest texts shortened, each saying so.
 fn cut(e: crate::harness::model::Event, budget: usize) -> crate::harness::model::Event {
-    let Ok(mut v) = serde_json::to_value(&e) else { return e };
+    let Ok(v) = serde_json::to_value(&e) else { return e };
+    serde_json::from_value(cut_value(v, budget)).unwrap_or(e)
+}
+
+/// JSON cut to about `budget` bytes: its longest texts shortened, each saying so.
+fn cut_value(mut v: serde_json::Value, budget: usize) -> serde_json::Value {
     for _ in 0..64 {
         let len = json_len(&v);
         if len <= budget {
@@ -1139,7 +1155,7 @@ fn cut(e: crate::harness::model::Event, budget: usize) -> crate::harness::model:
         s.truncate(at);
         s.push_str(&format!("\n… [{dropped} bytes cut by kiln to fit]"));
     }
-    serde_json::from_value(v).unwrap_or(e)
+    v
 }
 
 /// The JSON pointer of the longest string in `v`.
@@ -1307,5 +1323,22 @@ mod tests {
             _ => "",
         };
         assert!(text.starts_with("start ") && text.ends_with("bytes cut by kiln to fit]"), "{}", text.get(..40).unwrap_or(text));
+    }
+
+    #[test]
+    fn a_state_too_large_is_cut_not_dropped() {
+        use crate::harness::model::{State, Status};
+        // Dropped, its page would go on showing a turn under way that no longer is.
+        let state = State { status: Status::Idle, summary: format!("begin {}", "x".repeat(900_000)), ..State::default() };
+        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        assert_eq!(frames.len(), 1);
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
+            Ok(Update::State { state }) => Some(state),
+            _ => None,
+        };
+        assert!(state.as_ref().is_some_and(|s| s.status == Status::Idle), "the state, whole");
+        let summary = state.map(|s| s.summary).unwrap_or_default();
+        assert!(summary.starts_with("begin ") && summary.ends_with("bytes cut by kiln to fit]"));
     }
 }
