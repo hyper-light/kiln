@@ -1,4 +1,4 @@
-/** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, end, remove. */
+/** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove. */
 import * as React from "react";
 import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
@@ -9,11 +9,12 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { copyText } from "@/views/terminal/clipboard";
 import { MoveDialog } from "./move";
+import { ReachDialog } from "./reach";
 import { SpawnDialog } from "./spawn";
 
-type Act = "end" | "remove" | "rename" | "duplicate" | "move" | null;
+type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
-export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind">, after?: { onGone?: () => void }) {
+export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach">, after?: { onGone?: () => void }) {
   const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
   // Renaming from the menu: the menu mustn't hand focus back to its button, the name field takes it.
@@ -47,6 +48,7 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
     { label: "Duplicate…", onSelect: () => setAct("duplicate") },
     // Agents the kiln server itself runs stay there.
     { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !a.target.startsWith("agent:") },
+    { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },
   ];
@@ -95,6 +97,7 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
         onConfirm={end}
       />
       {act === "move" && <MoveDialog agent={a} onClose={() => setAct(null)} />}
+      {act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}
       {act === "duplicate" && (
         <SpawnDialog
           open

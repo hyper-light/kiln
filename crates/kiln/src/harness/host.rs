@@ -407,8 +407,9 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         account: None,
         plan: None,
         left_behind: 0,
+        reach: spec.reach.clone(),
     };
-    let state = super::model::State { status: Status::Exited, exit: Some(exit), ..Default::default() };
+    let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]
 }
 

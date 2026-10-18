@@ -292,6 +292,8 @@ export interface State {
   account?: string;
   /** Shells, monitors and other tasks still running while the agent is idle or ended. */
   left_behind?: number;
+  /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
+  reach?: string | null;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
   /** A switch to another harness's model, waiting for the turn under way to end. */
@@ -499,6 +501,8 @@ export interface AgentInfo {
   tasks_running: number;
   /** Shells, monitors and other tasks still running while the agent is idle or ended. */
   left_behind?: number;
+  /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
+  reach?: string | null;
   cost_usd: number;
   activity?: string;
   last_activity: number;

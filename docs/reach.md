@@ -167,7 +167,10 @@ The timeline shows a `run` as the command itself, with its output, its exit code
 
 Per agent (New agents → More → Commands; `Spec.reach`): any runner it needs (the default), a
 runner or platform it prefers (`run` goes there unless the agent says otherwise), or only its own
-machine (no tools).
+machine (no tools). An agent's **Where commands run…** changes it while it lives (the `reach`
+control): its harness takes the tools when it starts, so it starts again once its turn is over, the
+conversation going on, and the timeline says so; an agent that isn't running takes it when it next
+starts.
 
 ## 8. Moving an agent to another runner
 
@@ -214,6 +217,5 @@ agent stays where it is.
   and keep its session); today every link goes through the server.
 - Pinning fingerprints from the UI (today: `kiln reach status`, `kiln reach forget`).
 - Windows runners as the doing side (the process side is there; the local socket is Unix-only).
-- Changing an agent's Commands setting after it started (it takes effect at its next start).
 - Moving agents of ACP harnesses (Gemini, opencode, goose, amp): their sessions are the harness's own.
 - Moving the tasks an agent left running (shells, monitors): they stay, and stop, where they were.

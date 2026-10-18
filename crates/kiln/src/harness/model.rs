@@ -919,6 +919,10 @@ pub struct State {
     /// The harness's own session id (what `--resume` takes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session: Option<String>,
+    /// Where its commands may run besides its machine (`Spec::reach`): None anywhere it needs,
+    /// `"off"` only its own machine, else a runner or platform it prefers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
     #[serde(default)]
     pub cwd: String,
     #[serde(default)]
