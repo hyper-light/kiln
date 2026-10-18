@@ -13,9 +13,11 @@
  *   MOCK_LATE_SESSION=ms   for this long after the mock starts, it doesn't know the session (as a
  *                          restarted server before the session's machine reconnects): its socket
  *                          says {"t":"closed"}; then the session is announced on /api/events
+ *   MOCK_DROPPED=n   its timeline let go of its first n events, which the conversation store still
+ *                    has (an earlier history, before the forty turns, that a search finds)
  */
 import type { WebSocket } from "ws";
-import type { AgentInfo, HEvent, Meta, State } from "../src/api/harness.ts";
+import type { AgentInfo, HEvent, Meta, SaidHit, State } from "../src/api/harness.ts";
 
 const ID = "demo-long";
 /** A fixed start, so the history is the same on every run. */
@@ -265,7 +267,7 @@ const state = (): State => ({
   todos: [],
   usage: { cost_usd: 4.21, input_tokens: 812_000, output_tokens: 64_000, cache_read_tokens: 5_100_000, turns: TURNS + 1 },
   plan: "Max",
-  dropped: 0,
+  dropped: DROPPED,
   pause: pause(),
   limits: limits(),
 });
@@ -326,6 +328,31 @@ function tick() {
 let emit: (ev: { type: "harness"; info: AgentInfo }) => void = () => {};
 export function setLongEmit(fn: typeof emit) {
   emit = fn;
+}
+
+/* ------------------------------------------------------------------ the conversation store's copy */
+
+const DROPPED = Number(process.env.MOCK_DROPPED ?? 0);
+/** What the timeline let go of (MOCK_DROPPED): the store still has it. Before the forty turns. */
+const earlier: HEvent[] = Array.from({ length: Math.min(DROPPED, 600) }, (_, i) => {
+  const at = T0 - (DROPPED - i) * 60_000;
+  const id = `E-${i}`;
+  return i % 3 === 0
+    ? { id, seq: -DROPPED + i, at, kind: "user", text: `${ASKS[i % ASKS.length]} (earlier, ${i})` }
+    : { id, seq: -DROPPED + i, at, kind: "assistant", text: `Earlier: the retry loop in \`${FILES[i % FILES.length]}\` still read the clock twice; the backoff test failed on tick ${i}.` };
+});
+
+const wordsOf = (e: HEvent) => (e.kind === "tool" ? [e.title, e.detail, e.output].filter(Boolean).join("\n") : e.kind === "thinking" && e.redacted ? "" : e.text);
+
+/** `GET /api/conversations/search` as the server answers it from its store: every word, any case, newest first. */
+export function searchSaid(q: string, agent: string | null, until: number | null, limit: number): SaidHit[] {
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const all = [...earlier, ...events].filter((e) => (until === null || e.at < until) && words.every((w) => wordsOf(e).toLowerCase().includes(w)));
+  const hits: SaidHit[] = (agent === null || agent === ID ? all : []).map((event) => ({ agent: ID, name: info.name, machine: info.target, event }));
+  // One from an agent that ended and is forgotten (no name: it can't be opened).
+  if (agent === null && words.every((w) => "the retry test passed on the old runner".includes(w)))
+    hits.push({ agent: "gone-1", name: null, machine: null, event: { id: "G-1", seq: 1, at: T0 - 86_400_000, kind: "assistant", text: "The retry test passed on the old runner." } });
+  return hits.sort((a, b) => b.event.at - a.event.at).slice(0, limit);
 }
 
 const late = Number(process.env.MOCK_LATE_SESSION ?? 0);
