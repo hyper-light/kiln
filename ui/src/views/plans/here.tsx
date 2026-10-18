@@ -61,7 +61,8 @@ function Here({ session }: { session: string }) {
     setBusy(true);
     setError(null);
     try {
-      const body = { title: draft.title.trim() || undefined, body: draft.body, items: draft.items };
+      // Emptied, the title is taken from the plan (its overview, else its first step).
+      const body = { title: draft.title.trim(), body: draft.body, items: draft.items };
       const p = draft.id ? await plansApi.update(draft.id, body) : await plansApi.create({ ...body, source: { session } });
       res.setData((l) => [p, ...l.filter((x) => x.id !== p.id)]);
       setPicked(p.id);
@@ -97,7 +98,7 @@ function Here({ session }: { session: string }) {
             Title
           </label>
           <div className="field">
-            <input id={`ph-title-${session}`} value={draft.title} placeholder="From the first step when left empty" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
+            <input id={`ph-title-${session}`} value={draft.title} placeholder="From the overview, or the first step, when left empty" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
           </div>
         </div>
         <div>
