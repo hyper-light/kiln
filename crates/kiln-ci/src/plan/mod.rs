@@ -1664,21 +1664,23 @@ impl RunPlan {
 
     /// The plan without running it (W04-R29): every leg the run would queue if each succeeded
     /// with no outputs, what the plan decided along the way, and what `exclude` and `where:`
-    /// removed. Jobs
-    /// whose `if` or matrix read needs are marked: what a real run decides for them may differ.
+    /// removed. Jobs whose `if` or matrix read needs, and the jobs after them, are decided only
+    /// when those finish: they are listed in `later`, and what the preview's empty outputs made
+    /// of them (a matrix from `fromJSON('')`, say) is not reported as decided.
     pub fn preview(wf: Arc<Workflow>, input: RunInput, settings: Settings, src: &dyn PlanSource) -> Result<Preview, String> {
-        let reads_needs: Vec<String> = wf
+        let mut reads_needs: Vec<String> = wf
             .jobs
             .iter()
-            .filter(|j| {
-                let mut srcs: Vec<&str> = j.cond.iter().map(|t| t.src.as_str()).collect();
-                if let Some(Matrix::Expr(t)) = j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
-                    srcs.push(&t.src);
-                }
-                srcs.iter().any(|s| s.contains("needs."))
-            })
+            .filter(|j| j.cond.as_ref().is_some_and(|t| t.src.contains("needs.")) || j.strategy.as_ref().and_then(|s| s.matrix.as_ref()).is_some_and(matrix_reads_needs))
             .map(|j| j.id.clone())
             .collect();
+        loop {
+            let after: Vec<String> = wf.jobs.iter().filter(|j| !reads_needs.contains(&j.id) && j.needs.iter().any(|n| reads_needs.iter().any(|r| r == n.job()))).map(|j| j.id.clone()).collect();
+            if after.is_empty() {
+                break;
+            }
+            reads_needs.extend(after);
+        }
         let (mut plan, mut actions) = RunPlan::start(wf, input, settings, src)?;
         let mut legs = Vec::new();
         let mut decided = Vec::new();
@@ -1700,7 +1702,34 @@ impl RunPlan {
             }
         }
         legs.sort_by(|a, b| a.key.cmp(&b.key));
+        decided.retain(|d| !reads_needs.contains(&d.job));
         Ok(Preview { name: plan.name.clone(), legs, decided, removed: plan.removed.clone(), later: reads_needs })
+    }
+}
+
+/// Whether a matrix (as a whole, an axis, `include`, `exclude` or `where`) reads `needs`.
+fn matrix_reads_needs(m: &Matrix) -> bool {
+    fn yval(y: &YVal) -> bool {
+        match y {
+            YVal::Str(t) => t.src.contains("needs."),
+            YVal::Seq(xs) => xs.iter().any(yval),
+            YVal::Map(kv) => kv.iter().any(|(_, v)| yval(v)),
+            YVal::Null | YVal::Bool(_) | YVal::Num(_) => false,
+        }
+    }
+    let axis = |a: &Axis| match a {
+        Axis::Expr(t) => t.src.contains("needs."),
+        Axis::Values(vs) => vs.iter().any(yval),
+    };
+    match m {
+        Matrix::Expr(t) => t.src.contains("needs."),
+        Matrix::Spec(s) => {
+            s.axes.iter().any(|(_, a)| axis(a))
+                || s.include.as_ref().is_some_and(yval)
+                || s.exclude.as_ref().is_some_and(yval)
+                || s.filter.as_ref().is_some_and(|t| t.src.contains("needs."))
+                || s.platforms.as_ref().is_some_and(axis)
+        }
     }
 }
 

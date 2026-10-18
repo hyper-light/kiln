@@ -615,6 +615,18 @@ fn preview_matches_what_a_run_queues() -> Result<(), String> {
     Ok(())
 }
 
+/// A matrix from a job's outputs is decided when that job finishes: the preview's empty outputs
+/// don't make it a failure, nor skip the jobs after it.
+#[test]
+fn preview_leaves_what_needs_outputs_decide_for_later() -> Result<(), String> {
+    let src = "on: push\njobs:\n  list:\n    runs-on: x\n    outputs: {targets: '${{ steps.l.outputs.t }}'}\n    steps: [{id: l, run: x}]\n  fuzz:\n    needs: list\n    runs-on: x\n    strategy:\n      matrix:\n        target: ${{ fromJSON(needs.list.outputs.targets) }}\n    steps: [{run: f}]\n  report:\n    needs: fuzz\n    runs-on: x\n    steps: [{run: r}]\n";
+    let p = RunPlan::preview(workflow(src, Dialect::Gha), RunInput { trusted: true, ..RunInput::default() }, Settings::default(), &NoSource)?;
+    assert_eq!(p.legs.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(), vec!["list"]);
+    assert!(p.decided.is_empty(), "{:?}", p.decided);
+    assert_eq!(p.later, vec!["fuzz", "report"]);
+    Ok(())
+}
+
 #[test]
 fn preview_lists_the_combinations_exclude_removed() -> Result<(), String> {
     let src = "on: push\njobs:\n  t:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [linux, mac]\n        node: [20, 22]\n        exclude:\n          - {os: linux, node: 99}\n          - {os: mac, node: 20}\n    steps: [{run: t}]\n";
