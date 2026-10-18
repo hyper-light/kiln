@@ -18,6 +18,8 @@ yaml-rust2 = "0.13"
 # Time zones for schedules (W03-R10), with the tz database built in so every host decides alike.
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
 fancy-regex = "0.19.2"
+# Lockfiles for SBOMs (W18-R03).
+toml = "1.1.8"
 
 [dev-dependencies]
 proptest = "1"
