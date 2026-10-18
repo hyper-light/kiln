@@ -175,7 +175,7 @@ export function UsagePanel({
           </label>
         )}
         {onMoveOn && (
-          <label className="hx-usage-move" title="At a limit, it goes on on another of your machines whose harness is signed in to an account with room: its conversation and repository go along">
+          <label className="hx-usage-move" title="At a limit, it goes on on another of your machines with room (its harness signed in to another account, or another harness its conversation can be carried into): its conversation and repository go along">
             <input type="checkbox" className="check" checked={Boolean(moveOn)} onChange={(e) => onMoveOn(e.target.checked)} />
             Go on elsewhere at a limit
           </label>
