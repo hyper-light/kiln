@@ -73,22 +73,27 @@ async fn run_json(hub: &Hub, id: &str) -> Result<Value, Fail> {
 }
 
 /// The legs of a run, as the API shows them.
-async fn legs(hub: &Hub, run: &str) -> Result<Vec<Value>, Fail> {
+/// An attempt the query names (`?attempt=`), else the current one.
+fn attempt_of(q: &HashMap<String, String>) -> Option<i64> {
+    q.get("attempt").and_then(|a| a.parse().ok())
+}
+
+async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, Fail> {
     let run = run.to_owned();
     hub.store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code
-                 FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY rowid",
+                "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from
+                 FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
-            let rows = st.query_map([&run], |r| {
+            let rows = st.query_map(params![run, attempt], |r| {
                 let json_col = |i: usize| -> rusqlite::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)) };
                 Ok(json!({
                     "id": r.get::<_, String>(0)?, "key": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?, "job": r.get::<_, Option<String>>(3)?,
                     "matrix": json_col(4)?, "status": r.get::<_, String>(5)?, "conclusion": r.get::<_, Option<String>>(6)?, "runner": r.get::<_, Option<String>>(7)?,
                     "executor": r.get::<_, Option<String>>(8)?, "attempt": r.get::<_, i64>(9)?, "wait_reason": json_col(10)?, "queued_at": r.get::<_, Option<i64>>(11)?,
                     "started_at": r.get::<_, Option<i64>>(12)?, "finished_at": r.get::<_, Option<i64>>(13)?, "error": r.get::<_, Option<String>>(14)?, "needs": json_col(15)?,
-                    "exit_code": r.get::<_, Option<i64>>(16)?,
+                    "exit_code": r.get::<_, Option<i64>>(16)?, "reused_from": r.get::<_, Option<String>>(17)?,
                 }))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -98,17 +103,25 @@ async fn legs(hub: &Hub, run: &str) -> Result<Vec<Value>, Fail> {
 }
 
 /// `GET /api/ci/runs/:id`: the run and its legs.
-pub async fn get(hub: &Hub, id: &str) -> Result<Response, Fail> {
+pub async fn get(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let run = run_json(hub, id).await?;
-    let legs = legs(hub, id).await?;
-    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "legs": legs })))
+    let legs = legs(hub, id, attempt_of(q)).await?;
+    // The actions the run pinned when it started (W07-R02).
+    let rid = id.to_owned();
+    let input: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT input FROM ci_plans WHERE run_id = ?1", [&rid], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let actions: Vec<Value> = input
+        .and_then(|i| serde_json::from_str::<Value>(&i).ok())
+        .and_then(|v| v.get("actions").and_then(Value::as_object).cloned())
+        .map(|m| m.into_iter().map(|(uses, a)| json!({ "uses": uses, "repo": a.get("repo"), "sha": a.get("sha") })).collect())
+        .unwrap_or_default();
+    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "legs": legs, "actions": actions })))
 }
 
 /// `GET /api/ci/runs/:id/graph`: the jobs as nodes (their legs inside), `needs` as edges, and the
 /// critical path, the chain of jobs that took longest end to end.
-pub async fn graph(hub: &Hub, id: &str) -> Result<Response, Fail> {
+pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     run_json(hub, id).await?;
-    let legs = legs(hub, id).await?;
+    let legs = legs(hub, id, attempt_of(q)).await?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     // Jobs by id, in the order their first leg appeared.
     let mut order: Vec<String> = Vec::new();
@@ -154,7 +167,7 @@ pub async fn graph(hub: &Hub, id: &str) -> Result<Response, Fail> {
         .map(|j| {
             let ls = by_job.get(j).cloned().unwrap_or_default();
             let (start, end) = span(j);
-            let leg_ids: Vec<Value> = ls.iter().map(|l| json!({ "id": l.get("id"), "key": l.get("key"), "name": l.get("name"), "status": l.get("status"), "conclusion": l.get("conclusion") })).collect();
+            let leg_ids: Vec<Value> = ls.iter().map(|l| json!({ "id": l.get("id"), "key": l.get("key"), "name": l.get("name"), "matrix": l.get("matrix"), "status": l.get("status"), "conclusion": l.get("conclusion"), "wait_reason": l.get("wait_reason"), "reused": l.get("reused_from").is_some_and(|r| !r.is_null()) })).collect();
             json!({ "job": j, "legs": leg_ids, "started_at": (start > 0).then_some(start), "finished_at": (end > 0).then_some(end) })
         })
         .collect();
@@ -163,19 +176,21 @@ pub async fn graph(hub: &Hub, id: &str) -> Result<Response, Fail> {
 }
 
 /// `GET /api/ci/runs/:id/annotations`, `/summary`, `/artifacts`.
-pub async fn part(hub: &Hub, id: &str, which: &str) -> Result<Response, Fail> {
+pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     run_json(hub, id).await?;
-    let (run, which) = (id.to_owned(), which.to_owned());
+    let (run, which, attempt) = (id.to_owned(), which.to_owned(), attempt_of(q));
     let v = hub
         .store
         .call(move |c| {
             Ok(match which.as_str() {
                 "annotations" => {
+                    // The attempt's legs; a leg a rerun kept shows its original's.
                     let mut st = c.prepare(
-                        "SELECT a.leg_id, j.key, a.step_idx, a.level, a.title, a.message, a.file, a.line, a.end_line, a.col, a.end_col FROM ci_annotations a
-                         JOIN jobs j ON j.id = a.leg_id WHERE j.run_id = ?1 ORDER BY a.id",
+                        "SELECT j.id, j.key, a.step_idx, a.level, a.title, a.message, a.file, a.line, a.end_line, a.col, a.end_col FROM jobs j
+                         JOIN ci_annotations a ON a.leg_id = COALESCE(j.reused_from, j.id)
+                         WHERE j.run_id = ?1 AND j.run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY a.id",
                     )?;
-                    let rows = st.query_map([&run], |r| {
+                    let rows = st.query_map(params![run, attempt], |r| {
                         Ok(json!({ "leg": r.get::<_, String>(0)?, "leg_key": r.get::<_, String>(1)?, "step": r.get::<_, Option<i64>>(2)?, "level": r.get::<_, String>(3)?,
                                    "title": r.get::<_, Option<String>>(4)?, "message": r.get::<_, String>(5)?, "file": r.get::<_, Option<String>>(6)?, "line": r.get::<_, Option<i64>>(7)?,
                                    "end_line": r.get::<_, Option<i64>>(8)?, "col": r.get::<_, Option<i64>>(9)?, "end_col": r.get::<_, Option<i64>>(10)? }))
@@ -183,8 +198,11 @@ pub async fn part(hub: &Hub, id: &str, which: &str) -> Result<Response, Fail> {
                     json!({ "annotations": rows.collect::<Result<Vec<_>, _>>()? })
                 }
                 "summary" => {
-                    let mut st = c.prepare("SELECT s.leg_id, j.key, s.step_idx, s.markdown FROM ci_summaries s JOIN jobs j ON j.id = s.leg_id WHERE j.run_id = ?1 ORDER BY j.rowid, s.step_idx")?;
-                    let rows = st.query_map([&run], |r| Ok(json!({ "leg": r.get::<_, String>(0)?, "leg_key": r.get::<_, String>(1)?, "step": r.get::<_, i64>(2)?, "markdown": r.get::<_, String>(3)? })))?;
+                    let mut st = c.prepare(
+                        "SELECT j.id, j.key, s.step_idx, s.markdown FROM jobs j JOIN ci_summaries s ON s.leg_id = COALESCE(j.reused_from, j.id)
+                         WHERE j.run_id = ?1 AND j.run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY j.rowid, s.step_idx",
+                    )?;
+                    let rows = st.query_map(params![run, attempt], |r| Ok(json!({ "leg": r.get::<_, String>(0)?, "leg_key": r.get::<_, String>(1)?, "step": r.get::<_, i64>(2)?, "markdown": r.get::<_, String>(3)? })))?;
                     json!({ "summaries": rows.collect::<Result<Vec<_>, _>>()? })
                 }
                 _ => {
@@ -268,7 +286,9 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
         .await
         .map_err(internal)?;
     let Some((run, steps, annotations)) = found else { return Err(missing("no such leg of the CI engine")) };
-    let all = legs(hub, &run).await?;
+    let lid = id.to_owned();
+    let attempt: Option<i64> = hub.store.call(move |c| Ok(c.query_row("SELECT run_attempt FROM jobs WHERE id = ?1", [&lid], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let all = legs(hub, &run, attempt).await?;
     let me = all.into_iter().find(|l| l.get("id").and_then(Value::as_str) == Some(id)).unwrap_or(Value::Null);
     Ok(srv::json(StatusCode::OK, &json!({ "run": run, "leg": me, "steps": steps, "annotations": annotations })))
 }

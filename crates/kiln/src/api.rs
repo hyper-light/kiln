@@ -268,7 +268,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             trigger(&hub, &id, req).await
         }
         (&Method::GET, ["api", "runs"]) => runs(&hub, &q).await,
-        (&Method::GET, ["api", "runs", id]) => run(&hub, id).await,
+        (&Method::GET, ["api", "runs", id]) => run(&hub, id, &q).await,
         (&Method::POST, ["api", "runs", id, "cancel"]) => cancel(&hub, id).await,
         (&Method::POST, ["api", "runs", id, "retry"]) => {
             let id = (*id).to_owned();
@@ -1309,9 +1309,11 @@ async fn runs(hub: &Hub, q: &HashMap<String, String>) -> R {
     Ok(srv::json(StatusCode::OK, &hub.store.runs(q.get("repo").cloned(), limit, before).await?))
 }
 
-async fn run(hub: &Hub, id: &str) -> R {
+async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let run = hub.store.run(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
-    let jobs = hub.store.jobs(id.to_owned(), false).await?;
+    // A CI run's attempt (docs/ci.md W05-R17); the current one by default.
+    let attempt = q.get("attempt").and_then(|a| a.parse().ok());
+    let jobs = hub.store.jobs_at(id.to_owned(), false, attempt).await?;
     Ok(srv::json(StatusCode::OK, &json!({ "run": run, "jobs": jobs })))
 }
 
@@ -1347,7 +1349,13 @@ async fn job(hub: &Hub, id: &str) -> R {
 
 async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let data = hub.logs.read(id, step).await;
+    let mut data = hub.logs.read(id, step).await;
+    // A CI leg a rerun kept: its original's logs (docs/ci.md W05-R17).
+    if data.is_empty()
+        && let Some(from) = hub.store.reused_from(id.to_owned()).await?
+    {
+        data = hub.logs.read(&from, step).await;
+    }
     Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
 }
 

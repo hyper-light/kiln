@@ -92,9 +92,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (_, ["integrations", ..]) => super::integrations::route(hub, &method, rest, q, req.into_body()).await,
         // §4.1: the engine's runs, legs and caches (W21's data).
         (&Method::GET, ["runs"]) => super::runs_api::list(hub, q).await,
-        (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id).await,
-        (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id).await,
-        (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which).await,
+        (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id, q).await,
+        (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id, q).await,
+        (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which, q).await,
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
         (&Method::POST, ["runs", id, "rerun"]) => {
             let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;

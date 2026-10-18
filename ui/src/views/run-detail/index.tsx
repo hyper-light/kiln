@@ -1,7 +1,8 @@
 import * as React from "react";
-import { Link, useNavigate, useParams } from "@/lib/router";
+import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ChevronRight, GitBranch, RotateCcw, Square, User, Workflow } from "lucide-react";
 import { api } from "@/api/client";
+import { ci, ciRun, waitSentence, type CiRunDetail } from "@/api/ci";
 import { useServerEvents } from "@/api/events";
 import type { Job, RunDetail as RunData, Status, Step } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,7 @@ import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
+import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, criticalKeys } from "./ci";
 import { JobDag } from "./dag";
 
 const LogViewer = React.lazy(() => import("./log-viewer"));
@@ -37,9 +39,9 @@ export default function RunDetail() {
 }
 
 /** A run, and null when there is no such run (pruned, or a wrong link). */
-async function readRun(id: string, signal: AbortSignal): Promise<RunData | null> {
+async function readRun(id: string, signal: AbortSignal, attempt?: number): Promise<RunData | null> {
   try {
-    return await api.run(id, signal);
+    return await api.run(id, signal, attempt);
   } catch (e) {
     if ((e as { status?: number }).status === 404) return null;
     throw e;
@@ -49,7 +51,13 @@ async function readRun(id: string, signal: AbortSignal): Promise<RunData | null>
 function RunBody({ id }: { id: string }) {
   const { jobId } = useParams();
   const navigate = useNavigate();
-  const res = useSuspenseResource(`run/${id}`, (s) => readRun(id, s));
+  // A CI run's attempt (docs/ci.md W05-R17): the latest unless the URL names one.
+  const [search, setSearch] = useSearchParams();
+  const asked = Number(search.get("attempt")) || undefined;
+  const res = useSuspenseResource(`run/${id}/${asked ?? ""}`, (s) => readRun(id, s, asked));
+  // The CI engine's view of the run; null for v1 pipelines.
+  const ciRes = useSuspenseResource(`ci-run/${id}/${asked ?? ""}`, (s) => ciRun(id, asked, s));
+  const ciDetail = ciRes.data;
   const [confirm, setConfirm] = React.useState<null | "cancel" | "retry-all">(null);
   const [busy, setBusy] = React.useState(false);
   const [firstPick, setFirstPick] = React.useState(() => (res.data ? pickDefaultJob(res.data.jobs)?.id : undefined));
@@ -57,8 +65,7 @@ function RunBody({ id }: { id: string }) {
 
   useServerEvents((ev) => {
     if (ev.type === "run" && ev.run.id === id) res.setData((d) => (d ? { ...d, run: ev.run } : d));
-    if (ev.type === "job" && ev.job.run_id === id)
-      res.setData((d) => (d ? { ...d, jobs: upsert(d.jobs, { ...ev.job, spec: d.jobs.find((j) => j.id === ev.job.id)?.spec }, (j) => j.id, false) } : d));
+    if (ev.type === "job" && ev.job.run_id === id) res.setData((d) => (d ? { ...d, jobs: upsert(d.jobs, { ...ev.job, spec: d.jobs.find((j) => j.id === ev.job.id)?.spec }, (j) => j.id, false) } : d));
   });
 
   if (!res.data) {
@@ -86,7 +93,9 @@ function RunBody({ id }: { id: string }) {
   const { run, jobs } = res.data;
   // Without a job in the URL, the one picked first stays picked as statuses change (no jumping).
   const selected = jobs.find((j) => j.id === jobId) ?? jobs.find((j) => j.id === firstPick) ?? pickDefaultJob(jobs);
-  const select = (jid: string) => navigate(`/runs/${id}/jobs/${jid}`, { replace: true });
+  const select = (jid: string) => navigate(`/runs/${id}/jobs/${jid}${asked ? `?attempt=${asked}` : ""}`, { replace: true });
+  const shownAttempt = asked ?? ciDetail?.run.attempt ?? 1;
+  const setAttempt = (n: number) => setSearch(n === ciDetail?.run.attempt ? {} : { attempt: String(n) }, { replace: true });
 
   const act = async (fn: () => Promise<void>, ok: string) => {
     setBusy(true);
@@ -152,65 +161,80 @@ function RunBody({ id }: { id: string }) {
             </div>
           )}
         </div>
-        <div className="flex flex-col items-start gap-3 md:items-end">
-          <div className="flex flex-wrap gap-2">
-            {active && (
-              <Button variant="danger" disabled={busy} aria-expanded={confirm === "cancel"} onClick={() => setConfirm(confirm === "cancel" ? null : "cancel")}>
-                <Square /> Cancel
-              </Button>
-            )}
-            {!active && failedCount > 0 && (
-              <Button variant="secondary" disabled={busy} onClick={() => act(() => api.retryRun(run.id, true), "Retrying failed jobs")}>
-                <RotateCcw /> Retry failed
-              </Button>
-            )}
-            <Button variant={active ? "ghost" : "primary"} disabled={busy} aria-expanded={confirm === "retry-all"} onClick={() => setConfirm(confirm === "retry-all" ? null : "retry-all")}>
-              <RotateCcw /> Retry all
-            </Button>
+        {ciDetail ? (
+          <div className="flex flex-col items-start gap-3 md:items-end">
+            <AttemptSelect current={ciDetail.run.attempt} shown={shownAttempt} onChange={setAttempt} />
+            {shownAttempt === ciDetail.run.attempt && <CiRunActions detail={ciDetail} jobs={[...new Set(ciDetail.legs.map((l) => (l.job ?? "").split("/")[0] ?? "").filter((j) => j !== ""))]} />}
           </div>
-          {confirm === "cancel" && (
-            <Confirm
-              label={`Cancel ${run.repo_name} #${run.number}?`}
-              tone="danger"
-              actions={
-                <>
-                  <Button size="xs" variant="danger" disabled={busy} onClick={() => act(() => api.cancelRun(run.id), "Run cancelled")}>
-                    Cancel run
-                  </Button>
-                  <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
-                    Cancel
-                  </Button>
-                </>
-              }
-            >
-              <p className="font-medium text-[#e4e5e7]">{`Cancel ${run.repo_name} #${run.number}?`}</p>
-              <p>Running jobs are killed (whole process group) and queued jobs are dropped.</p>
-            </Confirm>
-          )}
-          {confirm === "retry-all" && (
-            <Confirm
-              label={`Retry every job in #${run.number}?`}
-              actions={
-                <>
-                  <Button size="xs" disabled={busy} onClick={() => act(() => api.retryRun(run.id, false), "Run re-queued")}>
-                    Retry all
-                  </Button>
-                  <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
-                    Cancel
-                  </Button>
-                </>
-              }
-            >
-              <p className="font-medium text-[#e4e5e7]">{`Retry every job in #${run.number}?`}</p>
-              <p>All jobs are re-queued from scratch, including those that passed.</p>
-            </Confirm>
-          )}
-        </div>
+        ) : (
+          <div className="flex flex-col items-start gap-3 md:items-end">
+            <div className="flex flex-wrap gap-2">
+              {active && (
+                <Button variant="danger" disabled={busy} aria-expanded={confirm === "cancel"} onClick={() => setConfirm(confirm === "cancel" ? null : "cancel")}>
+                  <Square /> Cancel
+                </Button>
+              )}
+              {!active && failedCount > 0 && (
+                <Button variant="secondary" disabled={busy} onClick={() => act(() => api.retryRun(run.id, true), "Retrying failed jobs")}>
+                  <RotateCcw /> Retry failed
+                </Button>
+              )}
+              <Button variant={active ? "ghost" : "primary"} disabled={busy} aria-expanded={confirm === "retry-all"} onClick={() => setConfirm(confirm === "retry-all" ? null : "retry-all")}>
+                <RotateCcw /> Retry all
+              </Button>
+            </div>
+            {confirm === "cancel" && (
+              <Confirm
+                label={`Cancel ${run.repo_name} #${run.number}?`}
+                tone="danger"
+                actions={
+                  <>
+                    <Button size="xs" variant="danger" disabled={busy} onClick={() => act(() => api.cancelRun(run.id), "Run cancelled")}>
+                      Cancel run
+                    </Button>
+                    <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
+                      Cancel
+                    </Button>
+                  </>
+                }
+              >
+                <p className="font-medium text-[#e4e5e7]">{`Cancel ${run.repo_name} #${run.number}?`}</p>
+                <p>Running jobs are killed (whole process group) and queued jobs are dropped.</p>
+              </Confirm>
+            )}
+            {confirm === "retry-all" && (
+              <Confirm
+                label={`Retry every job in #${run.number}?`}
+                actions={
+                  <>
+                    <Button size="xs" disabled={busy} onClick={() => act(() => api.retryRun(run.id, false), "Run re-queued")}>
+                      Retry all
+                    </Button>
+                    <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
+                      Cancel
+                    </Button>
+                  </>
+                }
+              >
+                <p className="font-medium text-[#e4e5e7]">{`Retry every job in #${run.number}?`}</p>
+                <p>All jobs are re-queued from scratch, including those that passed.</p>
+              </Confirm>
+            )}
+          </div>
+        )}
       </header>
 
       {/* DAG */}
       <Panel eyebrow={`Jobs · ${jobs.length}`} title="Pipeline graph" actions={<JobTally jobs={jobs} />} bodyClassName="px-0 pb-3">
-        {jobs.length === 0 ? <p className="empty-line px-5 py-8 text-center">This run has no jobs (yet).</p> : <JobDag jobs={jobs} selected={selected?.id ?? null} onSelect={select} />}
+        {jobs.length === 0 ? (
+          <p className="empty-line px-5 py-8 text-center">This run has no jobs (yet).</p>
+        ) : ciDetail ? (
+          <Loadable label="the graph" fallback={<Hold height={160} />}>
+            <CiDag detail={ciDetail} attempt={asked} jobs={jobs} selected={selected?.id ?? null} onSelect={select} />
+          </Loadable>
+        ) : (
+          <JobDag jobs={jobs} selected={selected?.id ?? null} onSelect={select} />
+        )}
       </Panel>
 
       {/* jobs + selected job */}
@@ -239,14 +263,34 @@ function RunBody({ id }: { id: string }) {
           {selected && (
             <Loadable label="the job" fallback={<Hold height={420} className="panel" />}>
               <ErrorBoundary resetKey={selected.id} compact label="Job view crashed">
-                <JobPanel key={selected.id} job={selected} onJobPatch={(j) => res.setData((d) => (d ? { ...d, jobs: upsert(d.jobs, j, (x) => x.id, false) } : d))} />
+                <JobPanel
+                  key={selected.id}
+                  job={selected}
+                  ciDetail={ciDetail}
+                  attempt={asked}
+                  onJobPatch={(j) => res.setData((d) => (d ? { ...d, jobs: upsert(d.jobs, j, (x) => x.id, false) } : d))}
+                />
               </ErrorBoundary>
             </Loadable>
           )}
         </div>
       </div>
+
+      {ciDetail && (
+        <Loadable label="the run's summaries and annotations" fallback={<Hold height={120} className="mt-6" />}>
+          <CiRunParts detail={ciDetail} attempt={asked} />
+        </Loadable>
+      )}
     </>
   );
+}
+
+/** A CI run's graph: the critical path drawn heavier, wait reasons and kept legs on the nodes. */
+function CiDag({ detail, attempt, jobs, selected, onSelect }: { detail: CiRunDetail; attempt: number | undefined; jobs: Job[]; selected: string | null; onSelect: (id: string) => void }) {
+  const graph = useSuspenseResource(`ci-run/${detail.run.id}/graph/${attempt ?? ""}`, (s) => ci.graph(detail.run.id, attempt, s)).data;
+  const critical = React.useMemo(() => criticalKeys(detail, graph.critical_path), [detail, graph]);
+  const notes = React.useMemo(() => new Map(detail.legs.map((l) => [l.id, { wait: l.status === "queued" ? waitSentence(l.wait_reason) : null, reused: !!l.reused_from }])), [detail]);
+  return <JobDag jobs={jobs} selected={selected} onSelect={onSelect} critical={critical} notes={notes} />;
 }
 
 function BackLink({ repo, repoId }: { repo?: string; repoId?: string }) {
@@ -298,7 +342,7 @@ function defaultOpen(job: Job): Set<number> {
   return new Set(pick ? [pick.idx] : []);
 }
 
-function JobPanel({ job, onJobPatch }: { job: Job; onJobPatch: (j: Job) => void }) {
+function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: CiRunDetail | null; attempt: number | undefined; onJobPatch: (j: Job) => void }) {
   const now = useNow();
   // The job as planned (its steps' commands), read once.
   const planned = useSuspenseResource(`job/${job.id}`, (s) => api.job(job.id, s)).data;
@@ -362,6 +406,12 @@ function JobPanel({ job, onJobPatch }: { job: Job; onJobPatch: (j: Job) => void 
           </div>
         )}
       </div>
+
+      {ciDetail && (
+        <Loadable label="the leg's notes" fallback={null}>
+          <CiLegExtras runId={ciDetail.run.id} attempt={attempt} legId={job.id} status={job.status} reused={!!ciDetail.legs.find((l) => l.id === job.id)?.reused_from} />
+        </Loadable>
+      )}
 
       {/* steps */}
       <div className="border-t border-[#28313d]">

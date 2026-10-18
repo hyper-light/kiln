@@ -77,7 +77,14 @@ function specId(key: string) {
 }
 
 const STATUS_RANK: Record<string, number> = {
-  running: 0, failed: 1, timed_out: 2, cancelled: 3, queued: 4, pending: 5, succeeded: 6, skipped: 7,
+  running: 0,
+  failed: 1,
+  timed_out: 2,
+  cancelled: 3,
+  queued: 4,
+  pending: 5,
+  succeeded: 6,
+  skipped: 7,
 };
 
 export interface DagGroup {
@@ -127,11 +134,22 @@ export function groupMatrix(jobs: Job[]): { nodes: Job[]; groups: Map<string, Da
   return { nodes, groups };
 }
 
+/** What a CI run adds to a node (docs/ci.md W21-R04): why a leg waits, and whether a rerun kept it. */
+export interface DagNote {
+  wait: string | null;
+  reused: boolean;
+}
+
+/** The most matrix legs a node shows as cells; more are counted instead. */
+const MAX_CELLS = 18;
+
 /**
  * The jobs and what each needs, read left to right. Where the graph doesn't fit the width it has (a
  * phone, a long pipeline), its columns stack instead, one under the other: nothing scrolls sideways.
+ * A CI run also draws its critical path heavier, shows a matrix job's legs as cells by state, and
+ * says why a queued leg waits.
  */
-export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: string | null; onSelect: (id: string) => void }) {
+export function JobDag({ jobs, selected, onSelect, critical, notes }: { jobs: Job[]; selected: string | null; onSelect: (id: string) => void; critical?: Set<string>; notes?: Map<string, DagNote> }) {
   const now = useNow();
   const [ref, avail] = useElementWidth<HTMLDivElement>();
   const { nodes, groups } = React.useMemo(() => groupMatrix(jobs), [jobs]);
@@ -152,6 +170,9 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
           .map(([st, n]) => `${n} ${st.replace("_", " ")}`)
           .join(" · ")
       : null;
+    const note = group ? undefined : notes?.get(job.id);
+    const cells = group && notes && group.members.length <= MAX_CELLS ? group.members : null;
+    const kept = group ? group.members.every((m) => notes?.get(m.id)?.reused) : note?.reused;
     return (
       <button
         key={job.id}
@@ -170,10 +191,25 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
           <StatusDot status={job.status} />
           <span className="min-w-0 flex-1 truncate text-[12.5px] text-[#e4e5e7]">{job.display}</span>
           {job.attempt > 1 && <span className="font-mono text-[9px] text-[#cbb69a]">×{job.attempt}</span>}
+          {kept && <span className="font-mono text-[9px] text-[#93a1b4]">kept</span>}
         </span>
         <span className="flex min-w-0 items-center gap-2 font-mono text-[10px] text-[#8c8f98]">
           <span className={job.status === "running" ? "text-[#d8d0f2] tabular-nums" : "tabular-nums"}>{dur === null ? job.status.replace("_", " ") : formatDuration(dur)}</span>
-          {summary ? <span className="min-w-0 truncate">· {summary}</span> : job.agent && <span className="min-w-0 truncate">· {job.agent}</span>}
+          {cells ? (
+            <span className="dag-cells" aria-label={summary ?? undefined}>
+              {cells.map((m) => (
+                <i key={m.id} className="dag-cell" data-status={m.status} title={`${m.display}: ${m.status.replace("_", " ")}`} />
+              ))}
+            </span>
+          ) : summary ? (
+            <span className="min-w-0 truncate">· {summary}</span>
+          ) : note?.wait ? (
+            <span className="min-w-0 truncate" title={note.wait}>
+              · {note.wait}
+            </span>
+          ) : (
+            job.agent && <span className="min-w-0 truncate">· {job.agent}</span>
+          )}
           {job.executor && (
             <span className="ml-auto shrink-0 rounded-full border border-white/10 px-1.5 text-[8.5px] tracking-[0.06em] text-[#a9acb5] uppercase">
               {job.executor === "baremetal" ? "metal" : job.executor}
@@ -200,7 +236,7 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
     );
   }
 
-  const edges: { d: string; active: boolean; key: string }[] = [];
+  const edges: { d: string; active: boolean; critical: boolean; key: string }[] = [];
   for (const p of placed) {
     for (const n of p.job.needs) {
       const from = pos.get(n);
@@ -214,6 +250,7 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
         key: `${n}->${p.job.key}`,
         d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,
         active: p.job.status === "running" || (p.job.status === "queued" && from.job.status === "succeeded"),
+        critical: !!critical?.has(n) && critical.has(p.job.key),
       });
     }
   }
@@ -232,7 +269,7 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
             </linearGradient>
           </defs>
           {edges.map((e) => (
-            <path key={e.key} d={e.d} className="dag-edge" data-active={e.active} style={e.active ? { stroke: `url(#${gradId})` } : undefined} />
+            <path key={e.key} d={e.d} className="dag-edge" data-active={e.active} data-critical={e.critical || undefined} style={e.active ? { stroke: `url(#${gradId})` } : undefined} />
           ))}
           {edges.map((e) => {
             const m = /([\d.]+),([\d.]+)$/.exec(e.d);

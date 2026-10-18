@@ -514,11 +514,21 @@ impl Store {
     }
 
     pub async fn jobs(&self, run_id: String, with_spec: bool) -> anyhow::Result<Vec<Job>> {
+        self.jobs_at(run_id, with_spec, None).await
+    }
+
+    /// The leg a CI rerun's kept leg keeps the result of (docs/ci.md W05-R17).
+    pub async fn reused_from(&self, job: String) -> anyhow::Result<Option<String>> {
+        self.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&job], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
+    }
+
+    /// A run's jobs; for a CI run, the legs of `attempt` (the current one when `None`, docs/ci.md
+    /// W05-R17). v1's jobs have no job_id and no attempts.
+    pub async fn jobs_at(&self, run_id: String, with_spec: bool, attempt: Option<i64>) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
-            // A CI run's legs of its current attempt (docs/ci.md W05-R17); v1's jobs have no job_id.
-            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE run_id = ?1 AND (job_id IS NULL OR run_attempt = (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid"))?;
+            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE run_id = ?1 AND (job_id IS NULL OR run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1))) ORDER BY rowid"))?;
             let mut jobs: Vec<Job> =
-                st.query_map([&run_id], row_job)?.collect::<Result<Vec<_>, _>>()?;
+                st.query_map(params![run_id, attempt], row_job)?.collect::<Result<Vec<_>, _>>()?;
             for j in &mut jobs {
                 j.steps = steps_of(c, &j.id)?;
                 if !with_spec {
