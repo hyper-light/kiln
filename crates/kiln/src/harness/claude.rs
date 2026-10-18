@@ -2284,6 +2284,12 @@ impl Claude {
             }
             diffs = patch_diffs(o, &core.state.cwd);
         }
+        // A command run on another runner (kiln reach): its output and exit code, not the tool's JSON.
+        let reach = crate::reach::shown(&name, &Value::String(text.clone()));
+        if let Some(r) = &reach {
+            text.clone_from(&r.output);
+            exit_code = r.exit_code.or(exit_code);
+        }
         let interrupted = text.contains("[Request interrupted by user");
         let status = if self.denied.remove(tid) {
             ToolStatus::Denied
@@ -2308,6 +2314,9 @@ impl Claude {
                 t.diffs = diffs;
             }
             t.exit_code = exit_code.or(t.exit_code);
+            if let Some(runner) = reach.and_then(|r| r.runner) {
+                t.detail = Some(format!("on {runner}"));
+            }
             t.ended = Some(Core::now());
         } else if !name.is_empty() {
             // A result whose call we never saw (it started before we attached).

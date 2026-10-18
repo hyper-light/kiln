@@ -2289,12 +2289,18 @@ impl Codex {
                     .map(str::to_owned)
                     .or_else(|| item.get("result").map(|r| clip_middle(&r.to_string(), OUTPUT_MAX).0));
                 let reach = crate::reach::describe(server, tool_name, item.get("arguments").unwrap_or(&Value::Null));
+                // A command run on another runner (kiln reach): its output and exit code.
+                let shown = item.get("result").and_then(|r| crate::reach::shown(&format!("mcp__{server}__{tool_name}"), r));
+                let output = match &shown {
+                    Some(s) => Some(clip_middle(&s.output, OUTPUT_MAX).0),
+                    None => output,
+                };
                 let call = ToolCall {
                     tool_id: id.clone(),
                     name: format!("mcp__{server}__{tool_name}"),
                     tool: reach.as_ref().map(|r| r.0).unwrap_or(if ty == "mcpToolCall" { ToolKind::Mcp } else { ToolKind::Other }),
                     title: reach.as_ref().map(|r| r.1.clone()).unwrap_or_else(|| if server.is_empty() { tool_name.to_owned() } else { format!("{server} · {tool_name}") }),
-                    detail: reach.and_then(|r| r.2),
+                    detail: shown.as_ref().and_then(|s| s.runner.as_ref()).map(|r| format!("on {r}")).or_else(|| reach.and_then(|r| r.2)),
                     input: clip_json(item.get("arguments").unwrap_or(&Value::Null), 16 * 1024),
                     status,
                     output,
@@ -2302,7 +2308,7 @@ impl Codex {
                     diffs: Vec::new(),
                     todos: Vec::new(),
                     task: None,
-                    exit_code: None,
+                    exit_code: shown.as_ref().and_then(|s| s.exit_code),
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
                     server: None,

@@ -328,3 +328,20 @@ fn thousands_of_small_files_and_a_big_one_sync_without_stalling() -> anyhow::Res
         Ok(())
     })
 }
+
+#[test]
+fn the_timeline_shows_a_remote_run_as_a_command_with_where_it_ran() {
+    use crate::harness::model::ToolKind;
+    let input = serde_json::json!({"command": "cargo test", "on": "linux/amd64"});
+    let (kind, title, detail) = super::describe("kiln-reach", "run", &input).unwrap_or((ToolKind::Other, String::new(), None));
+    assert_eq!((kind, title.as_str(), detail.as_deref()), (ToolKind::Shell, "cargo test", Some("on linux/amd64")));
+    assert!(super::describe("other-server", "run", &input).is_none());
+    // Claude Code hands the tool's text; Codex its structured answer.
+    let text = serde_json::json!(r#"{"runner":"beta","output":"ok\n","running":false,"exit_code":3}"#);
+    let s = super::shown("mcp__kiln-reach__run", &text);
+    assert!(s.as_ref().is_some_and(|s| s.output == "ok\n" && s.exit_code == Some(3) && s.runner.as_deref() == Some("beta")));
+    let structured = serde_json::json!({"structuredContent": {"runner": "beta", "output": "tick\n", "running": true, "id": "r2"}});
+    let s = super::shown("mcp__kiln_reach__run", &structured);
+    assert!(s.is_some_and(|s| s.output.contains("still running in the background as r2") && s.exit_code.is_none()));
+    assert!(super::shown("mcp__kiln-reach__runners", &text).is_none());
+}

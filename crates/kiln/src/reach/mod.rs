@@ -35,5 +35,45 @@ pub fn describe(server: &str, tool: &str, input: &serde_json::Value) -> Option<(
     })
 }
 
+/// What a reach tool returned, as the timeline shows a command's result: its output, its exit
+/// code, and where it ran. `result` is the tool's answer (its JSON, as text or structured).
+pub struct Shown {
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub runner: Option<String>,
+}
+
+pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
+    let tool = tool_name.strip_prefix("mcp__kiln-reach__").or_else(|| tool_name.strip_prefix("mcp__kiln_reach__"))?;
+    if !matches!(tool, "run" | "output" | "stop") {
+        return None;
+    }
+    // Text holding JSON, MCP content blocks, or the structured answer itself.
+    let v = match result {
+        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
+        serde_json::Value::Object(o) if o.contains_key("structuredContent") => o.get("structuredContent").cloned()?,
+        serde_json::Value::Object(o) if o.contains_key("content") => {
+            let text = o.get("content").and_then(serde_json::Value::as_array)?.iter().find_map(|b| b.get("text").and_then(serde_json::Value::as_str))?;
+            serde_json::from_str(text).ok()?
+        }
+        other => other.clone(),
+    };
+    let mut output = v.get("output").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+    if let Some(e) = v.get("error").and_then(serde_json::Value::as_str) {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(e);
+    }
+    if v.get("running").and_then(serde_json::Value::as_bool) == Some(true) {
+        output.push_str(&format!("\n[still running in the background as {}]", v.get("id").and_then(serde_json::Value::as_str).unwrap_or("?")));
+    }
+    Some(Shown {
+        output,
+        exit_code: v.get("exit_code").and_then(serde_json::Value::as_i64).and_then(|c| i32::try_from(c).ok()),
+        runner: v.get("runner").and_then(serde_json::Value::as_str).filter(|r| !r.is_empty()).map(str::to_owned),
+    })
+}
+
 #[cfg(test)]
 mod tests;
