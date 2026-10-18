@@ -696,8 +696,13 @@ cd "$dir/src" || fail "no $dir/src"
 echo "building the UI"
 npm ci --prefix ui --no-audit --no-fund --loglevel=error || fail "npm ci failed"
 npm run --prefix ui build || fail "the UI did not build"
-echo "building kiln {s}"
-MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 cargo build --release --locked -p kiln || fail "kiln did not build"
+cargo=cargo
+if command -v rustup >/dev/null 2>&1; then
+  echo "bringing the stable Rust toolchain up to date: kiln needs a recent one"
+  if rustup toolchain install stable --profile minimal --no-self-update >/dev/null 2>&1; then cargo="cargo +stable"; else echo "rustup could not update stable: building with the Rust there is"; fi
+fi
+echo "building kiln {s} with $($cargo --version 2>/dev/null)"
+MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln || fail "kiln did not build"
 bin="$dir/target/release/kiln"
 if command -v sha256sum >/dev/null 2>&1; then sum=$(sha256sum "$bin" | cut -d" " -f1); else sum=$(shasum -a 256 "$bin" | cut -d" " -f1); fi
 echo "{BUILT_MARK} $sum"
@@ -838,6 +843,8 @@ mod tests {
         assert!(s.contains("/api/updates/jobs/job1/source"));
         assert!(s.contains("--data-binary @\"$bin\""));
         assert!(s.contains("KILN_COMMIT=e8c17e544623c019c78fce08ee0931a79d5d09db"));
+        // A recent Rust: the machine's may be older than kiln's dependencies need.
+        assert!(s.contains("rustup toolchain install stable") && s.contains("$cargo build"));
         let linux = build_script("job1", &["https://kiln.example".to_owned()], "tok", "e8c17e5", &[], false, "01a14794");
         assert!(!linux.contains("--data-binary"), "a Linux build isn't handed back");
         assert!(linux.contains("*-01a14794) svc=${svc%-01a14794}"));
