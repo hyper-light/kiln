@@ -1,9 +1,9 @@
 # Deploying anywhere
 
-> **Proposal, 2026-10-18, for review. Nothing here is built yet.** It extends [cd.md](cd.md), the
-> CD engine's specification, from Kubernetes to every place kiln deploys to. Identity (W10),
-> integrations (W11) and environments (W15) are shared with [ci.md](ci.md); §13 records what the
-> Kiln CI work and this work each build, as agreed on 2026-10-18.
+> **Agreed 2026-10-18; being built.** It extends [cd.md](cd.md), the CD engine's specification,
+> from Kubernetes to every place kiln deploys to. Identity (W10), integrations (W11) and
+> environments (W15) are shared with [ci.md](ci.md); §13 records what the Kiln CI work and this work
+> each build. The [status](#status) table says what runs.
 
 ## At a glance
 
@@ -28,6 +28,9 @@
 - **No stored cloud keys.** A sync federates kiln's OIDC identity (W10) through the integrations
   broker (W11) for credentials that last minutes: AWS, Google Cloud and Azure by OIDC.
   Platforms without federation use scoped tokens in kiln's secret store.
+- **Any registry.** Images come from any number of registries: Docker Hub first, and any OCI
+  registry, public or private, from the start (§7.1). kiln's own registry (ci.md W12) will be one
+  more.
 - **A builder.** The UI creates and describes apps for any target, in place:
   1. pick the platform and account;
   2. pick what runs there, discovered from the account;
@@ -40,18 +43,20 @@
 - **kiln deploys itself with kiln, first.** kiln's own apps move from Argo CD and
   `deploy-image.sh` to KilnCD, with your approval as the production gate (§10).
 
-## Decisions for you
+## Decisions
 
-| # | Decision | Proposed |
+Agreed with the user on 2026-10-18:
+
+| # | Decision | Agreed |
 | --- | --- | --- |
-| D1 | Model: providers present platform resources to the existing engine as objects (§1) | yes |
-| D2 | Order of providers (§12) | kiln itself (Kubernetes); then AWS ECS and Lambda, Cloudflare Workers with Durable Objects, Vercel; then Google Cloud and Azure equivalents; then the rest |
-| D3 | Infrastructure as code (CloudFormation, Terraform/OpenTofu, Pulumi) as apps | yes, after the platforms (M4) |
-| D4 | Rollouts use each platform's own mechanism where it has one; kiln orchestrates only where not (§5) | yes |
-| D5 | Self-heal on cloud targets | off by default (people edit consoles); drift is always shown |
-| D6 | kiln's production gate | you approve; agents may plan and request, never approve |
-| D7 | Registry for kiln's own image until CI's W12 | minikube's registry addon |
-| D8 | Test accounts | real sandbox accounts per platform, created once with you, for each provider's end-to-end tests |
+| D1 | Model | providers present platform resources to the existing engine as objects (§1) |
+| D2 | Providers | **every provider in §3**, none left out; §12 is only the order they're built in |
+| D3 | Infrastructure as code | Terraform (and OpenTofu), Pulumi and CloudFormation, as apps (§3) |
+| D4 | Rollouts | each platform's own mechanism where it has one; kiln orchestrates only where not (§5) |
+| D5 | Self-heal on cloud and hosting targets | off by default (people edit consoles); drift is always shown |
+| D6 | Who deploys and approves | people, by default. Agents deploy and approve only where the user allows it, per environment (§6) |
+| D7 | Registries | Docker Hub to start; any number of registries; any OCI registry, private ones included, from the start (§7.1). kiln's own registry comes later |
+| D8 | Test accounts | real sandbox accounts per platform, created once with the user, for each provider's end-to-end tests |
 
 ## 1. The model
 
@@ -496,6 +501,11 @@ changes it again.
   hash.
 - **Least privilege.** Each provider documents the permissions it needs: read alone for shadow
   mode, write for syncs. Setup generates the policy for each.
+- **Agents (D6).** By default only people sync, roll back and approve; an agent can plan, and can
+  ask (its request waits for a person). An environment allows agents explicitly, with
+  `agents: { deploy: true, approve: true }` (`approve` is ci.md W15's `agents-can-approve`). Agents
+  always act on behalf of a person (W10-R01), with at most that person's rights, and the record
+  names both.
 
 ## 7. Artifacts
 
@@ -513,6 +523,31 @@ changes it again.
     platform can't pull from where CI pushed it.
 - **Provenance.** With `require-provenance` (W15-R03, W18), an environment takes only artifacts
   whose provenance shows kiln built them from that commit.
+
+### 7.1 Registries
+
+Registries are integrations (W11) of kind `oci`, and there can be any number of them (D7).
+
+- **Any OCI registry.** kiln speaks the OCI Distribution Specification, with Docker's token
+  authentication:
+  - it resolves a tag to a digest (`HEAD` on the manifest, accepting OCI and Docker media types);
+  - it reads multi-platform indexes, and checks that every platform a target runs is present;
+  - it copies an image between registries by digest when a platform can only pull from its own.
+
+  This covers Docker Hub, GHCR, Quay, GitLab, Harbor, ECR, Artifact Registry, ACR, JFrog,
+  self-hosted `distribution`, and kiln's own registry when it exists.
+- **Private registries.** Each registry has its credentials:
+  - anonymous;
+  - a username and a token (Docker Hub access tokens; robot accounts);
+  - federated, where the registry is a cloud's: ECR through the AWS account, Artifact Registry
+    through Google Cloud, ACR through Entra. These tokens are short-lived and minted as needed.
+- **Pulling on the target.** kiln gives each platform what it needs to pull, refreshing it before
+  it expires:
+  - Kubernetes: an `imagePullSecrets` Secret per namespace;
+  - ECS: `repositoryCredentials`;
+  - the registry credentials of Container Apps, Cloud Run, Railway, Render, Fly and DigitalOcean.
+- **Docker Hub first.** kiln's own image goes to Docker Hub (§10). Its rate limits are respected:
+  pulls are cached by digest, and anonymous pulls are never used where an account exists.
 
 ## 8. The UI
 
@@ -601,14 +636,14 @@ and skills for deploying to a new platform, adopting from an account, and runnin
 
 **Then:**
 
-1. **Registry.** Use minikube's registry addon until CI's W12 (D7). A workflow builds the image on
-   every push to main, with `KILN_COMMIT`, pushes it by digest, and leaves the digest as its
-   artifact.
+1. **Registry.** Docker Hub (D7), private if you choose, through an `oci` integration. A workflow
+   builds the image on every push to main with `KILN_COMMIT`, pushes it, and leaves its digest as
+   its artifact. The cluster pulls with the integration's credentials.
 2. **Definitions.**
    - `.kiln/deploy.yaml` defines the apps: kiln's chart with `image: ${{ artifacts.image }}`, the
      namespaces, and kube-prometheus-stack pinned. No root app is needed.
    - `.kiln/environments.yaml` defines `production` as the minikube cluster (in-cluster), with
-     you as its approver (D6).
+     you as its approver. Agents may deploy only if you allow it there (D6).
 3. **Take over.** kiln already reads the four apps in shadow mode and agrees with Argo CD on
    them. It takes them over, then Argo CD and the in-cluster git server are removed: kiln reads
    its own repository.
@@ -653,13 +688,15 @@ What cd.md's status table leaves open that this work needs, in the order it's ne
 
 ## 12. Plan of work
 
+Every provider in §3 is in scope (D2). This is the order they are built in, not a choice of which.
+
 | | What | Done when |
 | --- | --- | --- |
 | **M0** | kiln deploys itself: §11 items 1 to 4; the registry; the self-deploy guard; take-over from Argo CD | §10's criteria |
 | **M1** | The provider framework: both halves, polling, budgets, tracking, health, tree, logs, events, discovery. W11's exchanges (AWS, Google Cloud, Azure `mint()`; token kinds). Providers `aws-ecs`, `aws-lambda`, `cloudflare-workers` (with Durable Objects), `vercel`. The builder (§8.2), import and shadow mode (§8.3) | per provider, against a real sandbox account: create, change, roll back, detect drift, shadow then take over |
 | **M2** | Rollouts and analysis (§5), with the rollout panel. Providers `gcp-run`, `gcp-functions`, `azure-containerapps`, `azure-functions`, `azure-appservice`, `host`, `compose` | a canary that fails its analysis rolls back, on each platform with traffic weights |
 | **M3** | `aws-ec2`, `aws-beanstalk`, `aws-static`, `gcp-appengine`, `gcp-compute`, `azure-vmss`, `azure-static`, `cloudflare-pages`, `netlify`, `fly`, `railway`, `render`, `heroku`, `digitalocean`, `nomad`, `microvm` | per provider, as M1 |
-| **M4** | `cloudformation`, `terraform` and OpenTofu, `pulumi`, `job` (D3); Argo Rollouts; Gateway API weights; previews on every provider that has them | plans show each tool's changes; a failed apply is recorded with its output |
+| **M4** | `cloudformation`, `terraform` and OpenTofu, `pulumi` (D3), `job`; Argo Rollouts; Gateway API weights; previews on every provider that has them | plans show each tool's changes; a failed apply is recorded with its output |
 
 ## 13. Shared with ci.md
 
@@ -673,4 +710,12 @@ Agreed with the Kiln CI work on 2026-10-18:
 | W11: the registry (`ci_integrations`), server-side `mint()` for AWS, Google Cloud and Azure, token kinds through W09's store | CD, now | in `crates/kiln/src/ci/integrations/`; W11 marked in progress on ci.md's board. CI then builds the job side on it: `kiln/auth@v1`, and secrets `from: integration:…` |
 | W15: the environment model, protection, approvals, the job binding, deployment records, `kiln/deploy@v1` | CI | `kiln/deploy@v1` asks CD to sync, for every kind |
 | W15: targets and providers for every kind, and the `job` provider | CD | |
-| W12: the built-in registry | CI, later | CD uses minikube's registry until then |
+| Registries as `oci` integrations: any OCI registry, private, federated (§7.1) | CD, now | in W11's registry; Docker Hub first |
+| W12: kiln's own registry | CI, later | one more `oci` registry when it lands |
+
+## Status
+
+| Part | State |
+| --- | --- |
+| This design | agreed 2026-10-18 |
+| Everything else | not built yet |
