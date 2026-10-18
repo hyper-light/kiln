@@ -15,6 +15,7 @@
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 
 pub mod acp;
+pub mod antigravity;
 pub mod broadcast;
 pub mod claude;
 pub mod cli;

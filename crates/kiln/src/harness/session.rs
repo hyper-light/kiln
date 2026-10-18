@@ -1187,7 +1187,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             crate::rt::blocking(move || match from.protocol {
                 Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
                 Protocol::CodexAppServer => handoff::read_codex(&env, &id),
-                Protocol::Acp(_) | Protocol::Terminal => None,
+                Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => None,
             })
             .await
             .ok()
@@ -1226,7 +1226,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             }
         }
         Protocol::CodexAppServer => (None, Some(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))))),
-        Protocol::Acp(_) | Protocol::Terminal => (None, None),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => (None, None),
     };
     {
         let mut sp = s.spec.lock();

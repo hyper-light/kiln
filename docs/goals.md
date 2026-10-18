@@ -93,11 +93,12 @@ restarts again before it goes out. The runner does this whether or not keep-goin
 agent, since the turn was kiln's to have stopped.
 
 Every harness kiln runs as an agent reports how its turns end: Claude Code (its result's stop
-reason), Codex (`turn/completed`: completed, interrupted, failed) and the ACP agents, Gemini CLI,
+reason), Codex (`turn/completed`: completed, interrupted, failed), the ACP agents, Gemini CLI,
 opencode, Goose and Amp (the prompt's `stopReason`: end_turn, max_tokens, max_turn_requests,
-refusal, cancelled). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan. A
-harness kiln only runs as a terminal program (the Antigravity CLI today) isn't kept going: kiln
-can't tell its turns from its screen.
+refusal, cancelled), and the Antigravity CLI (its `result`: SUCCESS, or ERROR with what went wrong;
+"interrupted" is a stop). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan. A
+turn of the Antigravity CLI that ended on something it wasn't allowed to do (it can't ask, so it
+was denied) ends as "blocked" and is left alone: going on would only be denied again.
 
 Kiln waits four seconds (a message of yours goes first), then sends one line, shown as kiln's in
 the timeline: "Your last turn stopped part-way (stop_sequence). Pick up where you left off and
