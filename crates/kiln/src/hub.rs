@@ -978,7 +978,11 @@ impl Hub {
                 // lets go of it, and nothing it says of it counts.
                 Ok(crate::harness::core::Update::Open { info }) if self.harness.stale(&session, info.epoch) => {
                     tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
-                    self.send_peer(peer, &ServerMsg::HarnessRelease { session }).await;
+                    // A runner from before letting go stops its copy instead (what it says of it
+                    // doesn't count either way).
+                    let lets_go = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
+                    let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
+                    self.send_peer(peer, &msg).await;
                 }
                 // The rest of what a copy left behind says (its machine was told to let go of it):
                 // none of it counts, and it doesn't take the session's messages from where it runs.
