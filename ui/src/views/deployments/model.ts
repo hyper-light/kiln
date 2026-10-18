@@ -337,3 +337,38 @@ export function healthCounts(list: CdNode[]): string {
   for (const n of list) counts.set(n.health ?? "no health", (counts.get(n.health ?? "no health") ?? 0) + 1);
   return [...counts.entries()].map(([h, c]) => `${c} ${h.toLowerCase()}`).join(" · ");
 }
+
+/** What a sync does about an object that differs: the fix it needs. */
+export type Fix = "changed" | "takeover" | "unmarked" | "missing" | "prune";
+
+/** The fixes, in the order people deal with them. */
+export const FIXES: Fix[] = ["changed", "missing", "takeover", "unmarked", "prune"];
+
+/** The fix an app's object needs, if it differs. */
+export function fixOf(n: { sync?: string | null; hook?: boolean; missing?: boolean; requires_pruning?: boolean; tracked_by?: string | null; marks_only?: boolean }): Fix | null {
+  if (n.hook || n.sync === "Synced" || n.sync === "Hook") return null;
+  if (n.requires_pruning) return "prune";
+  if (n.missing) return "missing";
+  if (n.tracked_by) return "takeover";
+  if (n.marks_only) return "unmarked";
+  return n.sync === "OutOfSync" || n.sync === undefined ? "changed" : null;
+}
+
+/** What differs in an app, by what a sync does about it ("14 changed · 92 to take over · 3 to prune"), or how many objects it has when nothing does. */
+export function whatDiffers(a: { out_of_sync?: number; resources?: number; missing?: number; prune?: number; shared?: number; unmarked?: number }): string {
+  const differ = a.out_of_sync ?? 0;
+  if (!differ) return a.resources === undefined ? "" : `${a.resources} ${a.resources === 1 ? "object" : "objects"}`;
+  const [missing, prune, shared, unmarked] = [a.missing ?? 0, a.prune ?? 0, a.shared ?? 0, a.unmarked ?? 0];
+  const changed = Math.max(0, differ - missing - prune - shared - unmarked);
+  const parts: [number, string][] = [
+    [changed, "changed"],
+    [missing, "missing"],
+    [shared, "to take over"],
+    [unmarked, "unmarked"],
+    [prune, "to prune"],
+  ];
+  return parts
+    .filter(([n]) => n > 0)
+    .map(([n, w]) => `${n} ${w}`)
+    .join(" · ");
+}
