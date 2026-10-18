@@ -131,6 +131,15 @@ fn open(k: &[u8; 32], sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result
     Ok(plain.to_vec())
 }
 
+/// Seals `plain` under the master key, bound to `aad` (keys of other subsystems: OIDC, W10).
+pub(crate) fn seal_master(hub: &Hub, plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    seal(&master(hub)?, plain, aad)
+}
+
+pub(crate) fn open_master(hub: &Hub, sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+    open(&master(hub)?, sealed, nonce, aad)
+}
+
 /// The current data key: `(id, key)`, made (and wrapped) when there is none.
 async fn current_key(hub: &Hub) -> anyhow::Result<(String, [u8; 32])> {
     let m = master(hub)?;

@@ -7,6 +7,7 @@
 //! - [`wf`]: workflows of both dialects, overlays and action metadata, validated (W02).
 //! - [`trigger`]: events and how workflows match them (W03).
 //! - [`plan`]: a run's graph, matrices, reusable workflows, outputs (W04).
+//! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
@@ -18,6 +19,7 @@
 
 pub mod expr;
 pub mod facts;
+pub mod oidc;
 pub mod plan;
 pub mod results;
 pub mod runner;

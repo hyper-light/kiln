@@ -36,6 +36,9 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         ["api", "v3", rest @ ..] => Some(super::rest::route(hub, rest, req).await),
         ["api", "graphql"] => Some(super::rest::graphql(hub, req).await),
         _ if super::rest::is_web(seg) => Some(super::rest::web(hub, seg).await),
+        // W10: ID tokens for jobs, and the issuer's documents.
+        ["_kiln", "oidc", "token"] => Some(super::oidc::token(hub, &req).await),
+        _ if super::oidc::is_issuer(hub, seg).is_some() => Some(super::oidc::document(hub, super::oidc::is_issuer(hub, seg).unwrap_or_default()).await),
         ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] => Some(Err((StatusCode::NOT_FOUND, "not found".into()))),
         _ => None,
     }

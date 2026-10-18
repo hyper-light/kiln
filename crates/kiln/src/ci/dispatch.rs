@@ -659,6 +659,7 @@ impl Dispatch {
         let spec = &l.spec;
         let wf = &spec.workflow;
         let job = spec.def();
+        let id_tokens = spec.permissions.level("id-token") == kiln_ci::plan::perms::Level::Write && (r.trusted || self.hub.cfg.ci.oidc.untrusted);
         let num = |k: &str| spec.strategy.get(k).and_then(serde_json::Value::as_f64).map_or(0, |v| v as u32);
         let mut env_from = spec.env_from.clone();
         env_from.extend(spec.run_env.iter().map(|(k, v)| (format!("KILN_RUN_{k}"), v.clone())));
@@ -693,8 +694,9 @@ impl Dispatch {
                 results_url: "/".into(),
                 runtime_token: token.clone(),
                 cache_url: "/".into(),
-                id_token_url: None,
-                id_token_request_token: None,
+                // ID tokens only with `permissions: id-token: write` (W10-R07, GitHub-exact).
+                id_token_url: id_tokens.then(|| "/_kiln/oidc/token?api-version=1".to_owned()),
+                id_token_request_token: id_tokens.then(|| token.clone()),
                 // The code host: kiln's mirror, which the leg's token reads (W14), at the
                 // server's root (`actions/checkout` keeps only the origin).
                 facade_url: "/".into(),

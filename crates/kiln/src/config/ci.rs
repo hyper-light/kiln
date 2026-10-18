@@ -19,6 +19,7 @@ pub struct Ci {
     pub github_labels: bool,
     pub cache: Cache,
     pub artifacts: Artifacts,
+    pub oidc: Oidc,
 }
 
 /// `[ci.cache]`: GitHub's cache service (docs/ci.md W08-R06).
@@ -55,4 +56,20 @@ impl Default for Artifacts {
     fn default() -> Self {
         Artifacts { retention_days: 90, max_size_gb: 10 }
     }
+}
+
+/// `[ci.oidc]`: kiln as an OpenID Connect issuer for jobs (docs/ci.md W10-R06 to W10-R10).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Oidc {
+    /// The issuer URL; `<public_url>/oidc` when unset. Providers fetch its discovery document and
+    /// keys from here (or from where `kiln oidc publish` put them).
+    pub issuer: Option<String>,
+    /// `aud` when a job asks for none; the issuer URL when unset.
+    pub default_audience: Option<String>,
+    /// Build `sub` from these claim keys (GitHub's `include_claim_keys`), e.g.
+    /// `["repo", "context", "kiln_trust"]`; GitHub's default subject when empty.
+    pub subject_claims: Vec<String>,
+    /// Untrusted runs (fork pull requests) may get ID tokens too, with `kiln_trust: untrusted`.
+    pub untrusted: bool,
 }

@@ -10,6 +10,7 @@ pub mod events;
 pub mod facade;
 pub mod hooks;
 pub mod load;
+pub mod oidc;
 pub mod rest;
 pub mod runs;
 pub mod schedule;
