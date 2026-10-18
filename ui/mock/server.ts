@@ -21,7 +21,7 @@ import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, 
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, searchSaid, setLongEmit } from "./conversation.ts";
+import { handleLongSession, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -1245,6 +1245,11 @@ const server = http.createServer(async (req, res) => {
     if (!authed(req)) return err(res, 401, "unauthorized");
 
     if (p === "/api/me") return json(res, 200, { authenticated: true, version: VERSION, hostname: HOSTNAME });
+    // The browser checks send the long session's machine away for a while (`?ms=`).
+    if (p === "/api/mock/away" && m === "POST") {
+      sendAway(Number(url.searchParams.get("ms") ?? 10_000));
+      return json(res, 200, { ok: true });
+    }
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());

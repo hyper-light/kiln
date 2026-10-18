@@ -850,24 +850,28 @@ impl Cd {
     }
 
     /// Registers the Applications an app rendered as its children, and forgets the ones it no
-    /// longer renders.
+    /// longer renders. One kept in kiln (taken over, or made through the API) is kiln's own: the
+    /// parent rendering it changes nothing, and it is never the parent's to forget.
     fn adopt_children(&self, parent: &str, children: Vec<Value>) {
-        let clusters = self.store.read(|d| d.clusters.clone());
+        let (clusters, kept) = self.store.read(|d| (d.clusters.clone(), d.apps.keys().cloned().collect::<BTreeSet<String>>()));
         let by_url = |url: &str| clusters.values().find(|c| c.server.trim_end_matches('/') == url.trim_end_matches('/')).map(|c| c.name.clone());
-        let mut ids = BTreeSet::new();
-        for c in children {
-            match apps::from_argo(&c, Some(parent), &by_url) {
-                Ok(def) => {
-                    ids.insert(def.id());
-                    self.register(def);
-                }
-                Err(e) => tracing::warn!(parent = %parent, error = %e.0, "deployments: a rendered Application can't be read"),
-            }
+        let defs: Vec<AppDef> = children
+            .iter()
+            .filter_map(|c| {
+                apps::from_argo(c, Some(parent), &by_url)
+                    .map_err(|e| tracing::warn!(parent = %parent, error = %e.0, "deployments: a rendered Application can't be read"))
+                    .ok()
+            })
+            .collect();
+        let defs = rendered_children(defs, &kept);
+        let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
+        for def in defs {
+            self.register(def);
         }
         let (gone, prune) = {
             let mut apps = self.apps.write();
             let Some(p) = apps.get_mut(parent) else { return };
-            let gone: Vec<String> = p.children.difference(&ids).cloned().collect();
+            let gone = forgotten(&p.children, &ids, &kept);
             p.children = ids;
             (gone, p.def.sync.prune)
         };
@@ -1236,6 +1240,18 @@ impl Cd {
     }
 }
 
+/// The children an app of apps rendered that it registers: none kept in kiln (taken over, or made
+/// through the API), which is kiln's own whatever its parent renders.
+fn rendered_children(defs: Vec<AppDef>, kept: &BTreeSet<String>) -> Vec<AppDef> {
+    defs.into_iter().filter(|d| !kept.contains(&d.id())).collect()
+}
+
+/// The children an app of apps no longer renders, to forget (`before`: its children until now):
+/// never one kept in kiln.
+fn forgotten(before: &BTreeSet<String>, now: &BTreeSet<String>, kept: &BTreeSet<String>) -> Vec<String> {
+    before.difference(now).filter(|g| !kept.contains(*g)).cloned().collect()
+}
+
 /// Apps adopted from Argo CD are shadowed (compared, never written) until they are taken over.
 pub fn is_shadow(def: &AppDef) -> bool {
     matches!(def.origin, Origin::Argo { .. }) && def.labels.get("kiln.dev/take-over").map(String::as_str) != Some("true")
@@ -1439,4 +1455,45 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     let _ = hub.shutdown.cancelled().await;
     *CD.write() = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An Application `kiln-root` renders (app of apps).
+    fn child(name: &str) -> Result<AppDef, String> {
+        let app = json!({"apiVersion": "argoproj.io/v1alpha1", "kind": "Application", "metadata": {"name": name, "namespace": "argocd"},
+            "spec": {"project": "default", "source": {"repoURL": "http://git.example/kiln.git", "path": name, "targetRevision": "main"},
+                "destination": {"server": "https://kubernetes.default.svc", "namespace": name}, "syncPolicy": {"automated": {"prune": true, "selfHeal": true}}}});
+        apps::from_argo(&app, Some("default/kiln-root"), &|_| None).map_err(|e| e.0)
+    }
+
+    fn ids(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_child_taken_over_stays_kilns_whatever_its_parent_renders() -> Result<(), String> {
+        let rendered = vec![child("kiln")?, child("kiln-namespaces")?];
+        assert!(rendered.iter().all(is_shadow), "rendered by a parent from Argo CD: shadowed");
+        // default/kiln was taken over: kept in kiln, not the parent's to register again.
+        let kept = ids(&["default/kiln"]);
+        let registered: Vec<String> = rendered_children(rendered, &kept).iter().map(AppDef::id).collect();
+        assert_eq!(registered, ["default/kiln-namespaces"]);
+        // Nor to forget (and with it, maybe delete) once the parent stops counting it.
+        let before = ids(&["default/kiln", "default/kiln-namespaces"]);
+        assert!(forgotten(&before, &ids(&["default/kiln-namespaces"]), &kept).is_empty());
+        assert_eq!(forgotten(&before, &BTreeSet::new(), &kept), ["default/kiln-namespaces"], "one it no longer renders is forgotten");
+        Ok(())
+    }
+
+    #[test]
+    fn taking_over_ends_the_shadow() -> Result<(), String> {
+        let mut d = child("kiln")?;
+        assert!(is_shadow(&d));
+        d.labels.insert("kiln.dev/take-over".into(), "true".into());
+        assert!(!is_shadow(&d));
+        Ok(())
+    }
 }

@@ -32,6 +32,7 @@ export function pauseLine(p: Pause, now: number): string {
 /** Above the composer while the agent is paused. */
 export function PausedLine({ store, send }: { store: SessionStore; send: (c: Command) => void }) {
   const pause = useSession(store, (s) => s.state?.pause);
+  const moveOn = useSession(store, (s) => s.state?.move_on_limit ?? false);
   const queued = useSession(store, (s) => s.state?.queue?.length ?? 0);
   const target = useSession(store, (s) => s.info?.target);
   const kind = useSession(store, (s) => s.info?.kind);
@@ -52,6 +53,10 @@ export function PausedLine({ store, send }: { store: SessionStore; send: (c: Com
         <label className="hx-paused-auto">
           <input type="checkbox" className="check" checked={pause.auto} onChange={(e) => send({ type: "auto_resume", on: e.target.checked })} />
           Resume by itself at the reset
+        </label>
+        <label className="hx-paused-auto" title="It moves to another of your machines whose harness is signed in to an account with room; its conversation and repository go along">
+          <input type="checkbox" className="check" checked={moveOn} onChange={(e) => send({ type: "move_on_limit", on: e.target.checked })} />
+          Go on on another machine
         </label>
         {canSwitch && target && kind && (
           <React.Suspense fallback={null}>

@@ -475,7 +475,7 @@ impl Codex {
             "fork" => core.effects.push(Effect::Branch { resume: thread, resume_at: None }),
             "undo" => {
                 // The last prompt's turn, undone with everything after it.
-                let last = core.events().filter(|e| matches!(&e.body, Body::User { origin, .. } if origin.as_deref() != Some("system")) && self.turns.contains_key(&e.id)).last().map(|e| e.id.clone());
+                let last = core.events().rfind(|e| matches!(&e.body, Body::User { origin, .. } if origin.as_deref() != Some("system")) && self.turns.contains_key(&e.id)).map(|e| e.id.clone());
                 match last {
                     Some(ev) => self.control(core, "rewind", Some(json!({"event": ev}))),
                     None => self.notice(core, Level::Info, "Nothing to undo"),
@@ -668,7 +668,7 @@ impl Codex {
                 }
             }
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             Command::McpEnable { name, enabled } => {
                 if !valid_server_name(&name) {
                     self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
@@ -1643,10 +1643,11 @@ impl Codex {
                 };
                 let was = core.state.account.clone();
                 core.state.account = plan.as_deref().filter(|p| *p != "Signed out").map(|p| account_id("codex", p, email.as_deref()));
-                // Signed in as someone else: the old account's limits go, and a pause for one ends.
+                // Signed in as someone else (here, or on the machine it moved to for room): the
+                // old account's limits go, and a pause for one ends.
                 if was.is_some() && core.state.account != was {
                     core.state.limits.clear();
-                    if core.state.pause.as_ref().is_some_and(|p| p.reason == super::pause::LIMIT)
+                    if core.state.pause.is_some()
                         && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
                     {
                         self.go_on(core, p);

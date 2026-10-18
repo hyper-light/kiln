@@ -1038,6 +1038,15 @@ pub struct State {
     /// A pause ends only when a person resumes it, not by itself at the reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual_resume: bool,
+    /// At a usage limit (or its stop point) it goes on on another machine whose harness is signed
+    /// in to an account with room, its conversation and repository going along: opted in to, a
+    /// conversation at a time (the server sees to it, `harness::elsewhere`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub move_on_limit: bool,
+    /// Windows a person resumed it in past its stop point (their `Limit::id`, and when they start
+    /// over): the stop point leaves them be until then (`pause::waive_stop_point`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_waived: Vec<(String, i64)>,
     /// How its last turn ended (`Core::end_turn`): what kiln's keep-going reads (`goals::keep`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn: Option<TurnEnd>,
@@ -1382,11 +1391,15 @@ pub enum Command {
     AutoResume {
         on: bool,
     },
-    /// Stop between turns once a limit is this full (`State::pause_at`); None: only when one is
-    /// reached.
+    /// Pause once a limit is this full (`State::pause_at`): between turns, or at the next step of
+    /// one under way. None: only when one is reached.
     PauseAt {
         #[serde(default)]
         percent: Option<u8>,
+    },
+    /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`).
+    MoveOnLimit {
+        on: bool,
     },
     /// Another session on the same account reached a usage limit: wait for its reset too (the
     /// server sends it).
@@ -1413,15 +1426,26 @@ pub enum Decision {
 /// The id of the account a session runs on: "<harness>:<plan>", and a short hash of who it is
 /// when known (an address or an organization), never the thing itself.
 pub fn account_id(harness: &str, plan: &str, who: Option<&str>) -> String {
-    use sha2::Digest as _;
     let plan: String = plan.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    match who.map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty()) {
-        Some(w) => {
-            let h = sha2::Sha256::digest(w.as_bytes());
-            format!("{harness}:{plan}:{}", hex::encode(h.get(..5).unwrap_or_default()))
-        }
+    match who.and_then(who_hash) {
+        Some(h) => format!("{harness}:{plan}:{h}"),
         None => format!("{harness}:{plan}"),
     }
+}
+
+/// The part of an account id that says who it is, without saying it: a short hash of the address.
+fn who_hash(who: &str) -> Option<String> {
+    use sha2::Digest as _;
+    let w = who.trim().to_lowercase();
+    (!w.is_empty()).then(|| hex::encode(sha2::Sha256::digest(w.as_bytes()).get(..5).unwrap_or_default()))
+}
+
+/// Whether account id `account` (`account_id`) is `harness` signed in as `who`: Some(true) or
+/// Some(false), None when the id doesn't say who (an API key, a provider of its own).
+pub fn account_is(account: &str, harness: &str, who: &str) -> Option<bool> {
+    let mut parts = account.split(':');
+    let (Some(h), Some(_plan), Some(hash)) = (parts.next(), parts.next(), parts.next()) else { return None };
+    Some(h == harness && who_hash(who).is_some_and(|w| w == hash))
 }
 
 /// Plan words for the UI: "max" → "Max", "self_serve_business_prolite" → "Self serve business prolite".

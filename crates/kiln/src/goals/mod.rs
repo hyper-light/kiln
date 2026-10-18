@@ -409,6 +409,8 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
             keep::tick(&hub, info, now).await;
         }
         keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
+        // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
+        crate::harness::elsewhere::tick(&hub, &all, now);
     }
 }
 

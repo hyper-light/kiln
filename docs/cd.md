@@ -493,7 +493,12 @@ Every change is audited with its principal, and with the person it acted for.
    The import page shows, per app, whether kiln's sync and health agree with Argo CD's, and why
    when they don't.
 3. When they agree, take over an app, a project or everything. kiln adopts the objects (Argo CD's
-   tracking is read) and disables auto-sync in Argo CD for what it took. Nothing is recreated.
+   tracking is read). Nothing is recreated. Argo CD's own automation keeps running until you turn
+   it off there (`spec.syncPolicy.automated` of its Application): kiln doesn't write to Argo CD.
+   An app another app renders (Argo CD's app of apps) stays taken over: its parent rendering it
+   again changes nothing, and the parent never forgets it, or deletes its objects with it.
+4. Deleting a shadowed app only stops kiln comparing it: its objects are Argo CD's, and stay,
+   whatever the delete asks.
 
 ### Measured
 

@@ -2,11 +2,12 @@
  * What the agent console remembers for you, in this browser:
  * - how a message goes while an agent works (queue, steer, now), until you change it;
  * - where you were in each conversation, so coming back (or reloading) puts you there;
- * - what you were writing to each agent, until it's sent.
+ * - what you were writing to each agent, until it's sent;
+ * - what you sent while it couldn't take it (its machine away), until it can.
  */
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
-import type { SendMode } from "@/api/harness";
+import type { Attachment, SendMode } from "@/api/harness";
 
 /* ------------------------------------------------------------------ send mode */
 
@@ -82,6 +83,54 @@ export const useDrafts = create<DraftsState>()(
       name: "kiln.agents.drafts",
       storage: createJSONStorage(() => sessionStorage),
       partialize: (s) => ({ drafts: s.drafts }),
+    },
+  ),
+);
+
+/* ------------------------------------------------------------------ messages kept here */
+
+/**
+ * A message written while its agent couldn't take one (its machine away, the connection down): it
+ * waits in this browser and goes, in order, once the agent can take it.
+ */
+export interface Held {
+  id: string;
+  text: string;
+  at: number;
+  attachments?: Attachment[];
+  overrides?: { model?: string; effort?: string };
+}
+
+interface HeldState {
+  held: Record<string, Held[]>;
+  hold: (agent: string, m: Held) => void;
+  edit: (agent: string, id: string, text: string) => void;
+  drop: (agent: string, ...ids: string[]) => void;
+}
+
+/** Inline files (no upload to keep them by) stay in memory only: the browser's storage is small. */
+const keepable = (m: Held): Held => ({ ...m, attachments: m.attachments?.filter((a) => !a.data_base64) });
+
+/** The messages kept for each agent until it can take them: in this browser, across reloads. */
+export const useHeld = create<HeldState>()(
+  persist(
+    (set) => ({
+      held: {},
+      hold: (agent, m) => set((s) => ({ held: { ...s.held, [agent]: [...(s.held[agent] ?? []), m] } })),
+      edit: (agent, id, text) => set((s) => ({ held: { ...s.held, [agent]: (s.held[agent] ?? []).map((m) => (m.id === id ? { ...m, text } : m)) } })),
+      drop: (agent, ...ids) =>
+        set((s) => {
+          const left = (s.held[agent] ?? []).filter((m) => !ids.includes(m.id));
+          const held = { ...s.held };
+          if (left.length) held[agent] = left;
+          else delete held[agent];
+          return { held };
+        }),
+    }),
+    {
+      name: "kiln.agents.held",
+      storage: createJSONStorage(() => localStorage),
+      partialize: (s) => ({ held: Object.fromEntries(Object.entries(s.held).map(([k, v]) => [k, v.map(keepable)])) }),
     },
   ),
 );
