@@ -53,6 +53,17 @@ struct Ran {
     state: Vec<(String, String)>,
 }
 
+/// A secret or variable `name` set to `true` (W06-R13: `ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
+fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
+    let truthy = |v: &str| v.eq_ignore_ascii_case("true");
+    a.secrets.iter().any(|s| s.name == name && truthy(&s.value)) || a.contexts.vars.get(name).and_then(serde_json::Value::as_str).is_some_and(truthy)
+}
+
+/// Runner debug (`RUNNER_DEBUG=1`, `runner.debug`): a debug rerun, or `ACTIONS_RUNNER_DEBUG`.
+fn runner_debug(a: &AssignmentV2) -> bool {
+    a.debug.runner_debug || debug_flag(a, "ACTIONS_RUNNER_DEBUG")
+}
+
 /// The step outputs (step id, name) the job's secret outputs read (W04-R22).
 fn secret_feeds(a: &AssignmentV2, dialect: Dialect) -> std::collections::BTreeSet<(String, String)> {
     let mut out = std::collections::BTreeSet::new();
@@ -585,7 +596,7 @@ impl Leg {
         set("AGENT_TOOLSDIRECTORY", l.tool_cache.to_string_lossy().to_string());
         set("RUNNER_WORKSPACE", l.runner_workspace.to_string_lossy().to_string());
         set("RUNNER_ENVIRONMENT", "self-hosted".into());
-        if a.debug.runner_debug {
+        if runner_debug(a) {
             set("RUNNER_DEBUG", "1".into());
         }
         let rt = &a.runtime;
@@ -625,11 +636,11 @@ impl Leg {
         })
         .await??;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
-        let mut masks: Vec<String> = secrets.values().cloned().collect();
+        let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();
         masks.extend(a.masks.iter().cloned());
         masks.push(a.runtime.github_token.clone());
         masks.push(a.runtime.runtime_token.clone());
-        let step_debug = a.debug.step_debug || secrets.get("ACTIONS_STEP_DEBUG").is_some_and(|v| v == "true");
+        let step_debug = a.debug.step_debug || debug_flag(a, "ACTIONS_STEP_DEBUG");
         let base = vec![
             ("vars", Value::from_json(&a.contexts.vars)),
             ("needs", Value::from_json(&a.contexts.needs)),
@@ -645,7 +656,7 @@ impl Leg {
                     ("arch".to_owned(), Value::str(runner_arch())),
                     ("temp".to_owned(), Value::str(&layout.temp.to_string_lossy())),
                     ("tool_cache".to_owned(), Value::str(&layout.tool_cache.to_string_lossy())),
-                    ("debug".to_owned(), Value::str(if a.debug.runner_debug { "1" } else { "" })),
+                    ("debug".to_owned(), Value::str(if runner_debug(a) { "1" } else { "" })),
                     ("environment".to_owned(), Value::str("self-hosted")),
                 ]),
             ),

@@ -176,17 +176,24 @@ fn render(src: &str, secrets: &BTreeMap<String, String>) -> Option<String> {
     expr::render(&t, &cx, &mut Budget::default()).ok()
 }
 
+/// Secrets the runner reads for itself (W06-R13), delivered whenever they're set: flags, not
+/// secrets, so the runner doesn't mask their values.
+pub const DEBUG_FLAGS: [&str; 2] = ["ACTIONS_STEP_DEBUG", "ACTIONS_RUNNER_DEBUG"];
+
 /// The `secrets` context a leg gets (W09-R04, W09-R05): what its job reads, followed through the
 /// calls that brought it (`secrets: inherit` or the caller's map) to the run's secrets `run`
 /// (upper-case names). `GITHUB_TOKEN` comes from `run` like any other.
 pub fn deliver(spec: &SecretsSpec, used: &Used, run: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     match spec {
         SecretsSpec::Run => {
-            if used.all {
-                run.clone()
-            } else {
-                used.names.iter().filter_map(|n| run.get(n).map(|v| (n.clone(), v.clone()))).collect()
+            let mut out: BTreeMap<String, String> = if used.all { run.clone() } else { used.names.iter().filter_map(|n| run.get(n).map(|v| (n.clone(), v.clone()))).collect() };
+            // The runner reads these whatever the steps reference (W06-R13).
+            for n in DEBUG_FLAGS {
+                if let Some(v) = run.get(n) {
+                    out.insert(n.to_owned(), v.clone());
+                }
             }
+            out
         }
         SecretsSpec::None => BTreeMap::new(),
         SecretsSpec::Mapped { map, from } => {
@@ -313,5 +320,14 @@ mod tests {
         let decls = vec![SecretDecl { name: "npm_token".into(), description: None, required: true }, SecretDecl { name: "sentry".into(), description: None, required: false }];
         let have: BTreeSet<String> = ["SENTRY".to_owned()].into_iter().collect();
         assert_eq!(missing_required(&decls, &have), vec!["NPM_TOKEN"]);
+    }
+
+    #[test]
+    fn w06_r13_the_debug_flags_arrive_unreferenced() {
+        let run: BTreeMap<String, String> = [("ACTIONS_STEP_DEBUG", "true"), ("DEPLOY_KEY", "k3y-value"), ("OTHER", "x-value")].iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        let mut used = Used::default();
+        used.add("${{ secrets.DEPLOY_KEY }}");
+        let got = deliver(&SecretsSpec::Run, &used, &run);
+        assert_eq!(got.keys().map(String::as_str).collect::<Vec<_>>(), vec!["ACTIONS_STEP_DEBUG", "DEPLOY_KEY"], "the flag comes without being referenced; OTHER doesn't");
     }
 }
