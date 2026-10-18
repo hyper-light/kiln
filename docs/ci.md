@@ -176,14 +176,14 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host executor; background steps, matchers, containers left |
-| W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local; `actions/checkout@v4` unmodified; Docker, `$/`, policy left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; background steps, matchers left |
+| W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local, Docker; `actions/checkout@v4` unmodified; `$/`, policy left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken); principals and roles left |
 | W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
-| W13 | Runners and executors | W06 | ready (facts, docker) | |
+| W13 | Runners and executors | W06 | in progress | job containers, services, Docker actions on the host executor; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (artifacts, 501s); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
@@ -1906,7 +1906,7 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
   - Runners announce `CAP_CI2` and `CAP_ACTIONS`.
 - *Left.*
   - Background steps (R17), problem matchers, `KILN_OUTPUT_JSON` and `exports`.
-  - Job containers and services (W13), debug (R13).
+  - Debug (R13).
   - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
 
 ### W07 Actions
@@ -2030,10 +2030,10 @@ Gives step execution for `uses:`.
       - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11).
     - R07: composite actions, with their own `steps` context, inputs, outputs and nesting.
     - R08: outputs.
+    - R06: Docker actions (Dockerfile and `docker://`), on hosts with Docker (W13).
   - `actions/checkout@v4` runs unmodified end to end against the git facade (W14).
 - *Left.*
-  - R01's `$/path`, `docker://`, `kiln://` and `kiln/*`.
-  - R06 Docker actions, with W13.
+  - R01's `$/path`, `kiln://` and `kiln/*`.
   - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
     tarballs in W08's store (today they are files under `<data>/actions/tar`).
   - R04, R09 beyond checkout (with W14's REST facade), R10, R11, R12.
@@ -2799,7 +2799,19 @@ enforcement points to W18, agent isolation to W20.
   enabled ends with a runner whose facts and executors are correct, without editing files by hand.
   *E2E, user-assisted for the VM.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.* `crates/kiln/src/runner/docker.rs`, on the host executor through Docker or Podman
+  (R03, R08), as GitHub's self-hosted runner does it:
+  - job containers with GitHub's mounts, steps run through `docker exec` with paths
+    translated;
+  - services on a per-leg network, health checks awaited, ports published, with the
+    `job.services` context;
+  - teardown;
+  - Docker actions (W07-R06);
+  - `CAP_DOCKER` announced when a CLI answers.
+- *Left.* R01's probes and R02, the `docker`, `firecracker`, `shards` and `k8s` executors (R04
+  to R07), R09 to R15, and the ACs.
 
 ### W14 Code hosting, stacked diffs, review and landing
 
