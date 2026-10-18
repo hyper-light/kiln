@@ -182,6 +182,67 @@ pub fn claims(f: &Facts<'_>, issuer: &str, audience: &str, jti: &str, now: i64, 
     c
 }
 
+/// Who a server-minted token is for (W10-R11): a CD sync, or another workload of the server's
+/// acting for a repository's environment.
+#[derive(Debug, Clone, Default)]
+pub struct Workload<'a> {
+    /// `owner/repo`.
+    pub repository: &'a str,
+    pub environment: Option<&'a str>,
+    /// The ref and commit it acts on, when it has them.
+    pub git_ref: Option<&'a str>,
+    pub sha: Option<&'a str>,
+    pub actor: &'a str,
+    /// `cd`, `job` or `service`.
+    pub source: &'a str,
+    pub app: Option<&'a str>,
+    pub deployment: Option<&'a str>,
+    /// What started it (`sync`, `drift`, `rollback`, a run id, …).
+    pub trigger: Option<&'a str>,
+}
+
+/// A workload's claims. The default subject is a deploy job's
+/// (`repo:<owner>/<repo>:environment:<env>`, else `…:ref:<ref>`), so one trust policy per
+/// environment covers CI deploy jobs and CD syncs alike. `kiln_source`, `kiln_app`,
+/// `kiln_deployment` and `kiln_trigger` tell them apart.
+#[allow(clippy::too_many_arguments)]
+pub fn workload_claims(w: &Workload<'_>, issuer: &str, audience: &str, jti: &str, now: i64, ttl: i64, subject_keys: Option<&[String]>) -> Map<String, Value> {
+    let mut c = Map::new();
+    let mut put = |k: &str, v: &str| {
+        c.insert(k.to_owned(), Value::String(v.to_owned()));
+    };
+    put("repository", w.repository);
+    put("repository_owner", w.repository.split_once('/').map_or(w.repository, |(o, _)| o));
+    if let Some(r) = w.git_ref {
+        put("ref", r);
+    }
+    if let Some(s) = w.sha {
+        put("sha", s);
+    }
+    if let Some(e) = w.environment.filter(|e| !e.is_empty()) {
+        put("environment", e);
+    }
+    put("actor", w.actor);
+    put("runner_environment", "self-hosted");
+    put("kiln_trust", "trusted");
+    put("kiln_source", w.source);
+    for (k, v) in [("kiln_app", w.app), ("kiln_deployment", w.deployment), ("kiln_trigger", w.trigger)] {
+        if let Some(v) = v {
+            put(k, v);
+        }
+    }
+    let sub = subject(&c, subject_keys);
+    c.insert("sub".into(), Value::String(sub));
+    c.insert("iss".into(), Value::String(issuer.to_owned()));
+    c.insert("aud".into(), Value::String(audience.to_owned()));
+    c.insert("jti".into(), Value::String(jti.to_owned()));
+    let ttl = ttl.clamp(60, MAX_TTL_SECS);
+    c.insert("iat".into(), json!(now));
+    c.insert("nbf".into(), json!(now - 5));
+    c.insert("exp".into(), json!(now + ttl));
+    c
+}
+
 /// The discovery document (W10-R06), as GitHub's issuer publishes it.
 pub fn discovery(issuer: &str, jwks_uri: &str) -> Value {
     json!({
@@ -193,7 +254,8 @@ pub fn discovery(issuer: &str, jwks_uri: &str) -> Value {
             "sub", "aud", "exp", "iat", "iss", "jti", "nbf", "ref", "sha", "repository", "repository_id", "repository_owner",
             "repository_owner_id", "repository_visibility", "run_id", "run_number", "run_attempt", "runner_environment", "actor",
             "actor_id", "workflow", "workflow_ref", "workflow_sha", "head_ref", "base_ref", "event_name", "ref_type", "ref_protected",
-            "environment", "job_workflow_ref", "job_workflow_sha", "kiln_trust", "kiln_executor", "kiln_runner", "kiln_pool", "kiln_job"
+            "environment", "job_workflow_ref", "job_workflow_sha", "kiln_trust", "kiln_executor", "kiln_runner", "kiln_pool", "kiln_job",
+            "kiln_source", "kiln_app", "kiln_deployment", "kiln_trigger"
         ],
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid"]
@@ -262,5 +324,17 @@ mod tests {
         // Lifetimes are kept between a minute and an hour.
         let c = claims(&f, "i", "a", "j", 0, 99_999, None);
         assert_eq!(c.get("exp"), Some(&json!(3600)));
+    }
+
+    #[test]
+    fn w10_r11_a_cd_sync_shares_a_deploy_jobs_subject() {
+        let w = Workload { repository: "acme/app", environment: Some("prod"), actor: "kiln", source: "cd", app: Some("web"), deployment: Some("d7"), trigger: Some("sync"), ..Workload::default() };
+        let c = workload_claims(&w, "https://kiln/oidc", "sts.amazonaws.com", "j", 0, 300, None);
+        assert_eq!(c.get("sub").and_then(Value::as_str), Some("repo:acme/app:environment:prod"));
+        assert_eq!((c.get("kiln_source"), c.get("kiln_app"), c.get("kiln_trigger")), (Some(&json!("cd")), Some(&json!("web")), Some(&json!("sync"))));
+        // A deploy job of the same environment has the same subject.
+        let g = github("push", "refs/heads/main");
+        let job = claims(&Facts { github: &g, environment: Some("prod"), trusted: true, executor: "host", runner: "r", job: "l", ..Facts::default() }, "i", "a", "j", 0, 300, None);
+        assert_eq!(job.get("sub"), c.get("sub"));
     }
 }

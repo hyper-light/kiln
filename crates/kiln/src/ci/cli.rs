@@ -111,6 +111,66 @@ impl Api {
     }
 }
 
+#[derive(clap::Args)]
+pub struct OidcArgs {
+    #[arg(long, env = "KILN_URL", global = true)]
+    url: Option<String>,
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    token: Option<String>,
+    #[command(subcommand)]
+    cmd: OidcCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum OidcCmd {
+    /// The issuer, its keys and which one signs.
+    Status,
+    /// The published key set (JWKS), for providers that take keys pasted in (Google Cloud, …).
+    Jwks,
+    /// Write the discovery document and keys to a directory for a static host (W10-R12): serve it
+    /// at the issuer URL (`[ci.oidc] issuer`). Run it again within 7 days of each new key (`kiln
+    /// oidc status`), or set `[ci.oidc] publish_dir` and the server keeps it written.
+    Publish {
+        #[arg(long)]
+        to: std::path::PathBuf,
+    },
+    /// Make a new signing key: it signs in 7 days, or at once with `--now`.
+    Rotate {
+        #[arg(long)]
+        now: bool,
+    },
+}
+
+/// `kiln oidc`.
+pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
+    let api = Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
+    match args.cmd {
+        OidcCmd::Status => {
+            let v = api.call(Method::Get, "/oidc", None).await?;
+            println!("issuer {}", v.get("issuer").and_then(Value::as_str).unwrap_or_default());
+            for k in v.get("keys").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let flag = |n: &str| k.get(n).and_then(Value::as_bool).unwrap_or(false);
+                println!("{}  signs from {}{}{}", k.get("kid").and_then(Value::as_str).unwrap_or_default(), when(k.get("sign_from").and_then(Value::as_i64)), if flag("signing") { "  signing" } else { "" }, if flag("published") { "  published" } else { "" });
+            }
+        }
+        OidcCmd::Jwks => {
+            let v = api.call(Method::Get, "/oidc/jwks-export", None).await?;
+            println!("{}", serde_json::to_string_pretty(v.get("jwks").unwrap_or(&Value::Null))?);
+        }
+        OidcCmd::Publish { to } => {
+            let v = api.call(Method::Get, "/oidc/jwks-export", None).await?;
+            let (Some(discovery), Some(jwks)) = (v.get("discovery"), v.get("jwks")) else { bail!("the server sent no documents") };
+            super::oidc::write_published(&to, discovery, jwks)?;
+            println!("wrote the discovery document and keys to {}; serve it at {}", to.display(), v.get("issuer").and_then(Value::as_str).unwrap_or_default());
+        }
+        OidcCmd::Rotate { now } => {
+            let v = api.call(Method::Post, "/oidc/rotate", Some(json!({ "now": now }))).await?;
+            println!("a new signing key, signing from {}", when(v.get("sign_from").and_then(Value::as_i64)));
+        }
+    }
+    Ok(())
+}
+
 /// Percent-encodes a query value.
 fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()

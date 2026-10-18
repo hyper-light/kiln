@@ -72,4 +72,7 @@ pub struct Oidc {
     pub subject_claims: Vec<String>,
     /// Untrusted runs (fork pull requests) may get ID tokens too, with `kiln_trust: untrusted`.
     pub untrusted: bool,
+    /// Keep the discovery document and keys written here, for a static host that serves the
+    /// directory at `issuer` (W10-R12): providers that fetch from the internet read them there.
+    pub publish_dir: Option<std::path::PathBuf>,
 }

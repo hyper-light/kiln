@@ -112,6 +112,8 @@ enum Cmd {
     Secrets(kiln::ci::cli::SecretsArgs),
     /// CI variables (the `vars` context): set, list, delete.
     Vars(kiln::ci::cli::VarsArgs),
+    /// The CI OIDC issuer: status, keys to paste or publish, rotation.
+    Oidc(kiln::ci::cli::OidcArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -527,6 +529,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Vars(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             kiln::ci::cli::vars(a, &cfg).await
+        }
+        Cmd::Oidc(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            kiln::ci::cli::oidc(a, &cfg).await
         }
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

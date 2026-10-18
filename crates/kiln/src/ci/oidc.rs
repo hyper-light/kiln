@@ -7,7 +7,11 @@
 //!   are what providers fetch. Also `/_kiln/oidc/token?api-version=1&audience=…`, the toolkit's
 //!   `core.getIDToken()`, for a leg's `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. That one answers
 //!   `{"value": "<jwt>"}`, GitHub-exact, and only for legs granted `id-token: write`.
+//! - **Publishing** (W10-R12). Where providers can't reach the server, the two documents go to a
+//!   static host that serves them at the issuer URL: `[ci.oidc] publish_dir`, rewritten by the
+//!   hourly upkeep and at each rotation, or `kiln oidc publish --to <dir>` by hand.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aws_lc_rs::encoding::AsDer;
@@ -157,11 +161,60 @@ async fn rotate(hub: &Hub) -> anyhow::Result<(Vec<Stored>, rules::Rotation)> {
     Ok((keys, plan))
 }
 
+/// A public key as a JWK.
+fn jwk(kid: &str, n: &str, e: &str) -> Value {
+    json!({ "kty": "RSA", "alg": "RS256", "use": "sig", "kid": kid, "n": n, "e": e })
+}
+
 /// The published key set (JWKS).
 pub async fn jwks(hub: &Hub) -> anyhow::Result<Value> {
     let (keys, plan) = rotate(hub).await?;
-    let list: Vec<Value> = keys.iter().filter(|k| plan.publish.contains(&k.times.kid)).map(|k| json!({ "kty": "RSA", "alg": "RS256", "use": "sig", "kid": k.times.kid, "n": k.n, "e": k.e })).collect();
+    let list: Vec<Value> = keys.iter().filter(|k| plan.publish.contains(&k.times.kid)).map(|k| jwk(&k.times.kid, &k.n, &k.e)).collect();
     Ok(json!({ "keys": list }))
+}
+
+/// The files a static host serves at the issuer URL, by path under it: the discovery document,
+/// and the key set where the discovery document says it is.
+pub fn published_files(discovery: &Value, jwks: &Value) -> anyhow::Result<[(&'static str, String); 2]> {
+    Ok([(".well-known/openid-configuration", serde_json::to_string_pretty(discovery)?), ("jwks", serde_json::to_string_pretty(jwks)?)])
+}
+
+/// Writes them under `dir`, each by rename so a host never serves half a file. Whether anything
+/// changed.
+pub fn write_published(dir: &Path, discovery: &Value, jwks: &Value) -> anyhow::Result<bool> {
+    let mut changed = false;
+    for (rel, body) in published_files(discovery, jwks)? {
+        let path = dir.join(rel);
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("kiln-tmp");
+        std::fs::write(&tmp, &body)?;
+        std::fs::rename(&tmp, &path)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Rewrites `[ci.oidc] publish_dir` when it is set and the keys changed; where it is.
+pub async fn publish(hub: &Hub) -> anyhow::Result<Option<PathBuf>> {
+    let Some(dir) = hub.cfg.ci.oidc.publish_dir.clone() else { return Ok(None) };
+    let i = issuer(hub);
+    let (discovery, set) = (rules::discovery(&i, &format!("{i}/jwks")), jwks(hub).await?);
+    let to = dir.clone();
+    if crate::rt::blocking(move || write_published(&to, &discovery, &set)).await?? {
+        tracing::info!(dir = %dir.display(), "OIDC: published the issuer's documents");
+    }
+    Ok(Some(dir))
+}
+
+/// A token for a workload of the server's own (W10-R11): a CD sync, say. The claims come from
+/// `kiln_ci::oidc::workload_claims`; this signs them with the issuer's current key.
+pub async fn mint(hub: &Hub, claims: &serde_json::Map<String, Value>) -> anyhow::Result<String> {
+    sign(hub, claims).await
 }
 
 /// Signs `claims` with the current key: a JWT.
@@ -172,6 +225,10 @@ async fn sign(hub: &Hub, claims: &serde_json::Map<String, Value>) -> anyhow::Res
     let (sealed, nonce): (Vec<u8>, Vec<u8>) = hub.store.call(move |c| Ok(c.query_row("SELECT sealed, nonce FROM oidc_keys WHERE kid = ?1", [&k], |r| Ok((r.get(0)?, r.get(1)?)))?)).await?;
     let pkcs8 = secrets::open_master(hub, &sealed, &nonce, &aad(&kid))?;
     let kp = KeyPair::from_pkcs8(&pkcs8).map_err(|_| anyhow::anyhow!("the OIDC key can't be read"))?;
+    sign_with(&kp, &kid, claims)
+}
+
+fn sign_with(kp: &KeyPair, kid: &str, claims: &serde_json::Map<String, Value>) -> anyhow::Result<String> {
     let head = B64.encode(serde_json::to_vec(&json!({ "alg": "RS256", "typ": "JWT", "kid": kid }))?);
     let body = B64.encode(serde_json::to_vec(claims)?);
     let signing = format!("{head}.{body}");
@@ -189,6 +246,46 @@ pub async fn document(hub: &Arc<Hub>, which: &str) -> Result<Response, Fail> {
             let set = jwks(hub).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &set))
         }
+    }
+}
+
+/// `/api/ci/oidc…`, behind the console's auth (W10-R12):
+/// - `GET /api/ci/oidc`: the issuer and its keys;
+/// - `GET /api/ci/oidc/jwks-export`: the discovery document and key set to publish elsewhere;
+/// - `POST /api/ci/oidc/rotate { now }`: a new key, signing in 7 days, or at once;
+/// - `POST /api/ci/oidc/publish`: rewrite `[ci.oidc] publish_dir` now.
+pub async fn admin(hub: &Hub, method: &http::Method, rest: &[&str], body: Value) -> Result<Response, Fail> {
+    let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let i = issuer(hub);
+    match (method, rest) {
+        (&http::Method::GET, []) => {
+            let (keys, plan) = rotate(hub).await.map_err(fail)?;
+            let list: Vec<Value> = keys
+                .iter()
+                .map(|k| json!({ "kid": k.times.kid, "created_at": k.times.created_at, "sign_from": k.times.sign_from, "signing": plan.sign.as_deref() == Some(k.times.kid.as_str()), "published": plan.publish.contains(&k.times.kid) }))
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "issuer": i, "discovery": format!("{i}/.well-known/openid-configuration"), "jwks_uri": format!("{i}/jwks"), "serving": hub.ci.enabled(), "keys": list, "subject_claims": hub.cfg.ci.oidc.subject_claims })))
+        }
+        (&http::Method::GET, ["jwks-export"]) => {
+            let set = jwks(hub).await.map_err(fail)?;
+            Ok(srv::json(StatusCode::OK, &json!({ "issuer": i, "discovery": rules::discovery(&i, &format!("{i}/jwks")), "jwks": set })))
+        }
+        (&http::Method::POST, ["rotate"]) => {
+            let now = body.get("now").and_then(Value::as_bool).unwrap_or(false);
+            let at = crate::util::now_unix() + if now { 0 } else { rules::LEAD_SECS };
+            // Released before publishing, which rotates (and locks) too.
+            let g = ROTATE.lock().await;
+            make_key(hub, at).await.map_err(fail)?;
+            drop(g);
+            hub.store.audit("admin".into(), "ci.oidc.rotate".into(), format!("a new signing key, signing from {at}")).await;
+            let published = publish(hub).await.map_err(fail)?;
+            Ok(srv::json(StatusCode::OK, &json!({ "sign_from": at, "published": published })))
+        }
+        (&http::Method::POST, ["publish"]) => match publish(hub).await.map_err(fail)? {
+            Some(dir) => Ok(srv::json(StatusCode::OK, &json!({ "published": dir }))),
+            None => Err((StatusCode::BAD_REQUEST, "no [ci.oidc] publish_dir on this server; `kiln oidc publish --to <dir>` writes the documents wherever you run it".into())),
+        },
+        _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
     }
 }
 
@@ -262,6 +359,67 @@ mod tests {
         let public = aws_lc_rs::signature::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() };
         assert!(public.verify(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256, b"head.body", &sig).is_ok());
         assert!(public.verify(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256, b"head.other", &sig).is_err());
+        Ok(())
+    }
+
+    /// A provider's check, reading only what a static host at `issuer` would serve from `dir`:
+    /// discovery, then the keys where it points, then the token's signature and issuer.
+    fn verify_published(dir: &Path, issuer: &str, jwt: &str) -> anyhow::Result<serde_json::Map<String, Value>> {
+        let fetch = |url: &str| -> anyhow::Result<Value> {
+            let rel = url.strip_prefix(issuer).and_then(|r| r.strip_prefix('/')).ok_or_else(|| anyhow::anyhow!("{url} is not under the issuer"))?;
+            Ok(serde_json::from_str(&std::fs::read_to_string(dir.join(rel))?)?)
+        };
+        let discovery = fetch(&format!("{issuer}/.well-known/openid-configuration"))?;
+        anyhow::ensure!(discovery.get("issuer").and_then(Value::as_str) == Some(issuer), "discovery names another issuer");
+        let set = fetch(discovery.get("jwks_uri").and_then(Value::as_str).unwrap_or_default())?;
+        let mut parts = jwt.split('.');
+        let (Some(head), Some(body), Some(sig), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { anyhow::bail!("not a JWT") };
+        let header: Value = serde_json::from_slice(&B64.decode(head)?)?;
+        let kid = header.get("kid").and_then(Value::as_str).unwrap_or_default();
+        let keys = set.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
+        let key = keys.iter().find(|k| k.get("kid").and_then(Value::as_str) == Some(kid)).ok_or_else(|| anyhow::anyhow!("no published key {kid}"))?;
+        let part = |n: &str| B64.decode(key.get(n).and_then(Value::as_str).unwrap_or_default());
+        let (n, e) = (part("n")?, part("e")?);
+        let public = aws_lc_rs::signature::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() };
+        public.verify(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256, format!("{head}.{body}").as_bytes(), &B64.decode(sig)?).map_err(|_| anyhow::anyhow!("bad signature"))?;
+        let claims: serde_json::Map<String, Value> = serde_json::from_slice(&B64.decode(body)?)?;
+        anyhow::ensure!(claims.get("iss").and_then(Value::as_str) == Some(issuer), "the token names another issuer");
+        Ok(claims)
+    }
+
+    #[test]
+    fn w10_ac07_published_documents_verify_tokens() -> anyhow::Result<()> {
+        let issuer = "https://oidc.example.com/kiln";
+        let key = |kid: &str| -> anyhow::Result<(KeyPair, Value)> {
+            let kp = KeyPair::generate(KeySize::Rsa2048).map_err(|_| anyhow::anyhow!("keygen"))?;
+            let (n, e) = rsa_parts(kp.public_key().as_ref()).ok_or_else(|| anyhow::anyhow!("parts"))?;
+            Ok((kp, jwk(kid, &B64.encode(n), &B64.encode(e))))
+        };
+        let ((current, a), (next, b), (stray, _)) = (key("a")?, key("b")?, key("c")?);
+        let dir = tempfile::tempdir()?;
+        let discovery = rules::discovery(issuer, &format!("{issuer}/jwks"));
+        assert!(write_published(dir.path(), &discovery, &json!({ "keys": [a, b] }))?);
+        assert!(!write_published(dir.path(), &discovery, &json!({ "keys": [a, b] }))?, "unchanged documents aren't rewritten");
+        let w = rules::Workload { repository: "acme/app", environment: Some("prod"), actor: "kiln", source: "cd", ..rules::Workload::default() };
+        let claims = rules::workload_claims(&w, issuer, "sts.amazonaws.com", "j1", 1_000, 300, None);
+        // The signing key and the next one (published early) both verify.
+        for (kp, kid) in [(&current, "a"), (&next, "b")] {
+            let got = verify_published(dir.path(), issuer, &sign_with(kp, kid, &claims)?)?;
+            assert_eq!(got.get("sub").and_then(Value::as_str), Some("repo:acme/app:environment:prod"));
+        }
+        // An unpublished key, a key claiming another's kid, a changed body: refused.
+        assert!(verify_published(dir.path(), issuer, &sign_with(&stray, "c", &claims)?).is_err());
+        assert!(verify_published(dir.path(), issuer, &sign_with(&stray, "a", &claims)?).is_err());
+        let good = sign_with(&current, "a", &claims)?;
+        let mut forged: Vec<&str> = good.split('.').collect();
+        let other = B64.encode(serde_json::to_vec(&json!({ "iss": issuer, "sub": "repo:evil/app:environment:prod" }))?);
+        if let Some(b) = forged.get_mut(1) {
+            *b = &other;
+        }
+        assert!(verify_published(dir.path(), issuer, &forged.join(".")).is_err());
+        // Another issuer's token, even with a published key, is refused.
+        let elsewhere = rules::workload_claims(&w, "https://other", "a", "j2", 1_000, 300, None);
+        assert!(verify_published(dir.path(), issuer, &sign_with(&current, "a", &elsewhere)?).is_err());
         Ok(())
     }
 }
