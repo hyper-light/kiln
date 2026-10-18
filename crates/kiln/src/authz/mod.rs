@@ -307,6 +307,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/runs/*/rerun", "runs.rerun", At::Run(3)),
     r("GET", "/api/ci/legs/*", "runs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
+    r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
+    r("GET", "/api/ci/logs/search", "logs.read", At::RepoQuery),
     // A terminal into a leg, and keeping or releasing a failed one (W17); on the `host` executor
     // the terminal also needs `runners.terminal` on its runner, which the handler checks.
     r("GET", "/api/ci/legs/*/terminal", "runs.debug", At::Job(3)),
@@ -338,6 +340,11 @@ pub static ROUTES: &[Rule] = &[
     any("/api/ci/integrations", "integrations.manage", At::Server),
     any("/api/ci/integrations/**", "integrations.manage", At::Server),
     any("/api/ci/webhooks/**", "integrations.manage", At::Server),
+    r("GET", "/api/ci/insights/repos", "runs.read", At::Server),
+    r("GET", "/api/ci/insights/repos/*", "runs.read", At::Repo(4)),
+    r("GET", "/api/ci/insights/workflows/*", "runs.read", At::Repo(4)),
+    r("GET", "/api/ci/insights/runners", "runners.read", At::Server),
+    r("GET", "/api/ci/insights/runners/*", "runners.read", At::Server),
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),

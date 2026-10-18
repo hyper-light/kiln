@@ -45,6 +45,25 @@ export function EditWorkflowLink({ detail }: { detail: CiRunDetail }) {
   );
 }
 
+/** The run's workflow in Insights: its durations, success and where its time goes (W21-R12). */
+export function WorkflowInsightsLink({ detail }: { detail: CiRunDetail }) {
+  const { run } = detail;
+  return (
+    <Link to={`/insights?repo=${encodeURIComponent(run.repo)}&workflow=${encodeURIComponent(run.workflow)}`} className="text-link font-mono text-[11px]">
+      Workflow insights
+    </Link>
+  );
+}
+
+/** The run against the last green run of its workflow and branch (W19-R03). */
+export function CompareLink({ detail }: { detail: CiRunDetail }) {
+  return (
+    <Link to={`/runs/${encodeURIComponent(detail.run.id)}/compare`} className="text-link font-mono text-[11px]">
+      Compare with last green
+    </Link>
+  );
+}
+
 /** Rerun (all, failed, one job; with debug logging) and Cancel, where the run's header is. */
 export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: string[] }) {
   const { run } = detail;
@@ -420,6 +439,13 @@ export function CiLegExtras({
     <div className="border-t border-[#28313d]">
       <LegDebug runId={runId} legId={legId} running={status === "running"} keptUntil={keptUntil ?? null} />
       {reused && <p className="px-5 py-3 font-mono text-[11px] text-[#a6b2c6]">Kept from the last attempt: this rerun didn't run it again.</p>}
+      {(status === "failed" || status === "timed_out") && (
+        <p className="px-5 py-3">
+          <Link to={`/runs/${encodeURIComponent(runId)}/compare?leg=${encodeURIComponent(legId)}`} className="text-link font-mono text-[11px]">
+            What changed since the last green run
+          </Link>
+        </p>
+      )}
       {status === "queued" && (
         <React.Suspense fallback={<p className="px-5 py-3 font-mono text-[11px] text-[#7f8a9a]">Asking the scheduler why it waits…</p>}>
           <WhyWaiting legId={legId} />

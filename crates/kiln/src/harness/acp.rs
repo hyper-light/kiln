@@ -377,7 +377,8 @@ impl Acp {
     fn show(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments: names });
+        core.note_sent(&m.id);
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
         core.touch_state();
     }
 
@@ -621,6 +622,15 @@ impl Acp {
                     }
                 }
                 core.state.usage.turns += 1;
+                // How it ended, for kiln's keep-going.
+                let how = match stop {
+                    "end_turn" => "done",
+                    "cancelled" => "stopped",
+                    "refusal" => "refused",
+                    "max_turn_requests" => "limit",
+                    _ => "cut",
+                };
+                core.end_turn(core.state.turn_started, how, Some(stop));
                 core.state.turn_started = None;
                 core.state.doing = None;
                 core.touch_state();
@@ -1097,6 +1107,8 @@ mod tests {
             ],
         );
         assert_eq!(core.state.todos.len(), 2);
+        // How the turn ended, for kiln's keep-going.
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref())), Some(("done", Some("end_turn"))));
         assert!(core.change_jobs.iter().any(|j| j.rel == "main.rs"));
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         // The queued message went out as the next prompt.
@@ -1136,6 +1148,7 @@ mod tests {
         assert!(w.iter().any(|v| v.pointer("/result/outcome/outcome").and_then(Value::as_str) == Some("cancelled")));
         assert!(core.state.approvals.is_empty());
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "cancelled"}})]);
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("stopped"), "you stopped it");
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str) == Some("stop, do this")));
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));

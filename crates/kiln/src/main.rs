@@ -35,6 +35,10 @@ enum Cmd {
         /// Detach into the background (logs go to <data>/kiln.log).
         #[arg(long)]
         detach: bool,
+        /// The kiln binary to run the subcommand with (default: this one). A launchd job's
+        /// launcher, a copy of kiln that upgrades leave alone, runs the `kiln` they replace.
+        #[arg(long)]
+        exe: Option<PathBuf>,
         /// The kiln subcommand to supervise, e.g. `-- server`.
         #[arg(last = true, required = true)]
         args: Vec<String>,
@@ -126,6 +130,9 @@ enum Cmd {
     /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
     /// server's runners (`--server`), before you push.
     Workflow(kiln::ci::local::WorkflowArgs),
+    /// Inside a CI leg: an integration's credentials, exchanged with the leg's ID token or
+    /// stored, as variables (`--print-env`) or for a command (`--exec CMD…`).
+    Auth(kiln::runner::auth::AuthArgs),
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// A CI run's or leg's logs.
@@ -192,8 +199,10 @@ struct OutpostArgs {
     /// The server's URL.
     #[arg(long, env = "KILN_SERVER")]
     server: String,
-    /// The server's one-time invite (Machines -> Add an outpost). Once the outpost has its
-    /// certificate it runs on that, and the invite isn't needed again.
+    /// The server's one-time invite (Machines -> Add an outpost). Without one, the outpost asks to
+    /// join, as `kiln join` does: it shows a verification code, and an admin approves it (Runners ->
+    /// Add machines) once the codes match. Once it has its certificate it runs on that, and needs
+    /// neither again.
     #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
     token: Option<String>,
     /// Its name in kiln (default: this machine's hostname).
@@ -288,7 +297,9 @@ fn shutdown_on_signals(token: Shutdown) {
     });
 }
 
-/// Run an agent until shutdown. Persistent agents supervise their own main loop.
+/// Run an agent until shutdown. Persistent agents supervise their own main loop. One that
+/// handed its terminals to its supervisor to take up a new binary exits with
+/// [`kiln::supervise::HANDOVER_EXIT`], so the supervisor starts that binary at once.
 async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if opts.ephemeral {
         return kiln::agent::run(opts, shutdown).await;
@@ -297,6 +308,9 @@ async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Resul
     let sd = shutdown.clone();
     let h = kiln::sup::spawn(&reg, "agent", shutdown, move || kiln::agent::run(opts.clone(), sd.clone()));
     let _ = h.await;
+    if kiln::agent::handed_over() {
+        return Err(kiln::reach::cli::ExitWith(kiln::supervise::HANDOVER_EXIT).into());
+    }
     Ok(())
 }
 
@@ -349,6 +363,9 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             kiln::server::run(cfg, shutdown).await
         }
         Cmd::Agent(a) => {
+            // What the supervisor handed this process (its handover channel), before anything
+            // here starts a process that could inherit it.
+            kiln::os::supervise::claim_inherited();
             shutdown_on_signals(shutdown.clone());
             let base = config::default_data_dir().join("agent");
             let state_dir = a.state_dir.clone().unwrap_or_else(|| base.clone());
@@ -431,15 +448,24 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             // An invite works once: with a certificate that still works, the outpost runs on it.
             let enrolled = std::fs::read_to_string(state_dir.join("agent.pem")).is_ok_and(|c| kiln::pki::still_valid(&c));
             tracing::info!("kiln outpost: nothing is installed; it runs in this terminal until you stop it (Ctrl-C)");
+            let mut name = a.name.unwrap_or_else(config::Config::hostname);
+            let token = a.token.filter(|_| !enrolled);
+            // No certificate and no invite: ask to join, as `kiln join` does (an admin approves it
+            // after comparing the code); the certificate it gets is kept for the next time.
+            if !enrolled && token.is_none() {
+                let me = kiln::join::Machine::this(Some(name.clone()), &[kiln::proto::OUTPOST_LABEL.to_owned()]);
+                let joined = kiln::join::request(&a.server, &me, &state_dir, &kiln::join::say_stderr, &shutdown).await?;
+                name = joined.name;
+            }
             let opts = kiln::agent::Opts {
                 server_url: a.server,
                 quic: None,
-                name: a.name.unwrap_or_else(config::Config::hostname),
+                name,
                 labels: vec![kiln::proto::OUTPOST_LABEL.to_owned()],
                 slots: 0,
                 work_dir: state_dir.join("work"),
                 state_dir,
-                join_token: a.token.filter(|_| !enrolled),
+                join_token: token,
                 ephemeral: false,
                 dedicated_job: None,
                 terminal: true,
@@ -474,7 +500,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 None => Ok(()),
             }
         }
-        Cmd::Supervise { detach, args } => {
+        Cmd::Supervise { detach, exe, args } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let state_dir = if args.first().is_some_and(|a| a == "agent") {
                 // The agent's own state directory, when it has one of its own.
@@ -487,9 +513,9 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 args.insert(0, format!("--config={}", config_path.display()));
             }
             if detach {
-                return supervise::detach(&args, &state_dir);
+                return supervise::detach(&args, &state_dir, exe.as_deref());
             }
-            supervise::run(supervise::Options { args, state_dir }).await
+            supervise::run(supervise::Options { args, state_dir, exe }).await
         }
         Cmd::Up => {
             let cfg = config::Config::load(&config_path)?;
@@ -497,7 +523,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             if kiln::join::offer_instead_of_server(&config_path, &cfg).await? {
                 return Ok(());
             }
-            supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir }).await
+            supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None }).await
         }
         Cmd::Install(a) => install::install(a).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
@@ -637,6 +663,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
+        Cmd::Auth(a) => kiln::runner::auth::cli(a).await,
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();

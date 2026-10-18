@@ -287,4 +287,39 @@ mod tests {
         Ok(())
     })
     }
+
+    /// A shell handed over by the runner process before this one is not this process's child
+    /// (macOS upgrades): its exit is still seen, without a status.
+    #[cfg(unix)]
+    #[test]
+    fn an_adopted_shell_that_is_not_our_child_is_seen_to_exit() -> anyhow::Result<()> {
+        // Handed to a fresh process (macOS), it is reaped by no one here; handed to another
+        // runner process of the machine (blue/green, `foreign`), its exit is only watched.
+        for foreign in [false, true] {
+            crate::rt::block_on(async move {
+                // Started by a shell that exits at once: not this process's child.
+                let out = std::process::Command::new("/bin/sh").args(["-c", "sleep 1 >/dev/null 2>&1 & echo $!"]).output()?;
+                let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
+                // Its "master": a pipe's read end, non-blocking as a handed-over master is.
+                let (r, w) = std::io::pipe()?;
+                let r = std::os::fd::OwnedFd::from(r);
+                crate::os::proc::nonblocking(&r)?;
+                let (tx, rx) = async_channel::bounded(16);
+                let (_input, input_rx) = async_channel::unbounded();
+                let _session = crate::os::pty::adopt(r, pid, foreign, tx, input_rx);
+                drop(w);
+                let code = loop {
+                    match crate::rt::timeout(std::time::Duration::from_secs(15), rx.recv()).await {
+                        Ok(Ok(PtyOut::Exit(code))) => break code,
+                        Ok(Ok(PtyOut::Data(_))) => {}
+                        _ => anyhow::bail!("the adopted shell's exit was never seen (foreign: {foreign})"),
+                    }
+                };
+                assert_eq!(code, None, "no status for a process that is not our child");
+                assert!(!crate::os::pid_alive(pid));
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        Ok(())
+    }
 }

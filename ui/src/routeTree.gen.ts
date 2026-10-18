@@ -12,6 +12,8 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as AppIndexRouteImport } from './routes/_app.index'
 import { Route as AppSplatRouteImport } from './routes/_app.$'
+import { Route as AppInsightsRouteImport } from './routes/_app.insights'
+import { Route as AppLogsRouteImport } from './routes/_app.logs'
 import { Route as AppReposRouteImport } from './routes/_app.repos'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppSyncRouteImport } from './routes/_app.sync'
@@ -32,6 +34,7 @@ import { Route as SharedPlansTokenRouteImport } from './routes/shared.plans.$tok
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
 import { Route as AppRunsIdIndexRouteImport } from './routes/_app.runs.$id.index'
+import { Route as AppRunsIdCompareRouteImport } from './routes/_app.runs.$id.compare'
 import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
 
@@ -47,6 +50,16 @@ const AppIndexRoute = AppIndexRouteImport.update({
 const AppSplatRoute = AppSplatRouteImport.update({
   id: '/$',
   path: '/$',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppInsightsRoute = AppInsightsRouteImport.update({
+  id: '/insights',
+  path: '/insights',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLogsRoute = AppLogsRouteImport.update({
+  id: '/logs',
+  path: '/logs',
   getParentRoute: () => AppRoute,
 } as any)
 const AppReposRoute = AppReposRouteImport.update({
@@ -149,6 +162,11 @@ const AppRunsIdIndexRoute = AppRunsIdIndexRouteImport.update({
   path: '/runs/$id/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppRunsIdCompareRoute = AppRunsIdCompareRouteImport.update({
+  id: '/runs/$id/compare',
+  path: '/runs/$id/compare',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsAppsProjectNameRoute =
   AppDeploymentsAppsProjectNameRouteImport.update({
     id: '/deployments/apps/$project/$name',
@@ -164,6 +182,8 @@ const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/$': typeof AppSplatRoute
+  '/insights': typeof AppInsightsRoute
+  '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
   '/sync': typeof AppSyncRoute
@@ -182,6 +202,7 @@ export interface FileRoutesByFullPath {
   '/runners/': typeof AppRunnersIndexRoute
   '/runs/': typeof AppRunsIndexRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans/': typeof AppAgentsPlansIndexRoute
   '/runs/$id/': typeof AppRunsIdIndexRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
@@ -189,6 +210,8 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/$': typeof AppSplatRoute
+  '/insights': typeof AppInsightsRoute
+  '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
   '/sync': typeof AppSyncRoute
@@ -208,6 +231,7 @@ export interface FileRoutesByTo {
   '/runners': typeof AppRunnersIndexRoute
   '/runs': typeof AppRunsIndexRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans': typeof AppAgentsPlansIndexRoute
   '/runs/$id': typeof AppRunsIdIndexRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
@@ -217,6 +241,8 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/_app/$': typeof AppSplatRoute
+  '/_app/insights': typeof AppInsightsRoute
+  '/_app/logs': typeof AppLogsRoute
   '/_app/repos': typeof AppReposRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/sync': typeof AppSyncRoute
@@ -236,6 +262,7 @@ export interface FileRoutesById {
   '/_app/runners/': typeof AppRunnersIndexRoute
   '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/_app/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
@@ -246,6 +273,8 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/$'
+    | '/insights'
+    | '/logs'
     | '/repos'
     | '/settings'
     | '/sync'
@@ -264,6 +293,7 @@ export interface FileRouteTypes {
     | '/runners/'
     | '/runs/'
     | '/agents/plans/$id'
+    | '/runs/$id/compare'
     | '/agents/plans/'
     | '/runs/$id/'
     | '/deployments/apps/$project/$name'
@@ -271,6 +301,8 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/$'
+    | '/insights'
+    | '/logs'
     | '/repos'
     | '/settings'
     | '/sync'
@@ -290,6 +322,7 @@ export interface FileRouteTypes {
     | '/runners'
     | '/runs'
     | '/agents/plans/$id'
+    | '/runs/$id/compare'
     | '/agents/plans'
     | '/runs/$id'
     | '/deployments/apps/$project/$name'
@@ -298,6 +331,8 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_app'
     | '/_app/$'
+    | '/_app/insights'
+    | '/_app/logs'
     | '/_app/repos'
     | '/_app/settings'
     | '/_app/sync'
@@ -317,6 +352,7 @@ export interface FileRouteTypes {
     | '/_app/runners/'
     | '/_app/runs/'
     | '/_app/agents/plans/$id'
+    | '/_app/runs/$id/compare'
     | '/_app/agents/plans/'
     | '/_app/runs/$id/'
     | '/_app/deployments/apps/$project/$name'
@@ -349,6 +385,20 @@ declare module '@tanstack/react-router' {
       path: '/$'
       fullPath: '/$'
       preLoaderRoute: typeof AppSplatRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/insights': {
+      id: '/_app/insights'
+      path: '/insights'
+      fullPath: '/insights'
+      preLoaderRoute: typeof AppInsightsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/logs': {
+      id: '/_app/logs'
+      path: '/logs'
+      fullPath: '/logs'
+      preLoaderRoute: typeof AppLogsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/repos': {
@@ -491,6 +541,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunsIdIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/runs/$id/compare': {
+      id: '/_app/runs/$id/compare'
+      path: '/runs/$id/compare'
+      fullPath: '/runs/$id/compare'
+      preLoaderRoute: typeof AppRunsIdCompareRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/apps/$project/$name': {
       id: '/_app/deployments/apps/$project/$name'
       path: '/deployments/apps/$project/$name'
@@ -510,6 +567,8 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppSplatRoute: typeof AppSplatRoute
+  AppInsightsRoute: typeof AppInsightsRoute
+  AppLogsRoute: typeof AppLogsRoute
   AppReposRoute: typeof AppReposRoute
   AppSettingsRoute: typeof AppSettingsRoute
   AppSyncRoute: typeof AppSyncRoute
@@ -528,6 +587,7 @@ interface AppRouteChildren {
   AppRunnersIndexRoute: typeof AppRunnersIndexRoute
   AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppAgentsPlansIdRoute: typeof AppAgentsPlansIdRoute
+  AppRunsIdCompareRoute: typeof AppRunsIdCompareRoute
   AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
@@ -536,6 +596,8 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppSplatRoute: AppSplatRoute,
+  AppInsightsRoute: AppInsightsRoute,
+  AppLogsRoute: AppLogsRoute,
   AppReposRoute: AppReposRoute,
   AppSettingsRoute: AppSettingsRoute,
   AppSyncRoute: AppSyncRoute,
@@ -554,6 +616,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunnersIndexRoute: AppRunnersIndexRoute,
   AppRunsIndexRoute: AppRunsIndexRoute,
   AppAgentsPlansIdRoute: AppAgentsPlansIdRoute,
+  AppRunsIdCompareRoute: AppRunsIdCompareRoute,
   AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,
   AppDeploymentsAppsProjectNameRoute: AppDeploymentsAppsProjectNameRoute,

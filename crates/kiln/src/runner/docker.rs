@@ -386,6 +386,22 @@ fn s(x: &str) -> String {
 }
 
 impl Containers {
+    /// Each container's image as named and its content-addressed id, by role (`job`,
+    /// `service <key>`), for comparing runs (docs/ci.md W19-R03).
+    pub async fn images(&self) -> Vec<(String, String, String)> {
+        let mut ids: Vec<(String, String)> = self.job.iter().map(|j| (s("job"), j.id.clone())).collect();
+        ids.extend(self.services.iter().map(|v| (format!("service {}", v.key), v.id.clone())));
+        let mut out = Vec::new();
+        for (role, id) in ids {
+            if let Ok(o) = self.cli.run(&[s("inspect"), s("--format"), s("{{.Config.Image}} {{.Image}}"), id], &BTreeMap::new(), QUICK).await
+                && let Some((name, digest)) = o.trim().split_once(' ')
+            {
+                out.push((role, name.to_owned(), digest.to_owned()));
+            }
+        }
+        out
+    }
+
     /// Starts the leg's network, its services (awaited until healthy) and its job container.
     /// `say` reports progress for the leg's "Initialize containers" log.
     #[allow(clippy::too_many_arguments)]

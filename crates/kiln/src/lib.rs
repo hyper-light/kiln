@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod accounts;
+pub mod audit;
 pub mod agent;
 pub mod aisessions;
 pub mod api;
@@ -14,6 +15,7 @@ pub mod http;
 pub mod kubeapi;
 pub mod config;
 pub mod config_cli;
+pub mod convo;
 pub mod dirs;
 pub mod discovery;
 pub mod dns;

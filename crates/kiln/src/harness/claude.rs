@@ -1333,7 +1333,8 @@ impl Claude {
         core.state.delivery.insert(id.clone(), Delivery::Sent);
         prune_delivery(core);
         let (images, names) = super::model::attachment_summary(&attachments);
-        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some("human".into()), attachments: names });
+        core.note_sent(&id);
+        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(super::core::origin_of(&id).into()), attachments: names });
         core.touch_state();
         self.settle(core);
     }
@@ -2303,7 +2304,9 @@ impl Claude {
         let id = if uuid.is_empty() { format!("user-{}", Core::now()) } else { uuid.to_owned() };
         let ours = core.state.delivery.contains_key(&id);
         let human = ours || v.get("isReplay").and_then(Value::as_bool) == Some(true);
-        if human && core.state.goal.is_empty() {
+        // One of kiln's own (keeping it going) stays kiln's, and isn't what the person asked for.
+        let from = if ours { super::core::origin_of(&id) } else if human { "human" } else { "system" };
+        if human && from != "kiln" && core.state.goal.is_empty() {
             core.state.goal = clip_middle(t, 600).0;
             core.touch_state();
         }
@@ -2321,7 +2324,7 @@ impl Claude {
                 images: keep_images,
                 attachments: keep_names,
                 client_id: ours.then(|| id.clone()),
-                origin: Some(if human { "human".into() } else { "system".into() }),
+                origin: Some(from.into()),
             },
         );
     }
@@ -2488,6 +2491,7 @@ impl Claude {
 
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
+        let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
         let u = &mut core.state.usage;
@@ -2535,6 +2539,19 @@ impl Claude {
                 self.notice(core, Level::Error, msg, None);
             }
         }
+        // How it ended, for kiln's keep-going: a stop sequence, running out of output or an error
+        // part-way is a turn cut short, not one that's done.
+        let stop = str_of(v, "stop_reason");
+        let aborted = matches!(str_of(v, "terminal_reason"), Some("aborted_streaming" | "aborted_tools"));
+        let (how, why) = match (sub, stop) {
+            _ if aborted => ("stopped", Some("interrupted")),
+            ("error_max_turns" | "error_max_budget_usd", _) => ("limit", Some(sub)),
+            ("success", None | Some("end_turn")) => ("done", stop),
+            ("success", Some("refusal")) => ("refused", stop),
+            ("success", Some(s)) => ("cut", Some(s)),
+            (s, _) => ("cut", Some(s)),
+        };
+        core.end_turn(started, how, why);
         // A goal it pursued: how it came out is in the transcript.
         if core.state.objective.as_ref().is_some_and(|o| o.status == "active")
             && let Some(session) = core.state.harness_session.clone()
@@ -4057,6 +4074,25 @@ mod tests {
     }
 
     /// A session that has answered initialize (as a Max subscriber) and init.
+    #[test]
+    fn a_turn_ended_by_a_stop_sequence_is_cut_short() {
+        let (mut c, mut core, _) = started();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "carry on".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+        c.line(
+            &mut core,
+            &json!({"type": "assistant", "message": {"id": "msg_9", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "No response requested."}]}, "parent_tool_use_id": null, "session_id": "s1", "uuid": "a9"}).to_string(),
+        );
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "No response requested.", "stop_reason": "stop_sequence", "session_id": "s1"}).to_string());
+        let t = core.state.last_turn.clone().unwrap_or_default();
+        assert_eq!((t.how.as_str(), t.why.as_deref()), ("cut", Some("stop_sequence")));
+        // One that ends as turns do is done; one you stopped is yours.
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "and?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "Done.", "stop_reason": "end_turn", "session_id": "s1"}).to_string());
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("done"));
+        c.line(&mut core, &json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_streaming", "session_id": "s1"}).to_string());
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("stopped"));
+    }
+
     fn started() -> (Claude, Core, Vec<(String, String, Value)>) {
         let mut c = Claude::new(false).with_config_dir("/home/u/.claude".into());
         let mut core = Core::new();

@@ -4,7 +4,9 @@
 //! A function's apply makes Lambda's calls in its order: create the function, or update its code
 //! and then its configuration (each waits for the one before to settle, as Lambda requires), then
 //! publish a version when anything changed. The alias then moves to that version; the URL
-//! follows the alias.
+//! follows the alias. Every update names the `RevisionId` kiln read (and a version the code it
+//! settled), so a change someone made meanwhile is never overwritten or published unseen: Lambda
+//! refuses, and the next sync reads it.
 
 use std::time::Duration;
 
@@ -94,6 +96,27 @@ async fn url(cx: &Cx<'_>, function: &str, qualifier: &str) -> Result<Option<Valu
         Err(e) if AwsError::is_not_found(&e) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Lambda's refusal of an update whose `RevisionId` (or a version's `CodeSha256`) no longer
+/// matches, said as what happened.
+fn changed_meanwhile(e: anyhow::Error, what: &str) -> anyhow::Error {
+    match e.downcast_ref::<AwsError>() {
+        Some(a) if a.code == "PreconditionFailedException" => anyhow::anyhow!("{what} changed while kiln was applying it (Lambda: {}); the next sync reads it again", a.message),
+        _ => e,
+    }
+}
+
+/// The `RevisionId` of a function's configuration or an alias, as Lambda answered.
+fn revision_of(answer: &Value) -> Option<Value> {
+    answer.get("RevisionId").or_else(|| answer.pointer("/Configuration/RevisionId")).filter(|v| v.is_string()).cloned()
+}
+
+fn with_revision(mut body: Value, revision: Option<Value>) -> Value {
+    if let (Value::Object(m), Some(r)) = (&mut body, revision) {
+        m.insert("RevisionId".into(), r);
+    }
+    body
 }
 
 /// `function:qualifier`, as aliases and URLs are named.
@@ -200,17 +223,18 @@ async fn code_location(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     }
 }
 
-/// Waits until the function settles (it isn't pending, nor updating), failing if Lambda says
-/// the change failed.
+/// Waits until the function settles (it isn't being created, updated or deactivated), failing
+/// if Lambda says the change failed or the function is being deleted.
 async fn settle(cx: &Cx<'_>, name: &str) -> Result<Value> {
     until(cx.conn, SETTLE, &format!("function {name} settling"), || async {
         let Some(answer) = get_function(cx, name).await? else { bail!("function {name} is gone") };
         let c = answer.get("Configuration").cloned().unwrap_or(Value::Null);
         let st = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         match (st("State").as_str(), st("LastUpdateStatus").as_str()) {
-            ("Failed", _) => bail!("Lambda failed the function: {}", st("StateReason")),
-            (_, "Failed") => bail!("Lambda failed the update: {}", st("LastUpdateStatusReason")),
-            ("Pending", _) | (_, "InProgress") => Ok(None),
+            ("Failed", _) => bail!("Lambda failed the function: {} {}", st("StateReasonCode"), st("StateReason")),
+            (_, "Failed") => bail!("Lambda failed the update: {} {}", st("LastUpdateStatusReasonCode"), st("LastUpdateStatusReason")),
+            ("Deleting", _) => bail!("function {name} is being deleted"),
+            ("Pending" | "Deactivating", _) | (_, "InProgress") => Ok(None),
             _ => Ok(Some(answer)),
         }
     })
@@ -231,36 +255,42 @@ async fn apply_function(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
             changed = true;
         }
         Some(live) => {
+            // Each update on the revision that just settled (git's code and configuration win
+            // over a change made meanwhile; what gets published is guarded below).
             if !p::code_matches(desired, live) {
-                settle(cx, name).await?;
+                let settled = settle(cx, name).await?;
                 cx.conn.budget().await;
-                aws.rest("lambda", Method::Put, &format!("{}/code", function_path(name)), &[], Some(&p::code_body(desired, &code))).await?;
+                let body = with_revision(p::code_body(desired, &code), revision_of(&settled));
+                aws.rest("lambda", Method::Put, &format!("{}/code", function_path(name)), &[], Some(&body)).await.map_err(|e| changed_meanwhile(e, &format!("function {name}")))?;
                 changed = true;
             }
             if !p::configuration_matches(desired, live) {
-                settle(cx, name).await?;
+                let settled = settle(cx, name).await?;
                 cx.conn.budget().await;
-                aws.rest("lambda", Method::Put, &format!("{}/configuration", function_path(name)), &[], Some(&p::configuration_body(desired))).await?;
+                let body = with_revision(p::configuration_body(desired), revision_of(&settled));
+                aws.rest("lambda", Method::Put, &format!("{}/configuration", function_path(name)), &[], Some(&body)).await.map_err(|e| changed_meanwhile(e, &format!("function {name}")))?;
                 changed = true;
             }
         }
     }
     let settled = settle(cx, name).await?;
     let arn = settled.pointer("/Configuration/FunctionArn").and_then(Value::as_str).unwrap_or_default().to_owned();
+    // A version for each change, and one for a function kiln takes over: exactly what settled,
+    // its code and its revision (before tagging, which isn't part of a version).
+    let sha = settled.pointer("/Configuration/CodeSha256").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut version = record.as_ref().and_then(|r| r.made.get("Version").and_then(Value::as_str).map(str::to_owned));
+    if changed || version.is_none() {
+        cx.conn.budget().await;
+        let body = with_revision(json!({ "CodeSha256": sha }), revision_of(&settled));
+        let v = aws.rest("lambda", Method::Post, &format!("{}/versions", function_path(name)), &[], Some(&body)).await.map_err(|e| changed_meanwhile(e, &format!("function {name}")))?;
+        version = v.get("Version").and_then(Value::as_str).map(str::to_owned);
+    }
     // Tags: kiln's tracking, and the definition's own.
     let want = p::tags_of(desired);
     let have = settled.get("Tags").and_then(Value::as_object).cloned().unwrap_or_default();
     if !arn.is_empty() && want.iter().any(|(k, v)| have.get(k) != Some(v)) {
         cx.conn.budget().await;
         aws.rest("lambda", Method::Post, &format!("/2017-03-31/tags/{}", encode(&arn, false)), &[], Some(&json!({ "Tags": want }))).await?;
-    }
-    // A version for each change, and one for a function kiln takes over.
-    let sha = settled.pointer("/Configuration/CodeSha256").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let mut version = record.as_ref().and_then(|r| r.made.get("Version").and_then(Value::as_str).map(str::to_owned));
-    if changed || version.is_none() {
-        cx.conn.budget().await;
-        let v = aws.rest("lambda", Method::Post, &format!("{}/versions", function_path(name)), &[], Some(&json!({ "CodeSha256": sha }))).await?;
-        version = v.get("Version").and_then(Value::as_str).map(str::to_owned);
     }
     cx.record(GROUP, "Function", "", name, Some(applied(desired, json!({ "CodeSha256": sha, "Version": version, "FunctionArn": arn })))).await?;
     function(cx, name).await?.ok_or_else(|| anyhow::anyhow!("function {name} is gone"))
@@ -286,9 +316,11 @@ async fn apply_alias(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let path = format!("{}/aliases", function_path(function));
     cx.conn.budget().await;
     let answer = match aws.rest("lambda", Method::Get, &format!("{path}/{}", encode(name, false)), &[], None).await {
-        Ok(_) => {
+        Ok(read) => {
+            // On the alias as kiln read it: a rollout or a person moving it meanwhile wins.
             cx.conn.budget().await;
-            aws.rest("lambda", Method::Put, &format!("{path}/{}", encode(name, false)), &[], Some(&body)).await?
+            let body = with_revision(body, revision_of(&read));
+            aws.rest("lambda", Method::Put, &format!("{path}/{}", encode(name, false)), &[], Some(&body)).await.map_err(|e| changed_meanwhile(e, &format!("alias {function}:{name}")))?
         }
         Err(e) if AwsError::is_not_found(&e) => {
             if let Value::Object(m) = &mut body {
@@ -452,6 +484,16 @@ mod tests {
             }
             apply(&cx, &f3).await?;
             assert_eq!(fake.state.lock().calls.iter().filter(|c| c.starts_with("PutObject")).count(), 1);
+
+            // Someone moves the alias right after kiln reads it: kiln's update names the revision
+            // it read, so Lambda refuses it, and their change stands until the next sync.
+            fake.state.lock().race = Some("thumbs:live".into());
+            let refused = apply(&cx, &a2).await;
+            fake.state.lock().race = None;
+            assert!(refused.is_err_and(|e| e.to_string().contains("alias thumbs:live changed while kiln was applying it")));
+            let now = fake.state.lock().functions.get("thumbs").and_then(|f| f.aliases.get("live").cloned()).unwrap_or_default();
+            assert_eq!(now.pointer("/RoutingConfig/AdditionalVersionWeights/1"), Some(&json!(0.5)), "their change stands");
+            apply(&cx, &a2).await?;
 
             // Gone: the alias, then the function; their records with them.
             delete(&cx, &key_of(&a2)).await?;

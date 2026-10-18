@@ -764,6 +764,7 @@ async fn resources(cx: Cx, v: Value) -> Out {
                 "group": r.key.group.as_ref(), "kind": r.key.kind.as_ref(), "namespace": r.key.namespace.as_ref(), "name": r.key.name.as_ref(),
                 "sync": if r.hook { "Hook" } else { r.sync.as_str() }, "missing": r.missing, "requires_pruning": r.requires_pruning,
                 "health": r.health.map(|h| h.as_str()), "message": r.message, "hook": r.hook, "why": r.why,
+                "tracked_by": r.tracked_by.as_deref(), "shared_with": r.shared_with.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), "marks_only": r.marks_only,
             })
         })
         .collect();
@@ -780,12 +781,25 @@ async fn diff(cx: Cx, v: Value) -> Out {
             e.resources(&key)
                 .into_iter()
                 .filter(|r| r.sync != Sync::Synced && !r.hook)
-                .filter_map(|r| e.change(&key, &r.key).map(|c| (r.key, r.why, c)))
+                .filter_map(|r| e.change(&key, &r.key).map(|c| (r, c)))
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
-    let out: Vec<Value> = changes.into_iter().map(|(k, why, c)| change_json(&k, why, c)).collect();
+    let out: Vec<Value> = changes
+        .into_iter()
+        .map(|(r, c)| {
+            let mut d = change_json(&r.key, r.why.clone(), c);
+            // What kind of fix it needs: a sync creates it, prunes it, takes it over, or changes it.
+            if let Some(m) = d.as_object_mut() {
+                m.insert("missing".into(), json!(r.missing));
+                m.insert("requires_pruning".into(), json!(r.requires_pruning));
+                m.insert("tracked_by".into(), json!(r.tracked_by.as_deref()));
+                m.insert("marks_only".into(), json!(r.marks_only));
+            }
+            d
+        })
+        .collect();
     Ok(json!({"diffs": out}))
 }
 

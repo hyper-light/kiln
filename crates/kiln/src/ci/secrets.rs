@@ -350,18 +350,27 @@ pub async fn record_uses(hub: &Hub, leg: &str, ids: Vec<String>) -> anyhow::Resu
         return Ok(());
     }
     let leg = leg.to_owned();
-    hub.store
+    let l = leg.clone();
+    let names: Vec<String> = hub
+        .store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = crate::util::now_unix();
+            let mut names = Vec::new();
             for id in &ids {
-                tx.execute("INSERT OR REPLACE INTO ci_secret_uses (secret_id, leg_id, ts) VALUES (?1, ?2, ?3)", params![id, leg, now])?;
+                tx.execute("INSERT OR REPLACE INTO ci_secret_uses (secret_id, leg_id, ts) VALUES (?1, ?2, ?3)", params![id, l, now])?;
                 tx.execute("UPDATE ci_secrets SET last_used_at = ?2 WHERE id = ?1", params![id, now])?;
+                if let Some(n) = tx.query_row("SELECT name FROM ci_secrets WHERE id = ?1", [id], |r| r.get::<_, String>(0)).optional()? {
+                    names.push(n);
+                }
             }
             tx.commit()?;
-            Ok(())
+            Ok(names)
         })
-        .await
+        .await?;
+    // A secret's use is audited (W19-R05): which leg was given which, by name.
+    hub.store.audit(format!("job:{leg}"), "ci.secrets.use".into(), names.join(", ")).await;
+    Ok(())
 }
 
 /// Re-seals every secret under a new data key and retires the old ones: how many moved.

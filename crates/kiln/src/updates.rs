@@ -1861,13 +1861,22 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
 }
 
 /// The service a runner process belongs to: the one it replaces (a runner set up beside another
-/// upgrades in place through that), else its own unit (Linux: from its cgroup), else the default.
+/// upgrades in place through that), else its own unit (Linux: from its cgroup; macOS: from the
+/// label of the launchd job that started it), else the default.
 pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
     if let Some(id) = instance
         && let Ok(b) = std::fs::read(crate::upgrade::instance_dir(state_dir, id).join("replaces.json"))
         && let Ok(r) = serde_json::from_slice::<crate::upgrade::Replaces>(&b)
     {
         return r.unit;
+    }
+    // launchd names its job here (`io.github.hyper-light.<unit>`); a runner started otherwise
+    // (by hand, from a terminal) has "0" or nothing.
+    if cfg!(target_os = "macos")
+        && let Some(unit) = std::env::var("XPC_SERVICE_NAME").ok().and_then(|l| l.strip_prefix("io.github.hyper-light.").map(str::to_owned))
+        && unit.starts_with("kiln")
+    {
+        return unit;
     }
     #[cfg(target_os = "linux")]
     if let Ok(cg) = std::fs::read_to_string("/proc/self/cgroup")

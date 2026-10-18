@@ -142,20 +142,31 @@ impl Handle {
     }
 }
 
-/// Take over a session a previous image of this process handed over: its master (already
-/// non-blocking) and its shell, which is still our child. Output and the exit status flow as for
-/// a spawned session.
+/// Take over a session handed over before this process started, or by another runner process of
+/// this machine: its master (already non-blocking) and its shell. After a re-exec the shell is
+/// still our child; after a handover to a fresh process (macOS) it is not (its parent was the
+/// runner before this one), so its exit is seen without a status. `foreign`: another runner of
+/// this machine still reaps it (a blue/green handover), so its exit is only watched. Output and
+/// the exit flow as for a spawned session.
 pub fn adopt(fd: OwnedFd, pid: u32, foreign: bool, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) -> Handle {
+    // Nothing this process starts (a job, another shell) may inherit this terminal.
+    let _ = crate::os::close_on_exec(&fd);
     let fd = Arc::new(fd);
     let stop = async_channel::bounded(1);
     pump(&fd, &out, input, stop.1.clone());
     crate::rt::spawn(async move {
-        // A shell another runner of this machine started (handed over) isn't ours to reap.
         let code = if foreign {
             crate::os::proc::wait_foreign_exit(pid).await;
             None
         } else {
-            wait_pid_exit(pid, || crate::os::try_reap(pid).map(|st| st.map(|(code, _)| code))).await.ok().flatten()
+            wait_pid_exit(pid, || match crate::os::try_reap(pid) {
+                Ok(st) => Ok(st.map(|(code, _)| code)),
+                Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD) => Ok((!crate::os::pid_alive(pid)).then_some(None)),
+                Err(e) => Err(e),
+            })
+            .await
+            .ok()
+            .flatten()
         };
         crate::rt::sleep(Duration::from_millis(50)).await;
         let _ = out.send(PtyOut::Exit(code)).await;

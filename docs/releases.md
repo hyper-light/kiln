@@ -149,3 +149,36 @@ curl -fsSL http://server:7070/install.sh | sh -s -- --join          # Linux, mac
 
 Windows (PowerShell): download `http://server:7070/dl/kiln/x86_64-pc-windows-msvc` to `kiln.exe`
 and run `kiln.exe join --server http://server:7070`.
+
+## Upgrading a runner
+
+A runner takes a new binary up once no job runs on it, and keeps its terminals; agent sessions
+continue in the new binary. Before switching, it checks the new binary starts (`kiln --version`);
+one that doesn't is never switched to.
+
+- **Linux:** the runner re-executes itself in place (same process), and so does its supervisor.
+- **macOS:** nothing re-executes itself. macOS's local network privacy stops recognising a
+  process that replaced its own image, so after an in-place upgrade the runner's connections to
+  the server failed with "No route to host" until kiln was started afresh. Instead, the runner
+  hands its terminals to its supervisor (`kiln supervise`) and exits, and the supervisor starts the
+  new binary as a fresh process that takes them over.
+- **Windows:** the supervisor restarts the runner (and its terminals).
+
+On macOS the launchd job (`~/Library/LaunchAgents/io.github.hyper-light.kiln-agent.plist`) runs a
+launcher, `~/.local/share/kiln/launcher/kiln-agent`: a copy of kiln that upgrades never replace,
+running the `kiln` they do (`~/.local/bin/kiln`) with `supervise --exe`. kiln's macOS builds are
+ad hoc signed, so to macOS every build is a new program; a job that ran the new build itself would
+be blocked from the local network after every upgrade until someone allowed it again. macOS asks
+once ("kiln-agent would like to find devices on your local network") the first time the launcher
+runs; allow it. `kiln install --agent` and `kiln join` make the launcher and keep one that works,
+and an older runner, from before launchers, has launchd start it afresh from one at its next
+upgrade. If the launchd job can't be loaded, they say why; a runner they start outside launchd
+instead stops at logout.
+
+A Mac where nobody can answer that question (a CI machine) can let every program reach the kiln
+server's network instead (macOS 15.5 or later; restart afterwards):
+
+```sh
+sudo defaults write com.apple.network.local-network AllowedEthernetLocalNetworkAddresses -array "192.168.1.0/24"
+sudo defaults write com.apple.network.local-network AllowedWiFiLocalNetworkAddresses -array "192.168.1.0/24"
+```

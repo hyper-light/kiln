@@ -311,6 +311,11 @@ struct State {
     /// Step outputs (step id, name) that feed a secret job output (W04-R22): masked the moment
     /// their step ends, so they're never reported or kept in the clear.
     sensitive: std::collections::BTreeSet<(String, String)>,
+    /// Its integrations, prepared (W11-R03), by name; and the ID token files kept fresh.
+    integrations: BTreeMap<String, super::auth::Applied>,
+    refresh: Option<std::sync::Arc<super::auth::Refresh>>,
+    /// Where the runner put its own binary, for `kiln auth` (W11-R04), last on steps' `PATH`.
+    kiln_bin: Option<PathBuf>,
 }
 
 /// A background step that finished, and what it changed: applied to the leg at its `wait`, in
@@ -640,6 +645,96 @@ impl Leg {
         }
     }
 
+    /// Prepares the leg's integrations (W11-R03): their files and variables, their ID tokens
+    /// minted and kept fresh, their secrets masked. The job's go into its environment under its
+    /// own `env`; a step's wait for that step; `kiln/auth@v1` exports one from its step on. The
+    /// list goes to `$KILN_INTEGRATIONS` for `kiln auth` (W11-R04).
+    async fn integrations(&self, st: &mut State) -> bool {
+        let a = &self.a;
+        let dir = st.layout.temp.join("_kiln_integrations");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.note(0, &format!("Error: the integrations' directory: {e}")).await;
+            return false;
+        }
+        let map = st.containers.as_ref().and_then(|c| c.job.as_ref()).map(|j| j.map.clone());
+        let seen = |p: &Path| map.as_ref().map_or_else(|| p.to_string_lossy().into_owned(), |m| m.translate(&p.to_string_lossy()));
+        let number = a.contexts.github.get("run_number").map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned)).unwrap_or_default();
+        let session = format!("kiln-{}-{number}", a.repo);
+        for i in &a.integrations {
+            let applied = match super::auth::apply(i, &dir, &session, &seen) {
+                Ok(x) => x,
+                Err(e) => {
+                    self.note(0, &format!("Error: {e:#}")).await;
+                    return false;
+                }
+            };
+            for m in &applied.masks {
+                self.mask(st, m).await;
+            }
+            if !applied.tokens.is_empty() {
+                let (Some(url), Some(token)) = (a.runtime.id_token_url.clone(), a.runtime.id_token_request_token.clone()) else {
+                    self.note(0, &format!("Error: `{}` federates with kiln's ID token, and this leg gets none (`permissions: id-token: write`)", i.name)).await;
+                    return false;
+                };
+                let refresh = std::sync::Arc::clone(st.refresh.get_or_insert_with(|| super::auth::Refresh::start(std::sync::Arc::clone(&self.http), url, token)));
+                match refresh.add(&applied.tokens).await {
+                    Ok(minted) => {
+                        for t in minted {
+                            self.mask(st, &t).await;
+                        }
+                    }
+                    Err(e) => {
+                        self.note(0, &format!("Error: `{}`: {e:#}", i.name)).await;
+                        return false;
+                    }
+                }
+            }
+            if i.job {
+                for (k, v) in &applied.env {
+                    st.env.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            let names: Vec<&str> = applied.env.keys().map(String::as_str).collect();
+            self.note(0, &format!("{} ({}){}: {}", i.name, i.kind, if i.job { "" } else { ", for its steps" }, names.join(", "))).await;
+            st.integrations.insert(i.name.clone(), applied);
+        }
+        // For `kiln auth`: the leg's integrations, readable by this user alone, and the binary.
+        st.kiln_bin = super::auth::place_binary(&self.work_dir);
+        let list = dir.join("integrations.json");
+        if serde_json::to_vec(&a.integrations).ok().is_some_and(|b| super::auth::write_private(&list, &b).is_ok()) {
+            st.env.insert("KILN_INTEGRATIONS".into(), list.to_string_lossy().into_owned());
+        }
+        true
+    }
+
+    /// Masks `value` here and on the server.
+    async fn mask(&self, st: &mut State, value: &str) {
+        if st.masker.add(value) {
+            self.event(&JobEventV2::Mask { value_sha256: crate::util::sha256_hex(value.as_bytes()) }).await;
+        }
+    }
+
+    /// What this leg runs on, for comparing runs (docs/ci.md W19-R03): the machine, this
+    /// runner's version, the executor, the containers' images, and the job's environment with
+    /// its secrets masked. Best effort: a server that doesn't take it loses only the comparison.
+    async fn report_facts(&self, st: &State) {
+        let images = match &st.containers {
+            Some(c) => c.images().await,
+            None => Vec::new(),
+        };
+        let env: BTreeMap<&String, String> = st.env.iter().map(|(k, v)| (k, crate::util::truncate(&st.masker.mask(v), 1000).to_owned())).collect();
+        let body = serde_json::json!({
+            "machine": fingerprint(&self.a.executor.kind), "version": env!("CARGO_PKG_VERSION"), "executor": self.a.executor.kind,
+            "images": images.iter().map(|(role, image, id)| serde_json::json!({ "role": role, "image": image, "id": id })).collect::<Vec<_>>(),
+            "env": env,
+        });
+        let url = format!("{}/_kiln/facts", self.a.runtime.results_url.trim_end_matches('/'));
+        let Ok(body) = serde_json::to_vec(&body) else { return };
+        if let Err(e) = self.http.post(&url).bearer(&self.a.runtime.runtime_token).header("content-type", "application/json").body(body).timeout(Duration::from_secs(20)).send().await {
+            tracing::debug!(leg = %self.a.job_id, error = %format!("{e:#}"), "the leg's facts weren't reported");
+        }
+    }
+
     async fn note(&self, idx: u32, text: &str) {
         self.up.note(&self.a.job_id, idx, text).await;
     }
@@ -805,6 +900,9 @@ impl Leg {
             step_json: BTreeMap::new(),
             run_env: Vec::new(),
             sensitive: secret_feeds(a, dialect),
+            integrations: BTreeMap::new(),
+            refresh: None,
+            kiln_bin: None,
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -829,6 +927,13 @@ impl Leg {
         let mut timed_out = false;
         let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
         if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {
+            if let Some(c) = &st.containers {
+                c.stop().await;
+            }
+            return Ok(Status::Failed);
+        }
+        self.report_facts(&st).await;
+        if !a.integrations.is_empty() && !self.integrations(&mut st).await {
             if let Some(c) = &st.containers {
                 c.stop().await;
             }
@@ -1142,6 +1247,12 @@ impl Leg {
     /// continue-on-error, run, environment files, outcome and conclusion.
     /// `nested`: a composite action's step, which reports into its caller's step.
     async fn step(&self, st: &mut State, idx: u32, step: &Step, job_deadline: Instant, nested: bool) -> Option<End> {
+        // ID tokens minted since the last step (W11-R03): masked before it can print them.
+        if let Some(r) = st.refresh.clone() {
+            for t in r.take_fresh() {
+                self.mask(st, &t).await;
+            }
+        }
         let id = step.id.clone();
         // Without a `name`, GitHub titles a step from its evaluated script's first line.
         let fallback_name = match (&step.run, &step.uses) {
@@ -1187,6 +1298,12 @@ impl Leg {
         let fail = |e: String| e;
         let prepared = (|| -> Result<_, String> {
             let mut env = st.env.clone();
+            // The step's own integrations (W11-R03), under its `env`.
+            for n in &step.kiln.integrations {
+                if let Some(x) = st.integrations.get(n) {
+                    env.extend(x.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+            }
             for (k, t) in &step.env {
                 env.insert(k.clone(), st.render(t, Site::StepEnv, &format!("env.{k}"))?);
             }
@@ -1607,7 +1724,11 @@ impl Leg {
         env.insert("KILN_LEG".into(), self.a.job_id.clone());
         let sep = if cfg!(windows) { ';' } else { ':' };
         let base_path = std::env::var("PATH").unwrap_or_default();
-        env.insert("PATH".into(), st.path.apply(env.get("PATH").map_or(base_path.as_str(), String::as_str), sep));
+        let mut path = st.path.apply(env.get("PATH").map_or(base_path.as_str(), String::as_str), sep);
+        if let Some(d) = &st.kiln_bin {
+            path = format!("{path}{sep}{}", d.to_string_lossy());
+        }
+        env.insert("PATH".into(), path);
         let mut container_run: Option<(super::docker::Cli, String, Option<String>, Vec<String>)> = None;
         let (prog, args) = match (what, &file) {
             (Run::Script { .. }, Some(f)) => shell_command(shell, f).map_err(|e| anyhow::anyhow!(e))?,
@@ -1636,7 +1757,11 @@ impl Leg {
         } else if let Some((cli, j)) = job_container {
             // A job container's step: `docker exec`, paths translated (W13-R08).
             let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), j.map.translate(v))).collect();
-            inner.insert("PATH".into(), st.path.apply(&j.path, ':'));
+            let mut path = st.path.apply(&j.path, ':');
+            if let Some(d) = &st.kiln_bin {
+                path = format!("{path}:{}", j.map.translate(&d.to_string_lossy()));
+            }
+            inner.insert("PATH".into(), path);
             inner.insert("HOME".into(), j.home.clone());
             let args: Vec<String> = args.iter().map(|a| j.map.translate(a)).collect();
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
@@ -2303,6 +2428,21 @@ impl Leg {
                     anyhow::bail!("no test report matched `{}`", get("path").unwrap_or_default());
                 }
                 !(fail_on && r.failed > 0 && !excused)
+            }
+            "auth" => {
+                // Prepared when the leg started (its files, its tokens kept fresh): its
+                // variables from here on, as `$GITHUB_ENV` lines would set them.
+                let name = get("integration").unwrap_or_default();
+                let Some(x) = st.integrations.get(&name).cloned() else { anyhow::bail!("no integration `{name}` for this leg") };
+                let kind = self.a.integrations.iter().find(|i| i.name == name).map(|i| i.kind.clone()).unwrap_or_default();
+                for (k, v) in &x.env {
+                    st.env.insert(k.clone(), v.clone());
+                }
+                let names: Vec<String> = x.env.keys().cloned().collect();
+                self.note(idx, &format!("{name} ({kind}): {}", names.join(", "))).await;
+                outputs.insert("kind".to_owned(), kind);
+                outputs.insert("env".to_owned(), names.join(","));
+                true
             }
             "notify" => {
                 let to: Vec<String> = get("to").unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();

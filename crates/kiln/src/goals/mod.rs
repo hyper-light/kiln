@@ -11,6 +11,7 @@
 //! composer) joins its stack, so it's kept the same way. The server keeps the stacks and drives
 //! them (`run`), so they go on with no console open and across restarts.
 
+pub mod keep;
 pub mod ops;
 
 use std::sync::Arc;
@@ -396,11 +397,18 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
             })
             .await
             .unwrap_or_default();
-        for agent in running {
-            if let Err(e) = step(&hub, &agent).await {
+        for agent in &running {
+            if let Err(e) = step(&hub, agent).await {
                 tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
             }
         }
+        // The agents no goal stack drives: kept going when they stop part-way (`keep`).
+        let now = now_ms();
+        let all = hub.harness.list();
+        for info in all.iter().filter(|i| !running.contains(&i.id)) {
+            keep::tick(&hub, info, now).await;
+        }
+        keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
     }
 }
 

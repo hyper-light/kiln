@@ -226,7 +226,8 @@ export const api = {
   /** Connected runners too old to report AI sessions. */
   aiSilent: (signal?: AbortSignal) => get<{ machines: string[] }>("/api/ai-sessions/silent", signal),
   aiTranscript: (machine: string, pid: number, signal?: AbortSignal) => get<AiTranscriptEntry[]>(`/api/ai-sessions/${enc(machine)}/${pid}/transcript`, signal),
-  audit: (limit = 200, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit })}`, signal),
+  /** The audit log, filtered by any of its fields (exact values, comma-separated for any of), `q` and `since`. */
+  audit: (filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit: 300, ...filters })}`, signal),
 
   /** Settings → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
   updates: (signal?: AbortSignal) => get<UpdatesOverview>("/api/updates", signal),

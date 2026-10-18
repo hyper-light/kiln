@@ -80,8 +80,28 @@ pub struct AssignmentV2 {
     /// quarantined passes, with a warning.
     #[serde(default)]
     pub quarantine: bool,
+    /// kiln (W11-R03): the integrations its job, its steps and its `kiln/auth@v1` steps name.
+    #[serde(default)]
+    pub integrations: Vec<Integration>,
     pub debug: Debug,
     pub limits: Limits,
+}
+
+/// An integration a leg authenticates to (W11-R03): what the runner needs to give its steps the
+/// provider's own federation files and variables, or its stored token.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Integration {
+    pub name: String,
+    pub kind: String,
+    /// `oidc` (exchanged with the leg's ID token) or `token` (stored).
+    pub mode: String,
+    /// Its configuration, without secrets: a role, a provider, a tenant, a registry…
+    pub config: serde_json::Value,
+    /// A stored token or key (masked).
+    pub token: Option<String>,
+    /// The job's own `integrations:` named it: every step gets it.
+    pub job: bool,
 }
 
 /// The leg itself.

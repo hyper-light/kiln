@@ -15,11 +15,11 @@ for (const r of runs.runs) {
   const run = await kiln.ci.runs.get({ run: r.id });
   for (const l of run.legs.filter(l => ["failure", "timed_out", "startup_failure"].includes(l.conclusion))) {
     const leg = await kiln.ci.legs.get({ leg: l.id });
-    const step = leg.steps.find(s => s.conclusion === "failure");
-    const log = step ? (await kiln.ci.legs.logs({ leg: l.id, step: step.idx })).text : "";
+    // The failed step's log from just before its first error line.
+    const ex = await kiln.ci.legs.failure_excerpt({ leg: l.id, lines: 30 });
     out.push({
       run: r.number, workflow: r.workflow, sha: r.sha, leg: l.key, id: l.id, error: l.error,
-      step: step?.name, tail: log.split("\n").slice(-25).join("\n"),
+      step: ex.step_name, excerpt: ex.lines.map(x => x.text).join("\n"),
       annotations: leg.annotations.filter(a => a.level === "error").map(a => a.message),
     });
   }
@@ -38,8 +38,19 @@ that starts at a commit and stays is a regression.
 - **Infrastructure**: a runner, network or registry problem: `ci.legs.routing` explains a leg
   that waits (no runner meets its requirements, a capability missing); a step dies with DNS
   errors, `429`/rate limits, disk full, or the runner disconnecting.
-- **Regression**: it started at a commit. Compare that commit with the last green run of the
-  workflow on the branch, and name the change that did it.
+- **Regression**: it started at a commit. Compare the run with the last green run of the
+  workflow on the branch, and name the change that did it:
+
+  ```js
+  const c = await kiln.ci.runs.compare({ run: input.run }); // other: "last-green"
+  return { differences: c.differences, files: c.files, slower: c.legs.flatMap(l => l.steps.filter(s => s.a !== null && s.b !== null && s.b > 2 * s.a + 5).map(s => ({ leg: l.key, ...s }))) };
+  ```
+
+  `differences` names the actions, variables, environment, images, machines and caches that
+  changed; `files` the commits' changed files.
+- **When did it start, how often?** Search the logs across runs for the error's text:
+  `kiln.ci.logs.search({ q: "error[E0308]", repo: input.repo, days: 30 })`, newest first. Hits
+  on unchanged code across days say flaky; hits only after one commit say regression.
 - **Pipeline error**: the workflow itself: a run that fails before any job (`startup_failure`,
   its `error` lists diagnostics with codes and positions), a bad expression, a missing secret
   (`KCI4040`), an action that doesn't resolve. Validate before proposing a fix:

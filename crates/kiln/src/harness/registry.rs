@@ -155,6 +155,8 @@ pub struct Registry {
     kinds: Mutex<HashMap<String, Vec<KindInfo>>>,
     /// The server's own sessions.
     pub local: Arc<Host>,
+    /// The server's conversation store (docs/conversations.md), when it's on.
+    pub convo: Option<crate::convo::store::Store>,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -168,6 +170,9 @@ pub struct Registry {
     /// takes its name here at once, whatever its machine's runner knows of names (one from before
     /// kiln named sessions never reports it), and keeps it across restarts.
     names: Mutex<HashMap<String, String>>,
+    /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
+    /// control), kept in `keep-off.json` so it holds across restarts.
+    keep_off: Mutex<std::collections::HashSet<String>>,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -199,16 +204,21 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
 impl Registry {
     pub fn new(dir: std::path::PathBuf) -> Self {
         let (tx, rx) = async_channel::bounded(8192);
+        // Every session's conversation, on every machine, kept on disk as it comes in
+        // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
+        let convo = crate::convo::open(&dir);
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             kinds: Mutex::new(HashMap::new()),
             local,
+            convo,
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
         }
@@ -216,17 +226,43 @@ impl Registry {
 
     fn save_names(&self) {
         let names = self.names.lock().clone();
-        let path = self.dir.join("names.json");
-        let write = || -> anyhow::Result<()> {
-            std::fs::create_dir_all(&self.dir)?;
-            let tmp = path.with_extension("json.part");
-            std::fs::write(&tmp, serde_json::to_vec(&names)?)?;
-            std::fs::rename(&tmp, &path)?;
-            Ok(())
-        };
-        if let Err(e) = write() {
+        if let Err(e) = self.keep_json("names.json", &names) {
             tracing::warn!(error = %format!("{e:#}"), "couldn't keep the agents' names");
         }
+    }
+
+    /// `value` as `file` in the registry's folder, whole or not at all.
+    fn keep_json(&self, file: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        let path = self.dir.join(file);
+        std::fs::create_dir_all(&self.dir)?;
+        let tmp = path.with_extension("json.part");
+        std::fs::write(&tmp, serde_json::to_vec(value)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Whether kiln keeps a session going when it stops part-way (the "keep_going" control, from
+    /// any device): kept here, so it holds across restarts whatever its machine's runner knows.
+    fn set_keep_going(&self, hub: &Hub, id: &str, on: bool) {
+        let off: Vec<String> = {
+            let mut g = self.keep_off.lock();
+            if on {
+                g.remove(id);
+            } else {
+                g.insert(id.to_owned());
+            }
+            g.iter().cloned().collect()
+        };
+        if let Err(e) = self.keep_json("keep-off.json", &off) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't keep which agents kiln doesn't keep going");
+        }
+        let info = {
+            let mut g = self.mirrors.lock();
+            let Some(m) = g.get_mut(id) else { return };
+            m.info.keep_off = !on;
+            m.info.clone()
+        };
+        hub.emit(&json!({"type": "harness", "info": info}));
     }
 
     /// A session is given a name here (the "rename" control from any device; empty gives it its
@@ -283,7 +319,7 @@ impl Registry {
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
         RESTORED.call_once(|| {
-            hub.harness.local.restore();
+            hub.harness.local.restore_from(hub.harness.convo.as_ref());
             match super::socket::serve(&hub.harness.local, super::socket::path("server", &hub.harness.dir)) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
@@ -372,10 +408,14 @@ impl Registry {
                 if let Some(n) = self.names.lock().get(id) {
                     info.name.clone_from(n);
                 }
+                info.keep_off = self.keep_off.lock().contains(id);
                 Update::Open { info }
             }
             other => other,
         };
+        if let Some(store) = &self.convo {
+            store.send(id, &u);
+        }
         {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {
@@ -674,6 +714,8 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        last_turn: None,
+                        keep_off: false,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);
@@ -764,6 +806,13 @@ impl Registry {
     /// A command for a session, from any device.
     pub async fn command(&self, hub: &Hub, id: &str, c: Command) -> Sent {
         let Some(loc) = self.location(id) else { return Sent::NoSession };
+        // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
+        if let Command::Control { id: control, value } = &c
+            && control == "keep_going"
+        {
+            self.set_keep_going(hub, id, value.as_ref().and_then(Value::as_bool).unwrap_or(true));
+            return Sent::Ok;
+        }
         // A name is kept here: the session takes it at once, whatever its machine can do (and
         // its harness names its conversation too, where it does).
         let renamed = matches!(&c, Command::Control { id: control, .. } if control == "rename");

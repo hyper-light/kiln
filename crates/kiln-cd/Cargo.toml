@@ -24,6 +24,9 @@ toml = "1.1.8"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 futures = "0.3.34"
 tracing = "0.1.44"
+# Argo CD's health checks are gopher-lua's Lua: 5.1 with 5.2's goto. Lua 5.2 is that (doubles only, goto),
+# built from source (zig cross-builds it like any C); 5.1's table.getn and unpack are shimmed.
+mlua = { version = "0.12.2", features = ["lua52", "vendored", "send", "serde"] }
 
 [dependencies.mimalloc]
 version = "0.1"

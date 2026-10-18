@@ -18,7 +18,7 @@ import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
-import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, criticalKeys, EditWorkflowLink } from "./ci";
+import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
 
 const LogViewer = React.lazy(() => import("./log-viewer"));
@@ -164,7 +164,11 @@ function RunBody({ id }: { id: string }) {
         {ciDetail ? (
           <div className="flex flex-col items-start gap-3 md:items-end">
             <AttemptSelect current={ciDetail.run.attempt} shown={shownAttempt} onChange={setAttempt} />
-            <EditWorkflowLink detail={ciDetail} />
+            <div className="flex flex-wrap gap-4">
+              <EditWorkflowLink detail={ciDetail} />
+              <WorkflowInsightsLink detail={ciDetail} />
+              <CompareLink detail={ciDetail} />
+            </div>
             {shownAttempt === ciDetail.run.attempt && <CiRunActions detail={ciDetail} jobs={[...new Set(ciDetail.legs.map((l) => (l.job ?? "").split("/")[0] ?? "").filter((j) => j !== ""))]} />}
           </div>
         ) : (
@@ -349,7 +353,10 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
   const planned = useSuspenseResource(`job/${job.id}`, (s) => api.job(job.id, s)).data;
   const spec = job.spec ?? planned.spec;
   const [specOpen, setSpecOpen] = React.useState(false);
-  const [open, setOpen] = React.useState<Set<number>>(() => defaultOpen(job));
+  // `?step=` (a log search's hit) opens that step too.
+  const [search] = useSearchParams();
+  const asked = search.get("step");
+  const [open, setOpen] = React.useState<Set<number>>(() => (asked !== null && Number.isInteger(Number(asked)) ? new Set([...defaultOpen(job), Number(asked)]) : defaultOpen(job)));
 
   // A step that starts running opens (the job is followed as it goes).
   const running = job.steps.find((s) => s.status === "running")?.idx ?? null;

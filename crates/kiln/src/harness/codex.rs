@@ -1114,7 +1114,8 @@ impl Codex {
     fn show_sent(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments: names });
+        core.note_sent(&m.id);
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
         core.touch_state();
     }
 
@@ -1981,6 +1982,13 @@ impl Codex {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
                 self.turn = None;
+                // How it ended, for kiln's keep-going.
+                let how = match status {
+                    "completed" => "done",
+                    "interrupted" => "stopped",
+                    _ => "cut",
+                };
+                core.end_turn(core.state.turn_started, how, Some(status));
                 core.state.turn_started = None;
                 core.state.doing = None;
                 core.state.usage.turns += 1;
@@ -2840,6 +2848,8 @@ mod tests {
         let said = "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.";
         let before = Core::now();
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "failed", "items": [], "error": {"message": said, "codexErrorInfo": "usageLimitExceeded"}}}})]);
+        // A failed turn is cut short (the pause, not keep-going, takes it from here).
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref())), Some(("cut", Some("failed"))));
         let p = core.state.pause.clone().ok_or_else(|| anyhow::anyhow!("not paused"))?;
         let wait = 2 * 3_600_000 + 13 * 60_000;
         assert!(p.until.is_some_and(|u| u >= before + wait && u <= Core::now() + wait), "{p:?}");
@@ -2934,6 +2944,8 @@ mod tests {
         assert_eq!(core.state.status, Status::Idle);
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         assert_eq!(core.state.usage.context_window, Some(1000));
+        // How the turn ended, for kiln's keep-going: done, with its command among its tools.
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref(), t.tools)), Some(("done", Some("completed"), 1)));
         assert_eq!(core.state.summary, "Removed build/.");
         Ok(())
     }

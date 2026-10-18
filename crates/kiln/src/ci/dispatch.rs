@@ -140,8 +140,15 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, local: bool) -> LegIn 
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
         group,
         retry,
+        cost: r.costs.get(&spec.job).copied(),
         ..LegIn::default()
     }
+}
+
+/// The scheduler's settings: `[ci.scheduler]`, `[ci.fairness]` and the routing rules.
+fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config {
+    let (s, f) = (&hub.cfg.ci.scheduler, &hub.cfg.ci.fairness);
+    Config { rules, aging_per_minute: s.aging_per_minute, default_cost: s.default_cost_seconds, weights: f.weights.clone(), quotas: f.quotas.clone(), ..Config::default() }
 }
 
 /// The hub's handle on the dispatcher.
@@ -238,6 +245,8 @@ struct RunSt {
     given: Given,
     /// The timing table its shards were balanced by (W16-R06), saved with its input.
     timing: Arc<HashMap<String, f64>>,
+    /// Each job's median seconds lately: what the scheduler expects its legs to cost (W05-R10).
+    costs: Arc<HashMap<String, f64>>,
 }
 
 /// A leg the scheduler has.
@@ -336,6 +345,8 @@ pub fn spawn(hub: Arc<Hub>) {
     hub.ci.on.store(true, Ordering::Relaxed);
     super::services::spawn_maintenance(Arc::clone(&hub));
     super::webhooks::spawn(Arc::clone(&hub));
+    super::insights::spawn(Arc::clone(&hub));
+    super::logsearch::spawn(Arc::clone(&hub));
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {
@@ -348,7 +359,7 @@ pub fn spawn(hub: Arc<Hub>) {
         }
         let sources = super::routing::sources(&hub).await;
         let rules = sources.effective();
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(sched_config(&hub, rules)), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -485,6 +496,10 @@ impl Dispatch {
         let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: None };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         for (leg, attempt) in gone {
+            let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some("the runner lost it".into()), peak_rss: None, cpu_seconds: None };
+            if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, end).await {
+                tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the attempt could not be recorded");
+            }
             cmds.extend(self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) }, now_ms()));
         }
         self.commands(cmds).await;
@@ -560,7 +575,8 @@ impl Dispatch {
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing };
+        let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
+        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, costs };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
@@ -854,7 +870,8 @@ impl Dispatch {
         };
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let path = run_path(&github);
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing) };
+        let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -993,6 +1010,17 @@ impl Dispatch {
         let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Its integrations (W11-R03); one it may not use fails it before it starts.
+        match self.leg_integrations(l, r, a.runtime.id_token_url.is_some()).await {
+            Ok(list) => a.integrations = list,
+            Err(m) => {
+                runs::annotation(&self.hub, leg, None, "error", Some("integrations".into()), &m, None, None, None, None, None).await?;
+                let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
+                let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
+                Box::pin(self.commands(cmds)).await;
+                return Ok(());
+            }
+        }
         // Its deployment (W15-R04), unless `deployment: false`.
         let deploys = l.deployment.is_none() && l.spec.environment.as_ref().is_some_and(|e| e.deployment && !e.name.is_empty());
         let deployment = if deploys {
@@ -1099,6 +1127,49 @@ impl Dispatch {
         (out, ids, vars)
     }
 
+    /// The integrations a leg authenticates to (W11-R03): its job's `integrations:`, its steps',
+    /// and those its `kiln/auth@v1` steps name, each one its repository may use. Federating
+    /// ones need ID tokens (`permissions: id-token: write`); untrusted runs get none.
+    async fn leg_integrations(&self, l: &LegSt, r: &RunSt, id_tokens: bool) -> Result<Vec<wire::Integration>, String> {
+        let Some(job) = l.spec.def() else { return Ok(Vec::new()) };
+        let mut names: Vec<(String, bool)> = job.kiln.integrations.iter().map(|n| (n.clone(), true)).collect();
+        for step in &job.steps {
+            names.extend(step.kiln.integrations.iter().map(|n| (n.clone(), false)));
+            if step.uses.as_deref().and_then(crate::runner::builtins::builtin).is_some_and(|b| b.name == "auth") {
+                let name = step.with.iter().find(|(k, _)| k == "integration").and_then(|(_, v)| v.as_str()).unwrap_or_default();
+                if name.is_empty() || name.contains("${{") {
+                    return Err("kiln/auth@v1 names its integration (`with: integration: <name>`), not an expression".into());
+                }
+                names.push((name.to_owned(), false));
+            }
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !r.trusted {
+            return Err("untrusted runs (from forks) get no integrations".into());
+        }
+        let mut out: Vec<wire::Integration> = Vec::new();
+        for (name, whole) in names {
+            if let Some(have) = out.iter_mut().find(|i| i.name == name) {
+                have.job |= whole;
+                continue;
+            }
+            let i = super::integrations::get(&self.hub, &name).await.map_err(|e| format!("{e:#}"))?.filter(|i| super::integrations::usable_by(i, &r.repo)).ok_or_else(|| format!("no integration `{name}` that {} may use", r.repo.name))?;
+            let mode = super::integrations::kind(&i.kind).map(|k| k.mode);
+            let oidc = mode == Some(super::integrations::Mode::Oidc);
+            if oidc && !id_tokens {
+                return Err(format!("`{name}` ({}) federates with kiln's ID token: the job needs `permissions: id-token: write`", i.kind));
+            }
+            let token = if oidc { None } else { super::integrations::token(&self.hub, &i).await.map_err(|e| format!("`{name}`'s token: {e:#}"))? };
+            if mode == Some(super::integrations::Mode::Token) && token.is_none() {
+                return Err(format!("`{name}` has no token stored"));
+            }
+            out.push(wire::Integration { name, kind: i.kind.clone(), mode: if oidc { "oidc".into() } else { "token".into() }, config: i.config.clone(), token, job: whole });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, image: Option<String>, token: String, job_token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
         let spec = &l.spec;
@@ -1169,6 +1240,7 @@ impl Dispatch {
             secret_outputs: job.map(|j| j.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect()).unwrap_or_default(),
             run_env: wf.run_env,
             quarantine: job.is_some_and(|j| j.kiln.quarantine_enforce),
+            integrations: Vec::new(),
             limits: wire::Limits::default(),
         }
     }
@@ -1278,6 +1350,15 @@ impl Dispatch {
                 l.report.outputs.retain(|_| true);
                 tracing::info!(leg = %r.job, error = %e, "leg ended with an error");
             }
+        }
+        let (conclusion, class) = match &outcome {
+            Outcome::Success => ("success", None),
+            Outcome::Cancelled => ("cancelled", None),
+            Outcome::Failed(f) => (if f.class == FailureClass::Timeout { "timed_out" } else { "failure" }, Some(f.class.as_str())),
+        };
+        let end = runs::AttemptEnd { conclusion, class, exit_code: r.exit_code, error: r.error.clone(), peak_rss: r.peak_rss, cpu_seconds: r.cpu_seconds };
+        if let Err(e) = runs::attempt_finished(&self.hub, &r.job, attempt, end).await {
+            tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the attempt could not be recorded");
         }
         let cmds = self.sched.handle(Input::AttemptFinished { leg: r.job.clone(), attempt, outcome }, now_ms());
         self.commands(cmds).await;
@@ -1432,7 +1513,8 @@ impl Dispatch {
                     .collect()
             })
             .unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing) };
+        let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());

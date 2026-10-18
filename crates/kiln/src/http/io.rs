@@ -255,6 +255,16 @@ pub(crate) async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> 
     Err(anyhow::anyhow!(last.unwrap_or_else(|| format!("{host}: no address"))))
 }
 
+/// A TCP connection out to `host:port` for HTTP (TLS when `https`): through the proxy this
+/// machine's network wants ([`super::proxy`]), else direct.
+pub(crate) async fn connect_out(host: &str, port: u16, https: bool) -> anyhow::Result<TcpStream> {
+    use anyhow::Context as _;
+    let Some(proxy) = super::proxy::settings().choose(https, host, port) else { return connect(host, port).await };
+    let tcp = connect(&proxy.host, proxy.port).await.with_context(|| format!("the proxy {}:{} (for {host}:{port})", proxy.host, proxy.port))?;
+    super::proxy::tunnel(&tcp, proxy, host, port).await?;
+    Ok(tcp)
+}
+
 /// One request on a fresh connection (HTTP/1.1; TLS when `https`). The connection is driven by a
 /// task on this shard and closes once the response body has been read and the request dropped.
 pub async fn send(
@@ -264,7 +274,7 @@ pub async fn send(
     https: bool,
     req: http::Request<Body>,
 ) -> anyhow::Result<http::Response<Incoming>> {
-    let tcp = connect(host, port).await?;
+    let tcp = connect_out(host, port, https).await?;
     let mut sender = if https {
         let stream = TlsStream::connect(RtFuturesIo::new(tcp), tls.config()?, super::tls::server_name(host)?)
             .await

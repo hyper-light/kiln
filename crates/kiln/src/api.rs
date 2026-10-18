@@ -260,14 +260,29 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let Some(caller) = caller_of(&hub, req.headers()).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
+    if method == Method::GET || method == Method::HEAD {
+        return authorized(hub, caller, req).await;
+    }
+    // A change is audited (W19-R05): one row for the request, refused or not, which takes what
+    // its handlers record on the way.
+    let (who, q, ip) = (caller.clone(), srv::query(&req), srv::remote_ip(&req));
+    let h = Arc::clone(&hub);
+    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, authorized(hub, caller, req), |r: &R| match r {
+        Ok(resp) => resp.status().as_u16(),
+        Err(e) => e.0.as_u16(),
+    })
+    .await
+}
+
+/// The API past authentication: everyone but the owner is held to the route table (W10-R05).
+async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -> R {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let seg = segments(&path);
+    let s: Vec<&str> = seg.iter().map(String::as_str).collect();
     let q = srv::query(&req);
-    // Everyone but the owner is held to the route table (W10-R05), and what they change is
-    // audited under their own name.
     if !caller.is_owner() {
         crate::authz::gate::check(&hub, &caller, &method, &s, &q).await.map_err(|(c, m)| err(c, m))?;
-        if method != Method::GET && method != Method::HEAD {
-            hub.store.audit(caller.name.clone(), format!("api.{}", method.as_str().to_ascii_lowercase()), path.clone()).await;
-        }
     }
     let mut req = req;
     req.extensions_mut().insert(caller.clone());
@@ -485,6 +500,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             harness_terminal(&hub, &id, req).await
         }
         (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => conversation_events(&hub, id, &q).await,
+        (&Method::GET, ["api", "conversations", "search"]) => conversation_search(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -1276,8 +1293,7 @@ async fn system(hub: &Hub) -> Response {
 }
 
 async fn audit(hub: &Hub, q: &HashMap<String, String>) -> R {
-    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
-    Ok(srv::json(StatusCode::OK, &hub.store.audit_log(limit).await?))
+    Ok(srv::json(StatusCode::OK, &crate::audit::list(&hub.store, q).await?))
 }
 
 fn history(hub: &Hub, q: &HashMap<String, String>) -> Response {
@@ -1580,7 +1596,8 @@ fn join_info(hub: &Hub) -> Response {
 
 /// `POST /api/outposts/invite`: a one-time invite for an outpost (`kiln outpost`), and a line per
 /// OS that downloads kiln from this server into a folder of its own and runs it from there,
-/// installing nothing. The invite works once, within [`crate::hub::OUTPOST_INVITE_TTL`].
+/// installing nothing. The invite works once, within [`crate::hub::OUTPOST_INVITE_TTL`]. `ask` is
+/// the same without the invite: the outpost asks to join, and an admin approves it.
 fn outpost_invite(hub: &Hub) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let (token, expires_at) = hub.outpost_invites.mint();
@@ -1593,6 +1610,11 @@ fn outpost_invite(hub: &Hub) -> Response {
                 "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
                 "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost -Token '{token}'"),
+            },
+            "ask": {
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost"),
+                "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost"),
             },
         }),
     )
@@ -2009,8 +2031,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
     let name = free_agent_name(hub, &wanted, &c.hostname).await;
+    // An outpost that asked instead of bringing an invite gets what an invited one gets.
+    let outpost = c.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
-    let cert = hub.pki.sign_csr(&c.csr, &name, 365).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let days = if outpost { crate::pki::OUTPOST_DAYS } else { 365 };
+    let cert = hub.pki.sign_csr(&c.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let quic = hub.cfg.server.quic_advertise.clone();
     let quic_port = hub.discovery.advert.lock().quic;
     let approval = crate::join::Approval {
@@ -2026,8 +2051,9 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     }
     // A name forgotten earlier in this server's life is welcome again.
     hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
-    hub.store.audit("admin".into(), "agent.join.approve".into(), format!("{name} ({})", c.hostname)).await;
-    tracing::info!(agent = %name, host = %c.hostname, "join request approved");
+    let what = if outpost { "outpost.join.approve" } else { "agent.join.approve" };
+    hub.store.audit("admin".into(), what.into(), format!("{name} ({})", c.hostname)).await;
+    tracing::info!(agent = %name, host = %c.hostname, outpost, "join request approved");
     if let Some(instance) = asked {
         hub.discovery.invites.revoke(&instance);
     }
@@ -2650,6 +2676,51 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+/// `GET /api/harness/sessions/:id/events?before=&limit=`: a session's history beyond what its
+/// timeline holds, from the server's conversation store (docs/conversations.md): `{events}`, oldest
+/// first, the newest `limit` (100, at most 1000) before event number `before`.
+async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    let id = id.to_owned();
+    let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "events": events })))
+}
+
+/// `GET /api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=`: events across
+/// every agent's conversation, newest first, from the server's store: `{hits: [{agent, name, machine,
+/// event}]}`.
+async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let text = |k: &str| q.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    let query = crate::convo::store::Query {
+        q: text("q").unwrap_or_default(),
+        session: text("agent"),
+        kind: text("kind"),
+        tool: text("tool"),
+        status: text("status"),
+        since: num("since"),
+        until: num("until"),
+        limit: q.get("limit").and_then(|v| v.parse::<usize>().ok()),
+    };
+    let rows = crate::rt::blocking(move || store.search(query)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let infos: HashMap<String, crate::harness::session::Info> = hub.harness.list().into_iter().map(|i| (i.id.clone(), i)).collect();
+    let hits: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let event: serde_json::Value = serde_json::from_str(&r.body).ok()?;
+            let info = infos.get(&r.session);
+            Some(json!({ "agent": r.session, "name": info.map(|i| i.name.clone()), "machine": info.map(|i| i.target.clone()), "event": event }))
+        })
+        .collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "hits": hits })))
 }
 
 fn goals_err(e: crate::goals::Error) -> ApiError {

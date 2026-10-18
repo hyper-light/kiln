@@ -7,6 +7,8 @@ export interface SeriesSpec {
   scale?: "y" | "y2";
   width?: number;
   dash?: number[];
+  /** Show its points where they're sparse (8px, ringed by the surface), so a lone value between gaps reads. */
+  points?: boolean;
   /** custom legend value: receives the raw data arrays */
   value?: (data: ArrayLike<ArrayLike<number | null | undefined>>, v: number | null, seriesIdx: number, idx: number) => string;
 }

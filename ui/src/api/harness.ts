@@ -302,6 +302,10 @@ export interface State {
   pause?: Pause;
   /** It stops between turns once a limit is this full (percent); absent: only when one is reached. */
   pause_at?: number;
+  /** How its last turn ended (what kiln's keep-going reads). */
+  last_turn?: TurnEnd;
+  /** Turns in a row kiln started to keep it going, since a person last said something. */
+  kept?: number;
   /** A pause ends only when a person resumes it. */
   manual_resume?: boolean;
 }
@@ -520,6 +524,21 @@ export interface ApprovalBrief {
 }
 
 /** An agent session as lists show it. */
+/** How a turn ended (`State.last_turn`). */
+export interface TurnEnd {
+  at: number;
+  /** "done", "cut" (stopped part-way), "stopped" (by you), "limit", "refused". */
+  how: string;
+  /** The harness's own word for it ("end_turn", "stop_sequence", "max_tokens" …). */
+  why?: string;
+  tools?: number;
+  /** Its last step was a tool that failed, with nothing said after it. */
+  after_error?: boolean;
+  /** Its last words ask you something. */
+  asks?: boolean;
+  kept?: number;
+}
+
 export interface AgentInfo {
   id: string;
   kind: string;
@@ -544,6 +563,8 @@ export interface AgentInfo {
   reach?: string | null;
   /** It waits for a usage limit to reset (as `State.pause`). */
   pause?: Pause;
+  /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
+  keep_off?: boolean;
   cost_usd: number;
   activity?: string;
   last_activity: number;

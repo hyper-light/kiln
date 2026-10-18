@@ -161,18 +161,53 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* A turn under way: what it's doing, its effort while it thinks, how long it's been going. */
-.ag-state > .ag-turn {
-  flex: 0 1 auto;
-  min-width: 0;
+/* The state word keeps the width of its longest ("Needs you"), so "Ready" turning "Working" as a
+   turn starts doesn't move the rest of the row. */
+.ag-state > .st-word {
+  min-width: calc(14px + 9ch + 0.2em);
+}
+/* The turn's slot ends the row, there between turns too. It takes the room the row has left, and
+   on a wide row keeps at least enough for the clock, the effort and a word of what it's doing,
+   which the folder gives up for good rather than as a turn starts; so nothing before it ever moves.
+   The turn is laid over it, so nothing in the turn (a taller word, the offer to force a stop) can
+   make the row taller either. */
+.ag-state > .ag-turn-slot {
+  position: relative;
+  flex: 1 1 0;
+  align-self: stretch;
+  min-width: 32ch;
+  overflow: hidden;
+  overflow: clip visible;
+}
+.ag-turn-slot > .ag-turn {
+  position: absolute;
+  inset: 0;
+}
+/* Said in the row's own words, so offering it doesn't make the row taller; its reach goes past
+   the words without taking room. */
+.ag-turn-force {
+  flex: none;
+  margin: -8px -6px;
+  padding: 8px 6px;
+  color: #d1aaad;
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: #d1aaad66;
+  text-underline-offset: 3px;
+}
+.ag-turn-force:hover {
+  color: #e6c3c6;
 }
 .ag-turn {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
+/* What gives way when the slot is short: what it's doing first, then the effort and how often it
+   was kept going; never the clock or the offer to force a stop. */
 .ag-turn-what.sg-label {
+  flex: 0 1000 auto;
   min-width: 0;
   max-width: 44ch;
   overflow: hidden;
@@ -186,6 +221,18 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   flex: none;
   color: #8f929b;
   white-space: nowrap;
+}
+.ag-turn-meta.ag-turn-effort,
+.ag-turn-meta.ag-turn-kept {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The clock keeps its width as it ticks ("59m 59s", "1h 02m"): nothing after it moves. */
+.ag-turn-time {
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
 }
 .ag-cwd {
   max-width: 40ch;
@@ -235,6 +282,16 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   }
   .ag-state {
     margin-top: 6px;
+  }
+  .ag-state > .ag-turn-slot {
+    min-width: 0;
+  }
+  /* A phone's row has room for the clock and what it's doing. The effort is said on the line
+     below, and the message box's Stop turns into Force stop at the same moment. */
+  .ag-turn-effort,
+  .ag-turn-kept,
+  .ag-turn-force {
+    display: none;
   }
 }
 

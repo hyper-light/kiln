@@ -684,7 +684,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
-    let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
+    let mut paths = if o.ephemeral {
+        crate::tunnel::Paths::new(&o.server_url, &quic_addr)
+    } else {
+        crate::tunnel::Paths::remembering(&o.server_url, &quic_addr, crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("transport"))
+    };
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
     // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).
@@ -749,15 +753,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // announced again on every reconnect.
     let mut terms: HashMap<String, (PtySession, Arc<crate::termsess::Session>)> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
-    // In-place upgrades: a new binary on disk is taken up by re-executing this process (same pid)
-    // once no job runs, handing every terminal to the new image so shells survive.
+    // Upgrades: a new binary on disk is taken up once no job runs, every terminal handed on so
+    // shells survive. On Linux this process re-executes itself (same pid). On macOS, where a
+    // process that re-executed itself loses the local network, it hands the terminals to its
+    // supervisor and exits, and the supervisor starts the new binary as a fresh process.
     let exe = std::env::current_exe().ok();
     let mut exe_mtime = exe.as_deref().and_then(binary_mtime);
     let mut upgrade_pending = false;
-    // Only a `kiln agent` process re-executes itself: the server's in-process agent shares its
+    // Only a `kiln agent` process upgrades itself: the server's in-process agent shares its
     // process with the server, whose upgrades its supervisor handles.
     let standalone = std::env::args().skip(1).find(|a| !a.starts_with('-')).as_deref() == Some("agent");
-    adopt_handover(&o, &mut terms, &term_tx);
+    let started_as = adopt_handover(&o, &mut terms, &term_tx);
+    let successor = crate::os::UPGRADE_BY_SUCCESSOR && standalone && !o.ephemeral;
+    let channel = crate::os::supervise::has_supervisor_channel();
+    let supervised = std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1");
+    // On macOS a supervised runner its supervisor can't hand over for (an older supervisor, or
+    // one an older kiln re-executed in place, which may have cut this process tree off from the
+    // local network) has launchd start it afresh, from its launcher, once it is idle.
+    let mut relaunch_wanted = successor && supervised && !channel && started_as == Start::ReExecuted;
+    let mut relaunch_asked: Option<Instant> = None;
     // AI coding sessions running on this machine (job pods have none), reported as they change.
     let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()));
     // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
@@ -789,8 +803,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut sockets_served = take_over_pending.is_none();
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        let h = crate::harness::host::Host::new(harness_tx.clone(), Some(own_dir.join("harness.json")), Default::default());
-        h.restore();
+        // Conversations kept on disk as they happen (docs/conversations.md).
+        let convo = crate::convo::open(&own_dir);
+        let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
+        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
+        h.restore_from(convo.as_ref());
         h
     });
     // What `kiln spawn` in this machine's terminals talks to.
@@ -1220,28 +1237,104 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let now = exe.as_deref().and_then(binary_mtime);
                     if !upgrade_pending && now.is_some() && now != exe_mtime {
                         upgrade_pending = true;
-                        tracing::info!(jobs = jobs.len(), terminals = terms.len(), "new kiln binary on disk; upgrading in place once running jobs finish");
+                        tracing::info!(jobs = jobs.len(), terminals = terms.len(), "new kiln binary on disk; taking it up once running jobs finish");
                     }
-                    // Agent sessions go on across it with their processes, mid-turn included
-                    // (`Host::hand_over_all`). Reach runs (for other runners, or followed on them)
-                    // get up to ten minutes to finish.
+                    // In place, agent sessions go on across it with their processes, mid-turn
+                    // included (`Host::hand_over_all`). As a fresh process (macOS) they are stopped
+                    // and continue (resumed) there, so those mid-turn get up to ten minutes to
+                    // finish first. Reach runs (for other runners, or followed on them) get as long.
                     let reach_busy = reach.as_ref().map_or(0, crate::reach::node::Handle::busy);
-                    if upgrade_pending && reach_busy > 0 {
+                    let busy = if successor { harness.as_ref().map_or(0, |h| h.busy()) + reach_busy } else { reach_busy };
+                    if upgrade_pending && busy > 0 {
                         harness_wait.get_or_insert_with(Instant::now);
                     }
-                    let reach_ready = reach_busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
-                    if upgrade_pending && jobs.is_empty() && reach_ready && let Some(exe) = exe.as_deref() {
-                        if let Some(h) = &harness {
-                            let n = h.hand_over_all().await;
-                            tracing::info!(sessions = n, "agent sessions handed to the new image, their processes still running");
+                    let ready = busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
+                    if upgrade_pending && !relaunch_wanted && jobs.is_empty() && ready && let Some(exe) = exe.as_deref() {
+                        if let Err(e) = binary_runs(exe).await {
+                            // Never switch to a binary that cannot start: keep this one until
+                            // the binary on disk changes again.
+                            tracing::error!(error = %format!("{e:#}"), exe = %exe.display(), "the new kiln binary does not run; staying on this one");
+                            upgrade_pending = false;
+                            exe_mtime = now;
+                        } else if !successor {
+                            if let Some(h) = &harness {
+                                let n = h.hand_over_all().await;
+                                tracing::info!(sessions = n, "agent sessions handed to the new image, their processes still running");
+                            }
+                            let err = upgrade_in_place(&o, exe, &terms);
+                            // Only reached when the exec failed: carry on with this binary, and
+                            // with the agent sessions just handed over.
+                            tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
+                            if let Some(h) = &harness {
+                                h.take_back();
+                            }
+                            upgrade_pending = false;
+                            exe_mtime = now;
+                        } else if channel {
+                            match write_handover(&o, &terms) {
+                                Ok(masters) => {
+                                    if let Some(h) = &harness {
+                                        h.stop_all();
+                                    }
+                                    match crate::os::supervise::to_supervisor(&masters) {
+                                        Ok(()) => {
+                                            tracing::info!(terminals = masters.len(), "handed over to the supervisor, which starts the new binary as a fresh process");
+                                            HANDED_OVER.store(true, std::sync::atomic::Ordering::SeqCst);
+                                            // The supervisor holds the terminals now: ending
+                                            // their sessions here would hang their shells up.
+                                            std::mem::forget(std::mem::take(&mut terms));
+                                            return Ok(());
+                                        }
+                                        Err(e) => {
+                                            let _ = std::fs::remove_file(handover_path(&o));
+                                            tracing::error!(error = %e, "could not hand over to the supervisor; continuing on the running binary");
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::error!(error = %format!("{e:#}"), "could not write the terminal handover; continuing on the running binary"),
+                            }
+                            upgrade_pending = false;
+                            exe_mtime = now;
+                        } else if supervised {
+                            relaunch_wanted = true;
+                        } else {
+                            // `kiln agent` run by hand: re-executing would cut it off from the
+                            // local network, and nothing would start it afresh.
+                            tracing::warn!("a new kiln binary is on disk; restart this runner to run it");
+                            upgrade_pending = false;
+                            exe_mtime = now;
                         }
-                        let err = upgrade_in_place(&o, exe, &terms);
-                        // Only reached when the exec failed: carry on with this binary, and with the
-                        // agent sessions just handed over.
-                        tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
+                    }
+                    if relaunch_wanted && relaunch_asked.is_none() && jobs.is_empty() && ready {
+                        relaunch_asked = Some(Instant::now());
+                        // Nothing new starts here meanwhile; launchd stops this process shortly.
+                        upgrade_pending = true;
                         if let Some(h) = &harness {
-                            h.take_back();
+                            h.stop_all();
                         }
+                        let state_dir = o.state_dir.clone();
+                        let instance = o.instance.clone();
+                        match crate::rt::blocking(move || crate::install::relaunch_runner(&state_dir, instance.as_deref())).await {
+                            Ok(Ok(true)) => tracing::warn!("asked launchd to start this runner afresh from its launcher; it stops in a moment"),
+                            Ok(Ok(false)) => {
+                                tracing::warn!("no launchd job runs this runner; restart it yourself to take up the new kiln");
+                                relaunch_wanted = false;
+                            }
+                            Ok(Err(e)) | Err(e) => {
+                                tracing::error!(error = %format!("{e:#}"), "could not have launchd start this runner afresh; restart it yourself");
+                                relaunch_wanted = false;
+                            }
+                        }
+                        if !relaunch_wanted {
+                            upgrade_pending = false;
+                            exe_mtime = now;
+                        }
+                    }
+                    // launchd should have stopped this process long since: take jobs again.
+                    if relaunch_asked.is_some_and(|t| t.elapsed() > Duration::from_secs(600)) {
+                        tracing::error!("launchd never started this runner afresh; carrying on with this binary (restart it yourself)");
+                        relaunch_asked = None;
+                        relaunch_wanted = false;
                         upgrade_pending = false;
                         exe_mtime = now;
                     }
@@ -2182,9 +2275,29 @@ fn handover_path(o: &Opts) -> PathBuf {
     crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("terminal-handover.json")
 }
 
-/// Re-execute this process from `exe` (same pid), handing every terminal to the new image.
-/// Returns only if the exec failed.
-fn upgrade_in_place(o: &Opts, exe: &std::path::Path, terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> std::io::Error {
+/// Whether this process stopped to take up a new binary, its terminals handed to its supervisor
+/// (`main` then exits with [`crate::supervise::HANDOVER_EXIT`]).
+static HANDED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn handed_over() -> bool {
+    HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether `exe` starts at all (`--version` succeeds, saying it is kiln): what an upgrade checks
+/// before switching to it.
+async fn binary_runs(exe: &std::path::Path) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    let out = crate::os::proc::output(cmd, Duration::from_secs(30)).await?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(out.status.success() && said.starts_with("kiln"), "`{} --version` gave {} ({})", exe.display(), out.status, said.trim());
+    Ok(())
+}
+
+/// Write every terminal's handover (what the process after this one needs to take it over) to
+/// the handover file; returns the PTY masters in the file's order. Terminals that cannot be
+/// handed over end with this upgrade.
+fn write_handover(o: &Opts, terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> std::io::Result<Vec<i32>> {
     use base64::Engine as _;
     let mut handed = Vec::new();
     for (id, (pty, state)) in terms {
@@ -2204,41 +2317,81 @@ fn upgrade_in_place(o: &Opts, exe: &std::path::Path, terms: &HashMap<String, (Pt
             replay: base64::engine::general_purpose::STANDARD.encode(&a.replay),
         });
     }
-    let path = handover_path(o);
-    let written = serde_json::to_vec(&handed).map_err(std::io::Error::other).and_then(|json| {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        crate::os::with_mode(&mut opts, 0o600);
-        use std::io::Write as _;
-        opts.open(&path)?.write_all(&json)
-    });
-    if let Err(e) = written {
-        return e;
-    }
+    let json = serde_json::to_vec(&handed).map_err(std::io::Error::other)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    crate::os::with_mode(&mut opts, 0o600);
+    use std::io::Write as _;
+    opts.open(handover_path(o))?.write_all(&json)?;
+    Ok(handed.iter().map(|h| h.handover.fd).collect())
+}
+
+/// Re-execute this process from `exe` (same pid), handing every terminal to the new image.
+/// Returns only if the exec failed.
+fn upgrade_in_place(o: &Opts, exe: &std::path::Path, terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> std::io::Error {
+    let handed = match write_handover(o, terms) {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
     tracing::info!(terminals = handed.len(), exe = %exe.display(), "upgrading in place");
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let err = crate::os::reexec(exe, &args, &[]);
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(handover_path(o));
     err
 }
 
-/// Take over the terminals a previous image of this process handed over (see
-/// [`upgrade_in_place`]): reopen each PTY, rebuild its replay state, and keep it for the server,
-/// which re-adopts it from the next TermList.
-fn adopt_handover(o: &Opts, terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>, term_tx: &async_channel::Sender<(String, PtyOut)>) {
+/// How this process started, as far as its terminals go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// Nothing was handed over.
+    Fresh,
+    /// A previous image of this process re-executed itself into this one ([`upgrade_in_place`]).
+    ReExecuted,
+    /// The supervisor started this process with the terminals the runner before it handed over.
+    Successor,
+}
+
+/// Take over the terminals handed over before this process started: by a previous image of it
+/// that re-executed itself ([`upgrade_in_place`], the masters kept at the numbers the handover
+/// file says), or by the runner process before it, through the supervisor ([`write_handover`],
+/// the masters at the numbers the supervisor names, in the file's order). Reopen each PTY,
+/// rebuild its replay state, and keep it for the server, which re-adopts it from the next TermList.
+fn adopt_handover(
+    o: &Opts,
+    terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
+    term_tx: &async_channel::Sender<(String, PtyOut)>,
+) -> Start {
     use base64::Engine as _;
     let path = handover_path(o);
-    let Ok(raw) = std::fs::read(&path) else { return };
+    let Ok(raw) = std::fs::read(&path) else { return Start::Fresh };
     let _ = std::fs::remove_file(&path);
+    let given = crate::os::supervise::handed_terminals();
+    let start = match &given {
+        Some(_) => Start::Successor,
+        // A fresh process its supervisor handed nothing: the file's numbers aren't this
+        // process's descriptors.
+        None if crate::os::supervise::has_supervisor_channel() => {
+            tracing::warn!("the terminals of the runner before this one did not come across; their shells are lost");
+            return Start::Fresh;
+        }
+        None => Start::ReExecuted,
+    };
     let handed: Vec<HandedTerm> = match serde_json::from_slice(&raw) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(error = %e, "unreadable terminal handover; its shells are lost");
-            return;
+            return start;
         }
     };
     let mut adopted = 0usize;
-    for h in handed {
+    for (i, mut h) in handed.into_iter().enumerate() {
+        if let Some(fds) = &given {
+            let Some(fd) = fds.get(i) else {
+                tracing::warn!(session = %h.session, "terminal did not come across the upgrade");
+                continue;
+            };
+            h.handover.fd = *fd;
+        }
         let Some((pty, rx)) = terminal::adopt(h.handover) else {
             tracing::warn!(session = %h.session, "terminal did not survive the upgrade");
             continue;
@@ -2263,6 +2416,7 @@ fn adopt_handover(o: &Opts, terms: &mut HashMap<String, (PtySession, Arc<crate::
     if adopted > 0 {
         tracing::info!(terminals = adopted, "terminals carried across the upgrade");
     }
+    start
 }
 
 #[cfg(test)]

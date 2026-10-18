@@ -31,6 +31,19 @@ impl FailureClass {
             _ => return None,
         })
     }
+
+    /// The name [`FailureClass::parse`] reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureClass::RunnerLost => "runner-lost",
+            FailureClass::Infra => "infra",
+            FailureClass::ImagePull => "image-pull",
+            FailureClass::Oom => "oom",
+            FailureClass::DiskFull => "disk-full",
+            FailureClass::Timeout => "timeout",
+            FailureClass::Failure => "failure",
+        }
+    }
 }
 
 /// A failed attempt, as the dispatcher reports it.
