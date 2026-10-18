@@ -28,6 +28,7 @@ pub mod kinds;
 pub mod model;
 pub mod moving;
 pub mod registry;
+pub mod relocate;
 pub mod screen;
 pub mod session;
 pub mod socket;

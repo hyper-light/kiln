@@ -277,8 +277,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         sync
     });
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
-    let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)) {
+    // Agent sessions other runners hand this one (a session moving here) are taken over by its
+    // session host, once there is one (below).
+    let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
+    let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config {
+        adopt: Some(adopt_tx.clone()),
+        ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)
+    }) {
         Ok((handle, said)) => {
+            crate::reach::node::set_global(handle.clone());
             let up = up_tx.clone();
             crate::rt::spawn(async move {
                 while let Ok(m) = said.recv().await {
@@ -341,6 +348,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             None
         }
     });
+    // Sessions moving here: taken over by this machine's session host (none: refused, saying why).
+    {
+        let host = harness.clone();
+        crate::rt::spawn(async move {
+            while let Ok(a) = adopt_rx.recv().await {
+                let crate::reach::node::Adoption { from, data, reply } = a;
+                let answer = match &host {
+                    Some(h) => {
+                        let h = Arc::clone(h);
+                        crate::rt::blocking(move || h.adopt(&from, &data)).await.unwrap_or_else(|e| Err(format!("{e:#}")))
+                    }
+                    None => Err("this runner runs no agent sessions".into()),
+                };
+                let _ = reply.send(answer);
+            }
+        });
+    }
     let mut harness_wait: Option<Instant> = None;
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;

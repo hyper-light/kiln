@@ -256,6 +256,21 @@ pub struct Files {
     pub dir: std::path::PathBuf,
     pub take: Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
     pub spawn: Arc<dyn Fn(Spec) + Send + Sync>,
+    /// The session went on on another machine: this one lets go of it (it isn't closed).
+    pub release: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+/// What a session that moved here starts from (`super::moving`): its timeline and state as they
+/// were, and for a harness that takes one, the history of its new thread.
+pub struct Seed {
+    pub events: Vec<super::model::Event>,
+    pub state: State,
+    pub items: Option<Vec<serde_json::Value>>,
+    /// Where it came from: the runner and its folder there.
+    pub from: String,
+    pub from_cwd: String,
+    /// Said with the move (its folder isn't here, so it works in home).
+    pub note: Option<String>,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -437,6 +452,11 @@ pub fn resolve_cwd(cwd: Option<&str>) -> String {
 
 /// Start a session; its updates go to `sink`, tagged with its id.
 pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
+    start_seeded(id, spec, sink, on_change, files, None)
+}
+
+/// Start a session, seeded with what it had on another machine when it moved here.
+pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let now = crate::util::now_ms();
     let cwd = resolve_cwd(spec.cwd.as_deref());
@@ -445,6 +465,22 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
     core.state.model = spec.model.clone().unwrap_or_default();
     core.state.mode = spec.mode.clone().unwrap_or_default();
     core.state.harness_session.clone_from(&spec.resume);
+    // Moved here: its timeline as it was, then the line saying so.
+    let mut items = None;
+    if let Some(sd) = seed {
+        core.adopt(sd.events, sd.state);
+        core.state.model = spec.model.clone().unwrap_or_default();
+        core.state.mode = spec.mode.clone().unwrap_or_default();
+        core.harness = Some(kind.name.to_owned());
+        let here = crate::config::Config::hostname();
+        let mut text = format!("Moved here ({here}, {}) from {} ({}) — the conversation, its timeline and queue came along", core.state.cwd, sd.from, sd.from_cwd);
+        if let Some(n) = &sd.note {
+            text.push_str(". ");
+            text.push_str(n);
+        }
+        core.upsert(&format!("harness-switch:moved-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+        items = sd.items;
+    }
     let info = Info {
         id: id.clone(),
         kind: kind.id.to_owned(),
@@ -495,7 +531,7 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
         let id = run.id.clone();
-        if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files)).catch_unwind().await {
+        if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");
         }
     });
@@ -1116,8 +1152,62 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     Some((to, seed))
 }
 
+/// A move to another runner, waiting for the turn under way to end.
+struct Move {
+    to: String,
+    cwd: String,
+    note: Option<String>,
+}
+
+/// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>) -> Move {
+    let mut core = s.core.lock();
+    core.hold = true;
+    let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
+    let text = if busy { format!("Moving to {to} when this turn ends") } else { format!("Moving to {to}…") };
+    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
+    core.touch_state();
+    Move { to, cwd, note }
+}
+
+/// How a move is getting on before it starts (its repository being copied there).
+fn moving_note(s: &Session, text: &str) {
+    s.core.lock().upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text: text.to_owned() });
+}
+
+/// A move that couldn't be: the session goes on here, and the timeline says why.
+fn move_failed(s: &Session, mv: &Move, why: &str) {
+    let mut core = s.core.lock();
+    core.hold = false;
+    core.touch_state();
+    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text: format!("Couldn't move to {}: {why} — it goes on here", mv.to) });
+}
+
+/// Hand the session to runner `mv.to` (its turn is over, its harness down): its record, timeline
+/// and queue, over reach. Ok once that runner has taken it over and runs it.
+async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
+    let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
+    let me = reach.name().to_owned();
+    let spec = s.resume_spec();
+    let (events, state, from_cwd, session) = {
+        let core = s.core.lock();
+        (core.events().cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone(), core.state.harness_session.clone())
+    };
+    let mut note = format!("This conversation moved from {me} (where it worked in {from_cwd}) to {} (it works in {} now).", mv.to, mv.cwd);
+    if let Some(n) = &mv.note {
+        note.push(' ');
+        note.push_str(n);
+    }
+    let env = spec.env.clone();
+    let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &note)).await.map_err(|e| format!("{e:#}"))??;
+    let pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
+    moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
+    reach.adopt(&mv.to, &bytes).await
+}
+
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
-async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) {
+async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>) {
     // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;
     s.core.lock().harness = Some(kind.name.to_owned());
@@ -1159,13 +1249,33 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // A switch to another harness, waiting for the turn under way to end; and the conversation
     // carried over, for a harness that takes it once started (Codex), until it has.
     let mut switching: Option<Switch> = None;
-    let mut seed: Option<Vec<serde_json::Value>> = None;
+    // A session that moved here with a new thread's history starts with it.
+    let mut seed: Option<Vec<serde_json::Value>> = carried;
+    // A move to another runner, waiting for the turn under way to end.
+    let mut moving: Option<Move> = None;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
     // The models it last listed (the machine keeps the list for its "new agent" and switches).
     let mut models_seen: Vec<super::model::ModelOption> = Vec::new();
     loop {
         // The harness it ran in is down: on in the other one.
+        // Its turn is over: on to the other runner (or, if that can't be, on here).
+        if let Some(mv) = moving.take() {
+            match hand_over(&s, kind, &mv).await {
+                Ok(()) => {
+                    tracing::info!(session = %s.id, to = %mv.to, "agent session moved");
+                    (files.release)(&s.id);
+                    return;
+                }
+                Err(why) => {
+                    tracing::warn!(session = %s.id, to = %mv.to, %why, "agent session could not move");
+                    move_failed(&s, &mv, &why);
+                    flush(&s, &sink, None).await;
+                    on_change();
+                }
+            }
+            first = false;
+        }
         if let Some(sw) = switching.take() {
             if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
                 kind = to;
@@ -1302,6 +1412,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     switching = Some(sw);
                                 }
                             }
+                            Command::MoveTo { to, cwd, note } => moving = Some(move_wanted(&s, to, cwd, note)),
+                            Command::Moving { text } => moving_note(&s, &text),
                             c => {
                                 // A model of its own harness: no switch after all.
                                 if matches!(c, Command::SetModel { .. }) && switching.take().is_some() {
@@ -1393,7 +1505,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     // A switch, now that nothing is under way: the harness ends by itself once its
                     // input closes (its record of the conversation complete), else it is stopped.
-                    if switching.is_some() && settled(&s) {
+                    if (switching.is_some() || moving.is_some()) && settled(&s) {
                         left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
@@ -1445,8 +1557,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if adapter.seeded() {
             seed = None;
         }
-        // A switch waiting for the turn: the turn is over (it ended with the harness).
-        if switching.is_some() {
+        // A switch or a move waiting for the turn: the turn is over (it ended with the harness).
+        if switching.is_some() || moving.is_some() {
             continue;
         }
         // A crash after a good run comes back by itself (a few times); a harness that will not
@@ -1481,6 +1593,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             break;
                         }
                     }
+                    // Another runner: it goes there, now.
+                    Command::MoveTo { to, cwd, note } => {
+                        moving = Some(move_wanted(&s, to, cwd, note));
+                        break;
+                    }
+                    Command::Moving { text } => moving_note(&s, &text),
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
                         carry.push(prepare(&files, c).await);
                         break;

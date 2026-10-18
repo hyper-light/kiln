@@ -139,6 +139,18 @@ pub struct Handle {
     tx: async_channel::Sender<In>,
     announce: Announce,
     busy: Arc<AtomicU64>,
+    name: String,
+}
+
+static GLOBAL: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
+
+/// This process's node, for what runs here without a handle passed to it (agent sessions moving).
+pub fn set_global(h: Handle) {
+    let _ = GLOBAL.set(h);
+}
+
+pub fn global() -> Option<&'static Handle> {
+    GLOBAL.get()
 }
 
 impl Handle {
@@ -149,6 +161,11 @@ impl Handle {
 
     pub fn fingerprint(&self) -> &str {
         &self.announce.fingerprint
+    }
+
+    /// This runner's name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Runs under way: those this runner does for others and those it follows elsewhere. A
@@ -283,6 +300,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
             }
         }
     });
+    let node_name = cfg.name.clone();
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -342,7 +360,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce, busy }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

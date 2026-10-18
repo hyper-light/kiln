@@ -410,6 +410,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
+            let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+            match crate::harness::relocate::start(&hub, id, &to).await {
+                Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
+                Err(e) => Err(err(StatusCode::CONFLICT, e)),
+            }
+        }
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
             harness_command(&hub, &id, req).await
