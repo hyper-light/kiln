@@ -762,6 +762,14 @@ export interface CdStatus {
   resources?: number;
   /** Objects that differ, missing and to-prune ones included. */
   out_of_sync?: number;
+  /** Of those, objects another app's tracking is on: a sync takes them over. */
+  shared?: number;
+  /** Of those, objects in git that the cluster doesn't have. */
+  missing?: number;
+  /** Of those, live objects git no longer has: a sync that prunes deletes them. Not in `resources`. */
+  prune?: number;
+  /** Of those, objects that lack only kiln's tracking marks (no other app's on them): a sync changes nothing else. */
+  unmarked?: number;
   /** Why the status is what it is, when that isn't obvious. */
   message?: string | null;
   operation?: CdOperation | null;
@@ -807,7 +815,7 @@ export interface CdSource {
 export interface CdAppDetail extends CdApp {
   definition: {
     sources: CdSource[];
-    sync: { auto: boolean; prune: boolean; self_heal: boolean; allow_empty: boolean };
+    sync: { auto: boolean; prune: boolean; self_heal: boolean; allow_empty: boolean; options?: CdSyncOptions };
     [k: string]: unknown;
   } | null;
   /** Each source's commit, as last resolved. */
@@ -816,6 +824,16 @@ export interface CdAppDetail extends CdApp {
   children: string[];
   /** Who wrote the revision it is at, when, and what it says. */
   revision_info: CdCommit | null;
+}
+
+/** An app's own sync options (Argo CD's), as its definition sets them: none, true or false. */
+export interface CdSyncOptions {
+  server_side_apply?: boolean | null;
+  apply_out_of_sync_only?: boolean | null;
+  prune_last?: boolean | null;
+  respect_ignore_differences?: boolean | null;
+  replace?: boolean | null;
+  force?: boolean | null;
 }
 
 /** A label and value people read on a node (`Ready` · `2/2`). */
@@ -853,6 +871,12 @@ export interface CdNode extends CdResourceKey {
   missing: boolean;
   requires_pruning: boolean;
   why: string | null;
+  /** The app whose tracking the live object carries, when it isn't this one: a sync of this app takes it over. */
+  tracked_by?: string;
+  /** Other apps that deploy it too. */
+  shared_with?: string[];
+  /** It differs only by tracking marks: a sync changes nothing else in it. */
+  marks_only?: boolean;
   created_at: string | null;
   info: CdInfo[];
   /** A pod's state in kubectl's words. */
@@ -948,6 +972,12 @@ export interface CdResource extends CdResourceKey {
   hook: boolean;
   /** Where it differs: `.spec.replicas differs`. */
   why: string | null;
+  /** The app whose tracking the live object carries, when it isn't this one. */
+  tracked_by?: string | null;
+  /** Other apps that deploy it too. */
+  shared_with?: string[];
+  /** It differs only by tracking marks. */
+  marks_only?: boolean;
 }
 
 /** A unified-diff hunk; each line keeps its ' ', '-' or '+'. */
@@ -969,6 +999,14 @@ export interface CdDiff {
   predicted: string;
   /** From live to predicted. */
   hunks: CdHunk[];
+  /** In git, not in the cluster: a sync creates it. */
+  missing?: boolean;
+  /** Not in git any more: a sync that prunes deletes it. */
+  requires_pruning?: boolean;
+  /** The app whose tracking it carries, when it isn't this one: a sync takes it over. */
+  tracked_by?: string | null;
+  /** It differs only by tracking marks. */
+  marks_only?: boolean;
 }
 
 /** One deployment of an app. */
@@ -1108,6 +1146,8 @@ export interface OutpostInvite {
   /** When the invite stops working (unix seconds). */
   expires_at: number;
   commands: Record<InstallOs, string>;
+  /** The same lines without the invite: the outpost asks to join, and is approved on Add machines (servers from before don't say). */
+  ask?: Record<InstallOs, string>;
 }
 
 export interface JoinInfo {
@@ -1362,7 +1402,8 @@ export interface CdPlanSync {
   /** Gone from git, kept in the cluster: by `Prune=false`, or until a person confirms. */
   held: { key: CdResourceKey; prune: "false" | "confirm" }[];
   /** Deployed by another app, which keeps them. */
-  taken: { key: CdResourceKey; app: string }[];
+  /** Objects another app deploys too, or whose live object carries its tracking: a sync takes them over. */
+  shared: { key: CdResourceKey; app: string }[];
   steps: CdPlanObject[];
 }
 

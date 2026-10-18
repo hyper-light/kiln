@@ -54,13 +54,14 @@ impl ChildControl {
     }
 }
 
-/// Wait for the child (a 100 ms `try_wait` poll) and report how it ended.
-pub async fn wait_child(mut child: Child) -> String {
+/// Wait for the child (a 100 ms `try_wait` poll) and report how it ended: its exit code and a
+/// description.
+pub async fn wait_child(mut child: Child) -> (Option<i32>, String) {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.to_string(),
+            Ok(Some(status)) => return (status.code(), status.to_string()),
             Ok(None) => crate::rt::sleep(Duration::from_millis(100)).await,
-            Err(e) => return format!("wait error: {e}"),
+            Err(e) => return (None, format!("wait error: {e}")),
         }
     }
 }
@@ -123,4 +124,52 @@ pub fn watch_supervisor(shutdown: crate::rt::Shutdown) {
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "cannot watch the supervisor pipe");
     }
+}
+
+// ------------------------------------------------------------------ handing terminals over
+
+/// Runners on Windows never hand their terminals to a successor ([`crate::os::UPGRADE_BY_SUCCESSOR`]).
+pub struct Handover;
+
+/// Terminals handed over: never any on Windows.
+pub struct Terminals;
+
+impl Handover {
+    pub fn for_child(_cmd: &mut Command) -> Option<Self> {
+        None
+    }
+
+    pub fn started(&mut self) {}
+
+    pub async fn finish(self) -> Option<Terminals> {
+        None
+    }
+}
+
+impl Terminals {
+    pub fn len(&self) -> usize {
+        0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+
+    pub fn pass_to(&self, _cmd: &mut Command) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn claim_inherited() {}
+
+pub fn has_supervisor_channel() -> bool {
+    false
+}
+
+pub fn handed_terminals() -> Option<Vec<i32>> {
+    None
+}
+
+pub fn to_supervisor(_masters: &[i32]) -> std::io::Result<()> {
+    Err(std::io::Error::other("terminals are not handed over on Windows"))
 }

@@ -18,7 +18,7 @@ screen.
 | POST | `/api/auth/login` | `{ "token": "…" }` | 204 + cookie |
 | GET | `/api/auth/otp?code=…` | one-time code from `kiln login` | 302 → `/` + cookie |
 | POST | `/api/auth/logout` | | 204 |
-| GET | `/api/me` | | `{ "authenticated": true, "version": "0.1.0", "hostname": "…" }` |
+| GET | `/api/me` | | `{ "authenticated": true, "version": "0.2.0", "hostname": "…" }` |
 
 ## Types
 

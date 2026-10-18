@@ -16,7 +16,7 @@ import { RefreshCw, Rocket } from "lucide-react";
 
 import { cdApi } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
-import type { CdAppDetail, CdDeployment, CdNode, CdResource, CdTree } from "@/api/types";
+import type { CdAppDetail, CdDeployment, CdNode, CdResource, CdSyncOptions, CdTree } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Hold, RowsHold } from "@/components/ui/hold";
@@ -29,7 +29,7 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
 import { ResourceDetails } from "./details";
-import { age, compareNodes, compareText, facetsOf, forest, isFiltered, keep, kindRank, troubled, type GroupItem } from "./model";
+import { FIXES, age, compareNodes, compareText, facetsOf, fixOf, forest, isFiltered, keep, kindRank, troubled, whatDiffers, type Fix, type GroupItem } from "./model";
 import {
   HealthPair,
   KindBadge,
@@ -53,6 +53,8 @@ import "./deployments.css";
 type View = "tree" | "list" | "pods";
 type Ask = null | "sync" | "diff" | "history" | "takeover" | "delete" | "follow";
 type Notice = { tone: "ok" | "fail"; text: string } | null;
+/** A sync asked for from one kind of difference: those objects chosen, pruning for what git no longer has. */
+type SyncPreset = { fix: Fix; ids: string[] } | null;
 type ListSort = "kind" | "name" | "namespace" | "health" | "sync" | "age";
 type PodGroup = "owner" | "node";
 
@@ -139,11 +141,11 @@ async function readObjects(id: string, signal: AbortSignal): Promise<Objects> {
 }
 
 /** The app, or why there is none (404: deleted, or a wrong link). */
-async function readApp(id: string, signal: AbortSignal): Promise<CdAppDetail | { missing: string }> {
+async function readApp(id: string, signal: AbortSignal): Promise<CdAppDetail | { notFound: string }> {
   try {
     return await cdApi.app(id, signal);
   } catch (e) {
-    if ((e as { status?: number }).status === 404) return { missing: errorMessage(e) };
+    if ((e as { status?: number }).status === 404) return { notFound: errorMessage(e) };
     throw e;
   }
 }
@@ -160,10 +162,10 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
   const r = appRes(id);
   warm(r.detail, r.objects, r.history);
   const app = useRes(r.detail).data;
-  if ("missing" in app) {
+  if ("notFound" in app) {
     return (
       <EmptyState icon={<Rocket size={20} />} title="No such app." action={<Link to="/deployments">All deployments</Link>}>
-        {app.missing}
+        {app.notFound}
       </EmptyState>
     );
   }
@@ -179,6 +181,8 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
   const [orphan, setOrphan] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<Notice>(null);
+  const [preset, setPreset] = React.useState<SyncPreset>(null);
+  const [diffOnly, setDiffOnly] = React.useState<Fix | null>(null);
 
   // Live: this app's status changed, so read it again (at most twice a second).
   const soon = React.useRef<number | null>(null);
@@ -262,7 +266,15 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
               Take over…
             </Button>
           ) : (
-            <Button size="xs" onClick={() => toggle("sync")} aria-expanded={ask === "sync"} disabled={busy || live}>
+            <Button
+              size="xs"
+              onClick={() => {
+                setPreset(null);
+                toggle("sync");
+              }}
+              aria-expanded={ask === "sync" && !preset}
+              disabled={busy || live}
+            >
               Sync…
             </Button>
           )}
@@ -278,7 +290,15 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           >
             Hard refresh
           </Button>
-          <Button size="xs" variant="secondary" onClick={() => toggle("diff")} aria-expanded={ask === "diff"}>
+          <Button
+            size="xs"
+            variant="secondary"
+            onClick={() => {
+              setDiffOnly(null);
+              toggle("diff");
+            }}
+            aria-expanded={ask === "diff" && !diffOnly}
+          >
             Diff{a.out_of_sync ? ` (${a.out_of_sync})` : ""}
           </Button>
           <Button size="xs" variant="secondary" onClick={() => toggle("history")} aria-expanded={ask === "history"}>
@@ -298,7 +318,17 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
             Delete…
           </Button>
         </div>
-        {ask === "sync" && !a.shadow && <SyncPanel a={a} managed={managed} busy={busy} onCancel={() => setAsk(null)} onSync={(body, done) => act(done, () => cdApi.sync(id, body))} />}
+        {ask === "sync" && !a.shadow && (
+          <SyncPanel
+            key={preset?.fix ?? "all"}
+            a={a}
+            managed={managed}
+            preset={preset}
+            busy={busy}
+            onCancel={() => setAsk(null)}
+            onSync={(body, done) => act(done, () => cdApi.sync(id, body))}
+          />
+        )}
         {ask === "takeover" && (
           <Confirm
             label="Confirm"
@@ -385,12 +415,28 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 
       {a.source_error && <p className="cd-warn">kiln can't read its sources: {a.source_error}</p>}
       {a.message && <p className="cd-warn">{a.message}</p>}
+      {!live && (a.out_of_sync ?? 0) > 0 && (
+        <Differences
+          a={a}
+          managed={managed}
+          busy={busy}
+          onSync={(p) => {
+            setPreset(p);
+            setAsk("sync");
+          }}
+          onReview={(f) => {
+            setDiffOnly(f);
+            setAsk("diff");
+          }}
+          onTakeOver={() => setAsk("takeover")}
+        />
+      )}
 
       {ask === "diff" && (
         <section className="cd-panel-flow" aria-label="What differs">
           <h2 className="cd-flow-title">What differs</h2>
           <Loadable label="what differs" fallback={<RowsHold rows={4} rowHeight={48} />}>
-            <DiffList id={id} />
+            <DiffList id={id} only={diffOnly} onAll={() => setDiffOnly(null)} />
           </Loadable>
         </section>
       )}
@@ -518,38 +564,54 @@ function fromLine(a: CdAppDetail) {
   return [where && `${where}${at}${more} → ${a.cluster} / ${a.namespace || "default"}`, how].filter(Boolean).join(" · ");
 }
 
+/** Argo CD's sync options a person can set for one sync, each starting as the app sets it. */
+const SYNC_OPTIONS: { name: string; key: keyof CdSyncOptions; label: string }[] = [
+  { name: "ServerSideApply", key: "server_side_apply", label: "Server-side apply: the cluster merges each field, kiln owns only its own" },
+  { name: "ApplyOutOfSyncOnly", key: "apply_out_of_sync_only", label: "Apply only what differs" },
+  { name: "PruneLast", key: "prune_last", label: "Prune last, once everything else is applied" },
+  { name: "RespectIgnoreDifferences", key: "respect_ignore_differences", label: "Leave the fields it ignores as they are live" },
+  { name: "Replace", key: "replace", label: "Replace instead of apply" },
+  { name: "Force", key: "force", label: "Force: delete and create again what can't change in place" },
+];
+
 /**
- * Sync, asked in place: prune, dry run, and optionally only some of the app's objects, chosen
- * from a list (what differs first).
+ * Sync, asked in place: prune, dry run, Argo CD's options, and optionally only some of the
+ * app's objects, chosen from a list (what differs first), or as a kind of difference chose them.
  */
 function SyncPanel({
   a,
   managed,
+  preset,
   busy,
   onSync,
   onCancel,
 }: {
   a: CdAppDetail;
   managed: CdNode[];
+  preset: SyncPreset;
   busy: boolean;
-  onSync: (body: { prune: boolean; dry_run: boolean; resources?: { group: string; kind: string; namespace: string; name: string }[] }, done: string) => void;
+  onSync: (body: { prune: boolean; dry_run: boolean; options: string[]; resources?: { group: string; kind: string; namespace: string; name: string }[] }, done: string) => void;
   onCancel: () => void;
 }) {
-  const [prune, setPrune] = React.useState(false);
+  const [prune, setPrune] = React.useState(preset?.fix === "prune");
   const [dryRun, setDryRun] = React.useState(false);
-  const [some, setSome] = React.useState(false);
+  const [some, setSome] = React.useState(preset !== null);
+  const own = a.definition?.sync.options;
+  const [opts, setOpts] = React.useState<Record<string, boolean>>(() => Object.fromEntries(SYNC_OPTIONS.map((o) => [o.name, own?.[o.key] ?? false])));
+  const changedOpts = SYNC_OPTIONS.filter((o) => opts[o.name] !== (own?.[o.key] ?? false)).length;
   const list = React.useMemo(
     () => managed.filter((n) => !n.hook).sort((x, y) => Number(y.sync === "OutOfSync") - Number(x.sync === "OutOfSync") || compareNodes(x, y)),
     [managed],
   );
-  const [picked, setPicked] = React.useState<ReadonlySet<string>>(() => new Set(list.filter((n) => n.sync === "OutOfSync").map((n) => n.id)));
+  const [picked, setPicked] = React.useState<ReadonlySet<string>>(() => new Set(preset ? preset.ids : list.filter((n) => n.sync === "OutOfSync").map((n) => n.id)));
   const prunable = list.filter((n) => n.requires_pruning).length;
   const pick = (ids: string[]) => setPicked(new Set(ids));
   const chosen = list.filter((n) => picked.has(n.id));
   const go = () => {
     const resources = some ? chosen.map((n) => ({ group: n.group, kind: n.kind, namespace: n.namespace, name: n.name })) : undefined;
+    const options = SYNC_OPTIONS.map((o) => `${o.name}=${opts[o.name] ? "true" : "false"}`);
     const what = some ? `${chosen.length} of its objects` : "it";
-    onSync({ prune, dry_run: dryRun, resources }, dryRun ? `Checking ${what} against the cluster.` : `Syncing ${what}.`);
+    onSync({ prune, dry_run: dryRun, options, resources }, dryRun ? `Checking ${what} against the cluster.` : `Syncing ${what}.`);
   };
   return (
     <Confirm
@@ -568,7 +630,7 @@ function SyncPanel({
     >
       <p>
         Apply what git holds{a.revision ? ` at ${shortRev(a.revision)}` : ""} to {placeOf(a)}
-        {a.out_of_sync ? `: ${a.out_of_sync} ${a.out_of_sync === 1 ? "object differs" : "objects differ"}.` : ". Nothing differs now."}
+        {a.out_of_sync ? `: ${whatDiffers(a)}.` : ". Nothing differs now."}
       </p>
       <label className="cd-opt">
         <input type="checkbox" className="check" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Prune: delete what git no longer holds
@@ -581,6 +643,14 @@ function SyncPanel({
       <label className="cd-opt">
         <input type="checkbox" className="check" checked={some} onChange={(e) => setSome(e.target.checked)} /> Only the objects chosen below
       </label>
+      <details className="cd-sync-options">
+        <summary>Options{changedOpts ? ` (${changedOpts} changed from the app's)` : ""}</summary>
+        {SYNC_OPTIONS.map((o) => (
+          <label key={o.name} className="cd-opt">
+            <input type="checkbox" className="check" checked={opts[o.name] ?? false} onChange={(e) => setOpts({ ...opts, [o.name]: e.target.checked })} /> {o.label}
+          </label>
+        ))}
+      </details>
       {some && (
         <div className="cd-pickset">
           <div className="cd-pickset-bar">
@@ -925,13 +995,27 @@ function PodList({
 
 /* ------------------------------------------------------------------ diff and history */
 
-function DiffList({ id }: { id: string }) {
+/** What a sync changes in each object that differs, by kind of difference; or only one kind. */
+function DiffList({ id, only, onAll }: { id: string; only: Fix | null; onAll: () => void }) {
   const diff = useSuspenseResource(`${appKey(id)}diff`, (s) => cdApi.diff(id, s));
-  const list = diff.data.diffs;
-  if (list.length === 0) return <p className="cd-empty">Nothing differs: the cluster runs what git says.</p>;
+  const all = diff.data.diffs;
+  if (all.length === 0) return <p className="cd-empty">Nothing differs: the cluster runs what git says.</p>;
+  const fix = (d: (typeof all)[number]) => fixOf({ ...d, sync: "OutOfSync" }) ?? "changed";
+  const list = only ? all.filter((d) => fix(d) === only) : [...all].sort((x, y) => FIXES.indexOf(fix(x)) - FIXES.indexOf(fix(y)));
   return (
     <div className="cd-diffs">
-      <p className="cd-meta">What a sync changes: − is what runs, + what it becomes. Fields the cluster fills in itself are left out.</p>
+      <p className="cd-meta">
+        What a sync changes: − is what runs, + what it becomes. Fields the cluster fills in itself are left out.
+        {only ? (
+          <>
+            {" "}
+            Showing {list.length} of {all.length}.{" "}
+            <button type="button" className="cd-link" onClick={onAll}>
+              Show all
+            </button>
+          </>
+        ) : null}
+      </p>
       {list.map((d) => (
         <div key={objectKey(d.key)} className="cd-diff">
           {d.why && <p className="cd-why">{d.why}</p>}
@@ -939,6 +1023,109 @@ function DiffList({ id }: { id: string }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/** An app's id without its project. */
+const appName = (id: string) => id.slice(id.indexOf("/") + 1);
+
+/** What a kind of difference says of its objects, what a sync does about it, and the button that does it. */
+function fixWords(fix: Fix, list: CdNode[]): { what: string; does: string; act: string } {
+  const n = list.length;
+  const objects = (one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  const them = n === 1 ? "it" : "them";
+  const Them = n === 1 ? "It" : "Them";
+  switch (fix) {
+    case "changed":
+      return { what: objects("object differs", "objects differ"), does: "Fields differ from git: a sync applies what git says.", act: `Sync ${them}…` };
+    case "missing":
+      return { what: objects("object is missing", "objects are missing"), does: `In git, not in the cluster: a sync creates ${them}.`, act: `Create ${them}…` };
+    case "unmarked":
+      return {
+        what: objects("object lacks", "objects lack") + " kiln's tracking marks",
+        does: `Nothing else differs: a sync adds the marks and changes nothing else in ${them}.`,
+        act: `Mark ${them}…`,
+      };
+    case "prune":
+      return { what: objects("object is", "objects are") + " no longer in git", does: `A sync that prunes deletes ${them}.`, act: `Prune ${them}…` };
+    case "takeover": {
+      const owners = [...new Set(list.flatMap((x) => (x.tracked_by ? [appName(x.tracked_by)] : [])))];
+      const changing = list.filter((x) => !x.marks_only).length;
+      return {
+        what: `${objects("object carries", "objects carry")} ${owners.join(" and ")}'s tracking`,
+        does:
+          changing === 0
+            ? `Nothing else differs: a sync of this app takes ${them} over, changing only the tracking marks.`
+            : `A sync of this app takes ${them} over. ${n === 1 ? Them : changing === n ? "All of them" : `${changing} of them`} also change${n === 1 || changing === 1 ? "s" : ""}.`,
+        act: `Take ${them} over…`,
+      };
+    }
+  }
+}
+
+/**
+ * Why an app differs from git, by what a sync does about each kind of difference (changes,
+ * missing objects, objects another app's tracking is on, missing marks, what git no longer
+ * has), each with its objects' diff and the sync that deals with them.
+ */
+function Differences({
+  a,
+  managed,
+  busy,
+  onSync,
+  onReview,
+  onTakeOver,
+}: {
+  a: CdAppDetail;
+  managed: CdNode[];
+  busy: boolean;
+  onSync: (p: Exclude<SyncPreset, null>) => void;
+  onReview: (f: Fix) => void;
+  onTakeOver: () => void;
+}) {
+  const byFix = new Map<Fix, CdNode[]>();
+  for (const n of managed) {
+    const f = fixOf(n);
+    if (f) byFix.set(f, [...(byFix.get(f) ?? []), n]);
+  }
+  const fixes = FIXES.filter((f) => (byFix.get(f)?.length ?? 0) > 0);
+  if (fixes.length === 0) return null;
+  return (
+    <section className="cd-differences" aria-label="Why it differs from git">
+      <h2 className="cd-differences-title">Why it differs from git</h2>
+      <ul className="cd-fixes">
+        {fixes.map((f) => {
+          const list = byFix.get(f) ?? [];
+          const w = fixWords(f, list);
+          return (
+            <li key={f} className="cd-fix" data-fix={f}>
+              <span className="cd-fix-text">
+                <span className="cd-fix-what">{w.what}</span>
+                <span className="cd-fix-does">{w.does}</span>
+              </span>
+              <span className="cd-fix-acts">
+                <button type="button" className="cd-link" onClick={() => onReview(f)}>
+                  Review
+                </button>
+                {a.shadow ? null : (
+                  <Button size="xs" variant="secondary" onClick={() => onSync({ fix: f, ids: list.map((n) => n.id) })} disabled={busy}>
+                    {w.act}
+                  </Button>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      {a.shadow && (
+        <p className="cd-meta">
+          Shadowed from Argo CD: kiln compares it and never writes to it.{" "}
+          <button type="button" className="cd-link" onClick={onTakeOver}>
+            Take it over…
+          </button>
+        </p>
+      )}
+    </section>
   );
 }
 

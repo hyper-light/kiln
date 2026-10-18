@@ -22,6 +22,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { useWindowedRows } from "@/lib/virtual";
+import { whatDiffers } from "./model";
 import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
 
@@ -471,7 +472,7 @@ const AppRow = React.memo(function AppRow({
   const failed = app.operation?.phase === "Failed";
   const note = app.source_error ?? (failed ? app.operation?.message : app.message) ?? "";
   const tone = app.health === "Degraded" || failed || app.source_error ? "fail" : app.sync === "OutOfSync" ? "warn" : undefined;
-  const extent = app.out_of_sync ? `${app.out_of_sync} of ${app.resources ?? 0} differ` : app.resources !== undefined ? `${app.resources} resources` : "";
+  const extent = whatDiffers(app);
   return (
     <div role="listitem" aria-posinset={pos} aria-setsize={size} className="cd-item" data-checked={checked || undefined} data-live={live || undefined} data-tone={tone}>
       <label className="cd-pick">

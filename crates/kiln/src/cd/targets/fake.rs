@@ -24,6 +24,8 @@ pub struct Function {
     pub urls: BTreeMap<String, Value>,
     pub tags: Map<String, Value>,
     pub policy: Vec<String>,
+    /// Its configuration's `RevisionId`, moved on by every change.
+    pub revision: u64,
 }
 
 #[derive(Default)]
@@ -37,6 +39,8 @@ pub struct State {
     pub buckets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     /// Every operation, in order: `CreateFunction thumbs`.
     pub calls: Vec<String>,
+    /// An alias (`thumbs:live`) someone else moves right after kiln reads it.
+    pub race: Option<String>,
 }
 
 #[derive(Default)]
@@ -94,7 +98,33 @@ fn config_of(name: &str, f: &Function) -> Value {
     };
     c.insert("State".into(), json!(state));
     c.insert("LastUpdateStatus".into(), json!(update));
+    c.insert("RevisionId".into(), json!(format!("r{}", f.revision)));
     Value::Object(c)
+}
+
+/// Lambda's refusal when an update names a `RevisionId` that is no longer the latest.
+fn stale(body: &Value, current: &str) -> Option<Response> {
+    let given = body.get("RevisionId").and_then(Value::as_str)?;
+    (given != current).then(|| err(412, "PreconditionFailedException", "The Revision Id provided does not match the latest Revision Id. Call the GetFunction/GetAlias API to retrieve the latest Revision Id"))
+}
+
+fn without_revision(body: &Value) -> Value {
+    let mut b = body.clone();
+    if let Some(m) = b.as_object_mut() {
+        m.remove("RevisionId");
+    }
+    b
+}
+
+fn alias_revision(a: &Value) -> String {
+    a.get("RevisionId").and_then(Value::as_str).unwrap_or_default().to_owned()
+}
+
+fn bump_alias(a: &mut Value) {
+    let n = alias_revision(a).trim_start_matches('a').parse::<u64>().unwrap_or(0) + 1;
+    if let Some(m) = a.as_object_mut() {
+        m.insert("RevisionId".into(), json!(format!("a{n}")));
+    }
 }
 
 impl Function {
@@ -127,7 +157,7 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
             if st.functions.contains_key(&name) {
                 return err(409, "ResourceConflictException", "Function already exist");
             }
-            let mut f = Function { busy: 1, ..Function::default() };
+            let mut f = Function { busy: 1, revision: 1, ..Function::default() };
             for k in CONFIG {
                 if let Some(v) = body.get(*k) {
                     f.config.insert((*k).to_owned(), v.clone());
@@ -159,7 +189,10 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
         ("PUT", ["2015-03-31", "functions", name, "code"]) => match st.functions.get_mut(*name) {
             Some(f) if f.busy > 0 => err(409, "ResourceConflictException", "An update is in progress"),
             Some(f) => {
-                let mut code = body.clone();
+                if let Some(refused) = stale(body, &format!("r{}", f.revision)) {
+                    return refused;
+                }
+                let mut code = without_revision(body);
                 if let Some(m) = code.as_object_mut()
                     && let Some(a) = m.remove("Architectures")
                 {
@@ -168,18 +201,23 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
                 f.code = code;
                 f.sha = sha_of(&f.code);
                 f.busy = 1;
+                f.revision += 1;
                 st.calls.push(format!("UpdateFunctionCode {name}"));
-                ok(json!({}))
+                ok(json!({ "RevisionId": format!("r{}", f.revision) }))
             }
             None => err(404, "ResourceNotFoundException", "Function not found"),
         },
         ("PUT", ["2015-03-31", "functions", name, "configuration"]) => match st.functions.get_mut(*name) {
             Some(f) if f.busy > 0 => err(409, "ResourceConflictException", "An update is in progress"),
             Some(f) => {
-                for (k, v) in body.as_object().cloned().unwrap_or_default() {
+                if let Some(refused) = stale(body, &format!("r{}", f.revision)) {
+                    return refused;
+                }
+                for (k, v) in without_revision(body).as_object().cloned().unwrap_or_default() {
                     f.config.insert(k, v);
                 }
                 f.busy = 1;
+                f.revision += 1;
                 st.calls.push(format!("UpdateFunctionConfiguration {name}"));
                 ok(json!({}))
             }
@@ -187,6 +225,12 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
         },
         ("POST", ["2015-03-31", "functions", name, "versions"]) => match st.functions.get_mut(*name) {
             Some(f) => {
+                if let Some(refused) = stale(body, &format!("r{}", f.revision)) {
+                    return refused;
+                }
+                if body.get("CodeSha256").and_then(Value::as_str).is_some_and(|s| s != f.sha) {
+                    return err(412, "PreconditionFailedException", "CodeSHA256 does not match");
+                }
                 let snapshot = json!({ "sha": f.sha, "config": f.config });
                 if let Some((v, _, _)) = f.versions.last().filter(|(_, sha, s)| *sha == f.sha && *s == snapshot) {
                     return ok(json!({ "Version": v }));
@@ -206,14 +250,27 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
             }
             None => err(404, "ResourceNotFoundException", "Function not found"),
         },
-        ("GET", ["2015-03-31", "functions", name, "aliases", alias]) => match st.functions.get(*name).and_then(|f| f.aliases.get(*alias)) {
-            Some(a) => ok(a.clone()),
-            None => err(404, "ResourceNotFoundException", "Alias not found"),
-        },
+        ("GET", ["2015-03-31", "functions", name, "aliases", alias]) => {
+            let racing = st.race.as_deref() == Some(&format!("{name}:{alias}"));
+            match st.functions.get_mut(*name).and_then(|f| f.aliases.get_mut(*alias)) {
+                Some(a) => {
+                    let read = a.clone();
+                    // Someone else moves it right after this read.
+                    if racing {
+                        if let Some(m) = a.as_object_mut() {
+                            m.insert("RoutingConfig".into(), json!({ "AdditionalVersionWeights": { "1": 0.5 } }));
+                        }
+                        bump_alias(a);
+                    }
+                    ok(read)
+                }
+                None => err(404, "ResourceNotFoundException", "Alias not found"),
+            }
+        }
         ("POST", ["2015-03-31", "functions", name, "aliases"]) => match st.functions.get_mut(*name) {
             Some(f) => {
                 let alias = body.get("Name").and_then(Value::as_str).unwrap_or_default().to_owned();
-                let a = json!({ "Name": alias, "FunctionVersion": body.get("FunctionVersion"), "AliasArn": format!("arn:aws:lambda:us-east-1:1:function:{name}:{alias}"), "RoutingConfig": body.get("RoutingConfig") });
+                let a = json!({ "Name": alias, "FunctionVersion": body.get("FunctionVersion"), "AliasArn": format!("arn:aws:lambda:us-east-1:1:function:{name}:{alias}"), "RoutingConfig": body.get("RoutingConfig"), "RevisionId": "a1" });
                 f.aliases.insert(alias.clone(), a.clone());
                 st.calls.push(format!("CreateAlias {name}:{alias}"));
                 ok(a)
@@ -222,11 +279,15 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
         },
         ("PUT", ["2015-03-31", "functions", name, "aliases", alias]) => match st.functions.get_mut(*name).and_then(|f| f.aliases.get_mut(*alias)) {
             Some(a) => {
-                if let (Some(m), Some(b)) = (a.as_object_mut(), body.as_object()) {
+                if let Some(refused) = stale(body, &alias_revision(a)) {
+                    return refused;
+                }
+                if let (Some(m), Some(b)) = (a.as_object_mut(), without_revision(body).as_object()) {
                     for (k, v) in b {
                         m.insert(k.clone(), v.clone());
                     }
                 }
+                bump_alias(a);
                 let a = a.clone();
                 st.calls.push(format!("UpdateAlias {name}:{alias} {}", a.get("FunctionVersion").and_then(Value::as_str).unwrap_or_default()));
                 ok(a)

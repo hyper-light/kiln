@@ -9,6 +9,8 @@
 
 pub mod client;
 pub mod io;
+pub mod proxy;
+pub mod roots;
 pub mod server;
 pub mod tls;
 pub mod ws;

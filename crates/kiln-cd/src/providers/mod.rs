@@ -60,10 +60,16 @@ pub struct KindDef {
     pub stateful: bool,
     /// Only read (a version, a task): kiln shows it in the tree and never applies it.
     pub child: bool,
+    /// Carries traffic between versions: a rollout moves it (docs/cd-targets.md §5).
+    pub traffic: bool,
 }
 
 const fn kind(group: &'static str, kind: &'static str, title: &'static str) -> KindDef {
-    KindDef { group, kind, namespaced: false, title, stateful: false, child: false }
+    KindDef { group, kind, namespaced: false, title, stateful: false, child: false, traffic: false }
+}
+
+const fn traffic(k: KindDef) -> KindDef {
+    KindDef { traffic: true, ..k }
 }
 
 const fn scoped(k: KindDef) -> KindDef {
@@ -152,7 +158,7 @@ pub const CATALOG: &[ProviderDef] = &[
         ],
         kinds: &[
             kind("lambda.aws.kiln.dev", "Function", "Function"),
-            kind("lambda.aws.kiln.dev", "Alias", "Alias"),
+            traffic(kind("lambda.aws.kiln.dev", "Alias", "Alias")),
             kind("lambda.aws.kiln.dev", "FunctionUrl", "Function URL"),
             child(kind("lambda.aws.kiln.dev", "Version", "Version")),
         ],
@@ -324,7 +330,7 @@ pub const CATALOG: &[ProviderDef] = &[
         scope: None,
         settings: &[s("name", false, "the Worker (by default the wrangler config's name)"), s("bundle", true, "the bundle CI built (${{ artifacts.* }})"), s("config", false, "a wrangler.jsonc or wrangler.toml in the source (found by default)")],
         kinds: &[
-            kind("workers.cloudflare.kiln.dev", "Worker", "Worker"),
+            traffic(kind("workers.cloudflare.kiln.dev", "Worker", "Worker")),
             kind("workers.cloudflare.kiln.dev", "Route", "Route"),
             kind("workers.cloudflare.kiln.dev", "CustomDomain", "Custom domain"),
             child(kind("workers.cloudflare.kiln.dev", "Version", "Version")),
@@ -355,7 +361,7 @@ pub const CATALOG: &[ProviderDef] = &[
         settings: &[s("project", true, "the project"), s("prebuilt", false, "the prebuilt output CI made (${{ artifacts.* }}); otherwise Vercel builds the commit"), s("domains", false, "domains to keep on the project")],
         kinds: &[
             kind("vercel.kiln.dev", "Project", "Project"),
-            kind("vercel.kiln.dev", "Production", "Production deployment"),
+            traffic(kind("vercel.kiln.dev", "Production", "Production deployment")),
             scoped(kind("vercel.kiln.dev", "Domain", "Domain")),
             scoped(kind("vercel.kiln.dev", "EnvVar", "Environment variable")),
             child(kind("vercel.kiln.dev", "Deployment", "Deployment")),

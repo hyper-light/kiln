@@ -1581,7 +1581,8 @@ fn join_info(hub: &Hub) -> Response {
 
 /// `POST /api/outposts/invite`: a one-time invite for an outpost (`kiln outpost`), and a line per
 /// OS that downloads kiln from this server into a folder of its own and runs it from there,
-/// installing nothing. The invite works once, within [`crate::hub::OUTPOST_INVITE_TTL`].
+/// installing nothing. The invite works once, within [`crate::hub::OUTPOST_INVITE_TTL`]. `ask` is
+/// the same without the invite: the outpost asks to join, and an admin approves it.
 fn outpost_invite(hub: &Hub) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let (token, expires_at) = hub.outpost_invites.mint();
@@ -1594,6 +1595,11 @@ fn outpost_invite(hub: &Hub) -> Response {
                 "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
                 "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost -Token '{token}'"),
+            },
+            "ask": {
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost"),
+                "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost"),
             },
         }),
     )
@@ -2010,8 +2016,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
     let name = free_agent_name(hub, &wanted, &c.hostname).await;
+    // An outpost that asked instead of bringing an invite gets what an invited one gets.
+    let outpost = c.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
-    let cert = hub.pki.sign_csr(&c.csr, &name, 365).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let days = if outpost { crate::pki::OUTPOST_DAYS } else { 365 };
+    let cert = hub.pki.sign_csr(&c.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let quic = hub.cfg.server.quic_advertise.clone();
     let quic_port = hub.discovery.advert.lock().quic;
     let approval = crate::join::Approval {
@@ -2027,8 +2036,9 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     }
     // A name forgotten earlier in this server's life is welcome again.
     hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
-    hub.store.audit("admin".into(), "agent.join.approve".into(), format!("{name} ({})", c.hostname)).await;
-    tracing::info!(agent = %name, host = %c.hostname, "join request approved");
+    let what = if outpost { "outpost.join.approve" } else { "agent.join.approve" };
+    hub.store.audit("admin".into(), what.into(), format!("{name} ({})", c.hostname)).await;
+    tracing::info!(agent = %name, host = %c.hostname, outpost, "join request approved");
     if let Some(instance) = asked {
         hub.discovery.invites.revoke(&instance);
     }
