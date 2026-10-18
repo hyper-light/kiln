@@ -550,6 +550,8 @@ export interface Spec {
   allow_bypass?: boolean;
   /** The effort level to start at (none: the model's own default). */
   effort?: string;
+  /** Commands on other runners (kiln reach): unset, it may use any; "off", only its own machine; else where it prefers them (a runner, or `linux/x86_64`). */
+  reach?: string;
 }
 
 export type Command =

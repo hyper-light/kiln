@@ -1301,3 +1301,21 @@ export interface CdPlanRepo {
   /** The newest first. */
   branches: { name: string; commit: string; at_ms: number }[];
 }
+
+/** A runner as reach sees it (`GET /api/reach/runners`). */
+export interface ReachRunner {
+  name: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  labels: string[];
+  connected: boolean;
+  /** It takes commands from other runners. */
+  reach: boolean;
+  fingerprint?: string | null;
+  cpus: number;
+  cpu_pct: number;
+  mem_total: number;
+  mem_used: number;
+  harnesses: string[];
+}

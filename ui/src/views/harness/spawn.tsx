@@ -9,7 +9,7 @@ import { Dialog as D, DropdownMenu, Popover } from "radix-ui";
 import { Check, ChevronDown, Folder, Gauge, Rocket, Server, ShieldCheck, ShieldOff, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec } from "@/api/harness";
-import type { Agent, TerminalSessionInfo } from "@/api/types";
+import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
@@ -229,11 +229,12 @@ function PastList({ target, kind, kindName, onPick, busy }: { target: string; ki
 /** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
 type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string };
 
-/** What starting agents needs to know: each machine's harnesses, the machines, their shells. */
+/** What starting agents needs to know: each machine's harnesses, the machines, their shells, and the runners its commands can go to. */
 interface Machines {
   byTarget: Record<string, KindInfo[]>;
   machines: Agent[];
   shells: TerminalSessionInfo[];
+  reach: ReachRunner[];
 }
 
 /** Asked all at once. A part that can't be had is empty: no harnesses (the dialog says what to do), no machine names, no shells. */
@@ -245,7 +246,11 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
       (): Agent[] => [],
     ),
     api.terminalSessions(signal).catch((): TerminalSessionInfo[] => []),
-  ]).then(([byTarget, machines, shells]) => ({ byTarget, machines, shells }));
+    api.reachRunners(signal).then(
+      (r) => r.runners.filter((x) => x.connected && x.reach),
+      (): ReachRunner[] => [],
+    ),
+  ]).then(([byTarget, machines, shells, reach]) => ({ byTarget, machines, shells, reach }));
 
 /** What stays from one opening to the next: the message, how many, its options, a start under way. */
 interface Kept {
@@ -259,17 +264,30 @@ interface Kept {
   setName: (n: string) => void;
   model: string;
   setModel: (m: string) => void;
+  /** Where its commands may go (Spec.reach): "" anywhere it needs, "off" only its machine, else a runner or platform it prefers. */
+  reach: string;
+  setReach: (r: string) => void;
   busy: boolean;
   setBusy: (b: boolean) => void;
 }
 
-/** More: a name, a model and, where the machine has shells open, one to run in. */
+/** Where an agent's commands can run, besides its own machine: each other runner that takes them, and each platform they make up. */
+function reachChoices(runners: ReachRunner[], target: string): { value: string; label: string }[] {
+  const others = runners.filter((r) => `agent:${r.name}` !== target);
+  const platforms = [...new Set(others.map((r) => `${r.os}/${r.arch}`))].sort();
+  return [...platforms.map((p) => ({ value: p, label: `Prefer any ${p}` })), ...others.map((r) => ({ value: r.name, label: `Prefer ${r.name} (${r.os}/${r.arch})` }))];
+}
+
+/** More: a name, a model, where its commands run and, where the machine has shells open, one to run in. */
 function MoreFields({
   count,
   name,
   onName,
   model,
   onModel,
+  reach,
+  onReach,
+  reachOptions,
   shell,
   onShell,
   shells,
@@ -279,6 +297,9 @@ function MoreFields({
   onName: (v: string) => void;
   model: string;
   onModel: (v: string) => void;
+  reach: string;
+  onReach: (v: string) => void;
+  reachOptions: { value: string; label: string }[];
   shell: string;
   onShell: (v: string) => void;
   shells: TerminalSessionInfo[];
@@ -292,6 +313,18 @@ function MoreFields({
       <label className="sp-field">
         <span>Model</span>
         <input className="hx-input" value={model} onChange={(e) => onModel(e.target.value)} placeholder="the harness's default" spellCheck={false} autoCapitalize="off" />
+      </label>
+      <label className="sp-field">
+        <span>Commands</span>
+        <select className="hx-select" value={reach} onChange={(e) => onReach(e.target.value)}>
+          <option value="">Here, and other runners when it needs them</option>
+          {reachOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+          <option value="off">Only on its own machine</option>
+        </select>
       </label>
       {shells.length > 0 && (
         <label className="sp-field">
@@ -312,11 +345,13 @@ function MoreFields({
 
 /** Until the machines have said what they have: the note where the chips go, and Start, not startable yet. */
 function Looking({ kept }: { kept: Kept }) {
-  const { count, more, name, setName, model, setModel, busy } = kept;
+  const { count, more, name, setName, model, setModel, reach, setReach, busy } = kept;
   return (
     <>
       <div className="sp-note">Looking at your machines…</div>
-      {more && <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} shell="" onShell={() => undefined} shells={[]} />}
+      {more && (
+        <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} reach={reach} onReach={setReach} reachOptions={[]} shell="" onShell={() => undefined} shells={[]} />
+      )}
       <footer className="sp-foot">
         <span className="sp-foot-note" />
         <Button type="submit" disabled>
@@ -348,10 +383,11 @@ export function SpawnDialog({
   const [more, setMore] = React.useState(false);
   const [name, setName] = React.useState("");
   const [model, setModel] = React.useState("");
+  const [reach, setReach] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [form, setForm] = React.useState<HTMLFormElement | null>(null);
   const promptRef = React.useRef<HTMLTextAreaElement>(null);
-  const kept: Kept = { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, busy, setBusy };
+  const kept: Kept = { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, reach, setReach, busy, setBusy };
   return (
     <D.Root open={open} onOpenChange={onOpenChange}>
       <D.Portal>
@@ -426,10 +462,10 @@ function Setup({
   onStarted: (agents: AgentInfo[]) => void;
   onOpenChange: (o: boolean) => void;
 }) {
-  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, busy, setBusy } = kept;
+  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, reach, setReach, busy, setBusy } = kept;
   // Each machine's harnesses, the machines and their shells: shown at once when known from before,
   // read again as it opens.
-  const { byTarget, machines, shells } = useSuspenseResource("harness/spawn", askMachines).data;
+  const { byTarget, machines, shells, reach: reachRunners } = useSuspenseResource("harness/spawn", askMachines).data;
   const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
   const [effortByKind, setEffortByKind] = useLocalStorage<Record<string, string>>("kiln.agents.efforts", {});
@@ -534,6 +570,7 @@ function Setup({
       name: name.trim() || undefined,
       prompt: prompt.trim() || undefined,
       shell: shell || undefined,
+      reach: reach || undefined,
     };
     try {
       const started = await harnessApi.start(target, spec, count);
@@ -625,7 +662,21 @@ function Setup({
         </div>
       )}
 
-      {more && <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} shell={shell} onShell={setShell} shells={targetShells} />}
+      {more && (
+        <MoreFields
+          count={count}
+          name={name}
+          onName={setName}
+          model={model}
+          onModel={setModel}
+          reach={reach}
+          onReach={setReach}
+          reachOptions={reachChoices(reachRunners, target)}
+          shell={shell}
+          onShell={setShell}
+          shells={targetShells}
+        />
+      )}
 
       {!shell && target && <InlinePath target={target} value={cwd} onChange={setCwd} recent={recent} className="sp-path" />}
       {!noHarness && upgradeHint}

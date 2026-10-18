@@ -13,6 +13,7 @@ import type {
   MetricsHistory,
   NewRepo,
   Overview,
+  ReachRunner,
   Repo,
   Run,
   RunDetail,
@@ -180,6 +181,8 @@ export const api = {
 
   system: (signal?: AbortSignal) => get<SystemInfo>("/api/system", signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
+  /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
+  reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),
   /** End a session: its shell stops on every device. */
   closeTerminalSession: (id: string) => del<void>(`/api/terminal/sessions/${enc(id)}`),
   /** Names a terminal session ("" takes its name away). */
