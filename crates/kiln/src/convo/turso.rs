@@ -20,6 +20,9 @@ const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Rows of each kind a feed reads at once.
 const FEED_PAGE: usize = 512;
+/// How long opening waits for whoever else holds the file to let go of it: this process's last
+/// writer still closing, or the runner process before this one on its way out after an upgrade.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// A Turso database file.
 pub struct Turso {
@@ -106,7 +109,13 @@ impl Turso {
         finish_compact(path)?;
         let name = path.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", path.display()))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
-        let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
+        let until = std::time::Instant::now() + LOCK_WAIT;
+        let db = loop {
+            match Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())) {
+                Err(turso_core::LimboError::LockingError(_)) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(100)),
+                opened => break opened.map_err(fail)?,
+            }
+        };
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
         let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0 };
         t.migrate(schema)?;
@@ -943,6 +952,35 @@ mod tests {
         for left in [".compact", ".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
             assert!(!beside(&path, left).exists(), "{left} left beside the store");
         }
+        Ok(())
+    }
+
+    /// A store whose file another process still holds (the runner before this one, on its way
+    /// out after an upgrade) is opened once that process lets go, not given up on.
+    #[cfg(unix)]
+    #[test]
+    fn opening_waits_for_another_process_to_let_go_of_the_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let id = Turso::open(&path)?.id();
+        // Held as Turso holds it (an fcntl lock), by another process, for a second.
+        let holder = std::process::Command::new("python3")
+            .args(["-c", "import fcntl, sys, time; f = open(sys.argv[1], 'r+'); fcntl.lockf(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(1)", &path.to_string_lossy()])
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut holder) = holder else {
+            eprintln!("skipped: no python3");
+            return Ok(());
+        };
+        let mut line = String::new();
+        let out = holder.stdout.take().ok_or_else(|| anyhow::anyhow!("the holder has no stdout"))?;
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)?;
+        anyhow::ensure!(line.trim() == "held", "the holder said {line:?}");
+        let started = std::time::Instant::now();
+        let t = Turso::open(&path)?;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300), "opened while another process held the file");
+        assert_eq!(t.id(), id);
+        let _ = holder.wait();
         Ok(())
     }
 
