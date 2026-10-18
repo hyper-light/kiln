@@ -283,8 +283,13 @@ mod imp {
         if find(true).is_none() {
             anyhow::ensure!(cert.exists(), "kiln's signing certificate isn't in {}: remove {} and run this again", d.display(), kc.display());
             eprintln!("  macOS asks you to allow a change to your certificate trust settings: allow it, so kiln can sign its own builds.");
-            security(&["add-trusted-cert", "-r", "trustRoot", "-p", "codeSign", "-k", &kcs, &cert.to_string_lossy()]).context("have macOS trust kiln's signing certificate for code signing")?;
-            anyhow::ensure!(find(true).is_some(), "macOS still doesn't trust kiln's signing certificate for code signing");
+            // It may say the certificate is in the keychain already (it is): what counts is
+            // whether macOS trusts it now.
+            let asked = security(&["add-trusted-cert", "-r", "trustRoot", "-p", "codeSign", "-k", &kcs, &cert.to_string_lossy()]);
+            if find(true).is_none() {
+                asked.context("have macOS trust kiln's signing certificate for code signing")?;
+                anyhow::bail!("macOS still doesn't trust kiln's signing certificate for code signing");
+            }
         }
         // Every kiln binary installed here: its launchers, the kiln that runs this, and the builds
         // upgrades keep.
