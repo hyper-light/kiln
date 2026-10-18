@@ -27,7 +27,7 @@ export const NAV = [
   { to: "/runners", label: "Runners" },
   { to: "/agents", label: "Agents" },
   { to: "/terminal", label: "Terminal" },
-  { to: "/telemetry", label: "Metrics" },
+  { to: "/observe", label: "Observe" },
   { to: "/system", label: "System" },
 ];
 

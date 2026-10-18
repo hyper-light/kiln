@@ -103,6 +103,7 @@ pub struct Status {
     pub durable: u64,
     pub series: u64,
     pub blocks: u64,
+    /// Bytes observe's folder holds on the machine.
     pub disk_bytes: u64,
     /// Fetching a snapshot's files: bytes so far and in all.
     pub fetching: Option<(u64, u64)>,

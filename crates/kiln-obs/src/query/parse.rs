@@ -512,7 +512,11 @@ fn filters(toks: &[Spanned<'_>], mut i: usize, out: &mut Vec<Clause>) -> Result<
                 if key.is_empty() {
                     return Err(syntax(at, "a filter's key"));
                 }
-                if value.is_empty() {
+                if let (true, Some((_, Tok::Str(quoted)))) = (value.is_empty(), toks.get(i + 1)) {
+                    // `key:"a value"`: any value, spaces and all, exactly (no wildcards).
+                    out.push(Clause { key: key.to_owned(), values: vec![ValueMatch::Exact(quoted.clone())], negate });
+                    i += 2;
+                } else if value.is_empty() {
                     // `key:(a OR b)`.
                     let (values, next) = value_list(toks, i + 1, true)?;
                     out.push(Clause { key: key.to_owned(), values, negate });
@@ -600,6 +604,16 @@ mod tests {
         assert_eq!(m.rollup, Some((Rollup::Max, Some(60))));
         assert_eq!(m.mode, Some(CountMode::Rate));
         assert_eq!(m.fill, Some(Fill::Linear(Some(300))));
+        // A quoted value: spaces, commas, braces and quotes in it, matched exactly.
+        let ast = parse(r#"a{version:"1.2 beta, {rc}", !note:"say \"hi\"", glob:"x*"}"#).unwrap();
+        assert_eq!(
+            metric(&ast, ast.root).filters,
+            vec![
+                Clause { key: "version".into(), values: vec![ValueMatch::Exact("1.2 beta, {rc}".into())], negate: false },
+                Clause { key: "note".into(), values: vec![ValueMatch::Exact("say \"hi\"".into())], negate: true },
+                Clause { key: "glob".into(), values: vec![ValueMatch::Exact("x*".into())], negate: false },
+            ]
+        );
     }
 
     #[test]

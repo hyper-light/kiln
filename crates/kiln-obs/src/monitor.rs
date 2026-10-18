@@ -261,6 +261,23 @@ fn parse_logs(q: &str) -> Result<Query, MonitorError> {
     Ok(Query { kind: Kind::Logs { search, measure, by, window_ms: window_ms.ok_or_else(|| syntax(".last(\"5m\")"))? }, op, threshold })
 }
 
+/// Where events are kept: log records of this source (kiln's own, its integrations', the API's).
+pub const EVENTS: &str = "kiln.event";
+
+/// A log search as a log monitor reads it: logs, not events (records of [`EVENTS`]), unless the
+/// search names them. Events are records too, and a monitor's own alerts are events at error's
+/// severity: a monitor of `status:error` that counted them would count its own alerting.
+pub fn logs_only(search: &str) -> String {
+    let s = search.trim();
+    if s.contains(EVENTS) {
+        s.to_owned()
+    } else if s.is_empty() || s == "*" {
+        format!("-source:{EVENTS}")
+    } else {
+        format!("({s}) -source:{EVENTS}")
+    }
+}
+
 /// One group's value, as an evaluation found it (none: the group was there before, with no data
 /// now).
 #[derive(Debug, Clone, PartialEq)]
@@ -341,7 +358,7 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
                 .collect())
         }
         Kind::Logs { search, measure, by, window_ms } => {
-            let parsed: Search = crate::logs::search::parse(search).map_err(|e| MonitorError::Eval(e.to_string()))?;
+            let parsed: Search = crate::logs::search::parse(&logs_only(search)).map_err(|e| MonitorError::Eval(e.to_string()))?;
             let ns = |ms: i64| ms.saturating_mul(1_000_000);
             let agg = store.aggregate_logs(&parsed, ns(to - window_ms), ns(to) - 1, by, measure).map_err(|e| MonitorError::Eval(e.to_string()))?;
             let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
@@ -526,6 +543,7 @@ mod tests {
     use super::*;
     use crate::batch::{Builder, Kind as SKind, SeriesKey};
     use crate::hash::Keyed;
+    use crate::logs::record::Record;
 
     #[test]
     fn datadog_s_monitor_queries_parse() {
@@ -604,6 +622,17 @@ mod tests {
         // Logs: a count, zero when nothing came.
         let q = parse(r#"logs("status:error").last("5m") > 3"#).unwrap();
         assert_eq!(evaluate(&s, &q, now, 0).unwrap(), vec![Value { group: Vec::new(), value: 0.0 }]);
+        // An error logged, and an alert said (an event, at error's severity): the monitor counts the
+        // log, not its own alert; a monitor of events counts the event.
+        let rec = |source: &str, message: &str| Record { ts: (now - 60_000) * 1_000_000, severity: 17, service: "api".into(), host: "a".into(), source: source.into(), message: message.into(), ..Record::default() };
+        let mut b = Builder::new();
+        b.logs(&[rec("app", "connection refused"), rec(EVENTS, "errors in api WARN -> ALERT")]);
+        s.apply(&b.finish()).unwrap();
+        let count = |q: &str| evaluate(&s, &parse(q).unwrap(), now, 0).unwrap().first().map(|v| v.value);
+        assert_eq!(count(r#"logs("status:error").last("5m") > 3"#), Some(1.0));
+        assert_eq!(count(r#"logs("*").last("5m") > 3"#), Some(1.0));
+        assert_eq!(count(r#"logs("source:kiln.event status:error").last("5m") > 3"#), Some(1.0));
+        assert_eq!(logs_only("service:api OR status:error"), "(service:api OR status:error) -source:kiln.event");
         // Every window is whole buckets, at least ten.
         for w in [60_000, 300_000, 420_000, 900_000, 3_600_000, 86_400_000, 7 * 86_400_000] {
             let st = step_for(w);

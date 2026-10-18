@@ -48,6 +48,8 @@ const STATUS_EVERY: Duration = Duration::from_secs(10);
 const MAINTAIN_EVERY: Duration = Duration::from_secs(60);
 /// How often the view the API shows is made again, at the most.
 const VIEW_EVERY: Duration = Duration::from_millis(500);
+/// How often the bytes observe holds on disk are counted (a walk of its folder: a stat a file).
+const SIZED_EVERY: Duration = Duration::from_secs(30);
 /// Writes of other nodes' senders whose answers the server routes, at the most: one out a sender.
 const WRITERS: usize = kiln_obs::store::MAX_SESSIONS;
 /// A snapshot's file fetched over HTTP, at the most (a store keeps O(log n) blocks of n samples).
@@ -92,6 +94,7 @@ pub struct View {
     pub durable: u64,
     pub series: u64,
     pub blocks: u64,
+    /// Bytes observe's folder holds on this machine (`dir_bytes`), and of them its logs files.
     pub disk_bytes: u64,
     pub log_bytes: u64,
     pub cutoff_ms: i64,
@@ -305,6 +308,10 @@ struct Owner {
     store: Arc<Mutex<Option<Shared>>>,
     view: Arc<Mutex<View>>,
     viewed: Instant,
+    /// The bytes observe's folder holds (the store's files, the group's log, snapshots), and when
+    /// they were last counted.
+    dir_bytes: u64,
+    sized: Option<Instant>,
     out: async_channel::Sender<Out>,
     wakeup: Arc<Wakeup>,
     waker: Waker,
@@ -357,6 +364,8 @@ impl Owner {
             store,
             view,
             viewed: Instant::now(),
+            dir_bytes: 0,
+            sized: None,
             out,
             wakeup,
             waker,
@@ -856,6 +865,10 @@ impl Owner {
             let status = self.status();
             self.send("", Msg::Status(status), Vec::new());
         }
+        if self.sized.is_none_or(|t| t.elapsed() >= SIZED_EVERY) {
+            self.sized = Some(Instant::now());
+            self.dir_bytes = dir_bytes(&self.dir);
+        }
         if self.viewed.elapsed() >= VIEW_EVERY {
             self.viewed = Instant::now();
             let view = self.make_view();
@@ -894,8 +907,8 @@ impl Owner {
             s.durable = store.durable().index;
             s.series = store.series_count() as u64;
             s.blocks = store.block_count() as u64;
-            s.disk_bytes = store.disk_bytes() + store.log_bytes();
         }
+        s.disk_bytes = self.dir_bytes;
         s
     }
 
@@ -911,7 +924,6 @@ impl Owner {
             v.durable = store.durable().index;
             v.series = store.series_count() as u64;
             v.blocks = store.block_count() as u64;
-            v.disk_bytes = store.disk_bytes();
             v.log_bytes = store.log_bytes();
             v.cutoff_ms = store.cutoff();
             v.voters = rep.r.configuration().voters.clone();
@@ -919,6 +931,7 @@ impl Owner {
             v.digest = store.digest(false).unwrap_or(0);
             v.digest_at = store.applied();
         }
+        v.disk_bytes = self.dir_bytes;
         v.verified = self.verified;
         if self.is_server() {
             v.machines = self.members.machines.iter().map(|(machine, &member)| MachineView { machine: machine.clone(), member, up: self.up.contains(machine), status: self.statuses.get(machine).cloned() }).collect();
@@ -1078,4 +1091,43 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 fn save_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     crate::sync::group::save_atomic(path, &serde_json::to_vec_pretty(value)?)?;
     Ok(())
+}
+
+/// The bytes the files under `dir` hold, each file once however many names it has: a snapshot's
+/// files are hard links to the store's (where links can be told apart: elsewhere the snapshots,
+/// copies or links, are left out). At most 100,000 entries are looked at.
+fn dir_bytes(dir: &Path) -> u64 {
+    #[cfg(unix)]
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let (mut total, mut entries) = (0u64, 0usize);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            entries += 1;
+            if entries > 100_000 {
+                return total;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if cfg!(unix) || e.file_name() != kiln_obs::machine::SNAPSHOTS {
+                    stack.push(e.path());
+                }
+                continue;
+            }
+            let Ok(m) = e.metadata() else { continue };
+            if !m.is_file() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if !seen.insert((m.dev(), m.ino())) {
+                    continue;
+                }
+            }
+            total = total.saturating_add(m.len());
+        }
+    }
+    total
 }

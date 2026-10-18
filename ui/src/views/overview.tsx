@@ -99,7 +99,7 @@ function Throughput({ d }: { d: OverviewData | null }) {
       title="Runs per hour"
       description="Succeeded and failed runs, hourly; average run time on the right axis."
       actions={
-        <Link to="/telemetry" className="icon-btn" aria-label="Open metrics">
+        <Link to="/observe/live" className="icon-btn" aria-label="Open the live metrics">
           <ArrowUpRight size={16} />
         </Link>
       }

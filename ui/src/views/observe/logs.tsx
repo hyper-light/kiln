@@ -1,0 +1,258 @@
+/**
+ * The logs explorer, and as events the event stream (events are records of source `kiln.event`):
+ * a search (docs/observe.md §4.6), how its records fall over the range by status, each facet's
+ * most common values (a click narrows the search to one, again widens it), and the newest
+ * records, each opened to its attributes.
+ */
+import * as React from "react";
+import { observeApi, type LogFacets, type LogRecord } from "@/api/observe";
+import { Button } from "@/components/ui/button";
+import { Hold, RowsHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { PageIntro } from "@/components/ui/misc";
+import { useRes, type Res } from "@/lib/data";
+import { cn } from "@/lib/utils";
+import { Histogram, ObserveNav, RANGES, RangePicker, STATUS_COLOR, firstLine, histogramRes, logsOnly, pollFor, recordsRes, useParam, useRange, when, within, type Range } from "./parts";
+
+/** The newest records a page shows at first, each "more" adds, and shows at the most (the API's). */
+const LIMIT = 100;
+const MOST = 1000;
+
+const KINDS = {
+  logs: {
+    title: "Logs",
+    base: "",
+    facets: ["service", "status", "host", "source"],
+    lead: "Every log line kiln keeps: its own, its runners' and what OTLP exporters send. Search them, see how they fall over time, open any one.",
+  },
+  events: {
+    title: "Events",
+    base: "source:kiln.event",
+    facets: ["service", "status", "@event.type", "@repo"],
+    lead: "What happened: CI runs and jobs, deploys, monitors' alerts, GitHub's pushes and pull requests, and events posted to the API.",
+  },
+} as const;
+
+const facetsRes = (query: string, range: Range, facets: readonly string[]): Res<LogFacets> => ({
+  key: `observe/facets/${range}/${facets.join(",")}/${query}`,
+  fetch: (signal) => {
+    const to = Date.now();
+    return observeApi.facets({ query, from: to - RANGES[range], to, facets: [...facets], top: 8 }, signal);
+  },
+  opts: { pollMs: pollFor(range) },
+});
+
+/** `facet:value` as a search term, quoted when it must be. */
+function term(facet: string, value: string) {
+  return /^[\w.\-/:@]+$/.test(value) ? `${facet}:${value}` : `${facet}:"${value.replace(/["\\]/g, "\\$&")}"`;
+}
+
+/** The search with `t` added, or taken out when it is there. */
+function toggle(q: string, t: string) {
+  const words =
+    q.trim() === "*"
+      ? []
+      : q
+          .trim()
+          .split(/\s+(?=(?:[^"]*"[^"]*")*[^"]*$)/)
+          .filter(Boolean);
+  return words.includes(t) ? words.filter((w) => w !== t).join(" ") : [...words, t].join(" ");
+}
+
+export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
+  const k = KINDS[kind];
+  const [q, setQ] = useParam("q");
+  const [range, setRange] = useRange();
+  const query = kind === "events" ? within(k.base, q) : logsOnly(q);
+  return (
+    <div className="container-console page">
+      <title>{`${k.title} · Observe · kiln`}</title>
+      <PageIntro index={8} label="Observe" title={k.title} lead={k.lead} />
+      <ObserveNav />
+      <SearchForm key={q} initial={q} onSearch={setQ} placeholder={kind === "events" ? "service:kiln.ci status:error" : 'service:api status:error "connection refused"'} />
+      <div className="mb-5">
+        <RangePicker value={range} onChange={setRange} />
+      </div>
+      <Loadable key={`h/${query}`} label="the histogram" fallback={<Hold height={146} />}>
+        <HistogramOf query={query} range={range} />
+      </Loadable>
+      <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)]">
+        <Loadable key={`f/${query}`} label="the facets" fallback={<RowsHold rows={8} rowHeight={32} />}>
+          <Facets query={query} range={range} facets={k.facets} q={q} onToggle={(t) => setQ(toggle(q, t))} />
+        </Loadable>
+        <Loadable key={`r/${query}`} label="the records" fallback={<RowsHold rows={10} rowHeight={36} />}>
+          <Records query={query} range={range} onFilter={(t) => setQ(toggle(q, t))} />
+        </Loadable>
+      </div>
+    </div>
+  );
+}
+
+function SearchForm({ initial, onSearch, placeholder }: { initial: string; onSearch: (q: string) => void; placeholder: string }) {
+  const [draft, setDraft] = React.useState(initial);
+  return (
+    <form
+      className="mb-4 flex flex-wrap items-end gap-3"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSearch(draft.trim());
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <label htmlFor="observe-search" className="field-label">
+          Search
+        </label>
+        <div className="field">
+          <input
+            id="observe-search"
+            type="search"
+            className="font-mono"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={placeholder}
+            spellCheck={false}
+            autoComplete="off"
+            autoCapitalize="off"
+          />
+        </div>
+      </div>
+      <Button type="submit">Search</Button>
+    </form>
+  );
+}
+
+function HistogramOf({ query, range }: { query: string; range: Range }) {
+  const h = useRes(histogramRes(query, range)).data;
+  return <Histogram h={h} range={range} height={120} />;
+}
+
+function Facets({ query, range, facets, q, onToggle }: { query: string; range: Range; facets: readonly string[]; q: string; onToggle: (t: string) => void }) {
+  const f = useRes(facetsRes(query, range, facets)).data;
+  return (
+    <aside aria-label="Facets" className="space-y-6">
+      <p className="font-mono text-[10px] text-[#7b7e88]">
+        {f.matched.toLocaleString()} {f.matched === 1 ? "record" : "records"} · {f.rows_scanned.toLocaleString()} read in {f.took_ms.toFixed(1)} ms
+      </p>
+      {f.facets.map((facet) => {
+        const values = facet.values.filter((v) => v.value !== "N/A" && v.value !== "");
+        if (values.length === 0) return null;
+        const top = values[0]?.count ?? 1;
+        return (
+          <section key={facet.facet} aria-label={facet.facet}>
+            <h3 className="field-label">
+              {facet.facet}
+              {facet.distinct > values.length && <span className="ml-1 text-[#6f7380]">· {facet.distinct.toLocaleString()}</span>}
+            </h3>
+            <ul className="space-y-0.5">
+              {values.map((v) => {
+                const t = term(facet.facet, v.value);
+                const on = q.split(/\s+/).includes(t);
+                return (
+                  <li key={v.value}>
+                    <button
+                      type="button"
+                      aria-pressed={on}
+                      onClick={() => onToggle(t)}
+                      className={cn(
+                        "relative flex w-full items-center justify-between gap-2 overflow-hidden rounded px-2 py-1 text-left text-[12px] hover:text-white",
+                        on ? "bg-white/[0.07] text-white" : "text-[#c8cad0] hover:bg-white/[0.05]",
+                      )}
+                    >
+                      <span className="absolute inset-y-0 left-0 bg-white/[0.035]" style={{ width: `${(100 * v.count) / top}%` }} aria-hidden="true" />
+                      <span className="relative flex min-w-0 items-center gap-2">
+                        {facet.facet === "status" && <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: STATUS_COLOR[v.value] }} aria-hidden="true" />}
+                        <span className="truncate">{v.value}</span>
+                      </span>
+                      <span className="relative font-mono text-[10px] text-[#898d99] tabular-nums">{v.count.toLocaleString()}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        );
+      })}
+    </aside>
+  );
+}
+
+function Records({ query, range, onFilter }: { query: string; range: Range; onFilter: (t: string) => void }) {
+  const [limit, setLimit] = React.useState(LIMIT);
+  const found = useRes(recordsRes(query, range, limit)).data;
+  const [open, setOpen] = React.useState<number | null>(null);
+  if (found.records.length === 0) return <p className="empty-line py-16 text-center">Nothing matches in this range.</p>;
+  return (
+    <section aria-label="Records">
+      <ol className="divide-y divide-[#1d1f23] border-y border-[#1d1f23]">
+        {found.records.map((r, i) => (
+          <li key={`${r.ts_ns}-${i}`}>
+            <button type="button" aria-expanded={open === i} onClick={() => setOpen(open === i ? null : i)} className="flex w-full items-baseline gap-3 px-2 py-2 text-left hover:bg-[#101114]">
+              <span className="inline-block size-2 shrink-0 translate-y-[-1px] rounded-full" style={{ background: STATUS_COLOR[r.status] }} title={r.status} aria-label={r.status} />
+              <time className="shrink-0 font-mono text-[10.5px] text-[#8c8f98] tabular-nums" dateTime={new Date(r.ts_ns / 1e6).toISOString()}>
+                {when(r.ts_ns)}
+              </time>
+              {r.service && <span className="hidden shrink-0 font-mono text-[10.5px] text-[#a7aab3] sm:inline">{r.service}</span>}
+              <span className={cn("min-w-0 flex-1 text-[12.5px] text-[#d6d8dd]", open === i ? "whitespace-pre-wrap break-words" : "truncate")}>{open === i ? r.message : firstLine(r.message)}</span>
+            </button>
+            {open === i && <Detail r={r} onFilter={onFilter} />}
+          </li>
+        ))}
+      </ol>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+        <p className="font-mono text-[10px] text-[#7b7e88]">
+          The newest {found.records.length.toLocaleString()} · {found.blocks.pruned.toLocaleString()} of {found.blocks.total.toLocaleString()} blocks ruled out by their summaries ·{" "}
+          {found.took_ms.toFixed(1)} ms
+        </p>
+        {found.records.length >= limit && limit < MOST && (
+          <Button variant="ghost" size="sm" onClick={() => React.startTransition(() => setLimit((l) => Math.min(MOST, l + LIMIT)))}>
+            Show {LIMIT} more
+          </Button>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** A record's fields and attributes; each one a filter a click away. */
+function Detail({ r, onFilter }: { r: LogRecord; onFilter: (t: string) => void }) {
+  const fields: [string, string, string][] = [
+    ["host", r.host, "host"],
+    ["service", r.service, "service"],
+    ["source", r.source, "source"],
+    ["status", r.status, "status"],
+    ...Object.entries(r.attributes).map(([k, v]): [string, string, string] => [`@${k}`, v, `@${k}`]),
+  ];
+  // Not a field a search reads: shown, not a filter.
+  if (r.trace_id) fields.push(["trace", r.trace_id, ""]);
+  return (
+    <div className="mb-3 ml-5 overflow-x-auto px-2 pb-2">
+      <p className="mb-2 font-mono text-[10px] text-[#7b7e88]">{new Date(r.ts_ns / 1e6).toISOString()}</p>
+      <table className="w-full text-[12px]">
+        <tbody>
+          {fields
+            .filter(([, v]) => v)
+            .map(([k, v, facet]) => (
+              <tr key={k}>
+                <th scope="row" className="w-1 py-0.5 pr-4 text-left align-top font-mono text-[10.5px] font-normal whitespace-nowrap text-[#8c8f98]">
+                  {k}
+                </th>
+                <td className="py-0.5 align-top break-all text-[#c8cad0]">
+                  {facet ? (
+                    <button type="button" className="text-left hover:text-white hover:underline" title={`Search for ${k}:${v}`} onClick={() => onFilter(term(facet, v))}>
+                      {v}
+                    </button>
+                  ) : (
+                    <span className="font-mono text-[11px]">{v}</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default function Logs() {
+  return <LogsExplorer kind="logs" />;
+}

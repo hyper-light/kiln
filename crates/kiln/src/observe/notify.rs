@@ -356,7 +356,7 @@ async fn deliver(http: &Client, job: Job) {
         match req.send().await {
             Ok(r) if r.is_success() => {
                 delivered = true;
-                outcome = format!("{} after {attempt} tries", r.status());
+                outcome = if attempt == 1 { r.status().to_string() } else { format!("{} on try {attempt}", r.status()) };
                 break;
             }
             Ok(r) => {

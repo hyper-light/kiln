@@ -40,7 +40,7 @@ function SettingsPanels({ updates, password }: { updates: React.ReactNode; passw
     <div className="space-y-4">
       {updates}
       <DeploySettings />
-      <Panel eyebrow="Integrations" title="Grafana" description="Linked from the Metrics page. kiln ships dashboards as ConfigMaps under deploy/.">
+      <Panel eyebrow="Integrations" title="Grafana" description="Linked from Observe › Live, for Grafana's dashboards beside kiln's own. kiln ships them as ConfigMaps under deploy/.">
         <form
           className="flex flex-wrap items-end gap-3"
           onSubmit={(e) => {

@@ -181,7 +181,9 @@ fn lex(q: &str) -> Result<Vec<(usize, Tok)>, SearchError> {
                 it.next();
                 out.push((i, Tok::Close));
             }
-            '-' if out.last().is_none_or(|(_, t)| !matches!(t, Tok::Term(_) | Tok::Close)) || q.get(i + 1..).is_some_and(|r| !r.starts_with(char::is_whitespace)) && is_term_start(&out) => {
+            // A `-` that starts a term is NOT (`timeout -env:dev`, `(a) -b`); one inside a term is
+            // the term's own (`web-1`: the term's branch below reads it).
+            '-' if is_term_start(&out) || q.get(i + 1..).is_some_and(|r| r.starts_with(|c: char| !c.is_whitespace())) => {
                 it.next();
                 out.push((i, Tok::Not));
             }
@@ -218,12 +220,25 @@ fn lex(q: &str) -> Result<Vec<(usize, Tok)>, SearchError> {
                         break;
                     }
                     if c == '"' && text.ends_with(':') {
+                        // `\"` and `\\` within: a value that holds a quote, or a backslash.
                         it.next();
-                        for (_, c) in it.by_ref() {
-                            if c == '"' {
-                                break;
+                        let mut closed = false;
+                        while let Some((_, c)) = it.next() {
+                            match c {
+                                '\\' => {
+                                    if let Some((_, n)) = it.next() {
+                                        text.push(n);
+                                    }
+                                }
+                                '"' => {
+                                    closed = true;
+                                    break;
+                                }
+                                c => text.push(c),
                             }
-                            text.push(c);
+                        }
+                        if !closed {
+                            return Err(syntax(j, "an unterminated quote"));
                         }
                         continue;
                     }
@@ -601,12 +616,30 @@ mod tests {
             ("NOT reset", false),
             ("service:web (timeout OR \"reading /api\")", true),
             ("service:web -(timeout OR \"reading /api\")", false),
+            ("reset -timeout", true),
+            ("reset -peer", false),
+            ("service:web -status:info", true),
+            ("service:web -status:error", false),
+            ("(reset OR timeout) -@route:/api/jobs", true),
+            ("(reset OR timeout) -@route:/api/runs", false),
+            ("timeout -env:dev", false),
             ("*", true),
             ("", true),
             ("@route:\"/api/runs\"", true),
         ] {
             assert_eq!(matches(q, &r), want, "{q:?}");
         }
+        // A quoted value holds anything, a quote and a backslash escaped.
+        let odd = rec("my \"odd\" app\\x", 9, "m", &[("note", "say \"hi\"")]);
+        for (q, want) in [
+            ("service:\"my \\\"odd\\\" app\\\\x\"", true),
+            ("service:\"my \\\"odd\\\" app\"", false),
+            ("@note:\"say \\\"hi\\\"\"", true),
+            ("@note:\"say hi\"", false),
+        ] {
+            assert_eq!(matches(q, &odd), want, "{q:?}");
+        }
+        assert!(parse("service:\"open").is_err(), "an unterminated quoted value");
     }
 
     #[test]

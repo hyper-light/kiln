@@ -70,7 +70,8 @@ pub struct Widget {
     pub text: String,
     #[serde(default)]
     pub layout: Layout,
-    /// What the kind takes besides: a unit, a display (`line`, `bars`, `area`), a precision, ...
+    /// What the kind takes besides: a unit, a display (`line`, `bars`, `area`), how a query value or
+    /// a toplist sums a series over the range (`aggregator`: `avg`, `sum`, `min`, `max`, `last`).
     #[serde(default)]
     pub options: Value,
 }
@@ -207,7 +208,7 @@ pub fn builtins() -> Vec<Dashboard> {
             widgets: vec![
                 widget("CPU user %", "timeseries", &["avg:system.cpu.user{$host} by {host}"], (0, 0, 6, 4), json!({ "unit": "%" })),
                 widget("CPU system %", "timeseries", &["avg:system.cpu.system{$host} by {host}"], (6, 0, 6, 4), json!({ "unit": "%" })),
-                widget("Memory usable (MiB)", "timeseries", &["avg:system.mem.usable{$host} by {host}"], (0, 4, 6, 4), json!({ "unit": "MiB" })),
+                widget("Memory usable", "timeseries", &["avg:system.mem.usable{$host} by {host}"], (0, 4, 6, 4), json!({ "unit": "MiB" })),
                 widget("Load per core (1 min)", "timeseries", &["avg:system.load.norm.1{$host} by {host}"], (6, 4, 6, 4), json!({})),
                 widget("Disk in use", "toplist", &["max:system.disk.in_use{$host} by {host,mount}"], (0, 8, 6, 4), json!({ "unit": "fraction" })),
                 widget("Network in (bytes/s)", "timeseries", &["sum:system.net.bytes_rcvd{$host} by {host}"], (6, 8, 6, 4), json!({ "unit": "B/s" })),
@@ -225,8 +226,8 @@ pub fn builtins() -> Vec<Dashboard> {
             template_variables: vec![TemplateVariable { name: "repo".into(), tag: "repo".into(), default: "*".into() }],
             widgets: vec![
                 widget("Jobs finished", "timeseries", &["sum:kiln.ci.jobs.finished{$repo} by {status}.as_count()"], (0, 0, 6, 4), json!({ "display": "bars" })),
-                widget("Failed jobs (last range)", "query_value", &["sum:kiln.ci.jobs.finished{$repo,status:failed}.as_count()"], (6, 0, 3, 4), json!({})),
-                widget("p95 job duration (s)", "query_value", &["p95:kiln.ci.job.duration{$repo}"], (9, 0, 3, 4), json!({ "unit": "s" })),
+                widget("Failed jobs", "query_value", &["sum:kiln.ci.jobs.finished{$repo,status:failed}.as_count()"], (6, 0, 3, 4), json!({ "aggregator": "sum" })),
+                widget("Longest job", "query_value", &["max:kiln.ci.job.duration{$repo}"], (9, 0, 3, 4), json!({ "unit": "s", "aggregator": "max" })),
                 widget("Job duration by job (s)", "timeseries", &["avg:kiln.ci.job.duration{$repo} by {job}"], (0, 4, 6, 4), json!({ "unit": "s" })),
                 widget("Queue time by runner (s)", "timeseries", &["avg:kiln.ci.job.queue_time{$repo} by {runner}"], (6, 4, 6, 4), json!({ "unit": "s" })),
                 widget("Slowest jobs", "toplist", &["max:kiln.ci.job.duration{$repo} by {repo,job}"], (0, 8, 6, 4), json!({ "unit": "s" })),
@@ -243,7 +244,7 @@ pub fn builtins() -> Vec<Dashboard> {
             template_variables: vec![TemplateVariable { name: "app".into(), tag: "app".into(), default: "*".into() }],
             widgets: vec![
                 widget("Deploys", "timeseries", &["sum:kiln.cd.deploys{$app} by {result}.as_count()"], (0, 0, 6, 4), json!({ "display": "bars" })),
-                widget("Apps by health", "timeseries", &["max:kiln.cd.apps{*} by {health}"], (6, 0, 6, 4), json!({})),
+                widget("Apps by health", "timeseries", &["sum:kiln.cd.apps{*} by {health}"], (6, 0, 6, 4), json!({})),
                 search_widget("Deploys and status changes", "events", "service:kiln.cd", (0, 4, 12, 5)),
             ],
             builtin: true,

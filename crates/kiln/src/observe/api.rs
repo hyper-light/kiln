@@ -51,6 +51,26 @@ fn dashboards() -> Result<&'static std::sync::Arc<super::dashboards::Dashboards>
     DASHBOARDS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "dashboards are kept by the server"))
 }
 
+/// The node's view, each digest also in hex (`digest_hex`, `verified_hex`): a u64 is more than
+/// JavaScript's numbers hold exactly, and two digests that differ must not read alike.
+fn status_json(v: &super::View) -> Value {
+    let hex = |d: u64| Value::from(format!("{d:016x}"));
+    let mut j = serde_json::to_value(v).unwrap_or(Value::Null);
+    if let Value::Object(o) = &mut j {
+        o.insert("digest_hex".into(), hex(v.digest));
+        o.insert("verified_hex".into(), v.verified.map_or(Value::Null, |(at, d)| json!([at, hex(d)])));
+        if let Some(Value::Array(ms)) = o.get_mut("machines") {
+            for (m, mv) in ms.iter_mut().zip(&v.machines) {
+                if let (Some(s), Some(Value::Object(so))) = (&mv.status, m.get_mut("status")) {
+                    so.insert("digest_hex".into(), hex(s.digest));
+                    so.insert("verified_hex".into(), s.verified.map_or(Value::Null, |(at, d)| json!([at, hex(d)])));
+                }
+            }
+        }
+    }
+    j
+}
+
 /// A monitor as the API shows it: its definition, its overall state and its groups'.
 fn monitor_json(ms: &super::monitors::Monitors, m: &super::monitors::Monitor) -> Value {
     let mut v = serde_json::to_value(m).unwrap_or(Value::Null);
@@ -158,7 +178,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             b.query = if b.query.trim().is_empty() || b.query.trim() == "*" { "source:kiln.event".into() } else { format!("source:kiln.event ({})", b.query) };
             search(b).await
         }
-        (&Method::GET, ["status"]) => Ok(srv::json(StatusCode::OK, &observe()?.view())),
+        (&Method::GET, ["status"]) => Ok(srv::json(StatusCode::OK, &status_json(&observe()?.view()))),
         (&Method::POST, ["compact"]) => {
             observe()?.compact();
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "compacting": true })))
@@ -184,8 +204,16 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 query: String,
             }
             let v: V = read_json(req.into_body(), QUERY_BODY).await?;
+            // What it watches besides, to draw: the metric query, or the log search, and its window.
             Ok(match kiln_obs::monitor::parse(&v.query) {
-                Ok(q) => srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold })),
+                Ok(q) => {
+                    let (kind, watched, window_ms) = match &q.kind {
+                        kiln_obs::monitor::Kind::Metric { query, window_ms, .. } => ("metric", json!({ "query": query }), window_ms),
+                        kiln_obs::monitor::Kind::Change { query, window_ms, .. } => ("change", json!({ "query": query }), window_ms),
+                        kiln_obs::monitor::Kind::Logs { search, window_ms, .. } => ("logs", json!({ "search": search }), window_ms),
+                    };
+                    srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold, "kind": kind, "watched": watched, "window_ms": window_ms }))
+                }
                 Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
             })
         }
@@ -322,7 +350,7 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
                 "series": series,
                 "scalar": a.scalar,
                 "scanned": { "series": a.scanned_series, "samples": a.scanned_samples },
-                "applied": s.durable().index,
+                "applied": s.applied(),
                 "took_ms": started.elapsed().as_secs_f64() * 1000.0,
             }),
         ))

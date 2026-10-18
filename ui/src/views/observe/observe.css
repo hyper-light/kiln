@@ -1,0 +1,63 @@
+/* Observe: a dashboard's grid of widgets, and notes' prose. */
+
+/* Twelve columns from a laptop's width up, each widget as wide as it says; one column below. */
+.obs-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+@media (min-width: 1024px) {
+  .obs-grid {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+  }
+  .obs-widget {
+    grid-column: span var(--w) / span var(--w);
+  }
+}
+.obs-widget {
+  min-width: 0;
+}
+.obs-widget > .panel {
+  height: 100%;
+}
+
+.obs-note {
+  font-size: 13px;
+  line-height: 1.65;
+  color: #c8cad0;
+  overflow-wrap: anywhere;
+}
+.obs-note > * + * {
+  margin-top: 0.55em;
+}
+.obs-note code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: #15171b;
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  color: #e6e1f5;
+}
+.obs-note a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.obs-note strong {
+  font-weight: 600;
+  color: var(--color-bright);
+}
+.obs-note ul,
+.obs-note ol {
+  padding-left: 1.3em;
+}
+.obs-note ul {
+  list-style: disc;
+}
+.obs-note ol {
+  list-style: decimal;
+}
+.obs-note .hx-h {
+  font-weight: 600;
+  color: var(--color-bright);
+}
