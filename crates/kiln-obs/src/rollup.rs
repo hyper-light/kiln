@@ -157,6 +157,8 @@ pub struct Builder {
     windows: Vec<(i64, Option<Agg>)>,
     tier: Vec<u8>,
     col: BitWriter,
+    list: Vec<u8>,
+    body: Vec<u8>,
 }
 
 /// `kind`'s rollups of samples `ts` and `vs` (in time order, each time once) into `out`, cleared:
@@ -168,7 +170,7 @@ pub fn build(kind: Kind, ts: &[i64], vs: &[f64], raw_bytes: usize, b: &mut Build
     let mut kept = 0u8;
     for &width in &TIERS {
         windows(width, ts, vs, &mut b.windows);
-        encode_tier(kind, width, &b.windows, &mut b.col, &mut b.tier);
+        encode_tier(kind, width, b);
         if b.windows.is_empty() || b.tier.len().saturating_mul(KEEP_RATIO) > raw_bytes {
             continue;
         }
@@ -187,31 +189,30 @@ pub fn sizes(kind: Kind, ts: &[i64], vs: &[f64], b: &mut Builder) -> [(usize, us
     let mut out = [(0, 0); TIERS.len()];
     for (o, &width) in out.iter_mut().zip(&TIERS) {
         windows(width, ts, vs, &mut b.windows);
-        encode_tier(kind, width, &b.windows, &mut b.col, &mut b.tier);
+        encode_tier(kind, width, b);
         *o = (b.windows.len(), b.tier.len());
     }
     out
 }
 
-/// A tier, its byte length before it.
-fn encode_tier(kind: Kind, width: i64, windows: &[(i64, Option<Agg>)], col: &mut BitWriter, out: &mut Vec<u8>) {
-    out.clear();
-    let mut body = std::mem::take(out);
-    let mut list = Vec::with_capacity(windows.len() * 2);
+/// `b.windows` as a tier of `width` into `b.tier`, its byte length before it.
+fn encode_tier(kind: Kind, width: i64, b: &mut Builder) {
+    let Builder { windows, tier, col, list, body } = b;
+    list.clear();
     let mut prev = None;
-    for &(k, a) in windows {
+    for &(k, a) in windows.iter() {
         match prev {
-            None => varint::put(&mut list, varint::zig(k)),
-            Some(p) => varint::put(&mut list, (k.wrapping_sub(p) as u64).wrapping_sub(1)),
+            None => varint::put(list, varint::zig(k)),
+            Some(p) => varint::put(list, (k.wrapping_sub(p) as u64).wrapping_sub(1)),
         }
         prev = Some(k);
-        varint::put(&mut list, a.map_or(0, |a| u64::from(a.n)));
+        varint::put(list, a.map_or(0, |a| u64::from(a.n)));
     }
-    varint::put(&mut body, width as u64);
-    varint::put(&mut body, windows.len() as u64);
-    varint::put(&mut body, list.len() as u64);
-    body.extend_from_slice(&list);
-    let out_body = &mut body;
+    body.clear();
+    varint::put(body, width as u64);
+    varint::put(body, windows.len() as u64);
+    varint::put(body, list.len() as u64);
+    body.extend_from_slice(list);
     for &c in columns(kind) {
         col.clear();
         let (mut last, mut window) = (None, None);
@@ -223,11 +224,12 @@ fn encode_tier(kind: Kind, width: i64, windows: &[(i64, Option<Agg>)], col: &mut
             }
             last = Some(bits);
         }
-        varint::put(out_body, col.byte_len() as u64);
-        col.write_to(out_body);
+        varint::put(body, col.byte_len() as u64);
+        col.write_to(body);
     }
-    varint::put(out, body.len() as u64);
-    out.extend_from_slice(&body);
+    tier.clear();
+    varint::put(tier, body.len() as u64);
+    tier.extend_from_slice(body);
 }
 
 /// Rollups that do not parse.
