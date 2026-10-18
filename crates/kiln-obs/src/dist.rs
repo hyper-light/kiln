@@ -15,6 +15,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::batch::{BatchError, Kind, SeriesKey};
+
 /// The finest scale kept: 32 buckets an octave, a percentile within 1.09% of the truth (scale 6
 /// would halve that and double the buckets). OTel SDKs start at 20 and shrink to fit 160 buckets,
 /// most often to 3 to 5 for a latency's range.
@@ -221,6 +223,46 @@ impl Merged {
         }
         self.counts.values().next_back().map(|(b, _)| b.value(self.scale))
     }
+}
+
+/// A distribution's series of raw values (Datadog's `distribution_points`: each point a time and
+/// its values): its buckets' counts at [`SCALE`] (`<metric>.dist`), and its `.count`, `.sum`,
+/// `.min` and `.max`, as an exponential histogram's are.
+pub fn series_of(metric: &str, tags: &[(&str, &str)], points: &[(i64, Vec<f64>)]) -> Result<Vec<(SeriesKey, Vec<(i64, f64)>)>, BatchError> {
+    let mut buckets: BTreeMap<(u8, i64), (Bucket, Vec<(i64, f64)>)> = BTreeMap::new();
+    let (mut count, mut sum, mut min, mut max) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (t, values) in points {
+        let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+        if finite.is_empty() {
+            continue;
+        }
+        let mut here: BTreeMap<(u8, i64), (Bucket, f64)> = BTreeMap::new();
+        for &v in &finite {
+            if let Some(b) = bucket_of(v, SCALE) {
+                here.entry(b.order()).or_insert((b, 0.0)).1 += 1.0;
+            }
+        }
+        for (order, (b, n)) in here {
+            buckets.entry(order).or_insert_with(|| (b, Vec::new())).1.push((*t, n));
+        }
+        count.push((*t, finite.len() as f64));
+        sum.push((*t, finite.iter().sum()));
+        min.push((*t, finite.iter().copied().fold(f64::INFINITY, f64::min)));
+        max.push((*t, finite.iter().copied().fold(f64::NEG_INFINITY, f64::max)));
+    }
+    let mut out = Vec::with_capacity(buckets.len() + 4);
+    let dist = format!("{metric}{SUFFIX}");
+    for (b, pts) in buckets.into_values() {
+        let tag = tag_value(SCALE, b);
+        let with: Vec<(&str, &str)> = tags.iter().copied().chain([(BUCKET_TAG, tag.as_str())]).collect();
+        out.push((SeriesKey::new(&dist, with, Kind::Count)?, pts));
+    }
+    for (suffix, kind, pts) in [(".count", Kind::Count, count), (".sum", Kind::Count, sum), (".min", Kind::Gauge, min), (".max", Kind::Gauge, max)] {
+        if !pts.is_empty() {
+            out.push((SeriesKey::new(&format!("{metric}{suffix}"), tags.iter().copied(), kind)?, pts));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -202,7 +202,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
     match (&method, rest) {
         (&Method::POST, ["query"]) => query(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::GET, ["query"]) => {
-            let body = QueryBody { query: q.get("query").cloned().unwrap_or_default(), from: num(q, "from")?, to: num(q, "to")?, step: q.get("step").map(|s| s.parse()).transpose().map_err(|_| fail(StatusCode::BAD_REQUEST, "step"))?, points: None, max_series: None };
+            let body = QueryBody { query: q.get("query").cloned().unwrap_or_default(), from: num(q, "from")?, to: num(q, "to")?, step: q.get("step").map(|s| s.parse()).transpose().map_err(|_| fail(StatusCode::BAD_REQUEST, "step"))?, points: None, max_series: None, heatmap: None };
             query(body).await
         }
         (&Method::GET, ["metrics"]) => {
@@ -473,6 +473,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             false => Err(fail(StatusCode::NOT_FOUND, "no such dashboard")),
         },
         (&Method::POST, ["series"]) => ingest_series(read_json(req.into_body(), INGEST_BODY).await?),
+        (&Method::POST, ["distribution_points"]) => ingest_distributions(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),
         _ => Err(fail(StatusCode::NOT_FOUND, "no such observe route")),
     }
@@ -494,6 +495,10 @@ struct QueryBody {
     points: Option<usize>,
     #[serde(default)]
     max_series: Option<usize>,
+    /// A heatmap of the query instead of its series, of this many rows at the most
+    /// (`kiln_obs::query::eval::heatmap`).
+    #[serde(default)]
+    heatmap: Option<usize>,
 }
 
 async fn query(body: QueryBody) -> Result<Response, Fail> {
@@ -508,6 +513,19 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
         }
         if let Some(m) = body.max_series {
             r.max_series = m.clamp(1, eval::DEFAULT_MAX_SERIES);
+        }
+        if let Some(rows) = body.heatmap {
+            let h = eval::heatmap(s, &r, rows).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let rows: Vec<[f64; 2]> = h.rows.iter().map(|&(lo, hi)| [lo, hi]).collect();
+            return Ok(srv::json(
+                StatusCode::OK,
+                &json!({
+                    "grid": { "from": h.grid.from, "step": h.grid.step, "n": h.grid.n },
+                    "heatmap": { "rows": rows, "counts": h.counts, "distribution": h.distribution },
+                    "applied": s.applied(),
+                    "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+                }),
+            ));
         }
         let a = eval::eval(s, &r).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let series: Vec<Value> = a
@@ -1104,6 +1122,41 @@ fn ingest_series(body: SeriesBody) -> Result<Response, Fail> {
         return Ok(behind());
     }
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "points": points })))
+}
+
+/// Distribution points as Datadog's API takes them (v1 `distribution_points`): a metric, its
+/// tags, and points of `[seconds since the epoch, [values...]]`.
+#[derive(Debug, Deserialize)]
+struct DistributionsBody {
+    series: Vec<DistributionIn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DistributionIn {
+    metric: String,
+    #[serde(default)]
+    tags: Option<Value>,
+    #[serde(default)]
+    host: Option<String>,
+    points: Vec<(f64, Vec<f64>)>,
+}
+
+fn ingest_distributions(body: DistributionsBody) -> Result<Response, Fail> {
+    let o = observe()?;
+    let mut series = Vec::new();
+    let mut values = 0usize;
+    for d in body.series {
+        let tags = tags_of(d.tags.as_ref(), d.host.as_deref());
+        let borrowed: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let points: Vec<(i64, Vec<f64>)> = d.points.into_iter().filter(|(t, _)| t.is_finite()).map(|(t, v)| ((t * 1000.0) as i64, v)).collect();
+        values += points.iter().map(|(_, v)| v.len()).sum::<usize>();
+        series.extend(kiln_obs::dist::series_of(&d.metric, &borrowed, &points).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{}: {e}", d.metric)))?);
+    }
+    if !o.offer(series) {
+        return Ok(behind());
+    }
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "values": values })))
 }
 
 /// Log records: a message, and what Datadog's intake takes beside it.

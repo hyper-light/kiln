@@ -1083,32 +1083,9 @@ fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, ma
         }
         entry.or_default().push((id, scale, b));
     }
-    let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Rollup::Sum, None)), calendar: None, weighted: false, fill: None, ..q.clone() };
-    let (from, end) = (spans.start(0), spans.start(grid.n));
-    let (mut ts, mut vs) = (Vec::new(), Vec::new());
-    let mut buckets = vec![f64::NAN; grid.n];
     let mut out = Vec::with_capacity(groups.len());
     for (tags, members) in groups {
-        // Each of the group's buckets at its coarsest scale, its counts a bucket of time.
-        let scale = members.iter().map(|m| m.1).min().unwrap_or(crate::dist::SCALE);
-        let mut by_bucket: std::collections::BTreeMap<(u8, i64), (crate::dist::Bucket, Vec<f64>)> = std::collections::BTreeMap::new();
-        for (id, at, b) in members {
-            let Some(s) = store.series(id) else { continue };
-            ts.clear();
-            vs.clear();
-            let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
-            store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
-            scanned.0 += 1;
-            scanned.1 += ts.len() as u64;
-            rollup(s.kind(), &counted, spans, &ts, &vs, &mut buckets, None);
-            let coarse = b.coarser(u32::try_from(at - scale).unwrap_or(0));
-            let counts = &mut by_bucket.entry(coarse.order()).or_insert_with(|| (coarse, vec![0.0; grid.n])).1;
-            for (c, v) in counts.iter_mut().zip(&buckets) {
-                if v.is_finite() && *v > 0.0 {
-                    *c += v;
-                }
-            }
-        }
+        let (scale, by_bucket) = dist_counts(store, q, grid, spans, &members, scratch, scanned)?;
         // Each bucket of time: the rank's bucket, DDSketch's way (`crate::dist::Merged::quantile`).
         let q01 = (p / 100.0).clamp(0.0, 1.0);
         let values: Vec<f64> = (0..grid.n)
@@ -1131,6 +1108,117 @@ fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, ma
         out.push(Series { tags, values, bounds: None, outlier: None });
     }
     Ok(out)
+}
+
+/// A distribution's buckets in a bucket of time each: `members`' (series id, scale, bucket),
+/// each made the coarsest scale's among them, their counts summed; the scale and the buckets by
+/// their order.
+fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, members: &[(u32, i32, crate::dist::Bucket)], scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<(i32, DistCounts), QueryError> {
+    let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Rollup::Sum, None)), calendar: None, weighted: false, fill: None, ..q.clone() };
+    let (from, end) = (spans.start(0), spans.start(grid.n));
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    let mut buckets = vec![f64::NAN; grid.n];
+    let scale = members.iter().map(|m| m.1).min().unwrap_or(crate::dist::SCALE);
+    let mut by_bucket = DistCounts::new();
+    for &(id, at, b) in members {
+        let Some(s) = store.series(id) else { continue };
+        ts.clear();
+        vs.clear();
+        let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
+        store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
+        scanned.0 += 1;
+        scanned.1 += ts.len() as u64;
+        rollup(s.kind(), &counted, spans, &ts, &vs, &mut buckets, None);
+        let coarse = b.coarser(u32::try_from(at - scale).unwrap_or(0));
+        let counts = &mut by_bucket.entry(coarse.order()).or_insert_with(|| (coarse, vec![0.0; grid.n])).1;
+        for (c, v) in counts.iter_mut().zip(&buckets) {
+            if v.is_finite() && *v > 0.0 {
+                *c += v;
+            }
+        }
+    }
+    Ok((scale, by_bucket))
+}
+
+/// Buckets by their order, each its count a bucket of time.
+type DistCounts = std::collections::BTreeMap<(u8, i64), (crate::dist::Bucket, Vec<f64>)>;
+
+/// A heatmap of a query (`docs/observe.md` §6): each bucket of time, how many values fell in each
+/// row. A distribution's rows are its buckets, merged across its series and made coarser a scale
+/// at a time until they are `rows` at the most; any other query's are `rows` equal ranges between
+/// its least and most value, its series' values counted (Datadog's heatmap of a metric across its
+/// tags).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Heatmap {
+    pub grid: Grid,
+    /// Each row's range, ascending (a distribution's bucket's bounds).
+    pub rows: Vec<(f64, f64)>,
+    /// `counts[t][r]`: bucket of time `t`, row `r`.
+    pub counts: Vec<Vec<f64>>,
+    pub distribution: bool,
+}
+
+/// The most rows a heatmap has: a chart's height in pixels' worth, a few to a row.
+pub const HEATMAP_ROWS: usize = 120;
+
+pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap, QueryError> {
+    let rows = rows.clamp(1, HEATMAP_ROWS);
+    let ast = parse(req.query)?;
+    if req.to <= req.from {
+        return Err(QueryError::EmptyRange);
+    }
+    if let Some(Node::Metric(q)) = ast.nodes.get(ast.root)
+        && distribution_of(store, q).is_some()
+        && let NameMatch::Exact(name) = &q.metric
+    {
+        let grid = grid_for(&ast, req)?;
+        let edges = grid.edges(0);
+        let spans = Spans::new(grid, 0, edges.as_deref());
+        let mut ids = Vec::new();
+        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+        ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
+        let members: Vec<(u32, i32, crate::dist::Bucket)> = ids.iter().filter_map(|&id| store.series(id)?.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value).map(|(s, b)| (id, s, b))).collect();
+        let (mut scale, mut by_bucket) = dist_counts(store, q, grid, spans, &members, &mut Scratch::default(), &mut (0, 0))?;
+        // Coarser until the rows fit: each step halves the buckets of each sign, exactly.
+        while by_bucket.len() > rows && scale > crate::dist::MIN_SCALE {
+            scale -= 1;
+            let mut coarser = DistCounts::new();
+            for (b, c) in std::mem::take(&mut by_bucket).into_values() {
+                let b = b.coarser(1);
+                let into = &mut coarser.entry(b.order()).or_insert_with(|| (b, vec![0.0; grid.n])).1;
+                for (x, y) in into.iter_mut().zip(c) {
+                    *x += y;
+                }
+            }
+            by_bucket = coarser;
+        }
+        let rows: Vec<(f64, f64)> = by_bucket.values().map(|(b, _)| b.bounds(scale)).collect();
+        let counts = (0..grid.n).map(|t| by_bucket.values().map(|(_, c)| c.get(t).copied().unwrap_or(0.0)).collect()).collect();
+        return Ok(Heatmap { grid, rows, counts, distribution: true });
+    }
+    let a = eval(store, req)?;
+    let finite = a.series.iter().flat_map(|s| s.values.iter().copied()).filter(|v| v.is_finite());
+    let (lo, hi) = finite.fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| (l.min(v), h.max(v)));
+    if lo > hi {
+        return Ok(Heatmap { grid: a.grid, rows: Vec::new(), counts: vec![Vec::new(); a.grid.n], distribution: false });
+    }
+    // A range of one value is one row; else `rows` equal ones, the last closed at the most.
+    let n = if hi > lo { rows } else { 1 };
+    let width = if hi > lo { (hi - lo) / n as f64 } else { 1.0 };
+    let edges: Vec<(f64, f64)> = (0..n).map(|r| (lo + width * r as f64, if r + 1 == n { hi } else { lo + width * (r + 1) as f64 })).collect();
+    let mut counts = vec![vec![0.0; n]; a.grid.n];
+    for s in &a.series {
+        for (t, &v) in s.values.iter().enumerate() {
+            if !v.is_finite() {
+                continue;
+            }
+            let r = (((v - lo) / width) as usize).min(n - 1);
+            if let Some(c) = counts.get_mut(t).and_then(|row| row.get_mut(r)) {
+                *c += 1.0;
+            }
+        }
+    }
+    Ok(Heatmap { grid: a.grid, rows: edges, counts, distribution: false })
 }
 
 /// A metric query's series on the grid.
@@ -2561,6 +2649,46 @@ mod tests {
         assert_eq!(ask("max:lat{*}")[0].1, all.iter().copied().fold(f64::MIN, f64::max));
         // A metric of its own name is no distribution: its series are read as they are.
         assert!(ask("p99:lat.count{*}")[0].1 > 0.0);
+    }
+
+    /// A heatmap: a distribution's rows its buckets (made coarser until they fit), each bucket of
+    /// time its merged counts; a gauge's, its series' values counted in equal rows.
+    #[test]
+    fn a_heatmap_counts_a_distribution_s_buckets_and_a_metric_s_values() {
+        use crate::dist::{BUCKET_TAG, Bucket, tag_value};
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        // Two hosts' buckets at scale 5: p0 3 and p40 1 from a, p1 2 from b, in the first minute;
+        // p40 4 from b in the second.
+        for (h, bucket, t, n) in [("a", Bucket::Pos(0), 10_000, 3.0), ("a", Bucket::Pos(40), 10_000, 1.0), ("b", Bucket::Pos(1), 20_000, 2.0), ("b", Bucket::Pos(40), 70_000, 4.0)] {
+            let tag = tag_value(5, bucket);
+            let k = SeriesKey::new("lat.dist", [("host", h), (BUCKET_TAG, tag.as_str())], Kind::Count).unwrap();
+            b.define(&k);
+            b.run(k.fp, [(t, n)]);
+        }
+        for (h, v) in [("a", 1.0), ("b", 2.0), ("c", 4.0)] {
+            let k = SeriesKey::new("cpu", [("host", h)], Kind::Gauge).unwrap();
+            b.define(&k);
+            b.run(k.fp, [(10_000, v)]);
+        }
+        s.apply(&b.finish()).unwrap();
+        let mut r = Request::new("p50:lat{*}", 0, 120_000);
+        r.step = Some(60_000);
+        let h = heatmap(&s, &r, 10).unwrap();
+        assert!(h.distribution);
+        assert_eq!(h.rows, vec![Bucket::Pos(0).bounds(5), Bucket::Pos(1).bounds(5), Bucket::Pos(40).bounds(5)]);
+        assert_eq!(h.counts, vec![vec![3.0, 2.0, 1.0], vec![0.0, 0.0, 4.0]]);
+        // Two rows at the most: one scale coarser, p0 and p1 are scale 4's p0 and p40 its p20.
+        let h2 = heatmap(&s, &r, 2).unwrap();
+        assert_eq!(h2.rows.len(), 2);
+        assert_eq!(h2.counts.iter().map(|c| c.iter().sum::<f64>()).collect::<Vec<_>>(), vec![6.0, 4.0], "every count kept");
+        // A gauge: its three hosts' values in equal rows from 1 to 4.
+        let mut r = Request::new("avg:cpu{*} by {host}", 0, 60_000);
+        r.step = Some(60_000);
+        let g = heatmap(&s, &r, 3).unwrap();
+        assert!(!g.distribution);
+        assert_eq!(g.rows, vec![(1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]);
+        assert_eq!(g.counts, vec![vec![1.0, 1.0, 1.0]]);
     }
 
     #[test]
