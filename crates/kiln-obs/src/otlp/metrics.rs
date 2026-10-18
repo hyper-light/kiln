@@ -172,7 +172,7 @@ impl Keys {
         let mut guard = shard.lock().unwrap_or_else(PoisonError::into_inner);
         let CumShard { last: kept, bytes: held } = &mut *guard;
         let entry = |scale: i32| Cum { start_ns, at_ns, scale, buckets: buckets.to_vec() };
-        let new_bytes = buckets.len() * std::mem::size_of::<(Bucket, u64)>() + std::mem::size_of::<Cum>();
+        let new_bytes = std::mem::size_of_val(buckets) + std::mem::size_of::<Cum>();
         match kept.get_mut(&id) {
             Some(c) if c.start_ns == start_ns && at_ns <= c.at_ns => {}
             Some(c) if c.start_ns == start_ns && scale <= c.scale => {
@@ -212,7 +212,7 @@ impl Keys {
                     out.clear();
                     out.extend_from_slice(buckets);
                 }
-                *held = held.saturating_sub(c.buckets.len() * std::mem::size_of::<(Bucket, u64)>()).saturating_add(buckets.len() * std::mem::size_of::<(Bucket, u64)>());
+                *held = held.saturating_sub(c.buckets.len() * std::mem::size_of::<(Bucket, u64)>()).saturating_add(std::mem::size_of_val(buckets));
                 *c = entry(scale);
             }
             _ => {
