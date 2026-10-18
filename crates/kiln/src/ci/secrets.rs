@@ -190,10 +190,18 @@ pub struct Meta {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_used_at: Option<i64>,
+    /// A brokered secret's source (W09-R08); its value is made at leg start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// Sets a secret (W09-R02, W09-R03).
 pub async fn set(hub: &Hub, scope: &Scope, name: &str, value: &str, by: &str) -> Result<(), String> {
+    store_row(hub, scope, name, value, None, by).await
+}
+
+/// Stores a secret's row: a value sealed, or a brokered one's source (its value empty).
+async fn store_row(hub: &Hub, scope: &Scope, name: &str, value: &str, from: Option<String>, by: &str) -> Result<(), String> {
     let name = rules::check_name(name)?;
     if value.len() > rules::MAX_SECRET {
         return Err(format!("a secret is at most {} KiB", rules::MAX_SECRET >> 10));
@@ -209,14 +217,20 @@ pub async fn set(hub: &Hub, scope: &Scope, name: &str, value: &str, by: &str) ->
             }
             let now = crate::util::now_unix();
             c.execute(
-                "INSERT INTO ci_secrets (id, scope_kind, scope_id, name, ciphertext, nonce, key_id, size, created_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
-                 ON CONFLICT (scope_kind, scope_id, name) DO UPDATE SET ciphertext = excluded.ciphertext, nonce = excluded.nonce, key_id = excluded.key_id, size = excluded.size, updated_at = excluded.updated_at",
-                params![crate::util::new_id(), s.kind.as_str(), s.id, name, sealed, nonce, key_id, size, by, now],
+                "INSERT INTO ci_secrets (id, scope_kind, scope_id, name, ciphertext, nonce, key_id, size, created_by, created_at, updated_at, broker) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)
+                 ON CONFLICT (scope_kind, scope_id, name) DO UPDATE SET ciphertext = excluded.ciphertext, nonce = excluded.nonce, key_id = excluded.key_id, size = excluded.size, updated_at = excluded.updated_at, broker = excluded.broker",
+                params![crate::util::new_id(), s.kind.as_str(), s.id, name, sealed, nonce, key_id, size, by, now, from],
             )?;
             Ok(())
         })
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Defines a secret as brokered (W09-R08): `from` says where its value comes from at leg start.
+pub async fn set_brokered(hub: &Hub, scope: &Scope, name: &str, from: &str, by: &str) -> Result<(), String> {
+    super::broker::parse(from)?;
+    store_row(hub, scope, name, "", Some(from.trim().to_owned()), by).await
 }
 
 pub async fn delete(hub: &Hub, scope: &Scope, name: &str) -> anyhow::Result<bool> {
@@ -228,8 +242,8 @@ pub async fn list(hub: &Hub, scope: &Scope) -> anyhow::Result<Vec<Meta>> {
     let s = scope.clone();
     hub.store
         .call(move |c| {
-            let mut q = c.prepare("SELECT name, size, created_at, updated_at, last_used_at FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 ORDER BY name")?;
-            let rows = q.query_map(params![s.kind.as_str(), s.id], |r| Ok(Meta { name: r.get(0)?, size: r.get(1)?, created_at: r.get(2)?, updated_at: r.get(3)?, last_used_at: r.get(4)? }))?;
+            let mut q = c.prepare("SELECT name, size, created_at, updated_at, last_used_at, broker FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 ORDER BY name")?;
+            let rows = q.query_map(params![s.kind.as_str(), s.id], |r| Ok(Meta { name: r.get(0)?, size: r.get(1)?, created_at: r.get(2)?, updated_at: r.get(3)?, last_used_at: r.get(4)?, from: r.get(5)? }))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
@@ -263,34 +277,58 @@ pub struct Resolved {
 }
 
 /// The secrets a leg of `repo`'s `workflow` (bound to `environment`) may draw on, resolved by
-/// scope and decrypted: the names in `wanted`, or all of them (W09-R01, W09-R04).
-pub async fn for_leg(hub: &Hub, repo: &Repo, workflow: &str, environment: Option<&str>, wanted: &Used) -> anyhow::Result<BTreeMap<String, Resolved>> {
+/// scope and decrypted: the names in `wanted`, or all of them (W09-R01, W09-R04). Brokered ones
+/// (W09-R08) are made now, for the leg acting as `w`; those that couldn't be, with why, come
+/// second.
+pub async fn for_leg(hub: &Hub, repo: &Repo, workflow: &str, environment: Option<&str>, wanted: &Used, w: &kiln_ci::oidc::Workload<'_>) -> anyhow::Result<(BTreeMap<String, Resolved>, Vec<(String, String)>)> {
     let scopes = scopes_for(repo, workflow, environment);
     let wanted = wanted.clone();
     let m = master(hub)?;
     let (all, names) = (wanted.all, wanted.names.clone());
-    let stored: BTreeMap<String, Resolved> = hub
+    let (mut stored, brokered): (BTreeMap<String, Resolved>, Vec<(String, String, String, ScopeKind)>) = hub
         .store
         .call(move |c| {
             let keys = all_keys(c, &m)?;
             let mut out: BTreeMap<String, Resolved> = BTreeMap::new();
+            let mut brokered: Vec<(String, String, String, ScopeKind)> = Vec::new();
             // From the least specific up, so the most specific wins.
             for s in scopes.iter().rev() {
-                let mut q = c.prepare("SELECT id, name, ciphertext, nonce, key_id FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2")?;
-                let rows = q.query_map(params![s.kind.as_str(), s.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?, r.get::<_, String>(4)?)))?;
+                let mut q = c.prepare("SELECT id, name, ciphertext, nonce, key_id, broker FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2")?;
+                let rows = q.query_map(params![s.kind.as_str(), s.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?)))?;
                 for row in rows {
-                    let (id, name, sealed, nonce, key_id) = row?;
+                    let (id, name, sealed, nonce, key_id, broker) = row?;
                     if !all && !names.contains(&name) {
                         continue;
                     }
+                    if let Some(from) = broker {
+                        // A more specific scope's wins here too.
+                        out.remove(&name);
+                        brokered.retain(|b| b.0 != name);
+                        brokered.push((name, from, id, s.kind));
+                        continue;
+                    }
+                    brokered.retain(|b| b.0 != name);
                     let k = keys.get(&key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
                     let plain = open(k, &sealed, &nonce, &s.aad(&name))?;
                     out.insert(name, Resolved { value: String::from_utf8_lossy(&plain).into_owned(), id: Some(id), scope: s.kind });
                 }
             }
-            Ok(out)
+            Ok((out, brokered))
         })
         .await?;
+    let mut failed = Vec::new();
+    for (name, from, id, scope) in brokered {
+        let made = match super::broker::parse(&from) {
+            Ok(src) => super::broker::value(hub, repo, w, &src).await.map_err(|e| format!("{e:#}")),
+            Err(e) => Err(e),
+        };
+        match made {
+            Ok(value) => {
+                stored.insert(name, Resolved { value, id: Some(id), scope });
+            }
+            Err(e) => failed.push((name, format!("from {from}: {e}"))),
+        }
+    }
     // The config's `[secrets]`: server scope, beneath stored ones.
     let mut out: BTreeMap<String, Resolved> = BTreeMap::new();
     for (k, v) in hub.ci_secrets() {
@@ -305,7 +343,7 @@ pub async fn for_leg(hub: &Hub, repo: &Repo, workflow: &str, environment: Option
             out.insert(name, r);
         }
     }
-    Ok(out)
+    Ok((out, failed))
 }
 
 /// The names a leg of `repo`'s `workflow` bound to `environment` could resolve, without
@@ -350,18 +388,27 @@ pub async fn record_uses(hub: &Hub, leg: &str, ids: Vec<String>) -> anyhow::Resu
         return Ok(());
     }
     let leg = leg.to_owned();
-    hub.store
+    let l = leg.clone();
+    let names: Vec<String> = hub
+        .store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = crate::util::now_unix();
+            let mut names = Vec::new();
             for id in &ids {
-                tx.execute("INSERT OR REPLACE INTO ci_secret_uses (secret_id, leg_id, ts) VALUES (?1, ?2, ?3)", params![id, leg, now])?;
+                tx.execute("INSERT OR REPLACE INTO ci_secret_uses (secret_id, leg_id, ts) VALUES (?1, ?2, ?3)", params![id, l, now])?;
                 tx.execute("UPDATE ci_secrets SET last_used_at = ?2 WHERE id = ?1", params![id, now])?;
+                if let Some(n) = tx.query_row("SELECT name FROM ci_secrets WHERE id = ?1", [id], |r| r.get::<_, String>(0)).optional()? {
+                    names.push(n);
+                }
             }
             tx.commit()?;
-            Ok(())
+            Ok(names)
         })
-        .await
+        .await?;
+    // A secret's use is audited (W19-R05): which leg was given which, by name.
+    hub.store.audit(format!("job:{leg}"), "ci.secrets.use".into(), names.join(", ")).await;
+    Ok(())
 }
 
 /// Re-seals every secret under a new data key and retires the old ones: how many moved.
@@ -467,6 +514,15 @@ struct Value {
     value: String,
 }
 
+/// A secret as set: its `value`, or where it comes `from` (W09-R08).
+#[derive(serde::Deserialize)]
+struct SecretBody {
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+}
+
 fn fail(status: http::StatusCode, m: impl Into<String>) -> super::Fail {
     (status, m.into())
 }
@@ -496,9 +552,20 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
         }
         (&Method::PUT, ["secrets", name]) => {
             let (scope, text) = scope_of(hub, q).await?;
-            let v: Value = srv::body_json(body, rules::MAX_SECRET * 2 + 1024).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-            set(hub, &scope, name, &v.value, "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
-            hub.store.audit("admin".into(), "ci.secret.set".into(), format!("{} in {text}", name.to_ascii_uppercase())).await;
+            let v: SecretBody = srv::body_json(body, rules::MAX_SECRET * 2 + 1024).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let detail = match (&v.value, &v.from) {
+                (Some(value), None) => {
+                    set(hub, &scope, name, value, "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    format!("{} in {text}", name.to_ascii_uppercase())
+                }
+                // W09-R08: brokered, its value made at leg start.
+                (None, Some(from)) => {
+                    set_brokered(hub, &scope, name, from, "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    format!("{} in {text}, from {}", name.to_ascii_uppercase(), from.trim())
+                }
+                _ => return Err(fail(StatusCode::BAD_REQUEST, "a secret has a `value`, or says where it comes `from`")),
+            };
+            hub.store.audit("admin".into(), "ci.secret.set".into(), detail).await;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::DELETE, ["secrets", name]) => {

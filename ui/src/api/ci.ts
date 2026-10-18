@@ -344,6 +344,25 @@ export interface CiInsightsRunner extends CiInsightsHead, CiRunnerInsight {
   repos: { id: string; name: string | null; legs: number; runner_minutes: number; failure: number }[];
 }
 
+/** A log line that matched a search (W19-R04). `at` is where the match starts in `text` (bytes). */
+export interface CiLogHit {
+  run: string;
+  number: number;
+  repo: string;
+  repo_name: string | null;
+  workflow: string;
+  branch: string;
+  conclusion: string | null;
+  created_at: number;
+  leg: string;
+  job: string;
+  step: number;
+  step_name: string | null;
+  line: number;
+  text: string;
+  at: number;
+}
+
 /** Something that differs between two runs or legs (W19-R03): `a` is the base's, `b` the head's (null: not there). */
 export interface CiDifference {
   kind: "action" | "var" | "leg" | "conclusion" | "runner" | "executor" | "machine" | "version" | "image" | "env" | "cache" | string;
@@ -425,6 +444,17 @@ export const ci = {
     request<CiWorkflowSource>("GET", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   names: (repo: string, path: string, signal?: AbortSignal) => request<{ secrets: string[]; variables: string[] }>("GET", `/api/ci/repos/${enc(repo)}/names?path=${enc(path)}`, undefined, { signal }),
   catalog: (q: string, signal?: AbortSignal) => request<{ actions: CiCatalogEntry[] }>("GET", `/api/ci/actions?q=${enc(q)}`, undefined, { signal }),
+  searchLogs: (p: { q: string; repo?: string; branch?: string; conclusion?: string; days?: number }, signal?: AbortSignal) =>
+    request<{ hits: CiLogHit[]; took_ms: number; unindexed_legs: number }>(
+      "GET",
+      `/api/ci/logs/search?${new URLSearchParams(
+        Object.entries(p)
+          .filter(([, v]) => v !== undefined && v !== "")
+          .map(([k, v]) => [k, String(v)]),
+      )}`,
+      undefined,
+      { signal },
+    ),
   /** `other`: a run's (or leg's) id, or `last-green`. */
   compare: (run: string, other: string, signal?: AbortSignal) => request<CiCompare>("GET", `/api/ci/runs/${enc(run)}/compare/${enc(other)}`, undefined, { signal }),
   compareLegs: (leg: string, other: string, signal?: AbortSignal) => request<CiCompare>("GET", `/api/ci/legs/${enc(leg)}/compare/${enc(other)}`, undefined, { signal }),

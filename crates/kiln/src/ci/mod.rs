@@ -4,6 +4,7 @@
 
 pub mod actions;
 pub mod api;
+pub mod broker;
 pub mod cli;
 pub mod compare;
 pub mod dispatch;
@@ -15,6 +16,7 @@ pub mod insights;
 pub mod integrations;
 pub mod load;
 pub mod local;
+pub mod logsearch;
 pub mod notify;
 pub mod oidc;
 pub mod ops;

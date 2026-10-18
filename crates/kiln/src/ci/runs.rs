@@ -286,7 +286,10 @@ pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, 
             c.execute("UPDATE steps SET status = 'skipped' WHERE job_id = ?1 AND status IN ('pending', 'running')", [&leg])?;
             Ok(())
         })
-        .await
+        .await?;
+    // Its logs go into the search index (W19-R04).
+    super::logsearch::kick();
+    Ok(())
 }
 
 /// A step started on the runner: its evaluated name replaces the planned one (or the step is new:
