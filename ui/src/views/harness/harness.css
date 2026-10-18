@@ -1029,12 +1029,18 @@ textarea.hx-input {
 }
 .hx-table {
   container-type: inline-size;
+  /* Only a table too wide to fit at all, many columns of long words, scrolls, and by itself. */
+  overflow-x: auto;
 }
 .hx-prose table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
   line-height: 1.5;
+  /* Words stay whole in a cell. Breaking "anywhere" lets a column count as one letter wide, and a
+     long column beside it squeezes it to a letter a line. Long runs get places to wrap instead
+     (markdown.tsx). */
+  overflow-wrap: break-word;
 }
 .hx-prose th {
   padding: 0 14px 6px 0;
