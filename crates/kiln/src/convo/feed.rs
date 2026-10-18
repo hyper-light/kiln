@@ -303,7 +303,7 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                     return vec![Msg::From { store: s, rev }];
                 }
             };
-            match store.take(&peer_name(machine, &s), from, batch) {
+            match store.take(&peer_name(machine, &s), machine, from, batch) {
                 Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev }],
                 Ok(t) => {
                     if t.fenced > 0 {

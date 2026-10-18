@@ -93,6 +93,17 @@ pub struct Mark {
     pub line: String,
 }
 
+/// A session the store has that hasn't ended: what it is, as JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unended {
+    pub id: String,
+    pub info: String,
+    pub meta: Option<String>,
+    pub state: Option<String>,
+    /// The machine whose feed brought it (None: it came another way, `info` says where).
+    pub machine: Option<String>,
+}
+
 /// What a store did with a batch of a peer's feed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Took {
@@ -119,15 +130,18 @@ pub trait Engine: Send + 'static {
     fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>>;
     /// The rows written after number `from`, as they are now, oldest first, about `max_bytes`.
     fn changes(&mut self, from: u64, max_bytes: usize) -> anyhow::Result<Changes>;
-    /// Take a batch of `peer`'s feed, which follows number `from` of it, in one transaction:
-    /// numbered here as this store's own writes, a session's rows from its latest writer alone.
-    fn take(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took>;
+    /// Take a batch of `peer`'s feed (a store of machine `machine`), which follows number `from`
+    /// of it, in one transaction: numbered here as this store's own writes, a session's rows from
+    /// its latest writer alone.
+    fn take(&mut self, peer: &str, machine: &str, from: u64, batch: &Changes) -> anyhow::Result<Took>;
     /// Through where this store has taken `peer`'s feed (0: none of it).
     fn peer(&mut self, peer: &str) -> anyhow::Result<u64>;
     /// Each file of `session`'s record kept, with its last line.
     fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>>;
     /// `limit` lines of `session`'s record from `source`, from line `from` on: `(n, line)`.
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
+    /// The sessions not ended, heard of since `since` (unix ms), oldest first.
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -229,12 +243,12 @@ impl Store {
         self.run(move |e| e.changes(from, max_bytes))
     }
 
-    /// Take a batch of `peer`'s feed (it follows `from`). Blocking.
-    pub fn take(&self, peer: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
-        let p = peer.to_owned();
+    /// Take a batch of `peer`'s feed (a store of machine `machine`; it follows `from`). Blocking.
+    pub fn take(&self, peer: &str, machine: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
+        let (p, m) = (peer.to_owned(), machine.to_owned());
         let w = self.watchers.clone();
         self.run(move |e| {
-            let took = e.take(&p, from, &batch)?;
+            let took = e.take(&p, &m, from, &batch)?;
             if took.applied > 0 {
                 notify(&w);
             }
@@ -258,6 +272,11 @@ impl Store {
     pub fn record(&self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
         let (s, src) = (session.to_owned(), source.to_owned());
         self.run(move |e| e.record(&s, &src, from, limit))
+    }
+
+    /// The sessions not ended, heard of since `since` (unix ms). Blocking.
+    pub fn unended(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.run(move |e| e.unended(since))
     }
 
     /// Wait until everything sent so far is committed. Blocking.

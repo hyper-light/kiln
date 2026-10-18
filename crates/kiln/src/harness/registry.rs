@@ -331,8 +331,66 @@ impl Registry {
     }
 
     /// The server's own sessions' updates, into the mirrors (supervised; restartable).
+    /// Sessions of machines that are away, as the server's store has them (the server started
+    /// again since they went away): listed as away, so they can be moved on, until their machine
+    /// says what it has.
+    pub fn restore_away(&self, hub: &Hub, away: Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>) {
+        let mut infos = Vec::new();
+        {
+            let mut g = self.mirrors.lock();
+            for (u, events) in away {
+                let Ok(mut info) = serde_json::from_str::<Info>(&u.info) else { continue };
+                // The machine whose feed brought it, else the one its updates came from.
+                let Some(machine) = u.machine.clone().or_else(|| info.target.strip_prefix("agent:").map(str::to_owned)) else { continue };
+                info.target = format!("agent:{machine}");
+                if g.contains_key(&u.id) || hub.agents.lock().get(&machine).is_some_and(|a| a.connected) {
+                    continue;
+                }
+                info.status = Status::Disconnected;
+                let mut m = Mirror::new(info.clone(), Location::Machine(machine));
+                m.meta = u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
+                m.state = u.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
+                if let Some(o) = m.state.as_object_mut() {
+                    o.insert("status".into(), json!("disconnected"));
+                }
+                for e in events {
+                    if let Ok(v) = serde_json::from_str::<Value>(&e.body) {
+                        m.upsert(v);
+                    }
+                }
+                g.insert(u.id, m);
+                infos.push(info);
+            }
+        }
+        if !infos.is_empty() {
+            tracing::info!(sessions = infos.len(), "agent sessions on machines that are away, from the conversation store");
+        }
+        for info in infos {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+    }
+
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
         static RESTORED: std::sync::Once = std::sync::Once::new();
+        // Sessions of machines that are away: listed from the store (the last month's).
+        if let Some(st) = hub.harness.convo.clone() {
+            const AWAY_DAYS: i64 = 30;
+            const AWAY_EVENTS: usize = 200;
+            let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
+            let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+                let mut out = Vec::new();
+                for u in st.unended(since)? {
+                    let events = st.events(&u.id, None, AWAY_EVENTS)?;
+                    out.push((u, events));
+                }
+                Ok(out)
+            })
+            .await;
+            match read {
+                Ok(Ok(away)) => hub.harness.restore_away(&hub, away),
+                Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
+            }
+        }
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
@@ -999,9 +1057,13 @@ impl Registry {
             Some(Location::Machine(machine)) => hub.send_to_agent(machine, LANE_TERM, &ServerMsg::HarnessClose { session: id.to_owned() }).await,
         };
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
+        // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(m) = self.mirrors.lock().remove(id) {
                 m.out.send(Arc::from(json!({"t": "closed"}).to_string()));
+            }
+            if let Some(store) = &self.convo {
+                store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }

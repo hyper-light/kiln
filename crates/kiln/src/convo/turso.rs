@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use super::rows::{EventRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Engine, Kept, Mark, Query, SEARCH_MAX, Took};
+use super::store::{Change, Changes, Engine, Kept, Mark, Query, SEARCH_MAX, Took, Unended};
 
 /// How often a statement that finds the database busy tries again, and how long it waits between.
 const BUSY_TRIES: u32 = 50;
@@ -446,13 +446,13 @@ impl Engine for Turso {
         Ok(out)
     }
 
-    fn take(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+    fn take(&mut self, peer: &str, machine: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
         let have = self.peer(peer)?;
         if from != have || batch.upto < from {
             return Ok(Took { rev: have, gap: true, ..Took::default() });
         }
         let now = crate::util::now_ms();
-        let peer = peer.to_owned();
+        let (peer, machine) = (peer.to_owned(), machine.to_owned());
         self.transaction(|t| {
             let mut w = t.writes()?;
             let mut epochs: HashMap<String, u64> = HashMap::new();
@@ -483,6 +483,15 @@ impl Engine for Turso {
                 let r = t.rev;
                 t.write(&mut w, &c.row, r)?;
                 took.applied += 1;
+            }
+            // Where each session it brought runs: the machine of this feed (a former writer's
+            // rows, left out, don't say so).
+            let mut at = t.prepare(sql::SESSION_MACHINE)?;
+            for (session, epoch) in &epochs {
+                let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
+                if theirs {
+                    t.run(&mut at, &[txt(session), txt(&machine)], |_| Ok(()))?;
+                }
             }
             let mut set = t.prepare(sql::PEER_SET)?;
             t.run(&mut set, &[txt(&peer), seq(batch.upto), int(now)], |_| Ok(()))?;
@@ -523,6 +532,18 @@ impl Engine for Turso {
         let mut out = Vec::new();
         self.run(&mut stmt, &[txt(session), txt(source), seq(from), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
             out.push((u(r, 0), r.get::<String>(1).unwrap_or_default()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(since)], |r| {
+            if let (Ok(id), Ok(info)) = (r.get::<String>(0), r.get::<String>(1)) {
+                out.push(Unended { id, info, meta: r.get::<String>(2).ok(), state: r.get::<String>(3).ok(), machine: r.get::<String>(4).ok() });
+            }
             Ok(())
         })?;
         Ok(out)

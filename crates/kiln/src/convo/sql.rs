@@ -37,11 +37,12 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (session, n)
     );",
     // 2: revisions (a store numbers its writes; a feed sends what came after a number), epochs
-    // (a session's writer), the harness's record by the file it is from, what was dropped (a
-    // feed sends that too), and the peers a store takes feeds from. Rows from before get
-    // numbers of their own: sessions even, events odd.
+    // (a session's writer), the machine a feed brought a session from, the harness's record by
+    // the file it is from, what was dropped (a feed sends that too), and the peers a store takes
+    // feeds from. Rows from before get numbers of their own: sessions even, events odd.
     "ALTER TABLE sessions ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE sessions ADD COLUMN rev INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN machine TEXT;
     ALTER TABLE events ADD COLUMN rev INTEGER NOT NULL DEFAULT 0;
     UPDATE sessions SET rev = rowid * 2;
     UPDATE events SET rev = rowid * 2 + 1;
@@ -100,6 +101,10 @@ pub const SESSION_OPEN: &str = "UPDATE sessions SET closed_at = NULL WHERE id = 
 pub const SESSION_CLOSE: &str = "UPDATE sessions SET closed_at = ?2, rev = ?3 WHERE id = ?1";
 pub const SESSION_GET: &str = "SELECT info, meta, state, changes, updated_at, closed_at FROM sessions WHERE id = ?1";
 pub const SESSION_EPOCH: &str = "SELECT epoch FROM sessions WHERE id = ?1";
+/// Sessions not ended, heard of since `?1` (unix ms).
+pub const SESSIONS_UNENDED: &str = "SELECT id, info, meta, state, machine FROM sessions WHERE closed_at IS NULL AND info IS NOT NULL AND updated_at >= ?1 ORDER BY updated_at";
+/// The machine whose feed brought the session.
+pub const SESSION_MACHINE: &str = "UPDATE sessions SET machine = ?2 WHERE id = ?1";
 
 pub const EVENT_UPSERT: &str = "INSERT INTO events (session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
     ON CONFLICT (session, id) DO UPDATE SET
