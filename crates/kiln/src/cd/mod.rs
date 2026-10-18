@@ -18,6 +18,7 @@ pub mod kube;
 pub mod live;
 pub mod ops;
 pub mod plans;
+pub mod targets;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -168,6 +169,12 @@ pub struct Cd {
     pub environments: RwLock<BTreeMap<String, BTreeMap<String, apps::EnvironmentSpec>>>,
     /// The latest sync each app started, for a self-deploy's record.
     pub started: Mutex<HashMap<String, guard::Started>>,
+    /// Connected targets beyond Kubernetes, by name (docs/cd-targets.md §2).
+    pub targets: RwLock<BTreeMap<String, Arc<targets::Conn>>>,
+    /// Why a target can't be reached yet, by name.
+    pub target_errors: Mutex<BTreeMap<String, String>>,
+    /// Repositories' `owner/name`, by clone URL: whose workload a target's calls are.
+    pub repo_names: RwLock<HashMap<String, String>>,
 }
 
 impl Cd {
@@ -287,6 +294,7 @@ impl Cd {
                 return;
             }
         };
+        self.repo_names.write().extend(repos.iter().map(|r| (r.clone_url.clone(), r.name.clone())));
         for repo in repos.into_iter().filter(|r| r.enabled) {
             let trunk = repo.branches.first().cloned().unwrap_or_else(|| "main".into());
             let (dir, auth, url, t) = (self.mirror_dir(&repo.clone_url), self.git_auth(&repo.clone_url), repo.clone_url.clone(), trunk.clone());
@@ -380,6 +388,7 @@ impl Cd {
 
     async fn refresh_sources(self: &Arc<Self>) {
         self.refresh_deploy_files().await;
+        self.connect_targets().await;
         let apps: Vec<AppEntry> = self.apps.read().values().cloned().collect();
         // Each repository is fetched once a round.
         let mut urls: BTreeSet<String> = BTreeSet::new();
@@ -1080,7 +1089,22 @@ impl Cd {
                     let this = self.clone();
                     crate::rt::spawn(this.render(key, app.to_string()));
                 }
+                Action::Watch { cluster, kind } if kiln_cd::providers::is_target(&cluster) => self.target_watch(cluster.to_string(), kind),
                 Action::Watch { cluster, kind } => self.watch(cluster.to_string(), kind),
+                Action::Apply { id, cluster, object, dry_run, .. } if kiln_cd::providers::is_target(&cluster) => {
+                    let this = self.clone();
+                    crate::rt::spawn(async move {
+                        let result = this.target_apply(&cluster, &object, dry_run).await;
+                        this.input(Input::Answer { id, result });
+                    });
+                }
+                Action::Delete { id, cluster, key, .. } if kiln_cd::providers::is_target(&cluster) => {
+                    let this = self.clone();
+                    crate::rt::spawn(async move {
+                        let result = this.target_delete(&cluster, &key).await.map(|()| None);
+                        this.input(Input::Answer { id, result });
+                    });
+                }
                 Action::Apply { id, cluster, object, dry_run, manager, .. } => {
                     let this = self.clone();
                     crate::rt::spawn(async move {
@@ -1317,6 +1341,9 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         deploy_errors: Mutex::new(BTreeMap::new()),
         environments: RwLock::new(BTreeMap::new()),
         started: Mutex::new(HashMap::new()),
+        targets: RwLock::new(BTreeMap::new()),
+        target_errors: Mutex::new(BTreeMap::new()),
+        repo_names: RwLock::new(HashMap::new()),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

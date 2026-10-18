@@ -342,6 +342,12 @@ pub async fn delete(hub: &Hub, name: &str, by: &str) -> anyhow::Result<bool> {
 }
 
 /// The integration's stored secret, for the server's own use.
+/// A token integration's stored token (`cloudflare`, `vercel`, …), for the providers that act
+/// through it.
+pub async fn token(hub: &Hub, i: &Integration) -> anyhow::Result<Option<String>> {
+    secret(hub, i).await
+}
+
 async fn secret(hub: &Hub, i: &Integration) -> anyhow::Result<Option<String>> {
     if !i.has_secret {
         return Ok(None);

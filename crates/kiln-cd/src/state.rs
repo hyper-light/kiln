@@ -259,6 +259,37 @@ pub enum Command {
         /// The hold; none to follow git.
         pin: Option<Box<Pin>>,
     },
+    /// Keep what kiln last applied to a provider's object, or forget it once the object is gone
+    /// (docs/cd-targets.md §2.4).
+    Applied {
+        /// The target (its cluster name).
+        target: String,
+        /// The object: [`applied_key`].
+        key: String,
+        /// The record; none to forget it.
+        applied: Option<Box<Applied>>,
+    },
+}
+
+/// What kiln last applied to a provider's object (docs/cd-targets.md §2.4). Platforms have no
+/// server-side apply, so kiln keeps the object it applied, as `kubectl apply` keeps its
+/// last-applied configuration: the fields kiln owns, and its metadata, read back onto the live
+/// object. `made` is what the platform made of it (an ARN, a code hash), so a provider can tell
+/// whether the platform still holds what kiln made.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Applied {
+    /// The desired object kiln applied.
+    pub object: Value,
+    /// What the platform made of it.
+    #[serde(default)]
+    pub made: Value,
+    /// When.
+    pub at_ms: u64,
+}
+
+/// A provider object's key in [`Data::applied`]: `group/kind/namespace/name`.
+pub fn applied_key(group: &str, kind: &str, namespace: &str, name: &str) -> String {
+    format!("{group}/{kind}/{namespace}/{name}")
 }
 
 /// Something that changed, for whoever follows the store.
@@ -282,6 +313,8 @@ pub enum Change {
     Setting(String),
     /// An app was held at an earlier deployment, or let go.
     Pinned(String),
+    /// What kiln applied to a target's object changed (by target).
+    Applied(String),
 }
 
 /// What is kept.
@@ -302,6 +335,9 @@ pub struct Data {
     /// Apps held at an earlier deployment, by id.
     #[serde(default)]
     pub pins: BTreeMap<String, Pin>,
+    /// What kiln last applied to each provider object, by target, then [`applied_key`].
+    #[serde(default)]
+    pub applied: BTreeMap<String, BTreeMap<String, Applied>>,
 }
 
 impl Data {
@@ -403,6 +439,22 @@ impl Data {
                     }
                 }
                 changes.push(Change::Pinned(app));
+            }
+            Command::Applied { target, key, applied } => {
+                match applied {
+                    Some(a) => {
+                        self.applied.entry(target.clone()).or_default().insert(key, *a);
+                    }
+                    None => {
+                        if let Some(m) = self.applied.get_mut(&target) {
+                            m.remove(&key);
+                            if m.is_empty() {
+                                self.applied.remove(&target);
+                            }
+                        }
+                    }
+                }
+                changes.push(Change::Applied(target));
             }
         }
         Ok(())
