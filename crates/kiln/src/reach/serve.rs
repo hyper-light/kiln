@@ -347,7 +347,9 @@ mod tests {
             let second = RunSpec { id: 2, command: "pwd; echo \"$GREETING\"; exit 4".into(), ..RunSpec::default() };
             let (out, _, code, _) = run(second, dir.path(), Some(state.clone())).await?;
             let text = String::from_utf8_lossy(&out).into_owned();
-            assert!(text.starts_with(&dir.path().join("sub").to_string_lossy().into_owned()), "{text}");
+            // bash says where it is as the kernel has it (macOS's /var is /private/var).
+            let there = std::fs::canonicalize(text.lines().next().unwrap_or_default())?;
+            assert_eq!(there, std::fs::canonicalize(dir.path().join("sub"))?, "{text}");
             assert!(text.ends_with("hi\n"), "{text}");
             // An exit still saves the state.
             assert_eq!(code, Some(4));
