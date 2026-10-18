@@ -1179,7 +1179,9 @@ impl Codex {
         if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
+            let id = item.id.clone();
             self.start_turn(core, &thread, item);
+            super::pause::sent_from_queue(core, &id);
         }
     }
 
@@ -1208,9 +1210,12 @@ impl Codex {
             let id = crate::util::new_id();
             self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
             super::pause::from_kiln(core, &id);
-        } else {
-            self.next(core);
+            return;
         }
+        if p.cut.is_some() {
+            super::pause::continue_later(core, super::pause::CONTINUE);
+        }
+        self.next(core);
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {

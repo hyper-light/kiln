@@ -903,9 +903,12 @@ impl Claude {
             let id = crate::util::new_id();
             self.send(core, id.clone(), super::pause::CONTINUE.to_owned(), SendMode::Queue, Vec::new(), None);
             super::pause::from_kiln(core, &id);
-        } else {
-            self.drain_queue(core);
+            return;
         }
+        if p.cut.is_some() {
+            super::pause::continue_later(core, super::pause::CONTINUE);
+        }
+        self.drain_queue(core);
     }
 
     /// The account reached a usage limit (the harness's `rate_limit` error): the session pauses
@@ -1339,7 +1342,9 @@ impl Claude {
         }
         let item = core.state.queue.remove(0);
         core.touch_state();
+        let id = item.id.clone();
         self.send(core, item.id, item.text, SendMode::Queue, item.attachments, item.overrides);
+        super::pause::sent_from_queue(core, &id);
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {

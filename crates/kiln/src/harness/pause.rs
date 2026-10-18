@@ -399,6 +399,23 @@ pub fn snapshot(cwd: &str, session: &str, at: i64) -> Option<(String, String)> {
     made
 }
 
+/// Ids kiln gives the messages it queues itself (`continue_later`).
+pub const KILN_ID: &str = "kiln-";
+
+/// The cut-off turn goes on once the harness can take it (it ended, or a turn is under way): kiln's
+/// message waits at the front of the queue.
+pub fn continue_later(core: &mut Core, text: &str) {
+    core.state.queue.insert(0, QueueItem { id: format!("{KILN_ID}{}", crate::util::new_id()), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+    core.touch_state();
+}
+
+/// A queued message went out: kiln's own reads as kiln's in the timeline.
+pub fn sent_from_queue(core: &mut Core, id: &str) {
+    if id.starts_with(KILN_ID) {
+        from_kiln(core, id);
+    }
+}
+
 /// Mark a message kiln sent itself (`CONTINUE`) as kiln's in the timeline.
 pub fn from_kiln(core: &mut Core, id: &str) {
     if let Some(e) = core.get_mut(id)
@@ -614,6 +631,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&plain);
         Ok(())
+    }
+
+    #[test]
+    fn a_continue_that_cant_go_now_waits_first_in_the_queue() {
+        let mut core = Core::new();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "then the tests".into(), at: 1, attachments: vec![], overrides: None });
+        continue_later(&mut core, CONTINUE);
+        assert!(core.state.queue.first().is_some_and(|q| q.id.starts_with(KILN_ID) && q.text == CONTINUE));
+        assert_eq!(core.state.queue.len(), 2);
     }
 
     #[test]

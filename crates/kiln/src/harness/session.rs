@@ -1203,7 +1203,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         // the limit cut off goes on first.
         let unpaused = core.state.pause.take();
         if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
-            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
         }
         let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
         if !empty {
