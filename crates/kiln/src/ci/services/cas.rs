@@ -230,7 +230,7 @@ pub struct Collected {
     pub bytes: u64,
 }
 
-/// Removes objects nothing refers to (no cache entry, artifact or action), and then chunks that
+/// Removes objects nothing refers to (no cache entry, artifact or release asset), and then chunks that
 /// no remaining object uses. Anything younger than an hour stays, since an upload in progress
 /// may be about to refer to it.
 pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
@@ -243,7 +243,8 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
             let gone = tx.execute(
                 "DELETE FROM cas_objects WHERE last_used_at < ?1
                    AND digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
-                   AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)",
+                   AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
+                   AND digest NOT IN (SELECT object FROM ci_release_assets)",
                 params![now - grace],
             )?;
             let mut used = HashSet::new();

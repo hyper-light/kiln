@@ -35,6 +35,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W14: GitHub's REST API (as GHES serves it, at /api/v3) and GraphQL, for a leg's token.
         ["api", "v3", rest @ ..] => Some(super::rest::route(hub, rest, req).await),
         ["api", "graphql"] => Some(super::rest::graphql(hub, req).await),
+        ["api", "uploads", "repos", owner, repo, "releases", id, "assets"] => Some(super::rest::upload(hub, owner, repo, id, req).await),
+        _ if super::rest::is_download(seg) => Some(super::rest::download(hub, seg, &req).await),
         _ if super::rest::is_web(seg) => Some(super::rest::web(hub, seg).await),
         // W10: ID tokens for jobs, and the issuer's documents.
         ["_kiln", "oidc", "token"] => Some(super::oidc::token(hub, &req).await),
@@ -47,7 +49,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 
 /// Is this path one of [`open`]'s? (So the caller can hand the request over without cloning it.)
 pub fn is_open(seg: &[&str]) -> bool {
-    git_path(seg) || super::rest::is_web(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"])
+    git_path(seg) || super::rest::is_web(seg) || super::rest::is_download(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"] | ["api", "uploads", ..])
 }
 
 /// First segments that are kiln's own, never a repository owner.

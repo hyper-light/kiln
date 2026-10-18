@@ -157,9 +157,13 @@ pub fn split_options(s: &str) -> Vec<String> {
     out
 }
 
-/// Host paths and where they are in the job container, longest first.
+/// Host paths and where they are in the job container, longest first, and the server's
+/// loopback addresses as a container reaches them.
 #[derive(Debug, Clone, Default)]
 pub struct PathMap(Vec<(PathBuf, String)>);
+
+/// The host, as containers reach it (`--add-host host.docker.internal:host-gateway`).
+pub const HOST_ALIAS: &str = "host.docker.internal";
 
 impl PathMap {
     pub fn new(mut pairs: Vec<(PathBuf, String)>) -> PathMap {
@@ -167,13 +171,20 @@ impl PathMap {
         PathMap(pairs)
     }
 
-    /// `s` (a path, or text holding paths) with the host's paths swapped for the container's.
+    /// `s` (a path, or text holding paths) with the host's paths swapped for the container's. A
+    /// URL of the host's loopback (`http://127.0.0.1:…`, `http://localhost:…`) becomes the host's
+    /// alias, since a container's loopback is its own.
     pub fn translate(&self, s: &str) -> String {
         let mut out = s.to_owned();
         for (host, inside) in &self.0 {
             let h = host.to_string_lossy();
             if !h.is_empty() && out.contains(h.as_ref()) {
                 out = out.replace(h.as_ref(), inside);
+            }
+        }
+        for lo in ["://127.0.0.1", "://localhost", "://[::1]"] {
+            if out.contains(lo) {
+                out = out.replace(lo, &format!("://{HOST_ALIAS}"));
             }
         }
         out
@@ -261,7 +272,7 @@ impl Containers {
         if let Some(spec) = &job {
             say(format!("Starting job container ({})", spec.image));
             c.pull(&spec.image, say).await?;
-            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone()];
+            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), format!("{HOST_ALIAS}:host-gateway")];
             if Path::new("/var/run/docker.sock").exists() {
                 args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
             }
@@ -405,7 +416,7 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
 /// come by name from `env`).
 #[allow(clippy::too_many_arguments)]
 pub fn action_run_args(name: &str, label: &str, network: Option<&str>, mounts: &[String], env: &BTreeMap<String, String>, entrypoint: Option<&str>, image: &str, args: &[String]) -> Vec<String> {
-    let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned(), s("--label"), label.to_owned(), s("--workdir"), s("/github/workspace")];
+    let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned(), s("--label"), label.to_owned(), s("--workdir"), s("/github/workspace"), s("--add-host"), format!("{HOST_ALIAS}:host-gateway")];
     if let Some(n) = network {
         a.extend([s("--network"), n.to_owned()]);
     }
@@ -447,6 +458,8 @@ mod tests {
         assert_eq!(pm.translate("/w/abc/_temp/_github_home/.npmrc"), "/github/home/.npmrc");
         assert_eq!(pm.translate("/w/abc/_temp/x.sh"), "/__w/_temp/x.sh");
         assert_eq!(pm.translate("cd /w/abc/app/src"), "cd /__w/app/app/src");
+        assert_eq!(pm.translate("http://127.0.0.1:7070/api/v3"), "http://host.docker.internal:7070/api/v3");
+        assert_eq!(pm.translate("http://localhost:7070/"), "http://host.docker.internal:7070/");
         assert_eq!(registry("postgres:16"), "docker.io");
         assert_eq!(registry("ghcr.io/acme/app:1"), "ghcr.io");
         assert_eq!(registry("localhost:5000/x"), "localhost:5000");

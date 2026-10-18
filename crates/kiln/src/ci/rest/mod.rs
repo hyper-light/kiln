@@ -4,7 +4,11 @@
 //!
 //! - Implemented so far:
 //!   - the artifact endpoints that `download-artifact` uses across runs (W08-R08);
-//!   - `workflow_dispatch` and `repository_dispatch` (W03-R11).
+//!   - `workflow_dispatch` and `repository_dispatch` (W03-R11);
+//!   - the repository's reads from the server's mirror ([`repos`]): repository, commits,
+//!     branches, refs, contents, tarballs and zipballs, compare;
+//!   - what jobs record ([`records`]): commit statuses, check runs, releases and their assets;
+//!   - `/user` and `/rate_limit`.
 //! - Anything else answers 501 with `{"message": "not implemented by kiln: …"}`, and the leg gets
 //!   a warning naming the route, so gaps are visible and get filled.
 //!
@@ -25,6 +29,22 @@ use super::{Fail, runs, token};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 
+pub mod records;
+pub mod repos;
+
+/// The token's repository when `owner/repo` names it: a job's token reads its own only.
+async fn site<'a>(hub: &'a Hub, claims: &Job, owner: &str, repo: &str, origin: &str) -> Result<Option<repos::Site<'a>>, Fail> {
+    let full = format!("{owner}/{repo}");
+    let all = hub.store.repos().await.map_err(internal)?;
+    let Some(r) = all.into_iter().find(|r| r.id == claims.repo && r.name.eq_ignore_ascii_case(&full)) else { return Ok(None) };
+    Ok(Some(repos::Site::new(hub, r, origin).await))
+}
+
+/// A request body as JSON (`{}` when empty).
+async fn body(req: Request) -> Result<Value, Fail> {
+    srv::body_json(req.into_body(), 4 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))
+}
+
 const DOCS: &str = "https://github.com/hyper-light/kiln/blob/main/docs/ci.md#w14-code-hosting-stacked-diffs-review-and-landing";
 
 fn message(status: StatusCode, msg: &str) -> Response {
@@ -43,6 +63,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
     let origin = blob::origin(&req);
     // What the job's `permissions` must grant for the route (W10-R04), GitHub's mapping.
     let need = match (&method, rest) {
+        (&Method::GET, ["repos", _, _, "commits", _, "statuses" | "status"]) => Some(("statuses", Level::Read)),
+        (&Method::POST, ["repos", _, _, "statuses", _]) => Some(("statuses", Level::Write)),
+        (&Method::GET, ["repos", _, _, "commits", _, "check-runs"] | ["repos", _, _, "check-runs", ..]) => Some(("checks", Level::Read)),
+        (&Method::POST | &Method::PATCH, ["repos", _, _, "check-runs", ..]) => Some(("checks", Level::Write)),
+        (&Method::POST | &Method::PATCH | &Method::DELETE, ["repos", _, _, "releases", ..]) => Some(("contents", Level::Write)),
+        (&Method::GET, ["repos", _, _, "commits" | "branches" | "git" | "contents" | "tarball" | "zipball" | "compare" | "releases", ..]) => Some(("contents", Level::Read)),
         (&Method::GET, ["repos", _, _, "actions", ..]) => Some(("actions", Level::Read)),
         (&Method::DELETE, ["repos", _, _, "actions", ..]) | (&Method::POST, ["repos", _, _, "actions", "workflows", ..]) => Some(("actions", Level::Write)),
         (&Method::POST, ["repos", _, _, "dispatches"]) => Some(("contents", Level::Write)),
@@ -54,7 +80,42 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         let word = if level == Level::Write { "write" } else { "read" };
         return Ok(message(StatusCode::FORBIDDEN, &format!("Resource not accessible by integration: the job's token lacks `{scope}: {word}`")));
     }
+    // The repository's reads and records.
+    if let ["repos", owner, repo, tail @ ..] = rest
+        && !matches!(tail, ["actions", ..] | ["dispatches"])
+    {
+        let Some(s) = site(hub, &claims, owner, repo, &origin).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+        let raw = req.headers().get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|a| a.contains("raw") || a.contains("octet-stream"));
+        return match (&method, tail) {
+            (&Method::GET, []) => Ok(repos::repository(&s)),
+            (&Method::GET, ["commits", r, "statuses"]) => records::statuses(&s, r, false).await,
+            (&Method::GET, ["commits", r, "status"]) => records::statuses(&s, r, true).await,
+            (&Method::GET, ["commits", r, "check-runs"]) => records::checks(&s, None, Some(r)).await,
+            (&Method::GET, ["commits", r @ ..]) if !r.is_empty() => Ok(repos::commit(&s, &r.join("/")).await),
+            (&Method::GET, ["branches", b @ ..]) if !b.is_empty() => Ok(repos::branch(&s, &b.join("/")).await),
+            (&Method::GET, ["git", "ref", r @ ..]) => Ok(repos::git_refs(&s, &r.join("/"), true).await),
+            (&Method::GET, ["git", "matching-refs", r @ ..]) => Ok(repos::git_refs(&s, &r.join("/"), false).await),
+            (&Method::GET, ["contents", path @ ..]) => Ok(repos::contents(&s, &path.join("/"), q.get("ref").map(String::as_str), raw).await),
+            (&Method::GET, ["tarball", r @ ..]) => repos::archive(&s, &r.join("/"), false).await,
+            (&Method::GET, ["zipball", r @ ..]) => repos::archive(&s, &r.join("/"), true).await,
+            (&Method::GET, ["compare", bh @ ..]) => Ok(repos::compare(&s, &bh.join("/")).await),
+            (&Method::POST, ["statuses", sha]) => records::create_status(&s, sha, &body(req).await?).await,
+            (&Method::POST, ["check-runs"]) => records::create_check(&s, &body(req).await?).await,
+            (&Method::PATCH, ["check-runs", id]) => records::update_check(&s, id, &body(req).await?).await,
+            (&Method::GET, ["check-runs", id]) => records::checks(&s, Some(id), None).await,
+            (&Method::GET, ["releases", "assets", id]) if raw => records::asset_content(&s, records::AssetBy::Id(id)).await,
+            (&Method::GET, ["releases", id, "assets"]) => records::assets(&s, id).await,
+            (&Method::GET, ["releases", which @ ..]) => records::releases(&s, which).await,
+            (&Method::POST, ["releases"]) => records::save_release(&s, None, &body(req).await?).await,
+            (&Method::PATCH, ["releases", id]) => records::save_release(&s, Some(id), &body(req).await?).await,
+            (&Method::DELETE, ["releases", "assets", id]) => records::delete(&s, true, id).await,
+            (&Method::DELETE, ["releases", id]) => records::delete(&s, false, id).await,
+            _ => not_implemented(hub, &claims, &method, &format!("/api/v3/{}", rest.join("/"))).await,
+        };
+    }
     match (&method, rest) {
+        (&Method::GET, ["user"]) => Ok(repos::user(&origin)),
+        (&Method::GET, ["rate_limit"]) => Ok(repos::rate_limit()),
         (&Method::GET, ["repos", owner, repo, "actions", "runs", run, "artifacts"]) => {
             let Some(r) = repo_run(hub, &claims, owner, repo, run).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
             artifacts(hub, &origin, Scope::Run(r), q.get("name").cloned(), &q).await
@@ -244,6 +305,34 @@ async fn artifacts(hub: &Hub, origin: &str, scope: Scope, name: Option<String>, 
     let start = usize::try_from((page - 1) * per_page).unwrap_or(usize::MAX);
     let shown: Vec<Value> = list.iter().skip(start).take(usize::try_from(per_page).unwrap_or(30)).map(|a| a.json(origin, owner, repo)).collect();
     Ok(srv::json(StatusCode::OK, &json!({ "total_count": total, "artifacts": shown })))
+}
+
+/// `POST /api/uploads/repos/{o}/{r}/releases/{id}/assets?name=`: a release asset, to a job token
+/// with `contents: write` (GHES's upload path, which `upload_url` names).
+pub async fn upload(hub: &Arc<Hub>, owner: &str, repo: &str, release: &str, req: Request) -> Result<Response, Fail> {
+    let Some(claims) = token::job_of_request(hub, req.headers()).await else { return Ok(message(StatusCode::UNAUTHORIZED, "Bad credentials")) };
+    if !claims.may("contents", Level::Write) {
+        return Ok(message(StatusCode::FORBIDDEN, "Resource not accessible by integration: the job's token lacks `contents: write`"));
+    }
+    let origin = blob::origin(&req);
+    let Some(s) = site(hub, &claims, owner, repo, &origin).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    records::upload_asset(&s, release, req).await
+}
+
+/// `/<owner>/<repo>/releases/download/<tag>/<name>`: a release asset by name, to a job token.
+pub fn is_download(seg: &[&str]) -> bool {
+    matches!(seg, [owner, _, "releases", "download", _, _] if !super::api::reserved(owner))
+}
+
+pub async fn download(hub: &Arc<Hub>, seg: &[&str], req: &Request) -> Result<Response, Fail> {
+    let [owner, repo, "releases", "download", tag, name] = seg else { return Err((StatusCode::NOT_FOUND, "not found".into())) };
+    let Some(claims) = token::job_of_request(hub, req.headers()).await else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    if !claims.may("contents", Level::Read) {
+        return Ok(message(StatusCode::NOT_FOUND, "Not Found"));
+    }
+    let origin = blob::origin(req);
+    let Some(s) = site(hub, &claims, owner, repo, &origin).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    records::asset_content(&s, records::AssetBy::Name(tag, name)).await
 }
 
 /// GitHub-shaped page links: `/<owner>/<repo>/actions/runs/<run_id>[/…]` to the run's page.
