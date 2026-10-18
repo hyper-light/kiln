@@ -15,6 +15,7 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::argocd;
 use super::host::{Author, Change, CommitError};
 use super::kilncd::{self, Landed};
 use super::model::{App, Artifact, Concurrency, Environment, KILN_HOST, KILNCD, Kind, Origin, Registration, Release, ReleaseFile, State};
@@ -66,10 +67,22 @@ fn author(who: &str) -> Author {
 
 // ------------------------------------------------------------------ environments
 
+/// The Argo CD integration an environment deploys through, if it isn't KilnCD.
+fn argo_of(env: &Environment) -> Option<&str> {
+    env.provider.strip_prefix("argocd/")
+}
+
 pub async fn put_environment(d: &Deploy, actor: &str, e: Environment) -> Result<Environment, Fail> {
     dns_label("environment", &e.name)?;
-    if e.provider != KILNCD {
-        return Err(bad(format!("{}: kiln deploys through {KILNCD} so far; Argo CD environments come with the Argo CD provider (docs/deploy-api.md §19, P2)", e.provider)));
+    match argo_of(&e) {
+        Some(name) => {
+            let i = crate::ci::integrations::get(&d.hub, name).await.map_err(internal)?.ok_or_else(|| bad(format!("no integration {name}: add the Argo CD instance in Settings → Integrations first")))?;
+            if i.kind != argocd::KIND {
+                return Err(bad(format!("{name} is a {} integration, not Argo CD", i.kind)));
+            }
+        }
+        None if e.provider == KILNCD => {}
+        None => return Err(bad(format!("{}: a provider is {KILNCD} or argocd/<integration>", e.provider))),
     }
     if e.release_repo.host != KILN_HOST {
         return Err(bad(format!("{}: release repositories live on kiln's own git server so far; GitHub, GitLab and Bitbucket come with P3", e.release_repo.host)));
@@ -213,8 +226,16 @@ pub async fn deregister(d: &Deploy, actor: &str, app_name: &str, env_name: &str,
         return Err(conflict(format!("release {} is in flight for {app_name} in {env_name}: wait for it, or cancel it", r.id)));
     }
     if reg.running.is_some() || reg.enabled {
-        let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "KilnCD isn't running: it removes what the app runs".to_owned()))?;
-        kilncd::remove(&d.hub, &cd, &format!("deploy for {actor}"), &kilncd::app_id(&a, env_name), keep).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+        match argo_of(&env) {
+            Some(name) => {
+                let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+                argo.delete_application(&argocd::application_name(&a, env_name), keep).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            }
+            None => {
+                let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "KilnCD isn't running: it removes what the app runs".to_owned()))?;
+                kilncd::remove(&d.hub, &cd, &format!("deploy for {actor}"), &kilncd::app_id(&a, env_name), keep).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            }
+        }
     }
     let rr = &env.release_repo;
     let changes = vec![Change { path: repo::release_file(rr, &a, env_name), content: None }, Change { path: repo::values_file(rr, &a, env_name), content: None }];
@@ -234,9 +255,19 @@ async fn registration(d: &Deploy, app_name: &str, env_name: &str) -> Result<Regi
 /// survive until the next release, which resumes it.
 pub async fn pause(d: &Deploy, actor: &str, app_name: &str, env_name: &str, paused: bool) -> Result<Registration, Fail> {
     let a = app(d, app_name).await?;
+    let env = environment(d, env_name).await?;
     let mut reg = registration(d, app_name, env_name).await?;
-    if let Some(cd) = crate::cd::get() {
-        kilncd::automation(&d.hub, &cd, &format!("deploy for {actor}"), &kilncd::app_id(&a, env_name), !paused).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    match argo_of(&env) {
+        Some(name) => {
+            let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            let automated = (!paused).then_some((env.sync.prune, env.sync.self_heal));
+            argo.set_automation(&argocd::application_name(&a, env_name), automated).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+        }
+        None => {
+            if let Some(cd) = crate::cd::get() {
+                kilncd::automation(&d.hub, &cd, &format!("deploy for {actor}"), &kilncd::app_id(&a, env_name), !paused).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            }
+        }
     }
     reg.paused = paused;
     store::put_registration(&d.hub.store, &reg).await.map_err(internal)?;
@@ -573,14 +604,47 @@ async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -
     repo::decode(&bytes).map_err(|e| format!("release.json doesn't read: {e:#}"))
 }
 
-/// Hands a release's commit to KilnCD, the environment's provider.
+/// A file of a release's commit, for its registration (`None`: the commit has none).
+async fn file_at(d: &Deploy, env: &Environment, commit: &str, path: String) -> Result<Option<String>, String> {
+    let (hosted, rr, commit) = (d.hosted.clone(), env.release_repo.clone(), commit.to_owned());
+    let bytes = crate::rt::blocking(move || hosted.read(&rr.repo, &commit, &path)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    Ok(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
+/// Hands a release's commit to the environment's provider.
 async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
     let commit = r.commit.clone().ok_or("no commit to deliver")?;
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let mut reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
-    let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let file = release_file_at(d, &a, &env, &commit).await?;
+    // A release resumes the provider's automation (docs/deploy-api.md §5).
+    if file.enabled && file.version.is_some() && reg.paused {
+        reg.paused = false;
+        store::put_registration(&d.hub.store, &reg).await.map_err(|e| format!("{e:#}"))?;
+    }
+    if let Some(name) = argo_of(&env) {
+        let argo = argocd::Argo::of(&d.hub, name).await?;
+        let app_name = argocd::application_name(&a, &env.name);
+        if !file.enabled {
+            return argo.delete_application(&app_name, r.keep).await;
+        }
+        if file.version.is_none() {
+            return Ok(());
+        }
+        if let super::model::Package::Helm { repo, .. } = &a.package
+            && let Some(oci) = repo.strip_prefix("oci://")
+        {
+            argo.ensure_oci_repo(oci.trim_end_matches('/')).await?;
+        }
+        let values = file_at(d, &env, &commit, repo::values_file(&env.release_repo, &a, &env.name)).await?;
+        let spec = argocd::application(&argo.namespace, &a, &env, &reg, &file, values.as_deref(), &commit)?;
+        argo.put_application(&spec).await?;
+        // Compared again at once, rather than at Argo CD's next look (3 minutes by default).
+        argo.application(&app_name, Some("hard")).await?;
+        return Ok(());
+    }
+    let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let actor = format!("deploy for {}", r.requested_by);
     let id = kilncd::app_id(&a, &env.name);
     if !file.enabled {
@@ -589,11 +653,6 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
     if file.version.is_none() {
         // Registered and enabled, but never given a version: nothing runs yet.
         return Ok(());
-    }
-    // A release resumes the provider's automation (docs/deploy-api.md §5).
-    if reg.paused {
-        reg.paused = false;
-        store::put_registration(&d.hub.store, &reg).await.map_err(|e| format!("{e:#}"))?;
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(|e| format!("{e:#}"))?;
     let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url)?;
@@ -605,8 +664,28 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
 async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value), String> {
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
-    let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let file = release_file_at(d, &a, &env, commit).await?;
+    if let Some(name) = argo_of(&env) {
+        let argo = argocd::Argo::of(&d.hub, name).await?;
+        let app_name = argocd::application_name(&a, &env.name);
+        let current = argo.application(&app_name, None).await?;
+        if !file.enabled {
+            return Ok((if current.is_some() { Landed::No } else { Landed::Yes }, json!({ "application": app_name, "removed": true })));
+        }
+        let Some(version) = file.version.clone() else {
+            return Ok((Landed::Yes, json!({ "application": app_name, "message": "registered and enabled; no version deployed yet" })));
+        };
+        // An Application that isn't this release's (lost to a restart, or replaced by hand) is
+        // written again.
+        let stamped = current.as_ref().and_then(|c| c.pointer("/metadata/annotations/kiln.dev~1release").and_then(Value::as_str).map(str::to_owned));
+        if stamped.as_deref() != Some(r.id.to_string().as_str()) {
+            deliver(d, r).await?;
+            return Ok((Landed::No, json!({ "application": app_name, "message": "written again" })));
+        }
+        let current = current.unwrap_or(Value::Null);
+        return Ok(argocd::landed(&current, r.id, &version));
+    }
+    let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let id = kilncd::app_id(&a, &env.name);
     let present = cd.apps.read().get(&id).map(|e| e.def.sources.iter().any(|s| s.as_ref.as_deref() == Some("release") && s.revision == commit));
     if !file.enabled {

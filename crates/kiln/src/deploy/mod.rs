@@ -7,11 +7,12 @@
 //! - [`store`]: where the records are kept (kiln's store, until KilnDB).
 //! - [`repo`]: the release repository's layout.
 //! - [`host`]: kiln's own git server.
-//! - [`kilncd`]: KilnCD as the CD provider.
+//! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD.
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
 //! - [`api`], [`cli`]: `/api/deploy` and `kiln deploy`, `kiln app`, `kiln env`.
 
 pub mod api;
+pub mod argocd;
 pub mod cli;
 pub mod flow;
 pub mod host;
