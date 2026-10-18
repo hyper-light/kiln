@@ -1393,6 +1393,20 @@ apps:
         Ok(())
     }
 
+    /// kiln's own deploy files (its production reads them every round) read as they always did.
+    #[test]
+    fn kilns_own_deploy_files_read() -> Result<(), DefError> {
+        let envs: BTreeMap<String, EnvironmentSpec> = serde_yaml::from_str(include_str!("../../../.kiln/environments.yaml")).map_err(|e| DefError(e.to_string()))?;
+        let mut scope = Scope::default();
+        scope.set("git.sha", json!("1111111111111111111111111111111111111111"));
+        let apps = from_deploy_file(include_str!("../../../.kiln/deploy.yaml"), "https://github.com/adalundhe/kiln.git", "main", &envs, &scope)?;
+        let mut names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["kiln-production", "kube-prometheus-stack-production", "namespaces-production"]);
+        assert!(apps.iter().all(|a| a.destination.cluster == IN_CLUSTER && !matches!(a.sources.first().map(|s| &s.engine), Some(Engine::Provider(_)))));
+        Ok(())
+    }
+
     /// docs/cd-targets.md §7: a file a workflow uploaded is an artifact too; an artifact is one
     /// kind of thing.
     #[test]
