@@ -1610,9 +1610,11 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
     "kiln-agent".to_owned()
 }
 
-/// What a runner announces after Hello ([`AgentMsg::Build`]).
+/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do, and
+/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
 pub fn runner_build() -> AgentMsg {
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS }
+    let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it

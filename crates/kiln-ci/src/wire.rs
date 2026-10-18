@@ -34,6 +34,10 @@ pub struct AssignmentV2 {
     /// The job container's image, evaluated; its other keys come with `job_container`.
     pub container: Option<String>,
     pub services: BTreeMap<String, String>,
+    /// The job's `container` and `services` as written: their `credentials`, `env`, `ports`,
+    /// `volumes` and `options` are evaluated on the runner (W13-R08).
+    pub job_container: Option<crate::wf::ir::Container>,
+    pub job_services: Vec<(String, crate::wf::ir::Container)>,
     /// The job's steps, unevaluated (W06).
     pub steps: Vec<Step>,
     /// `env` of the workflow, then of the job, unevaluated.

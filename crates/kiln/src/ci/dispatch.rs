@@ -678,6 +678,8 @@ impl Dispatch {
             executor: wire::ExecutorSpec { kind: executor.unwrap_or_else(|| "host".into()), image: None, options: serde_json::Value::Null },
             container: spec.container.clone(),
             services: spec.services.iter().cloned().collect(),
+            job_container: job.and_then(|j| j.container.clone()),
+            job_services: job.map(|j| j.services.clone()).unwrap_or_default(),
             steps: job.map(|j| j.steps.clone()).unwrap_or_default(),
             workflow_env: wf.env.clone(),
             job_env: job.map(|j| j.env.clone()).unwrap_or_default(),
