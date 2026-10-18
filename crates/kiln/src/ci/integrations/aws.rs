@@ -574,7 +574,7 @@ mod tests {
                     let ok = "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>ASIAFAKE</AccessKeyId><SecretAccessKey>s3cret</SecretAccessKey><SessionToken>sess</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>";
                     return srv::text(http::StatusCode::OK, ok);
                 }
-                if !auth.starts_with("AWS4-HMAC-SHA256 Credential=ASIAFAKE/") || !auth.contains("/us-east-1/ecs/aws4_request") || !auth.contains("x-amz-security-token") || token != "sess" {
+                if !auth.starts_with("AWS4-HMAC-SHA256 Credential=ASIAFAKE/") || !auth.contains("/us-east-1/signtest/aws4_request") || !auth.contains("x-amz-security-token") || token != "sess" {
                     return srv::json(http::StatusCode::FORBIDDEN, &serde_json::json!({ "__type": "UnrecognizedClientException", "message": format!("bad signature: {auth}") }));
                 }
                 match target.as_str() {
@@ -601,12 +601,13 @@ mod tests {
             let creds = assume_role_with_web_identity(&base, "arn:aws:iam::1:role/kiln", "kiln-test", "good", 900).await?;
             assert_eq!((creds.access_key_id.as_str(), creds.session_token.as_deref(), creds.expires_at), ("ASIAFAKE", Some("sess"), Some(1_893_456_000)));
             assert!(!format!("{creds:?}").contains("s3cret"));
-            override_endpoint("ecs", &base);
+            // A service of its own: overrides are global, and other tests fake ECS.
+            override_endpoint("signtest", &base);
             let aws = Aws { creds, region: "us-east-1".into() };
-            let v = aws.json("ecs", "AmazonEC2ContainerServiceV20141113.DescribeClusters", &serde_json::json!({ "clusters": ["main"] })).await?;
+            let v = aws.json("signtest", "AmazonEC2ContainerServiceV20141113.DescribeClusters", &serde_json::json!({ "clusters": ["main"] })).await?;
             assert_eq!(v.pointer("/clusters/0/clusterName").and_then(Value::as_str), Some("main"));
             assert_eq!(v.get("echo").and_then(Value::as_str), Some(r#"{"clusters":["main"]}"#));
-            let err = aws.json("ecs", "AmazonEC2ContainerServiceV20141113.Nope", &serde_json::json!({})).await.err().ok_or_else(|| anyhow::anyhow!("an unknown operation answered"))?;
+            let err = aws.json("signtest", "AmazonEC2ContainerServiceV20141113.Nope", &serde_json::json!({})).await.err().ok_or_else(|| anyhow::anyhow!("an unknown operation answered"))?;
             assert_eq!(err.downcast_ref::<AwsError>().map(|a| (a.code.as_str(), a.message.as_str())), Some(("ClientException", "unknown operation")));
             Ok(())
         })
