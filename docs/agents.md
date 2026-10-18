@@ -359,6 +359,23 @@ turn (`harness/pause.rs`):
 Repeated identical notices in a turn (such as a limit said over and over by a build before this)
 show once in the timeline, with a count.
 
+### Runner upgrades: agents keep their processes
+
+A runner upgraded in place (a new kiln binary where its own is: the fleet's upgrades, `kiln install
+--agent --upgrade`) re-executes itself, same pid, and hands every agent session to its new image
+with the harness process still running. Nothing the agent is doing stops: a turn mid-reply goes on,
+a permission prompt waiting stays waiting and is answered as before, the commands it left running
+in the background keep running, and its timeline, queue and pause are where they were. The upgrade
+doesn't wait for turns to end.
+
+How: before it re-executes, each session stops reading its harness's output at a line boundary
+(what was read is taken in, the rest waits in the pipe), writes out its whole state (the timeline,
+and the adapter's: requests in flight, prompts waiting, streaming state), and keeps its pipes open
+across the exec; the new image takes the process over by its pipes and its pid, and reads on. A
+session that can't be handed over (a switch, move or setting waiting for its turn to end; Windows,
+which has no in-place upgrade) is stopped and starts again from its record, continuing its
+conversation, as every session did before.
+
 ### Tasks: shells, monitors and other work an agent leaves running
 
 `state.tasks` holds every task a harness runs beside its turns: subagents, and also commands it
@@ -431,6 +448,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | start | ✓ | ✓ | ✓ | ? |
 | resume, with the history | ✓ | ✓ (latest 100 turns, paged) | unit (when the agent loads sessions) | ? |
 | survives server and runner restarts | ✓ | ? | ? | ? |
+| a runner upgrade keeps its process (mid-turn, background commands) | ✓ | unit | unit | ? |
 | send, queue | ✓ | ✓ | ✓ | ? |
 | steer into a running turn | ✓ | ✓ | — (waits for the turn) | — |
 | a queued message steered in (`queue_steer`) | ✓ | ✓ | — | — |

@@ -459,21 +459,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         upgrade_pending = true;
                         tracing::info!(jobs = jobs.len(), terminals = terms.len(), "new kiln binary on disk; upgrading in place once running jobs finish");
                     }
-                    // Agent sessions mid-turn get up to ten minutes to finish it; then they are
-                    // stopped and continue (resumed) in the new image.
-                    // Reach runs (for other runners, or followed on them) count like agents mid-turn.
-                    let agents_busy = harness.as_ref().map_or(0, |h| h.busy()) + reach.as_ref().map_or(0, crate::reach::node::Handle::busy);
-                    if upgrade_pending && agents_busy > 0 {
+                    // Agent sessions go on across it with their processes, mid-turn included
+                    // (`Host::hand_over_all`). Reach runs (for other runners, or followed on them)
+                    // get up to ten minutes to finish.
+                    let reach_busy = reach.as_ref().map_or(0, crate::reach::node::Handle::busy);
+                    if upgrade_pending && reach_busy > 0 {
                         harness_wait.get_or_insert_with(Instant::now);
                     }
-                    let agents_ready = agents_busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
-                    if upgrade_pending && jobs.is_empty() && agents_ready && let Some(exe) = exe.as_deref() {
+                    let reach_ready = reach_busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
+                    if upgrade_pending && jobs.is_empty() && reach_ready && let Some(exe) = exe.as_deref() {
                         if let Some(h) = &harness {
-                            h.stop_all();
+                            let n = h.hand_over_all().await;
+                            tracing::info!(sessions = n, "agent sessions handed to the new image, their processes still running");
                         }
                         let err = upgrade_in_place(&o, exe, &terms);
-                        // Only reached when the exec failed: carry on with this binary.
+                        // Only reached when the exec failed: carry on with this binary, and with the
+                        // agent sessions just handed over.
                         tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
+                        if let Some(h) = &harness {
+                            h.take_back();
+                        }
                         upgrade_pending = false;
                         exe_mtime = now;
                     }

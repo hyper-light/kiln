@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::core::{Baseline, Core};
@@ -60,7 +61,7 @@ fn status_rows(init: &Value) -> Vec<StatusItem> {
     rows
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     Session,
@@ -69,13 +70,16 @@ enum Pending {
     SetModel(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ask {
     rpc: Value,
     /// (option id, kind) as the agent offered them.
     options: Vec<(String, String)>,
 }
 
+/// Its whole state is plain data, written out when this process re-executes itself (an in-place
+/// upgrade) and read back by the next image, which goes on with the same process.
+#[derive(Serialize, Deserialize)]
 pub struct Acp {
     next_id: u64,
     pending: HashMap<u64, Pending>,

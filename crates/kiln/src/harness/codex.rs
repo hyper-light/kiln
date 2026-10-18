@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::core::{Baseline, Core, Effect};
@@ -48,7 +49,7 @@ fn policy(mode: &str) -> (&'static str, &'static str, Value) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     Thread,
@@ -87,7 +88,7 @@ enum Pending {
 }
 
 /// A run of the CLI (or a fetch) kiln is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Run {
     McpAdd { name: String, client: Option<String> },
     McpRemove { name: String, client: Option<String> },
@@ -140,7 +141,7 @@ fn not_yet(msg: &str) -> Option<&'static str> {
 pub(super) const EFFORTS: &[&str] = &["low", "medium", "high"];
 
 /// An approval request Codex is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ask {
     /// The JSON-RPC id to answer under.
     rpc: Value,
@@ -151,7 +152,7 @@ struct Ask {
     can_decline: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum AskKind {
     Command,
     FileChange,
@@ -163,6 +164,9 @@ enum AskKind {
     Elicitation,
 }
 
+/// Its whole state is plain data, written out when this process re-executes itself (an in-place
+/// upgrade) and read back by the next image, which goes on with the same process.
+#[derive(Serialize, Deserialize)]
 pub struct Codex {
     next_id: u64,
     pending: HashMap<u64, Pending>,
@@ -227,7 +231,7 @@ pub struct Codex {
     rollout: Option<String>,
     /// The thread open kiln sent (method, params), how often, and whether to send it again at
     /// the next tick.
-    opening: Option<(&'static str, Value)>,
+    opening: Option<(String, Value)>,
     open_tries: u32,
     reopen: bool,
     /// Settings changed outside it (its own screen): it starts again to load them once idle.
@@ -837,7 +841,7 @@ impl Codex {
         if std::mem::take(&mut self.reopen)
             && let Some((method, params)) = self.opening.clone()
         {
-            self.open_thread(core, method, params);
+            self.open_thread(core, &method, params);
             return;
         }
         if matches!(core.state.status, Status::Starting | Status::Exited) {
@@ -854,9 +858,9 @@ impl Codex {
     }
 
     /// thread/start, thread/resume or thread/fork, kept to be sent again.
-    fn open_thread(&mut self, core: &mut Core, method: &'static str, params: Value) {
+    fn open_thread(&mut self, core: &mut Core, method: &str, params: Value) {
         self.open_tries += 1;
-        self.opening = Some((method, params.clone()));
+        self.opening = Some((method.to_owned(), params.clone()));
         self.request(core, Pending::Thread, method, params);
     }
 

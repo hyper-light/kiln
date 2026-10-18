@@ -139,7 +139,7 @@ impl Host {
 
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
-        self.open_seeded(id, spec, None)
+        self.open_seeded(id, spec, None, None)
     }
 
     /// Take over a session another runner handed this one (`super::moving`): its record where its
@@ -168,7 +168,7 @@ impl Host {
         }
         let items = super::moving::install(&pkg, &cwd)?;
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note };
-        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed)).map(|_| ()).map_err(|e| format!("{e:#}"))
+        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
     /// Let go of a session that went on on another machine: it is no longer this machine's, and it
@@ -179,7 +179,7 @@ impl Host {
         }
     }
 
-    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>) -> anyhow::Result<Arc<Session>> {
+    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>) -> anyhow::Result<Arc<Session>> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
@@ -227,7 +227,10 @@ impl Host {
                 }
             }),
         };
-        let s = session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?;
+        let s = match handed {
+            Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h)?,
+            None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?,
+        };
         self.sessions.lock().insert(id, Arc::clone(&s));
         self.mark_dirty();
         Ok(s)
@@ -252,32 +255,93 @@ impl Host {
         found
     }
 
-    /// Stop every harness process now (this process is about to re-execute itself; the sessions
-    /// continue in the new image from the record saved here). Blocks up to a few seconds.
-    pub fn stop_all(&self) {
-        self.save_now();
-        let pids: Vec<u32> = self.sessions.lock().values().filter_map(|s| *s.pid.lock()).collect();
-        for pid in pids {
-            stop_process(pid);
-            // This image re-executes next and the new one won't wait for it: reaped now.
-            #[cfg(unix)]
-            let _ = crate::os::try_reap(pid);
+    /// Hand every session's harness process, still running, to this process's next image (it
+    /// re-executes itself next: an in-place upgrade), where each goes on as it was, mid-turn
+    /// included ([`Host::restore`]). One that can't be handed over is stopped, and starts again
+    /// there from its record (its conversation goes on). Returns how many were handed over.
+    pub async fn hand_over_all(&self) -> usize {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
+        let mut out: HashMap<String, Box<session::Handed>> = HashMap::new();
+        for (s, h) in handed {
+            match h {
+                Some(h) => {
+                    out.insert(s.id.clone(), h);
+                }
+                None => {
+                    if let Some(pid) = s.pid.lock().take() {
+                        stop_process(pid);
+                        #[cfg(unix)]
+                        let _ = crate::os::try_reap(pid);
+                    }
+                }
+            }
         }
+        self.save_now();
+        let n = out.len();
+        if let Some(path) = self.handover_path() {
+            let wrote = serde_json::to_vec(&out).map_err(std::io::Error::other).and_then(|json| crate::util::write_secret(&path, &json, 0o600));
+            if let Err(e) = wrote {
+                // The next image can't take them: stopped, and they start again from their records.
+                tracing::warn!(error = %e, file = %path.display(), "couldn't write the agent sessions' handover: they start again after the upgrade");
+                for h in out.values() {
+                    stop_process(h.process.pid);
+                    #[cfg(unix)]
+                    let _ = crate::os::try_reap(h.process.pid);
+                }
+                return 0;
+            }
+        }
+        n
     }
 
-    /// Continue the sessions recorded before a restart.
+    /// The image the sessions were handed to never came (the exec failed): this one goes on with
+    /// them, their processes included.
+    pub fn take_back(&self) {
+        self.sessions.lock().clear();
+        self.restore();
+    }
+
+    /// Where the sessions handed to the next image are written: beside their record.
+    fn handover_path(&self) -> Option<PathBuf> {
+        self.file.as_ref().map(|f| f.with_file_name("agent-handover.json"))
+    }
+
+    /// The sessions the previous image of this process handed over ([`Host::hand_over_all`]),
+    /// once: the file goes as it's read.
+    fn take_handover(&self) -> HashMap<String, Box<session::Handed>> {
+        let Some(path) = self.handover_path() else { return HashMap::new() };
+        let Ok(raw) = std::fs::read(&path) else { return HashMap::new() };
+        let _ = std::fs::remove_file(&path);
+        serde_json::from_slice(&raw).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, file = %path.display(), "unreadable agent session handover: they start again");
+            HashMap::new()
+        })
+    }
+
+    /// Continue the sessions recorded before a restart: those handed over by the previous image of
+    /// this process with their processes, still running; the rest from their records.
     pub fn restore(&self) {
-        let Some(file) = &self.file else { return };
-        let Ok(raw) = std::fs::read(file) else { return };
-        let saved: Vec<Saved> = match serde_json::from_slice(&raw) {
-            Ok(s) => s,
-            Err(e) => {
+        let mut handed = self.take_handover();
+        let saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
+            Some((file, Ok(raw))) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, file = %file.display(), "unreadable agent session record; starting without it");
-                return;
-            }
+                Vec::new()
+            }),
+            _ => Vec::new(),
         };
         for s in saved {
             let id = s.id.clone();
+            if let Some(h) = handed.remove(&id) {
+                let pid = h.process.pid;
+                match self.open_seeded(Some(s.id.clone()), s.spec.clone(), None, Some(h)) {
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(session = %id, error = %format!("{e:#}"), "could not go on with an agent session's process: it starts again");
+                        stop_process(pid);
+                    }
+                }
+            }
             match self.open(Some(s.id), s.spec) {
                 Ok(session) => {
                     let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
@@ -294,6 +358,10 @@ impl Host {
                 }
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
+        }
+        // Handed over without a record to go on from: nothing goes on with them.
+        for h in handed.into_values() {
+            stop_process(h.process.pid);
         }
     }
 

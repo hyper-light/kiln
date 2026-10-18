@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::core::{Core, Effect, PreviewJob};
@@ -85,7 +86,7 @@ pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String
 }
 
 /// What one of our control requests was for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     SetMode(String),
@@ -115,13 +116,13 @@ enum Pending {
     McpAuth { client: String, name: String },
     McpCallback { client: String, name: String },
     /// A request whose answer is shown to one client as `{title, text}` (what it was for).
-    Info { client: String, what: &'static str },
+    Info { client: String, what: String },
     /// reload_plugins: its commands, plugins and servers.
     Plugins,
 }
 
 /// A run of the CLI kiln is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Run {
     McpAdd { name: String, client: Option<String> },
     McpRemove { name: String, client: Option<String> },
@@ -139,7 +140,7 @@ pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ask {
     input: Value,
     /// An MCP server's request for input (MCP elicitation), not a tool's.
@@ -147,7 +148,7 @@ struct Ask {
 }
 
 /// The streaming state of one API message: which event each content block index became.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Streamed {
     /// Event id per block index (text/thinking blocks).
     blocks: HashMap<u64, String>,
@@ -155,6 +156,9 @@ struct Streamed {
     finals: u64,
 }
 
+/// Its whole state is plain data, written out when this process re-executes itself (an in-place
+/// upgrade) and read back by the next image, which goes on with the same CLI process.
+#[derive(Serialize, Deserialize)]
 pub struct Claude {
     next_req: u64,
     pending: HashMap<String, Pending>,
@@ -437,7 +441,7 @@ impl Claude {
                     core.reply(client, json!({"error": "Ask something after /btw."}));
                     return;
                 }
-                self.request(core, Pending::Info { client, what }, body);
+                self.request(core, Pending::Info { client, what: what.to_owned() }, body);
             }
             "reload_plugins" => self.request(core, Pending::Plugins, json!({"subtype": "reload_plugins"})),
             "task_output" => {
@@ -1629,7 +1633,7 @@ impl Claude {
                 // Signed in through kiln, the CLI does not connect by itself: it is asked to.
                 self.request(core, Pending::McpChange(format!("Reconnect {name}")), json!({"subtype": "mcp_reconnect", "serverName": name}));
             }
-            Pending::Info { client, what } => core.reply(client, info_reply(what, &body)),
+            Pending::Info { client, what } => core.reply(client, info_reply(&what, &body)),
             Pending::Plugins => {
                 if let Some(list) = body.get("mcpServers").and_then(Value::as_array) {
                     core.state.mcp = list.iter().filter_map(claude_server).collect();
@@ -3815,6 +3819,35 @@ mod tests {
         assert!(core.take_writes().first().is_some_and(|l| l.contains("\"subtype\":\"interrupt\"")));
         c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null}"#);
         assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text == "Interrupted")));
+        Ok(())
+    }
+
+    #[test]
+    fn mid_turn_it_goes_on_in_the_next_image_as_it_was() -> anyhow::Result<()> {
+        // An in-place upgrade: the adapter and the core, written out mid-turn with a permission
+        // request waiting and a tool call under way, read back by the next image.
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t9","name":"Write","input":{"file_path":"/work/a.txt","content":"x\n"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"control_request","request_id":"r9","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/work/a.txt","content":"x\n"},"tool_use_id":"t9"}}"#);
+        core.take_writes();
+        let events = core.events().count();
+        let adapter = serde_json::to_vec(&super::super::kinds::Adapter::Claude(Box::new(c)).freeze())?;
+        let frozen = serde_json::to_vec(&core.freeze())?;
+        let mut a = super::super::kinds::Adapter::thaw(serde_json::from_slice(&adapter)?);
+        let mut core = Core::thaw(serde_json::from_slice(&frozen)?);
+        assert_eq!(core.events().count(), events);
+        assert_eq!(core.state.approvals.len(), 1);
+        // The person's answer reaches the CLI under its request id, with the input as it sent it.
+        a.command(&mut core, Command::Approve { id: "r9".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: None });
+        let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(resp.pointer("/response/request_id").and_then(Value::as_str), Some("r9"));
+        assert_eq!(resp.pointer("/response/response/behavior").and_then(Value::as_str), Some("allow"));
+        assert_eq!(resp.pointer("/response/response/updatedInput/file_path").and_then(Value::as_str), Some("/work/a.txt"));
+        // The tool call's result, when it comes, lands on the call it was for.
+        a.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t9","type":"tool_result","content":"written"}]},"parent_tool_use_id":null}"#);
+        assert!(core.state.approvals.is_empty());
+        assert_eq!(core.events().count(), events);
         Ok(())
     }
 

@@ -206,7 +206,33 @@ pub enum Adapter {
     Acp(Box<Acp>),
 }
 
+/// An adapter written out whole, for this process's next image (an in-place upgrade).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "adapter", content = "state", rename_all = "snake_case")]
+pub enum Frozen {
+    Claude(Box<Claude>),
+    Codex(Box<Codex>),
+    Acp(Box<Acp>),
+}
+
 impl Adapter {
+    /// Its state, whole, to go on with in the next image ([`Adapter::thaw`]).
+    pub fn freeze(self) -> Frozen {
+        match self {
+            Self::Claude(a) => Frozen::Claude(a),
+            Self::Codex(a) => Frozen::Codex(a),
+            Self::Acp(a) => Frozen::Acp(a),
+        }
+    }
+
+    pub fn thaw(f: Frozen) -> Self {
+        match f {
+            Frozen::Claude(a) => Self::Claude(a),
+            Frozen::Codex(a) => Self::Codex(a),
+            Frozen::Acp(a) => Self::Acp(a),
+        }
+    }
+
     pub fn start(&mut self, core: &mut Core) {
         match self {
             Self::Claude(a) => a.start(core),
@@ -475,4 +501,26 @@ pub fn models_of(kind: &str) -> Vec<super::model::ModelOption> {
         .iter()
         .map(|(id, label, efforts)| super::model::ModelOption { id: (*id).to_owned(), label: (*label).to_owned(), description: String::new(), efforts: efforts.iter().map(|e| (*e).to_owned()).collect() })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each adapter, started (its first requests to the harness under way), is written out and read
+    /// back whole: what an in-place upgrade hands the next image of the runner.
+    #[test]
+    fn every_adapter_is_written_out_and_read_back_whole() -> anyhow::Result<()> {
+        for id in ["claude", "codex", "gemini"] {
+            let kind = Kind::get(id).ok_or_else(|| anyhow::anyhow!("no kind {id}"))?;
+            let mut adapter = kind.adapter(&Spec { kind: id.to_owned(), ..Spec::default() });
+            let mut core = Core::new();
+            adapter.start(&mut core);
+            let out = serde_json::to_value(adapter.freeze())?;
+            assert!(out.pointer("/state/pending").and_then(serde_json::Value::as_object).is_some_and(|p| !p.is_empty()), "{id}: nothing under way to carry");
+            let back = Adapter::thaw(serde_json::from_value(out.clone())?);
+            assert_eq!(serde_json::to_value(back.freeze())?, out, "{id}");
+        }
+        Ok(())
+    }
 }
