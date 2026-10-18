@@ -495,6 +495,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             harness_terminal(&hub, &id, req).await
         }
         (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => conversation_events(&hub, id, &q).await,
+        (&Method::GET, ["api", "conversations", "search"]) => conversation_search(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -2618,6 +2620,51 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+/// `GET /api/harness/sessions/:id/events?before=&limit=`: a session's history beyond what its
+/// timeline holds, from the server's conversation store (docs/conversations.md): `{events}`, oldest
+/// first, the newest `limit` (100, at most 1000) before event number `before`.
+async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    let id = id.to_owned();
+    let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "events": events })))
+}
+
+/// `GET /api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=`: events across
+/// every agent's conversation, newest first, from the server's store: `{hits: [{agent, name, machine,
+/// event}]}`.
+async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let text = |k: &str| q.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    let query = crate::convo::store::Query {
+        q: text("q").unwrap_or_default(),
+        session: text("agent"),
+        kind: text("kind"),
+        tool: text("tool"),
+        status: text("status"),
+        since: num("since"),
+        until: num("until"),
+        limit: q.get("limit").and_then(|v| v.parse::<usize>().ok()),
+    };
+    let rows = crate::rt::blocking(move || store.search(query)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let infos: HashMap<String, crate::harness::session::Info> = hub.harness.list().into_iter().map(|i| (i.id.clone(), i)).collect();
+    let hits: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let event: serde_json::Value = serde_json::from_str(&r.body).ok()?;
+            let info = infos.get(&r.session);
+            Some(json!({ "agent": r.session, "name": info.map(|i| i.name.clone()), "machine": info.map(|i| i.target.clone()), "event": event }))
+        })
+        .collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "hits": hits })))
 }
 
 fn goals_err(e: crate::goals::Error) -> ApiError {

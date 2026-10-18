@@ -189,9 +189,9 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare, log search, audit v2 left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search, audit v2 left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
-| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); the rest left |
+| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
 
 ---
@@ -3733,7 +3733,40 @@ rule-based notifications (G-30, G-31).
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
 **Progress.** In progress: R02 (OpenTelemetry export waits for W11-R09) and R06 (with W11-R06's
-channels). Done: R01, R07, AC01 and AC02.
+channels). Done: R01, R03, R07, AC01, AC02 and AC03.
+
+- *R03* (`crates/kiln-ci/src/compare.rs`, `crates/kiln/src/ci/compare.rs`, migration
+  `20261018-2000_w19_compare.sql`):
+  - **Leg facts.** Each leg reports what it runs on to `POST /_kiln/facts`, kept on its attempt:
+    - the machine (OS and architecture, CPU, kernel) and the runner's version;
+    - the executor;
+    - its containers' images, as named and by content-addressed id;
+    - the job's environment, with secrets masked.
+  - **What differs.** `kiln_ci::compare::differences` lists only what differs categorically:
+    - actions, by name, so a moved ref or a new version is one difference;
+    - variables;
+    - legs one run lacks;
+    - each leg's conclusion, runner, executor, machine, runner version, images, environment and
+      cache (hit or miss by key prefix).
+
+    A runner that didn't report its machine adds no differences. Durations aren't differences:
+    `steps` pairs each leg's steps by name, an action's ref aside, for reading side by side.
+  - **The API:**
+    - `GET /api/ci/runs/:id/compare/:other` and `GET /api/ci/legs/:id/compare/:other`, within
+      one repository;
+    - `:other` is a run (or leg) or `last-green`: the last run of the same workflow and branch
+      that succeeded before this one;
+    - each returns the differences, the files changed between the commits (from the server's
+      mirror) and the legs' steps side by side.
+  - **The page** (`/runs/:id/compare`, W21) holds what differs, the changed files and each leg's
+    steps with their change. It opens from a run's "Compare with last green", and from a failed
+    leg's "What changed since the last green run": one click.
+  - **AC03** (a unit test of the comparison): two runs differing in one action SHA and one cache
+    miss show exactly those two differences, whatever their durations.
+  - **Verified end to end** on a local server. Bumping `actions/cache@v4` to `@v4.1.2`, adding a
+    job variable and changing the cache key showed exactly three differences: the action (both
+    SHAs), the variable, and the cache's hit then miss. The two changed files were listed. The
+    page opened from a failed leg in one click, in Chromium and WebKit, desktop and phone.
 
 - *R01, R02* (`crates/kiln-ci/src/insights/`, `crates/kiln/src/ci/insights.rs`, migration
   `20261018-1900_w19_insights.sql`):
@@ -3838,8 +3871,8 @@ channels). Done: R01, R07, AC01 and AC02.
     - pointing that subscriber at a working URL sent the rest there;
     - redelivering a failed delivery sent it there with its own delivery id;
     - `run.failed` and `run.succeeded` arrived with their repository.
-- *Left*: R02's OpenTelemetry export, R03 to R05; email (SMTP), the inbox and issue trackers as channels; the other
-  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC03 to AC06.
+- *Left*: R02's OpenTelemetry export, R04, R05; email (SMTP), the inbox and issue trackers as channels; the other
+  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC04 to AC06.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 
@@ -4329,6 +4362,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/legs/:id/tests` · `/api/ci/repos/:repo/tests?sort=failing\|slowest\|flaky` | `ci.tests.*` | runs.read | W16 |
 | PUT | `/_kiln/test-results?step=&format=&path=` | a leg's report (its runtime token) | the leg | W16 |
 | GET | `/api/ci/runs/:a/compare/:b` | `ci.runs.compare` | runs.read | W19 |
+| GET | `/api/ci/runs/:id/compare/:other` · `/api/ci/legs/:id/compare/:other` (built; `:other` may be `last-green`) · POST `/_kiln/facts` (a leg's) | `ci.runs.compare` | runs.read; the leg's token | W19 |
 | GET | `/api/ci/legs/:id` | `ci.legs.get` (attempts, steps, outputs, wait reason) | runs.read | W05, W06 |
 | GET | `/api/ci/legs/:id/logs?step=&attempt=&from=` · `/logs/ws` | `ci.legs.logs` (`from`: a byte offset, for followers) | logs.read | W06 |
 | GET | `/api/ci/legs/:id/logs/search?q=` · `/failure` | `ci.legs.search`, `ci.legs.failure_excerpt` | logs.read | W19, W20 |

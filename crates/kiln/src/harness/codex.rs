@@ -1110,7 +1110,8 @@ impl Codex {
     fn show_sent(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments: names });
+        core.note_sent(&m.id);
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
         core.touch_state();
     }
 
@@ -1977,6 +1978,13 @@ impl Codex {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
                 self.turn = None;
+                // How it ended, for kiln's keep-going.
+                let how = match status {
+                    "completed" => "done",
+                    "interrupted" => "stopped",
+                    _ => "cut",
+                };
+                core.end_turn(core.state.turn_started, how, Some(status));
                 core.state.turn_started = None;
                 core.state.doing = None;
                 core.state.usage.turns += 1;

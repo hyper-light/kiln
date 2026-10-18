@@ -12,6 +12,7 @@ pub mod ci;
 pub mod http;
 pub mod kubeapi;
 pub mod config;
+pub mod convo;
 pub mod dirs;
 pub mod discovery;
 pub mod dns;

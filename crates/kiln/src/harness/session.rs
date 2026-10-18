@@ -193,6 +193,12 @@ pub struct Info {
     /// It waits for a usage limit to reset (as `State::pause`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<super::model::Pause>,
+    /// How its last turn ended (as `State::last_turn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<super::model::TurnEnd>,
+    /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_off: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -244,6 +250,7 @@ impl Info {
         self.left_behind = s.count_left_behind();
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
+        self.last_turn.clone_from(&s.last_turn);
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -281,6 +288,9 @@ pub struct Seed {
     pub picks_up: bool,
     /// Said with the move (its folder isn't here, so it works in home).
     pub note: Option<String>,
+    /// Not a move: the session is started again here after a restart, its timeline and state
+    /// taken from the conversation store (`crate::convo`).
+    pub restored: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -505,7 +515,14 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
-    if let Some(sd) = seed {
+    let restored = seed.as_ref().is_some_and(|sd| sd.restored);
+    if let Some(sd) = seed.as_ref().filter(|_| restored) {
+        // Restarted here: its timeline and state as the store kept them, and nothing said of it.
+        core.adopt(sd.events.clone(), sd.state.clone());
+        core.state.model = spec.model.clone().unwrap_or_default();
+        core.state.mode = spec.mode.clone().unwrap_or_default();
+        core.harness = Some(kind.name.to_owned());
+    } else if let Some(sd) = seed {
         core.adopt(sd.events, sd.state);
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
@@ -564,6 +581,8 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        last_turn: None,
+        keep_off: false,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -1874,6 +1893,8 @@ mod tests {
             left_behind: 0,
             reach: None,
             pause: None,
+            last_turn: None,
+            keep_off: false,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

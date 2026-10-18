@@ -5,6 +5,7 @@
 pub mod actions;
 pub mod api;
 pub mod cli;
+pub mod compare;
 pub mod dispatch;
 pub mod environments;
 pub mod events;

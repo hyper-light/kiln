@@ -18,7 +18,7 @@ import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
-import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
+import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
 
 const LogViewer = React.lazy(() => import("./log-viewer"));
@@ -167,6 +167,7 @@ function RunBody({ id }: { id: string }) {
             <div className="flex flex-wrap gap-4">
               <EditWorkflowLink detail={ciDetail} />
               <WorkflowInsightsLink detail={ciDetail} />
+              <CompareLink detail={ciDetail} />
             </div>
             {shownAttempt === ciDetail.run.attempt && <CiRunActions detail={ciDetail} jobs={[...new Set(ciDetail.legs.map((l) => (l.job ?? "").split("/")[0] ?? "").filter((j) => j !== ""))]} />}
           </div>

@@ -640,6 +640,27 @@ impl Leg {
         }
     }
 
+    /// What this leg runs on, for comparing runs (docs/ci.md W19-R03): the machine, this
+    /// runner's version, the executor, the containers' images, and the job's environment with
+    /// its secrets masked. Best effort: a server that doesn't take it loses only the comparison.
+    async fn report_facts(&self, st: &State) {
+        let images = match &st.containers {
+            Some(c) => c.images().await,
+            None => Vec::new(),
+        };
+        let env: BTreeMap<&String, String> = st.env.iter().map(|(k, v)| (k, crate::util::truncate(&st.masker.mask(v), 1000).to_owned())).collect();
+        let body = serde_json::json!({
+            "machine": fingerprint(&self.a.executor.kind), "version": env!("CARGO_PKG_VERSION"), "executor": self.a.executor.kind,
+            "images": images.iter().map(|(role, image, id)| serde_json::json!({ "role": role, "image": image, "id": id })).collect::<Vec<_>>(),
+            "env": env,
+        });
+        let url = format!("{}/_kiln/facts", self.a.runtime.results_url.trim_end_matches('/'));
+        let Ok(body) = serde_json::to_vec(&body) else { return };
+        if let Err(e) = self.http.post(&url).bearer(&self.a.runtime.runtime_token).header("content-type", "application/json").body(body).timeout(Duration::from_secs(20)).send().await {
+            tracing::debug!(leg = %self.a.job_id, error = %format!("{e:#}"), "the leg's facts weren't reported");
+        }
+    }
+
     async fn note(&self, idx: u32, text: &str) {
         self.up.note(&self.a.job_id, idx, text).await;
     }
@@ -834,6 +855,7 @@ impl Leg {
             }
             return Ok(Status::Failed);
         }
+        self.report_facts(&st).await;
         // What a terminal into the leg opens (W17-R01): its workspace and environment, or its
         // container.
         let mut shell_env = self.env_vars(&st);
