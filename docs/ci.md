@@ -173,7 +173,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
-| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; push, tag, PR, manual from polling |
+| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host executor; background steps, matchers, containers left |
@@ -1135,27 +1135,52 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
 **Progress.** In progress.
 
 - *Done.*
-  - `kiln_ci::trigger`:
-    - `event` (R01);
-    - `matcher` (R03, R09, every "no" with its reason);
-    - `pattern` (R04, every row of GitHub's cheat sheet, AC02);
-    - `skip` (R06, AC03);
-    - `cron` (R10 with time zones and DST, AC06's two 2026 transitions in Berlin and New York;
-      `jitter`);
-    - `context`: the `github` context, and payloads for push, pull request, dispatch and schedule
-      (R07).
-  - `crates/kiln/src/ci/events.rs`: the server path. gitops' push, tag, pull-request and manual
-    triggers become events, with changed files (R05), commit messages and payloads. Matching
-    workflows start runs. A broken workflow gets a `startup_failure` run listing its diagnostics.
-    v1's auto-detected pipeline stands aside when GitHub workflows run. All of this is behind
-    `[ci] enabled`.
-  - Checked end to end on a local server: push → matrix legs → needs → outputs.
+  - `kiln_ci::trigger`, pure code:
+    - `event` (R01).
+    - `matcher` (R03, R09), with a reason for every "no".
+    - `pattern` (R04): every row of GitHub's cheat sheet (AC02).
+    - `skip` (R06, AC03).
+    - `cron` (R10): time zones and DST, with AC06's two 2026 transitions in Berlin and New York;
+      `jitter`; humane durations.
+    - `context`: the `github` context, and payloads for push, pull request, dispatch, schedule and
+      `workflow_run` (R07).
+    - `dispatch`: `workflow_dispatch` inputs, typed and checked, with GitHub's messages (R11).
+    - `github`: webhook deliveries as events, with GitHub's ref and commit for each event and
+      forks untrusted (R07, R08).
+  - `crates/kiln/src/ci/`:
+    - `events.rs`, the one path from an event and a workflow to a run:
+      - polled pushes, tags, pull requests and manual runs, with changed files (R05);
+      - `startup_failure` runs for broken workflows;
+      - `workflow_dispatch` and `repository_dispatch` (R11);
+      - `workflow_run` (`requested`, `in_progress` and `completed`), with chains stopping at
+        three levels (R13).
+    - `schedule.rs` (R10): every entry fires once a minute at most, recorded in
+      `ci_schedule_fires`, with kiln's opt-in `timezone`, `jitter`, `branch`, `inputs`,
+      `skip-if-unchanged` and `catch-up`.
+    - `hooks.rs`:
+      - GitHub's webhooks with their payloads;
+      - one trigger for a move a webhook and a poll both see, via a ref compare-and-set
+        (`Store::advance_ref`) that polls use too;
+      - redeliveries ignored for 24 hours (R14).
+    - The dispatch routes: `/api/ci/repos/:repo/workflows/<path>/dispatches`,
+      `/api/ci/repos/:repo/dispatches`, and the facade's `/api/v3/…/dispatches` for a trusted
+      run's token.
+  - All of it is behind `[ci] enabled`. With it off, a webhook only hints that a poll is due, as
+    before.
+  - Checked end to end on a local server:
+    - push, then matrix legs, needs and outputs;
+    - a per-minute schedule firing once a minute;
+    - dispatches with typed inputs, and their refusals;
+    - `repository_dispatch`;
+    - `workflow_run` after each run;
+    - an `issue_comment` delivery, and its redelivery doing nothing;
+    - a push both delivered and polled, running once.
 - *Left.*
-  - Webhook and App payloads passed through (today the webhook only wakes the poll).
-  - The schedule loop for GitHub workflows, dedup (R14) and `repository_dispatch`.
-  - `workflow_run` and `pipeline` events from finished runs.
-  - kiln's native events, with W14, W15 and W20.
-  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05.
+  - The App's events (with W14-R10).
+  - kiln's native events (with W14, W15 and W20).
+  - kiln dialect raising the `workflow_run` depth.
+  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05 as an integration
+    test, AC07 to AC09.
 
 ### W04 Planner: graph, matrices, reusable workflows, outputs
 
