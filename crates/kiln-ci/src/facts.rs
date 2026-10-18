@@ -36,6 +36,23 @@ pub struct RunnerFacts {
     pub custom: BTreeMap<String, String>,
     /// When the facts were gathered (unix seconds).
     pub probed_at: i64,
+    /// The kiln the runner runs (kiln's `fleet`).
+    pub kiln: Option<KilnFacts>,
+}
+
+/// The kiln a runner runs, and where kiln's source is on its machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KilnFacts {
+    /// The commit it was built from; empty for a local build that knows none.
+    pub commit: String,
+    /// The start of its binary's SHA-256.
+    pub build: String,
+    pub version: String,
+    /// The platform it was built for (`x86_64-unknown-linux-musl`, …).
+    pub target: String,
+    /// A checkout of kiln on the machine.
+    pub checkout: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

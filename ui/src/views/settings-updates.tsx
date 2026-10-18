@@ -11,14 +11,14 @@ import { create } from "zustand";
 import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import type { KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
+import type { FleetTarget, KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
-import { formatBytes, relativeTime } from "@/lib/format";
+import { formatBytes, relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -214,7 +214,10 @@ export function UpdatesPanel() {
     }
   };
 
-  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date);
+  // Runners on a branch or a local build run it on purpose: "Upgrade all" leaves them be.
+  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date && r.how !== "left" && r.how !== "wait");
+  const newest = data.newest ?? null;
+  const current = data.runners.filter((r) => r.up_to_date).length;
   const runningRunners = new Set(jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
 
   return (
@@ -265,7 +268,9 @@ export function UpdatesPanel() {
               <p className="upd-sub">
                 {data.runners.length === 0
                   ? "No machines have joined yet."
-                  : `${data.runners.filter((r) => r.up_to_date).length} of ${data.runners.length} on the server's build · runners are brought to the build this server runs`}
+                  : newest
+                    ? `${current} of ${data.runners.length} on the newest kiln, ${shortSha(newest.commit)}${newest.from === "server" ? ", the server's" : `, from ${newest.from}`} · ${data.follow ? "every runner follows it on its own" : "runners are upgraded when you say"}`
+                    : `${current} of ${data.runners.length} on the server's build · runners are brought to the build this server runs`}
               </p>
             </div>
             <Button
@@ -292,6 +297,7 @@ export function UpdatesPanel() {
               <RunnerRow
                 key={r.name}
                 r={r}
+                newest={newest}
                 job={latest("runner", r.name)}
                 uploading={uploading}
                 onUpload={() => r.target && pickUpload(r.target)}
@@ -299,10 +305,10 @@ export function UpdatesPanel() {
                 onUpgrade={() =>
                   setConfirm({
                     scope: `runner:${r.name}`,
-                    title: `Upgrade ${r.name}?`,
+                    title: r.how === "build" ? `Build the newest kiln on ${r.name}?` : `Upgrade ${r.name}?`,
                     lead: "What will happen:",
-                    plan: <RunnerPlan r={r} />,
-                    confirmLabel: "Upgrade",
+                    plan: <RunnerPlan r={r} newest={newest} />,
+                    confirmLabel: r.how === "build" ? "Build and upgrade" : "Upgrade",
                     run: () => startRunner(r),
                   })
                 }
@@ -458,14 +464,23 @@ function ServerPlan({ s, action }: { s: ServerUpdate; action: "restart" | "repla
 /* ---------------------------- runners ---------------------------- */
 
 function runnerState(r: RunnerUpdate, job: UpdateJob | undefined): { tone: string; text: string } {
-  if (job?.state === "running") return { tone: "running", text: "upgrading" };
+  if (job?.state === "running") return { tone: "running", text: job.method === "build" ? "building itself" : "upgrading" };
   if (!r.connected) return { tone: "cancelled", text: "offline" };
   if (r.up_to_date) return { tone: "succeeded", text: "up to date" };
+  if (r.how === "left") return { tone: "timed_out", text: r.standing === "local" ? "local build" : "branch build" };
+  if (r.how === "wait") return { tone: "queued", text: "waiting" };
+  if (r.standing) return { tone: "queued", text: "behind" };
   return { tone: "queued", text: r.build ? "upgrade available" : "older runner" };
+}
+
+/** "builds 94f0847a1b2c itself" → "Builds 94f0847a1b2c itself". */
+function sentence(s: string) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 function RunnerRow({
   r,
+  newest,
   job,
   uploading,
   plan,
@@ -473,6 +488,8 @@ function RunnerRow({
   onUpload,
 }: {
   r: RunnerUpdate;
+  /** The newest kiln, when kiln knows it. */
+  newest: FleetTarget | null;
   job: UpdateJob | undefined;
   uploading: string | null;
   /** Its upgrade, being confirmed. */
@@ -498,17 +515,17 @@ function RunnerRow({
       </div>
       <div className="upd-runner-detail">
         <span className="mono upd-build">
-          {r.build ?? "build not reported"}
-          {!r.up_to_date && r.connected && (
+          {r.commit ? shortSha(r.commit) : (r.build ?? "build not reported")}
+          {!r.up_to_date && r.connected && r.how !== "left" && (
             <>
               {" → "}
-              {r.target_build ?? `${r.target ?? "?"} build`}
+              {newest ? shortSha(newest.commit) : (r.target_build ?? `${r.target ?? "?"} build`)}
             </>
           )}
         </span>
         {r.connected && !r.up_to_date && (
           <span className="upd-sub">
-            {r.method === "native" ? "upgrades itself" : r.terminal ? "upgraded through a terminal on it" : "terminals are off: upgrade it on the machine"}
+            {r.next ? sentence(r.next) : r.method === "native" ? "upgrades itself" : r.terminal ? "upgraded through a terminal on it" : "terminals are off: upgrade it on the machine"}
           </span>
         )}
         <div className="upd-actions">
@@ -517,9 +534,9 @@ function RunnerRow({
               <Upload /> {uploading === r.target ? "Uploading…" : `Upload ${r.target}`}
             </Button>
           )}
-          {r.connected && !r.up_to_date && !plan && (
-            <Button size="xs" variant="secondary" disabled={job?.state === "running" || (r.method === "terminal" && !r.terminal)} onClick={onUpgrade}>
-              Upgrade
+          {r.connected && !r.up_to_date && !plan && r.how !== "wait" && r.how !== "upgrading" && (
+            <Button size="xs" variant="secondary" disabled={job?.state === "running" || ((r.method === "terminal" || r.how === "build") && !r.terminal)} onClick={onUpgrade}>
+              {r.how === "build" ? "Build and upgrade" : "Upgrade"}
             </Button>
           )}
         </div>
@@ -545,13 +562,32 @@ function RunnerRow({
   );
 }
 
-function RunnerPlan({ r }: { r: RunnerUpdate }) {
+function RunnerPlan({ r, newest: target }: { r: RunnerUpdate; newest: FleetTarget | null }) {
   const newest = r.instances.find((i) => i.newest);
   const inPlace = r.method === "native" && newest !== undefined && newest.id !== "main" && !newest.legacy;
-  const to = r.target_build ? `build ${r.target_build}` : `the ${r.target ?? ""} build (this version's GitHub release, if one is published)`;
+  const of = target ? ` (${shortSha(target.commit)})` : "";
+  const to = r.target_build ? `build ${r.target_build}${of}` : `the ${r.target ?? ""} build (this version's GitHub release, if one is published)`;
   return (
     <ul className="upd-plan">
-      {r.method === "native" ? (
+      {r.how === "build" ? (
+        <>
+          <li>
+            No binary of {target ? shortSha(target.commit) : "the newest kiln"} exists for {r.target ?? "its platform"} yet, so {r.name} builds it: kiln opens a terminal on it (it won&rsquo;t appear
+            among your terminals) that fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and runs <code>kiln install --agent --upgrade</code>.
+          </li>
+          <li>
+            {r.checkout ? (
+              <>
+                Its kiln checkout at <code>{r.checkout}</code> is left as it is.
+              </>
+            ) : (
+              "Its kiln checkout is left as it is."
+            )}{" "}
+            The build takes its CPU for a few minutes.
+          </li>
+          {r.os === "macos" && <li>The binary comes back to this server, so other Macs download it instead of building.</li>}
+        </>
+      ) : r.method === "native" ? (
         <li>
           {r.name} downloads {to} from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>.
         </li>
@@ -580,8 +616,13 @@ function AllPlan({ runners }: { runners: RunnerUpdate[] }) {
       <ul className="upd-plan">
         {runners.map((r) => (
           <li key={r.name}>
-            <strong className="font-medium text-[#d6dbe2]">{r.name}</strong>: {r.target_build ? `to build ${r.target_build}` : `to the ${r.target ?? ""} build`},{" "}
-            {r.method === "native" ? "by its own upgrade command" : "through a terminal on it (it predates upgrade commands)"}
+            <strong className="font-medium text-[#d6dbe2]">{r.name}</strong>:{" "}
+            {r.next ?? (
+              <>
+                {r.target_build ? `to build ${r.target_build}` : `to the ${r.target ?? ""} build`},{" "}
+                {r.method === "native" ? "by its own upgrade command" : "through a terminal on it (it predates upgrade commands)"}
+              </>
+            )}
           </li>
         ))}
       </ul>
@@ -594,6 +635,7 @@ function AllPlan({ runners }: { runners: RunnerUpdate[] }) {
 
 function jobTitle(j: UpdateJob) {
   if (j.kind === "server") return j.method === "restart" ? "Rollout restart" : `Install build ${j.to_build ?? ""}`;
+  if (j.method === "build") return `Build ${j.commit ? shortSha(j.commit) : "the newest kiln"} and upgrade to it`;
   const to = j.to_build ? `build ${j.to_build}` : "the new build";
   return `Upgrade to ${to}${j.method === "terminal" ? " · through a terminal" : ""}`;
 }
@@ -660,8 +702,10 @@ function Binaries({
         ? `uploaded ${relativeTime(b.at)}`
         : b.origin === "built"
           ? `built by run #${b.run ?? "?"} from ${(b.sha ?? "").slice(0, 7)}, ${relativeTime(b.at)}`
-          : `GitHub release, fetched ${relativeTime(b.at)}`;
-  // Not built from the commit the server runs: its machines run something else than the server.
+          : b.origin === "machine"
+            ? `built by ${b.by ?? "a machine"} from ${(b.sha ?? "").slice(0, 7)}, ${relativeTime(b.at)}`
+            : `GitHub release, fetched ${relativeTime(b.at)}`;
+  // Not built from the newest kiln: its machines are behind until one is.
   const behind = (b: KilnBinary) => b.origin !== "server" && (data.build?.behind ?? []).includes(b.target);
   return (
     <section className="upd-section" aria-labelledby="upd-binaries">
@@ -683,7 +727,7 @@ function Binaries({
             </span>
             <span className="upd-dim">
               {origin(b)}
-              {behind(b) && <span className="upd-behind"> · behind the server</span>}
+              {behind(b) && <span className="upd-behind"> · behind the newest kiln</span>}
             </span>
             {b.origin !== "server" && confirm?.target !== b.target && (
               <Button size="xs" variant="ghost" aria-label={`Remove the ${b.target} binary`} onClick={() => setConfirm(b)}>
@@ -755,7 +799,7 @@ function BuildEvery({ build, onStarted }: { build: ReleaseBuild; onStarted: () =
     }
   };
   const runLink = last ? <Link to={`/runs/${last.id}`}>run #{last.number}</Link> : null;
-  // The commit the server runs, when it knows it: every platform should be built from it.
+  // The newest kiln's commit, when kiln knows it: every platform should be built from it.
   const commit = build.commit ? build.commit.slice(0, 7) : null;
   const behind = build.behind ?? [];
   const lastOfIt = last !== null && build.commit != null && last.sha.toLowerCase() === build.commit.toLowerCase();
@@ -783,16 +827,16 @@ function BuildEvery({ build, onStarted }: { build: ReleaseBuild; onStarted: () =
             (building ? (
               <>
                 Building every platform from {last?.sha.slice(0, 7)}
-                {lastOfIt ? ", the commit the server runs" : ""} · {runLink}
+                {lastOfIt ? ", the newest kiln" : ""} · {runLink}
               </>
             ) : build.in_step ? (
               <>
-                Every platform is built from {commit}, the commit the server runs{runLink ? " · " : ""}
+                Every platform is built from {commit}, the newest kiln{runLink ? " · " : ""}
                 {runLink}
               </>
             ) : commit ? (
               <span title={behind.join(", ")}>
-                {behind.length} platform{behind.length === 1 ? " isn't" : "s aren't"} built from {commit}, the commit the server runs
+                {behind.length} platform{behind.length === 1 ? " isn't" : "s aren't"} built from {commit}, the newest kiln
                 {lastOfIt && last?.status === "failed" ? (
                   <>
                     : the build failed · {runLink}

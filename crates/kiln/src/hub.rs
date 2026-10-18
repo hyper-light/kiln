@@ -212,7 +212,9 @@ impl Hub {
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
     /// each other platform's runners upgrade to now.
     async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
-        if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) {
+        // The server's commit, or the newest one a runner runs (`crate::fleet`).
+        let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
+        if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {
             return;
         }
         let path = crate::api::artifact_path(self, job);
@@ -227,6 +229,7 @@ impl Hub {
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
                 self.emit(&serde_json::json!({ "type": "updates" }));
+                self.updates.fleet.wake();
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) | Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
@@ -768,6 +771,7 @@ impl Hub {
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
                 self.updates.on_build(self, &agent, &build);
+                self.updates.fleet.wake();
                 self.emit(&serde_json::json!({ "type": "updates" }));
                 crate::frontdoor::control::on_build(self, &agent, caps).await;
                 if caps & proto::CAP_SYNC != 0 {
@@ -784,7 +788,17 @@ impl Hub {
                     self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
                 }
             }
-            AgentMsg::Facts { .. } => tracing::debug!(agent = %agent, "runner facts before CI facts are stored"),
+            // The kiln it runs (`crate::fleet`); the rest is W13's.
+            AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
+                Ok(f) => {
+                    if let Some(k) = f.kiln {
+                        crate::fleet::remember(self, &k.build, &k.target, &k.commit);
+                        self.instances.lock().set_kiln(peer, k);
+                        self.updates.fleet.wake();
+                    }
+                }
+                Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),
+            },
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -1072,6 +1086,12 @@ impl Hub {
     pub fn runner_caps(&self, name: &str) -> u32 {
         let inst = self.instances.lock();
         inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
+    }
+
+    /// The kiln a machine's newest runner process says it runs (`crate::fleet`).
+    pub fn runner_kiln(&self, name: &str) -> Option<kiln_ci::facts::KilnFacts> {
+        let inst = self.instances.lock();
+        inst.newest(name).and_then(|p| inst.get(p)).and_then(|i| i.kiln.clone())
     }
 
     pub fn runner_processes(&self, name: &str) -> Vec<crate::instances::InstanceView> {

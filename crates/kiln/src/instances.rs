@@ -77,6 +77,8 @@ pub struct Instance {
     pub build: Option<String>,
     /// What it can do ([`crate::proto::CAP_UPGRADE`] ...).
     pub caps: u32,
+    /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
+    pub kiln: Option<kiln_ci::facts::KilnFacts>,
 }
 
 impl Instance {
@@ -162,6 +164,7 @@ impl Instances {
                 drained: false,
                 build: None,
                 caps: 0,
+                kiln: None,
             },
         );
         // Ownership moves with the instance.
@@ -197,6 +200,13 @@ impl Instances {
     /// instance that could is not asked instead: new work goes to the newest.
     pub fn newest_with(&self, name: &str, caps: u32) -> Option<PeerId> {
         self.newest_of(name).filter(|p| self.by_peer.get(p).is_some_and(|i| i.caps & caps == caps))
+    }
+
+    /// [`crate::proto::AgentMsg::Facts`]: the kiln an instance says it runs.
+    pub fn set_kiln(&mut self, peer: PeerId, kiln: kiln_ci::facts::KilnFacts) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.kiln = Some(kiln);
+        }
     }
 
     /// [`crate::proto::AgentMsg::Build`]: which build an instance runs and what it can do.
