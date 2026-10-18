@@ -43,7 +43,11 @@ impl ClientTls {
     pub fn new(roots: Roots, identity: Option<Identity>) -> anyhow::Result<Self> {
         let mut store = RootCertStore::empty();
         match roots {
-            Roots::WebPki => store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            // The public roots, and this machine's own (a TLS-inspecting proxy's root, say).
+            Roots::WebPki => {
+                store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                store.add_parsable_certificates(super::roots::system().iter().cloned());
+            }
             Roots::Pem(pem) => {
                 for cert in CertificateDer::pem_slice_iter(&pem) {
                     store.add(cert.context("CA PEM")?).context("CA certificate")?;
@@ -51,6 +55,7 @@ impl ClientTls {
             }
             Roots::WebPkiPlusDer(der) => {
                 store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                store.add_parsable_certificates(super::roots::system().iter().cloned());
                 store.add(CertificateDer::from(der)).context("CA certificate")?;
             }
         }

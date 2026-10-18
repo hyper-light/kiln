@@ -273,7 +273,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
-    let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
+    let mut paths = if o.ephemeral {
+        crate::tunnel::Paths::new(&o.server_url, &quic_addr)
+    } else {
+        crate::tunnel::Paths::remembering(&o.server_url, &quic_addr, crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("transport"))
+    };
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
     // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).

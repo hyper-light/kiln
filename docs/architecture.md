@@ -138,6 +138,33 @@ holds up every QUIC stream behind it (head-of-line blocking) and QUIC's congesti
 delays rather than the path's; terminals and job traffic are small enough not to notice. Datagrams a
 full socket cannot take are dropped, as a congested link would, and QUIC recovers them.
 
+### Networks that block UDP or inspect TLS
+
+A company network (Zscaler, a proxy, a VPN) may drop UDP, let traffic out only through a proxy, and
+re-sign every HTTPS connection with its own root certificate. A runner there works over TCP alone:
+
+- **The tunnel, at once.** A runner keeps the path it last reached the server by
+  (`<state>/transport`): one that last connected through the tunnel takes it first after a restart
+  or an upgrade, instead of waiting 20 s for UDP again, and still switches back once UDP answers.
+  Everything a runner does with other runners goes through the server (reach, repository sync,
+  clones), so it all rides the tunnel too.
+- **Proxies.** HTTPS, the tunnel and joining go through `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+  (or their lowercase forms; `http://[user:password@]host:port`), or, on macOS, the system's proxy
+  settings when none is set (not a PAC file). Every connection is a `CONNECT` tunnel through it,
+  plain HTTP included, so the tunnel's WebSocket gets through. Loopback and private addresses and
+  `localhost` / `.local` names always go direct (a proxy on the internet can't reach them), and so
+  does whatever `NO_PROXY` or the system's exceptions list.
+- **TLS inspection.** Beside the public roots, HTTPS trusts this machine's own: on macOS the
+  keychains, on Windows the Root stores, elsewhere the system's CA bundle, and `SSL_CERT_FILE` /
+  `SSL_CERT_DIR`. That is where a company installs its inspection root. It changes no trust between
+  kiln's ends: QUIC runs end to end inside the tunnel, still pinned to the kiln CA.
+- **Joining.** Finding servers on the network needs multicast UDP; with it blocked, join by
+  address: `kiln join --server https://kiln.example.com`, or the server's own
+  `curl -fsSL https://kiln.example.com/install.sh | sh -s -- --join`.
+
+Where only web ports pass, serve kiln on 443 (`[server] https`, or a front door, docs/front-door.md):
+the server's URL then is the only address a runner needs.
+
 ## Home network: discovery and joining
 
 kiln instances on one LAN find each other, and any computer can become an agent of a server with
