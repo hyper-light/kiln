@@ -82,6 +82,16 @@ part-way is one that:
   can't make a turn that ended look cut short; and only for an agent whose runner reports how its
   turns end (one from before keep-going would look started again after every turn).
 
+A turn kiln itself cut short is taken up by the runner, not by keep-going: its runner upgrading in
+place, the system stopping the runner, or the runner crashing. Each session's record on its
+machine says whether a turn of it is open (set as one starts, cleared as one ends; its harness
+ending doesn't clear it, a force stop does). Started again from that record, a session whose turn
+was open gets one message first in its queue, shown as kiln's: "kiln restarted on this machine
+part-way through your last turn, which stopped it and anything it was running. Pick up where you
+left off." Agents that were between turns hear nothing, and it isn't said twice if the runner
+restarts again before it goes out. The runner does this whether or not keep-going is on for the
+agent, since the turn was kiln's to have stopped.
+
 Every harness kiln runs as an agent reports how its turns end: Claude Code (its result's stop
 reason), Codex (`turn/completed`: completed, interrupted, failed) and the ACP agents, Gemini CLI,
 opencode, Goose and Amp (the prompt's `stopReason`: end_turn, max_tokens, max_turn_requests,
