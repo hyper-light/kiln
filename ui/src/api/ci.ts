@@ -24,6 +24,10 @@ export interface CiRun {
   started_at: number | null;
   finished_at: number | null;
   error: string | null;
+  /** W18-R06: `required` while an outside contributor's run waits for a maintainer, then
+   * `approved` or `rejected`. */
+  approval?: "required" | "approved" | "rejected" | null;
+  approved_by?: string | null;
 }
 
 export interface CiLeg {
@@ -427,9 +431,10 @@ export const ci = {
     request<{ counts: Record<string, number>; tests: CiTest[] }>("GET", `/api/ci/runs/${enc(id)}/tests${at(attempt)}`, undefined, { signal }),
   rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false) =>
     request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed }),
-  /** A review of the run's deployments waiting on their environments (W15-R04). */
+  /** A review of the run's deployments waiting on their environments (W15-R04), or, with none
+   * named, of an outside contributor's run waiting to start (W18-R06). */
   approve: (id: string, environments: string[], state: "approved" | "rejected", comment: string) =>
-    request<{ run: string; environments: string[]; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
+    request<{ run: string; environments?: string[]; approval?: "run"; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
   /** A kept leg kept `minutes` more from now, or let go (W17-R02). */
   keep: (leg: string, minutes: number) => request<{ leg: string; kept_until: number }>("POST", `/api/ci/legs/${enc(leg)}/keep`, { minutes }),

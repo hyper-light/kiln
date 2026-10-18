@@ -135,6 +135,9 @@ enum Cmd {
     Auth(kiln::runner::auth::AuthArgs),
     /// The packages a tree's lockfiles pin, as an SBOM (SPDX 2.3 or CycloneDX 1.6).
     Sbom(kiln::ci::sbom::SbomArgs),
+    /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
+    #[command(hide = true)]
+    EgressRelay,
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// A CI run's or leg's logs.
@@ -661,6 +664,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
         Cmd::Auth(a) => kiln::runner::auth::cli(a).await,
         Cmd::Sbom(a) => kiln::ci::sbom::cli(a).await,
+        Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();

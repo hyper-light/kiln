@@ -80,6 +80,9 @@ pub enum Msg {
     Reviewed { run: String },
     /// Where a leg routed so would go now, and why each runner can or can't take it.
     ExplainRoute { route: Box<LegRoute>, reply: async_channel::Sender<serde_json::Value> },
+    /// A maintainer decided an outside contributor's run (W18-R06): approved, it starts; rejected,
+    /// it is cancelled. `false` when the run waits for no approval.
+    ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
     Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, reply: async_channel::Sender<Result<u32, String>> },
 }
@@ -95,7 +98,7 @@ fn machine_label(l: &str) -> bool {
 
 /// A leg's route. On `kiln workflow run`'s own server (`local`, W17-R06) a leg keeps only the labels
 /// that say what machine it needs: the rest name the user's runners, and it runs on this one.
-fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool) -> LegRoute {
+fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool, untrusted: Option<kiln_ci::sched::routing::Untrusted>) -> LegRoute {
     let job = spec.def();
     let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
     let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
@@ -110,6 +113,7 @@ fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool
         group: if local { None } else { spec.runs_on.group.clone() },
         requires: spec.requires.clone(),
         caps,
+        untrusted,
     }
 }
 
@@ -163,9 +167,10 @@ fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
 }
 
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
-fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, local: bool) -> LegIn {
+fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci) -> LegIn {
     let job = spec.def();
-    let mut route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, local);
+    // Untrusted code runs only where `ci.untrusted` lets it (W18-R07).
+    let mut route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, cfg.local, (!r.trusted).then(|| cfg.untrusted.route()));
     // What kiln actions' steps need of the runner (W07-R11).
     for step in job.map(|j| j.steps.as_slice()).unwrap_or_default() {
         if let Some(a) = step.uses.as_deref().and_then(|u| r.actions.get(u)) {
@@ -290,6 +295,43 @@ struct RunSt {
     timing: Arc<HashMap<String, f64>>,
     /// Each job's median seconds lately: what the scheduler expects its legs to cost (W05-R10).
     costs: Arc<HashMap<String, f64>>,
+    /// An outside contributor's run waiting for a maintainer (W18-R06): the concurrency group
+    /// it joins once approved.
+    awaiting: Option<Awaiting>,
+}
+
+/// What an unapproved run is handed to the scheduler with, once it's approved.
+struct Awaiting {
+    group: Option<(String, String, GroupConfig)>,
+}
+
+/// A leg's egress policy (W18-R08), from its job's `network:` and its trust. One that doesn't
+/// read lets the leg reach only kiln's server: closed, never open.
+fn egress_of(network: Option<&kiln_ci::wf::ir::YVal>, trusted: bool, untrusted_allow: &[String], leg: &str) -> Option<wire::Network> {
+    match kiln_ci::trust::egress(network, trusted, untrusted_allow) {
+        Ok(allow) => allow.map(|allow| wire::Network { allow, untrusted: !trusted }),
+        Err(e) => {
+            tracing::warn!(leg, error = %e, "the job's network policy doesn't read; it reaches only kiln");
+            Some(wire::Network { allow: Vec::new(), untrusted: !trusted })
+        }
+    }
+}
+
+/// Whether a run of `e` is trusted: the event's own say (a fork's pull request isn't, W03-R08),
+/// unless an administrator marked the repository or the actor (W18-R05).
+fn trusted_of(cfg: &crate::config::ci::Ci, repo: &Repo, e: &Event) -> bool {
+    e.trusted && !cfg.untrusted.marks(&repo.name, &e.actor)
+}
+
+/// The author's standing for approvals (GitHub's `author_association`): the pull request's, or
+/// kiln's for what it synthesized; a run through the API is a known account's.
+fn association(e: &Event) -> Option<String> {
+    let p = &e.payload;
+    p.pointer("/pull_request/author_association")
+        .or_else(|| p.pointer("/kiln/author_association"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| (e.source == kiln_ci::trigger::Source::Api).then(|| "CONTRIBUTOR".to_owned()))
 }
 
 /// A leg the scheduler has.
@@ -450,6 +492,11 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
+            Msg::ApproveRun { run, by, approve, reply } => {
+                let r = self.approve_run(&run, &by, approve).await;
+                let _ = reply.try_send(*r.as_ref().unwrap_or(&false));
+                r.map(|_| ())
+            }
             Msg::Explain { leg, reply } => {
                 let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "runners": self.sched.explain(&leg) });
                 let _ = reply.try_send(v);
@@ -528,8 +575,10 @@ impl Dispatch {
         // Executors it has: the host always, Docker when it announced it (W13-R01's probes, for now).
         let mut executors = std::collections::BTreeMap::new();
         executors.insert("host".to_owned(), kiln_ci::facts::Executor::default());
-        if self.hub.runner_caps(agent) & CAP_DOCKER != 0 {
-            executors.insert("docker".to_owned(), kiln_ci::facts::Executor::default());
+        let caps = self.hub.runner_caps(agent);
+        if caps & CAP_DOCKER != 0 {
+            let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
+            executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
         }
         let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() };
         let view = RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(self.hub.runner_caps(agent)) };
@@ -549,14 +598,17 @@ impl Dispatch {
     }
 
     /// A workflow that matched an event becomes a run (W04-R01).
-    async fn start(&mut self, s: Start) -> anyhow::Result<()> {
+    async fn start(&mut self, mut s: Start) -> anyhow::Result<()> {
         // The repository's routing rules as its default branch has them now (W05-R21).
         let fresh = super::routing::repo_rules(&self.hub, &s.repo).await;
         if self.routing.set_repo(&s.repo.name, fresh) {
             self.rules_changed().await;
         }
         let id = crate::util::new_id();
+        s.event.trusted = trusted_of(&self.hub.cfg.ci, &s.repo, &s.event);
         let trusted = s.event.trusted;
+        // An outside contributor's run waits for a maintainer before any job starts (W18-R06).
+        let approval = kiln_ci::trust::needs_approval(self.hub.cfg.ci.untrusted.require_approval, trusted, association(&s.event).as_deref());
         let model = serde_json::to_string(&*s.workflow).unwrap_or_default();
         let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
         let new = runs::NewRun {
@@ -619,14 +671,37 @@ impl Dispatch {
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, costs };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, costs, awaiting: None };
         self.workflow_run(&st, "requested", None);
+        if approval {
+            runs::set_approval(&self.hub, &id, "required", None).await?;
+            st.awaiting = Some(Awaiting { group });
+            self.runs.insert(id.clone(), st);
+            self.hub.ci.runs.lock().insert(id.clone());
+            self.hub.emit_run(&id).await;
+            crate::rt::spawn(super::notify::approval_waiting(Arc::clone(&self.hub), id, Vec::new()));
+            return Ok(());
+        }
         self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
         self.hub.emit_run(&id).await;
         let cmds = self.sched.handle(Input::RunQueued { run: id, group, supersede: None }, now_ms());
         self.commands(cmds).await;
         Ok(())
+    }
+
+    /// A maintainer's decision on an outside contributor's run (W18-R06).
+    async fn approve_run(&mut self, run: &str, by: &str, approve: bool) -> anyhow::Result<bool> {
+        let Some(waiting) = self.runs.get_mut(run).and_then(|r| r.awaiting.take()) else { return Ok(false) };
+        runs::set_approval(&self.hub, run, if approve { "approved" } else { "rejected" }, Some(by)).await?;
+        if approve {
+            self.hub.emit_run(run).await;
+            let cmds = self.sched.handle(Input::RunQueued { run: run.to_owned(), group: waiting.group, supersede: None }, now_ms());
+            self.commands(cmds).await;
+        } else {
+            self.cancel_run(run, &format!("{by} didn't approve it")).await?;
+        }
+        Ok(true)
     }
 
     /// `KCI4040`: the required secrets a kiln workflow declares that don't resolve for each job's
@@ -740,7 +815,8 @@ impl Dispatch {
             .legs
             .iter()
             .map(|spec| {
-                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local));
+                let untrusted = (!trusted_of(&self.hub.cfg.ci, &s.repo, &s.event)).then(|| self.hub.cfg.ci.untrusted.route());
+                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local, untrusted));
                 let mut v = serde_json::to_value(spec).unwrap_or_default();
                 if let Some(o) = v.as_object_mut() {
                     let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
@@ -946,7 +1022,8 @@ impl Dispatch {
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs };
+        // A maintainer reruns it: that is approval enough, as on GitHub.
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting: None };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -1014,7 +1091,7 @@ impl Dispatch {
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
-        let leg = leg_in(r, run, &id, &spec, self.hub.cfg.ci.local);
+        let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
         self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None });
         self.hub.emit_job(&id).await;
         // A leg bound to an environment starts when its protection lets it (W15-R04).
@@ -1343,6 +1420,7 @@ impl Dispatch {
             quarantine: job.is_some_and(|j| j.kiln.quarantine_enforce),
             integrations: Vec::new(),
             limits: wire::Limits::default(),
+            network: egress_of(job.and_then(|j| j.kiln.network.as_ref()), r.trusted, &self.hub.cfg.ci.untrusted.allow_hosts, leg),
         }
     }
 
@@ -1557,7 +1635,7 @@ impl Dispatch {
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
         let timing = saved_timing(&v);
-        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing }).map_err(|e| anyhow::anyhow!(e))?;
+        let (mut plan, initial) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing }).map_err(|e| anyhow::anyhow!(e))?;
         let run_owned = run.to_owned();
         let (log, last_seq): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
             let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
@@ -1569,6 +1647,7 @@ impl Dispatch {
         })
         .await?;
         let seq = last_seq;
+        let logged = !log.is_empty();
         let mut reported: HashSet<String> = HashSet::new();
         for (_, kind, leg, report) in log {
             match kind.as_str() {
@@ -1621,7 +1700,16 @@ impl Dispatch {
             })
             .unwrap_or_default();
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs };
+        // Still waiting for a maintainer's approval (W18-R06): it starts from the plan's first
+        // actions once approved.
+        let unapproved = !logged && legs.is_empty() && runs::approval(&self.hub, run).await?.as_deref() == Some("required");
+        let (held, awaiting) = if unapproved {
+            let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+            (Some(initial), Some(Awaiting { group }))
+        } else {
+            (None, None)
+        };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -1640,7 +1728,7 @@ impl Dispatch {
             };
             self.hub.ci.legs.lock().insert(id.clone());
             self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None });
-            let li = leg_in(&st, run, &id, &spec, self.hub.cfg.ci.local);
+            let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
             match (s, agent) {
                 (Status::Running, Some(a)) => {
                     let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a.clone(), attempt: attempt.max(1) }, now_ms());
@@ -1654,7 +1742,12 @@ impl Dispatch {
             }
         }
         self.hub.ci.runs.lock().insert(run.to_owned());
+        let waits = st.awaiting.is_some();
         self.runs.insert(run.to_owned(), st);
+        if waits {
+            // Still waiting for a maintainer: nothing goes to the scheduler until then.
+            return Ok(());
+        }
         let _ = self.sched.handle(Input::RunQueued { run: run.to_owned(), group: None, supersede: None }, now_ms());
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
@@ -1845,7 +1938,13 @@ fn cache_access(spec: &kiln_ci::plan::LegSpec, r: &RunSt) -> (kiln_ci::store::ca
     let wf_mode = spec.workflow.cache_mode.as_deref().and_then(Mode::parse);
     let mode = cache::effective(job_mode, wf_mode, &r.event.name, on_default);
     let mut access = Vec::new();
-    for (i, scope) in cache::scopes(&git_ref, r.event.base_ref.as_deref(), &default_branch).into_iter().enumerate() {
+    let mut scopes = cache::scopes(&git_ref, r.event.base_ref.as_deref(), &default_branch);
+    // An untrusted run saves only to a scope of its own, which no trusted run reads; it restores
+    // from that and its base's, as on GitHub (W18-R07).
+    if let (false, Some(own)) = (r.trusted, scopes.first_mut()) {
+        *own = format!("untrusted/{git_ref}");
+    }
+    for (i, scope) in scopes.into_iter().enumerate() {
         let read = if mode.restores() { super::token::READ } else { 0 };
         let write = if i == 0 && mode.saves() { super::token::WRITE } else { 0 };
         if read | write != 0 {

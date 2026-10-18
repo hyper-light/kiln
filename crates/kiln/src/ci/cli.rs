@@ -904,7 +904,7 @@ pub async fn env(args: EnvArgs, cfg: &Config) -> Result<()> {
 pub struct ApproveArgs {
     #[command(flatten)]
     conn: Conn,
-    /// The run waiting for a deployment review.
+    /// The run waiting for a deployment review, or for a maintainer (an outside contributor's).
     run: String,
     /// The environments decided (default: every one the run waits for; repeatable).
     #[arg(long = "env")]
@@ -921,8 +921,14 @@ pub async fn approve(args: ApproveArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     let body = json!({ "environments": args.environments, "state": if args.reject { "rejected" } else { "approved" }, "comment": args.comment });
     let v = api.call(Method::Post, &format!("/runs/{}/approve", enc(&args.run)), Some(body)).await?;
+    let verb = if args.reject { "rejected" } else { "approved" };
+    // An outside contributor's run (W18-R06), or deployments (W15-R03).
+    if v.get("approval").and_then(Value::as_str) == Some("run") {
+        println!("{verb} the run{}", if args.reject { ": it is cancelled" } else { ": it starts" });
+        return Ok(());
+    }
     let envs: Vec<String> = v.get("environments").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|e| e.as_str().map(str::to_owned)).collect();
-    println!("{} the deployments to {}", if args.reject { "rejected" } else { "approved" }, envs.join(", "));
+    println!("{verb} the deployments to {}", envs.join(", "));
     Ok(())
 }
 

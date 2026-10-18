@@ -316,6 +316,8 @@ struct State {
     refresh: Option<std::sync::Arc<super::auth::Refresh>>,
     /// Where the runner put its own binary, for `kiln auth` (W11-R04), last on steps' `PATH`.
     kiln_bin: Option<PathBuf>,
+    /// The leg's egress proxy (W18-R08), when it has a network policy.
+    egress: Option<std::sync::Arc<super::egress::Pool>>,
 }
 
 /// A background step that finished, and what it changed: applied to the leg at its `wait`, in
@@ -909,6 +911,7 @@ impl Leg {
             integrations: BTreeMap::new(),
             refresh: None,
             kiln_bin: None,
+            egress: None,
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -937,6 +940,23 @@ impl Leg {
                 c.stop().await;
             }
             return Ok(Status::Failed);
+        }
+        // A network policy with the leg's steps on the host (W18-R08): the proxy on loopback.
+        if let (Some(n), None) = (&a.network, &st.egress) {
+            match super::egress::Pool::local(self.egress_policy(n)).await {
+                Ok((pool, port)) => {
+                    let url = format!("http://127.0.0.1:{port}");
+                    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                        st.env.insert(k.into(), url.clone());
+                    }
+                    for k in ["NO_PROXY", "no_proxy"] {
+                        st.env.insert(k.into(), "localhost,127.0.0.1,::1".into());
+                    }
+                    st.egress = Some(std::sync::Arc::new(pool));
+                    self.annotate(0, "warning", "The job's network policy can't be enforced on the host: its steps are pointed at kiln's egress proxy (HTTP_PROXY), but a step may connect around it. A container or microVM contains it.").await;
+                }
+                Err(e) => self.note(0, &format!("Error: the egress proxy: {e:#}")).await,
+            }
         }
         self.report_facts(&st).await;
         if !a.integrations.is_empty() && !self.integrations(&mut st).await {
@@ -1632,9 +1652,25 @@ impl Leg {
         let map = self.container_map(l);
         let workdir = map.translate(&l.workspace.to_string_lossy());
         // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
+        // A leg with a network policy never gets the host's Docker socket: it would get around it.
+        let open = a.network.is_none();
         let job = match (&a.job_container, &a.executor.image) {
-            (Some(c), _) => Some(super::docker::Spec { docker_socket: true, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
-            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: self.docker_inside(), ..super::docker::Spec::default() }),
+            (Some(c), _) => Some(super::docker::Spec { docker_socket: open, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
+            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: open && self.docker_inside(), ..super::docker::Spec::default() }),
+            _ => None,
+        };
+        // W18-R08: a job in a container is contained, its one way out the relay to the runner's
+        // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
+        // stops here; a trusted one runs as it would without its policy, and says so.
+        let egress = match (&a.network, &job) {
+            (Some(n), Some(_)) => match super::egress::relay_binary() {
+                Some(binary) => Some((super::docker::EgressSpec { binary, token: crate::util::random_token() }, n.clone())),
+                None if n.untrusted => anyhow::bail!("this untrusted leg's network can't be contained here: the runner has no static kiln for its egress relay (a musl build of kiln, or KILN_EGRESS_BINARY)"),
+                None => {
+                    self.annotate(idx, "warning", "The job's network policy isn't enforced: this runner has no static kiln for the egress relay (a musl build of kiln, or KILN_EGRESS_BINARY).").await;
+                    None
+                }
+            },
             _ => None,
         };
         let mut services = Vec::new();
@@ -1643,13 +1679,27 @@ impl Leg {
         }
         let said = parking_lot::Mutex::new(Vec::<String>::new());
         let say = |m: String| said.lock().push(m);
-        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, &say).await;
+        let keys: Vec<String> = services.iter().map(|(k, _)| k.clone()).collect();
+        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, egress.as_ref().map(|(e, _)| e), &say).await;
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{}\r\n", st.masker.mask(&line)).into_bytes()).await;
         }
-        st.containers = Some(started?);
+        let started = started?;
+        if let (Some((e, n)), Some((_, port))) = (egress, started.relay.as_ref()) {
+            st.egress = Some(std::sync::Arc::new(super::egress::Pool::start(*port, e.token, self.egress_policy(&n))));
+            st.env.extend(super::docker::proxy_env(keys.iter().map(String::as_str)));
+            self.note(idx, &format!("The leg's network is contained: out only through kiln's egress proxy, to kiln and {}", if n.allow.is_empty() { "nothing else".to_owned() } else { n.allow.join(", ") })).await;
+        }
+        st.containers = Some(started);
         Ok(())
+    }
+
+    /// What the leg's network policy lets it reach: kiln's server always, as this runner reaches it.
+    fn egress_policy(&self, n: &kiln_ci::wire::Network) -> super::egress::Policy {
+        let r = &self.a.runtime;
+        let urls: Vec<&str> = [r.results_url.as_str(), r.cache_url.as_str(), r.facade_url.as_str(), r.api_url.as_str(), r.graphql_url.as_str()].into_iter().chain(r.id_token_url.as_deref()).collect();
+        super::egress::Policy::new(n.allow.clone(), &urls)
     }
 
     async fn start(&self, idx: u32, name: &str, kind: &str, action: Option<String>) {
@@ -1667,6 +1717,10 @@ impl Leg {
             }
         }
         if !nested {
+            // What the leg's egress policy refused while it ran (W18-R08).
+            for what in st.egress.as_ref().map(|p| p.blocked()).unwrap_or_default() {
+                self.annotate(idx, "warning", &format!("blocked egress to {what}")).await;
+            }
             let masked: BTreeMap<String, String> = outputs.iter().map(|(k, v)| (k.clone(), st.masker.mask(v))).collect();
             self.event(&JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs: masked }).await;
         }

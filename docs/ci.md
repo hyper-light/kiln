@@ -188,7 +188,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
-| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles, its own P-256 key), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; keyless, cosign key files and KMS, images' referrers (W12), R04, untrusted code left |
+| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles, its own P-256 key), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; keyless, cosign key files and KMS, images' referrers (W12), R04, microVM containment (W13) left |
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
@@ -3750,7 +3750,8 @@ code from outside a repository's trust safely: microVMs or containers, limited e
 - **W18-AC04 Deploy policy.** An image without matching provenance is refused by an environment
   with `require-provenance`, and one with it deploys. *E2E.*
 
-**Progress.** R01, R03, AC01 and AC02 done; R02 with the server's key:
+**Progress.** R01, R03, R05–R08, AC01, AC02 and AC03 (in containers) done; R02 with the
+server's key:
 - **Attesting.** `kiln/attest@v1` takes GitHub's subjects (`subject-path` patterns,
   `subject-name` with `subject-digest`, `subject-checksums`) and kiln's (`subject-image`, whose
   digests come from the runner's engine or the reference; `subjects`, files where one matches,
@@ -3783,11 +3784,55 @@ code from outside a repository's trust safely: microVMs or containers, limited e
     the job's but kiln's key doesn't verify.
 - **AC02** is an integration test over kiln's own `Cargo.lock` and `ui/package-lock.json`.
 
+Untrusted code (R05–R08):
+- **Trust.** A webhook's fork pull request is untrusted (W03-R08). A polled one is untrusted
+  unless its head is on one of the repository's branches: polling can't see where a head lives.
+  Other people's local runs are untrusted too, and so is anything `ci.untrusted.repos` and
+  `actors` mark.
+- **Approval.** `ci.untrusted.require_approval` is `first-time` (default), `all-external` or
+  `none`. Each uses GitHub's `author_association`; for a polled pull request kiln derives it as
+  GitHub does, counting the author a contributor once the default branch has a commit of theirs.
+  - A run that needs approval doesn't reach the scheduler until a maintainer with
+    `runs.approve` decides it, in one step (`POST /api/ci/runs/:id/approve`, `kiln approve`, the
+    run page's "Approve and run"). Rejected, it is cancelled.
+  - The wait survives a restart (`runs.approval`). `approval.waiting` notifies, and the audit
+    log records who decided.
+- **Untrusted legs** run only on `ci.untrusted.executors` (firecracker, shards, docker). Docker
+  counts only when it is rootless: the runner announces `CAP_DOCKER_ROOTLESS`, unless
+  `rootful_docker` allows otherwise. A rule that sends one elsewhere leaves it waiting, with why.
+  Its cache saves go to `untrusted/<ref>`, which no trusted run reads; restores also read the
+  base's.
+- **Egress.** A leg with `network: { egress: none | open | { allow: [...] } }`, and every
+  untrusted leg, sits on an `--internal` Docker network of its own.
+  - Its one way out is a relay container (a static kiln, any image) that hands each connection
+    to the runner's proxy. The runner dials into the relay through a port on loopback, so
+    nothing in the leg connects to the host.
+  - The proxy allows kiln's server and the policy's hosts (`*.example.com`, `:port`); an
+    untrusted leg gets `ci.untrusted.allow_hosts`, which its own list can only narrow. It checks
+    `CONNECT` targets and plain HTTP by their URLs, and a TLS client's SNI too.
+  - It refuses names that resolve to the host's own or link-local addresses (metadata services)
+    unless the policy names the address, and annotates each refusal ("blocked egress to
+    github.com:443").
+  - Such a leg gets no Docker socket. Its `options:` and volumes may not take it off its network
+    (`--network`, `--privileged`, the socket, …).
+  - On the host executor the proxy is advisory (`HTTP_PROXY`, with a warning), which is why
+    untrusted legs never go there unless the host is listed.
+- **AC03**, verified E2E with a polled fork pull request from an author with nothing merged:
+  - it waits for approval, then runs on Docker;
+  - no secrets, and no ID token; a write through the facade gets 403;
+  - `example.com` (allowed) answers; `github.com` and the metadata address are refused and
+    annotated; nothing gets out around the proxy (no DNS, no route);
+  - its cache lands in `untrusted/refs/pull/1/merge`;
+  - a returning contributor's fork pull request runs, contained, without waiting.
+
+  The microVM half waits for W13's executors (shards' network grants, Firecracker's tap device).
+
 Left:
 - keyless signing (Fulcio, Rekor), cosign key files and KMS;
 - attaching to images through the OCI referrers API (W12);
 - the SBOM differences in review;
-- R04 (with CD), R05–R08, AC03 and AC04.
+- R04 (with CD) and AC04;
+- microVM and `k8s` containment (W13), and the host's network namespace (opt-in).
 
 ### W19 Insights, audit and notifications
 

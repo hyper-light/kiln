@@ -6,6 +6,7 @@ pub mod attest;
 pub mod auth;
 pub mod builtins;
 pub mod docker;
+pub mod egress;
 pub mod hashfiles;
 pub mod kept;
 pub mod runtime;

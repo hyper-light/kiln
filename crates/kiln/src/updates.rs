@@ -1624,7 +1624,9 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 /// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
 pub fn runner_build() -> AgentMsg {
     let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker }
+    // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
+    let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
