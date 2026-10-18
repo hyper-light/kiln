@@ -318,6 +318,7 @@ pub async fn release(hub: &Hub, id: &str, by: &str) -> Result<Response, Fail> {
     let agent = kept_on(hub, id).await?;
     hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }).await;
     super::runs::kept(hub, id, None).await.map_err(internal)?;
+    hub.ci.keep(id, None);
     hub.store.audit(by.to_owned(), "ci.legs.release".into(), id.to_owned()).await;
     hub.emit_job(id).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
@@ -332,9 +333,42 @@ pub async fn extend(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respo
     hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }).await;
     let until = crate::util::now_unix() + i64::from(minutes) * 60;
     super::runs::kept(hub, id, Some(until)).await.map_err(internal)?;
+    hub.ci.keep(id, Some((agent.clone(), until)));
     hub.store.audit(by.to_owned(), "ci.legs.keep".into(), format!("{id} {minutes}m")).await;
     hub.emit_job(id).await;
     Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "kept_until": until })))
+}
+
+/// `POST /api/ci/legs/:id/rerun-step` with `{ step }` (from 1, or `idx` from 0): a kept leg runs
+/// that step again in place, as a new section of its log (W17-R04). Answers the section's index.
+pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+    let agent = kept_on(hub, id).await?;
+    let step = match (body.get("idx").and_then(Value::as_u64), body.get("step").and_then(Value::as_u64)) {
+        (Some(i), _) => i,
+        (None, Some(n)) if n > 0 => n - 1,
+        _ => return Err((StatusCode::BAD_REQUEST, "say which step: `step` (from 1) or `idx` (from 0)".into())),
+    };
+    let step = u32::try_from(step).map_err(|_| (StatusCode::BAD_REQUEST, "no such step".to_owned()))?;
+    let leg = id.to_owned();
+    let (known, busy, next): (bool, bool, u32) = hub
+        .store
+        .call(move |c| {
+            let known: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM steps WHERE job_id = ?1 AND idx = ?2)", params![leg, step], |r| r.get(0))?;
+            let busy: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM steps WHERE job_id = ?1 AND status = 'running')", [&leg], |r| r.get(0))?;
+            let next: i64 = c.query_row("SELECT COALESCE(MAX(idx), -1) + 1 FROM steps WHERE job_id = ?1", [&leg], |r| r.get(0))?;
+            Ok((known, busy, u32::try_from(next).unwrap_or(u32::MAX)))
+        })
+        .await
+        .map_err(internal)?;
+    if !known {
+        return Err(missing("the leg has no such step"));
+    }
+    if busy {
+        return Err((StatusCode::CONFLICT, "a step of this leg is running again already; rerun once it ends".into()));
+    }
+    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }).await;
+    hub.store.audit(by.to_owned(), "ci.legs.rerun_step".into(), format!("{id} step {}", step + 1)).await;
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "leg": id, "step": step, "idx": next })))
 }
 
 /// `GET /api/ci/legs/:id/logs?step=`.

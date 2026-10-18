@@ -124,6 +124,7 @@ pub fn extend(job: &str, minutes: u32) -> Option<i64> {
 
 /// A kept leg let go now: its containers stopped, its workspace removed. Whether it was kept.
 pub async fn release(job: &str) -> bool {
+    super::runtime::unpark(job);
     let Some(e) = LEGS.lock().remove(job) else { return false };
     let Some(k) = e.kept else { return false };
     if let Some(c) = k.containers {

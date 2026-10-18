@@ -174,6 +174,17 @@ pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -
         .await
 }
 
+/// The legs kept now: each with its runner and until when.
+pub async fn kept_legs(hub: &Hub) -> anyhow::Result<Vec<(String, String, i64)>> {
+    hub.store
+        .call(|c| {
+            let mut st = c.prepare("SELECT id, agent, kept_until FROM jobs WHERE kept_until > ?1 AND agent IS NOT NULL")?;
+            let rows = st.query_map([crate::util::now_unix()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+}
+
 /// A failed leg kept until `until` (W17-R02), or no longer kept.
 pub async fn kept(hub: &Hub, leg: &str, until: Option<i64>) -> anyhow::Result<()> {
     let leg = leg.to_owned();

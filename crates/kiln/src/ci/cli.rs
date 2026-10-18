@@ -824,6 +824,13 @@ enum DebugCmd {
     },
     /// Let a kept leg go now: its workspace and containers are removed.
     Release { leg: String },
+    /// Run a kept leg's step again in place (after fixing what made it fail, in its terminal), as
+    /// a new section of the leg's log.
+    RerunStep {
+        leg: String,
+        /// The step, from 1 as the run page numbers them.
+        step: u32,
+    },
 }
 
 /// `kiln debug`.
@@ -837,6 +844,10 @@ pub async fn debug(args: DebugArgs, cfg: &Config) -> Result<()> {
         DebugCmd::Release { leg } => {
             api.call(Method::Post, &format!("/legs/{}/release", enc(&leg)), Some(json!({}))).await?;
             println!("released {leg}");
+        }
+        DebugCmd::RerunStep { leg, step } => {
+            let v = api.call(Method::Post, &format!("/legs/{}/rerun-step", enc(&leg)), Some(json!({ "step": step }))).await?;
+            println!("step {step} of {leg} runs again as step {} of its log; `kiln logs {leg}` follows it", v.get("idx").and_then(Value::as_u64).map_or(0, |i| i + 1));
         }
     }
     Ok(())

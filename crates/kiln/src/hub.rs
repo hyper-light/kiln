@@ -696,7 +696,8 @@ impl Hub {
 
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
-        self.agents.lock().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job))
+        // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
+        self.agents.lock().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {

@@ -28,6 +28,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::store::Status;
 
 /// One leg, run on this machine.
+#[derive(Clone)]
 pub struct Leg {
     pub a: AssignmentV2,
     pub work_dir: PathBuf,
@@ -242,6 +243,8 @@ fn str_map(m: &BTreeMap<String, String>) -> Value {
 /// The leg's state as its steps change it.
 #[derive(Clone)]
 struct State {
+    /// The next step's title starts with this (a step rerun in place, W17-R04).
+    rerun_label: Option<String>,
     dialect: Dialect,
     layout: Layout,
     /// The job's environment: the workflow's and the job's `env`, `env-from`, `$GITHUB_ENV`.
@@ -514,6 +517,48 @@ fn script_file(shell: Option<&str>, body: &str) -> (&'static str, String) {
     }
 }
 
+/// Kept legs' runtimes and states, by leg: what rerunning one of their steps needs (W17-R04).
+static PARKED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, (Leg, State)>>> = std::sync::LazyLock::new(Default::default);
+
+/// A kept leg let go: its state goes too.
+pub fn unpark(job: &str) {
+    PARKED.lock().remove(job);
+}
+
+/// Runs step `step` of kept leg `job` again in place, as step `idx` of its log (W17-R04): with the
+/// environment, paths and outputs the leg ended with, whatever its earlier steps concluded.
+/// `false` when the leg isn't kept here.
+pub fn rerun_step(job: &str, step: u32, idx: u32) -> bool {
+    let Some((leg, mut st)) = PARKED.lock().remove(job) else { return false };
+    let job = job.to_owned();
+    crate::rt::spawn(async move {
+        let def = usize::try_from(step).ok().and_then(|i| leg.a.steps.get(i)).cloned();
+        match def {
+            Some(def) if !def.is_control() => {
+                st.failed = false;
+                st.cancelled = false;
+                st.rerun_label = Some("Rerun: ".into());
+                let deadline = Instant::now() + Duration::from_secs(u64::from(leg.a.timeout_minutes.max(1)) * 60);
+                let _ = leg.step(&mut st, idx, &def, deadline, false).await;
+                for g in &st.groups {
+                    crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={job}"));
+                }
+                st.groups.clear();
+            }
+            _ => {
+                leg.start(idx, "Rerun", "internal", None).await;
+                leg.note(idx, &format!("Step {} can't be rerun: it isn't one of the job's steps.", step + 1)).await;
+                leg.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Failure, conclusion: Conclusion::Failure, exit_code: None, outputs: BTreeMap::new() }).await;
+            }
+        }
+        // Still kept (not released meanwhile): ready for the next rerun.
+        if super::kept::kept_until(&job).is_some() {
+            PARKED.lock().insert(job, (leg, st));
+        }
+    });
+    true
+}
+
 impl Leg {
     pub async fn run(self) -> JobResult {
         let job = self.a.job_id.clone();
@@ -691,6 +736,7 @@ impl Leg {
             m.insert("graphql_url".into(), serde_json::json!(a.runtime.graphql_url));
         }
         let mut st = State {
+            rerun_label: None,
             dialect,
             layout,
             env: BTreeMap::new(),
@@ -805,7 +851,8 @@ impl Leg {
         for g in &st.groups {
             crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={}", a.job_id));
         }
-        Ok(if timed_out {
+        st.groups.clear();
+        let status = if timed_out {
             Status::TimedOut
         } else if st.cancelled || self.cancel.is_cancelled() {
             Status::Cancelled
@@ -813,7 +860,12 @@ impl Leg {
             Status::Failed
         } else {
             Status::Succeeded
-        })
+        };
+        // A kept leg keeps its state, to rerun a step in place (W17-R04).
+        if keep {
+            PARKED.lock().insert(a.job_id.clone(), (self.clone(), st));
+        }
+        Ok(status)
     }
 
     /// `checkout: auto` (W06-R14): the run's commit in the workspace before the first step, as a
@@ -1040,6 +1092,10 @@ impl Leg {
             None => fallback_name,
         };
         let name = st.masker.mask(&name);
+        let name = match st.rerun_label.take() {
+            Some(label) => format!("{label}{name}"),
+            None => name,
+        };
         let kind = if step.uses.is_some() { "uses" } else { "run" };
         let run = match st.condition(step.cond.as_ref()) {
             Ok(r) => r,

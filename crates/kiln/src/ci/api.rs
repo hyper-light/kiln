@@ -132,6 +132,11 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["legs", id]) => super::runs_api::leg(hub, id).await,
         (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["legs", id, "routing"]) => super::runs_api::routing(hub, id).await,
+        (&Method::POST, ["legs", id, "rerun-step"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::runs_api::rerun_step(hub, id, &body, &by).await
+        }
         (&Method::POST, ["legs", id, "release"]) => {
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
             super::runs_api::release(hub, id, &by).await

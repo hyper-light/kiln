@@ -1053,6 +1053,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::KeepExtend { job, minutes } => {
                         crate::runner::kept::extend(&job, minutes);
                     }
+                    ServerMsg::JobRerunStep { job, step, idx } => {
+                        if !crate::runner::runtime::rerun_step(&job, step, idx) {
+                            tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
+                        }
+                    }
                     // The rest of CI's messages (W09, W13) land with their workstreams.
                     ServerMsg::SecretsFor { .. } => {
                         tracing::debug!("ignoring a CI message this runner does not take yet");

@@ -303,6 +303,10 @@ pub enum ServerMsg {
     /// CI: keep a kept leg `minutes` from now (docs/ci.md W17-R02, "Extend"). Only to runners
     /// announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
     KeepExtend { job: String, minutes: u32 },
+    /// CI: run step `step` of kept leg `job` again in place, as step `idx` of its log (docs/ci.md
+    /// W17-R04). Only to runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes
+    /// variants by index.
+    JobRerunStep { job: String, step: u32, idx: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

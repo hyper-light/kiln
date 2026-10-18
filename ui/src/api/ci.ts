@@ -249,6 +249,8 @@ export const ci = {
   /** A kept leg kept `minutes` more from now, or let go (W17-R02). */
   keep: (leg: string, minutes: number) => request<{ leg: string; kept_until: number }>("POST", `/api/ci/legs/${enc(leg)}/keep`, { minutes }),
   release: (leg: string) => request<void>("POST", `/api/ci/legs/${enc(leg)}/release`, {}),
+  /** A kept leg's step run again in place, as a new section of its log (W17-R04). */
+  rerunStep: (leg: string, idx: number) => request<{ leg: string; step: number; idx: number }>("POST", `/api/ci/legs/${enc(leg)}/rerun-step`, { idx }),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
   validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
   workflows: (repo: string, ref: string, signal?: AbortSignal) =>

@@ -128,12 +128,14 @@ pub struct Handle {
     /// Legs the dispatcher owns, so the hub hands their messages here and not to v1.
     legs: Arc<Mutex<HashSet<String>>>,
     runs: Arc<Mutex<HashSet<String>>>,
+    /// Failed legs kept to look into: the runner keeping each, and until when (W17-R02).
+    kept: Mutex<HashMap<String, (String, i64)>>,
 }
 
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = async_channel::unbounded();
-        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default() }
+        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default() }
     }
 }
 
@@ -152,6 +154,25 @@ impl Handle {
     /// Whether `job` is one of the engine's legs.
     pub fn is_leg(&self, job: &str) -> bool {
         self.legs.lock().contains(job)
+    }
+
+    /// A failed leg kept on `agent` until `until` (W17-R02): its events and logs (a step rerun in
+    /// place) are taken from that runner; `None` lets it go.
+    pub fn keep(&self, job: &str, kept: Option<(String, i64)>) {
+        let mut g = self.kept.lock();
+        match kept {
+            Some(k) => {
+                g.insert(job.to_owned(), k);
+            }
+            None => {
+                g.remove(job);
+            }
+        }
+    }
+
+    /// Whether `agent` keeps `job` now.
+    pub fn kept_by(&self, job: &str, agent: &str) -> bool {
+        self.kept.lock().get(job).is_some_and(|(a, until)| a == agent && *until > crate::util::now_unix())
     }
 
     /// Whether `run` is one of the engine's live runs.
@@ -273,6 +294,15 @@ pub fn spawn(hub: Arc<Hub>) {
     hub.ci.on.store(true, Ordering::Relaxed);
     super::services::spawn_maintenance(Arc::clone(&hub));
     crate::rt::spawn(async move {
+        // Legs kept to look into before a restart (W17-R02).
+        match runs::kept_legs(&hub).await {
+            Ok(kept) => {
+                for (leg, agent, until) in kept {
+                    hub.ci.keep(&leg, Some((agent, until)));
+                }
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "kept legs could not be read"),
+        }
         let sources = super::routing::sources(&hub).await;
         let rules = sources.effective();
         let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
@@ -1067,7 +1097,6 @@ impl Dispatch {
 
     /// What a runner says about a leg while it runs (W06, §2.5).
     async fn event(&mut self, agent: &str, leg: &str, json: &str) -> anyhow::Result<()> {
-        let _ = agent;
         let e: JobEventV2 = serde_json::from_str(json)?;
         match e {
             JobEventV2::StepStarted { idx, name, kind, action } => {
@@ -1113,7 +1142,10 @@ impl Dispatch {
                     l.report.secret_outputs = secret_outputs;
                 }
             }
-            JobEventV2::Kept { until } => runs::kept(&self.hub, leg, Some(until)).await?,
+            JobEventV2::Kept { until } => {
+                runs::kept(&self.hub, leg, Some(until)).await?;
+                self.hub.ci.keep(leg, Some((agent.to_owned(), until)));
+            }
             JobEventV2::FailureClass { class } => {
                 if let Some(l) = self.legs.get_mut(leg) {
                     l.class = FailureClass::parse(&class);

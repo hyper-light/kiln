@@ -440,6 +440,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
             onStepStatus={(idx, status) => onJobPatch({ ...job, steps: job.steps.map((x) => (x.idx === idx ? { ...x, status } : x)) })}
             command={spec?.steps[s.idx]?.run}
             now={now}
+            onRerun={keptLeg(ciDetail, job.id) && s.status === "failed" ? () => rerunInPlace(job.id, s.idx, i + 1) : undefined}
           />
         ))}
       </div>
@@ -469,6 +470,22 @@ function inRunOrder(steps: Step[]): Step[] {
   return [...steps].sort((a, b) => (a.started_at ?? Infinity) - (b.started_at ?? Infinity) || a.idx - b.idx);
 }
 
+/** Whether a leg is kept to look into now (W17-R02). */
+function keptLeg(detail: CiRunDetail | null | undefined, legId: string): boolean {
+  const until = detail?.legs.find((l) => l.id === legId)?.kept_until;
+  return !!until && until * 1000 > Date.now();
+}
+
+/** A kept leg's failed step, run again in place (W17-R04). */
+async function rerunInPlace(legId: string, idx: number, position: number) {
+  try {
+    const r = await ci.rerunStep(legId, idx);
+    toast({ title: `Step ${position} runs again, as step ${r.idx + 1}`, tone: "info" });
+  } catch (e) {
+    toast.error("Rerun failed", errorMessage(e));
+  }
+}
+
 function StepRow({
   position,
   jobId,
@@ -478,6 +495,7 @@ function StepRow({
   onStepStatus,
   command,
   now,
+  onRerun,
 }: {
   position: number;
   jobId: string;
@@ -487,6 +505,8 @@ function StepRow({
   onStepStatus: (idx: number, s: Status) => void;
   command?: string;
   now: number;
+  /** A kept leg's failed step can run again in place. */
+  onRerun?: () => void;
 }) {
   const dur = spanSeconds(step.started_at, step.finished_at, now);
   const notStarted = step.status === "pending" || step.status === "queued";
@@ -502,6 +522,14 @@ function StepRow({
       </button>
       {open && (
         <div>
+          {onRerun && (
+            <div className="flex items-center gap-3 px-5 pb-2">
+              <span className="font-mono text-[11px] text-[#7f8a9a]">Kept: fix what failed in the leg&rsquo;s terminal, then</span>
+              <Button size="xs" variant="ghost" onClick={onRerun}>
+                Rerun this step in place
+              </Button>
+            </div>
+          )}
           {command && (
             <pre className="mx-5 mb-2 rounded border border-[#22262d] bg-[#0d0f13] px-3 py-2 font-mono text-[11px] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#a6b2c6]">
               <span className="text-[#6d7078] select-none">$ </span>
