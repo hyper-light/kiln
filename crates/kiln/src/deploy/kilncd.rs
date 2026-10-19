@@ -206,7 +206,7 @@ mod tests {
             },
             namespace: Some("shop-web".into()),
             properties: BTreeMap::new(),
-            archived: false,
+            template: None, contacts: Default::default(), archived: false,
         }
     }
 
