@@ -3,9 +3,11 @@
 //! W15-R04) releases an app there through the deploy service, whose own gates apply too
 //! (approvals, windows, soak), and follows the release to its end.
 //!
-//! - `POST /_kiln/deploy/releases` `{ app, environment, version?, artifacts?, attempt }`: the
-//!   release, made once per attempt (a retry of the request gets the same one).
-//! - `GET /_kiln/deploy/releases/<id>`: one the leg made.
+//! - `POST /_kiln/deploy/releases` `{ app?, environment, version?, artifacts?, attempt }`: the
+//!   release, made once per attempt (a retry of the request gets the same one). Without `app`,
+//!   the one app the leg's repository is the source of and registers in the environment.
+//! - `GET /_kiln/deploy/releases/<id>`: one the leg made, with what its provider says of it
+//!   (`sync`, `health`, the operation's `phase`, and whether it `landed`: synced and healthy).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,7 +40,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
     };
     let method = req.method().clone();
     match (method, rest) {
-        (Method::POST, ["releases"]) => create(hub, &claims.sub, req).await,
+        (Method::POST, ["releases"]) => create(hub, &claims.sub, &claims.repo, req).await,
         (Method::GET, ["releases", id]) => get(&claims.sub, id).await,
         _ => Ok(msg(StatusCode::NOT_FOUND, "not found")),
     }
@@ -46,7 +48,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
 
 #[derive(Deserialize)]
 struct Ask {
-    app: String,
+    #[serde(default)]
+    app: Option<String>,
     environment: String,
     #[serde(default)]
     version: Option<String>,
@@ -56,8 +59,26 @@ struct Ask {
     attempt: u32,
 }
 
+/// The one app `repo_id`'s repository is the source of that `environment` registers; else why not.
+async fn default_app(hub: &Hub, d: &crate::deploy::Deploy, repo_id: &str, environment: &str) -> Result<Result<String, String>, Fail> {
+    let Some(repo) = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id) else { return Ok(Err("which app? name it (`app:`)".into())) };
+    let registered: Vec<String> = crate::deploy::store::registrations(&d.hub.store, None, Some(environment)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
+    let mut apps: Vec<String> = crate::deploy::store::apps(&d.hub.store)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|a| !a.archived && a.source.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&repo.name)) && registered.contains(&a.name))
+        .map(|a| a.name)
+        .collect();
+    Ok(match apps.len() {
+        1 => Ok(apps.remove(0)),
+        0 => Err(format!("which app? no app from {} is registered in {environment}: name one (`app:`)", repo.name)),
+        _ => Err(format!("which app? {} are from {} and registered in {environment}: name one (`app:`)", apps.join(", "), repo.name)),
+    })
+}
+
 /// The release, when the leg's job is bound to the environment.
-async fn create(hub: &Arc<Hub>, leg: &str, req: Request) -> Result<Response, Fail> {
+async fn create(hub: &Arc<Hub>, leg: &str, repo_id: &str, req: Request) -> Result<Response, Fail> {
     let ask: Ask = srv::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let l = leg.to_owned();
     let bound: Vec<String> = hub
@@ -77,9 +98,16 @@ async fn create(hub: &Arc<Hub>, leg: &str, req: Request) -> Result<Response, Fai
         ));
     }
     let Some(d) = crate::deploy::get() else { return Ok(msg(StatusCode::SERVICE_UNAVAILABLE, "the deploy service isn't running on this server")) };
+    let app = match ask.app.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => a.to_owned(),
+        None => match default_app(hub, &d, repo_id, &ask.environment).await? {
+            Ok(a) => a,
+            Err(why) => return Ok(msg(StatusCode::BAD_REQUEST, &why)),
+        },
+    };
     let who = crate::deploy::flow::Who { name: who(leg), agent: false };
     let flow_ask = crate::deploy::flow::Ask {
-        app: ask.app.clone(),
+        app: app.clone(),
         environment: ask.environment.clone(),
         version: ask.version.clone(),
         artifacts: ask.artifacts.clone(),
@@ -88,7 +116,7 @@ async fn create(hub: &Arc<Hub>, leg: &str, req: Request) -> Result<Response, Fai
         enabled: None,
         promote_from: None,
         keep: false,
-        idempotency_key: Some(format!("ci:{leg}:{}:{}:{}", ask.attempt, ask.app, ask.environment)),
+        idempotency_key: Some(format!("ci:{leg}:{}:{app}:{}", ask.attempt, ask.environment)),
     };
     match crate::deploy::flow::release(&d, &who, flow_ask).await {
         Ok(r) => Ok(srv::json(StatusCode::CREATED, &release_json(&r))),
@@ -97,7 +125,12 @@ async fn create(hub: &Arc<Hub>, leg: &str, req: Request) -> Result<Response, Fai
 }
 
 fn release_json(r: &crate::deploy::model::Release) -> Value {
-    json!({ "id": r.id, "app": r.app, "environment": r.environment, "state": r.state.as_str(), "version": r.version, "message": r.message })
+    let said = |k: &str| r.provider.get(k).cloned().unwrap_or(Value::Null);
+    json!({
+        "id": r.id, "app": r.app, "environment": r.environment, "state": r.state.as_str(), "version": r.version, "message": r.message,
+        "landed": r.provider.get("landed_at").is_some_and(|v| !v.is_null()), "sync": said("sync"), "health": said("health"),
+        "phase": r.provider.pointer("/operation/phase").cloned().unwrap_or(Value::Null),
+    })
 }
 
 /// One release this leg made.

@@ -39,6 +39,8 @@ pub struct EnvDef {
     pub source: String,
     /// Agents may approve its deployments.
     pub agents_approve: bool,
+    /// At most this many of its deployments at once (W15-R01); the rest wait their turn.
+    pub concurrency: Option<u32>,
 }
 
 /// One environment's CI keys in `.kiln/environments.yaml`; the rest are CD's.
@@ -49,6 +51,7 @@ struct FileEnv {
     protection: Protection,
     url: Option<String>,
     agents: FileAgents,
+    concurrency: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -86,7 +89,7 @@ async fn from_file(hub: &Hub, repo: &Repo) -> BTreeMap<String, EnvDef> {
                         tracing::warn!(repo = %repo.name, file = name, environment = env, error = e, "an environment's protection can't be used; it has none");
                     }
                     let protection = if f.protection.check().is_ok() { f.protection } else { Protection::default() };
-                    out.insert(env.to_ascii_lowercase(), EnvDef { name: env, protection, url: f.url, source: "file".into(), agents_approve: f.agents.approve });
+                    out.insert(env.to_ascii_lowercase(), EnvDef { name: env, protection, url: f.url, source: "file".into(), agents_approve: f.agents.approve, concurrency: f.concurrency.filter(|n| *n > 0) });
                 }
             }
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's environments can't be read"),
@@ -100,17 +103,18 @@ async fn from_file(hub: &Hub, repo: &Repo) -> BTreeMap<String, EnvDef> {
 pub async fn defs(hub: &Hub, repo: &Repo) -> anyhow::Result<BTreeMap<String, EnvDef>> {
     let mut out = from_file(hub, repo).await;
     let id = repo.id.clone();
-    let rows: Vec<(String, String, Option<String>, String)> = hub
+    let rows: Vec<(String, String, Option<String>, String, Option<i64>)> = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT name, protection, url, source FROM ci_environments WHERE repo_id = ?1 ORDER BY name")?;
-            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let mut st = c.prepare("SELECT name, protection, url, source, concurrency FROM ci_environments WHERE repo_id = ?1 ORDER BY name")?;
+            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
-    for (name, protection, url, source) in rows {
+    for (name, protection, url, source, concurrency) in rows {
         let protection: Protection = serde_json::from_str(&protection).unwrap_or_default();
-        out.entry(name.to_ascii_lowercase()).or_insert(EnvDef { name, protection, url, source, agents_approve: false });
+        let concurrency = concurrency.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+        out.entry(name.to_ascii_lowercase()).or_insert(EnvDef { name, protection, url, source, agents_approve: false, concurrency });
     }
     Ok(out)
 }
@@ -130,7 +134,7 @@ pub async fn ensure(hub: &Hub, repo: &Repo, name: &str) -> anyhow::Result<EnvDef
             Ok(())
         })
         .await?;
-    Ok(EnvDef { name: name.to_owned(), protection: Protection::default(), url: None, source: "run".into(), agents_approve: false })
+    Ok(EnvDef { name: name.to_owned(), protection: Protection::default(), url: None, source: "run".into(), agents_approve: false, concurrency: None })
 }
 
 /// The reviews of a run's deployments to `env`.
@@ -193,7 +197,7 @@ async fn repo_of(hub: &Hub, q: &HashMap<String, String>) -> Result<Repo, Fail> {
 }
 
 fn env_json(d: &EnvDef, latest: Option<Value>) -> Value {
-    json!({ "name": d.name, "source": d.source, "protection": d.protection, "url": d.url, "agents_can_approve": d.agents_approve, "latest_deployment": latest })
+    json!({ "name": d.name, "source": d.source, "protection": d.protection, "url": d.url, "agents_can_approve": d.agents_approve, "concurrency": d.concurrency, "latest_deployment": latest })
 }
 
 /// The latest deployment of each environment of a repository, by lower-cased name.
@@ -227,6 +231,9 @@ struct EnvBody {
     protection: Option<Protection>,
     #[serde(default)]
     url: Option<String>,
+    /// At most this many deployments at once.
+    #[serde(default)]
+    concurrency: Option<u32>,
 }
 
 /// `/api/ci/environments[/:name[/deployments]]?repo=`.
@@ -263,20 +270,23 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
             }
             let protection = b.protection.unwrap_or_default();
             protection.check().map_err(bad)?;
-            let (id, n, p, u, who) = (repo.id.clone(), name.clone(), serde_json::to_string(&protection).unwrap_or_default(), b.url.clone(), by.clone());
+            if b.concurrency == Some(0) {
+                return Err(bad("a concurrency limit is 1 or more (leave it out for none)"));
+            }
+            let (id, n, p, u, who, limit) = (repo.id.clone(), name.clone(), serde_json::to_string(&protection).unwrap_or_default(), b.url.clone(), by.clone(), b.concurrency);
             hub.store
                 .call(move |c| {
                     c.execute(
-                        "INSERT INTO ci_environments (repo_id, name, protection, url, source, created_at, created_by) VALUES (?1, ?2, ?3, ?4, 'kiln', ?5, ?6)
-                         ON CONFLICT(repo_id, name) DO UPDATE SET protection = ?3, url = ?4, source = 'kiln'",
-                        params![id, n, p, u, crate::util::now_unix(), who],
+                        "INSERT INTO ci_environments (repo_id, name, protection, url, source, created_at, created_by, concurrency) VALUES (?1, ?2, ?3, ?4, 'kiln', ?5, ?6, ?7)
+                         ON CONFLICT(repo_id, name) DO UPDATE SET protection = ?3, url = ?4, source = 'kiln', concurrency = ?7",
+                        params![id, n, p, u, crate::util::now_unix(), who, limit],
                     )?;
                     Ok(())
                 })
                 .await
                 .map_err(internal)?;
             hub.store.audit(by, "ci.environments.save".into(), format!("{} {name}", repo.name)).await;
-            let d = EnvDef { name, protection, url: b.url, source: "kiln".into(), agents_approve: false };
+            let d = EnvDef { name, protection, url: b.url, source: "kiln".into(), agents_approve: false, concurrency: b.concurrency };
             Ok(srv::json(if *method == Method::POST { StatusCode::CREATED } else { StatusCode::OK }, &env_json(&d, None)))
         }
         (&Method::DELETE, [name]) => {
@@ -328,18 +338,47 @@ struct ApproveBody {
     comment: String,
 }
 
-/// Whether `caller` may review deployments to `env` of a run by `actor`.
-fn may_review(caller: &Caller, env: &EnvDef, actor: &str) -> Result<(), String> {
+/// The person a caller acts for: `alice` of `user:alice`, of `agent:x for user:alice`.
+fn person_of(caller: &Caller) -> &str {
+    let user = caller.name.split(" for ").last().unwrap_or(&caller.name).split(" of ").last().unwrap_or(&caller.name);
+    user.strip_prefix("user:").unwrap_or(user)
+}
+
+/// The teams and groups a kiln user belongs to on the hosts they sign in with, as of their last
+/// sign-in (W23-R08: GitHub's `org/team`s, GitLab's groups' paths, Bitbucket's workspaces).
+async fn memberships(hub: &Hub, user: &str) -> Vec<String> {
+    let user = user.to_owned();
+    hub.store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT i.groups FROM user_identities i JOIN users u ON u.id = i.user_id WHERE u.name = ?1 COLLATE NOCASE AND u.disabled_at IS NULL")?;
+            let rows = q.query_map([&user], |r| r.get::<_, Option<String>>(0))?;
+            let mut all = Vec::new();
+            for g in rows {
+                all.extend(g?.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default());
+            }
+            Ok(all)
+        })
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether `caller` may review deployments to `env` of a run by `actor` in a repository of
+/// `owner`'s. A listed reviewer is a person (`alice`) or a team (`team:acme/web`, or `team:web`
+/// for the owner's), which `teams`, the caller's memberships, must hold.
+fn may_review(caller: &Caller, env: &EnvDef, actor: &str, owner: &str, teams: &[String]) -> Result<(), String> {
     if caller.is_owner() {
         return Ok(());
     }
-    let user = caller.name.split(" for ").last().unwrap_or(&caller.name).split(" of ").last().unwrap_or(&caller.name);
-    let user = user.strip_prefix("user:").unwrap_or(user);
+    let user = person_of(caller);
     if caller.kind == crate::authz::gate::Kind::Agent && !env.agents_approve {
         return Err(format!("agents don't approve deployments to {} (its `agents: {{ approve: true }}` allows it)", env.name));
     }
-    if !env.protection.reviewers.is_empty() && !env.protection.reviewers.iter().any(|r| r.strip_prefix("user:").unwrap_or(r).eq_ignore_ascii_case(user)) {
-        return Err(format!("{user} is not a required reviewer of {}", env.name));
+    let listed = |r: &String| match r.strip_prefix("team:") {
+        Some(t) => teams.iter().any(|m| m.eq_ignore_ascii_case(t) || m.eq_ignore_ascii_case(&format!("{owner}/{t}"))),
+        None => r.strip_prefix("user:").unwrap_or(r).eq_ignore_ascii_case(user),
+    };
+    if !env.protection.reviewers.is_empty() && !env.protection.reviewers.iter().any(listed) {
+        return Err(format!("{user} is not a required reviewer of {} (nor in a team that is)", env.name));
     }
     if env.protection.prevent_self_review && user.eq_ignore_ascii_case(actor) {
         return Err(format!("{} prevents self-review: {user} started this run", env.name));
@@ -401,12 +440,14 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
     let all = defs(hub, &repo).await.map_err(internal)?;
     let owner = Caller::owner();
     let who = caller.unwrap_or(&owner);
+    let teams = if who.is_owner() { Vec::new() } else { memberships(hub, person_of(who)).await };
+    let repo_owner = repo.name.split_once('/').map_or(repo.name.as_str(), |(o, _)| o);
     for e in &named {
         let d = all.get(&e.to_ascii_lowercase()).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment `{e}`")))?;
         if !who.is_owner() && !who.can("runs.approve", &Scope::Environment { repo: repo.name.clone(), environment: d.name.clone() }) {
             return Err((StatusCode::FORBIDDEN, format!("{} may not review deployments to {}: that needs runs.approve there", who.name, d.name)));
         }
-        may_review(who, d, &actor).map_err(|m| (StatusCode::FORBIDDEN, m))?;
+        may_review(who, d, &actor, repo_owner, &teams).map_err(|m| (StatusCode::FORBIDDEN, m))?;
     }
     let (rid, by, comment, envs) = (run.to_owned(), who.name.clone(), b.comment.clone(), named.clone());
     hub.store
@@ -462,6 +503,7 @@ mod tests {
             url: None,
             source: "file".into(),
             agents_approve: agents,
+            concurrency: None,
         }
     }
 
@@ -469,24 +511,33 @@ mod tests {
     fn w15_r03_who_may_review() {
         let none = || Some(crate::authz::Rights::default());
         let alice = Caller::with(crate::authz::gate::Kind::User, "user:alice", none(), None);
-        assert!(may_review(&alice, &env(&["alice"], false, false), "bob").is_ok());
-        assert!(may_review(&alice, &env(&["user:ALICE"], false, false), "bob").is_ok());
-        assert!(may_review(&alice, &env(&["carol"], false, false), "bob").is_err(), "not a listed reviewer");
-        assert!(may_review(&alice, &env(&["alice"], true, false), "alice").is_err(), "self-review prevented");
-        assert!(may_review(&alice, &env(&[], false, false), "alice").is_ok(), "no reviewers listed: anyone with runs.approve");
+        let may = |c: &Caller, e: &EnvDef, actor: &str| may_review(c, e, actor, "acme", &[]);
+        assert!(may(&alice, &env(&["alice"], false, false), "bob").is_ok());
+        assert!(may(&alice, &env(&["user:ALICE"], false, false), "bob").is_ok());
+        assert!(may(&alice, &env(&["carol"], false, false), "bob").is_err(), "not a listed reviewer");
+        assert!(may(&alice, &env(&["alice"], true, false), "alice").is_err(), "self-review prevented");
+        assert!(may(&alice, &env(&[], false, false), "alice").is_ok(), "no reviewers listed: anyone with runs.approve");
         let agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:fixer for user:alice", none(), none());
-        assert!(may_review(&agent, &env(&["alice"], false, false), "bob").is_err(), "agents only where allowed");
-        assert!(may_review(&agent, &env(&["alice"], false, true), "bob").is_ok());
-        assert!(may_review(&Caller::owner(), &env(&["carol"], true, false), "admin").is_ok(), "the owner always may");
+        assert!(may(&agent, &env(&["alice"], false, false), "bob").is_err(), "agents only where allowed");
+        assert!(may(&agent, &env(&["alice"], false, true), "bob").is_ok());
+        assert!(may(&Caller::owner(), &env(&["carol"], true, false), "admin").is_ok(), "the owner always may");
+        // Teams: the host's `org/team`, or a team of the repository's owner.
+        let web = vec!["acme".to_owned(), "acme/web".to_owned()];
+        assert!(may_review(&alice, &env(&["team:acme/web"], false, false), "bob", "acme", &web).is_ok());
+        assert!(may_review(&alice, &env(&["team:web"], false, false), "bob", "acme", &web).is_ok(), "the owner's team");
+        assert!(may_review(&alice, &env(&["team:web"], false, false), "bob", "other", &web).is_err(), "another owner's team");
+        assert!(may_review(&alice, &env(&["team:acme/ops"], false, false), "bob", "acme", &web).is_err(), "not in it");
+        assert!(may_review(&alice, &env(&["team:acme/web"], true, false), "alice", "acme", &web).is_err(), "a team doesn't lift self-review");
     }
 
     #[test]
     fn w15_r01_the_file_s_ci_keys() -> Result<(), String> {
-        let m: BTreeMap<String, FileEnv> = serde_yaml::from_str("production:\n  branches: [main]\n  clusters: [in-cluster]\n  reviewers: [alice]\n  wait-timer: 5\n  url: https://example.com\n  agents: { approve: true, deploy: false }\nstaging: {}\n").map_err(|e| e.to_string())?;
+        let m: BTreeMap<String, FileEnv> = serde_yaml::from_str("production:\n  branches: [main]\n  clusters: [in-cluster]\n  reviewers: [alice]\n  wait-timer: 5\n  url: https://example.com\n  agents: { approve: true, deploy: false }\n  concurrency: 1\nstaging: {}\n").map_err(|e| e.to_string())?;
         let p = m.get("production").ok_or("production")?;
         assert_eq!(p.protection.branches, Some(vec!["main".to_owned()]));
         assert_eq!((p.protection.reviewers.clone(), p.protection.wait_timer, p.url.clone(), p.agents.approve), (vec!["alice".to_owned()], 5, Some("https://example.com".to_owned()), true));
-        assert!(m.get("staging").is_some_and(|s| s.protection.is_empty()));
+        assert!(m.get("staging").is_some_and(|s| s.protection.is_empty() && s.concurrency.is_none()));
+        assert_eq!(p.concurrency, Some(1));
         Ok(())
     }
 }

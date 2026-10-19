@@ -741,6 +741,7 @@ impl Fe<'_> {
                 "quarantine" => kiln.quarantine_enforce = v.text().as_deref() == Some("enforce"),
                 "bench-gate" => kiln.bench_gate = Some(self.yval(v)),
                 "deploy" => kiln.deploy = Some(self.yval(v)),
+                "test-results" => kiln.test_results = Some(self.yval(v)),
                 "agents" => kiln.agents = Some(self.yval(v)),
                 "artifacts" => kiln.artifacts = self.str_list(v, &at),
                 "checkout" => kiln.checkout = self.bool(v, &at),
@@ -759,6 +760,17 @@ impl Fe<'_> {
             }
         }
         j.kiln = kiln;
+        // `deploy: { environment }` (kiln) binds the job to it, as `environment:` does (W15-R05).
+        if let Some(env) = j.kiln.deploy.as_ref().and_then(|d| d.get("environment")).and_then(YVal::as_str).map(str::to_owned) {
+            match &j.environment {
+                None => j.environment = Some(Environment { name: Tpl::new(env, Default::default()), url: None, deployment: None }),
+                Some(e) if !e.name.src.eq_ignore_ascii_case(&env) => {
+                    let range = entries.iter().find(|(k, _, _)| k == "deploy").map_or(n.range, |(_, v, _)| v.range);
+                    self.err("KCI1021", format!("`deploy.environment` is `{env}` but the job's `environment` is `{}`: a job deploys to its own environment", e.name.src), range, &format!("{path}.deploy.environment"));
+                }
+                Some(_) => {}
+            }
+        }
         if !self.overlay {
             self.job_shape(&j, n, &entries, &path);
         }
@@ -768,7 +780,8 @@ impl Fe<'_> {
     /// What every job must have, and what jobs calling a reusable workflow must not.
     fn job_shape(&mut self, j: &Job, n: &Node, entries: &[(String, &Node, Range)], path: &str) {
         if j.uses.is_some() {
-            const CALL_KEYS: &[&str] = &["name", "uses", "with", "secrets", "strategy", "needs", "if", "permissions", "concurrency"];
+            // `cache-mode` caps the called workflow's (W08-R14).
+            const CALL_KEYS: &[&str] = &["name", "uses", "with", "secrets", "strategy", "needs", "if", "permissions", "concurrency", "cache-mode"];
             for (k, _, kr) in entries {
                 if !CALL_KEYS.contains(&k.as_str()) && !(self.kiln() && keys::find(keys::JOB, k).is_some_and(|x| x.kiln)) {
                     self.err("KCI1016", format!("a job that calls a reusable workflow can't have `{k}`"), *kr, &format!("{path}.{k}"));
@@ -780,7 +793,10 @@ impl Fe<'_> {
             self.err("KCI1014", "a job needs `runs-on` (or `uses` to call a reusable workflow)", n.range, &format!("{path}.runs-on"));
         }
         if !entries.iter().any(|(k, _, _)| k == "steps") {
-            self.err("KCI1014", "a job needs `steps` (or `uses` to call a reusable workflow)", n.range, &format!("{path}.steps"));
+            // A kiln job that only deploys (`deploy:`) needs no steps of its own.
+            if j.kiln.deploy.is_none() {
+                self.err("KCI1014", "a job needs `steps` (or `uses` to call a reusable workflow)", n.range, &format!("{path}.steps"));
+            }
         } else if j.steps.is_empty() {
             self.err("KCI1014", "a job needs at least one step", n.range, &format!("{path}.steps"));
         }

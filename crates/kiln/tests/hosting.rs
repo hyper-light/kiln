@@ -1825,7 +1825,7 @@ fn w08_r09_kiln_cache_moves_only_new_chunks() -> anyhow::Result<()> {
         let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
         Ok((body.contains("\"last_polled_at\":null")).then_some(body))
     })?;
-    // 8 MiB of the same noise each run (a few chunks), and on the second run a line more.
+    // 24 MiB of the same noise each run (about a dozen chunks), and on the second run a line more.
     std::fs::create_dir_all(work.join(".kiln"))?;
     std::fs::write(
         work.join(".kiln/cache.yaml"),
@@ -1845,7 +1845,7 @@ jobs:
       - run: |
           mkdir -p big
           if [ ! -f big/noise.bin ]; then
-            python3 -c "import random; r = random.Random(7); open('big/noise.bin','wb').write(bytes(r.getrandbits(8) for _ in range(8 << 20)))"
+            python3 -c "import random; open('big/noise.bin','wb').write(random.Random(7).randbytes(24 << 20))"
           fi
           echo "run ${{ github.run_number }} hit=${{ steps.c.outputs.cache-hit }} matched=${{ steps.c.outputs.cache-matched-key }}" >> big/runs.txt
 "#,
@@ -1901,32 +1901,290 @@ jobs:
     assert_eq!(text(&two, "conclusion"), "success", "{said}\n{}", s.log());
     assert!(said.contains("Cache restored from key: big-") && said.contains("(0 bytes downloaded,"), "restored from the runner's own chunks: {said}");
     let (up2, size2) = sent(&said).ok_or_else(|| anyhow::anyhow!("no save in: {said}"))?;
-    // (The archive's size may not change: tar pads the longer runs.txt to the same block.)
-    assert!(size2 >= size1 && up2 * 4 < size2, "only what changed went: {up2} of {size2} bytes\n{said}");
+    // (The archive's size may not change: tar pads the longer runs.txt to the same block. A
+    // chunk is 2 MiB on average and at most 8: what changed is one or two of them.)
+    assert!(size2 >= size1 && up2 * 2 < size2, "only what changed went: {up2} of {size2} bytes\n{said}");
+    Ok(())
+}
+
+/// W08-R09's `scope: global`: a default branch's run saves an entry every repository of its owner
+/// restores; another owner's repository doesn't see it, and a branch's run can't save there.
+#[test]
+fn w08_r09_kiln_cache_global_scope() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let workflow = "on: push\njobs:\n  c:\n    runs-on: local\n    checkout: false\n    steps:\n      - id: c\n        uses: kiln/cache@v1\n        with:\n          key: shared-${{ github.ref_name }}\n          path: shared\n          scope: global\n      - run: |\n          echo \"restored: $(cat shared/who.txt 2>/dev/null || echo nothing)\"\n          mkdir -p shared && echo \"${{ github.repository }}\" > shared/who.txt\n";
+    // The workflow pushed to `branch` of `name` (made with it on main); what its run said.
+    let run = |name: &str, branch: &str| -> anyhow::Result<String> {
+        let work = dir.path().join(name.replace('/', "_"));
+        let url = format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port);
+        if branch == "main" {
+            let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
+            anyhow::ensure!(st == 200, "{st} {body}");
+            std::fs::create_dir_all(&work)?;
+            must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+            std::fs::write(work.join("README.md"), "shared\n")?;
+            must(git(&home, &work, &["add", "."]), "add")?;
+            must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+            must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+            until(60, "the first poll", || {
+                let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+                Ok(body.contains("\"last_polled_at\":null").then_some(body))
+            })?;
+            std::fs::create_dir_all(work.join(".kiln"))?;
+            std::fs::write(work.join(".kiln/shared.yaml"), workflow)?;
+        } else {
+            must(git(&home, &work, &["checkout", "-q", "-b", branch]), "branch")?;
+            std::fs::write(work.join("README.md"), format!("shared, on {branch}\n"))?;
+        }
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", "shared"]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &url, branch]), "push")?;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let done = loop {
+            let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo={name}&limit=10"), &s.admin, None)?;
+            let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(r) = list.into_iter().find(|r| text(r, "branch").trim_start_matches("refs/heads/") == branch && r.get("finished_at").is_some_and(|f| !f.is_null())) {
+                break r;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{name}@{branch} didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(&done, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (_, leg_detail) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+        let mut said: Vec<String> = serde_json::from_str::<Value>(&leg_detail)?.get("annotations").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            said.push(t);
+        }
+        Ok(format!("{}: {}", text(&done, "conclusion"), said.join("\n")))
+    };
+    let one = run("acme/one", "main")?;
+    assert!(one.starts_with("success") && one.contains("Cache not found for input keys: shared-main") && one.contains("Cache saved with key: shared-main"), "{one}\n{}", s.log());
+    let two = run("acme/two", "main")?;
+    assert!(two.contains("Cache restored from key: shared-main") && two.contains("restored: acme/one") && !two.contains("Cache saved"), "the owner's other repository restores it: {two}");
+    let three = run("other/three", "main")?;
+    assert!(three.contains("Cache not found for input keys: shared-main") && three.contains("restored: nothing"), "another owner's doesn't see it: {three}");
+    let branch = run("acme/one", "feature")?;
+    assert!(branch.contains("only main's runs save to the `global` scope"), "a branch can't save there: {branch}");
+    Ok(())
+}
+
+/// W16-R01's opt-in discovery: a job's `test-results: discover` takes the report its step wrote
+/// where nextest writes it, though the step failed, and leaves out the report the checkout brought
+/// (git tracks it).
+#[test]
+fn w16_r01_discovered_test_reports() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/tested", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "tested\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/tested.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    // A report the repository keeps (a fixture), and a job whose tests fail.
+    std::fs::create_dir_all(work.join("fixtures"))?;
+    std::fs::write(work.join("fixtures/junit.xml"), r#"<?xml version="1.0"?><testsuite name="fixture" tests="1"><testcase classname="fixture" name="from_the_fixture"/></testsuite>"#)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/tests.yaml"),
+        r#"on: push
+jobs:
+  t:
+    runs-on: local
+    test-results: discover
+    steps:
+      - run: |
+          mkdir -p target/nextest/ci
+          printf '%s' '<?xml version="1.0"?><testsuites><testsuite name="calc" tests="2" failures="1"><testcase classname="calc" name="adds"/><testcase classname="calc" name="divides"><failure message="boom">boom</failure></testcase></testsuite></testsuites>' > target/nextest/ci/junit.xml
+          exit 1
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "tests"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let run = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/tested&limit=5", &s.admin, None)?;
+        let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = list.into_iter().find(|r| text(r, "workflow").ends_with("tests.yaml") && r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            break r;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(text(&run, "conclusion"), "failure", "the tests failed: {run}");
+    let (_, tests) = http(s.port, "GET", &format!("/api/ci/runs/{}/tests", text(&run, "id")), &s.admin, None)?;
+    let tests: Value = serde_json::from_str(&tests)?;
+    let mut seen: Vec<(String, String)> = tests.get("tests").and_then(Value::as_array).into_iter().flatten().map(|t| (text(t, "name").to_owned(), text(t, "outcome").to_owned())).collect();
+    seen.sort();
+    assert_eq!(seen, vec![("adds".to_owned(), "passed".to_owned()), ("divides".to_owned(), "failed".to_owned())], "the job's report, not the fixture: {tests}\n{}", s.log());
+    Ok(())
+}
+
+/// W15-R01's concurrency limit: with `concurrency: 1`, two jobs deploying to the environment run
+/// one after the other, though the runner could take both at once (two slots).
+#[test]
+fn w15_r01_an_environments_deployments_one_at_a_time() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/envs", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "envs\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/envs.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/environments.yaml"), "staging:\n  concurrency: 1\n")?;
+    let job = |name: &str| format!("  {name}:\n    runs-on: local\n    checkout: false\n    environment: staging\n    steps:\n      - run: sleep 3\n");
+    std::fs::write(work.join(".kiln/deploys.yaml"), format!("on: push\njobs:\n{}{}", job("a"), job("b")))?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "deploys"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let legs = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/envs&limit=5", &s.admin, None)?;
+        let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = list.into_iter().find(|r| text(r, "workflow").ends_with("deploys.yaml") && r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            anyhow::ensure!(text(&r, "conclusion") == "success", "{r}\n{}", s.log());
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(&r, "id")), &s.admin, None)?;
+            break serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let mut spans: Vec<(i64, i64)> = legs.iter().map(|l| (l.get("started_at").and_then(Value::as_i64).unwrap_or(0), l.get("finished_at").and_then(Value::as_i64).unwrap_or(0))).collect();
+    spans.sort_unstable();
+    assert_eq!(spans.len(), 2, "{legs:?}");
+    let (first, second) = (spans.first().copied().unwrap_or_default(), spans.get(1).copied().unwrap_or_default());
+    assert!(second.0 >= first.1, "one at a time: {spans:?}");
+    Ok(())
+}
+
+/// W09-AC07: an environment's secret reaches a leg only after its deployment is approved. While
+/// the leg waits for its reviewer nothing is sent (the secret is never used); once approved, the
+/// leg gets it and its use is recorded.
+#[test]
+fn w09_ac07_environment_secrets_after_approval() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/guarded", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let scope = "/api/ci/secrets?scope=env:acme/guarded:production";
+    let (st, body) = http(s.port, "PUT", "/api/ci/secrets/E_TOKEN?scope=env:acme/guarded:production", &s.admin, Some(&json!({ "value": "only-after-approval" })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "guarded\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/guarded.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/environments.yaml"), "production:\n  reviewers: [alice]\n")?;
+    std::fs::write(
+        work.join(".kiln/ship.yaml"),
+        "on: push\njobs:\n  ship:\n    runs-on: local\n    checkout: false\n    environment: production\n    steps:\n      - env:\n          T: ${{ secrets.E_TOKEN }}\n        run: echo \"has it, ${#T} characters\"\n",
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "ship"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    // The leg waits for its reviewer: the secret goes nowhere.
+    until(120, "the leg waiting for approval", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/guarded&limit=5", &s.admin, None)?;
+        let Some(r) = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).and_then(|l| l.iter().find(|r| text(r, "workflow").ends_with("ship.yaml")).cloned()) else { return Ok(Some(body)) };
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(&r, "id")), &s.admin, None)?;
+        let waiting = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/wait_reason/reason").and_then(Value::as_str) == Some("approval");
+        Ok((!waiting).then_some(detail))
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    let (_, listed) = http(s.port, "GET", scope, &s.admin, None)?;
+    let used = |listed: &str| -> anyhow::Result<bool> { Ok(serde_json::from_str::<Value>(listed)?.pointer("/secrets/0/last_used_at").is_some_and(|v| !v.is_null())) };
+    assert!(!used(&listed)?, "nothing sent before approval: {listed}");
+    let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/guarded&limit=5", &s.admin, None)?;
+    let id = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).and_then(|l| l.iter().find(|r| text(r, "workflow").ends_with("ship.yaml")).map(|r| text(r, "id").to_owned())).unwrap_or_default();
+    let (st, out) = http(s.port, "POST", &format!("/api/ci/runs/{id}/approve"), &s.admin, Some(&json!({})))?;
+    anyhow::ensure!(st == 200, "approve: {st} {out}");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let finished = loop {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+        let d: Value = serde_json::from_str(&detail)?;
+        if d.pointer("/run/finished_at").is_some_and(|f| !f.is_null()) {
+            break d;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {detail}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(finished.pointer("/run/conclusion").and_then(Value::as_str), Some("success"), "{finished}\n{}", s.log());
+    let leg = finished.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..3 {
+        let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&t);
+    }
+    assert!(log.contains("has it, 19 characters"), "approved, it got the secret: {log}");
+    let (_, listed) = http(s.port, "GET", scope, &s.admin, None)?;
+    assert!(used(&listed)?, "its use recorded: {listed}");
     Ok(())
 }
 
 /// W15-R05's `kiln/deploy@v1`: a job bound to an environment releases an app there through the
-/// deploy service and follows the release; one that isn't bound is refused, saying why. (No CD
-/// provider runs here, so the release ends where the service leaves it, or the step's time runs
-/// out: what's checked is that CI asks as the job, and follows.)
+/// deploy service and follows the release; one that isn't bound is refused, saying why; and the
+/// `deploy:` shorthand binds its job and releases the one app the repository is the source of.
+/// (No CD provider runs here, so a release ends where the service leaves it, or the step's time
+/// runs out: what's checked is that CI asks as the job, and follows.)
 #[test]
 fn w15_r05_kiln_deploy_releases_from_the_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "[cd]\nenabled = true\n" })?;
     let home = dir.path().join("githome");
     std::fs::create_dir_all(&home)?;
+    // The repository first: an app names it as its source.
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/ship", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
     for (path, body) in [
         ("/api/deploy/environments", json!({ "name": "staging" })),
         ("/api/deploy/apps", json!({ "name": "web", "package": { "kind": "helm", "repo": "oci://registry.invalid/charts", "chart": "web" } })),
+        ("/api/deploy/apps", json!({ "name": "api", "source": "acme/ship", "package": { "kind": "helm", "repo": "oci://registry.invalid/charts", "chart": "api" } })),
     ] {
         let (st, out) = http(s.port, "POST", path, &s.admin, Some(&body))?;
         anyhow::ensure!((200..300).contains(&st), "{path}: {st} {out}");
     }
-    let (st, out) = http(s.port, "POST", "/api/deploy/apps/web/environments/staging", &s.admin, Some(&json!({})))?;
-    anyhow::ensure!((200..300).contains(&st), "register: {st} {out}");
-    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/ship", "mode": "native" })))?;
-    anyhow::ensure!(st == 200, "{st} {body}");
+    for app in ["web", "api"] {
+        let (st, out) = http(s.port, "POST", &format!("/api/deploy/apps/{app}/environments/staging"), &s.admin, Some(&json!({})))?;
+        anyhow::ensure!((200..300).contains(&st), "register {app}: {st} {out}");
+    }
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
@@ -1967,6 +2225,10 @@ jobs:
           app: web
           environment: staging
           revision: 1.2.3
+  short:
+    runs-on: local
+    checkout: false
+    deploy: { environment: staging, revision: 1.2.3, timeout: 8s }
 "#,
     )?;
     must(git(&home, &work, &["add", "."]), "add")?;
@@ -2001,6 +2263,70 @@ jobs:
     assert!(ship.contains("of web to staging:"), "the release was followed: {ship}\n{}", s.log());
     let (_, releases) = http(s.port, "GET", "/api/deploy/releases?app=web", &s.admin, None)?;
     assert!(releases.contains(&format!("job:{ship_id}")) && !releases.contains(&format!("job:{stray_id}")), "asked as the bound job alone: {releases}");
+    // The shorthand: no steps of its own, bound to staging, and the repository's own app.
+    let (short_id, short) = said("short")?;
+    assert!(short.contains("of api to staging:"), "{short}\n{}", s.log());
+    let (_, releases) = http(s.port, "GET", "/api/deploy/releases?app=api", &s.admin, None)?;
+    assert!(releases.contains(&format!("job:{short_id}")), "{releases}");
+    Ok(())
+}
+
+/// W03-AC07: a diff's first and second versions are `pull_request` `opened` and `synchronize`,
+/// with the diff's number, its head and its base, and a GitHub workflow `on: pull_request` runs
+/// on both.
+#[test]
+fn w03_ac07_a_diffs_versions_are_pull_request_events() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/prs.git", s.admin, s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/prs", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    must(git(&home, dir.path(), &["clone", "-q", &url, "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(
+        work.join(".github/workflows/pr.yml"),
+        "on: pull_request\njobs:\n  show:\n    runs-on: local\n    steps:\n      - run: |\n          echo \"saw ${{ github.event.action }} of ${{ github.event.number }}: ${{ github.event.pull_request.head.sha }} onto ${{ github.event.pull_request.base.ref }}\"\n",
+    )?;
+    std::fs::write(work.join("README.md"), "prs\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    let v1 = commit(&home, &work, "a.txt", "one\n", "one: a", "I4444444444444444444444444444444444444444")?;
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "v1")?;
+    assert!(out.contains("D1 v1 (new)"), "{out}");
+    std::fs::write(work.join("a.txt"), "one, again\n")?;
+    must(git(&home, &work, &["commit", "-q", "--amend", "--no-edit", "-a"]), "amend")?;
+    let v2 = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "v2")?;
+    assert!(out.contains("D1 v2 (updated)"), "{out}");
+    // Both versions' runs, and what each saw.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let saw = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/prs&event=pull_request&limit=10", &s.admin, None)?;
+        let done: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+        if done.len() >= 2 {
+            let mut logs = Vec::new();
+            for r in &done {
+                anyhow::ensure!(text(r, "conclusion") == "success", "{r}\n{}", s.log());
+                let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
+                let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let mut all = String::new();
+                for step in 0..4 {
+                    let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+                    all.push_str(&t);
+                }
+                logs.push(all);
+            }
+            break logs;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "two pull_request runs didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(saw.iter().any(|l| l.contains(&format!("saw opened of 1: {v1} onto main"))), "v1 opened it: {saw:?}");
+    assert!(saw.iter().any(|l| l.contains(&format!("saw synchronize of 1: {v2} onto main"))), "v2 synchronized it: {saw:?}");
     Ok(())
 }
 

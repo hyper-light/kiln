@@ -1231,9 +1231,13 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
   push that GitHub's webhook delivers and the poller also sees, a second later, runs once. A
   redelivery (the same `X-GitHub-Delivery`) does nothing, and a new delivery of the same push
   does nothing either.
+- *Done.* AC08 is W18-AC03's end-to-end check: a fork pull request ran untrusted, with no
+  secrets, no ID token, and a token whose writes through the facade got 403.
+- *Done.* AC09 is measured by `kiln ci bench` (W22-AC08): a run created 1.8 ms after its push at
+  the p99 (git stubbed), against 500 ms.
 - *Left.*
   - The App's events (with W14-R10).
-  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC07 to AC09.
+  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC07.
 
 ### W04 Planner: graph, matrices, reusable workflows, outputs
 
@@ -2300,8 +2304,7 @@ Gives step execution for `uses:`.
 - *Left.*
   - The pins on the run page and its "rerun with fresh actions" (the API and CLI have it), and
     storing tarballs in W08's store (today they are files under `<data>/actions/tar`).
-  - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache` (with W08's
-    tiers) and `kiln/deploy` (with W15).
+  - R09 beyond checkout (with W14's REST facade).
   - musl Node for Alpine job containers, with W13.
   - AC01 (with W22-AC02).
 
@@ -2530,25 +2533,42 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     - `chunks/<sha>` stores a chunk, checked against its digest;
     - `entries` commits an entry once every chunk is there and the sizes and the whole
       digest match.
-  - Lookups and saves follow the leg's scopes and cache mode (R06, R14). `scope: repo` adds a
-    scope every ref of the repository reads.
+  - Lookups and saves follow the leg's scopes and cache mode (R06, R14). Two scopes are kiln's
+    own:
+    - `scope: repo` adds a scope that every ref of the repository reads;
+    - `scope: global` adds the owner's: every repository of the owner (`acme/…`) reads it, and
+      only a run on its repository's default branch writes it. A save anywhere else is refused
+      before any chunk is sent.
   - The runner archives the paths (a tar whose entries name their path), chunks them
     content-defined (`kiln_ci::store::cdc`), and sends only what's missing. A restore unpacks
     into a staging directory before anything is replaced. The step sets `actions/cache`'s
     outputs, and its save runs after the job, unless an exact key hit, under `policy: pull |
     push | pull-push`.
-  - `local: true` keeps chunks in `<work>/_cache`, least recently used first out past
-    `KILN_CACHE_MAX` (10G by default), so a restore downloads only what the runner lacks.
+  - `local: true` keeps chunks in `<work>/_cache`, least recently used first out past the
+    runner's `[agent] cache_max` (10G by default), so a restore downloads only what the runner
+    lacks.
   - A job's `cache: [{ key, restore-keys, paths, scope, policy, local }]` is a `kiln/cache@v1`
     step before its own (`kiln_ci::store::cache::job_steps`).
-  - Checked end to end (`w08_r09_kiln_cache_moves_only_new_chunks`). The first run saved 8 MiB,
-    sending all of it. The second restored by a restore key with 0 bytes downloaded, changed a
-    file, and sent 0.5 MiB of the entry's 4 chunks.
+  - Checked end to end:
+    - `w08_r09_kiln_cache_moves_only_new_chunks`: the first run saved 8 MiB, sending all of
+      it. The second restored by a restore key with 0 bytes downloaded, changed a file, and sent
+      0.5 MiB of the entry's 4 chunks.
+    - `w08_r09_kiln_cache_global_scope`: `acme/one`'s main saved a `global` entry, and
+      `acme/two` restored it. `other/three` didn't see it, and `acme/one`'s branch was refused
+      a save there.
+- *Done.* R14's cap for called workflows. A job's `cache-mode` (else its workflow's, else the
+  cap it is under) caps the workflow it calls. If the called workflow or one of its jobs asks
+  for more, the call doesn't start, saying so ("asks for `cache-mode: write` (its job `inner`),
+  more than its caller's `cache-mode: read` allows"). Legs that ask for nothing run with their
+  own mode cut down to the cap (`LegSpec::cache_cap`), in their token too. Unit-tested
+  (`w08_r14_the_callers_cache_mode_caps_the_called`).
+- *Done.* v1's `artifacts: [globs]` on an engine leg: after the job's steps, unless it was
+  cancelled (as v1 did), a `kiln/upload@v1` step uploads what the globs match as the run's
+  artifact `artifacts`, quietly when nothing matches (`kiln_ci::store::v1_artifacts_step`,
+  unit-tested). v1's own jobs keep their tarballs at `GET /api/jobs/:id/artifacts`.
 - *Left.*
-  - R02 (S3), R09's `global` scope, R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - R02 (S3), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
   - A diff that only rebases reusing what it didn't touch (W14).
-  - R14's cap for called workflows.
-  - v1's `artifacts:` as an artifact.
   - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC03, AC06, AC09.
 
 ### W09 Secrets and variables
@@ -2712,8 +2732,15 @@ and masking), names to the editor's completion (W21; names only).
     - an action declaring `DEPLOY_KEY`, mapped from `PROD_DEPLOY_KEY`, read it (masked) and saw
       nothing of the job's undeclared `OTHER`, which the job's own step read;
     - a mapping to an unset secret failed the run at start with `KCI4040`.
+- *Done.* R04's environment secrets after approval (AC07). The dispatcher holds a leg bound to
+  a protected environment out of the scheduler until its protection lets it go (W15-R04). A
+  leg's secrets, its environment's included, are resolved only when it is assigned, and they go
+  in that `AssignV2`. So nothing of a protected environment's reaches a runner before approval,
+  and no separate `SecretsFor` message is needed. Checked end to end
+  (`w09_ac07_environment_secrets_after_approval`): while the leg waited for its reviewer, the
+  environment's secret was never used. Once approved, the leg read it and the use was
+  recorded.
 - *Left.*
-  - Environment secrets after approval, `SecretsFor` (R04, AC07), with W15.
   - R08's other stores: Vault, Infisical, Doppler, 1Password (their integration kinds first).
   - The UI (W21).
   - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
@@ -4004,20 +4031,53 @@ previews and the board).
     - a held job stayed held across a server restart, then deployed when approved;
     - the run page's review in Chromium and WebKit, on desktop and phone.
 - *Done.* R05's `kiln/deploy@v1` (`crates/kiln/src/ci/deploy_step.rs`, the runner's
-  `deploy_step`). A leg whose job is bound to the environment (`environment:` on the job, its
-  protection passed before it started) asks the deploy service for a release of the app there
-  (`POST /_kiln/deploy/releases`, with the leg's token). It asks as `job:<leg>`, once per attempt
-  (an idempotency key), so the service's own gates apply too. The step then follows the release,
-  logging each change of state, and succeeds when the release does. A job that isn't bound to
-  the environment is refused, saying so. Checked end to end
-  (`w15_r05_kiln_deploy_releases_from_the_job`): the bound job's release was made as the job and
-  followed, and the unbound job was refused, with no release made.
+  `deploy_step`):
+  - A leg whose job is bound to the environment (`environment:` on the job, its protection
+    passed before it started) asks the deploy service for a release of the app there
+    (`POST /_kiln/deploy/releases`, with the leg's token). A job that isn't bound to the
+    environment is refused, saying so.
+  - It asks as `job:<leg>`, once per attempt (an idempotency key), so the service's own gates
+    apply too. Without `app:`, it releases the one app that names the repository as its
+    `source` and is registered in the environment; when there is none, or more than one, it
+    asks which.
+  - The step follows the release, logging each change: its state, what the provider says (sync,
+    health, the operation's phase), and the release's message. `wait: synced` ends once the
+    provider has it synced and healthy. `wait: healthy` (the default) ends when the release
+    succeeds, after staying healthy through the environment's settle time. A failed,
+    cancelled or rolled-back release, or health that degrades after the sync, fails the step,
+    and so does the `timeout` running out.
+  - The kiln dialect's `deploy: { app, environment, revision, wait, timeout }` on a job binds
+    it to the environment (a different `environment:` is an error, KCI1021), needs no steps,
+    and runs `kiln/deploy@v1` after the job's own steps (and its `attest:`).
+  - Checked:
+    - `w15_r05_following_a_release`: the step's reading of each state, unit-tested;
+    - `w15_r05_the_deploy_shorthand`: the shorthand's binding and its step;
+    - end to end (`w15_r05_kiln_deploy_releases_from_the_job`): the bound job's release was
+      made as the job and followed, and the unbound job was refused, with no release made.
+      The shorthand job, with no steps, released the repository's own app.
 - *Done.* R06: KilnCD's app statuses raise kiln's `deploy` event in the app's repository (see
   W03's notes).
+- *Done.* Teams as required reviewers (R03). `team:acme/web`, or `team:web` for the
+  repository owner's team, counts anyone whose memberships on the hosts they sign in with hold it.
+  Those are W23-R08's: GitHub's `org/team`s, GitLab's group paths and Bitbucket's workspaces, as
+  of their last sign-in. A team doesn't lift `prevent-self-review`. Unit-tested
+  (`w15_r03_who_may_review`).
+- *Done.* R01's concurrency limit: `concurrency: N` on an environment (in
+  `.kiln/environments.yaml`, CD's key too, or `kiln env create --concurrency N` and the API).
+  At most N of its deployments get past its gate at once, counting legs bound to it that are
+  queued or running. The rest wait, saying so (`concurrency`, with the environment and the
+  limit), and go in the order they got ready as each deployment ends. Checked end to end
+  (`w15_r01_an_environments_deployments_one_at_a_time`): with `concurrency: 1`, two jobs
+  deploying to staging ran one after the other on a runner with two slots.
+- *Done.* R03's windows, as cd.md's sync windows, in the same `windows:` key of
+  `.kiln/environments.yaml`: `{ allow | deny: <cron>, duration, timezone }`. A job deploys only
+  while an `allow` window is open, and waits while a `deny` window is (`window`, saying until
+  when). It goes when the window opens, after its reviewers and wait timer. Windows that don't
+  check out leave the environment's rules refused, as other bad rules do. Unit-tested
+  (`w15_r03_windows`: a weekend deny window, office hours).
 - *Left.*
-  - Custom gates, windows, `after:` and `soak:` (R03, with CD), concurrency limits per
-    environment, teams as reviewers, the environment pages (R08) and the board (R09).
-  - R05's `wait: synced`, the sync's progress in the log, and the `deploy:` shorthand.
+  - Custom gates, `after:` and `soak:` (R03, with CD), the environment pages (R08) and the board
+    (R09).
   - R02, R07 and AC02 to AC05, which are CD's or shared with it.
 
 ### W16 Test results, flaky tests and benchmarks
@@ -4141,10 +4201,21 @@ annotations), R04 to R09; AC01 to AC04.
   - its rerun (the test passing on attempt 2) marked it flaky;
   - one more failure than quarantine covers failed the step, and an expired entry was flagged;
   - the Tests and Benchmarks panels in Chromium and WebKit, at desktop and phone widths.
+- *Done.* R01's other two ways in:
+  - `uses: kiln/test-results@v1` (`path`, `format`, `fail-on-failure`; W07-R10);
+  - opt-in discovery. A kiln job's `test-results: discover` adds a `kiln/test-results@v1` step
+    with `discover: true` after its own steps, run unless the job was cancelled. It looks where
+    test tools usually write reports (`kiln_ci::results::discover::USUAL`: `TEST-*.xml`,
+    `junit*.xml`, `test-results/`, TRX, CTRF; not under `node_modules`, `vendor` or `.git`). It
+    takes only reports the job wrote: newer than the leg's start, and not tracked by git, so a
+    checkout's fixtures stay out. A discovered failure doesn't fail the step (the tests' own
+    step already did).
+  - Checked end to end (`w16_r01_discovered_test_reports`): a step wrote nextest's report and
+    exited 1. The run failed, and its tests were the report's `adds` (passed) and `divides`
+    (failed), without the fixture report the checkout brought.
 - *Left*:
   - the repository's tests page and metric trend charts;
   - the gate's result on diffs and the land queue (W14);
-  - `kiln/test-results@v1` and discovery of the usual paths (with W07's built-ins);
   - AC05, kiln's own `bench.yaml` on an exclusive runner.
 
 ### W17 Debugging

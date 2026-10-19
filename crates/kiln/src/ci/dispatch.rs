@@ -1181,6 +1181,15 @@ impl Dispatch {
         let now = crate::util::now_unix();
         match kiln_ci::env::gate(&def.name, &def.protection, &git_ref, ready_at, now, &reviews) {
             kiln_ci::env::Gate::Open => {
+                // Its environment's concurrency limit (W15-R01): at most that many deployments
+                // past the gate at once; the rest wait their turn, in the order they got ready.
+                if let Some(limit) = def.concurrency
+                    && self.deploying(&repo.id, &def.name, id) >= usize::try_from(limit).unwrap_or(usize::MAX)
+                {
+                    runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": "concurrency", "environment": def.name, "limit": limit })).await?;
+                    self.hub.emit_job(id).await;
+                    return Ok(());
+                }
                 let Some(h) = self.held.remove(id) else { return Ok(()) };
                 runs::wait_reason(&self.hub, id, &serde_json::Value::Null).await?;
                 self.hub.emit_job(id).await;
@@ -1198,9 +1207,13 @@ impl Dispatch {
                 runs::annotation(&self.hub, id, None, "error", None, &m, None, None, None, None, None).await?;
                 Box::pin(self.settled(id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await?;
             }
-            kiln_ci::env::Gate::Waiting { reviewers, until } => {
-                let reason = if reviewers.is_empty() { "wait-timer" } else { "approval" };
-                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until })).await?;
+            kiln_ci::env::Gate::Waiting { reviewers, until, window } => {
+                let reason = match (reviewers.is_empty(), &window) {
+                    (false, _) => "approval",
+                    (true, Some(_)) => "window",
+                    (true, None) => "wait-timer",
+                };
+                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until, "window": window })).await?;
                 self.hub.emit_job(id).await;
                 // W19-R06: the first time it waits for a reviewer, who wants to hear of it.
                 if !reviewers.is_empty()
@@ -1214,6 +1227,31 @@ impl Dispatch {
                     self.timers.insert(t * 1000);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// How many of `repo`'s legs (other than `except`) are past `env`'s gate and not done: its
+    /// deployments under way.
+    fn deploying(&self, repo: &str, env: &str, except: &str) -> usize {
+        self.legs
+            .iter()
+            .filter(|(id, l)| id.as_str() != except && !self.held.contains_key(id.as_str()) && l.spec.environment.as_ref().is_some_and(|e| e.name.eq_ignore_ascii_case(env)) && self.runs.get(&l.run).is_some_and(|r| r.repo.id == repo))
+            .count()
+    }
+
+    /// A deployment to `repo`'s `env` ended: the legs held there are gated again, in the order
+    /// they got ready, so the next under its concurrency limit goes (W15-R01).
+    async fn next_deployments(&mut self, repo: &str, env: &str) -> anyhow::Result<()> {
+        let mut waiting: Vec<(i64, String)> = self
+            .held
+            .iter()
+            .filter(|(id, h)| h.env.eq_ignore_ascii_case(env) && self.legs.get(id.as_str()).and_then(|l| self.runs.get(&l.run)).is_some_and(|r| r.repo.id == repo))
+            .map(|(id, h)| (h.ready_at, id.clone()))
+            .collect();
+        waiting.sort();
+        for (_, id) in waiting {
+            Box::pin(self.gate(&id)).await?;
         }
         Ok(())
     }
@@ -1608,9 +1646,21 @@ impl Dispatch {
             services: spec.services.iter().cloned().collect(),
             job_container: job.and_then(|j| j.container.clone()),
             job_services: job.map(|j| j.services.clone()).unwrap_or_default(),
-            // A job's `attest:` (kiln) runs as `kiln/attest@v1` after its own steps (W18-R01).
-            // The kiln dialect's job-level caches come first (W08-R09), its `attest:` last (W18-R01).
-            steps: job.map(|j| kiln_ci::store::cache::job_steps(&j.kiln.cache).into_iter().chain(j.steps.iter().cloned()).chain(j.kiln.attest.as_ref().and_then(kiln_ci::attest::job_step)).collect()).unwrap_or_default(),
+            // The kiln dialect's job-level caches come first (W08-R09); after the job's own steps,
+            // its discovered test reports (W16-R01), v1's `artifacts:` (W08-R08), its `attest:`
+            // (W18-R01), then its `deploy:` (W15-R05).
+            steps: job
+                .map(|j| {
+                    kiln_ci::store::cache::job_steps(&j.kiln.cache)
+                        .into_iter()
+                        .chain(j.steps.iter().cloned())
+                        .chain(j.kiln.test_results.as_ref().and_then(kiln_ci::results::discover::job_step))
+                        .chain(kiln_ci::store::v1_artifacts_step(&j.kiln.artifacts))
+                        .chain(j.kiln.attest.as_ref().and_then(kiln_ci::attest::job_step))
+                        .chain(j.kiln.deploy.as_ref().and_then(kiln_ci::env::deploy_step))
+                        .collect()
+                })
+                .unwrap_or_default(),
             workflow_env: wf.env.clone(),
             job_env: job.map(|j| j.env.clone()).unwrap_or_default(),
             workflow_defaults: wf.defaults.clone(),
@@ -1824,6 +1874,10 @@ impl Dispatch {
     /// The leg is done for good: its row, then its plan (W04-R02).
     async fn settled(&mut self, leg: &str, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
         let Some(l) = self.legs.remove(leg) else { return Ok(()) };
+        // A deployment ends here: the next its environment holds may go (W15-R01).
+        if let Some((env, repo)) = l.spec.environment.as_ref().map(|e| e.name.clone()).zip(self.runs.get(&l.run).map(|r| r.repo.id.clone())) {
+            Box::pin(self.next_deployments(&repo, &env)).await?;
+        }
         let c = match &outcome {
             Outcome::Success => PlanC::Success,
             Outcome::Cancelled => PlanC::Cancelled,
@@ -2076,6 +2130,7 @@ fn rebuild_spec(wf: &Arc<Workflow>, v: &serde_json::Value) -> LegSpec {
     spec.timeout_minutes = v.get("timeout_minutes").and_then(serde_json::Value::as_u64).map_or(360, |t| u32::try_from(t).unwrap_or(360));
     spec.continue_on_error = v.get("continue_on_error").and_then(serde_json::Value::as_bool).unwrap_or(false);
     spec.container = v.get("container").and_then(|c| c.as_str().map(str::to_owned));
+    spec.cache_cap = v.get("cache_cap").and_then(|c| c.as_str().map(str::to_owned));
     spec
 }
 
@@ -2108,6 +2163,7 @@ fn placeholder_spec(wf: &Arc<Workflow>, job: &str) -> LegSpec {
         items: Vec::new(),
         emulated: false,
         reads: Vec::new(),
+        cache_cap: None,
         workflow: Arc::clone(wf),
         job_index: index,
     }
@@ -2215,6 +2271,11 @@ fn cache_access(spec: &kiln_ci::plan::LegSpec, r: &RunSt) -> (kiln_ci::store::ca
     let job_mode = spec.def().and_then(|j| j.cache_mode.as_deref()).and_then(Mode::parse);
     let wf_mode = spec.workflow.cache_mode.as_deref().and_then(Mode::parse);
     let mode = cache::effective(job_mode, wf_mode, &r.event.name, on_default);
+    // A called workflow's legs do no more than its caller allows (W08-R14).
+    let mode = match spec.cache_cap.as_deref().and_then(Mode::parse) {
+        Some(cap) => mode.min(cap),
+        None => mode,
+    };
     let mut access = Vec::new();
     let mut scopes = cache::scopes(&git_ref, r.event.base_ref.as_deref(), &default_branch);
     // An untrusted run saves only to a scope of its own, which no trusted run reads; it restores

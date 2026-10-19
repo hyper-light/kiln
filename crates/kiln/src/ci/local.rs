@@ -492,6 +492,8 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "no-runner" => ("no runner that can take it is connected".to_owned(), false),
         "approval" => (format!("a reviewer's approval to deploy to {} ({})", text("environment"), list("reviewers")), true),
         "wait-timer" => (format!("the wait timer of {}", text("environment")), false),
+        "window" => (format!("a deploy window of {}: {}", text("environment"), text("window")), false),
+        "concurrency" if o.get("environment").is_some() => (format!("{}'s other deployments (at most {} at once)", text("environment"), o.get("limit").and_then(Value::as_u64).unwrap_or(1)), false),
         "concurrency" => (format!("its concurrency group {}", text("group")), false),
         other => (other.replace('-', " "), false),
     })

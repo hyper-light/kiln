@@ -51,6 +51,16 @@ impl Mode {
     pub fn within(self, cap: Mode) -> bool {
         (!self.restores() || cap.restores()) && (!self.saves() || cap.saves())
     }
+
+    /// What both allow: this mode cut down to `cap` (a called workflow's legs, W08-R14).
+    pub fn min(self, cap: Mode) -> Mode {
+        match (self.restores() && cap.restores(), self.saves() && cap.saves()) {
+            (true, true) => Mode::Write,
+            (true, false) => Mode::Read,
+            (false, true) => Mode::WriteOnly,
+            (false, false) => Mode::None,
+        }
+    }
 }
 
 /// Events trusted to save caches when no mode is set: GitHub's, and kiln's `land` and `deploy`.

@@ -3,8 +3,8 @@
 //! each under its index (`0/…`, `1/…`: no absolute path is ever in it), cut into the store's
 //! content-defined chunks, so a cache that changed by 1 % moves about 1 % of its bytes. With
 //! `local`, the runner keeps the chunks it has seen in `<work>/_cache` (least recently used go
-//! first past `KILN_CACHE_MAX`, 10 GiB by default): a restore downloads only those it lacks, and a
-//! save uploads only those the server's copy of the repository's caches lacks.
+//! first past `[agent] cache_max`, 10 GiB by default): a restore downloads only those it lacks,
+//! and a save uploads only those the server's copy of the repository's caches lacks.
 
 use std::collections::HashSet;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -72,9 +72,9 @@ pub struct Local {
 }
 
 impl Local {
-    pub fn new(work: &Path) -> Local {
-        let max = std::env::var("KILN_CACHE_MAX").ok().and_then(|v| parse_size(&v)).unwrap_or(LOCAL_MAX);
-        Local { dir: work.join("_cache"), max }
+    /// The tier under `work`, keeping at most `max` bytes (10 GiB when `None`).
+    pub fn new(work: &Path, max: Option<u64>) -> Local {
+        Local { dir: work.join("_cache"), max: max.unwrap_or(LOCAL_MAX) }
     }
 
     fn path(&self, digest: &str) -> PathBuf {
@@ -131,9 +131,10 @@ impl Local {
     }
 }
 
-/// `10G`, `512M`, `1048576`.
-fn parse_size(s: &str) -> Option<u64> {
+/// `10G` (or `10GB`, `10GiB`), `512M`, `1048576`.
+pub fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
+    let s = s.strip_suffix("iB").or_else(|| s.strip_suffix("ib")).or_else(|| s.strip_suffix(['B', 'b'])).unwrap_or(s);
     let (n, mult) = match s.char_indices().last()? {
         (i, 'G' | 'g') => (s.get(..i)?, 1u64 << 30),
         (i, 'M' | 'm') => (s.get(..i)?, 1 << 20),
@@ -150,7 +151,7 @@ pub fn archive(paths: &Paths, out: &Path) -> anyhow::Result<usize> {
     let mut kept = 0;
     for (i, p) in paths.resolved.iter().enumerate() {
         if p.is_dir() {
-            b.append_dir_all(i.to_string(), p)?;
+            append_sorted(&mut b, Path::new(&i.to_string()), p)?;
             kept += 1;
         } else if p.is_file() {
             b.append_path_with_name(p, i.to_string())?;
@@ -159,6 +160,24 @@ pub fn archive(paths: &Paths, out: &Path) -> anyhow::Result<usize> {
     }
     b.finish()?;
     Ok(kept)
+}
+
+/// `dir` into the tar as `name`, its entries in name order: the same files make the same archive,
+/// and so the same chunks, whatever order the file system lists them in. Files, directories and
+/// links are kept; sockets and devices aren't.
+fn append_sorted(b: &mut tar::Builder<std::fs::File>, name: &Path, dir: &Path) -> anyhow::Result<()> {
+    b.append_dir(name, dir)?;
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for e in entries {
+        let (from, to, kind) = (e.path(), name.join(e.file_name()), e.file_type()?);
+        if kind.is_dir() {
+            append_sorted(b, &to, &from)?;
+        } else if kind.is_file() || kind.is_symlink() {
+            b.append_path_with_name(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// A tar back where its paths were named: unpacked in `staging` first (nothing in it can land
@@ -334,7 +353,7 @@ pub async fn save(svc: &Service<'_>, key: &str, version: &str, scope: &str, loca
     let keep = local.map(|l| Local { dir: l.dir.clone(), max: l.max });
     let (digest, size, list) = crate::rt::blocking(move || chunks(&a, keep.as_ref())).await??;
     let digests: Vec<&String> = list.iter().map(|c| &c.digest).collect();
-    let (status, v) = svc.post("missing", &json!({ "chunks": digests })).await?;
+    let (status, v) = svc.post("missing", &json!({ "chunks": digests, "scope": scope })).await?;
     anyhow::ensure!((200..300).contains(&status), "{}", v.get("message").and_then(Value::as_str).unwrap_or("the cache refused the save"));
     let missing: HashSet<String> = v.get("missing").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
     let mut f = std::fs::File::open(archive)?;
@@ -382,8 +401,14 @@ mod tests {
         std::fs::write(home.join(".cargo/registry/index"), "crates")?;
         std::fs::write(ws.join("lock.txt"), "one file")?;
         let paths = Paths::new(&["target".into(), "~/.cargo/registry".into(), "lock.txt".into(), "missing".into()], &ws, Some(&home));
+        for name in ["zeta", "alpha", "mid"] {
+            std::fs::write(ws.join("target").join(name), name)?;
+        }
         let tar = dir.path().join("c.tar");
         assert_eq!(archive(&paths, &tar)?, 3, "what doesn't exist is left out");
+        // Each directory's entries in name order, whatever order the file system keeps.
+        let names: Vec<String> = tar::Archive::new(std::fs::File::open(&tar)?).entries()?.filter_map(|e| e.ok()?.path().ok().map(|p| p.to_string_lossy().trim_end_matches('/').to_owned())).filter(|n| n.starts_with("0/")).collect();
+        assert_eq!(names, ["0/alpha", "0/debug", "0/debug/app", "0/mid", "0/zeta"], "{names:?}");
         // Gone, then back where each was.
         std::fs::remove_dir_all(ws.join("target"))?;
         std::fs::remove_dir_all(home.join(".cargo"))?;
@@ -416,6 +441,7 @@ mod tests {
         small.trim();
         assert!(list.iter().all(|c| local.get(&c.digest).is_none()));
         assert_eq!((parse_size("10G"), parse_size("512M"), parse_size("42")), (Some(10 << 30), Some(512 << 20), Some(42)));
+        assert_eq!((parse_size("20GB"), parse_size("20GiB"), parse_size("1 k"), parse_size("lots")), (Some(20 << 30), Some(20 << 30), Some(1 << 10), None));
         Ok(())
     }
 }

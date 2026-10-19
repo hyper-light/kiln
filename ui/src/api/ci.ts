@@ -503,6 +503,7 @@ export function waitSentence(w: unknown): string | null {
     at?: number;
     environment?: string;
     reviewers?: string[];
+    window?: string;
     until?: number | null;
     pool?: string;
     starting?: number;
@@ -520,6 +521,7 @@ export function waitSentence(w: unknown): string | null {
     case "capability":
       return `The runners that match need a newer kiln${list(o.runners)}.`;
     case "concurrency":
+      if (o.environment) return `Waiting for ${o.environment}'s other deployments (at most ${o.limit ?? 1} at once).`;
       return `Waiting for concurrency group ${o.group ?? ""}${o.holders?.length ? `, held by ${o.holders.join(", ")}` : ""}.`;
     case "quota":
       return `The repository's limit of ${o.limit ?? 0} running legs is reached.`;
@@ -535,6 +537,8 @@ export function waitSentence(w: unknown): string | null {
       return `Waiting for a review to deploy to ${o.environment ?? "its environment"}${o.reviewers?.length ? ` (${o.reviewers.join(", ")})` : ""}${o.until ? `, and until ${new Date(o.until * 1000).toLocaleTimeString()}` : ""}.`;
     case "wait-timer":
       return `Waiting until ${o.until ? new Date(o.until * 1000).toLocaleTimeString() : "its wait timer ends"} to deploy to ${o.environment ?? "its environment"}.`;
+    case "window":
+      return `Waiting for a deploy window of ${o.environment ?? "its environment"}: ${o.window ?? "it is closed"}.`;
     default:
       return o.reason ? o.reason.replace(/-/g, " ") : null;
   }

@@ -670,6 +670,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if orphans > 0 {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
     }
+    if let Some(max) = o.declared.cache_max.as_deref().filter(|m| crate::runner::cache::parse_size(m).is_none()) {
+        tracing::warn!(cache_max = max, "[agent] cache_max isn't a size (`20G`, `512M`): kiln/cache keeps up to 10G");
+    }
     let (ca, leaf, enrolled_quic) = credentials(&o, &shutdown).await?;
     // This process's own files (a runner beside another one of the machine shares the state
     // directory, never a file).
@@ -2257,7 +2260,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             None => None,
                         };
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)) };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
                         crate::rt::spawn(async move {
                             let result = leg.run().await;

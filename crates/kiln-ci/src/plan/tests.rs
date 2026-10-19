@@ -165,6 +165,7 @@ fn dead_spec() -> LegSpec {
         items: Vec::new(),
         emulated: false,
         reads: Vec::new(),
+        cache_cap: None,
         workflow: Arc::new(Workflow::default()),
         job_index: 0,
     }
@@ -406,6 +407,26 @@ fn w04_ac04_inputs_outputs_secrets_permissions() {
     assert_eq!(at(&r.spec("after").needs, "/call/result"), "success");
     r.finish("after", S);
     assert_eq!(r.finished, Some(S));
+}
+
+/// W08-R14 (AC09's last part): a job's cache mode caps the workflow it calls. A called workflow
+/// or job asking for more doesn't start; legs that ask nothing carry the cap to the dispatcher.
+#[test]
+fn w08_r14_the_callers_cache_mode_caps_the_called() {
+    let greedy = "on: workflow_call\njobs:\n  inner:\n    runs-on: x\n    cache-mode: write\n    steps: [{run: a}]\n";
+    let modest = "on: workflow_call\njobs:\n  inner:\n    runs-on: x\n    steps: [{run: a}]\n";
+    let src = || with_called(&[("./.github/workflows/greedy.yml", greedy), ("./.github/workflows/modest.yml", modest)]);
+    let caller = |called: &str, mode: &str| format!("on: push\njobs:\n  call:\n    uses: ./.github/workflows/{called}.yml\n{mode}");
+    let r = Run::with(&caller("greedy", "    cache-mode: read\n"), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert!(r.logged("asks for `cache-mode: write` (its job `inner`), more than its caller's `cache-mode: read` allows"), "{:?}", r.log);
+    assert!(r.queued.is_empty());
+    let r = Run::with(&caller("modest", "    cache-mode: read\n"), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert_eq!(r.spec("call / inner").cache_cap.as_deref(), Some("read"));
+    // Without a mode of its own, the caller caps nothing.
+    let r = Run::with(&caller("greedy", ""), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, src());
+    assert_eq!(r.spec("call / inner").cache_cap, None);
+    assert_eq!(crate::store::cache::Mode::Write.min(crate::store::cache::Mode::Read), crate::store::cache::Mode::Read);
+    assert_eq!(crate::store::cache::Mode::WriteOnly.min(crate::store::cache::Mode::Read), crate::store::cache::Mode::None);
 }
 
 #[test]

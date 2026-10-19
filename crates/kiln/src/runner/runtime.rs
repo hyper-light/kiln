@@ -39,6 +39,8 @@ pub struct Leg {
     pub http: std::sync::Arc<crate::http::client::Client>,
     /// The pool's executor, ready, the leg runs in (docs/ci.md W13-R09).
     pub warm: std::sync::Arc<parking_lot::Mutex<Option<super::pool::Warm>>>,
+    /// `[agent] cache_max`: the most `kiln/cache@v1`'s local tier keeps (docs/ci.md W08-R09).
+    pub cache_max: Option<u64>,
 }
 
 /// What a step runs: a script under a shell, or a program (an action's `node main.js`).
@@ -355,6 +357,8 @@ fn runs_env(st: &mut State, action: &kiln_ci::wf::Action, inputs: &BTreeMap<Stri
 /// The leg's state as its steps change it.
 #[derive(Clone)]
 struct State {
+    /// When the leg started here: what the job wrote is newer (W16-R01's discovery).
+    started: std::time::SystemTime,
     /// The next step's title starts with this (a step rerun in place, W17-R04).
     rerun_label: Option<String>,
     /// Post steps run: as on GitHub, a cancelled job's cleanup runs to its end, on time of its own.
@@ -1105,6 +1109,7 @@ impl Leg {
             m.insert("graphql_url".into(), serde_json::json!(a.runtime.graphql_url));
         }
         let mut st = State {
+            started: std::time::SystemTime::now(),
             rerun_label: None,
             cleanup: false,
             dialect,
@@ -1636,7 +1641,7 @@ impl Leg {
         // W16-R01: the step's test reports go to the server, which keeps and parses them. With
         // `quarantine: enforce`, a failure of quarantined tests only passes, with a warning (R05).
         let excused = match &step.kiln.test_results {
-            Some(spec) if !matches!(end, End::Cancelled) => self.test_reports(st, idx, spec, &wd).await.only_quarantined && !matches!(end, End::Exit(Some(0))) && self.a.quarantine,
+            Some(spec) if !matches!(end, End::Cancelled) => self.test_reports(st, idx, spec, &wd, None).await.only_quarantined && !matches!(end, End::Exit(Some(0))) && self.a.quarantine,
             _ => false,
         };
         let (outcome, exit_code) = match end {
@@ -1680,7 +1685,8 @@ impl Leg {
     /// patterns, from the step's working directory) and `format` (found from each file when left
     /// out). Each report goes to the server, which keeps and parses it; what it found goes to the
     /// step's log. Whether there were failures and quarantine covers every one of them (W16-R05).
-    async fn test_reports(&self, st: &mut State, idx: u32, spec: &YVal, wd: &Path) -> Reported {
+    /// With `since` (discovery), only reports the job wrote count: newer than that, and not git's.
+    async fn test_reports(&self, st: &mut State, idx: u32, spec: &YVal, wd: &Path, since: Option<std::time::SystemTime>) -> Reported {
         const MAX_REPORTS: usize = 64;
         const MAX_BYTES: u64 = 64 << 20;
         let (path_v, format_v) = match spec {
@@ -1720,8 +1726,15 @@ impl Leg {
                 return Reported::default();
             }
         };
+        let files: Vec<String> = match since {
+            Some(t) => files.into_iter().filter(|f| written_since(&root.join(f), t)).collect(),
+            None => files,
+        };
         if files.is_empty() {
-            self.annotate(idx, "warning", &format!("test-results: no report at {}", patterns.join(", "))).await;
+            match since {
+                Some(_) => self.note(idx, "Test results: the job wrote no reports where test tools usually write them").await,
+                None => self.annotate(idx, "warning", &format!("test-results: no report at {}", patterns.join(", "))).await,
+            }
             return Reported { missing: true, ..Reported::default() };
         }
         let base = self.a.runtime.results_url.trim_end_matches('/').to_owned();
@@ -2988,17 +3001,23 @@ impl Leg {
                 true
             }
             "test-results" => {
-                let mut spec = vec![("path".to_owned(), YVal::Str(Tpl::new(get("path").unwrap_or_default(), Default::default())))];
+                // W16-R01's discovery: the usual places, and only what the job wrote.
+                let discover = get("discover").is_some_and(|v| v == "true");
+                let Some(path) = get("path").or_else(|| discover.then(|| kiln_ci::results::discover::USUAL.join("\n"))) else {
+                    anyhow::bail!("say where the reports are (`path`), or `discover: true`");
+                };
+                let mut spec = vec![("path".to_owned(), YVal::Str(Tpl::new(path.clone(), Default::default())))];
                 if let Some(f) = get("format") {
                     spec.push(("format".to_owned(), YVal::Str(Tpl::new(f, Default::default()))));
                 }
-                let r = self.test_reports(st, idx, &YVal::Map(spec), wd).await;
+                let since = discover.then_some(st.started);
+                let r = self.test_reports(st, idx, &YVal::Map(spec), wd, since).await;
                 outputs.insert("failed".to_owned(), r.failed.to_string());
                 outputs.insert("passed".to_owned(), r.passed.to_string());
-                let fail_on = get("fail-on-failure").is_none_or(|v| v != "false");
+                let fail_on = get("fail-on-failure").map_or(!discover, |v| v != "false");
                 let excused = r.only_quarantined && self.a.quarantine;
-                if r.missing {
-                    anyhow::bail!("no test report matched `{}`", get("path").unwrap_or_default());
+                if r.missing && !discover {
+                    anyhow::bail!("no test report matched `{path}`");
                 }
                 !(fail_on && r.failed > 0 && !excused)
             }
@@ -3117,14 +3136,24 @@ impl Leg {
         anyhow::ensure!((200..300).contains(&status), "{}", made.get("message").and_then(serde_json::Value::as_str).unwrap_or("the release was refused"));
         let id = made.get("id").and_then(serde_json::Value::as_i64).unwrap_or_default();
         outputs.insert("release-id".to_owned(), id.to_string());
-        let said = |r: &serde_json::Value| {
-            let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-            format!("release {id} of {} to {}: {}{}", s("app"), s("environment"), s("state"), r.get("message").and_then(serde_json::Value::as_str).map(|m| format!(" ({m})")).unwrap_or_default())
-        };
-        self.note(idx, &said(&made)).await;
-        let (mut last, deadline) = (said(&made), Instant::now() + timeout);
-        let mut state = made.get("state").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-        while !matches!(state.as_str(), "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded") {
+        self.note(idx, &release_line(id, &made)).await;
+        let (mut last, mut landed, deadline) = (release_line(id, &made), false, Instant::now() + timeout);
+        let mut r = made;
+        loop {
+            match follow_release(&r, &wait, landed) {
+                Follow::Done(state) => {
+                    outputs.insert("state".to_owned(), state.to_owned());
+                    return Ok(true);
+                }
+                Follow::Failed(why) => {
+                    outputs.insert("state".to_owned(), r.get("state").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned());
+                    self.annotate(idx, "error", &format!("release {id}: {why}")).await;
+                    return Ok(false);
+                }
+                Follow::On => {}
+            }
+            landed |= r.get("landed").and_then(serde_json::Value::as_bool) == Some(true);
+            let state = r.get("state").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
             if Instant::now() >= deadline {
                 outputs.insert("state".to_owned(), state.clone());
                 self.annotate(idx, "error", &format!("release {id} is still {state} after {} s: it goes on without this step", timeout.as_secs())).await;
@@ -3138,16 +3167,13 @@ impl Leg {
             if !resp.is_success() {
                 continue;
             }
-            let r: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
-            state = r.get("state").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-            let now = said(&r);
+            r = resp.json(1 << 20).await.unwrap_or_default();
+            let now = release_line(id, &r);
             if now != last {
                 self.note(idx, &now).await;
                 last = now;
             }
         }
-        outputs.insert("state".to_owned(), state.clone());
-        Ok(state == "succeeded")
     }
 
     /// kiln's chunked cache, as this leg reaches it.
@@ -3197,14 +3223,14 @@ impl Leg {
         let flag = |k: &str| get(k).is_some_and(|v| v == "true");
         let key = get("key").unwrap_or_default();
         let scope = get("scope").unwrap_or_else(|| "ref".into());
-        anyhow::ensure!(matches!(scope.as_str(), "ref" | "repo"), "`scope` is `ref` or `repo`, not `{scope}`");
+        anyhow::ensure!(matches!(scope.as_str(), "ref" | "repo" | "global"), "`scope` is `ref`, `repo` or `global`, not `{scope}`");
         let policy = get("policy").unwrap_or_else(|| "pull-push".into());
         anyhow::ensure!(matches!(policy.as_str(), "pull-push" | "pull" | "push"), "`policy` is `pull-push`, `pull` or `push`, not `{policy}`");
         let (paths, unreachable) = self.cache_paths(st, &lines("path"));
         for p in &unreachable {
             self.annotate(idx, "warning", &format!("`{p}` isn't in a directory the runner shares with the job container: kiln/cache can't keep it")).await;
         }
-        let local = flag("local").then(|| super::cache::Local::new(&self.work_dir));
+        let local = flag("local").then(|| super::cache::Local::new(&self.work_dir, self.cache_max));
         outputs.insert("cache-primary-key".to_owned(), key.clone());
         outputs.insert("cache-hit".to_owned(), "false".to_owned());
         let mut exact = false;
@@ -3256,7 +3282,7 @@ impl Leg {
         let scope = get("scope").unwrap_or_else(|| "ref".into());
         let given: Vec<String> = get("path").map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
         let (paths, _) = self.cache_paths(st, &given);
-        let local = get("local").is_some_and(|v| v == "true").then(|| super::cache::Local::new(&self.work_dir));
+        let local = get("local").is_some_and(|v| v == "true").then(|| super::cache::Local::new(&self.work_dir, self.cache_max));
         let archive = st.layout.temp.join(format!("kiln-cache-{}.tar", crate::util::new_id()));
         let (a, p) = (archive.clone(), paths.clone());
         let kept = crate::rt::blocking(move || super::cache::archive(&p, &a)).await??;
@@ -3718,6 +3744,58 @@ impl Leg {
     }
 }
 
+/// Whether `path` is a report the job wrote (W16-R01's discovery): modified since `t` (less a
+/// second, for coarse clocks), and not a file git tracks (a checkout's are new too).
+fn written_since(path: &Path, t: std::time::SystemTime) -> bool {
+    let recent = std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|m| m + Duration::from_secs(1) >= t);
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return recent };
+    let tracked = Command::new("git").arg("-C").arg(dir).args(["ls-files", "--error-unmatch", "--"]).arg(name).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    recent && !tracked
+}
+
+/// Where `kiln/deploy@v1` stands with a release it follows (docs/ci.md W15-R05).
+#[derive(Debug, PartialEq)]
+enum Follow {
+    /// On to the next look.
+    On,
+    /// Done, the step's `state` output.
+    Done(&'static str),
+    /// Failed, and why.
+    Failed(String),
+}
+
+/// What a release's state means to the step that follows it under `wait` (`synced`: once the
+/// provider has it synced and healthy; `healthy`: once it stays so through the environment's
+/// settle time, and the release succeeds). Health that degrades after the sync fails it.
+fn follow_release(r: &serde_json::Value, wait: &str, landed_before: bool) -> Follow {
+    let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let why = || r.get("message").and_then(serde_json::Value::as_str).map(|m| format!(": {m}")).unwrap_or_default();
+    match s("state") {
+        "succeeded" => Follow::Done("succeeded"),
+        // It succeeded, and a later release has replaced it since.
+        "superseded" => Follow::Done("superseded"),
+        state @ ("failed" | "cancelled" | "rolled_back") => Follow::Failed(format!("{}{}", state.replace('_', " "), why())),
+        _ if wait == "synced" && r.get("landed").and_then(serde_json::Value::as_bool) == Some(true) => Follow::Done("synced"),
+        _ if landed_before && s("health") == "Degraded" => Follow::Failed(format!("its health degraded after the sync{}", why())),
+        _ => Follow::On,
+    }
+}
+
+/// One line of a release's progress: its state, and what its provider says (sync, health, the
+/// operation's phase) and the release's message.
+fn release_line(id: i64, r: &serde_json::Value) -> String {
+    let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let mut line = format!("release {id} of {} to {}: {}", s("app"), s("environment"), s("state"));
+    let said: Vec<String> = [("sync", s("sync")), ("health", s("health")), ("operation", s("phase"))].into_iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k} {v}")).collect();
+    if !said.is_empty() {
+        line.push_str(&format!(" [{}]", said.join(", ")));
+    }
+    if !s("message").is_empty() {
+        line.push_str(&format!(" ({})", s("message")));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3815,7 +3893,7 @@ mod tests {
         tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = async_channel::unbounded();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default() };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
@@ -4076,7 +4154,7 @@ jobs:
         let tmp = tempfile::tempdir()?;
         let a = AssignmentV2 { job_id: "leg-p".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
         let (tx, _rx) = async_channel::unbounded();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default() };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let l = Layout::new(tmp.path(), "leg-p", "acme/app", None);
         let map = leg.container_map(&l);
         assert_eq!(map.translate(&l.workspace.to_string_lossy()), "/__w/app/app");
@@ -4122,7 +4200,7 @@ jobs:
         let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
         let (tx, rx) = async_channel::unbounded();
         let cancel = Shutdown::new();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default() };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move {
             crate::rt::spawn(async move {
                 let until = Instant::now() + Duration::from_secs(120);
@@ -4383,5 +4461,27 @@ jobs:
         assert!(script_file(Some("pwsh"), "x").1.starts_with("$ErrorActionPreference = 'stop'"));
         assert_eq!(script_file(Some("bash"), "x").0, ".sh");
         Ok(())
+    }
+
+    /// W15-R05: what a release's state means to `kiln/deploy@v1`, by `wait`, and how it reads.
+    #[test]
+    fn w15_r05_following_a_release() {
+        use serde_json::json;
+        let delivering = json!({ "state": "delivering", "sync": "OutOfSync", "health": "Progressing", "phase": "Running" });
+        assert_eq!(follow_release(&delivering, "healthy", false), Follow::On);
+        let landed = json!({ "state": "delivering", "landed": true, "sync": "Synced", "health": "Healthy", "message": "synced and healthy; settling for 30s" });
+        assert_eq!(follow_release(&landed, "synced", false), Follow::Done("synced"));
+        assert_eq!(follow_release(&landed, "healthy", false), Follow::On, "healthy waits out the settle time");
+        let degraded = json!({ "state": "delivering", "sync": "Synced", "health": "Degraded" });
+        assert_eq!(follow_release(&degraded, "healthy", false), Follow::On, "not synced yet: still starting");
+        assert!(matches!(follow_release(&degraded, "healthy", true), Follow::Failed(w) if w.contains("degraded")));
+        assert_eq!(follow_release(&json!({ "state": "succeeded" }), "healthy", true), Follow::Done("succeeded"));
+        assert_eq!(follow_release(&json!({ "state": "superseded" }), "healthy", true), Follow::Done("superseded"));
+        assert_eq!(follow_release(&json!({ "state": "failed", "message": "KilnCD's sync of the release failed" }), "synced", false), Follow::Failed("failed: KilnCD's sync of the release failed".into()));
+        assert_eq!(follow_release(&json!({ "state": "rolled_back" }), "healthy", true), Follow::Failed("rolled back".into()));
+        assert_eq!(follow_release(&json!({ "state": "waiting_approval" }), "synced", false), Follow::On);
+        let line = release_line(7, &json!({ "app": "web", "environment": "staging", "state": "delivering", "sync": "Synced", "health": "Healthy", "phase": "Succeeded", "message": "synced and healthy; settling for 30s" }));
+        assert_eq!(line, "release 7 of web to staging: delivering [sync Synced, health Healthy, operation Succeeded] (synced and healthy; settling for 30s)");
+        assert_eq!(release_line(7, &json!({ "app": "web", "environment": "staging", "state": "waiting" })), "release 7 of web to staging: waiting");
     }
 }

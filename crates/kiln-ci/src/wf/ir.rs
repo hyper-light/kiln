@@ -367,6 +367,8 @@ pub struct JobKiln {
     pub quarantine_enforce: bool,
     pub bench_gate: Option<YVal>,
     pub deploy: Option<YVal>,
+    /// `discover`: the usual reports, after the job's steps (W16-R01).
+    pub test_results: Option<YVal>,
     pub agents: Option<YVal>,
     /// v1's `artifacts: [globs]`.
     pub artifacts: Vec<String>,

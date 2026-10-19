@@ -847,6 +847,9 @@ enum EnvCmd {
         tags: Vec<String>,
         #[arg(long)]
         url: Option<String>,
+        /// At most this many deployments at once; the rest wait their turn.
+        #[arg(long)]
+        concurrency: Option<u32>,
     },
     /// Remove an environment made in kiln.
     Delete {
@@ -883,16 +886,19 @@ pub async fn env(args: EnvArgs, cfg: &Config) -> Result<()> {
                         rules.push(format!("{k} {}", b.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")));
                     }
                 }
+                if let Some(n) = e.get("concurrency").and_then(Value::as_u64) {
+                    rules.push(format!("{n} at once"));
+                }
                 let last = e.get("latest_deployment").filter(|d| !d.is_null()).map(|d| format!("; last: {} {} {}", s(d, "state"), s(d, "ref"), s(d, "sha").get(..8).unwrap_or_default())).unwrap_or_default();
                 println!("{:<16} ({}) {}{last}", s(&e, "name"), s(&e, "source"), if rules.is_empty() { "no protection".to_owned() } else { rules.join("; ") });
             }
         }
-        EnvCmd::Create { name, repo, reviewers, prevent_self_review, wait_timer, branches, tags, url } => {
+        EnvCmd::Create { name, repo, reviewers, prevent_self_review, wait_timer, branches, tags, url, concurrency } => {
             let protection = json!({
                 "reviewers": reviewers, "prevent-self-review": prevent_self_review, "wait-timer": wait_timer,
                 "branches": (!branches.is_empty()).then_some(branches), "tags": (!tags.is_empty()).then_some(tags),
             });
-            api.call(Method::Put, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), Some(json!({ "protection": protection, "url": url }))).await?;
+            api.call(Method::Put, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), Some(json!({ "protection": protection, "url": url, "concurrency": concurrency }))).await?;
             println!("{name} saved in {repo}");
         }
         EnvCmd::Delete { name, repo } => {
