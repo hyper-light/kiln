@@ -1,6 +1,9 @@
 //! `kiln spawn` and `kiln agents`: start and manage AI coding agents from inside a kiln shell.
 //! They run in this shell's directory and environment, as kiln-native sessions of the machine's
-//! kiln, and show up under this shell in kiln's UI on every device.
+//! kiln, and show up under this shell in kiln's UI on every device. `kiln spawn --on` starts them
+//! on another machine, and `kiln agents wait` and `kiln agents result` wait for them and read what
+//! they concluded, wherever they run (asked of the kiln server, `agents.*`). Run by an agent, what
+//! it starts are its children, held to no more than it has (docs/agents.md).
 
 #[cfg(unix)]
 use std::io::BufRead as _;
@@ -27,6 +30,15 @@ pub struct SpawnArgs {
     pub mode: Option<String>,
     #[arg(long)]
     pub name: Option<String>,
+    /// Start them on another machine: its name (`local` for the server), or what it needs
+    /// (`linux/amd64`, `macos`, `+gpu`, `cpus>=16`), the idlest that suits and has the harness.
+    #[arg(long)]
+    pub on: Option<String>,
+    /// Their folder there (with --on; by default its home).
+    #[arg(long)]
+    pub cwd: Option<String>,
+    #[arg(long)]
+    pub effort: Option<String>,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -57,6 +69,30 @@ pub enum AgentsCmd {
         #[arg(long)]
         now: bool,
     },
+    /// Wait until agents (by id or id prefix, on any machine) are done: idle, needing a person,
+    /// paused for a usage limit, stopped or ended. Prints where each stands.
+    Wait {
+        ids: Vec<String>,
+        /// Seconds to wait at most (at most 600; again to wait longer).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Return when the first of them is done.
+        #[arg(long)]
+        any: bool,
+        /// Return when anything about them changes.
+        #[arg(long)]
+        change: bool,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What an agent concluded: its last reply, how its last turn ended, what it changed.
+    Result {
+        id: String,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(unix)]
@@ -72,9 +108,15 @@ fn shell() -> Option<String> {
 
 #[cfg(unix)]
 fn request(req: &Request) -> anyhow::Result<Value> {
+    request_for(req, std::time::Duration::from_secs(30))
+}
+
+/// A request whose answer may take up to `wait` (a wait for agents).
+#[cfg(unix)]
+fn request_for(req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
     let path = socket()?;
     let mut s = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    s.set_read_timeout(Some(wait))?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     s.write_all(&line)?;
@@ -92,13 +134,35 @@ fn request(_req: &Request) -> anyhow::Result<Value> {
     anyhow::bail!("kiln spawn is not available on Windows yet")
 }
 
+#[cfg(not(unix))]
+fn request_for(_req: &Request, _wait: std::time::Duration) -> anyhow::Result<Value> {
+    anyhow::bail!("kiln agents is not available on Windows yet")
+}
+
+/// One of kiln's operations, asked of the kiln server through this machine's kiln.
+fn op(name: &str, input: Value, wait: std::time::Duration) -> anyhow::Result<Value> {
+    let v = request_for(&Request::Op { name: name.to_owned(), input, terminal: shell() }, wait)?;
+    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+}
+
 fn print(s: &str) {
     let _ = writeln!(std::io::stdout(), "{s}");
 }
 
 pub fn spawn(a: SpawnArgs) -> anyhow::Result<()> {
     let prompt = a.prompt.join(" ");
-    let cwd = std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned());
+    // On another machine: the kiln server picks it and starts them there.
+    if let Some(on) = a.on.clone() {
+        let input = serde_json::json!({"kind": a.kind, "on": on, "cwd": a.cwd, "prompt": (!prompt.trim().is_empty()).then_some(prompt), "model": a.model, "mode": a.mode, "name": a.name, "count": a.count, "effort": a.effort});
+        let v = op("agents.start", input, std::time::Duration::from_secs(60))?;
+        for s in v.get("agents").and_then(Value::as_array).cloned().unwrap_or_default() {
+            let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+            print(&format!("started {} ({}) on {}{}", g("name"), short(&g("id")), g("machine"), if g("mode").is_empty() { String::new() } else { format!(", in {}", g("mode")) }));
+        }
+        print("`kiln agents wait <id>` waits for them; `kiln agents result <id>` says what they concluded");
+        return Ok(());
+    }
+    let cwd = a.cwd.clone().or_else(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned()));
     let env: Vec<(String, String)> = std::env::vars().collect();
     let v = request(&Request::Spawn {
         kind: a.kind,
@@ -162,6 +226,61 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
             };
             request(&Request::Send { id, text: text.join(" "), mode })?;
             print("sent");
+        }
+        AgentsCmd::Wait { ids, timeout, any, change, json } => {
+            if ids.is_empty() {
+                anyhow::bail!("say which agents to wait for (their ids, or the start of them)");
+            }
+            let timeout = timeout.min(600);
+            let input = serde_json::json!({"agents": ids, "timeout_s": timeout, "any": any, "until": if change { "change" } else { "settled" }});
+            let v = op("agents.wait", input, std::time::Duration::from_secs(timeout + 60))?;
+            if json {
+                print(&serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            for s in v.get("agents").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                let what = match s.get("needs").and_then(Value::as_array).and_then(|n| n.first()) {
+                    Some(n) => format!("asks a person: {}", n.get("title").and_then(Value::as_str).unwrap_or("")),
+                    None => g("summary").lines().next().unwrap_or("").to_owned(),
+                };
+                print(&format!("{}  {:<10} {}  {}", short(&g("id")), g("stand"), g("name"), what));
+            }
+            if v.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                print(&format!("still going after {timeout}s: wait again to keep waiting"));
+            }
+        }
+        AgentsCmd::Result { id, json } => {
+            let v = op("agents.result", serde_json::json!({"agent": id}), std::time::Duration::from_secs(60))?;
+            if json {
+                print(&serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            let a = v.get("agent").cloned().unwrap_or(Value::Null);
+            let g = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+            print(&format!("{} ({}) on {}, {}", g(&a, "name"), short(&g(&a, "id")), g(&a, "machine"), g(&a, "stand")));
+            let reply = v.pointer("/reply/text").and_then(Value::as_str).unwrap_or("");
+            if !reply.trim().is_empty() {
+                print("");
+                print(reply.trim());
+                print("");
+            }
+            if let Some(t) = v.get("last_turn").filter(|t| !t.is_null()) {
+                print(&format!("Its last turn: {}{}", g(t, "how"), t.get("why").and_then(Value::as_str).map(|w| format!(" ({w})")).unwrap_or_default()));
+            }
+            let c = v.get("changes").cloned().unwrap_or(Value::Null);
+            let n = |k: &str| c.get(k).and_then(Value::as_u64).unwrap_or(0);
+            if n("files_changed") > 0 {
+                print(&format!("It changed {} file{}: +{} −{}", n("files_changed"), if n("files_changed") == 1 { "" } else { "s" }, n("lines_added"), n("lines_removed")));
+                for f in c.get("files").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    print(&format!("  {}  +{} −{}", g(&f, "path"), f.get("added").and_then(Value::as_u64).unwrap_or(0), f.get("removed").and_then(Value::as_u64).unwrap_or(0)));
+                }
+            } else {
+                print("It changed no files.");
+            }
+            if let Some(cost) = v.get("cost_usd").and_then(Value::as_f64).filter(|c| *c > 0.0) {
+                print(&format!("Cost: ${cost:.2}"));
+            }
         }
     }
     Ok(())

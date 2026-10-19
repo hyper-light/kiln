@@ -8,7 +8,7 @@ import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { harnessApi, type KindInfo } from "@/api/harness";
-import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
+import { planHref, plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -289,6 +289,7 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   const [modeChoice, setMode] = React.useState<PlanMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
+  const [started, setStarted] = React.useState<PlanStarted | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const live = agents.filter((a) => a.status !== "exited");
@@ -297,14 +298,18 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   // A harness the machine doesn't offer gives way to the first it does; a plan without steps runs as one message.
   const kind = offered.some((k) => k.id === kindChoice) ? kindChoice : (offered[0]?.id ?? "");
   const mode: PlanMode = plan.steps.length === 0 ? "message" : modeChoice;
+  // One agent per step starts agents of its own.
+  const fresh = where === "new" || mode === "agents";
 
   const run = async () => {
     setBusy(true);
     setError(null);
     setRan(null);
+    setStarted(null);
     try {
-      const to = where === "new" ? { new: { target, kind, cwd: cwd.trim() || undefined } } : { session: where };
-      setRan(await plansApi.run(plan.id, to, mode));
+      const to = { target, kind, cwd: cwd.trim() || undefined };
+      if (mode === "agents") setStarted(await plansApi.runAgents(plan.id, to));
+      else setRan(await plansApi.run(plan.id, where === "new" ? { new: to } : { session: where }, mode));
       onRan();
     } catch (e) {
       setError(errorMessage(e));
@@ -317,13 +322,15 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
     <section className="plan-section" aria-label="Run the plan">
       <h2 className="plan-h">Run it</h2>
       <div className="plan-run-fields">
-        <SelectField
-          label="On"
-          value={where}
-          onChange={setWhere}
-          options={[{ value: "new", label: "A new agent" }, ...live.map((a) => ({ value: a.id, label: `${a.name} · ${a.kind_name} · ${machineOf(a.target)}` }))]}
-        />
-        {where === "new" && (
+        {mode !== "agents" && (
+          <SelectField
+            label="On"
+            value={where}
+            onChange={setWhere}
+            options={[{ value: "new", label: "A new agent" }, ...live.map((a) => ({ value: a.id, label: `${a.name} · ${a.kind_name} · ${machineOf(a.target)}` }))]}
+          />
+        )}
+        {fresh && (
           <>
             <SelectField label="Machine" value={target} onChange={setTarget} options={(targets.length ? targets : ["local"]).map((t) => ({ value: t, label: machineOf(t) }))} />
             <SelectField
@@ -345,14 +352,21 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
               ? [
                   { value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` },
                   { value: "goals", label: `Goals (${plan.steps.length}, each a /goal once the one before is met)` },
+                  { value: "agents", label: `One agent per step (${plan.steps.length}, each once the one before is met)` },
                 ]
               : []),
           ]}
         />
       </div>
+      {mode === "agents" && (
+        <p className="plan-dim plan-meta-line">
+          Each step gets an agent of its own, held to the step as a goal; the next starts once it&rsquo;s met. They work in one folder, so one at a time: side by side waits for agents to have
+          workspaces of their own.
+        </p>
+      )}
       <div className="plan-actions">
-        <Button size="sm" variant="secondary" disabled={busy || dirty || (where === "new" && !kind)} onClick={() => void run()}>
-          {busy ? "Sending…" : "Run plan"}
+        <Button size="sm" variant="secondary" disabled={busy || dirty || (fresh && !kind)} onClick={() => void run()}>
+          {busy ? (mode === "agents" ? "Starting…" : "Sending…") : "Run plan"}
         </Button>
         {dirty && <span className="plan-dim">Save your changes first: a run sends the saved version.</span>}
         {error && <span className="plan-error">{error}</span>}
@@ -360,6 +374,11 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
           <span className="plan-ok">
             {mode === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`} ·{" "}
             <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
+          </span>
+        )}
+        {started && (
+          <span className="plan-ok">
+            {started.steps} steps, an agent each · <Link to={runHref(started.run)}>follow the run</Link>
           </span>
         )}
       </div>
@@ -482,9 +501,15 @@ function Runs({ plan }: { plan: Plan }) {
       <ul className="plan-rows">
         {runs.map((r) => (
           <li key={r.id} className="plan-row-line">
-            <Link to={`/agents/${encodeURIComponent(r.session)}`} className="plan-row-main">
-              {r.mode === "steps" ? "Step by step" : r.mode === "goals" ? "As goals" : "One message"} · v{r.version} · on {nameOf(r.session)}
-            </Link>
+            {r.mode === "agents" ? (
+              <Link to={runHref(r.id)} className="plan-row-main">
+                One agent per step · v{r.version} · {r.state ?? "running"}
+              </Link>
+            ) : (
+              <Link to={`/agents/${encodeURIComponent(r.session)}`} className="plan-row-main">
+                {r.mode === "steps" ? "Step by step" : r.mode === "goals" ? "As goals" : "One message"} · v{r.version} · on {nameOf(r.session)}
+              </Link>
+            )}
             <span className="plan-dim">
               {relativeTime(r.at)} · {r.by}
             </span>

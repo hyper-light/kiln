@@ -14,6 +14,7 @@ import { copyText } from "@/views/terminal/clipboard";
 import { MoveDialog } from "./move";
 import { ReachDialog } from "./reach";
 import { SpawnDialog } from "./spawn";
+import { useEndWithChildren } from "./family";
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
@@ -36,9 +37,11 @@ export function useAgentActions(
       toast.error(`Couldn't ${what}`, errorMessage(e));
     }
   };
+  // Ending it ends the agents it started too, unless the dialog says otherwise.
+  const ending = useEndWithChildren(a.id);
   const end = async () => {
     try {
-      await harnessApi.stop(a.id);
+      await (live ? ending.end() : harnessApi.stop(a.id));
       after?.onGone?.();
     } catch (e) {
       toast.error(live ? "Couldn't end the agent" : "Couldn't remove the agent", errorMessage(e));
@@ -118,7 +121,12 @@ export function useAgentActions(
         open={act === "end"}
         onOpenChange={(o) => !o && setAct(null)}
         title={`End ${a.name}?`}
-        description={`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
+        description={
+          <>
+            {`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
+            {act === "end" && ending.note}
+          </>
+        }
         confirmLabel="End agent"
         danger
         onConfirm={end}

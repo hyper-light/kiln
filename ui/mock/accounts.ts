@@ -19,6 +19,7 @@ import type { WebSocket } from "ws";
 import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, SlashCommand, State } from "../src/api/harness.ts";
 import { longInfo } from "./conversation.ts";
 import { fleetInfos } from "./push.ts";
+import { familyInfos } from "./agents.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -400,7 +401,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fleetInfos()]);
+    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fleetInfos(), ...familyInfos()]);
     return true;
   }
 

@@ -1977,8 +1977,29 @@ impl Hub {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A hub of its own for a test: its data in a folder that lives as long as the process (tests
+    /// end with it), a QUIC endpoint on a free loopback port, no runners, its agents off unless a
+    /// test turns terminals on.
+    pub(crate) async fn scratch_hub() -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_with(|_| {}).await
+    }
+
+    pub(crate) async fn scratch_hub_with(f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        let dir = tempfile::tempdir()?.keep();
+        let mut cfg = Config::default();
+        cfg.server.data_dir = dir.clone();
+        cfg.terminal.enabled = false;
+        f(&mut cfg);
+        let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
+        let leaf = pki.server_leaf(&[])?;
+        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+        let store = Store::in_memory()?;
+        let logs = Logs::new(dir.join("logs"), 1 << 20);
+        Ok(Hub::new(Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
+    }
 
     #[test]
     fn an_outpost_has_its_label_and_no_slots() {

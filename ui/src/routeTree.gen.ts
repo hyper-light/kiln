@@ -36,6 +36,7 @@ import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.pl
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
 import { Route as AppRunsIdIndexRouteImport } from './routes/_app.runs.$id.index'
 import { Route as AppRunsIdCompareRouteImport } from './routes/_app.runs.$id.compare'
+import { Route as AppAgentsPlansRunsRunRouteImport } from './routes/_app.agents.plans.runs.$run'
 import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
 
@@ -173,6 +174,11 @@ const AppRunsIdCompareRoute = AppRunsIdCompareRouteImport.update({
   path: '/runs/$id/compare',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsPlansRunsRunRoute = AppAgentsPlansRunsRunRouteImport.update({
+  id: '/agents/plans/runs/$run',
+  path: '/agents/plans/runs/$run',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsAppsProjectNameRoute =
   AppDeploymentsAppsProjectNameRouteImport.update({
     id: '/deployments/apps/$project/$name',
@@ -212,6 +218,7 @@ export interface FileRoutesByFullPath {
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans/': typeof AppAgentsPlansIndexRoute
   '/runs/$id/': typeof AppRunsIdIndexRoute
+  '/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
@@ -242,6 +249,7 @@ export interface FileRoutesByTo {
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans': typeof AppAgentsPlansIndexRoute
   '/runs/$id': typeof AppRunsIdIndexRoute
+  '/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
@@ -274,6 +282,7 @@ export interface FileRoutesById {
   '/_app/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
+  '/_app/agents/plans/runs/$run': typeof AppAgentsPlansRunsRunRoute
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
@@ -306,6 +315,7 @@ export interface FileRouteTypes {
     | '/runs/$id/compare'
     | '/agents/plans/'
     | '/runs/$id/'
+    | '/agents/plans/runs/$run'
     | '/deployments/apps/$project/$name'
     | '/runs/$id/jobs/$jobId'
   fileRoutesByTo: FileRoutesByTo
@@ -336,6 +346,7 @@ export interface FileRouteTypes {
     | '/runs/$id/compare'
     | '/agents/plans'
     | '/runs/$id'
+    | '/agents/plans/runs/$run'
     | '/deployments/apps/$project/$name'
     | '/runs/$id/jobs/$jobId'
   id:
@@ -367,6 +378,7 @@ export interface FileRouteTypes {
     | '/_app/runs/$id/compare'
     | '/_app/agents/plans/'
     | '/_app/runs/$id/'
+    | '/_app/agents/plans/runs/$run'
     | '/_app/deployments/apps/$project/$name'
     | '/_app/runs/$id/jobs/$jobId'
   fileRoutesById: FileRoutesById
@@ -567,6 +579,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunsIdCompareRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/agents/plans/runs/$run': {
+      id: '/_app/agents/plans/runs/$run'
+      path: '/agents/plans/runs/$run'
+      fullPath: '/agents/plans/runs/$run'
+      preLoaderRoute: typeof AppAgentsPlansRunsRunRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/apps/$project/$name': {
       id: '/_app/deployments/apps/$project/$name'
       path: '/deployments/apps/$project/$name'
@@ -610,6 +629,7 @@ interface AppRouteChildren {
   AppRunsIdCompareRoute: typeof AppRunsIdCompareRoute
   AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
+  AppAgentsPlansRunsRunRoute: typeof AppAgentsPlansRunsRunRoute
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
 }
@@ -640,6 +660,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunsIdCompareRoute: AppRunsIdCompareRoute,
   AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,
+  AppAgentsPlansRunsRunRoute: AppAgentsPlansRunsRunRoute,
   AppDeploymentsAppsProjectNameRoute: AppDeploymentsAppsProjectNameRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
 }
