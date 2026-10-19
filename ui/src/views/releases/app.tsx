@@ -7,9 +7,9 @@ import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { Pause, Play, Plus, Rocket } from "lucide-react";
 
-import { boardHref, deployApi, describe, packageWords, providerName, releaseHref, STATE_DOT, STATE_WORDS, type ReleaseAsk } from "@/api/deploy";
+import { boardHref, deployApi, describe, packageWords, providerName, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type ReleaseAsk } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -252,6 +252,93 @@ function RegisterIn({ app, registered }: { app: string; registered: string[] }) 
   );
 }
 
+/** What an app is, changed here: its project and owners, who to reach, its source repository; it
+ * archived (no new releases, what runs keeps running), or deleted. */
+function Settings({ a, registered }: { a: App; registered: string[] }) {
+  const navigate = useNavigate();
+  const [project, setProject] = React.useState(a.project);
+  const [owners, setOwners] = React.useState(a.owners.join(", "));
+  const [oncall, setOncall] = React.useState(a.contacts?.oncall ?? "");
+  const [channels, setChannels] = React.useState((a.contacts?.channels ?? []).join(", "));
+  const [source, setSource] = React.useState(a.source ?? "");
+  const [busy, setBusy] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [keep, setKeep] = React.useState(true);
+  const list = (s: string) =>
+    s
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  const patch = async (p: AppPatch, done: string) => {
+    setBusy(true);
+    try {
+      await deployApi.patchApp(a.name, p);
+      toast({ title: done, tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (e) {
+      toast({ title: "Not changed", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const save = () =>
+    patch(
+      { project: project.trim() || "default", owners: list(owners), contacts: { ...a.contacts, oncall: oncall.trim() || undefined, channels: list(channels) }, source: source.trim() },
+      `${a.name} is saved`,
+    );
+  const remove = async () => {
+    try {
+      await deployApi.deleteApp(a.name, { everywhere: true, keep });
+      toast({ title: `${a.name} is deleted`, description: a.source ? `Its repository ${a.source} is kept.` : undefined, tone: "succeeded" });
+      invalidate("deploy/");
+      navigate(boardHref);
+    } catch (e) {
+      toast({ title: "Not deleted", description: errorMessage(e), tone: "failed" });
+    }
+  };
+  return (
+    <Panel eyebrow="Settings" title="What it is" description="Owners, who to reach and its source change here; its package and template, by API or kiln app set.">
+      <div className="cd-new-grid">
+        <TextField label="Project" value={project} spellCheck={false} onChange={(e) => setProject(e.target.value)} />
+        <TextField label="Owner teams" value={owners} placeholder="payments, platform" onChange={(e) => setOwners(e.target.value)} />
+        <TextField label="On call" value={oncall} placeholder="ada" onChange={(e) => setOncall(e.target.value)} />
+        <TextField label="Chat channels" value={channels} placeholder="#deploys" onChange={(e) => setChannels(e.target.value)} />
+        <TextField label="Source repository" value={source} placeholder="acme/web" spellCheck={false} onChange={(e) => setSource(e.target.value)} hint="One kiln has; empty for none." />
+      </div>
+      <div className="rel-settings-actions">
+        <Button size="sm" disabled={busy} onClick={() => void save()}>
+          Save
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void patch({ archived: !a.archived }, a.archived ? `${a.name} takes releases again` : `${a.name} is archived`)}>
+          {a.archived ? "Unarchive" : "Archive"}
+        </Button>
+        <Button size="sm" variant="ghost-danger" disabled={busy} onClick={() => setDeleting(true)}>
+          Delete
+        </Button>
+      </div>
+      <ConfirmDialog
+        open={deleting}
+        onOpenChange={setDeleting}
+        title={`Delete ${a.name}?`}
+        description={
+          <>
+            {registered.length ? `It is deregistered from ${registered.join(", ")} first. ` : ""}
+            Its releases stay in the history{a.source ? `, and its repository ${a.source} is kept` : ""}.
+            {registered.length > 0 && (
+              <label className="rel-keep">
+                <input type="checkbox" className="check" checked={keep} onChange={(e) => setKeep(e.target.checked)} /> Leave what it runs in place
+              </label>
+            )}
+          </>
+        }
+        confirmLabel="Delete the app"
+        danger
+        onConfirm={remove}
+      />
+    </Panel>
+  );
+}
+
 /** A duration as people say it. */
 function took(secs: number | null | undefined) {
   if (secs === null || secs === undefined) return "—";
@@ -339,15 +426,18 @@ function AppView({ name }: { name: string }) {
           ))}
         </div>
       )}
-      <Loadable label="the environments">
-        <RegisterIn app={a.name} registered={envs} />
-      </Loadable>
-      <Loadable label="how it delivers">
-        <Delivery app={a.name} />
-      </Loadable>
-      <Loadable label="its releases">
-        <Latest app={a.name} />
-      </Loadable>
+      <div className="rel-stack">
+        <Loadable label="the environments">
+          <RegisterIn app={a.name} registered={envs} />
+        </Loadable>
+        <Loadable label="how it delivers">
+          <Delivery app={a.name} />
+        </Loadable>
+        <Loadable label="its releases">
+          <Latest app={a.name} />
+        </Loadable>
+        <Settings key={JSON.stringify(a)} a={a} registered={envs} />
+      </div>
     </>
   );
 }

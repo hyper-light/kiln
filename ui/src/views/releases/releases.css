@@ -376,3 +376,36 @@
 .rel-gap {
   margin-top: 0.75rem;
 }
+.rel-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.rel-keep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--color-foreground);
+}
+.rel-env-page {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 16px;
+  margin: 20px 0 16px;
+}
+.rel-stack {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+.rel-stack > .rel-register {
+  margin-top: 0;
+}
+.rel-board thead th a {
+  color: inherit;
+}
+.rel-board thead th a:hover {
+  color: var(--color-link);
+}

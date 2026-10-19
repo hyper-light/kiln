@@ -136,6 +136,19 @@ export interface AppAsk {
   source?: string;
 }
 
+/** What changes in an app: only what is given. A property set to `null` is removed; `source: ""` unlinks. */
+export interface AppPatch {
+  project?: string;
+  owners?: string[];
+  package?: Package;
+  namespace?: string;
+  properties?: Record<string, string | null>;
+  template?: string;
+  contacts?: App["contacts"];
+  source?: string;
+  archived?: boolean;
+}
+
 /** One registration on the board: what runs, and what's on its way. */
 export interface Cell {
   registration: Registration;
@@ -221,6 +234,10 @@ export const deployApi = {
   environments: (signal?: AbortSignal) => request<{ environments: Environment[] }>("GET", "/api/deploy/environments", undefined, { signal }).then((r) => r.environments),
   nameFree: (name: string) => request<{ name: string; available: boolean; why?: string | null }>("GET", `/api/deploy/app-names/${enc(name)}`),
   createApp: (ask: AppAsk) => request<App>("POST", "/api/deploy/apps", ask),
+  patchApp: (name: string, patch: AppPatch) => request<App>("PATCH", `/api/deploy/apps/${enc(name)}`, patch),
+  deleteApp: (name: string, o: { everywhere: boolean; keep: boolean }) => request<void>("DELETE", `/api/deploy/apps/${enc(name)}?everywhere=${o.everywhere}&keep=${o.keep}`),
+  environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
+  putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
   register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
   pause: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/pause`, {}),
   resume: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/resume`, {}),
@@ -230,6 +247,7 @@ export const boardHref = "/deployments/releases";
 export const newAppHref = "/deployments/releases/new";
 export const releaseHref = (id: number) => `/deployments/releases/${id}`;
 export const releaseAppHref = (app: string) => `/deployments/releases/apps/${enc(app)}`;
+export const releaseEnvHref = (env: string) => `/deployments/releases/environments/${enc(env)}`;
 
 /** The status dot a release's state shows as. */
 export const STATE_DOT: Record<ReleaseState, string> = {
