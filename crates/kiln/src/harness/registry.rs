@@ -74,11 +74,16 @@ impl Mirror {
     }
 
     /// The state as a frame for its viewers, with what changed in it since the last one.
-    fn state_frame(&mut self) -> Frame {
+    fn state_frame(&mut self) -> Option<Frame> {
+        if self.out.receiver_count() == 0 {
+            // The next viewer starts from a snapshot, not the last viewer's patch baseline.
+            self.sent = Value::Null;
+            return None;
+        }
         let text = json!({"t": "state", "state": self.state}).to_string();
-        let patch = (self.out.receiver_count() > 0).then(|| state_patch(&self.sent, &self.state)).flatten();
+        let patch = state_patch(&self.sent, &self.state);
         self.sent.clone_from(&self.state);
-        Frame { text: Arc::from(text), patch: patch.map(Arc::from) }
+        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from) })
     }
 
     fn reindex(&mut self) {
@@ -494,8 +499,9 @@ impl Registry {
             m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
-                let frame = m.state_frame();
-                m.out.send(frame);
+                if let Some(frame) = m.state_frame() {
+                    m.out.send(frame);
+                }
             }
             m.info.clone()
         };
@@ -854,8 +860,9 @@ impl Registry {
             }
             // A state goes out with the name given here in it (the machine's may lack it).
             let frame = match &u {
-                Update::State { .. } => Some(m.state_frame()),
-                _ => serde_json::to_string(&u).ok().map(Frame::of),
+                Update::State { .. } => m.state_frame(),
+                _ if m.out.receiver_count() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
+                _ => None,
             };
             if let Some(frame) = frame {
                 m.out.send(frame);
@@ -953,8 +960,9 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                let frame = m.state_frame();
-                m.out.send(frame);
+                if let Some(frame) = m.state_frame() {
+                    m.out.send(frame);
+                }
                 infos.push(m.info.clone());
             }
         }
@@ -976,8 +984,9 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                let frame = m.state_frame();
-                m.out.send(frame);
+                if let Some(frame) = m.state_frame() {
+                    m.out.send(frame);
+                }
                 infos.push(m.info.clone());
             }
         }
@@ -1357,13 +1366,13 @@ mod tests {
         let mut live = m.out.subscribe();
         let skills = json!([{"name": "deploy", "description": "Ship it. ".repeat(200)}]);
         m.state = json!({"status": "running", "activity": "reading", "skills": skills, "pause": {"reason": "limit"}});
-        let f = m.state_frame();
+        let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         // The first goes whole: there is nothing before it to patch.
         assert!(f.patch.is_none());
         assert_eq!(f.for_viewer(true), f.for_viewer(false));
         m.out.send(f);
         m.state = json!({"status": "running", "activity": "editing", "skills": skills});
-        let f = m.state_frame();
+        let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         m.out.send(f);
         let first = live.try_recv()?;
         let second = live.try_recv()?;
@@ -1383,6 +1392,27 @@ mod tests {
             had.remove(k.as_str().unwrap_or_default());
         }
         assert_eq!(Value::Object(had.clone()), m.state);
+        Ok(())
+    }
+
+    #[test]
+    fn states_without_viewers_do_not_serialize_or_keep_a_patch_baseline() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info::default(), Location::Local);
+        let viewer = m.out.subscribe();
+        m.state = json!({"status": "running"});
+        assert!(m.state_frame().is_some());
+        drop(viewer);
+        m.state = json!({"status": "running", "activity": "editing"});
+        assert!(m.state_frame().is_none());
+        assert!(m.sent.is_null());
+        let _viewer = m.out.subscribe();
+        let snapshot = m.snapshot();
+        assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": m.state}))));
+        m.state = json!({"status": "idle"});
+        let frame = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
+        // A field that appeared while nobody watched is absent from the whole state too.
+        assert!(frame.patch.is_none());
+        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(true))?, json!({"t": "state", "state": m.state}));
         Ok(())
     }
 
