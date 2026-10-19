@@ -91,3 +91,53 @@
     opacity: 0.8;
   }
 }
+
+/* Live pages you open (live-pages.tsx): what to open and in which profile, in a row that wraps on
+   a phone; the ones open under it. */
+.lp {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lp-open {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+.lp-what {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.lp-profile {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+.lp-go {
+  flex: none;
+  min-height: 40px;
+}
+.lp-says {
+  margin: 0;
+}
+.lp-app {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #a1a3ab;
+  font-size: 12px;
+}
+.lp-app code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #c9cbd3;
+  overflow-wrap: anywhere;
+}
+.lp-error {
+  margin: 0;
+  color: #e3a7a0;
+  font-size: 12px;
+  line-height: 1.5;
+}

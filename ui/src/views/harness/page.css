@@ -58,6 +58,10 @@
   inset: -8px -2px;
   content: "";
 }
+/* The last one's reach stays in the row: past its edge, the row would scroll sideways. */
+.pg-action:last-child::before {
+  right: 0;
+}
 .pg-action:focus-visible {
   outline: 2px solid #bab0e3;
   outline-offset: 2px;

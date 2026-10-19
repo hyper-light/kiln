@@ -232,6 +232,9 @@ pub const CAP_FILES: u32 = 1 << 22;
 /// [`AgentMsg::Build`] capability: the runner streams pages for the people viewing its agent
 /// sessions (`crate::browser::stream`, [`ServerMsg::StreamOpen`], on [`LANE_STREAM`]).
 pub const CAP_STREAM: u32 = 1 << 23;
+/// [`AgentMsg::Build`] capability: the runner says what a person may open live from its sessions
+/// and starts their projects' apps ([`ServerMsg::Preview`], `crate::browser::apps`).
+pub const CAP_PREVIEW: u32 = 1 << 24;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -418,6 +421,12 @@ pub enum ServerMsg {
     StreamInput { stream: String, session: String, json: String },
     /// Close stream `stream`. Appended last: postcard encodes variants by index.
     StreamClose { stream: String, session: String },
+    /// What a person opens live from agent session `session` (`crate::browser::apps`): `json` is
+    /// `{"op": "look"}` (the ports the machine serves, the project's app), `{"op": "start"}` (its
+    /// app, as its `.kiln/preview.yaml` says) or `{"op": "stop"}`; answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_PREVIEW`]. Appended last: postcard
+    /// encodes variants by index.
+    Preview { req: u64, session: String, json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -636,6 +645,17 @@ mod tests {
         assert!(CAP_FILES.is_power_of_two() && CAP_FILES & taken == 0, "CAP_FILES is a bit of its own");
         let lanes = [LANE_CONTROL, LANE_TERM, LANE_LOGS, LANE_SYNC, LANE_REACH, 5, LANE_CONVO];
         assert!(LANE_FILES < 8 && !lanes.contains(&LANE_FILES), "a lane of its own, within the eight a peer has");
+        Ok(())
+    }
+
+    #[test]
+    fn previews_are_appended_after_streams() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::StreamClose { stream: "v".into(), session: "s".into() })?;
+        let m = ServerMsg::Preview { req: 3, session: "s".into(), json: "{\"op\":\"look\"}".into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "Preview comes right after StreamClose");
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        assert!(CAP_PREVIEW.is_power_of_two() && CAP_PREVIEW > CAP_STREAM);
         Ok(())
     }
 

@@ -16,6 +16,7 @@ import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { Goals } from "./goals";
+import { LivePages } from "./live-pages";
 
 const NO_EVENTS: HEvent[] = [];
 
@@ -342,6 +343,12 @@ export function Inspector({
           <div className="in-secs">
             {/* What it has going: shells and monitors it left running, subagents, the commands it ran. */}
             {agentId && send && <Background state={state} agent={agentId} send={send} />}
+            {agentId && (
+              <section>
+                <h3 className="in-sec-head">Live pages</h3>
+                <LivePages session={agentId} />
+              </section>
+            )}
             {tasks.length > 0 && (
               <section>
                 <h3 className="in-sec-head">Subagents<span>{tasks.length}</span></h3>

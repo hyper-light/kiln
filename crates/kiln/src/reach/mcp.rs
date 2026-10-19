@@ -667,6 +667,7 @@ impl Server {
                 let mut q = args.clone();
                 if let Some(o) = q.as_object_mut() {
                     o.insert("op".into(), json!("act"));
+                    o.insert("session".into(), json!(self.session));
                 }
                 match self.browser(&q) {
                     Ok(done) => picture_result(&done, done.get("picture_path").and_then(Value::as_str)),

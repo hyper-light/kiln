@@ -11,6 +11,8 @@ export interface LiveStream {
   session: string;
   url: string;
   title: string;
+  /** The browser profile it runs in, when not the conversation's (it starts again in the same). */
+  profile?: "clean" | "personal";
 }
 
 /** Whether a tool call is an agent showing a live page (Claude Code's and Codex's names for kiln's tool). */

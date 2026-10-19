@@ -2275,6 +2275,8 @@ textarea.hx-input {
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-secondary);
+  /* A path or an address in it breaks rather than widening the tab. */
+  overflow-wrap: anywhere;
 }
 .hx-skill-search {
   display: flex;

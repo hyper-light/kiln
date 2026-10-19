@@ -1263,6 +1263,21 @@ const server = http.createServer(async (req, res) => {
     }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
+    // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
+    const live = /^\/api\/harness\/sessions\/([^/]+)\/(preview|preview\/stop|streams)$/.exec(p);
+    if (live) {
+      if (live[2] === "preview" && m === "GET")
+        return json(res, 200, {
+          ports: [
+            { port: 5173, address: "127.0.0.1", pid: 4242, command: "node", agents: true },
+            { port: 8080, address: "0.0.0.0", pid: 977, command: "python3", agents: false },
+          ],
+          app: { configured: true, start: "npm run dev", port: 5173, path: "/", running: null },
+        });
+      if (live[2] === "preview/stop" && m === "POST") return json(res, 200, { stopped: false });
+      if (live[2] === "streams" && m === "GET") return json(res, 200, []);
+      if (live[2] === "streams" && m === "POST") return err(res, 409, "the mock doesn't stream pages: run a kiln server and a runner for live pages");
+    }
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

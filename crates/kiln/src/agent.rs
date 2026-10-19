@@ -1838,6 +1838,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.close(&session);
                         }
+                        // What it had going live: its app, its streams.
+                        crate::browser::apps::stop(&session);
+                        let dir = o.state_dir.clone();
+                        crate::rt::spawn(async move { crate::browser::stream::streams().close_session(&dir, &session).await });
                     }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
@@ -2065,6 +2069,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::StreamInput { stream, session: _, json } => crate::browser::stream::serve_input(&stream, &json),
                     ServerMsg::StreamClose { stream, session: _ } => {
                         crate::rt::spawn(async move { crate::browser::stream::streams().close(&stream).await });
+                    }
+                    // What a person opens live from one of its sessions (`crate::browser::apps`).
+                    ServerMsg::Preview { req, session, json } => {
+                        let (up, dir) = (uplink.0.clone(), o.state_dir.clone());
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| (std::path::PathBuf::from(s.info().cwd), *s.pid.lock()));
+                        crate::rt::spawn(async move {
+                            let answer = match found {
+                                None => serde_json::json!({"error": "no such session here"}),
+                                Some((cwd, pid)) => crate::browser::apps::serve(&dir, &session, &cwd, pid, &json).await,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
+                        });
                     }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.

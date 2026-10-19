@@ -7,7 +7,7 @@
  * view it's let go (the stream pauses, nothing is sent) and its last picture stays.
  */
 import * as React from "react";
-import { ArrowLeft, ArrowRight, Keyboard, RotateCw, Volume2, VolumeX } from "lucide-react";
+import { ArrowLeft, ArrowRight, Keyboard, RotateCw, Volume2, VolumeX, X } from "lucide-react";
 import type { ToolCall } from "@/api/harness";
 import { Beam, PrismLabel } from "./signals";
 import { chunkOf, liveOf, modifiers, type LiveStream } from "./live-of";
@@ -181,8 +181,8 @@ function agentWords(did: Record<string, unknown>[]): string {
   return said.length ? `the agent ${said.join(", ")}` : "";
 }
 
-/** The live page, its controls above it. */
-function Live({ stream: first, ev }: { stream: LiveStream; ev: string }) {
+/** The live page, its controls above it (`onClose`: it may be closed from here). */
+export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: string; onClose?: () => void }) {
   const [stream, setStream] = React.useState(first);
   const [status, setStatus] = React.useState<Status>(decodes ? "connecting" : "unsupported");
   const [why, setWhy] = React.useState("");
@@ -361,7 +361,7 @@ function Live({ stream: first, ev }: { stream: LiveStream; ev: string }) {
     setEditing(null);
   };
   const startAgain = async () => {
-    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600 }) });
+    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile }) });
     if (!r.ok) {
       setWhy((await r.text()) || "It couldn't start again.");
       return;
@@ -405,6 +405,12 @@ function Live({ stream: first, ev }: { stream: LiveStream; ev: string }) {
             <Keyboard size={12} aria-hidden="true" />
             Type
           </button>
+          {onClose && (
+            <button type="button" className="pg-action" onClick={onClose}>
+              <X size={12} aria-hidden="true" />
+              Close
+            </button>
+          )}
         </span>
       </div>
       <div className="lv-bar">

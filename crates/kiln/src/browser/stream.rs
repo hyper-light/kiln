@@ -2,8 +2,9 @@
 //! machine (its dev server, its files, its network, its GPU) runs here, in a real browser, and its
 //! picture and sound go to whoever looks at it, live; what they do in it comes back.
 //!
-//! Each stream is a tab of a browser of its own profile (a conversation's: its cookies kept
-//! between streams; or a clean one each time), with kiln's capture extension in it (`extension/`).
+//! Each stream is a tab of a browser of its profile's (a conversation's: its cookies kept between
+//! its streams, removed as it closes; a person's own, kept across conversations; or a clean one,
+//! a browser of the stream's own), with kiln's capture extension in it (`extension/`).
 //! The extension captures the tab as its compositor draws it, only when something changed, and
 //! encodes it with WebCodecs: H.264 (or VP8/VP9/AV1 when asked) at the viewer's own size and pixel
 //! density, Opus for its sound, a sharp key frame once the page is still. Its chunks come to kiln
@@ -43,13 +44,17 @@ const IDLE_BROWSER: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
     pub url: String,
+    /// A phone's until its viewer says its own size.
+    #[serde(default = "phone_width")]
     pub width: u32,
+    #[serde(default = "phone_height")]
     pub height: u32,
     #[serde(default = "two")]
     pub scale: f64,
     #[serde(default)]
     pub mobile: bool,
-    /// `conversation:<session>` (kept between its streams) or `clean` (fresh each time).
+    /// `conversation:<session>` (kept between its streams), `personal:<them>` (a person's own,
+    /// kept across conversations) or `clean` (new each time).
     #[serde(default = "clean")]
     pub profile: String,
     /// "h264" (the default), "vp8", "vp9", "av1".
@@ -65,6 +70,12 @@ pub struct Spec {
 
 fn two() -> f64 {
     2.0
+}
+fn phone_width() -> u32 {
+    390
+}
+fn phone_height() -> u32 {
+    640
 }
 fn clean() -> String {
     "clean".to_owned()
@@ -110,10 +121,17 @@ fn extension(dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(at)
 }
 
+/// The folder name of a kept profile ("conversation:<session>", "personal:<who>").
+fn profile_key(profile: &str) -> String {
+    profile.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_")
+}
+
 /// A profile's browser, streaming: its extension's worker and offscreen document attached, and
 /// where each stream's chunks go.
 struct Streamer {
     browser: Arc<Browser>,
+    /// A clean profile's: its one stream's, stopped (and its profile removed) as that closes.
+    alone: bool,
     worker: String,
     offscreen: futures::lock::Mutex<Option<String>>,
     outs: Arc<Mutex<HashMap<String, async_channel::Sender<Out>>>>,
@@ -130,6 +148,8 @@ pub struct Stream {
     inputs: async_channel::Sender<Vec<Input>>,
     /// Laid out as a phone's (touch, a phone's viewport): what its viewer is.
     mobile: std::sync::atomic::AtomicBool,
+    /// In a person's own profile (their sign-ins): theirs to use, not an agent's.
+    personal: bool,
     /// Where what it says goes (its viewers, through the server).
     out: async_channel::Sender<Out>,
 }
@@ -157,20 +177,22 @@ impl Streams {
             return Ok(s.clone());
         }
         let ext = extension(dir)?;
-        let key = profile.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_");
-        let persistent = profile.starts_with("conversation:").then(|| dir.join("browser").join("streams").join(&key));
+        // A conversation's or a person's profile is kept between its streams; a clean one isn't.
+        let persistent = (profile.starts_with("conversation:") || profile.starts_with("personal:")).then(|| dir.join("browser").join("streams").join(profile_key(profile)));
         let browser = Arc::new(Browser::start_with(dir, super::Launch { profile: persistent, extension: Some(ext), id: EXTENSION_ID }).await?);
         let cdp = browser.cdp.clone();
         let worker = super::target(&cdp, |t| t.get("type").and_then(Value::as_str) == Some("service_worker") && t.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with(&format!("chrome-extension://{EXTENSION_ID}/")))).await?;
         let worker = cdp.call(None, "Target.attachToTarget", json!({"targetId": worker, "flatten": true})).await?.get("sessionId").and_then(Value::as_str).unwrap_or("").to_owned();
-        let s = Arc::new(Streamer { browser, worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default() });
+        let s = Arc::new(Streamer { browser, alone: profile.starts_with("clean:"), worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default() });
         g.insert(profile.to_owned(), s.clone());
         Ok(s)
     }
 
     /// Open a stream of `spec` as `id`; its chunks and events go to `out`.
     pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
-        let s = self.streamer(dir, &spec.profile).await?;
+        // A clean profile is new each time: a browser of the stream's own.
+        let profile = if spec.profile == "clean" { format!("clean:{id}") } else { spec.profile.clone() };
+        let s = self.streamer(dir, &profile).await?;
         let mark = hex::encode(rand::random::<[u8; 8]>());
         let page = s.browser.tab(&format!("about:blank#kiln-{mark}")).await?;
         let scale = spec.scale.clamp(1.0, 3.0);
@@ -204,7 +226,7 @@ impl Streams {
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), out: out.clone() });
+        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), personal: spec.profile.starts_with("personal:"), out: out.clone() });
         crate::rt::spawn(watch(stream.clone(), out.clone()));
         // What viewers do, applied in the order they did it.
         let applying = Arc::downgrade(&stream);
@@ -260,7 +282,7 @@ impl Streams {
     }
 
     /// Close a stream: its capture stops, its tab goes. A browser left with no streams stops a
-    /// while later (unless one opens meanwhile).
+    /// while later (unless one opens meanwhile); a clean profile's stops now, and its profile goes.
     pub async fn close(&self, id: &str) {
         let Some(s) = self.open.lock().remove(id) else { return };
         let cdp = s.streamer.browser.cdp.clone();
@@ -271,6 +293,11 @@ impl Streams {
         let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": s.page.target()})).await;
         let streamer = s.streamer.clone();
         drop(s);
+        if streamer.alone {
+            self.streamers.lock().await.retain(|_, s| !Arc::ptr_eq(s, &streamer));
+            streamer.browser.stop();
+            return;
+        }
         crate::rt::spawn(async move {
             crate::rt::sleep(IDLE_BROWSER).await;
             streams().stop_if_idle(&streamer).await;
@@ -288,11 +315,21 @@ impl Streams {
         }
     }
 
-    /// A session's streams on this machine close (it closed).
-    pub async fn close_session(&self, session: &str) {
+    /// A session's streams on this machine close (it closed), and its conversation's profile goes
+    /// with them: its browser stops, its cookies and storage are removed.
+    pub async fn close_session(&self, dir: &Path, session: &str) {
         let ids: Vec<String> = self.open.lock().values().filter(|s| s.session == session).map(|s| s.id.clone()).collect();
         for id in ids {
             self.close(&id).await;
+        }
+        let profile = format!("conversation:{session}");
+        let browser = self.streamers.lock().await.remove(&profile);
+        if let Some(s) = browser {
+            s.browser.stop();
+        }
+        let kept = dir.join("browser").join("streams").join(profile_key(&profile));
+        if kept.exists() {
+            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(kept)).await;
         }
     }
 }
@@ -357,6 +394,9 @@ pub async fn serve_control(id: String, json: String) {
 #[derive(Debug, Deserialize)]
 pub struct Act {
     pub stream: String,
+    /// The agent session asking (its MCP server's): only its own streams are its to use.
+    #[serde(default)]
+    pub session: String,
     #[serde(default)]
     pub actions: Vec<Value>,
     #[serde(default = "yes")]
@@ -368,7 +408,8 @@ fn yes() -> bool {
 }
 
 pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
-    let s = streams().get(&a.stream).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
+    let s = streams().get(&a.stream).filter(|s| s.session == a.session).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
+    anyhow::ensure!(!s.personal, "that page is open in its person's own profile (their sign-ins): it's theirs to use, not yours. Show it yourself with show_live to use it");
     let mut did = Vec::new();
     let point = |v: &Value| -> Option<(f64, f64)> {
         let p = v.as_array()?;
