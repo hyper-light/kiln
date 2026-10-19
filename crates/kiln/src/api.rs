@@ -3028,43 +3028,83 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
 /// After a snapshot on an agent session's socket: what was resent is complete.
 const SYNCED: &str = r#"{"t":"synced"}"#;
 
+/// What a viewer of an agent session takes, as its socket's query says.
+#[derive(Debug, Clone, Copy, Default)]
+struct Takes {
+    /// `z=gzip`: each snapshot packed. What a long conversation sends on attach is most of what it
+    /// ever sends, and on a slow link a tenth of it arrives ten times sooner.
+    packed: bool,
+    /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's.
+    patches: bool,
+}
+
+impl Takes {
+    fn of(query: Option<&str>) -> Self {
+        let has = |p: &str| query.is_some_and(|q| q.split('&').any(|x| x == p));
+        Self { packed: has("z=gzip"), patches: has("patch=state") }
+    }
+}
+
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
+    let takes = Takes::of(req.uri().query());
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = harness_attach(hub, id, socket).await {
+        if let Err(e) = harness_attach(hub, id, socket, takes).await {
             tracing::debug!(error = %format!("{e:#}"), "agent session websocket ended");
         }
     });
     Ok(resp)
 }
 
+/// A snapshot's frames and the `synced` after them, gzip'd as one message: a frame a line (frames
+/// are JSON, whose strings escape their line breaks).
+fn pack_snapshot(frames: &[String]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    for f in frames {
+        gz.write_all(f.as_bytes())?;
+        gz.write_all(b"\n")?;
+    }
+    gz.write_all(SYNCED.as_bytes())?;
+    gz.finish()
+}
+
+/// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
+/// one gzip'd binary message.
+async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -> anyhow::Result<()> {
+    if packed {
+        let bytes = crate::rt::blocking(move || pack_snapshot(&frames)).await??;
+        tx.send(ws::binary(bytes)).await?;
+        return Ok(());
+    }
+    for f in frames {
+        tx.send(ws::text(f)).await?;
+    }
+    tx.send(ws::text(SYNCED)).await?;
+    Ok(())
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
 /// so a viewer can swap it in at once instead of clearing what it shows.
-async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> anyhow::Result<()> {
+async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
     let Some(att) = hub.harness.attach(&id) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
-    for f in att.frames {
-        tx.send(ws::text(f)).await?;
-    }
-    tx.send(ws::text(SYNCED)).await?;
+    send_snapshot(&mut tx, att.frames, takes.packed).await?;
     let mut live = att.live;
     loop {
         futures::select_biased! {
             f = live.recv().fuse() => match f {
-                Ok(frame) => tx.send(ws::text(frame.as_ref())).await?,
+                Ok(frame) => tx.send(ws::text(frame.for_viewer(takes.patches))).await?,
                 Err(async_broadcast::RecvError::Overflowed(_)) => {
                     // Fell behind: start over from the current state (it begins with "open").
-                    for f in hub.harness.frames(&id).unwrap_or_default() {
-                        tx.send(ws::text(f)).await?;
-                    }
-                    tx.send(ws::text(SYNCED)).await?;
+                    send_snapshot(&mut tx, hub.harness.frames(&id).unwrap_or_default(), takes.packed).await?;
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },
@@ -3137,6 +3177,34 @@ async fn readyz(hub: &Hub) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_viewer_takes_what_its_query_asks_for() {
+        let t = Takes::of(Some("z=gzip&patch=state"));
+        assert!(t.packed && t.patches);
+        let t = Takes::of(Some("patch=state"));
+        assert!(!t.packed && t.patches);
+        let t = Takes::of(None);
+        assert!(!t.packed && !t.patches);
+        assert!(!Takes::of(Some("z=gzipped&patch=states")).packed);
+    }
+
+    #[test]
+    fn a_packed_snapshot_unpacks_to_its_frames_then_synced() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let long = format!(r#"{{"t":"events","events":[{{"id":"e1","text":"{}\nsecond line"}}]}}"#, "word ".repeat(4000));
+        let frames = vec![r#"{"t":"open","info":{}}"#.to_owned(), long.clone(), r#"{"t":"state","state":{}}"#.to_owned()];
+        let packed = pack_snapshot(&frames)?;
+        // A long conversation packs small.
+        assert!(packed.len() * 10 < long.len(), "{} bytes packed from {}", packed.len(), long.len());
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut text)?;
+        let lines: Vec<&str> = text.split('\n').collect();
+        let mut want: Vec<&str> = frames.iter().map(String::as_str).collect();
+        want.push(SYNCED);
+        assert_eq!(lines, want);
+        Ok(())
+    }
 
     #[test]
     fn release_downloads() {

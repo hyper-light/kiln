@@ -771,6 +771,25 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 .hx-turn .hx-work {
   border-top: 0;
 }
+/* Where what came before the turns in the page joins as you scroll up to it: nothing to see. */
+.hx-earlier {
+  height: 1px;
+}
+/* A long turn's earlier steps, a tap away. */
+.hx-earlier-steps {
+  display: block;
+  min-height: 32px;
+  padding: 6px 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-decoration: underline;
+  text-decoration-color: #8f929b55;
+  text-underline-offset: 3px;
+}
+.hx-earlier-steps:hover {
+  color: var(--color-bright);
+}
 /* The end of a turn under way while nothing at its end moves: what it's doing, and for how long
    since its last step. */
 .hx-live-tail {
