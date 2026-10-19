@@ -211,9 +211,10 @@ async fn stop(cx: Cx, v: Value) -> Out {
     known(&cx, &id)?;
     may_steer(&cx, &id)?;
     let mut ended: Vec<String> = Vec::new();
-    // Its children first, the deepest first, so none outlives the one it reports to.
+    // Its children first (those that ended too: they leave with it), the deepest first, so none
+    // outlives the one it reports to.
     if flag(&v, "children") {
-        let mut kids = lineage::live_descendants(&cx.hub.harness.list(), &id);
+        let mut kids = lineage::descendants(&cx.hub.harness.list(), &id);
         kids.reverse();
         for k in kids {
             if end(&cx.hub, &k.id, &cx.caller.name).await {
@@ -337,7 +338,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.stop",
-            summary: "End an agent you started for good (its changes stay on disk); with `children`, the agents it started too.",
+            summary: "End an agent you started for good (its changes stay on disk); with `children`, the agents it started (and theirs) too.",
             read_only: false,
             destructive: true,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "children": {"type": "boolean", "description": "End the agents it started (and theirs) too."}}), &["agent"]),
@@ -373,5 +374,142 @@ mod tests {
         assert!(ids_of(&json!({})).is_err());
         assert_eq!(number(&json!({"timeout_s": "12"}), "timeout_s"), Some(12.0));
         assert!(flag(&json!({"any": "true"}), "any") && flag(&json!({"any": true}), "any") && !flag(&json!({}), "any"));
+    }
+}
+
+/// The operations end to end on a hub of their own, under a timeout: a parent that asks starts a
+/// child with no more than it has, through `crate::ops::call` (the route table, the audit trail,
+/// the registry). No harness ever runs: the children's folder doesn't exist, so they can't start,
+/// and the parent's program is missing.
+#[cfg(test)]
+mod end_to_end {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+
+    use crate::harness::session::Spec;
+    use crate::hub::Hub;
+    use crate::ops::{Cx, call};
+
+    /// A parent agent kiln runs on the server, in mode `mode`.
+    async fn parent(hub: &Arc<Hub>, mode: &str, allow_bypass: bool) -> anyhow::Result<String> {
+        let dir = tempfile::tempdir()?.keep();
+        let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), mode: Some(mode.into()), program: Some(dir.join("no-claude").to_string_lossy().into_owned()), allow_bypass, ..Spec::default() };
+        let infos = hub.harness.open(hub, "local", spec, 1).await?;
+        let id = infos.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no parent"))?;
+        // Its machine reports its mode (the registry follows the server's own sessions).
+        for _ in 0..200 {
+            if hub.harness.info(&id).is_some_and(|i| i.mode == mode) {
+                return Ok(id);
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::bail!("the parent's mode never showed")
+    }
+
+    async fn as_agent(hub: &Arc<Hub>, id: &str) -> anyhow::Result<Cx> {
+        let caller = crate::mcp::session_caller(hub, id, None).await.map_err(anyhow::Error::msg)?;
+        Ok(Cx { hub: Arc::clone(hub), caller })
+    }
+
+    const NOWHERE: &str = "/nonexistent/kiln-agents-test";
+
+    fn run(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::rt::block_on(f));
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("the operations hung (a lock held across a wait?)"),
+        }
+    }
+
+    async fn hub_with(f: impl FnOnce(&mut crate::config::Config)) -> anyhow::Result<Arc<Hub>> {
+        let hub = crate::hub::tests::scratch_hub_with(|c| {
+            c.terminal.enabled = true;
+            f(c);
+        })
+        .await?;
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        Ok(hub)
+    }
+
+    #[test]
+    fn a_child_asked_for_more_than_its_parent_has_is_refused_and_one_within_it_starts() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let p = parent(&hub, "default", true).await?;
+            let cx = as_agent(&hub, &p).await?;
+            // Bypass under a parent that asks: refused, and nothing starts.
+            let before = hub.harness.list().len();
+            let refused = call(cx.clone(), "agents.start", json!({"kind": "claude", "mode": "bypassPermissions", "cwd": NOWHERE})).await;
+            let Err((status, why)) = refused else { anyhow::bail!("bypass under ask started") };
+            anyhow::ensure!(status == http::StatusCode::FORBIDDEN && why.contains("above its own ask"), "{status} {why}");
+            anyhow::ensure!(hub.harness.list().len() == before, "nothing started");
+            // Codex's full access, and its default (auto), are above ask too: it starts in untrusted.
+            anyhow::ensure!(call(cx.clone(), "agents.start", json!({"kind": "codex", "mode": "full-access", "cwd": NOWHERE})).await.is_err());
+            let codex = call(cx.clone(), "agents.start", json!({"kind": "codex", "cwd": NOWHERE, "prompt": "list the files"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let cid = codex.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let child = hub.harness.info(&cid).ok_or_else(|| anyhow::anyhow!("no child"))?;
+            anyhow::ensure!(child.parent.as_deref() == Some(p.as_str()), "the parent is the agent that asked");
+            anyhow::ensure!(child.mode == "untrusted" || hub.harness.state(&cid).is_some_and(|s| s.mode == "untrusted") || child.mode.is_empty(), "codex starts at most at ask: {}", child.mode);
+            anyhow::ensure!(codex.get("parent") == Some(&json!(p)));
+            // Within its parent's: as asked.
+            let plan = call(cx.clone(), "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE, "name": "planner"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let kid = plan.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or("").to_owned();
+            // It can't start (its folder isn't there): it has stopped, and a wait says so at once.
+            let waited = call(cx.clone(), "agents.wait", json!({"agent": kid, "timeout_s": 20})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(waited.get("done") == Some(&json!(true)), "{waited}");
+            anyhow::ensure!(matches!(waited.pointer("/agents/0/stand").and_then(Value::as_str), Some("stopped" | "ended")), "{waited}");
+            let result = call(cx.clone(), "agents.result", json!({"agent": kid})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(result.get("changes").is_some() && result.get("workspace") == Some(&Value::Null) && result.get("reply").is_some(), "{result}");
+            // The parent lists its children; a person's list filters by parent too.
+            let mine = call(cx.clone(), "agents.list", json!({"parent": p})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(mine.get("agents").and_then(Value::as_array).map(Vec::len) == Some(2), "{mine}");
+            // Another agent can't steer or end them; their parent can, and ends them with it.
+            let other = parent(&hub, "default", true).await?;
+            let stranger = as_agent(&hub, &other).await?;
+            let Err((s, _)) = call(stranger, "agents.send", json!({"agent": kid, "text": "stop that"})).await else { anyhow::bail!("a stranger steered a child") };
+            anyhow::ensure!(s == http::StatusCode::FORBIDDEN);
+            let ended = call(cx.clone(), "agents.stop", json!({"agent": p, "children": true})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(ended.get("ended").and_then(Value::as_array).map(Vec::len) == Some(3), "the parent and its two children: {ended}");
+            anyhow::ensure!(hub.harness.info(&kid).is_none() && hub.harness.info(&cid).is_none() && hub.harness.info(&p).is_none());
+            // Every change was audited as the agent, for its person.
+            let rows = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM audit2 WHERE principal LIKE 'agent:%' AND on_behalf_of = 'admin'", [], |r| r.get::<_, i64>(0))?)).await.unwrap_or(0);
+            anyhow::ensure!(rows > 0, "audited as agent:<id> for its person");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn bypass_needs_the_parent_s_own_and_chains_and_children_are_bounded() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|c| {
+                c.agents.max_depth = 1;
+                c.agents.max_children = 1;
+            })
+            .await?;
+            // A parent in bypass that was started without it may not hand it on.
+            let p = parent(&hub, "bypassPermissions", false).await?;
+            let cx = as_agent(&hub, &p).await?;
+            let Err((_, why)) = call(cx.clone(), "agents.start", json!({"kind": "claude", "mode": "bypassPermissions", "cwd": NOWHERE})).await else { anyhow::bail!("bypass without allow_bypass") };
+            anyhow::ensure!(why.contains("bypass"), "{why}");
+            // One child at once.
+            let one = call(cx.clone(), "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let kid = one.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or("").to_owned();
+            // (It stopped: it isn't running, so another may start.)
+            let two = call(cx.clone(), "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE, "count": 2})).await;
+            anyhow::ensure!(two.as_ref().is_err_and(|(_, m)| m.contains("max_children")), "{two:?}");
+            // A child is 1 deep: with max_depth 1 it may not start one of its own.
+            let deep = as_agent(&hub, &kid).await?;
+            let Err((_, why)) = call(deep, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE})).await else { anyhow::bail!("too deep") };
+            anyhow::ensure!(why.contains("max_depth"), "{why}");
+            Ok(())
+        })
     }
 }

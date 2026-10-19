@@ -235,8 +235,8 @@ pub fn descends(all: &[Info], id: &str, ancestor: &str) -> bool {
     false
 }
 
-/// The agents still running that agent `id` started, and theirs, nearest first.
-pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
+/// Every agent kiln still lists that agent `id` started, and theirs, nearest first.
+pub fn descendants(all: &[Info], id: &str) -> Vec<Info> {
     let mut out: Vec<Info> = Vec::new();
     let mut frontier = vec![id.to_owned()];
     while let Some(p) = frontier.pop() {
@@ -245,12 +245,15 @@ pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
                 continue;
             }
             frontier.push(c.id.clone());
-            if c.status != Status::Exited {
-                out.push(c.clone());
-            }
+            out.push(c.clone());
         }
     }
     out
+}
+
+/// The agents still running that agent `id` started, and theirs, nearest first.
+pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
+    descendants(all, id).into_iter().filter(|c| c.status != Status::Exited).collect()
 }
 
 /// What an agent asks to start (`agents.start`).
@@ -538,5 +541,6 @@ mod tests {
         assert!(live.contains(&"b".to_owned()) && live.contains(&"c".to_owned()) && live.contains(&"e".to_owned()));
         assert!(!live.contains(&"d".to_owned()), "an ended child isn't live (its own children are)");
         assert!(live_descendants(&all, "x").is_empty());
+        assert_eq!(descendants(&all, "a").len(), 4, "ended ones too, for ending them with their parent");
     }
 }
