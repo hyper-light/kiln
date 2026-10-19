@@ -26,8 +26,8 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 | | Workstream | Depends on | Status |
 |---|---|---|---|
 | N | Notifications and a phone-first Mission Control | — | done: N1–N3 (docs/notifications.md); an iPhone check by a person is left |
-| O | Agents that run agents | — | building |
-| P | A plan run as one agent per step | O (W for parallel steps) | next |
+| O | Agents that run agents | — | built: O1–O5 (docs/agents.md, "Agents that run agents"), tested on a hub in process; O-AC1 with real harnesses across two machines not run yet |
+| P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P3 for steps in order (parallel steps run one at a time until workspaces exist, and say so); P4 waits on C |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | next |
 | W | Workspaces: Slates volumes, then Shards microVMs | — (Shards: its networking and file device) | designing |
 | C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | designing |
