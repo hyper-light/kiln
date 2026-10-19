@@ -412,11 +412,15 @@ pub struct Observe {
     /// How often the server looks at its own host, container and process (`crate::observe::host`;
     /// 0: never). Runners look as often as `KILN_OBSERVE_HOST_SECONDS` says, 15 unless it does.
     pub host_seconds: u32,
+    /// Threads queries may read series on beside their own, shared by every query at once (0: each
+    /// reads on its own thread alone), at a lower priority than the server's other work. Unset: a
+    /// quarter of the cores the server may run on, less one (docs/observe.md §12.19).
+    pub query_helpers: Option<u32>,
 }
 
 impl Default for Observe {
     fn default() -> Self {
-        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0, host_seconds: 15 }
+        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0, host_seconds: 15, query_helpers: None }
     }
 }
 

@@ -1568,28 +1568,79 @@ const ALONE: std::time::Duration = std::time::Duration::from_millis(2);
 /// many threads holds is bounded (`grid.n` values a series).
 const ROUND: usize = 64;
 
-/// Helper threads queries may read on beside their own, taken and given back: half the machine's
-/// cores, less one, shared by every query at once.
-fn helpers_free() -> &'static std::sync::atomic::AtomicUsize {
-    static FREE: std::sync::OnceLock<std::sync::atomic::AtomicUsize> = std::sync::OnceLock::new();
-    FREE.get_or_init(|| std::sync::atomic::AtomicUsize::new(std::thread::available_parallelism().map_or(1, std::num::NonZero::get).div_ceil(2).saturating_sub(1)))
+/// Helper threads queries may read on beside their own, shared by every query at once: how many
+/// at the most, and how many are taken.
+struct Budget {
+    limit: std::sync::atomic::AtomicUsize,
+    taken: std::sync::atomic::AtomicUsize,
 }
 
-/// Helpers taken, given back as they go.
-struct Helpers(usize);
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self { limit: std::sync::atomic::AtomicUsize::new(limit), taken: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// As many as `want` taken, as many as are free.
+    fn take(&self, want: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        let mut got = 0;
+        // `got` is the last try's: none if it found none free, else what it took.
+        let _ = self.taken.try_update(Ordering::AcqRel, Ordering::Acquire, |t| {
+            got = want.min(self.limit.load(Ordering::Acquire).saturating_sub(t));
+            (got > 0).then_some(t + got)
+        });
+        got
+    }
+
+    fn give(&self, n: usize) {
+        self.taken.fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn budget() -> &'static Budget {
+    static B: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
+    B.get_or_init(|| Budget::new(default_helpers()))
+}
+
+/// Helper threads queries read on unless [`set_helpers`] says otherwise: a quarter of the cores this
+/// process may run on (its CPU quota and affinity counted), less one; none on four or fewer.
+/// Measured (`docs/observe.md` §12.19): on 32 cores, 7 helpers read the widest query as fast as 15
+/// (its reading bound by memory past them), while the writes taken beside it wait half as long in
+/// their tail; a small machine keeps its cores for what it takes.
+#[must_use]
+pub fn default_helpers() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get).div_ceil(4).saturating_sub(1)
+}
+
+/// How many helper threads queries may read on beside their own, shared by every query at once (0:
+/// each reads on its own thread alone). A query already reading on more keeps them until it is
+/// done; none takes another past the bound.
+pub fn set_helpers(n: usize) {
+    budget().limit.store(n, std::sync::atomic::Ordering::Release);
+}
+
+/// What each helper thread runs first: the server's lowers its priority, so a query's helpers
+/// yield to the writes it takes. Set once; later calls are ignored.
+pub fn on_helper_start(f: fn()) {
+    let _ = HELPER_START.set(f);
+}
+
+static HELPER_START: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Helpers taken, given back as they go (a test's forced count, taken from nothing).
+struct Helpers(usize, bool);
 
 impl Helpers {
     fn take(want: usize) -> Self {
-        use std::sync::atomic::Ordering;
-        let free = helpers_free();
-        let got = free.try_update(Ordering::AcqRel, Ordering::Acquire, |f| Some(f - f.min(want))).map_or(0, |f| f.min(want));
-        Self(got)
+        Self(budget().take(want), true)
     }
 }
 
 impl Drop for Helpers {
     fn drop(&mut self) {
-        helpers_free().fetch_add(self.0, std::sync::atomic::Ordering::AcqRel);
+        if self.1 {
+            budget().give(self.0);
+        }
     }
 }
 
@@ -1606,81 +1657,162 @@ fn forced_threads() -> Option<usize> {
 
 /// Every series of `ids` (in their fingerprints' order) read, and its values added into its
 /// group's (`group_of`) in that order, as one thread would add them: the same bits however they
-/// were read. On this thread alone while it is quick ([`ALONE`]); then, helpers free, a round at a
-/// time on as many threads, each round's values added in order after it.
+/// were read. On this thread alone while it is quick ([`ALONE`]); then, helpers free, the rest on
+/// as many threads ([`read_together`]).
 fn read_groups(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc], reader: &mut Reader, scanned: &mut (u64, u64)) -> Result<(), QueryError> {
     let started = std::time::Instant::now();
-    let n = at.grid.n;
-    let mut helpers: Option<Helpers> = None;
+    let forced = forced_threads();
+    let mut asked = false;
     let mut i = 0;
     while i < ids.len() {
         let left = ids.len() - i;
-        let forced = forced_threads();
-        if helpers.is_none() && forced.is_none() && left > ROUND && started.elapsed() >= ALONE {
-            helpers = Some(Helpers::take(left.div_ceil(ROUND) - 1));
-        }
-        let workers = forced.unwrap_or_else(|| helpers.as_ref().map_or(0, |h| h.0) + 1);
-        if workers == 1 {
-            let (Some(&id), Some(&g)) = (ids.get(i), group_of.get(i)) else { break };
-            if let Some(samples) = reader.read(at, id)? {
-                scanned.0 += 1;
-                scanned.1 += samples;
-                if let Some(a) = acc.get_mut(g) {
-                    a.add(&reader.buckets, None);
-                }
+        if !asked && (forced.is_some() || (left > ROUND && started.elapsed() >= ALONE)) {
+            asked = true;
+            let helpers = match forced {
+                Some(t) => Helpers(t.saturating_sub(1), false),
+                None => Helpers::take(left.div_ceil(ROUND) - 1),
+            };
+            if helpers.0 > 0 {
+                let (Some(rest), Some(groups)) = (ids.get(i..), group_of.get(i..)) else { break };
+                return read_together(at, rest, groups, acc, reader, scanned, helpers.0 + 1);
             }
-            i += 1;
-            continue;
         }
-        let round = left.min(workers * ROUND);
-        let Some(part_ids) = ids.get(i..i + round) else { break };
-        let per = round.div_ceil(workers);
-        // Each part: its series' values, whether each was there, and the samples read.
-        type Part = Result<(Vec<f64>, Vec<bool>, u64), QueryError>;
-        let read_part = |r: &mut Reader, part: &[u32]| -> Part {
-            let mut values = Vec::with_capacity(part.len() * n);
-            let mut there = Vec::with_capacity(part.len());
-            let mut samples = 0;
-            for &id in part {
-                match r.read(at, id)? {
-                    Some(k) => {
-                        samples += k;
-                        values.extend_from_slice(&r.buckets);
-                        there.push(true);
-                    }
-                    None => {
-                        values.resize(values.len() + n, f64::NAN);
-                        there.push(false);
-                    }
-                }
-            }
-            Ok((values, there, samples))
-        };
-        let parts: Vec<Part> = std::thread::scope(|scope| {
-            let mut chunks = part_ids.chunks(per);
-            let mine = chunks.next().unwrap_or(&[]);
-            let handles: Vec<_> = chunks.map(|c| scope.spawn(move || read_part(&mut Reader::new(at, Scratch::default()), c))).collect();
-            let mut out = vec![read_part(reader, mine)];
-            out.extend(handles.into_iter().map(|h| h.join().unwrap_or(Err(QueryError::Invalid("a thread reading series failed".into())))));
-            out
-        });
-        let mut k = i;
-        for part in parts {
-            let (values, there, samples) = part?;
+        let (Some(&id), Some(&g)) = (ids.get(i), group_of.get(i)) else { break };
+        if let Some(samples) = reader.read(at, id)? {
+            scanned.0 += 1;
             scanned.1 += samples;
-            for (series, &present) in values.chunks(n.max(1)).zip(&there) {
-                if present {
-                    scanned.0 += 1;
-                    if let Some(a) = group_of.get(k).and_then(|&g| acc.get_mut(g)) {
-                        a.add(series, None);
-                    }
-                }
-                k += 1;
+            if let Some(a) = acc.get_mut(g) {
+                a.add(&reader.buckets, None);
             }
         }
-        i += round;
+        i += 1;
     }
     Ok(())
+}
+
+/// A part of a round, one thread's: its series' values on the grid, whether each was there, and
+/// the samples read. Its buffers go back and forth round to round, so a query allocates them once.
+#[derive(Default)]
+struct Part {
+    values: Vec<f64>,
+    there: Vec<bool>,
+    samples: u64,
+}
+
+/// Reads `ids` into `part` (cleared first).
+fn read_part(r: &mut Reader, at: &Reading<'_>, ids: &[u32], part: &mut Part) -> Result<(), QueryError> {
+    let n = at.grid.n;
+    part.values.clear();
+    part.there.clear();
+    part.samples = 0;
+    for &id in ids {
+        match r.read(at, id)? {
+            Some(k) => {
+                part.samples += k;
+                part.values.extend_from_slice(&r.buckets);
+                part.there.push(true);
+            }
+            None => {
+                part.values.resize(part.values.len() + n, f64::NAN);
+                part.there.push(false);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ids` read on `workers` threads (this one and helpers started once for them), a round at a time
+/// ([`ROUND`] series a thread): each round's parts added in order, this thread's first, as one
+/// thread adds them. Each helper keeps its reader and its part's buffers from round to round.
+#[allow(clippy::too_many_arguments)]
+fn read_together(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc], reader: &mut Reader, scanned: &mut (u64, u64), workers: usize) -> Result<(), QueryError> {
+    use std::sync::mpsc;
+    let n = at.grid.n.max(1);
+    let failed = || QueryError::Invalid("a thread reading series failed".into());
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel::<(usize, Result<Part, QueryError>)>();
+        let mut jobs: Vec<mpsc::Sender<(std::ops::Range<usize>, Part)>> = Vec::with_capacity(workers - 1);
+        for w in 1..workers {
+            let (tx, rx) = mpsc::channel::<(std::ops::Range<usize>, Part)>();
+            let done = done_tx.clone();
+            let spawned = std::thread::Builder::new().name("kiln-query".into()).spawn_scoped(scope, move || {
+                if let Some(f) = HELPER_START.get() {
+                    f();
+                }
+                let mut r = Reader::new(at, Scratch::default());
+                // Until this round's jobs stop coming: the query is done, or failed.
+                while let Ok((range, mut part)) = rx.recv() {
+                    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_part(&mut r, at, ids.get(range).unwrap_or(&[]), &mut part)));
+                    let outcome = match read {
+                        Ok(Ok(())) => Ok(part),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(QueryError::Invalid("a thread reading series failed".into())),
+                    };
+                    if done.send((w, outcome)).is_err() {
+                        return;
+                    }
+                }
+            });
+            // A helper that does not start: its part is this thread's to read.
+            if spawned.is_ok() {
+                jobs.push(tx);
+            }
+        }
+        drop(done_tx);
+        let threads = jobs.len() + 1;
+        let mut parts: Vec<Option<Part>> = (0..threads).map(|_| Some(Part::default())).collect();
+        let mut got: Vec<Option<Result<Part, QueryError>>> = (0..threads).map(|_| None).collect();
+        let mut i = 0;
+        while i < ids.len() {
+            let round = (ids.len() - i).min(threads * ROUND);
+            let per = round.div_ceil(threads);
+            let span = |w: usize| (i + w * per).min(i + round)..(i + (w + 1) * per).min(i + round);
+            let mut sent = 0;
+            for (k, job) in jobs.iter().enumerate() {
+                let range = span(k + 1);
+                if range.is_empty() {
+                    continue;
+                }
+                let part = parts.get_mut(k + 1).and_then(Option::take).unwrap_or_default();
+                job.send((range, part)).map_err(|_| failed())?;
+                sent += 1;
+            }
+            let mut mine = parts.first_mut().and_then(Option::take).unwrap_or_default();
+            let own = read_part(reader, at, ids.get(span(0)).unwrap_or(&[]), &mut mine);
+            if let Some(slot) = got.first_mut() {
+                *slot = Some(own.map(|()| mine));
+            }
+            for _ in 0..sent {
+                let (w, outcome) = done_rx.recv().map_err(|_| failed())?;
+                if let Some(slot) = got.get_mut(w) {
+                    *slot = Some(outcome);
+                }
+            }
+            // In order: this thread's part, then each helper's; the first failure is the answer.
+            let mut k = i;
+            for w in 0..threads {
+                let Some(outcome) = got.get_mut(w).and_then(Option::take) else { continue };
+                let part = outcome?;
+                scanned.1 += part.samples;
+                for (series, &present) in part.values.chunks(n).zip(&part.there) {
+                    if present {
+                        scanned.0 += 1;
+                        if let Some(a) = group_of.get(k).and_then(|&g| acc.get_mut(g)) {
+                            a.add(series, None);
+                        }
+                    }
+                    k += 1;
+                }
+                if let Some(slot) = parts.get_mut(w) {
+                    *slot = Some(part);
+                }
+            }
+            i += round;
+        }
+        // The helpers' jobs end: each returns, and the scope joins them.
+        drop(jobs);
+        Ok(())
+    })
 }
 
 /// Gaps [`interval_ms`] reads at the most, spread over the series: a median of 64 has a standard
@@ -2590,6 +2722,41 @@ mod tests {
             }
         }
         THREADS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Helpers are taken as many as are free, never past their bound however many ask at once, and
+    /// given back; a bound lowered under what is taken holds back new ones until enough are back.
+    #[test]
+    fn helpers_are_taken_within_their_bound_and_given_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let b = Budget::new(3);
+        assert_eq!((b.take(2), b.take(5), b.take(1)), (2, 1, 0));
+        b.give(2);
+        b.limit.store(1, Ordering::Release);
+        assert_eq!(b.take(4), 0, "one is taken still: the bound's one");
+        b.give(1);
+        assert_eq!(b.take(4), 1);
+        b.give(1);
+        b.limit.store(0, Ordering::Release);
+        assert_eq!(b.take(1), 0);
+        b.limit.store(5, Ordering::Release);
+        let most = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for i in 0..8usize {
+                let (b, most) = (&b, &most);
+                scope.spawn(move || {
+                    for _ in 0..20_000 {
+                        let want = 1 + i % 3;
+                        let got = b.take(want);
+                        assert!(got <= want);
+                        most.fetch_max(b.taken.load(Ordering::Acquire), Ordering::AcqRel);
+                        b.give(got);
+                    }
+                });
+            }
+        });
+        assert!(most.load(Ordering::Acquire) <= 5, "{} taken at once, of 5", most.load(Ordering::Acquire));
+        assert_eq!(b.taken.load(Ordering::Acquire), 0);
     }
 
     use super::*;

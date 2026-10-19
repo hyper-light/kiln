@@ -157,6 +157,11 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        if let Some(n) = cfg.observe.query_helpers {
+            kiln_obs::query::eval::set_helpers(n as usize);
+        }
+        // A query's helpers yield to the writes the server takes (§12.19).
+        kiln_obs::query::eval::on_helper_start(crate::os::lower_thread_priority);
         crate::observe::api::set_global(obs);
         crate::observe::api::set_dashboards(std::sync::Arc::new(crate::observe::dashboards::Dashboards::open(&cfg.data("observe"))));
         crate::observe::api::set_slos(std::sync::Arc::new(crate::observe::slos::Slos::open(&cfg.data("observe"))));

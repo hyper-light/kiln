@@ -18,7 +18,8 @@
 //!
 //! The soak (`a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing`):
 //! `KOBS_SOAK_SECS` (300; hours for a soak worth the name), `KOBS_SOAK_RATE` (points a second,
-//! 200,000), `KOBS_SOAK_LOGS` (log records a second, 2,000).
+//! 200,000), `KOBS_SOAK_LOGS` (log records a second, 2,000), `KOBS_SOAK_HELPERS` (the server's
+//! `query_helpers`; unset, its default).
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
@@ -181,6 +182,8 @@ struct Sent {
     requests: u64,
     errors: Vec<String>,
     latencies_us: Vec<u64>,
+    /// When each request was sent (µs into the run), where a sender says.
+    sent_at_us: Vec<u64>,
     /// A paced sender's schedule started over, behind by more than a second.
     late: u64,
 }
@@ -299,6 +302,58 @@ fn pct(sorted: &[u64], q: f64) -> u64 {
     }
     let i = ((sorted.len() as f64 - 1.0) * q).round() as usize;
     sorted.get(i).copied().unwrap_or(0)
+}
+
+/// The CPU time a process has had (user and system, every thread's), in clock ticks, from
+/// `/proc/<pid>/stat`: 0 where there is none.
+fn cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // Its name, in parentheses, may hold spaces: the fields after the last `)`, from its state on.
+    let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    rest.split_whitespace().skip(11).take(2).filter_map(|v| v.parse::<u64>().ok()).sum()
+}
+
+/// One GET of `path` on `port` (with `token` when given), within `within`: how long it took, or why
+/// it did not answer.
+fn timed_get(port: u16, path: &str, token: &str, within: Duration) -> Result<Duration, String> {
+    let t = Instant::now();
+    let mut s = TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), within).map_err(|e| format!("connect: {e}"))?;
+    s.set_read_timeout(Some(within)).map_err(|e| e.to_string())?;
+    let auth = if token.is_empty() { String::new() } else { format!("Authorization: Bearer {token}\r\n") };
+    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Connection: close\r\n\r\n").map_err(|e| format!("write: {e}"))?;
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).map_err(|e| format!("no answer within {} s ({e})", within.as_secs()))?;
+    if !out.starts_with(b"HTTP/1.1 200") {
+        return Err(String::from_utf8_lossy(out.get(..out.len().min(80)).unwrap_or(&[])).into_owned());
+    }
+    Ok(t.elapsed())
+}
+
+/// Every thread's stack of process `pid` (eu-stack, else gdb), written to `KOBS_STACKS` (or the
+/// temporary folder): where a process that stopped answering is. The file's path.
+fn stacks(pid: u32, why: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("KOBS_STACKS").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("stacks-{pid}-{}.txt", common::now_ms()));
+    let out = std::process::Command::new("eu-stack").args(["-p", &pid.to_string()]).output().ok().filter(|o| o.status.success()).or_else(|| std::process::Command::new("gdb").args(["-batch", "-p", &pid.to_string(), "-ex", "thread apply all bt"]).output().ok())?;
+    let mut text = format!("{why}\n\n").into_bytes();
+    text.extend_from_slice(&out.stdout);
+    text.extend_from_slice(&out.stderr);
+    std::fs::write(&path, text).ok()?;
+    Some(path)
+}
+
+/// The machine's CPU time, busy and in all (every core's), in clock ticks, and its cores, from
+/// `/proc/stat`.
+fn machine_ticks() -> (u64, u64, usize) {
+    let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    let mut lines = stat.lines();
+    // user, nice, system, idle, iowait, irq, softirq, steal (guest time is in user's already).
+    let v: Vec<u64> = lines.next().filter(|l| l.starts_with("cpu ")).map(|l| l.split_whitespace().skip(1).take(8).filter_map(|v| v.parse().ok()).collect()).unwrap_or_default();
+    let total: u64 = v.iter().sum();
+    let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
+    let cores = lines.filter(|l| l.strip_prefix("cpu").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))).count();
+    (total.saturating_sub(idle), total, cores)
 }
 
 /// Every point of `load.v` the store holds: each one 1.0, summed bucket by bucket.
@@ -759,7 +814,9 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     // A cut comes once the log holds half a cadence (`kiln_obs::group::due`): about a minute of
     // this load's points, so a soak shorter than two would judge none.
     anyhow::ensure!(secs >= 120, "a soak of 120 s at the least (KOBS_SOAK_SECS): a cut comes about once a minute at 200,000 points a second");
-    let mut f = Fleet::new()?;
+    // The server's `[observe]` section, as the fleet's configuration leaves it open.
+    let helpers = std::env::var("KOBS_SOAK_HELPERS").ok().filter(|v| !v.is_empty());
+    let mut f = Fleet::with(|_| helpers.as_ref().map_or_else(String::new, |n| format!("query_helpers = {n}")))?;
     f.start_runner("r1")?;
     f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
@@ -779,6 +836,8 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     };
     let stop = Arc::new(AtomicBool::new(false));
     let taken = Arc::new(AtomicU64::new(0));
+    // What the machine, the server, the runner and this process (its senders and reader) spend.
+    let cpu_then = (machine_ticks(), cpu_ticks(server_pid), cpu_ticks(runner_pid), cpu_ticks(std::process::id()));
     let started = Instant::now();
     let t0_ms = common::now_ms();
     // Each sender: its `series` points (one each) a request, paced to its share of the rate, their
@@ -811,6 +870,7 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
                 let t = Instant::now();
                 let answer = conn.send("/v1/metrics", &headers, &body);
                 sent.latencies_us.push(t.elapsed().as_micros() as u64);
+                sent.sent_at_us.push(t.duration_since(started).as_micros() as u64);
                 sent.requests += 1;
                 match answer {
                     Ok(a) if a.code == 200 => {
@@ -890,6 +950,38 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
             (took, errors)
         })
     };
+    // A watchdog: the server asked twice a second, its health (nothing in the way) and observe's
+    // status (through the API's authentication), each within 5 s; an answer slower than 2 s has the
+    // server's every thread's stack saved (three times at the most): where a stall is.
+    let watchdog = {
+        let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
+        std::thread::spawn(move || -> (Vec<u64>, Vec<u64>, Vec<String>) {
+            let (mut health, mut status, mut slow) = (Vec::new(), Vec::new(), Vec::new());
+            while !stop.load(Ordering::Relaxed) {
+                for (path, token, into) in [("/healthz", "", &mut health), ("/api/observe/v1/status", admin.as_str(), &mut status)] {
+                    let at = started.elapsed().as_secs_f64();
+                    match timed_get(port, path, token, Duration::from_secs(5)) {
+                        Ok(d) => {
+                            into.push(d.as_micros() as u64);
+                            if d >= Duration::from_secs(2) && slow.len() < 3 {
+                                let file = stacks(server_pid, &format!("{path} took {:.1} s at {at:.0} s", d.as_secs_f64()));
+                                slow.push(format!("{path} took {:.1} s at {at:.0} s (stacks: {file:?})", d.as_secs_f64()));
+                            }
+                        }
+                        Err(e) => {
+                            into.push(5_000_000);
+                            if slow.len() < 3 {
+                                let file = stacks(server_pid, &format!("{path} at {at:.0} s: {e}"));
+                                slow.push(format!("{path} at {at:.0} s: {e} (stacks: {file:?})"));
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            (health, status, slow)
+        })
+    };
     // A sample every 10 s.
     let mut samples: Vec<Sampled> = Vec::new();
     let mib = |s: &serde_json::Value, k: &str| at(s, &[k]).as_u64().unwrap_or(0) as f64 / 1048576.0;
@@ -897,34 +989,52 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     eprintln!("  {:>6} {:>16} {:>16} {:>8} {:>8} {:>7} {:>8} {:>12}", "s", "server MiB", "runner MiB", "head", "index", "blocks", "log MiB", "taken");
     while started.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_secs(10).min(Duration::from_secs(secs).saturating_sub(started.elapsed())).max(Duration::from_millis(100)));
-        let st = f.status()?;
+        let st = match f.status() {
+            Ok(st) => st,
+            Err(e) => {
+                let file = stacks(server_pid, &format!("observe's status at {:.0} s: {e:#}", started.elapsed().as_secs_f64()));
+                stop.store(true, Ordering::Relaxed);
+                anyhow::bail!("observe's status at {:.0} s: {e:#} (the server's stacks: {file:?})\n{}", started.elapsed().as_secs_f64(), f.logs());
+            }
+        };
         let x = Sampled { at_s: started.elapsed().as_secs_f64(), server: rss(server_pid), runner: rss(runner_pid), head_mib: mib(&st, "heap_samples"), index_mib: mib(&st, "heap_index"), blocks: at(&st, &["blocks"]).as_u64().unwrap_or(0), log_mib: mib(&st, "log_bytes"), taken: taken.load(Ordering::Relaxed) };
         eprintln!(
             "  {:>6.0} {:>9.0} ({:>4.0}) {:>9.0} ({:>4.0}) {:>8.1} {:>8.1} {:>7} {:>8.1} {:>12}",
             x.at_s, x.server.0, x.server.1, x.runner.0, x.runner.1, x.head_mib, x.index_mib, x.blocks, x.log_mib, x.taken
         );
-        // Every ten minutes, where the server's anonymous memory lies: what a climb is made of.
-        if samples.len() % 60 == 59 {
+        samples.push(x);
+        // At each third's end, where the server's anonymous memory lies: what a climb between the
+        // thirds the memory check compares is made of.
+        if samples.len().is_multiple_of((secs as usize / 30).max(1)) {
             eprintln!("  where      the server's {}", anon_by_mapping(server_pid));
         }
-        samples.push(x);
     }
     stop.store(true, Ordering::Relaxed);
     let ran = started.elapsed();
+    let cpu_now = (machine_ticks(), cpu_ticks(server_pid), cpu_ticks(runner_pid), cpu_ticks(std::process::id()));
     let mut all = Sent::default();
     let mut newest = 0i64;
-    for t in threads {
+    // Each node's requests' times apart: the even senders send to the server, the odd to the runner.
+    let (mut to_server, mut to_runner) = (Vec::new(), Vec::new());
+    // Every request: when it was sent and how long it took (µs).
+    let mut each: Vec<(u64, u64)> = Vec::new();
+    for (i, t) in threads.into_iter().enumerate() {
         let s = t.join().map_err(|_| anyhow::anyhow!("a sender panicked"))?;
         newest = newest.max(s.last_ms.unwrap_or(0));
         all.taken += s.taken;
         all.refused += s.refused;
         all.requests += s.requests;
         all.errors.extend(s.errors);
+        if i % 2 == 0 { &mut to_server } else { &mut to_runner }.extend_from_slice(&s.latencies_us);
+        each.extend(s.sent_at_us.iter().copied().zip(s.latencies_us.iter().copied()));
         all.latencies_us.extend(s.latencies_us);
         all.late += s.late;
     }
+    to_server.sort_unstable();
+    to_runner.sort_unstable();
     let (posted, log_errors) = logs.join().map_err(|_| anyhow::anyhow!("the log sender panicked"))?;
     let (read, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
+    let (mut health, mut status_us, slow) = watchdog.join().map_err(|_| anyhow::anyhow!("the watchdog panicked"))?;
     anyhow::ensure!(all.errors.is_empty() && log_errors.is_empty() && read_errors.is_empty(), "errors: {:?} {:?} {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), log_errors.iter().take(5).collect::<Vec<_>>(), read_errors.iter().take(5).collect::<Vec<_>>(), f.logs());
     // Every point and record taken, stored once.
     let settled = Instant::now();
@@ -976,10 +1086,70 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
             slow.iter().rev().take(8).map(|r| r.at_s.round() as u64).collect::<Vec<_>>()
         );
     }
+    // The widest query's readings, from when it was asked to when it was answered (µs into the run).
+    let mut wide: Vec<(u64, u64)> = read
+        .iter()
+        .filter(|r| r.which == 1)
+        .map(|r| {
+            let end = (r.at_s * 1e6) as u64;
+            (end.saturating_sub(r.us), end)
+        })
+        .collect();
+    wide.sort_unstable();
     let mut read: Vec<u64> = read.iter().map(|r| r.us).collect();
     read.sort_unstable();
     eprintln!("  taken      {} points ({:.0} a second), {} refused (503, sent again), the senders {} times a second behind; {posted} log records", all.taken, all.taken as f64 / ran.as_secs_f64(), all.refused, all.late);
     eprintln!("  a request  p50 {:.2} ms, p99 {:.2} ms; a dashboard query p50 {:.2} ms, p99 {:.2} ms", ms(pct(&all.latencies_us, 0.5)), ms(pct(&all.latencies_us, 0.99)), ms(pct(&read, 0.5)), ms(pct(&read, 0.99)));
+    eprintln!(
+        "  requests   the server's p50 {:.2} ms, p99 {:.2} ms, p99.9 {:.2} ms; the runner's p50 {:.2} ms, p99 {:.2} ms, p99.9 {:.2} ms",
+        ms(pct(&to_server, 0.5)),
+        ms(pct(&to_server, 0.99)),
+        ms(pct(&to_server, 0.999)),
+        ms(pct(&to_runner, 0.5)),
+        ms(pct(&to_runner, 0.99)),
+        ms(pct(&to_runner, 0.999))
+    );
+    // Requests while the widest query read (its helpers with it, if it took any) and while none did:
+    // what a wide query costs what is written meanwhile, the machine's other load the same for both.
+    let (mut during, mut outside) = (Vec::new(), Vec::new());
+    for &(at, us) in &each {
+        // The first query to end after the request was sent: the one it may overlap.
+        let k = wide.partition_point(|&(_, end)| end < at);
+        let overlaps = wide.get(k).is_some_and(|&(start, _)| start <= at + us);
+        if overlaps { &mut during } else { &mut outside }.push(us);
+    }
+    during.sort_unstable();
+    outside.sort_unstable();
+    eprintln!(
+        "  beside     requests while the by-host query read: p50 {:.2} ms, p99 {:.2} ms ({}); while none did: p50 {:.2} ms, p99 {:.2} ms ({})",
+        ms(pct(&during, 0.5)),
+        ms(pct(&during, 0.99)),
+        during.len(),
+        ms(pct(&outside, 0.5)),
+        ms(pct(&outside, 0.99)),
+        outside.len()
+    );
+    health.sort_unstable();
+    status_us.sort_unstable();
+    eprintln!(
+        "  watchdog   health p99 {:.2} ms, most {:.2} ms; status p99 {:.2} ms, most {:.2} ms{}",
+        ms(pct(&health, 0.99)),
+        ms(pct(&health, 1.0)),
+        ms(pct(&status_us, 0.99)),
+        ms(pct(&status_us, 1.0)),
+        if slow.is_empty() { String::new() } else { format!("; slow: {}", slow.join("; ")) }
+    );
+    anyhow::ensure!(slow.iter().all(|s| !s.contains("no answer") && !s.contains("connect")), "the server stopped answering: {}", slow.join("; "));
+    let ((busy0, total0, cores), server0, runner0, me0) = cpu_then;
+    let ((busy1, total1, _), server1, runner1, me1) = cpu_now;
+    // A process's ticks as cores busy over the run: every core's ticks in all are the run's length.
+    let all_ticks = total1.saturating_sub(total0).max(1) as f64;
+    let busy = |ticks: u64| ticks as f64 / all_ticks * cores as f64;
+    let (machine, server, runner, me) = (busy(busy1.saturating_sub(busy0)), busy(server1.saturating_sub(server0)), busy(runner1.saturating_sub(runner0)), busy(me1.saturating_sub(me0)));
+    eprintln!(
+        "  machine    {cores} cores, {machine:.1} busy: the server {server:.1}, the runner {runner:.1}, the senders and reader {me:.1}, the rest {:.1} (other work)",
+        (machine - server - runner - me).max(0.0)
+    );
     eprintln!("  where      the server's {} (of {:.0} MiB anonymous); the runner's {} (of {:.0})", anon_by_mapping(server_pid), rss(server_pid).1, anon_by_mapping(runner_pid), rss(runner_pid).1);
     eprintln!("  replicas   agree at index {index}: {digest:016x}");
     // The store cut and its log compacted all through.

@@ -62,6 +62,10 @@ name = "wide"
 harness = false
 
 [[bench]]
+name = "beside"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 

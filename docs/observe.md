@@ -2064,11 +2064,33 @@ holds) is two zero bits; a run of them is counted with one leading-zeros instruc
 written in a loop (`ChunkRef::decode_into`; a test holds it to the sample-by-sample decoder on runs
 of every length at every place, to the bit). Then perf put the time in the decoder (31% stepping,
 21% reading values, 12% in its loop), and the series are independent: a query reads them on its own
-thread while that is quick (2 ms), then takes helper threads, half the machine's cores less one
-shared by every query, and reads the rest a round at a time (64 series a thread), each round's values
-added into their groups in the series' fingerprints' order, as one thread adds them: the same bits on
-any number of threads (a test of seven queries on 1, 2, 3 and 7 threads, sums twelve orders of
-magnitude apart).
+thread while that is quick (2 ms), then takes helper threads, shared by every query, and reads the
+rest a round at a time (64 series a thread), each round's values added into their groups in the
+series' fingerprints' order, as one thread adds them: the same bits on any number of threads (a test
+of seven queries on 1, 2, 3 and 7 threads, sums twelve orders of magnitude apart).
+
+How many helpers was measured where it costs: the soak's writes (§13; 200,000 points a second, 10
+minutes a run), each request told apart by whether the by-host query was reading while it was taken.
+fedora (an i9-14900HX: 8 cores of two threads and 16 of one, 32 threads; other sessions' work beside,
+5 to 14 cores busy), runs alternated so the machine's other load falls on both, 2026-10-19:
+
+| helpers | runs | by host p50 | by host p99 | writes beside it, p99 / the rest's |
+| --- | --- | --- | --- | --- |
+| none | 11 | 175–257 ms | 418–699 ms | 0.9–1.3× (1.08–2.20 ms) |
+| 15 (half the threads, less one) | 8 | 31–84 ms | 84–1,482 ms | 1.7–3.9× (1.94–5.61 ms) |
+| 7 (a quarter, less one) | 4 | 42–72 ms | 115–227 ms | 1.1–1.75× (1.72–2.69 ms) |
+
+Without helpers the widest query costs the writes beside it nothing; with them it reads in a quarter
+of the time, and the 2–3% of writes taken while it reads wait longer in their tail. Fifteen buy
+little over seven (`cargo bench -p kiln-obs --bench beside`, the 4,000 series of 10 minutes: 28 ms a
+query on 15, 38 on 7, 219 on none) at twice the cost to the writes beside them: the reading is bound
+by memory past some eight threads, and every core then carries a helper beside the threads taking
+writes. So `query_helpers` defaults to a quarter of the cores the server may run on, less one (none
+on four or fewer); helpers run ten nice levels down (a CFS weight of 110 against 1,024), which only
+matters where cores are contended: with idle cores the 15 helpers' tail was alike niced or not (1.7–
+2.4× against 2.0–3.9×, three runs each). Memory: helper threads raise the server's anonymous memory
+once (the bench: 23 MiB to 42, the C library's arenas of the threads that read), then hold it (no
+page faults a query after the first); every soak run held its level.
 
 ## 13. Scenarios
 
@@ -2502,8 +2524,18 @@ varying (12 to 29 of 32 cores idle):
 
 Every run stored every point and record once, its replicas agreeing, its memory level. The last
 run's request p99 rose (4.5 ms against 1.0): the machine was the busiest of the three (12 cores idle,
-2 GB of memory free), and a wide query now takes helper threads in bursts; which of the two it was is
-measured next, on a quiet machine.
+2 GB of memory free), and a wide query now takes helper threads in bursts. Measured apart (§12.19,
+each request told apart by whether a wide query read while it was taken): both. The machine's other
+load moves every request's tail; the helpers move only the writes taken beside a wide query, which
+seven helpers (now the default on 32 threads) hold to 1.1–1.75 times the others' p99.
+
+The soak also watches the server answer (every 500 ms, `/healthz` and observe's status, 5 s a
+request at the most): one that takes over 2 s has the server's threads' stacks taken (`eu-stack`,
+else `gdb`; `KOBS_STACKS` says where), and one that is not answered fails the run with them. One
+run of twelve (2026-10-19, before the watchdog) had a status request unanswered for 30 s at 502 s;
+the six runs since, watched, answered every request within 3.84 ms. What held it is not yet known:
+the next time, the stacks say. Where the server's anonymous memory lies is said at each third's
+end, so a climb the memory check finds names what grew.
 
 What floods leave (§12.11) is a high-water mark, not a leak: after one, the server held some 300 MiB
 more than before, most of it in the C library's per-thread arenas (32 of them, from
