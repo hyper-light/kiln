@@ -14,7 +14,7 @@ use crate::http::client::Method;
 pub struct UpdatesArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: Option<UpdatesCmd>,

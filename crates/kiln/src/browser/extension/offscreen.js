@@ -182,7 +182,44 @@ class Stream {
   }
 }
 
+// A stream of pictures kiln brings (another engine's page, taken as it changes), each encoded as
+// a captured tab's frame is: a new size reconfigures, a still one is sent again sharp.
+class Pushed extends Stream {
+  constructor(id, opts) {
+    super(id, { getVideoTracks: () => [], getAudioTracks: () => [], getTracks: () => [] }, opts);
+    this.size = [opts.width || 780, opts.height || 1280];
+  }
+
+  async start() {
+    await this.configure(this.size[0], this.size[1]);
+  }
+
+  async push(b64, mime) {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: mime || "image/jpeg" }));
+    const frame = new VideoFrame(bitmap, { timestamp: Math.round(performance.now() * 1000) });
+    bitmap.close();
+    this.frame(frame);
+  }
+
+  // Its size is its pictures'.
+  async resize() {}
+}
+
 chrome.runtime.onMessage.addListener((m, _sender, reply) => {
+  if (m.kind === "pushed") {
+    (async () => {
+      try {
+        const s = new Pushed(m.stream, m.opts || {});
+        streams.set(m.stream, s);
+        await s.start();
+        reply({ ok: true, size: s.size, audio: false });
+      } catch (e) {
+        reply({ ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
   if (m.kind !== "start") return;
   (async () => {
     try {
@@ -215,6 +252,8 @@ globalThis.kiln = {
     streams.get(id)?.stop();
     streams.delete(id);
   },
+  // A picture of a pushed stream's page (base64, its type).
+  push: (id, b64, mime) => streams.get(id)?.push(b64, mime),
   streams: () => [...streams.keys()],
-  sizes: () => Object.fromEntries([...streams].map(([id, s]) => [id, { size: s.size, frame: s.last ? [s.last.displayWidth, s.last.displayHeight, s.last.codedWidth, s.last.codedHeight] : null, track: s.video.getSettings() }])),
+  sizes: () => Object.fromEntries([...streams].map(([id, s]) => [id, { size: s.size, frame: s.last ? [s.last.displayWidth, s.last.displayHeight, s.last.codedWidth, s.last.codedHeight] : null, track: s.video ? s.video.getSettings() : null }])),
 };

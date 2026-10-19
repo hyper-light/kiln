@@ -253,9 +253,13 @@ pub const CAP_PREVIEW: u32 = 1 << 24;
 /// [`AgentMsg::Build`] capability: the runner connects the server to ports its machine's processes
 /// listen on ([`ServerMsg::PortOpen`], on [`LANE_PORTS`], `crate::browser::ports`).
 pub const CAP_PORTS: u32 = 1 << 25;
+/// [`AgentMsg::Build`] capability: the runner streams pages in other engines (Firefox, WebKit) and
+/// laid out as devices (`crate::browser::driven`, `crate::browser::devices`): a stream's spec's
+/// `engine` and `device`.
+pub const CAP_ENGINES: u32 = 1 << 26;
 /// [`AgentMsg::Build`] capability: the runner answers questions about its agents' folders and
 /// pushes their work for review ([`ServerMsg::Workspace`], `crate::workspace`).
-pub const CAP_WORKSPACE: u32 = 1 << 26;
+pub const CAP_WORKSPACE: u32 = 1 << 27;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -712,6 +716,7 @@ mod tests {
             assert_eq!(decode::<AgentMsg>(&b)?, m);
         }
         assert!(CAP_PORTS.is_power_of_two() && CAP_PORTS > CAP_PREVIEW);
+        assert!(CAP_ENGINES.is_power_of_two() && CAP_ENGINES > CAP_PORTS);
         assert!(LANE_PORTS == LANE_STREAM + 1 && LANE_PORTS < crate::net::limits(true).lanes_per_peer, "a lane of its own, within what a peer allows");
         Ok(())
     }
@@ -723,7 +728,7 @@ mod tests {
         let b = encode(&m)?;
         assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "it comes right after the ones before it");
         assert_eq!(decode::<ServerMsg>(&b)?, m);
-        assert!(CAP_WORKSPACE.is_power_of_two() && CAP_WORKSPACE > CAP_PORTS);
+        assert!(CAP_WORKSPACE.is_power_of_two() && CAP_WORKSPACE > CAP_ENGINES && CAP_ENGINES > CAP_PORTS);
         Ok(())
     }
 

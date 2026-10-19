@@ -13,6 +13,20 @@ export interface LiveStream {
   title: string;
   /** The browser profile it runs in, when not the conversation's (it starts again in the same). */
   profile?: "clean" | "personal";
+  /** Its engine, when not Chromium, and the device it's laid out as (it starts again in them). */
+  engine?: string;
+  device?: string;
+}
+
+/** Where a point of the frame is in the page: the page drawn whole within the frame (a device's
+ *  window letterboxed), `page` its size in CSS pixels, `picture` the picture's in its pixels. */
+export function pagePoint(at: { x: number; y: number }, frame: { width: number; height: number }, picture: { width: number; height: number }, page: { width: number; height: number }): { x: number; y: number } {
+  if (!picture.width || !picture.height || !frame.width || !frame.height) return { x: Math.round(at.x), y: Math.round(at.y) };
+  const k = Math.min(frame.width / picture.width, frame.height / picture.height);
+  const [w, h] = [picture.width * k, picture.height * k];
+  const [ox, oy] = [(frame.width - w) / 2, (frame.height - h) / 2];
+  const clamp = (v: number, max: number) => Math.round(Math.min(max, Math.max(0, v)));
+  return { x: clamp(((at.x - ox) * page.width) / w, page.width), y: clamp(((at.y - oy) * page.height) / h, page.height) };
 }
 
 /** Whether a tool call is an agent showing a live page (Claude Code's and Codex's names for kiln's tool). */
@@ -24,7 +38,8 @@ export function liveOf(c: Pick<ToolCall, "output">): LiveStream | null {
   try {
     const s = (JSON.parse(c.output) as { kiln_stream?: Partial<LiveStream> }).kiln_stream;
     if (!s || typeof s.id !== "string" || !/^[0-9a-f]{32}$/.test(s.id) || typeof s.session !== "string") return null;
-    return { id: s.id, session: s.session, url: typeof s.url === "string" ? s.url : "", title: typeof s.title === "string" && s.title ? s.title : (s.url ?? "A live page") };
+    const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+    return { id: s.id, session: s.session, url: typeof s.url === "string" ? s.url : "", title: typeof s.title === "string" && s.title ? s.title : (s.url ?? "A live page"), engine: str(s.engine), device: str(s.device) };
   } catch {
     return null;
   }

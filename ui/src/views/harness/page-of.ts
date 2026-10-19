@@ -10,9 +10,24 @@ export interface ShownPage {
   title: string;
   /** Where it's served: `/v/<id>/` and its path on its machine, on the server or its pages address. */
   path: string;
-  /** Its height at each width measured, `[width, height]` in CSS pixels. */
+  /** Its height at each width measured, `[width, height]` in CSS pixels (in Chromium). */
   heights: [number, number][];
+  /** The same in other engines (`firefox`), when its machine had them. */
+  engines?: Record<string, [number, number][]>;
   files?: number;
+}
+
+/** The engine this browser is, as pages are measured in them. */
+export function ownEngine(ua: string): "chromium" | "firefox" | "webkit" {
+  if (/Firefox\//.test(ua)) return "firefox";
+  if (/AppleWebKit/.test(ua) && !/Chrome\/|Chromium\/|Edg\//.test(ua)) return "webkit";
+  return "chromium";
+}
+
+/** A page's heights as measured in this browser's own engine, else in Chromium. */
+export function heightsFor(page: Pick<ShownPage, "heights" | "engines">, ua: string): [number, number][] {
+  const own = page.engines?.[ownEngine(ua)];
+  return own && own.length ? own : page.heights;
 }
 
 /** Whether a tool call is an agent showing a page (Claude Code's and Codex's names for kiln's tool). */
@@ -24,10 +39,12 @@ export function pageOf(c: Pick<ToolCall, "output">): ShownPage | null {
   try {
     const p = (JSON.parse(c.output) as { kiln_page?: Partial<ShownPage> }).kiln_page;
     if (!p || typeof p.id !== "string" || !/^[0-9a-f]{32}$/.test(p.id)) return null;
-    const heights = (Array.isArray(p.heights) ? p.heights : []).filter((h): h is [number, number] => Array.isArray(h) && h.length === 2 && h.every((n) => typeof n === "number" && n > 0));
+    const pairs = (v: unknown) => (Array.isArray(v) ? v : []).filter((h): h is [number, number] => Array.isArray(h) && h.length === 2 && h.every((n) => typeof n === "number" && n > 0));
+    const heights = pairs(p.heights);
+    const engines = Object.fromEntries(Object.entries(p.engines && typeof p.engines === "object" ? p.engines : {}).map(([e, hs]) => [e, pairs(hs)]));
     // Where it's served (its own path under `/v/<id>`), never anywhere else.
     const path = typeof p.path === "string" && p.path.startsWith(`/v/${p.id}/`) && !p.path.includes("..") ? p.path : `/v/${p.id}/`;
-    return { id: p.id, title: typeof p.title === "string" && p.title ? p.title : "A page", path, heights, files: p.files };
+    return { id: p.id, title: typeof p.title === "string" && p.title ? p.title : "A page", path, heights, engines, files: p.files };
   } catch {
     return null;
   }

@@ -2110,10 +2110,10 @@ fn join_info(hub: &Hub) -> Response {
             "token": token,
             "server": url,
             "quic": hub.cfg.server.quic_advertise,
-            "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,bench"),
-            "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels macos"),
+            "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,bench"),
+            "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels macos"),
             "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'windows'"),
-            "manual": format!("kiln agent --server {url} --token {token} --labels baremetal,bench"),
+            "manual": format!("kiln agent --server {url} --token={token} --labels baremetal,bench"),
             // No token: the machine asks to join and an admin approves it (verification code).
             "join": format!("curl -fsSL {url}/install.sh | sh -s -- --join"),
             "join_manual": format!("kiln join --server {url}"),
@@ -2122,8 +2122,8 @@ fn join_info(hub: &Hub) -> Response {
             // One line per OS that downloads kiln from this server and installs the agent with the
             // join token (`install.sh` passes `--token`/`--labels` to `kiln install --agent`).
             "install": {
-                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,linux"),
-                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,macos"),
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,linux"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,macos"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'baremetal,windows'"),
             },
             // The join token is kept in <data>/join.token and does not expire.
@@ -2145,8 +2145,8 @@ fn outpost_invite(hub: &Hub) -> Response {
             "token": token,
             "expires_at": expires_at,
             "commands": {
-                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
-                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token={token}"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token={token}"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost -Token '{token}'"),
             },
             "ask": {

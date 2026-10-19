@@ -20,10 +20,17 @@ pub fn new_id() -> String {
 }
 
 /// 32 random bytes, URL-safe base64. Used for tokens and secrets.
+/// 32 random bytes, base64url: never beginning with `-`, which a command line would take for a
+/// flag (`kiln agent --token -Hq3…`).
 pub fn random_token() -> String {
     use base64::Engine as _;
-    let bytes: [u8; 32] = rand::random();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    loop {
+        let bytes: [u8; 32] = rand::random();
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        if !token.starts_with('-') {
+            return token;
+        }
+    }
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -87,5 +94,14 @@ pub fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
             hex::encode(m.finalize().into_bytes())
         }
         Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_token_never_begins_with_a_dash() {
+        // One in 64 would, without the care.
+        assert!((0..10_000).map(|_| super::random_token()).all(|t| !t.starts_with('-') && t.len() == 43));
     }
 }
