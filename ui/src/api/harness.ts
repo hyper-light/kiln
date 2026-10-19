@@ -806,10 +806,23 @@ export interface Listening {
   agents: boolean;
 }
 
-/** What a person may open live from a session (`GET .../preview`). */
+/** A device a live page can be laid out as (`crate::browser::devices`). */
+export interface Device {
+  name: string;
+  width: number;
+  height: number;
+  scale: number;
+  mobile: boolean;
+  agent?: string;
+}
+
+/** What a person may open live from a session (`GET .../preview`): its machine's ports, its
+ *  project's app, the engines it has, the devices kiln knows. */
 export interface PreviewLook {
   ports: Listening[];
   app: { configured: boolean; start?: string; port?: number; path?: string; running?: string | null; error?: string };
+  engines?: { chromium?: boolean; firefox?: boolean; webkit?: boolean };
+  devices?: Device[];
 }
 
 /** A live page of a session, as the server relays it (`crate::harness::streams::Live::view`). */
@@ -817,7 +830,7 @@ export interface StreamView {
   id: string;
   session: string;
   machine: string;
-  spec: { url?: string; title?: string; profile?: string };
+  spec: { url?: string; title?: string; profile?: string; engine?: string; device?: string };
   by: string;
   at: number;
   viewers: number;
@@ -863,7 +876,7 @@ export const harnessApi = {
   /** Its live pages. */
   streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
   /** Open a live page: an address, or (`start`) the project's app; in a profile. */
-  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
+  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
     call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Open the app on a port of its machine on this person's own device: a link to follow there. */

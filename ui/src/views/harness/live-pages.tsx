@@ -87,7 +87,7 @@ function localOf(typed: string): { port: number; path: string } | undefined {
 function streamOf(v: StreamView): LiveStream {
   const url = v.said.navigated?.url ?? v.spec.url ?? "";
   const profile = v.spec.profile === "clean" ? "clean" : v.spec.profile?.startsWith("personal:") ? "personal" : undefined;
-  return { id: v.id, session: v.session, url, title: v.said.loaded?.title || v.spec.title || url || "A live page", profile };
+  return { id: v.id, session: v.session, url, title: v.said.loaded?.title || v.spec.title || url || "A live page", profile, engine: v.spec.engine, device: v.spec.device };
 }
 
 function Pages({ session }: { session: string }) {
@@ -108,11 +108,16 @@ function Pages({ session }: { session: string }) {
   const [pick, setPick] = React.useState("");
   const [address, setAddress] = React.useState("");
   const [profile, setProfile] = React.useState<Profile>("conversation");
+  const [engine, setEngine] = React.useState("chromium");
+  const [layout, setLayout] = React.useState("");
   const [busy, setBusy] = React.useState<"" | "open" | "start" | "stop">("");
   const [error, setError] = React.useState<string | null>(null);
   // Opened here: shown until closed, ended or not (what it said when it ended stays to read).
   const [here, setHere] = React.useState<StreamView[]>([]);
   const [closed, setClosed] = React.useState<string[]>([]);
+  // One just opened is brought into view (it goes live once it's seen).
+  const [opened, setOpened] = React.useState<string | null>(null);
+  const into = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
 
   if (!look.data.look) return <p className="in-none">{look.data.error}</p>;
   const { ports, app } = look.data.look;
@@ -125,6 +130,15 @@ function Pages({ session }: { session: string }) {
   const values = [...(startable ? ["app"] : []), ...theirs.map((o) => o.value), ...others.map((o) => o.value), "address"];
   const chosen = values.includes(pick) ? pick : (values[0] ?? "address");
   const port = ports.find((p) => `port:${p.port}` === chosen);
+  // The engines its machine has, and the devices a page can be laid out as.
+  const has = look.data.look.engines ?? { chromium: true };
+  const engines = [
+    { value: "chromium", label: "Chromium" },
+    ...(has.firefox ? [{ value: "firefox", label: "Firefox" }] : []),
+    ...(has.webkit ? [{ value: "webkit", label: "WebKit (Safari)" }] : []),
+  ];
+  const devices = [{ value: "", label: "This screen" }, ...(look.data.look.devices ?? []).map((d) => ({ value: d.name, label: `${d.name} · ${d.width}×${d.height}` }))];
+  const runIn = engines.some((e) => e.value === engine) ? engine : "chromium";
   // What opens on the person's own device: a port of its machine (the app's once it runs).
   const device = port ? { port: port.port, path: chosen === `port:${appPort}` ? (app.path ?? "/") : "/" } : chosen === "address" ? localOf(address) : undefined;
   // Yours: the ones opened here, then any you opened elsewhere (the agent's are in the conversation).
@@ -140,8 +154,9 @@ function Pages({ session }: { session: string }) {
     setBusy(starting ? "start" : "open");
     setError(null);
     try {
-      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
+      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile, engine: runIn === "chromium" ? undefined : runIn, device: layout || undefined, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
       setHere((h) => [v, ...h]);
+      setOpened(v.id);
       listed.setData((l) => [v, ...l.filter((x) => x.id !== v.id)]);
       if (starting) look.reload();
     } catch (e) {
@@ -258,12 +273,18 @@ function Pages({ session }: { session: string }) {
             </div>
           </div>
         )}
+        <SelectField label="Engine" value={runIn} onChange={setEngine} options={engines} className="lp-half" />
+        <SelectField label="Device" value={layout} onChange={setLayout} options={devices} className="lp-half" />
         <SelectField label="Browser profile" value={profile} onChange={(v) => setProfile(v as Profile)} options={PROFILES} className="lp-profile" />
         <Button size="sm" type="submit" className="lp-go" disabled={busy !== ""}>
           {busy === "start" ? "Starting the app" : busy === "open" ? "Opening" : chosen === "app" ? "Start and open" : "Open"}
         </Button>
       </form>
-      <p className="field-hint lp-says">{PROFILE_SAYS[profile]}</p>
+      <p className="field-hint lp-says">
+        {PROFILE_SAYS[profile]}
+        {runIn === "webkit" ? " WebKit is Safari on the agent's machine: its window opens on that Mac's screen, and keeps nothing." : ""}
+        {runIn !== "chromium" ? " It streams without sound." : ""}
+      </p>
       <div className="lp-device">
         <span className="lp-device-what">On your device</span>
         <Button size="sm" variant="secondary" disabled={!device || deviceBusy} onClick={() => void onDevice("here")}>
@@ -311,7 +332,9 @@ function Pages({ session }: { session: string }) {
         </p>
       )}
       {yours.map((v) => (
-        <Live key={v.id} stream={streamOf(v)} ev={`lp-${v.id}`} onClose={() => close(v.id)} />
+        <div key={v.id} ref={v.id === opened ? into : undefined}>
+          <Live stream={streamOf(v)} ev={`lp-${v.id}`} onClose={() => close(v.id)} />
+        </div>
       ))}
     </div>
   );
