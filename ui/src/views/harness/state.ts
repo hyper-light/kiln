@@ -6,7 +6,7 @@
  * - what you sent while it couldn't take it (its machine away), until it can.
  */
 import { create } from "zustand";
-import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
+import { createJSONStorage, persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 import type { Attachment, SendMode } from "@/api/harness";
 
 /* ------------------------------------------------------------------ send mode */
@@ -60,18 +60,18 @@ export const usePlaces = create<PlacesState>()(
 );
 
 /**
- * A browser storage written at most this often (and as the page goes away): what changes with
- * every key typed doesn't write on every key.
+ * A browser storage encoded and written at most this often (and as the page goes away): what
+ * changes with every key typed doesn't serialize all drafts on every key.
  */
-function lazily(store: () => Storage, ms = 600): StateStorage {
-  const pending = new Map<string, string>();
+function lazily<T>(store: () => Storage, ms = 600): PersistStorage<T> {
+  const pending = new Map<string, StorageValue<T>>();
   let timer = 0;
   const flush = () => {
     window.clearTimeout(timer);
     timer = 0;
     for (const [k, v] of pending) {
       try {
-        store().setItem(k, v);
+        store().setItem(k, JSON.stringify(v));
       } catch {
         /* storage off (private mode): this visit only */
       }
@@ -80,7 +80,7 @@ function lazily(store: () => Storage, ms = 600): StateStorage {
   };
   if (typeof window !== "undefined") window.addEventListener("pagehide", flush);
   return {
-    getItem: (k) => pending.get(k) ?? store().getItem(k),
+    getItem: (k) => pending.get(k) ?? (JSON.parse(store().getItem(k) ?? "null") as StorageValue<T> | null),
     setItem: (k, v) => {
       pending.set(k, v);
       if (!timer) timer = window.setTimeout(flush, ms);
@@ -114,7 +114,7 @@ export const useDrafts = create<DraftsState>()(
     }),
     {
       name: "kiln.agents.drafts",
-      storage: createJSONStorage(() => lazily(() => sessionStorage)),
+      storage: lazily(() => sessionStorage),
       partialize: (s) => ({ drafts: s.drafts }),
     },
   ),
