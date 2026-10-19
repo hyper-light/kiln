@@ -313,6 +313,24 @@ fn str_map(m: &BTreeMap<String, String>) -> Value {
     Value::object(m.iter().map(|(k, v)| (k.clone(), Value::str(v))))
 }
 
+/// `oom_kill`'s count in a cgroup's `memory.events`.
+fn oom_kill_count(events: &str) -> u64 {
+    events.lines().find_map(|l| l.strip_prefix("oom_kill ")).and_then(|n| n.trim().parse().ok()).unwrap_or(0)
+}
+
+/// The OOM killer's kills in this runner's cgroup (cgroup v2), and on the machine as a whole.
+fn host_oom_kills() -> u64 {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(str::to_owned)));
+    let mine = cgroup.and_then(|path| std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.events")).ok()).map_or(0, |t| oom_kill_count(&t));
+    let machine = std::fs::read_to_string("/proc/vmstat").ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("oom_kill ").and_then(|n| n.trim().parse::<u64>().ok()))).unwrap_or(0);
+    mine.saturating_add(machine)
+}
+
+/// Whether the volume `path` is on is as good as full (under 64 MiB left).
+fn nearly_full(path: &Path) -> bool {
+    crate::os::disk_available(path).is_some_and(|free| free < 64 << 20)
+}
+
 /// An action's `runs.env`, evaluated with its own `inputs` in context, as GitHub evaluates it (a
 /// Docker action's `HADOLINT_OUTPUT: ${{ inputs.output-file }}`).
 fn runs_env(st: &mut State, action: &kiln_ci::wf::Action, inputs: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -355,6 +373,13 @@ struct State {
     /// The server's certificate authority and a bundle of it and this machine's roots, when the
     /// leg reaches the server over HTTPS (§2.6): its tools trust them.
     trust: Option<(PathBuf, PathBuf)>,
+    /// The kind of failure that failed the leg (W05-R15): `infra`, `image-pull`, `oom` or
+    /// `disk-full`, said to the server with its result; else it's a `failure`.
+    class: Option<&'static str>,
+    /// The running step's, should its failure fail the leg.
+    step_class: Option<&'static str>,
+    /// The kernel's OOM kills where the steps run, when last counted.
+    oom_seen: Option<u64>,
     /// The running step's, taken by its action.
     action_state: Vec<(String, String)>,
     /// The index the next pre or post step gets (after the job's own steps).
@@ -478,6 +503,8 @@ struct Reading {
     /// A command failed (an unreadable matcher file, a disabled command): the step fails, as on
     /// GitHub.
     failed: bool,
+    /// The step said its disk was full (ENOSPC's "No space left on device").
+    enospc: bool,
 }
 
 /// The `GITHUB_SERVER_URL` actions that refuse GitHub Enterprise Server see (docs/ci.md
@@ -943,6 +970,23 @@ impl Leg {
         v
     }
 
+    /// Whether the kernel's OOM killer struck where the leg's steps run since it was last counted:
+    /// the job container's cgroup (cgroup v2's `memory.events`, as the container sees its own),
+    /// else this runner's cgroup and the machine's (`/proc/vmstat`). The first count is the
+    /// baseline.
+    async fn oom_rose(&self, st: &mut State) -> bool {
+        let now = match st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c.cli.clone(), j.id.clone()))) {
+            Some((cli, id)) => {
+                let out = cli.run(&["exec".into(), id, "cat".into(), "/sys/fs/cgroup/memory.events".into()], &BTreeMap::new(), Duration::from_secs(30)).await.unwrap_or_default();
+                oom_kill_count(&out)
+            }
+            None => crate::rt::blocking(host_oom_kills).await.unwrap_or(0),
+        };
+        let rose = st.oom_seen.is_some_and(|before| now > before);
+        st.oom_seen = Some(now);
+        rose
+    }
+
     /// When the server serves HTTPS (it sent its certificate authority): that authority and a
     /// bundle of it and this machine's roots, written in the leg's temp (mounted in its
     /// containers), for its tools.
@@ -1052,6 +1096,9 @@ impl Leg {
             pre_state: BTreeMap::new(),
             action_state: Vec::new(),
             trust,
+            class: None,
+            step_class: None,
+            oom_seen: None,
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
             containers: None,
@@ -1132,6 +1179,8 @@ impl Leg {
         if a.checkout == "auto" && !self.implicit_checkout(&mut st).await {
             st.failed = true;
         }
+        // The OOM killer's count before any step runs, so a step it kills shows (W05-R15).
+        let _ = self.oom_rose(&mut st).await;
         self.pre_steps(&mut st, deadline).await;
         let turns = async_lock::Semaphore::new(MAX_BACKGROUND);
         let mut bg = Background::new(&turns);
@@ -1190,6 +1239,12 @@ impl Leg {
         } else {
             Status::Succeeded
         };
+        // What kind of failure it was, for the server's retry policy (W05-R14, R15).
+        if status == Status::Failed
+            && let Some(class) = st.class
+        {
+            self.event(&JobEventV2::FailureClass { class: class.to_owned() }).await;
+        }
         // A kept leg keeps its state, to rerun a step in place (W17-R04).
         if keep {
             PARKED.lock().insert(a.job_id.clone(), (self.clone(), st));
@@ -1573,8 +1628,13 @@ impl Leg {
             }
         };
         let conclusion = if outcome == Conclusion::Failure && (continue_on_error || excused) { Conclusion::Success } else { outcome };
+        let class = st.step_class.take();
         if conclusion == Conclusion::Failure {
             st.failed = true;
+            // The first step to fail the leg says what kind of failure it was (W05-R15).
+            if st.class.is_none() {
+                st.class = class;
+            }
         }
         self.finish(st, idx, id, outcome, conclusion, exit_code, outputs, nested).await;
         Some(end)
@@ -1746,8 +1806,11 @@ impl Leg {
         let r = self.try_init_containers(st, idx).await;
         let ok = r.is_ok();
         if let Err(e) = r {
-            self.note(idx, &format!("Error: {e:#}")).await;
+            let msg = format!("{e:#}");
+            self.note(idx, &format!("Error: {msg}")).await;
             st.failed = true;
+            // An image that couldn't be pulled, else the executor that couldn't start (W05-R15).
+            st.class.get_or_insert(if msg.contains(" pull:") || msg.contains(" pull ") { "image-pull" } else { "infra" });
         }
         let c = if ok { Conclusion::Success } else { Conclusion::Failure };
         self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
@@ -1994,7 +2057,7 @@ impl Leg {
         };
         let mut running = crate::proc::spawn_group(cmd)?;
         st.groups.push(running.pgid);
-        let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false };
+        let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false, enospc: false };
         let mut flush = Interval::new(Duration::from_millis(100));
         let mut end: Option<End> = None;
         let mut output_done = false;
@@ -2149,6 +2212,13 @@ impl Leg {
         let state = envfiles::pairs(&state_t).unwrap_or_default();
         let end = end.unwrap_or(End::Exit(None));
         let end = if (failed_files || r.failed) && end == End::Exit(Some(0)) { End::Exit(Some(1)) } else { end };
+        // What kind of failure, should this one fail the leg (W05-R15): a kill by the OOM killer
+        // (SIGKILL, and its count rose), a full disk (ENOSPC said, or the work volume full).
+        if matches!(end, End::Exit(Some(137) | None)) && self.oom_rose(st).await {
+            st.step_class = Some("oom");
+        } else if !matches!(end, End::Exit(Some(0)) | End::Cancelled) && (r.enospc || nearly_full(&st.layout.workspace)) {
+            st.step_class = Some("disk-full");
+        }
         Ok(Ran { end, outputs, state })
     }
 
@@ -2168,6 +2238,9 @@ impl Leg {
     async fn whole(&self, st: &mut State, idx: u32, r: &mut Reading, whole: Vec<u8>) {
         let whole = st.unfake_bytes(whole);
         let text = String::from_utf8_lossy(&whole).to_string();
+        if text.contains("No space left on device") {
+            r.enospc = true;
+        }
         match r.proc.line(&text) {
             Line::Text | Line::Unknown => match r.matchers.line(&text) {
                 Some(issue) => self.issue(st, idx, issue).await,

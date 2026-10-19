@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use kiln_ci::plan::{self, Conclusion as PlanC, LegReport, LegSpec, PlanAction, PlanSource, RunInput, RunPlan, Settings};
 use kiln_ci::sched::groups::GroupConfig;
-use kiln_ci::sched::retry::{Failed, FailureClass, RetryPolicy};
+use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy};
 use kiln_ci::sched::routing::{LegRoute, RunnerView};
 use kiln_ci::sched::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler};
 use kiln_ci::trigger::Event;
@@ -158,6 +158,34 @@ fn unresolved(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTree
         .filter_map(|u| actions.get(u).and_then(|a| a.error.as_deref()).map(|why| format!("Unable to resolve action `{u}`: {why}")))
         .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The `log:` patterns of a leg's retry policy (W05-R14) that its attempt's log has, its steps'
+/// logs read in turn.
+async fn log_hits(hub: &Hub, leg: &str, patterns: &[String]) -> Vec<String> {
+    let id = leg.to_owned();
+    let steps: Vec<u32> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT idx FROM steps WHERE job_id = ?1 ORDER BY idx")?;
+            let rows = st.query_map([&id], |r| r.get::<_, u32>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+        .unwrap_or_default();
+    let mut hits: Vec<String> = Vec::new();
+    for step in steps {
+        let text = super::logsearch::plain(&hub.logs.read(leg, step).await);
+        for p in patterns {
+            if !hits.contains(p) && text.contains(p.as_str()) {
+                hits.push(p.clone());
+            }
+        }
+        if hits.len() == patterns.len() {
+            break;
+        }
+    }
+    hits
 }
 
 /// `KCI4031` (W07-R11): the scopes a kiln action in `steps` needs that `granted` gives less of.
@@ -1708,7 +1736,13 @@ impl Dispatch {
             Status::Succeeded | Status::Skipped => Outcome::Success,
             Status::Cancelled => Outcome::Cancelled,
             Status::TimedOut => Outcome::Failed(Failed { class: FailureClass::Timeout, exit_code: r.exit_code, log_hits: Vec::new() }),
-            _ => Outcome::Failed(Failed { class: l.class.unwrap_or(FailureClass::Failure), exit_code: r.exit_code, log_hits: Vec::new() }),
+            _ => {
+                // The retry policy's `log:` patterns the attempt's log has (W05-R14).
+                let patterns: Vec<String> = l.spec.def().and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval).map(|p| p.on.into_iter().filter_map(|o| if let RetryOn::Log(s) = o { Some(s) } else { None }).collect()).unwrap_or_default();
+                let class = l.class.unwrap_or(FailureClass::Failure);
+                let log_hits = if patterns.is_empty() { Vec::new() } else { log_hits(&self.hub, &r.job, &patterns).await };
+                Outcome::Failed(Failed { class, exit_code: r.exit_code, log_hits })
+            }
         };
         // W16-R09: a job's bench-gate fails (or warns about) a leg whose metrics got worse.
         if let (Outcome::Success, Some(g)) = (&outcome, gate) {

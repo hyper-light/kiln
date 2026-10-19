@@ -1763,6 +1763,18 @@ W20.
     decides them, so the server's choices win. `POST /api/ci/routing/explain` (with
     `kiln routing where <labels> [--repo]`) shows where a leg so routed would go and which
     rules applied; `kiln routing rules [--scope] [--set FILE | --clear]`.
+- *Done.* R15's classes on the runner, said with each failed attempt (`JobEventV2::FailureClass`),
+  from the step that failed the leg:
+  - `oom`: the step ended by SIGKILL (exit 137, or no code), and the OOM killer's count rose
+    where it ran (the job container's cgroup, or this runner's and the machine's);
+  - `disk-full`: it said "No space left on device", or the work volume has under 64 MiB left;
+  - `image-pull` or `infra`: the leg's containers couldn't start, for an image that wouldn't
+    pull, or anything else.
+
+  R14's `{ log: "..." }` entries now match: the server reads the failed attempt's log for the
+  policy's patterns. Checked end to end (`crates/kiln/tests/retries.rs`): a log line, a full
+  disk and the OOM killer (a 64 MB job container) are each retried by the policy naming them,
+  and a plain failure under `on: [oom]` isn't.
 - *Done.* R12, reservations: `[[ci.reservations]]` keeps the runners a constraint names (or a
   pool's `reserve`, its executors) for the legs `for` matches (a condition over `job`,
   `workflow`, `repo` and `event`, as a routing rule's `match.job`). Windows start at `cron`
