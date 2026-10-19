@@ -38,6 +38,12 @@ For each agent session (kiln's id):
   kept before that are compressed in the background, a few thousand at a time while the store has
   nothing else to do, under the same numbers, so no feed sends them again. Feed batches travel
   compressed too, to a taker that says it takes them (`zip` in its answer).
+- **An ended agent's transcript goes after `keep_closed_days`** (30 unless set). Its events stay,
+  where search finds them; only the harness's record of it is let go, as nothing reads that once
+  the agent has ended. Each store lets go by its own clock, a few thousand lines at a time while
+  it has nothing else to do, and writes no drop, so no feed carries it: the server's store keeps
+  them as long as `[conversations] keep_closed_days` says, runners and mirrors the 30 days.
+  Claude Code keeps its own transcripts 30 days by default too.
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
@@ -211,6 +217,7 @@ outlives the server's disk and its own machine both.
 [conversations]
 mirrors = 1          # runners that keep a copy of the server's store; 0: none
 mirror_on = []       # runners to pick first, by name
+keep_closed_days = 30  # days an ended agent's transcript is kept (its events stay); 0: for good
 ```
 
 ## Milestones
@@ -232,9 +239,12 @@ mirror_on = []       # runners to pick first, by name
   `flush`. The recorder takes a session's locks one at a time (`Session::record_source`). See the
   lesson of c0ffda6 (agents.md).
 - **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
-  MB. They are kept compressed. A compressed store doesn't shrink its file by itself: the space
-  freed is used again for what comes next (Turso's `VACUUM INTO` makes a compact copy). Pruning
-  ended sessions' transcripts (`keep_closed_days`) is still to come.
+  MB. They are kept compressed, and ended agents' transcripts go after `keep_closed_days`. What
+  that frees is used again for what comes next, and the file is made compact once it is worth it:
+  hourly, while the store has nothing else to do, when a third of its file and 256 MiB are free.
+  The store writes a compact copy (`VACUUM INTO`), which takes the file's place; reads and writes
+  wait meanwhile. A copy written whole before a crash takes the file's place at the next start;
+  one written in part is removed. The copy needs room beside the file while it is written.
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status
@@ -242,7 +252,9 @@ mirror_on = []       # runners to pick first, by name
 | Part | State |
 |---|---|
 | C1 store | live (1a59fad, 2026-10-18): the Turso engine, each runner's store of its sessions, the server's store of every session, the writer, restore from the store, search and paging API |
-| C2 replication | built: revisions, the feed on its lane, the harness's record followed, epochs, resets that keep history. Lab with a real Claude Code: the server's store matches the runner's and the transcript line for line; a server killed mid-turn catches up; a runner killed comes back and goes on |
-| C3 resume elsewhere | built: Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context. Every harness now (ACP agents and Antigravity with their conversation in words), and a gone machine's agents moved on at once (Mission Control's Move them on). Lab (`~/.cache/kiln-mcp-lab/recover_e2e.py`, 12 checks): an ACP agent's runner killed outright, its agent moved on to the other runner, which answers from the conversation it was given |
-| C4 search UI | built: Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
-| C5 mirrors | built: the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |
+| C2 replication | live (dfbbd1a, 2026-10-18): revisions, the feed on its lane, the harness's record followed, epochs, resets that keep history. Lab with a real Claude Code: the server's store matches the runner's and the transcript line for line; a server killed mid-turn catches up; a runner killed comes back and goes on |
+| C3 resume elsewhere | live (dfbbd1a, 2026-10-18): Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context. Built since (e1bb7f2): every harness (ACP agents and Antigravity with their conversation in words), and a gone machine's agents moved on at once (Mission Control's Move them on). Lab (`~/.cache/kiln-mcp-lab/recover_e2e.py`, 12 checks): an ACP agent's runner killed outright, its agent moved on to the other runner, which answers from the conversation it was given |
+| C4 search UI | live (dfbbd1a, 2026-10-18): Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
+| C5 mirrors | live (dfbbd1a, 2026-10-18): the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |
+| Compression | built (2540397): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |
+| Pruning and compaction | built (902b999): an ended agent's transcript goes after `keep_closed_days`; the file is made compact when a third of it is free. 215 MB made 108 MB in about a second |

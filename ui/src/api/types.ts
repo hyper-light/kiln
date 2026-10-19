@@ -149,6 +149,17 @@ export interface HostSample {
   procs: number;
 }
 
+/** A machine's battery, when it has one (its runner says, about once a minute). */
+export interface Battery {
+  /** How full, 0–100. */
+  percent: number;
+  /** It runs on its charger (false: on battery). */
+  ac: boolean;
+  charging: boolean;
+  /** Minutes left on battery, when the machine says. */
+  minutes?: number | null;
+}
+
 export interface Agent {
   name: string;
   labels: string[];
@@ -166,6 +177,8 @@ export interface Agent {
   busy: number;
   draining: boolean;
   sample: HostSample | null;
+  /** Its battery, when it has one. */
+  battery?: Battery | null;
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
   /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
@@ -562,6 +575,8 @@ export interface UpdateJob {
   reached: boolean;
   log: string[];
   error: string | null;
+  /** kiln stopped waiting for it: which of the upgrade waits ran out. */
+  timed_out?: "upgrade" | "jobs" | "build";
 }
 
 /** A kiln binary the server can hand out. */
@@ -669,6 +684,30 @@ export interface RunnerUpdate {
   waits_on?: ReleaseWait | null;
   /** Its kiln checkout, as it reports it. */
   checkout?: string | null;
+  /** The ways it can be upgraded to the newest kiln now, each with what it does or why it can't
+   * (empty when it runs the newest, or kiln knows no newest). Older servers omit it. */
+  ways?: UpgradeWayOpen[];
+}
+
+/** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
+ * the machine itself, from the server's source. */
+export type UpgradeWay = "download" | "build";
+
+export interface UpgradeWayOpen {
+  way: UpgradeWay;
+  ok: boolean;
+  /** What it does ("downloads build 493003c712b0"), or why it can't. */
+  why: string;
+}
+
+/** How long kiln waits on a runner's upgrade before it calls it failed, in minutes. */
+export interface UpgradeWaits {
+  /** To switch to the new build and report in, once the runner has no jobs running. */
+  upgrade_minutes: number;
+  /** While the runner finishes the jobs it is running (it switches only once they are done). */
+  wait_for_jobs_minutes: number;
+  /** For a machine to build kiln itself, install included. */
+  build_minutes: number;
 }
 
 /** A release run building what a runner waits for: its job's step under way, since when, and where. */
@@ -698,6 +737,8 @@ export interface UpdatesOverview {
   newest?: FleetTarget | null;
   /** Every runner follows the newest kiln on its own (`[updates] follow`). */
   follow?: boolean;
+  /** How long upgrades are waited on now, what kiln.toml says, and whether they were changed here. Older servers omit it. */
+  waits?: { now: UpgradeWaits; config: UpgradeWaits; changed: boolean };
 }
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };

@@ -236,8 +236,8 @@ function PastList({ target, kind, kindName, onPick, busy }: { target: string; ki
   );
 }
 
-/** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
-type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string };
+/** Start inside this shell (its machine and folder), like another agent (Duplicate), or with a first message written for it (Diagnose, in Settings → Updates). */
+type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string; prompt?: string };
 
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, and the runners its commands can go to. */
 interface Machines {
@@ -384,12 +384,12 @@ export function SpawnDialog({
   /** It has opened (and taken focus). */
   onOpened?: () => void;
   onStarted: (agents: AgentInfo[]) => void;
-  /** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
+  /** Start inside this shell (its machine and folder), like another agent (Duplicate), or with a first message written for it. */
   defaults?: Defaults;
 }) {
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
   const [count, setCount] = React.useState(1);
-  const [prompt, setPrompt] = React.useState("");
+  const [prompt, setPrompt] = React.useState(defaults?.prompt ?? "");
   const [more, setMore] = React.useState(false);
   const [name, setName] = React.useState("");
   const [model, setModel] = React.useState("");
@@ -410,6 +410,8 @@ export function SpawnDialog({
             promptRef.current?.focus();
             // Opened like another agent: its harness, as if it had been chosen.
             if (defaults?.kind) setKind(defaults.kind);
+            // Opened with a message written for it: that one, to read and change before it starts.
+            if (defaults?.prompt) setPrompt(defaults.prompt);
             onOpened?.();
           }}
         >

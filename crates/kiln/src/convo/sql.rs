@@ -134,6 +134,15 @@ pub const RECORD_LINES: &str = "SELECT n, line FROM records WHERE session = ?1 A
 pub const RECORDS_BELOW: &str = "SELECT session, source, n, line, rev FROM records WHERE rev < ?1 ORDER BY rev DESC LIMIT ?2";
 /// A line, compressed: the same line, so its number for a feed stays as it was.
 pub const RECORD_SQUEEZE: &str = "UPDATE records SET line = ?4 WHERE session = ?1 AND source = ?2 AND n = ?3";
+/// The sessions that ended before `?1` (unix ms): their records go after `keep_closed_days`.
+pub const SESSIONS_ENDED_BEFORE: &str = "SELECT id FROM sessions WHERE closed_at IS NOT NULL AND closed_at < ?1";
+/// The first file of a session's record still kept.
+pub const RECORD_FIRST_SOURCE: &str = "SELECT source FROM records WHERE session = ?1 ORDER BY source, n LIMIT 1";
+/// The numbers of the first `?3` lines kept of a file of a session's record.
+pub const RECORD_FIRST_LINES: &str = "SELECT n FROM records WHERE session = ?1 AND source = ?2 ORDER BY n LIMIT ?3";
+/// A file of a session's record let go through line `?3`. No drop is written: every store lets
+/// an ended session's record go by its own clock, so no feed carries it.
+pub const RECORDS_PRUNE: &str = "DELETE FROM records WHERE session = ?1 AND source = ?2 AND n <= ?3";
 
 /// What was dropped, numbered as the writes are (each one kept: a feed sends them in order).
 pub const DROP_ADD: &str = "INSERT INTO drops (rev, session, what, source, n, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";

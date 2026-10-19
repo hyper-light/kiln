@@ -838,7 +838,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        convo = crate::convo::open(&own_dir);
+        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().keep_closed());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
         h.restore_from(convo.as_ref());
@@ -899,6 +899,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
+    // Its battery: when it was last read, and what was last said of it, when.
+    let mut power_read_at: Option<Instant> = None;
+    let mut power_said: Option<(crate::os::battery::Battery, Instant)> = None;
     let mut noticed: Option<String> = None;
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;
@@ -1971,7 +1974,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // The server's store, of which this runner keeps a copy (a mirror), beside
                         // its own store; opened the first time the server sends it.
                         if mirror.is_none() && convo.is_some() {
-                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
+                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().keep_closed()).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
                                 Ok((intake, out)) => {
                                     let up = uplink.0.clone();
                                     crate::rt::spawn(async move {
@@ -2242,6 +2245,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    // Its battery, once a minute, when it has one: said when it changes, and every
+                    // 10 minutes (a machine on battery sleeps when it runs out).
+                    if !o.ephemeral && !o.outpost && power_read_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        power_read_at = Some(Instant::now());
+                        if let Ok(Some(b)) = crate::rt::blocking(crate::os::battery::read).await
+                            && (power_said.as_ref().is_none_or(|(said, _)| said != &b) || power_said.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(600)))
+                            && let Ok(json) = serde_json::to_string(&b)
+                        {
+                            uplink.msg(AgentMsg::Power { json }).await;
+                            power_said = Some((b, Instant::now()));
+                        }
+                    }
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());

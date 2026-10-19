@@ -317,9 +317,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "check"]) => Ok(updates_overview(&hub, true).await),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
         (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
-        (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
+        (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name, req).await,
         (&Method::PUT, ["api", "updates", "runners", name]) => set_runner_policy(&hub, name, req).await,
         (&Method::PUT, ["api", "updates", "policy"]) => set_policies(&hub, req).await,
+        (&Method::PUT, ["api", "updates", "waits"]) => set_waits(&hub, req).await,
+        (&Method::DELETE, ["api", "updates", "waits"]) => reset_waits(&hub).await,
         (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
         (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
@@ -489,8 +491,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
             let now = body.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            // Going on there in another harness, its conversation carried over (optional).
+            let text = |k: &str| body.get(k).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
             // Its machine away: from the server's copy of its conversation (`relocate::start`).
-            match crate::harness::relocate::start(&hub, id, &to, now).await {
+            match crate::harness::relocate::start(&hub, id, &to, now, text("kind"), text("model")).await {
                 Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
                 Err(e) => Err(err(StatusCode::CONFLICT, e)),
             }
@@ -2214,6 +2218,11 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
             "build": release_build(hub).await,
             "newest": hub.updates.fleet.target(),
             "follow": hub.cfg.updates.follow,
+            "waits": {
+                "now": crate::updates::waits(hub).await,
+                "config": crate::updates::Waits::of(&hub.cfg.updates),
+                "changed": crate::updates::waits_changed(hub).await,
+            },
         }),
     )
 }
@@ -2261,8 +2270,23 @@ async fn build_every_platform(hub: &Hub) -> R {
 }
 
 /// `POST /api/updates/runners/{name}`: upgrade that machine's runner (nothing it runs stops).
-async fn upgrade_runner(hub: &Arc<Hub>, name: &str) -> R {
-    match crate::updates::upgrade_runner(hub, name).await {
+#[derive(Deserialize, Default)]
+struct RunnerUpgrade {
+    /// "download" or "build"; by default whichever kiln can.
+    #[serde(default)]
+    way: Option<crate::updates::Way>,
+}
+
+/// `POST /api/updates/runners/{name}`, optionally `{"way": "download" | "build"}`: upgrade that
+/// machine's runner to the newest kiln now, that way (a retry too).
+async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
+    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let b: RunnerUpgrade = if bytes.iter().all(u8::is_ascii_whitespace) {
+        RunnerUpgrade::default()
+    } else {
+        serde_json::from_slice(&bytes).map_err(|e| err(StatusCode::BAD_REQUEST, format!("the body isn't an upgrade: {e}")))?
+    };
+    match crate::updates::upgrade_runner(hub, name, b.way).await {
         Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
         Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
     }
@@ -2309,6 +2333,27 @@ async fn apply_policy(hub: &Arc<Hub>, names: &[String], policy: crate::updates::
     hub.emit(&json!({ "type": "updates" }));
     // Its gauges at once, and an automatic one brought up to date.
     hub.updates.fleet.wake();
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `PUT /api/updates/waits` `{"upgrade_minutes": 15, "wait_for_jobs_minutes": 360, "build_minutes": 60}`:
+/// how long kiln waits on runners' upgrades from now on, those under way too (kiln.toml's
+/// `[updates]` says until then).
+async fn set_waits(hub: &Arc<Hub>, req: Request) -> R {
+    let w: crate::updates::Waits = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    w.check().map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::updates::set_waits(hub, Some(w)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let said = format!("upgrades {}, waiting for jobs {}, builds {}", w.upgrade_minutes, w.wait_for_jobs_minutes, w.build_minutes);
+    hub.store.audit("admin".into(), "upgrade.waits".into(), format!("{said} (minutes)")).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `DELETE /api/updates/waits`: back to what kiln.toml says.
+async fn reset_waits(hub: &Arc<Hub>) -> R {
+    crate::updates::set_waits(hub, None).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.waits".into(), "as kiln.toml says".to_owned()).await;
+    hub.emit(&json!({ "type": "updates" }));
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
