@@ -144,9 +144,20 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Fills `${{ release.version }}`, `${{ release.id }}` and
-/// `${{ release.artifacts.<name>.<repository|tag|digest> }}` in a package's values.
+/// Expressions a platform's definition leaves to KilnCD, which fills them as it renders.
+pub const PLATFORM_KEEPS: &[&str] = &["git", "artifacts"];
+
+const FILLABLE: &str = "release.version, release.id, release.artifacts.<name>.<repository|tag|digest>, env.name, app.name";
+
+/// Fills `${{ release.version }}`, `${{ release.id }}`,
+/// `${{ release.artifacts.<name>.<repository|tag|digest> }}`, `${{ env.name }}` and
+/// `${{ app.name }}` in a package's values.
 pub fn fill(template: &str, file: &ReleaseFile) -> Result<String, String> {
+    fill_keeping(template, file, &[])
+}
+
+/// [`fill`], leaving the expressions under `keep` (`git`, `artifacts`) as they are.
+fn fill_keeping(template: &str, file: &ReleaseFile, keep: &[&str]) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = template;
     while let Some(start) = rest.find("${{") {
@@ -154,14 +165,48 @@ pub fn fill(template: &str, file: &ReleaseFile) -> Result<String, String> {
         let after = rest.get(start + 3..).unwrap_or("");
         let Some(end) = after.find("}}") else { return Err(format!("{template:?}: `${{{{` without `}}}}`")) };
         let expr = after.get(..end).unwrap_or("").trim();
-        out.push_str(&lookup(expr, file).ok_or_else(|| format!("{template:?}: kiln can't fill `{expr}` (release.version, release.id, release.artifacts.<name>.<repository|tag|digest>)"))?);
+        if kept(expr, keep) {
+            out.push_str(rest.get(start..start + 3 + end + 2).unwrap_or(""));
+        } else {
+            out.push_str(&lookup(expr, file).ok_or_else(|| format!("{template:?}: kiln can't fill `{expr}` ({FILLABLE})"))?);
+        }
         rest = after.get(end + 2..).unwrap_or("");
     }
     out.push_str(rest);
     Ok(out)
 }
 
+fn kept(expr: &str, keep: &[&str]) -> bool {
+    keep.iter().any(|k| expr == *k || expr.strip_prefix(*k).is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// A value with every string's expressions filled ([`fill`]), all the way down, those under
+/// `keep` left as they are.
+pub fn fill_value(v: &Value, file: &ReleaseFile, keep: &[&str]) -> Result<Value, String> {
+    Ok(match v {
+        Value::String(s) => Value::String(fill_keeping(s, file, keep)?),
+        Value::Array(a) => Value::Array(a.iter().map(|x| fill_value(x, file, keep)).collect::<Result<_, _>>()?),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, x)| Ok((k.clone(), fill_value(x, file, keep)?))).collect::<Result<_, String>>()?),
+        other => other.clone(),
+    })
+}
+
+/// Whether every expression in a value is one kiln fills, or one under `keep`.
+pub fn check_value(v: &Value, keep: &[&str]) -> Result<(), String> {
+    match v {
+        Value::String(s) => check_keeping(s, keep),
+        Value::Array(a) => a.iter().try_for_each(|x| check_value(x, keep)),
+        Value::Object(m) => m.values().try_for_each(|x| check_value(x, keep)),
+        _ => Ok(()),
+    }
+}
+
 fn lookup(expr: &str, file: &ReleaseFile) -> Option<String> {
+    match expr {
+        "env.name" => return Some(file.environment.clone()),
+        "app.name" => return Some(file.app.clone()),
+        _ => {}
+    }
     let path = expr.strip_prefix("release.")?;
     match path.split('.').collect::<Vec<_>>().as_slice() {
         ["version"] => file.version.clone(),
@@ -181,17 +226,23 @@ fn lookup(expr: &str, file: &ReleaseFile) -> Option<String> {
 
 /// Whether every `${{ }}` in `template` is one kiln fills, before any release exists.
 pub fn check(template: &str) -> Result<(), String> {
+    check_keeping(template, &[])
+}
+
+fn check_keeping(template: &str, keep: &[&str]) -> Result<(), String> {
     let mut rest = template;
     while let Some(start) = rest.find("${{") {
         let after = rest.get(start + 3..).unwrap_or("");
         let Some(end) = after.find("}}") else { return Err(format!("{template:?}: `${{{{` without `}}}}`")) };
         let expr = after.get(..end).unwrap_or("").trim();
-        let ok = match expr.strip_prefix("release.").map(|p| p.split('.').collect::<Vec<_>>()) {
-            Some(p) => matches!(p.as_slice(), ["version"] | ["id"] | ["artifacts", _, "repository" | "tag" | "digest"]),
-            None => false,
-        };
+        let ok = kept(expr, keep)
+            || matches!(expr, "env.name" | "app.name")
+            || match expr.strip_prefix("release.").map(|p| p.split('.').collect::<Vec<_>>()) {
+                Some(p) => matches!(p.as_slice(), ["version"] | ["id"] | ["artifacts", _, "repository" | "tag" | "digest"]),
+                None => false,
+            };
         if !ok {
-            return Err(format!("{template:?}: kiln can't fill `{expr}` (release.version, release.id, release.artifacts.<name>.<repository|tag|digest>)"));
+            return Err(format!("{template:?}: kiln can't fill `{expr}` ({FILLABLE})"));
         }
         rest = after.get(end + 2..).unwrap_or("");
     }
@@ -200,10 +251,7 @@ pub fn check(template: &str) -> Result<(), String> {
 
 /// A package's `set`, filled for a release.
 pub fn filled_set(package: &Package, file: &ReleaseFile) -> Result<BTreeMap<String, String>, String> {
-    let set = match package {
-        Package::Helm { set, .. } | Package::Git { set, .. } => set,
-    };
-    set.iter().map(|(k, v)| Ok((k.clone(), fill(v, file)?))).collect()
+    package.set().iter().map(|(k, v)| Ok((k.clone(), fill(v, file)?))).collect()
 }
 
 /// The JSON a client sees for a `release.json` (unknown future keys kept).
@@ -287,6 +335,18 @@ mod tests {
         let m = message(&app(), "staging", &release(Kind::Deploy, Some("1.4.2")));
         assert!(m.starts_with("deploy web 1.4.2 to staging (release 42)\n\n"));
         assert!(m.contains("Kiln-Release: 42\n") && m.contains("Kiln-Requested-By: ada\n"));
+    }
+
+    #[test]
+    fn a_platform_s_definition_is_filled_but_for_what_kilncd_fills() -> Result<(), String> {
+        let f = release_json(&app(), "staging", &release(Kind::Deploy, Some("1.4.2")), None, true);
+        let spec = serde_json::json!({ "name": "${{ app.name }}-${{ env.name }}", "tags": ["v${{ release.version }}", "${{ artifacts.zip }}"], "sha": "${{ git.sha }}" });
+        let filled = fill_value(&spec, &f, PLATFORM_KEEPS)?;
+        assert_eq!(filled, serde_json::json!({ "name": "web-staging", "tags": ["v1.4.2", "${{ artifacts.zip }}"], "sha": "${{ git.sha }}" }));
+        assert!(check_value(&spec, PLATFORM_KEEPS).is_ok());
+        assert!(check_value(&serde_json::json!({ "x": ["${{ secrets.token }}"] }), PLATFORM_KEEPS).is_err(), "nothing fills secrets");
+        assert!(fill_value(&serde_json::json!("${{ git.sha }}"), &f, &[]).is_err(), "kept only where kept");
+        Ok(())
     }
 
     #[test]

@@ -184,6 +184,10 @@ pub struct Targets {
     /// Clusters, by the provider's names for them. None: the cluster kiln runs in.
     #[serde(default)]
     pub kubernetes: Vec<String>,
+    /// Beyond Kubernetes, by provider, as `.kiln/environments.yaml` names them (docs/cd-targets.md
+    /// §4): `aws-lambda: { account: aws-prod, region: us-east-1 }`. KilnCD environments only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platforms: BTreeMap<String, serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +304,33 @@ pub enum Package {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         set: BTreeMap<String, String>,
     },
+    /// A platform KilnCD deploys to beyond Kubernetes (docs/cd-targets.md §3): its provider
+    /// (`aws-lambda`, `aws-ecs`, `cloudflare-workers`, `vercel`) and its definition, as the
+    /// provider's key in `.kiln/deploy.yaml` holds it, with `${{ release.* }}`, `${{ env.name }}`
+    /// and `${{ app.name }}` filled for each release (KilnCD's `${{ git.* }}` and
+    /// `${{ artifacts.* }}` left to it). The platform's own files (a task definition,
+    /// `wrangler.jsonc`) come from `repo` at `path`, at the release's version. KilnCD environments
+    /// only.
+    Platform {
+        provider: String,
+        #[serde(default)]
+        spec: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
+    },
+}
+
+impl Package {
+    /// What a release sets (Helm's `--set`); a platform's definition holds its own settings.
+    pub fn set(&self) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        match self {
+            Self::Helm { set, .. } | Self::Git { set, .. } => set,
+            Self::Platform { .. } => &NONE,
+        }
+    }
 }
 
 /// An app in an environment (docs/deploy-api.md §5).

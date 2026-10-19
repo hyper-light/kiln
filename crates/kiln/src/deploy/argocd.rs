@@ -188,9 +188,7 @@ fn argo_repo(repo: &str) -> (String, bool) {
 pub fn application(namespace: &str, app: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, values: Option<&str>, commit: &str) -> Result<Value, String> {
     let version = file.version.clone().ok_or("the release names no version")?;
     let mut set = repo::filled_set(&app.package, file)?;
-    let raw_set = match &app.package {
-        Package::Helm { set, .. } | Package::Git { set, .. } => set,
-    };
+    let raw_set = app.package.set();
     let values: Value = match values.map(str::trim).filter(|v| !v.is_empty()) {
         Some(v) => serde_yaml::from_str::<Value>(v).map_err(|e| format!("values.yaml doesn't read: {e}"))?,
         None => Value::Null,
@@ -210,6 +208,7 @@ pub fn application(namespace: &str, app: &App, env: &Environment, reg: &Registra
         h
     };
     let source = match &app.package {
+        Package::Platform { provider, .. } => return Err(format!("Argo CD deploys to Kubernetes only, and {} deploys to {provider}: release it in a KilnCD environment", app.name)),
         Package::Helm { repo: chart_repo, chart, chart_version, .. } => {
             let (repo_url, _) = argo_repo(chart_repo);
             let revision = match chart_version {
@@ -336,7 +335,7 @@ mod tests {
             name: "production".into(),
             provider: "argocd/prod".into(),
             release_repo: RepoRef::default(),
-            targets: Targets { kubernetes: vec!["prod-us".into()] },
+            targets: Targets { kubernetes: vec!["prod-us".into()], ..Targets::default() },
             gates: Default::default(),
             sync: Default::default(),
             watch: Default::default(),

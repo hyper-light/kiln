@@ -145,32 +145,7 @@ enum AppCmd {
     /// An app, and what runs where.
     Show { app: String },
     /// Create (or replace) an app.
-    Create {
-        app: String,
-        #[arg(long, default_value = "default")]
-        project: String,
-        /// Owner teams: the owner first, then a co-owner and an ops owner.
-        #[arg(long = "owner")]
-        owners: Vec<String>,
-        /// A Helm chart's repository (`oci://…` or a Helm repository's URL).
-        #[arg(long, conflicts_with = "git_repo")]
-        helm_repo: Option<String>,
-        #[arg(long, requires = "helm_repo")]
-        chart: Option<String>,
-        /// The chart's version, when it isn't the release's (`${{ release.version }}`).
-        #[arg(long, requires = "helm_repo")]
-        chart_version: Option<String>,
-        /// A git repository whose path deploys at the release's version (a ref).
-        #[arg(long)]
-        git_repo: Option<String>,
-        #[arg(long, default_value = "")]
-        path: String,
-        /// A value: `image.tag=${{ release.artifacts.image.tag }}`.
-        #[arg(long = "set")]
-        set: Vec<String>,
-        #[arg(long)]
-        namespace: Option<String>,
-    },
+    Create(Box<NewApp>),
     /// Register an app in an environment.
     Register {
         app: String,
@@ -198,6 +173,46 @@ enum AppCmd {
     },
     /// Delete an app registered nowhere.
     Delete { app: String },
+}
+
+/// `kiln app create`: an app and how it is deployed.
+#[derive(clap::Args)]
+struct NewApp {
+    app: String,
+    #[arg(long, default_value = "default")]
+    project: String,
+    /// Owner teams: the owner first, then a co-owner and an ops owner.
+    #[arg(long = "owner")]
+    owners: Vec<String>,
+    /// A Helm chart's repository (`oci://…` or a Helm repository's URL).
+    #[arg(long, conflicts_with = "git_repo")]
+    helm_repo: Option<String>,
+    #[arg(long, requires = "helm_repo")]
+    chart: Option<String>,
+    /// The chart's version, when it isn't the release's (`${{ release.version }}`).
+    #[arg(long, requires = "helm_repo")]
+    chart_version: Option<String>,
+    /// A git repository whose path deploys at the release's version (a ref).
+    #[arg(long)]
+    git_repo: Option<String>,
+    /// A platform KilnCD deploys to (aws-lambda, aws-ecs, cloudflare-workers, vercel), with
+    /// `--spec`: its definition.
+    #[arg(long, conflicts_with_all = ["helm_repo", "git_repo"], requires = "spec")]
+    platform: Option<String>,
+    /// The platform's definition, a YAML or JSON file, as its key in .kiln/deploy.yaml holds it.
+    #[arg(long, requires = "platform")]
+    spec: Option<PathBuf>,
+    /// Where the platform's own files are (a task definition, wrangler.jsonc), at each
+    /// release's version; with `--path`.
+    #[arg(long, requires = "platform")]
+    files_repo: Option<String>,
+    #[arg(long, default_value = "")]
+    path: String,
+    /// A value: `image.tag=${{ release.artifacts.image.tag }}`.
+    #[arg(long = "set")]
+    set: Vec<String>,
+    #[arg(long)]
+    namespace: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -488,16 +503,23 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 }
             });
         }
-        AppCmd::Create { app, project, owners, helm_repo, chart, chart_version, git_repo, path, set, namespace } => {
+        AppCmd::Create(new) => {
+            let NewApp { app, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace } = *new;
             let mut sets = BTreeMap::new();
             for kv in &set {
                 let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set name=value"))?;
                 sets.insert(k.to_owned(), v.to_owned());
             }
-            let package = match (helm_repo, git_repo) {
-                (Some(repo), None) => json!({ "kind": "helm", "repo": repo, "chart": chart.context("--chart: the chart's name")?, "chart_version": chart_version, "set": sets }),
-                (None, Some(repo)) => json!({ "kind": "git", "repo": repo, "path": path, "set": sets }),
-                _ => bail!("how is it deployed? --helm-repo and --chart, or --git-repo (and --path)"),
+            let package = match (helm_repo, git_repo, platform) {
+                (Some(repo), None, None) => json!({ "kind": "helm", "repo": repo, "chart": chart.context("--chart: the chart's name")?, "chart_version": chart_version, "set": sets }),
+                (None, Some(repo), None) => json!({ "kind": "git", "repo": repo, "path": path, "set": sets }),
+                (None, None, Some(provider)) => {
+                    let file = spec.context("--spec: the platform's definition")?;
+                    let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+                    let spec: Value = serde_yaml::from_str(&text).with_context(|| format!("{} doesn't read as YAML", file.display()))?;
+                    json!({ "kind": "platform", "provider": provider, "spec": spec, "repo": files_repo, "path": path })
+                }
+                _ => bail!("how is it deployed? --helm-repo and --chart, --git-repo (and --path), or --platform and --spec"),
             };
             let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace });
             let v = api.call(Method::Post, "/apps", Some(body)).await?;

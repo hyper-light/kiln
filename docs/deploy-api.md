@@ -180,7 +180,8 @@ production:
   release_repo: { host: github, repo: acme/releases, branch: main, root: "" }
   targets:
     kubernetes: [prod-us, prod-eu]    # clusters, as the provider names them
-    aws: { account: "123456789012", region: us-east-1 }   # KilnCD environments only
+    platforms:                        # KilnCD environments only (cd-targets.md §4)
+      aws-lambda: { account: aws-prod, region: us-east-1 }   # an aws integration
   gates:
     after: [staging]                  # the version ran healthy there (txst's required environments)
     soak: 30m                         # …for at least this long
@@ -684,4 +685,5 @@ deployments, and aren't carried over.
 | P2: ApplicationSets over the release repository, AppProjects, the repository registered for reading, diff, manifests, resources, logs, actions, the stream rather than polling; moving an environment between providers | not yet: ApplicationSets wait on release repositories being served (W14) |
 | The `deploy.*` operations (P8's MCP half, early, for agents: §12.3), the environment's `agents` policy, idempotency keys, the `deploy` event | built. Over MCP on the test server: a release with a key asked for twice was one release; `deploy.releases.wait` answered as it moved and when it landed; a missing version refused; a rollback with its key landed |
 | P4: gates (`after`, `soak`, approvals with reviewers and `self_approve`, allow and deny windows, the checks `no-snapshots` and `owners-set`, freezes), `waiting_approval`, approve and reject (HTTP, `kiln`, `deploy.releases.approve`/`reject`), promotion | built. On the test servers (upstream on Argo CD, downstream on KilnCD): a version not upstream refused; one upstream held for its soak, then for approval; the requester's own approval refused; a named reviewer's approval let it go and it landed; a rejection cancelled one; a freeze and a deny window each held one and released it the moment they were lifted. External checks, signatures, `promote: auto`, freezes by API and signed results between servers: not yet |
-| P3, P5 to P8 | not yet |
+| P7: platforms under releases through KilnCD: an app's `platform` package (its provider, `aws-lambda`, `aws-ecs`, `cloudflare-workers` or `vercel`, and its definition as `.kiln/deploy.yaml` holds it, `${{ release.* }}`, `${{ env.name }}` and `${{ app.name }}` filled, KilnCD's `${{ git.* }}` and `${{ artifacts.* }}` left to it; the platform's files from a repository at the release's version), an environment's `targets.platforms` (an account that is an integration of the provider's kind, its place), refused on Argo CD | built. KilnCD renders what a Lambda release defines into its Function (a test, against KilnCD's own provider); on the test server a release reached KilnCD for its target, and was cancelled and reverted; no real account yet (cd-targets.md D8) |
+| P3, P5, P6, P8 | not yet |

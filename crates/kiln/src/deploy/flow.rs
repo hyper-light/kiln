@@ -169,6 +169,24 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.release_repo.root.split('/').any(|s| s == "..") {
         return Err(bad("the release repository's root can't climb out of it"));
     }
+    for (provider, place) in &e.targets.platforms {
+        if argo_of(&e).is_some() {
+            return Err(bad(format!("Argo CD environments deploy to Kubernetes only: {provider} is a KilnCD environment's target")));
+        }
+        let (target, _) = kiln_cd::providers::target_of(provider, place).map_err(|m| bad(format!("targets.platforms.{provider}: {m}")))?;
+        let Some(def) = kiln_cd::providers::get(provider) else { continue };
+        if !def.built {
+            return Err(bad(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", def.title)));
+        }
+        // Its account is an integration of the provider's kind (a runner's targets need none).
+        if def.integration != "runner" {
+            match crate::ci::integrations::get(&d.hub, &target.account).await.map_err(internal)? {
+                Some(i) if i.kind == def.integration => {}
+                Some(i) => return Err(bad(format!("targets.platforms.{provider}: {} is an integration of kind {}, and {} deploys through one of kind {}", target.account, i.kind, def.title, def.integration))),
+                None => return Err(bad(format!("targets.platforms.{provider}: no integration `{}` (Settings → Integrations): {} deploys through an {} account", target.account, def.title, def.integration))),
+            }
+        }
+    }
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
@@ -254,11 +272,20 @@ pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
     match &a.package {
         super::model::Package::Helm { repo, chart, .. } if repo.is_empty() || chart.is_empty() => return Err(bad("a Helm package names its repository and its chart")),
         super::model::Package::Git { repo, .. } if repo.is_empty() => return Err(bad("a git package names its repository")),
+        super::model::Package::Platform { provider, spec, .. } => {
+            match kiln_cd::providers::get(provider) {
+                None => return Err(bad(format!("kiln deploys to no platform {provider} (aws-ecs, aws-lambda, cloudflare-workers, vercel)"))),
+                Some(def) if !def.built => return Err(bad(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", def.title))),
+                Some(_) => {}
+            }
+            if !spec.is_object() {
+                return Err(bad(format!("a {provider} package's spec is its definition: an object, as its key in .kiln/deploy.yaml")));
+            }
+            repo::check_value(spec, repo::PLATFORM_KEEPS).map_err(|e| bad(format!("spec: {e}")))?;
+        }
         _ => {}
     }
-    for (k, v) in match &a.package {
-        super::model::Package::Helm { set, .. } | super::model::Package::Git { set, .. } => set,
-    } {
+    for (k, v) in a.package.set() {
         repo::check(v).map_err(|e| bad(format!("set {k}: {e}")))?;
     }
     store::put_app(&d.hub.store, &a).await.map_err(internal)?;
@@ -314,6 +341,14 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     }
     if store::registration(&d.hub.store, app_name, env_name).await.map_err(internal)?.is_some() {
         return Err(conflict(format!("{app_name} is registered in {env_name} already")));
+    }
+    if let super::model::Package::Platform { provider, .. } = &a.package {
+        if argo_of(&env).is_some() {
+            return Err(conflict(format!("{app_name} deploys to {provider}, and {env_name} is on Argo CD, which deploys to Kubernetes only: register it in a KilnCD environment")));
+        }
+        if !env.targets.platforms.contains_key(provider) {
+            return Err(conflict(format!("{env_name} has no {provider} target: give it targets.platforms.{provider}: {{ account: <integration>, … }} first")));
+        }
     }
     let rr = &env.release_repo;
     let values = repo::values_file(rr, &a, env_name);
