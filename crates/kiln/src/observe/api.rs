@@ -51,6 +51,22 @@ fn dashboards() -> Result<&'static std::sync::Arc<super::dashboards::Dashboards>
     DASHBOARDS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "dashboards are kept by the server"))
 }
 
+/// The server's SLOs, once it started.
+static SLOS: OnceLock<std::sync::Arc<super::slos::Slos>> = OnceLock::new();
+
+pub fn set_slos(s: std::sync::Arc<super::slos::Slos>) {
+    let _ = SLOS.set(s);
+}
+
+fn slos() -> Result<&'static std::sync::Arc<super::slos::Slos>, Fail> {
+    SLOS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "SLOs are kept by the server"))
+}
+
+/// An SLO by its id, for a monitor of it.
+pub fn slo_def(id: &str) -> Option<super::slos::SloDef> {
+    SLOS.get()?.get(id)
+}
+
 /// The server's cloud integrations, once it started.
 static CLOUDS: OnceLock<std::sync::Arc<super::cloud::Clouds>> = OnceLock::new();
 
@@ -196,6 +212,20 @@ async fn reading<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store) -> R
     .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
 }
 
+/// An SLO as the API shows it: its definition and its standing (`days`: day by day too).
+fn slo_json(s: &kiln_obs::store::Store, d: &super::slos::SloDef, now: i64, days: bool) -> Value {
+    let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("standing".into(), super::slos::standing(s, d, now, days));
+    }
+    v
+}
+
+/// Whether monitor `m` alerts on SLO `id`.
+fn reads_slo(m: &super::monitors::Monitor, id: &str) -> bool {
+    matches!(kiln_obs::monitor::parse(&m.query), Ok(q) if matches!(&q.kind, kiln_obs::monitor::Kind::Slo { id: of, .. } if of == id))
+}
+
 /// The authenticated routes, under `/api/observe/v1/`.
 pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
@@ -282,6 +312,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                         kiln_obs::monitor::Kind::Logs { search, window_ms, .. } => ("logs", json!({ "search": search }), window_ms),
                         // A forecast's window is ahead: `window_ms` its horizon.
                         kiln_obs::monitor::Kind::Forecast { query, ahead_ms, .. } => ("forecast", json!({ "query": query }), ahead_ms),
+                        kiln_obs::monitor::Kind::Slo { id, burn } => ("slo", json!({ "slo": id }), &burn.map_or(3_600_000, |b| b.0)),
                     };
                     srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold, "kind": kind, "watched": watched, "window_ms": window_ms }))
                 }
@@ -476,6 +507,54 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["distribution_points"]) => ingest_distributions(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::GET, ["openapi.json"]) => Ok(srv::json(StatusCode::OK, &super::openapi::document(env!("CARGO_PKG_VERSION")))),
+        (&Method::GET, ["slos"]) => {
+            let list = slos()?.list();
+            reading(move |s| {
+                let now = crate::util::now_ms();
+                let out: Vec<Value> = list.iter().map(|d| slo_json(s, d, now, false)).collect();
+                Ok(srv::json(StatusCode::OK, &json!({ "slos": out })))
+            })
+            .await
+        }
+        (&Method::POST, ["slos"]) => {
+            let mut d: super::slos::SloDef = read_json(req.into_body(), QUERY_BODY).await?;
+            d.id.clear();
+            let d = slos()?.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::CREATED, &d))
+        }
+        (&Method::GET, ["slos", id]) => {
+            let d = slos()?.get(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such SLO"))?;
+            let alerts: Vec<Value> = monitors().map(|ms| ms.list().iter().filter(|m| reads_slo(m, &d.id)).map(|m| json!({ "id": m.id, "name": m.name, "query": m.query, "state": ms.overall(&m.id) })).collect()).unwrap_or_default();
+            reading(move |s| {
+                let mut v = slo_json(s, &d, crate::util::now_ms(), true);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("alerts".into(), Value::from(alerts));
+                }
+                Ok(srv::json(StatusCode::OK, &v))
+            })
+            .await
+        }
+        (&Method::PUT, ["slos", id]) => {
+            let store = slos()?;
+            let id = (*id).to_owned();
+            if store.get(&id).is_none() {
+                return Err(fail(StatusCode::NOT_FOUND, "no such SLO"));
+            }
+            let mut d: super::slos::SloDef = read_json(req.into_body(), QUERY_BODY).await?;
+            d.id = id;
+            let d = store.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::OK, &d))
+        }
+        (&Method::DELETE, ["slos", id]) => {
+            let by: Vec<String> = monitors().map(|ms| ms.list().into_iter().filter(|m| reads_slo(m, id)).map(|m| m.name).collect()).unwrap_or_default();
+            if !by.is_empty() {
+                return Err(fail(StatusCode::CONFLICT, format!("monitors read it: {}; change or delete them first", by.join(", "))));
+            }
+            match slos()?.delete(id).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
+                true => Ok(srv::status(StatusCode::NO_CONTENT)),
+                false => Err(fail(StatusCode::NOT_FOUND, "no such SLO")),
+            }
+        }
         _ => Err(fail(StatusCode::NOT_FOUND, "no such observe route")),
     }
 }

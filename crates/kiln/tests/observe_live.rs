@@ -1167,6 +1167,94 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
     Ok(())
 }
 
+/// SLOs (docs/observe.md §9.4): requests counted a minute for three hours, a thousandth failing but
+/// in the last half hour, when half do; a ratio SLO of them and a time slice SLO of a latency; the
+/// standing as the workbook reckons it; a burn-rate monitor of the SLO (the long window and the
+/// short both past 14.4) alerting; an SLO a monitor reads not deleted until the monitor is.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn an_slo_s_standing_and_its_burn_rate_alert_are_the_workbook_s() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    let base = "/api/observe/v1";
+    // Three hours of minutes ending at the last five-minute edge, the last 70 of them bad: every
+    // window the server reads ends at its own last whole step, a few minutes later, so the hour's
+    // and the quarter's hold bad minutes alone, and the week every one.
+    let end = now_ms().div_euclid(300_000) * 300_000;
+    let minutes: Vec<i64> = (0..180).map(|i| end - 180 * 60_000 + i * 60_000).collect();
+    let bad = |t: i64| t >= end - 70 * 60_000;
+    let pts = |f: &dyn Fn(i64) -> f64| -> Vec<Value> { minutes.iter().map(|&t| json!([t as f64 / 1000.0, f(t)])).collect() };
+    f.call(
+        "POST",
+        &format!("{base}/series"),
+        Some(&json!({ "series": [
+            { "metric": "slo.requests", "type": "count", "tags": ["status:ok"], "points": pts(&|t| if bad(t) { 50.0 } else { 99.9 }) },
+            { "metric": "slo.requests", "type": "count", "tags": ["status:error"], "points": pts(&|t| if bad(t) { 50.0 } else { 0.1 }) },
+            { "metric": "slo.latency.p99", "type": "gauge", "tags": ["service:web"], "points": pts(&|t| if bad(t) { 0.9 } else { 0.12 }) },
+        ] })),
+    )?;
+    let ratio = f.call(
+        "POST",
+        &format!("{base}/slos"),
+        Some(&json!({ "name": "requests", "type": "ratio", "good": "sum:slo.requests{status:ok}.as_count()", "total": "sum:slo.requests{*}.as_count()", "target": 99.0, "warning": 99.5, "timeframe": "7d", "tags": ["team:web"] })),
+    )?;
+    let id = at(&ratio, &["id"]).as_str().unwrap_or("").to_owned();
+    // Every minute applied before it is reckoned.
+    let start = Instant::now();
+    let standing = loop {
+        let s = f.call("GET", &format!("{base}/slos/{id}"), None)?;
+        if at(&s, &["standing", "total"]).as_f64() == Some(18_000.0) {
+            break s;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{s:#}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    // 110 minutes of 0.1 failing and 70 of 50: the SLI, the budget left, the burn rates.
+    let (failed, total) = (110.0 * 0.1 + 70.0 * 50.0, 18_000.0);
+    let sli = (1.0 - failed / total) * 100.0;
+    let st = at(&standing, &["standing"]);
+    anyhow::ensure!(at(st, &["state"]) == "BREACHED" && (at(st, &["sli"]).as_f64().unwrap_or(0.0) - sli).abs() < 1e-9, "{sli} {st:#}");
+    let left = 100.0 - (failed / total) / 0.01 * 100.0;
+    anyhow::ensure!((at(st, &["budget_left"]).as_f64().unwrap_or(0.0) - left).abs() < 1e-6, "{left} {st:#}");
+    anyhow::ensure!((at(st, &["burn_rates", "1h"]).as_f64().unwrap_or(0.0) - 50.0).abs() < 1e-9, "the hour, all bad: {st:#}");
+    let all = failed / total / 0.01;
+    anyhow::ensure!((at(st, &["burn_rates", "6h"]).as_f64().unwrap_or(0.0) - all).abs() < 1e-9, "{all} {st:#}");
+    anyhow::ensure!(at(st, &["days"]).as_array().is_some_and(|d| !d.is_empty()), "{st:#}");
+    // A time slice SLO: the five-minute slices whose p99 is under 300 ms.
+    let slices = f.call("POST", &format!("{base}/slos"), Some(&json!({ "name": "latency", "type": "slices", "query": "max:slo.latency.p99{service:web}", "condition": "< 0.3", "slice_s": 300, "target": 99.0, "timeframe": "7d" })))?;
+    let sid = at(&slices, &["id"]).as_str().unwrap_or("").to_owned();
+    let s2 = f.call("GET", &format!("{base}/slos/{sid}"), None)?;
+    let (met, all) = (at(&s2, &["standing", "good"]).as_f64().unwrap_or(0.0), at(&s2, &["standing", "total"]).as_f64().unwrap_or(0.0));
+    anyhow::ensure!(all == 36.0 && met == 22.0, "180 minutes are 36 slices, the last fourteen not met: {met} of {all}");
+    // The burn-rate alert: the hour's and the quarter hour's 50, both past 14.4.
+    let m = f.call(
+        "POST",
+        &format!("{base}/monitors"),
+        Some(&json!({ "name": "requests burning fast", "query": format!("slo(\"{id}\").burn_rate(\"1h\", \"15m\") > 14.4"), "message": "budget burning", "options": { "every": 10 } })),
+    )?;
+    let mid = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("{base}/monitors/{mid}"), None)?;
+        if at(&m, &["state"]) == "ALERT" {
+            let value = at(&m, &["groups"]).get(0).and_then(|g| g.get("value")).and_then(Value::as_f64).unwrap_or(0.0);
+            anyhow::ensure!((value - 50.0).abs() < 1e-9, "the lesser of the two windows' rates: {value} {m:#}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "not alerting: {m:#}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let shown = f.call("GET", &format!("{base}/slos/{id}"), None)?;
+    anyhow::ensure!(at(&shown, &["alerts"]).as_array().is_some_and(|a| a.len() == 1 && a.first().is_some_and(|x| at(x, &["state"]) == "ALERT")), "{shown:#}");
+    // An SLO a monitor reads is not deleted until the monitor is.
+    let (code, _) = f.request("DELETE", &format!("{base}/slos/{id}"), None)?;
+    anyhow::ensure!(code == 409, "{code}");
+    anyhow::ensure!(f.request("DELETE", &format!("{base}/monitors/{mid}"), None)?.0 == 204);
+    anyhow::ensure!(f.request("DELETE", &format!("{base}/slos/{id}"), None)?.0 == 204);
+    let listed = f.call("GET", &format!("{base}/slos"), None)?;
+    anyhow::ensure!(at(&listed, &["slos"]).as_array().is_some_and(|l| l.len() == 1), "{listed:#}");
+    Ok(())
+}
+
 /// Whether `v` is what `schema` says, `doc` holding the schemas it names: OpenAPI 3.1's JSON Schema
 /// as far as the document uses it (`$ref`, `type`, `properties`, `required`, `items`, `enum`,
 /// `anyOf`, `oneOf`, `allOf`, `additionalProperties`); where it is not, the path to what is not.
@@ -1320,6 +1408,15 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     check("PUT", &format!("{base}/dashboards/{did}"), &dpath, Some(json!({ "title": "api, changed", "widgets": [] })), 200)?;
     check("GET", &format!("{base}/dashboards"), &format!("{base}/dashboards"), None, 200)?;
     check("DELETE", &format!("{base}/dashboards/{did}"), &dpath, None, 204)?;
+    // SLOs: made, read with their standing, changed, listed, deleted.
+    let slo = check("POST", &format!("{base}/slos"), &format!("{base}/slos"), Some(json!({ "name": "api", "type": "ratio", "good": "sum:api.check{*}.as_count()", "total": "sum:api.check{*}.as_count()", "target": 99.0, "timeframe": "7d" })), 201)?;
+    let sid = at(&slo, &["id"]).as_str().unwrap_or("").to_owned();
+    let spath = format!("{base}/slos/{{id}}");
+    check("GET", &format!("{base}/slos/{sid}"), &spath, None, 200)?;
+    check("PUT", &format!("{base}/slos/{sid}"), &spath, Some(json!({ "name": "api", "type": "slices", "query": "max:api.check{*}", "condition": "< 100", "slice_s": 60, "target": 99.5, "timeframe": "30d" })), 200)?;
+    check("GET", &format!("{base}/slos"), &format!("{base}/slos"), None, 200)?;
+    check("POST", &format!("{base}/slos"), &format!("{base}/slos"), Some(json!({ "name": "bad", "type": "ratio", "target": 100.0, "timeframe": "7d" })), 400)?;
+    check("DELETE", &format!("{base}/slos/{sid}"), &spath, None, 204)?;
     // Integrations, scrapes and clouds as they are listed and kept (their tests reach outside).
     check("PUT", &format!("{base}/integrations/hook"), &format!("{base}/integrations/{{name}}"), Some(json!({ "kind": "webhook", "url": "https://example.invalid/hook", "secret": "s" })), 204)?;
     let listed = check("GET", &format!("{base}/integrations"), &format!("{base}/integrations"), None, 200)?;

@@ -529,6 +529,44 @@ fn schemas() -> Map<String, Value> {
         ("template_variables", array(object(&[("name", string()), ("tag", string()), ("default", string())], &["name", "tag"]))),
         ("widgets", array(widget)),
     ];
+    let slo_fields = [
+        ("name", string()),
+        ("description", string()),
+        ("type", describe(one_of(&["ratio", "slices"]), "good events over total, or time slices meeting a condition")),
+        ("good", describe(string(), "a ratio's good events: a metric query of counts")),
+        ("total", describe(string(), "a ratio's total events: a metric query of counts")),
+        ("query", describe(string(), "a time slice SLO's metric query")),
+        ("condition", describe(string(), "a time slice's condition: a comparison and a number (< 0.3)")),
+        ("slice_s", describe(integer(), "a time slice's width: 60 or 300")),
+        ("target", describe(number(), "percent: 99.9")),
+        ("warning", describe(number(), "percent, above the target: WARN below it")),
+        ("timeframe", one_of(&["7d", "30d", "90d"])),
+        ("tags", array(string())),
+    ];
+    put("SloIn", object(&slo_fields, &["name", "type", "target", "timeframe"]));
+    let mut slo_kept: Vec<(&str, Value)> = slo_fields.to_vec();
+    slo_kept.extend([("id", string()), ("created", ms()), ("modified", ms())]);
+    put("SloKept", object(&slo_kept, &["id", "name", "type", "target", "timeframe"]));
+    put(
+        "SloStanding",
+        object(
+            &[
+                ("state", one_of(&["OK", "WARN", "BREACHED", "NO DATA", "INVALID"])),
+                ("sli", describe(nullable(number()), "percent, over the timeframe")),
+                ("good", number()),
+                ("total", number()),
+                ("budget_left", describe(nullable(number()), "percent of the error budget (below 0 once spent)")),
+                ("burn_rates", describe(map_of(nullable(number())), "over the last 1h, 6h, 1d and 3d: the error rate over the budget's")),
+                ("days", array(object(&[("day", ms()), ("sli", nullable(number())), ("budget_left", nullable(number()))], &["day"]))),
+                ("error", string()),
+            ],
+            &["state"],
+        ),
+    );
+    put(
+        "Slo",
+        json!({ "allOf": [schema("SloKept"), object(&[("standing", schema("SloStanding")), ("alerts", array(object(&[("id", string()), ("name", string()), ("query", string()), ("state", string())], &["id", "name", "query", "state"])))], &["standing"])] }),
+    );
     put("DashboardIn", object(&dashboard_fields, &["title"]));
     let mut kept: Vec<(&str, Value)> = dashboard_fields.to_vec();
     kept.extend([("id", string()), ("builtin", boolean()), ("created", ms()), ("modified", ms())]);
@@ -712,6 +750,11 @@ fn ops() -> Vec<Op<'static>> {
         op("post", "/distribution_points", "Writes a distribution's values (Datadog's v1 distribution points)", "observe.write", Some(body("DistributionIntake")), vec![accepted(object(&[("values", integer())], &["values"]))]),
         op("post", "/logs", "Writes log records (Datadog's log intake)", "observe.write", Some(body("LogIntake")), vec![accepted(object(&[("records", integer())], &["records"]))]),
         op("get", "/openapi.json", "This document", "observe.read", None, vec![("200", answer_of("OpenAPI 3.1", any()))]),
+        op("get", "/slos", "Lists SLOs, each its standing", "observe.read", None, vec![("200", answer_of("the SLOs", object(&[("slos", array(schema("Slo")))], &["slos"])))]),
+        op("post", "/slos", "Makes an SLO", "observe.write", Some(body("SloIn")), vec![("201", answer("made", Some("SloKept")))]),
+        Op { params: vec![id()], ..op("get", "/slos/{id}", "An SLO, its standing day by day, and the monitors that alert on it", "observe.read", None, vec![ok("Slo")]) },
+        Op { params: vec![id()], ..op("put", "/slos/{id}", "Changes an SLO", "observe.write", Some(body("SloIn")), vec![ok("SloKept")]) },
+        Op { params: vec![id()], ..op("delete", "/slos/{id}", "Deletes an SLO (refused while a monitor reads it: 409)", "observe.write", None, vec![no_content(), ("409", answer("monitors read it", Some("Error")))]) },
     ];
     // What is sent in from outside, at the root, each with the ingest token its own way.
     let raw = |what: &str| json!({ "required": true, "content": { "application/x-protobuf": { "schema": { "type": "string", "format": "binary" } }, "application/json": { "schema": any() } }, "description": what });

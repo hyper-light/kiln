@@ -95,6 +95,23 @@ pub struct Monitor {
     pub modified: i64,
 }
 
+/// An SLO monitor's value (`monitor::Kind::Slo`): the lesser of its SLO's burn rates over the long
+/// window and the short (both must pass for it to; none while either has no data), or its error
+/// budget left, percent.
+fn slo_values(store: &kiln_obs::store::Store, id: &str, burn: Option<(i64, i64)>, now: i64) -> Result<Vec<monitor::Value>, monitor::MonitorError> {
+    let def = super::api::slo_def(id).ok_or_else(|| monitor::MonitorError::Eval(format!("no SLO {id}")))?;
+    let slo = def.slo().map_err(monitor::MonitorError::Eval)?;
+    let eval = |e: kiln_obs::slo::SloError| monitor::MonitorError::Eval(e.to_string());
+    let value = match burn {
+        Some((long, short)) => match (kiln_obs::slo::burn_rate(store, &slo, long, now).map_err(eval)?, kiln_obs::slo::burn_rate(store, &slo, short, now).map_err(eval)?) {
+            (Some(l), Some(s)) => Some(l.min(s)),
+            _ => None,
+        },
+        None => kiln_obs::slo::status(store, &slo, now).map_err(eval)?.budget_left,
+    };
+    Ok(value.map(|v| vec![monitor::Value { group: Vec::new(), value: v }]).unwrap_or_default())
+}
+
 /// A monitor, compiled: a query of the store and its thresholds, or a composite of other monitors.
 #[derive(Debug, Clone)]
 pub enum Compiled {
@@ -144,6 +161,7 @@ impl Monitor {
             monitor::Kind::Metric { window_ms, .. } | monitor::Kind::Change { window_ms, .. } | monitor::Kind::Logs { window_ms, .. } => *window_ms,
             // Ahead, not behind: an hour without a forecast is two "windows" without data.
             monitor::Kind::Forecast { .. } => 3_600_000,
+            monitor::Kind::Slo { burn, .. } => burn.map_or(3_600_000, |b| b.0),
         }
     }
 
@@ -352,7 +370,8 @@ impl Monitors {
     fn evaluate(&self, store: &kiln_obs::store::Store, m: &Monitor, now: i64) -> bool {
         let Ok(Compiled::Query(q, t)) = m.compiled() else { return false };
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
-        let values = match monitor::evaluate(store, &q, now, delay) {
+        let values = if let monitor::Kind::Slo { id, burn } = &q.kind { slo_values(store, id, *burn, now - delay) } else { monitor::evaluate(store, &q, now, delay) };
+        let values = match values {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(monitor = %m.name, error = %e, "a monitor did not evaluate");

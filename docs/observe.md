@@ -21,6 +21,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
+| O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13). Next: their page in the UI | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
@@ -750,6 +751,41 @@ those off by three.
 
 Built on it: `outliers()` in queries (§6), drawn with every member that is not one grey (§11), and
 outlier monitors (§9).
+
+### 9.2 Service level objectives
+
+An SLO (`kiln_obs::slo`, kept by the server in `<observe>/slos.json`) is what share of what a
+service does it promises is good, over a rolling timeframe (7, 30 or 90 days), Datadog's model:
+
+- **ratio**: good events over all of them, each a metric query of counts
+  (`sum:http.requests{status:2xx}.as_count()` over `sum:http.requests{*}.as_count()`), every
+  series of each summed;
+- **time slices**: the share of one- or five-minute slices whose query's value meets a condition
+  (`max:http.latency.p99{service:web}` `< 0.3`), of the slices with a value, each series' own.
+
+Its **standing** is read from the store when asked (an SLO keeps no history of its own): the SLI
+over the timeframe, the error budget left (the target's 99.9 allows 0.1% to fail; the budget left
+is what of that share is not spent, below 0 once it is), its state (OK, WARN under its warning,
+BREACHED under its target, NO DATA), each UTC day's SLI and the budget left through it (one read
+at a day's step: the rollups' hours, §4.7), and its **burn rates** over the last 1 h, 6 h, 1 d and
+3 d: the error rate there over the budget's (Beyer et al., *The Site Reliability Workbook*, ch. 5),
+1 spending the budget in the timeframe exactly, 14.4 a 30-day budget's 2% in an hour. Each window
+is read over its whole steps (a minute up to a day and a half, five minutes up to a week, an hour
+beyond), ending where its last whole step does: a step begun a second ago is not yet one, and a
+window holds no part of one either end.
+
+**Alerts are monitors of it**, so everything a monitor does (messages, mentions, renotifying,
+muting, composites) an SLO's alert does:
+
+```
+slo("<id>").burn_rate("1h", "5m") > 14.4     the lesser of the two windows' rates: both must pass
+slo("<id>").error_budget() < 25              the budget left, percent
+```
+
+The burn-rate form is the workbook's multiwindow, multi-burn-rate alert: the long window says the
+rate is real, the short that it still is, so an alert resolves within the short window of the
+burning stopping. Its suggested pairs for a 30-day SLO: 14.4 over 1 h and 5 m, 6 over 6 h and 30 m
+(pages), 1 over 3 d and 6 h (a ticket). An SLO a monitor reads is not deleted until the monitor is.
 
 ## 10. Integrations
 
@@ -1726,6 +1762,14 @@ token. Their figures are functions of the minute, so what is stored is checked m
   once (seven); a Pub/Sub push of a Cloud Logging entry sent twice, taken once; a wrong token
   refused; kiln's counts of what was taken and sent again.
 2026-10-18: all pass (243 s; the pushes 99 s).
+
+**SLOs** (`observe_live.rs`): requests counted a minute for three hours ending at a five-minute
+edge, a thousandth failing but in the last 70 minutes, when half do, and a latency high then; a
+ratio SLO of them and a time-slice SLO of the latency. Its SLI, budget left and burn rates come out
+as the workbook reckons them, exactly (the hour's 50, all of it bad; the six hours' 19.5); 22 of 36
+five-minute slices met; a monitor `slo("…").burn_rate("1h", "15m") > 14.4` alerting at the lesser
+window's 50, the SLO's page listing it; the SLO not deleted while the monitor reads it. 2026-10-18:
+passes (21 s).
 
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a

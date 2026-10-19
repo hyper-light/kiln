@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod otlp;
 pub mod owner;
 pub mod scrape;
+pub mod slos;
 pub mod spans;
 pub mod wire;
 

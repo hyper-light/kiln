@@ -11,6 +11,7 @@
 //! change := ("change" | "pct_change") "(" time_aggr "(" window ")" "," shift ")" ":" query op threshold
 //! logs   := "logs(" '"' search '"' ")" [".index(" '"' * '"' ")"] ".rollup(" '"' measure '"' ["," '"' facet '"'] ")"
 //!           [".by(" '"' facets '"' ")"] ".last(" '"' window '"' ")" op threshold
+//! slo    := "slo(" '"' id '"' ")" ( ".burn_rate(" '"' long '"' "," '"' short '"' ")" | ".error_budget()" ) op threshold
 //! time_aggr := avg | sum | min | max | last
 //! window := last_<n>(m|h|d|w)  (logs: <n>(m|h|d|w))
 //! op     := > | >= | < | <= | == | !=
@@ -91,6 +92,10 @@ pub enum Kind {
     /// Datadog's forecast monitor: the edge of a forecast's bounds over the next `ahead_ms`, its
     /// highest upper bound (`max`, alerting above) or its lowest lower one (`min`, below).
     Forecast { highest: bool, ahead_ms: i64, query: String },
+    /// Datadog's SLO alerts (`crate::slo`): the SLO's burn rate over a long window and a short one
+    /// at once, the lesser of the two (both must pass: the workbook's multiwindow alert), or with
+    /// `burn` none, its error budget left (percent). Its SLO is kiln's to know: kiln evaluates it.
+    Slo { id: String, burn: Option<(i64, i64)> },
 }
 
 /// A monitor's query, parsed.
@@ -227,6 +232,9 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     if q.starts_with("logs(") {
         return parse_logs(q);
     }
+    if q.starts_with("slo(") {
+        return parse_slo(q);
+    }
     let (left, op, threshold) = comparison(q)?;
     let colon = left.find("):").ok_or_else(|| syntax("time_aggr(window): before the query"))?;
     let (head, query) = (left.get(..=colon).unwrap_or(""), left.get(colon + 2..).unwrap_or("").trim().to_owned());
@@ -261,10 +269,32 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     // The metric query must parse as one.
     crate::query::parse::parse(match &kind {
         Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } => query,
-        Kind::Logs { .. } => "",
+        Kind::Logs { .. } | Kind::Slo { .. } => "",
     })
     .map_err(|e| syntax(e.to_string()))?;
     Ok(Query { kind, op, threshold })
+}
+
+fn parse_slo(q: &str) -> Result<Query, MonitorError> {
+    let (left, op, threshold) = comparison(q)?;
+    let Some((args, rest)) = call(left, "slo")? else { return Err(syntax("slo(\"<the SLO's id>\")")) };
+    let id = args.first().map(|s| (*s).to_owned()).filter(|s| !s.is_empty()).ok_or_else(|| syntax("slo(\"<the SLO's id>\")"))?;
+    let burn = if let Some((a, r)) = call(rest, "burn_rate")? {
+        let [long, short] = a.as_slice() else { return Err(syntax("burn_rate(\"1h\", \"5m\"): a long window and a short one")) };
+        let (long, short) = (window(long)?, window(short)?);
+        if short >= long || !r.trim().is_empty() {
+            return Err(syntax("burn_rate(long, short): the short window shorter than the long, and nothing after"));
+        }
+        Some((long, short))
+    } else if let Some((a, r)) = call(rest, "error_budget")? {
+        if !a.is_empty() || !r.trim().is_empty() {
+            return Err(syntax("error_budget(), and nothing after"));
+        }
+        None
+    } else {
+        return Err(syntax("slo(\"id\").burn_rate(\"1h\", \"5m\") or slo(\"id\").error_budget()"));
+    };
+    Ok(Query { kind: Kind::Slo { id, burn }, op, threshold })
 }
 
 fn parse_logs(q: &str) -> Result<Query, MonitorError> {
@@ -409,6 +439,7 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
                 .collect())
         }
         Kind::Forecast { highest, ahead_ms, query } => forecast_values(store, query, *highest, *ahead_ms, to),
+        Kind::Slo { .. } => Err(MonitorError::Eval("an SLO's monitor is evaluated with its SLO".into())),
         Kind::Logs { search, measure, by, window_ms } => {
             let parsed: Search = crate::logs::search::parse(&logs_only(search)).map_err(|e| MonitorError::Eval(e.to_string()))?;
             let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -697,6 +728,13 @@ mod tests {
             .collect();
         b.run(k.fp, points.iter().copied());
         s.apply(&b.finish()).unwrap();
+        let q = parse(r#"slo("abc").burn_rate("1h", "5m") > 14.4"#).unwrap();
+        assert!(matches!(&q.kind, Kind::Slo { id, burn: Some((3_600_000, 300_000)) } if id == "abc") && q.op == Op::Gt && q.threshold == 14.4);
+        let q = parse(r#"slo("abc").error_budget() < 25"#).unwrap();
+        assert!(matches!(&q.kind, Kind::Slo { burn: None, .. }) && q.op == Op::Lt);
+        for bad in [r#"slo("").error_budget() < 1"#, r#"slo("a").burn_rate("5m", "1h") > 1"#, r#"slo("a").burn_rate("1h") > 1"#, r#"slo("a").latency() > 1"#, r#"slo("a").error_budget()"#] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         let q = parse("avg(last_1h):anomalies(avg:cpu{*}, 'robust', 3) >= 0.05").unwrap();
         let got = evaluate(&s, &q, now, 0).unwrap();
         // A 1-hour window at 5-minute buckets: twelve, one of them the spike.
