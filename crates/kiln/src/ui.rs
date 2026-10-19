@@ -164,6 +164,18 @@ pub fn static_file(req: &Request) -> Option<Response> {
     Some(respond(req, path, data))
 }
 
+/// One of the fonts the console reads in, for pages agents show (`crate::harness::visuals`):
+/// `geist.woff2` or `geist-mono.woff2` (their Latin cuts, every weight).
+pub fn font(name: &str) -> Option<Bytes> {
+    let prefix = match name {
+        "geist.woff2" => "assets/geist-latin-wght-normal-",
+        "geist-mono.woff2" => "assets/geist-mono-latin-wght-normal-",
+        _ => return None,
+    };
+    let file = Assets::iter().find(|n| n.starts_with(prefix) && n.ends_with(".woff2"))?;
+    Assets::get(&file).map(|f| Bytes::from(f.data.into_owned()))
+}
+
 /// The app's shell (any page, rendered in the browser): for when the UI server isn't there.
 pub fn shell(req: &Request) -> Response {
     match Assets::get("_shell.html") {

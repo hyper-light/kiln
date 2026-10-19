@@ -9,6 +9,8 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::core::{MAX_EVENTS, Update};
+use super::files;
+use super::kept::{Job, Keeper, Kept};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
@@ -74,11 +76,16 @@ impl Mirror {
     }
 
     /// The state as a frame for its viewers, with what changed in it since the last one.
-    fn state_frame(&mut self) -> Frame {
+    fn state_frame(&mut self) -> Option<Frame> {
+        if self.out.receiver_count() == 0 {
+            // The next viewer starts from a snapshot, not the last viewer's patch baseline.
+            self.sent = Value::Null;
+            return None;
+        }
         let text = json!({"t": "state", "state": self.state}).to_string();
-        let patch = (self.out.receiver_count() > 0).then(|| state_patch(&self.sent, &self.state)).flatten();
+        let patch = state_patch(&self.sent, &self.state);
         self.sent.clone_from(&self.state);
-        Frame { text: Arc::from(text), patch: patch.map(Arc::from) }
+        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from) })
     }
 
     fn reindex(&mut self) {
@@ -108,8 +115,9 @@ impl Mirror {
         }
     }
 
-    /// The frames that bring a new viewer to the current state.
-    fn snapshot(&self) -> Vec<String> {
+    /// The frames that bring a new viewer to the current state; `files`, what's kept of the files
+    /// its messages mention (`Keeper::frame`), goes ahead of the events.
+    fn snapshot(&self, files: Option<String>) -> Vec<String> {
         let mut out = vec![json!({"t": "open", "info": self.info}).to_string()];
         if !self.meta.is_null() {
             out.push(json!({"t": "meta", "meta": self.meta}).to_string());
@@ -120,6 +128,7 @@ impl Mirror {
         if !self.changes.is_null() {
             out.push(json!({"t": "changes", "files": self.changes}).to_string());
         }
+        out.extend(files);
         let mut batch: Vec<&Value> = Vec::new();
         let mut size = 0usize;
         for e in &self.events {
@@ -257,6 +266,16 @@ pub struct Registry {
     /// The mirrors to ask for their copy as they connect: the store was found empty at start
     /// while the server had mirrors (it was lost, the rest wasn't).
     restore_auto: Mutex<Vec<String>>,
+    /// Files finished messages mention, kept so they still show after they go (`super::kept`).
+    pub keeper: Keeper,
+    /// Pages agents show in their conversations (`super::visuals`).
+    pub visuals: super::visuals::Visuals,
+    /// Pages streamed from agents' machines, relayed to their viewers (`super::streams`).
+    pub streams: super::streams::Relay,
+    /// Connections to ports of agents' machines, and the apps opened on people's devices over
+    /// them (`super::opened`).
+    pub ports: super::opened::Tunnels,
+    pub opened: super::opened::Openings,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -295,7 +314,7 @@ impl Registry {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
-        let convo = crate::convo::open(&dir, conversations.keep_closed());
+        let convo = crate::convo::open(&dir, conversations.upkeep());
         // Runners that keep a store send it here; the server keeps their sessions from that. What
         // a mirror sends back to restore the store from isn't sent to it again.
         let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
@@ -322,6 +341,8 @@ impl Registry {
             tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
         }
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
+        let keeper = Keeper::new(&dir);
+        let visuals = super::visuals::Visuals::new(&dir);
         Self {
             mirrors: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
@@ -342,6 +363,11 @@ impl Registry {
             scanner: Arc::new(Mutex::new(None)),
             restore: Mutex::new(Restore::Idle),
             restore_auto: Mutex::new(restore_auto),
+            keeper,
+            visuals,
+            streams: super::streams::Relay::default(),
+            ports: super::opened::Tunnels::default(),
+            opened: super::opened::Openings::default(),
         }
     }
 
@@ -494,8 +520,9 @@ impl Registry {
             m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
-                let frame = m.state_frame();
-                m.out.send(frame);
+                if let Some(frame) = m.state_frame() {
+                    m.out.send(frame);
+                }
             }
             m.info.clone()
         };
@@ -595,6 +622,8 @@ impl Registry {
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
         RESTORED.call_once(|| {
+            // Files finished messages mention, kept as they come.
+            crate::rt::spawn(Keeper::run(hub.clone()));
             hub.harness.local.restore_from(hub.harness.convo.as_ref());
             // The server's own sessions' harness records, followed into its store.
             if let Some(st) = &hub.harness.convo {
@@ -740,6 +769,8 @@ impl Registry {
     pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let mut changed: Option<Info> = None;
         let mut gone = false;
+        // Finished messages' mentions of files, to keep once the mirrors are let go.
+        let mut jobs: Vec<Job> = Vec::new();
         let mut save_names = false;
         // The account's other sessions, which pause too (`hold_account`).
         let mut hold: Option<(Command, Vec<(String, Location)>)> = None;
@@ -845,6 +876,9 @@ impl Registry {
                 Update::Changes { files } => m.changes = serde_json::to_value(files).unwrap_or(Value::Null),
                 Update::Events { events } => {
                     for e in events {
+                        if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
+                            jobs.push(job);
+                        }
                         if let Ok(v) = serde_json::to_value(e) {
                             m.upsert(v);
                         }
@@ -854,8 +888,9 @@ impl Registry {
             }
             // A state goes out with the name given here in it (the machine's may lack it).
             let frame = match &u {
-                Update::State { .. } => Some(m.state_frame()),
-                _ => serde_json::to_string(&u).ok().map(Frame::of),
+                Update::State { .. } => m.state_frame(),
+                _ if m.out.receiver_count() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
+                _ => None,
             };
             if let Some(frame) = frame {
                 m.out.send(frame);
@@ -875,10 +910,16 @@ impl Registry {
         if let Some((c, targets)) = hold {
             self.hold_account(hub, &c, targets);
         }
+        for job in jobs {
+            self.keeper.enqueue(job);
+        }
         if save_names {
             self.save_names();
         }
         if gone {
+            self.keeper.forget(id);
+            self.visuals.forget(id);
+            self.opened.forget(id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -945,6 +986,8 @@ impl Registry {
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub fn machine_lost(&self, hub: &Hub, machine: &str) {
+        self.streams.machine_lost(machine);
+        self.ports.machine_lost(machine);
         let mut infos = Vec::new();
         {
             let mut g = self.mirrors.lock();
@@ -953,8 +996,9 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                let frame = m.state_frame();
-                m.out.send(frame);
+                if let Some(frame) = m.state_frame() {
+                    m.out.send(frame);
+                }
                 infos.push(m.info.clone());
             }
         }
@@ -976,8 +1020,9 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                let frame = m.state_frame();
-                m.out.send(frame);
+                if let Some(frame) = m.state_frame() {
+                    m.out.send(frame);
+                }
                 infos.push(m.info.clone());
             }
         }
@@ -988,14 +1033,42 @@ impl Registry {
 
     /// Join a session's stream. None when there is no such session.
     pub fn attach(&self, id: &str) -> Option<Attachment> {
+        // What's kept is read before the mirrors are locked: the first time, off disk.
+        let files = self.keeper.frame(id);
         let g = self.mirrors.lock();
         let m = g.get(id)?;
-        Some(Attachment { frames: m.snapshot(), live: m.out.subscribe() })
+        Some(Attachment { frames: m.snapshot(files), live: m.out.subscribe() })
     }
 
     /// Catch-up frames for a viewer that fell behind.
     pub fn frames(&self, id: &str) -> Option<Vec<String>> {
-        self.mirrors.lock().get(id).map(Mirror::snapshot)
+        let files = self.keeper.frame(id);
+        self.mirrors.lock().get(id).map(|m| m.snapshot(files))
+    }
+
+    /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
+    pub fn files_added(&self, id: &str, added: &[Kept]) {
+        if let Some(m) = self.mirrors.lock().get(id) {
+            m.out.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
+        }
+    }
+
+    /// Where a session runs, when one of its messages mentions `path` (a relative mention, in its
+    /// folder): a viewer may read that file from its machine, and no other.
+    pub fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
+        let listed = self.keeper.lists_path(id, path);
+        let g = self.mirrors.lock();
+        let m = g.get(id)?;
+        let cwd = &m.info.cwd;
+        let said = || {
+            m.events
+                .iter()
+                .rev()
+                .filter(|e| matches!(e.get("kind").and_then(Value::as_str), Some("user" | "assistant")))
+                .filter_map(|e| e.get("text").and_then(Value::as_str))
+                .any(|t| files::mentioned(t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
+        };
+        (listed || said()).then(|| m.location.clone())
     }
 
     /// Start sessions on `target`. Sessions on machines are named here and appear at once
@@ -1299,6 +1372,10 @@ impl Registry {
             if let Some(m) = self.mirrors.lock().remove(id) {
                 m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
             }
+            self.keeper.forget(id);
+            self.visuals.forget(id);
+            self.streams.forget(hub, id).await;
+            self.opened.forget(id);
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
@@ -1325,6 +1402,17 @@ impl Registry {
         let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
         Some((m.state.clone(), reply, m.changes.clone()))
     }
+}
+
+/// A finished message's mentions of files, to keep (`super::kept`): what the person or the agent
+/// said, never a tool's input or output.
+fn mentions(id: &str, cwd: &str, location: &Location, e: &super::model::Event) -> Option<Job> {
+    let text = match &e.body {
+        super::model::Body::User { text, .. } | super::model::Body::Assistant { text, streaming: false } => text,
+        _ => return None,
+    };
+    let paths: Vec<String> = files::mentioned(text).iter().filter_map(|p| files::resolve(p, cwd)).collect();
+    (!paths.is_empty()).then(|| Job { session: id.to_owned(), seq: e.seq, paths, location: location.clone() })
 }
 
 fn default_name(kind: &str) -> String {
@@ -1357,13 +1445,13 @@ mod tests {
         let mut live = m.out.subscribe();
         let skills = json!([{"name": "deploy", "description": "Ship it. ".repeat(200)}]);
         m.state = json!({"status": "running", "activity": "reading", "skills": skills, "pause": {"reason": "limit"}});
-        let f = m.state_frame();
+        let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         // The first goes whole: there is nothing before it to patch.
         assert!(f.patch.is_none());
         assert_eq!(f.for_viewer(true), f.for_viewer(false));
         m.out.send(f);
         m.state = json!({"status": "running", "activity": "editing", "skills": skills});
-        let f = m.state_frame();
+        let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         m.out.send(f);
         let first = live.try_recv()?;
         let second = live.try_recv()?;
@@ -1383,6 +1471,27 @@ mod tests {
             had.remove(k.as_str().unwrap_or_default());
         }
         assert_eq!(Value::Object(had.clone()), m.state);
+        Ok(())
+    }
+
+    #[test]
+    fn states_without_viewers_do_not_serialize_or_keep_a_patch_baseline() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info::default(), Location::Local);
+        let viewer = m.out.subscribe();
+        m.state = json!({"status": "running"});
+        assert!(m.state_frame().is_some());
+        drop(viewer);
+        m.state = json!({"status": "running", "activity": "editing"});
+        assert!(m.state_frame().is_none());
+        assert!(m.sent.is_null());
+        let _viewer = m.out.subscribe();
+        let snapshot = m.snapshot(None);
+        assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": m.state}))));
+        m.state = json!({"status": "idle"});
+        let frame = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
+        // A field that appeared while nobody watched is absent from the whole state too.
+        assert!(frame.patch.is_none());
+        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(true))?, json!({"t": "state", "state": m.state}));
         Ok(())
     }
 

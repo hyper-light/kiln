@@ -68,10 +68,10 @@ pub fn path(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// kiln's own operations: agents', plans' and goal stacks', in the order they're listed.
+/// kiln's own operations: agents', plans', goal stacks' and runners', in the order they're listed.
 pub fn own() -> &'static [Op] {
     static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
-    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).collect())
+    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).collect())
 }
 
 /// Every operation this server has: CI's, deployments' when they're on, and kiln's own.
@@ -150,10 +150,11 @@ mod tests {
     use super::*;
 
     /// Each of kiln's own operations is a route the table names (none falls through to the
-    /// administrators' `settings.manage`), and reads exactly when its route is a GET.
+    /// administrators' `settings.manage`), needs what its route needs (agents' `agents.run`,
+    /// runners' `runners.read` or `runners.manage`), and reads exactly when its route is a GET.
     #[test]
     fn kiln_s_own_operations_are_routes_of_the_table() {
-        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"]});
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto"});
         assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
         for op in own() {
             let route = (op.route)(&probe);
@@ -162,7 +163,12 @@ mod tests {
             let s: Vec<&str> = segs.iter().map(String::as_str).collect();
             let rule = crate::authz::rule(&method, &s);
             assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, s.join("/"));
-            assert_eq!(rule.capability, "agents.run", "{}: agents, plans and goals need agents.run", op.name);
+            let needs = match op.name {
+                "runners.list" | "runners.diagnose" | "updates.list" => "runners.read",
+                "runners.repair" | "updates.retry" | "updates.policy" => "runners.manage",
+                _ => "agents.run",
+            };
+            assert_eq!(rule.capability, needs, "{}", op.name);
             assert_eq!(op.read_only, method == Method::GET, "{}: read-only exactly when its route reads", op.name);
             assert!((op.input)().get("type").is_some(), "{}", op.name);
         }

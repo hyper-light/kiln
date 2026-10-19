@@ -27,6 +27,9 @@ use crate::config::Config;
 use crate::hub::Hub;
 use crate::sup::{self, Registry};
 
+/// A runner seen this recently before the server started counts as connected before it.
+const RUNNERS_BEFORE_S: i64 = 900;
+
 pub fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
     R.get_or_init(Registry::default)
@@ -65,6 +68,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
+    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
     let requeued = store.recover().await?;
     if requeued > 0 {
         tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
@@ -94,6 +98,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
@@ -146,6 +151,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-poll", h => crate::gitops::poll_loop(h));
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
+        child!("github-checks", h => crate::githost::github::checks_loop(h));
+        child!("ci-providers", h => crate::ci::providers::sync_loop(h));
+        child!("diff-runs", h => crate::ci::review::runs_loop(h));
+        child!("registry-collect", h => crate::ci::registry::collect_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
             child!("deploy", h => crate::deploy::run(h));
@@ -183,6 +192,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let _ = hub.k8s.set(None);
     }
 
+    // The registry's own addresses (below) use the same TLS.
+    let registry_tls = tls.clone();
     // HTTP (and HTTPS on the same port with `server.https`).
     {
         let h = hub.clone();
@@ -219,6 +230,46 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                         Err(e) => {
                             // e.g. EMFILE: back off briefly instead of spinning.
                             tracing::warn!(error = %format!("{e:#}"), "accept failed");
+                            crate::rt::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // kiln's OCI registry on addresses of its own (docs/ci.md W12-R01, R02), beside the main
+    // origin's: the registry, and each mirror Docker's `registry-mirrors` pulls from at the root.
+    let mut registry_addresses: Vec<(String, Option<String>)> = if cfg.ci.enabled { cfg.ci.registry.listen.iter().map(|l| (l.clone(), None)).collect() } else { Vec::new() };
+    if cfg.ci.enabled {
+        registry_addresses.extend(cfg.ci.registry.mirrors.iter().filter_map(|m| m.listen.clone().map(|l| (l, Some(m.prefix())))));
+    }
+    for (listen, prefix) in registry_addresses {
+        let h = hub.clone();
+        let sd = shutdown.clone();
+        let tls = registry_tls.clone();
+        sup::spawn(reg, &format!("registry {listen}"), shutdown.clone(), move || {
+            let (hub, sd, tls, listen, prefix) = (h.clone(), sd.clone(), tls.clone(), listen.clone(), prefix.clone());
+            async move {
+                let addr: SocketAddr = listen.parse().with_context(|| format!("the registry's listen {listen}"))?;
+                let std_listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+                let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
+                tracing::info!(%addr, mirror = prefix.as_deref().unwrap_or("-"), "the registry listening");
+                let only = Arc::new(crate::ci::registry::Only { hub, prefix });
+                loop {
+                    let accepted = futures::select_biased! {
+                        () = sd.cancelled().fuse() => return Ok(()),
+                        r = listener.accept().fuse() => r,
+                    };
+                    match accepted {
+                        Ok(stream) => {
+                            let (only, remote, tls) = (only.clone(), stream.peer_addr().ok(), tls.clone());
+                            crate::rt::spawn_spread(async move {
+                                crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "the registry's accept failed");
                             crate::rt::sleep(Duration::from_millis(100)).await;
                         }
                     }

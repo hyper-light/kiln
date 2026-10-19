@@ -158,11 +158,15 @@ pub struct Hub {
     /// Transcript requests waiting for their machine's answer, by request number.
     ai_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<Option<String>>>>,
     ai_seq: AtomicU64,
+    /// File reads (`crate::harness::files`) waiting for their machine's answer: its JSON and bytes.
+    file_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<(String, Vec<u8>)>>>,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
     pub generation: u64,
+    /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
+    pub runners_before: AtomicU64,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -243,11 +247,13 @@ impl Hub {
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
+            file_requests: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             launching: Mutex::new(HashMap::new()),
             started: Instant::now(),
             generation,
+            runners_before: AtomicU64::new(0),
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
@@ -546,6 +552,109 @@ impl Hub {
         }
     }
 
+    /// A piece of a file on a machine, for whoever views agent session `session` there
+    /// (`crate::harness::files`): its answer's JSON and the bytes. Asked of the runner process
+    /// holding the session; `Ok(None)` when that one doesn't read files ([`proto::CAP_FILES`]).
+    pub async fn harness_file_read(&self, machine: &str, session: &str, path: &str, offset: u64, len: u32) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        /// A piece may be a megabyte from a machine on a slow link.
+        const WAIT: Duration = Duration::from_secs(30);
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let msg = ServerMsg::HarnessFileRead { req, session: session.to_owned(), path: path.to_owned(), offset, len };
+        let peer = {
+            let mut inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            let to = inst.route(machine, &msg);
+            to.filter(|p| inst.get(*p).is_some_and(|i| i.caps & proto::CAP_FILES != 0))
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let frame = proto::encode(&msg)?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.file_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(WAIT, rx).await.ok() } else { None };
+        self.file_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(a)) => Ok(Some(a)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
+    /// What the runner process holding what `msg` is about (`crate::instances`' routing) says it
+    /// can do: 0 for nothing, or no such process. One that has just connected says it a moment
+    /// after (its build, then its capabilities), so this waits up to three seconds for it.
+    pub async fn routed_caps(&self, machine: &str, msg: &ServerMsg) -> u32 {
+        for _ in 0..30 {
+            let caps = {
+                let mut inst = self.instances.lock();
+                let to = inst.route(machine, msg);
+                to.and_then(|p| inst.get(p).map(|i| i.caps)).unwrap_or(0)
+            };
+            if caps != 0 {
+                return caps;
+            }
+            crate::rt::sleep(Duration::from_millis(100)).await;
+        }
+        0
+    }
+
+    /// Ask the runner process holding what `msg` is about (a session, say: `crate::instances`'
+    /// routing) something, if it announced `cap`, and wait up to `wait` for its
+    /// [`AgentMsg::Answer`]. `Ok(None)`: that process doesn't know `cap` (its kiln is too old).
+    pub async fn ask_routed(&self, machine: &str, cap: u32, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<String>>> {
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let msg = msg(req);
+        if self.instances.lock().newest(machine).is_none() {
+            anyhow::bail!("{machine} is not connected");
+        }
+        if self.routed_caps(machine, &msg).await & cap != cap {
+            return Ok(None);
+        }
+        let Some(peer) = self.instances.lock().route(machine, &msg) else { return Ok(None) };
+        let frame = proto::encode(&msg)?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(json)) => Ok(Some(json)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
+    /// Ask machine `machine` something by its newest runner process announcing `cap` (`msg` given
+    /// the question's number), and wait up to `wait` for its [`AgentMsg::Answer`]. `Ok(None)`: no
+    /// process of it announces `cap` (its kiln is too old); `Ok(Some(json))`: what it answered.
+    pub async fn ask_runner(&self, machine: &str, cap: u32, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<String>>> {
+        let peer = {
+            let inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            inst.newest_with(machine, cap)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&msg(req))?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(json)) => Ok(Some(json)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
     /// A machine's past sessions (JSON `[PastSession]`).
     pub async fn harness_history(&self, machine: &str, kind: Option<String>, limit: u32) -> anyhow::Result<Option<String>> {
         self.ai_ask(machine, move |req| ServerMsg::HarnessHistory { req, kind, limit }).await
@@ -725,8 +834,9 @@ impl Hub {
                     }
                 }
             }
-            // Bulk frames are job output, but on the conversation feed's lane (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO => {
+            // Bulk frames are job output, but on the conversation feed's and the files' lanes
+            // (messages, in bulk).
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
                 let chunk: proto::LogChunk = proto::decode(&data)?;
                 if self.owns_job(peer, &chunk.job) {
                     self.logs.append(&chunk.job, chunk.idx, &chunk.data);
@@ -961,7 +1071,7 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
-            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } => {
+            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } | AgentMsg::Answer { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
                 }
@@ -971,6 +1081,19 @@ impl Hub {
                     let _ = tx.send(Some(json));
                 }
             }
+            AgentMsg::HarnessFileData { req, json, data } => {
+                if let Some(tx) = self.file_requests.lock().remove(&req) {
+                    let _ = tx.send((json, data));
+                }
+            }
+            // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
+            AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
+            AgentMsg::StreamEvent { stream, json } => self.harness.streams.event(&agent, &stream, json),
+            // Connections to its ports (`crate::harness::opened`).
+            AgentMsg::PortOpened { conn, error } => self.harness.ports.opened(&agent, conn, error),
+            AgentMsg::PortData { conn, data } => self.harness.ports.data(&agent, conn, data),
+            AgentMsg::PortAck { conn, bytes } => self.harness.ports.ack(&agent, conn, bytes),
+            AgentMsg::PortClose { conn, error } => self.harness.ports.ended(&agent, conn, error),
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
                 self.updates.on_build(self, &agent, &build);
@@ -1082,7 +1205,7 @@ impl Hub {
                     }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
-                    Some("registry" | "call") => {
+                    Some("registry" | "call" | "page" | "stream") => {
                         let (hub, runner) = (Arc::clone(self), agent.clone());
                         crate::rt::spawn(async move {
                             let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;

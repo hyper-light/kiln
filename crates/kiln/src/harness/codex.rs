@@ -182,6 +182,9 @@ pub struct Codex {
     thread: Option<String>,
     /// The turn under way.
     turn: Option<String>,
+    /// Runtime status pushed by Codex, including work started outside kiln.
+    #[serde(default)]
+    thread_status: Option<Status>,
     /// The message that started (or was steered into) the turn under way.
     turn_messages: Vec<String>,
     /// Messages to send once the thread exists or the turn under way has been interrupted.
@@ -269,6 +272,7 @@ impl Codex {
             asks: HashMap::new(),
             thread: None,
             turn: None,
+            thread_status: None,
             turn_messages: Vec::new(),
             waiting: Vec::new(),
             effort: None,
@@ -518,7 +522,7 @@ impl Codex {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.injecting || self.turn.is_some() || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
+        self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
@@ -537,8 +541,12 @@ impl Codex {
     }
 
     fn settle(&self, core: &mut Core) {
-        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
-        core.settle_status(running);
+        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_))) || matches!(self.thread_status, Some(Status::Running | Status::Waiting));
+        if let Some(status @ (Status::Waiting | Status::Starting | Status::Exited)) = self.thread_status {
+            core.set_status(status);
+        } else {
+            core.settle_status(running);
+        }
     }
 
     pub fn start(&mut self, core: &mut Core) {
@@ -576,6 +584,7 @@ impl Codex {
             t.ended.get_or_insert_with(Core::now);
         }
         self.turn = None;
+        self.thread_status = None;
         self.pending.clear();
         self.asks.clear();
         core.state.approvals.clear();
@@ -1094,6 +1103,7 @@ impl Codex {
     }
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        self.thread_status = None;
         let (approval, _, sandbox) = self.policies(core);
         let items = self.items(&m);
         let mut params = json!({
@@ -1157,7 +1167,7 @@ impl Codex {
     fn ready(&mut self, core: &mut Core) {
         self.refresh_controls(core);
         core.touch_state();
-        core.set_status(Status::Idle);
+        core.set_status(self.thread_status.unwrap_or(Status::Idle));
         // The thread's own MCP connections (their runtime state).
         self.ask_mcp(core);
         self.compose_status(core);
@@ -1469,6 +1479,9 @@ impl Codex {
                 if let Some(id) = thread.get("id").and_then(Value::as_str) {
                     self.thread = Some(id.to_owned());
                     core.state.harness_session = Some(id.to_owned());
+                }
+                if let Some(status) = thread.get("status") {
+                    self.thread_status(core, status);
                 }
                 if let Some(m) = result.get("model").and_then(Value::as_str) {
                     core.state.model = m.to_owned();
@@ -1956,9 +1969,38 @@ impl Codex {
         self.settle(core);
     }
 
+    fn thread_status(&mut self, core: &mut Core, status: &Value) {
+        let next = match status.get("type").and_then(Value::as_str) {
+            Some("active") if status.get("activeFlags").and_then(Value::as_array).is_some_and(|f| f.iter().any(|v| matches!(v.as_str(), Some("waitingOnApproval" | "waitingOnUserInput")))) => Status::Waiting,
+            Some("active") => Status::Running,
+            Some("idle") => Status::Idle,
+            Some("notLoaded") => Status::Starting,
+            Some("systemError") => Status::Exited,
+            _ => return,
+        };
+        self.thread_status = Some(next);
+        if !matches!(next, Status::Running | Status::Waiting) {
+            self.turn = None;
+            core.state.doing = None;
+            core.set_status(next);
+        }
+        core.state.exit = (next == Status::Exited).then(|| ExitInfo { code: None, error: Some("Codex reported a thread error".into()) });
+        core.touch_state();
+        self.settle(core);
+    }
+
     fn notification(&mut self, core: &mut Core, method: &str, p: Value) {
+        // One app-server can report child threads too. Their turns must not end the parent's.
+        if method != "serverRequest/resolved"
+            && let (Some(own), Some(thread)) = (self.thread.as_deref(), p.get("threadId").and_then(Value::as_str))
+            && own != thread
+        {
+            return;
+        }
         match method {
+            "thread/status/changed" => self.thread_status(core, p.get("status").unwrap_or(&Value::Null)),
             "turn/started" => {
+                self.thread_status = Some(Status::Running);
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
                 }
@@ -1968,9 +2010,15 @@ impl Codex {
                 }
                 core.state.doing = Some("Thinking".to_owned());
                 core.touch_state();
+                self.settle(core);
             }
             "turn/completed" => {
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
+                if let (Some(current), Some(completed)) = (self.turn.as_deref(), turn.get("id").and_then(Value::as_str))
+                    && current != completed
+                {
+                    return;
+                }
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("completed");
                 match status {
                     "interrupted" => self.notice(core, Level::Info, "Interrupted"),
@@ -2008,6 +2056,9 @@ impl Codex {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
                 self.turn = None;
+                if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
+                    self.thread_status = Some(Status::Idle);
+                }
                 // How it ended, for kiln's keep-going.
                 let how = match status {
                     "completed" => "done",
@@ -2036,7 +2087,7 @@ impl Codex {
             "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
                 if core.get(id).is_none() {
-                    let body = if method == "item/agentMessage/delta" {
+                    let body = if matches!(method, "item/agentMessage/delta" | "item/plan/delta") {
                         Body::Assistant { text: String::new(), streaming: true }
                     } else {
                         Body::Thinking { text: String::new(), streaming: true, redacted: false }
@@ -2049,11 +2100,26 @@ impl Codex {
                     core.touch_state();
                 }
             }
+            "item/reasoning/summaryPartAdded" => {
+                let Some(id) = p.get("itemId").and_then(Value::as_str) else { return };
+                if core.get(id).is_none() {
+                    core.upsert(id, None, Body::Thinking { text: String::new(), streaming: true, redacted: false });
+                }
+                if p.get("summaryIndex").and_then(Value::as_u64).is_some_and(|i| i > 0) {
+                    core.append(id, "\n\n");
+                }
+            }
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                if d.is_empty() {
+                    return;
+                }
                 // A terminal's whole output is kept (the call shows only its start).
                 if let Some(task) = core.state.tasks.iter().find(|t| t.tool_id.as_deref() == Some(id) && t.process.is_some()).map(|t| t.id.clone()) {
                     core.task_output.entry(task).or_default().append(d.as_bytes());
+                }
+                if core.get(id).is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.truncated && t.output.as_ref().is_some_and(|out| out.len() >= OUTPUT_MAX * 2))) {
+                    return;
                 }
                 if let Some(e) = core.get_mut(id)
                     && let Body::Tool(t) = &mut e.body
@@ -2321,8 +2387,9 @@ impl Codex {
                 }
             }
             "plan" => {
-                if let Some(text) = item.get("text").and_then(Value::as_str).filter(|_| done) {
-                    core.upsert(&id, None, Body::Assistant { text: text.to_owned(), streaming: false });
+                if done || core.get(&id).is_none() {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
+                    core.upsert(&id, None, Body::Assistant { text, streaming: !done });
                 }
             }
             "commandExecution" => {
@@ -2372,6 +2439,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
@@ -2426,6 +2494,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
@@ -2473,6 +2542,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: shown.as_ref().and_then(|s| s.runner.clone()).or_else(|| crate::reach::remote(server, tool_name, item.get("arguments").unwrap_or(&Value::Null))),
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -2497,38 +2567,56 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
             "collabAgentToolCall" | "subAgentActivity" => {
                 let desc = item.get("prompt").or_else(|| item.get("agentPath")).and_then(Value::as_str).unwrap_or("subagent").to_owned();
-                let status = match item.get("status").and_then(Value::as_str) {
-                    Some("completed") => "completed",
-                    Some("failed") => "failed",
-                    _ if done => "completed",
-                    _ => "running",
-                };
-                let task_id = item.get("agentThreadId").and_then(Value::as_str).unwrap_or(&id).to_owned();
-                match core.state.tasks.iter_mut().find(|t| t.id == task_id) {
-                    Some(t) => {
-                        t.status = status.to_owned();
-                        if done {
-                            t.ended.get_or_insert_with(Core::now);
+                let mut task = None;
+                let status = if ty == "collabAgentToolCall" {
+                    let status = match item.get("status").and_then(Value::as_str) {
+                        Some("completed") => ToolStatus::Done,
+                        Some("failed") => ToolStatus::Error,
+                        Some("interrupted") => ToolStatus::Cancelled,
+                        _ => ToolStatus::Running,
+                    };
+                    let spawned = item.get("tool").and_then(Value::as_str) == Some("spawnAgent");
+                    let states = item.get("agentsStates").and_then(Value::as_object);
+                    let mut targets: Vec<&str> = item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+                    for target in states.into_iter().flat_map(|s| s.keys().map(String::as_str)) {
+                        if !targets.contains(&target) {
+                            targets.push(target);
                         }
                     }
-                    None => core.state.tasks.push(Task {
-                        id: task_id.clone(),
-                        tool_id: Some(id.clone()),
-                        description: clip_middle(&desc, 300).0,
-                        kind: item.get("kind").and_then(Value::as_str).unwrap_or("subagent").to_owned(),
-                        status: status.to_owned(),
-                        depth: 1,
-                        started: Core::now(),
-                        ended: done.then(Core::now),
-                        ..Task::default()
-                    }),
-                }
-                core.touch_state();
+                    for target in targets {
+                        let child = match states.and_then(|s| s.get(target)).and_then(|s| s.get("status")).and_then(Value::as_str) {
+                            Some("pendingInit") => Some("pending"),
+                            Some("running") => Some("running"),
+                            Some("completed") => Some("completed"),
+                            Some("errored") => Some("failed"),
+                            Some("interrupted" | "shutdown" | "notFound") => Some("stopped"),
+                            _ if spawned && status == ToolStatus::Done && !core.state.tasks.iter().any(|t| t.id == target) => Some("pending"),
+                            _ => None,
+                        };
+                        if let Some(child) = child {
+                            subagent(core, target, &id, &desc, child, spawned);
+                        }
+                        task.get_or_insert_with(|| target.to_owned());
+                    }
+                    status
+                } else {
+                    let Some(target) = item.get("agentThreadId").and_then(Value::as_str) else { return };
+                    let child = match item.get("kind").and_then(Value::as_str) {
+                        Some("started" | "interacted") => "running",
+                        Some("interrupted") => "stopped",
+                        Some("completed") => "completed",
+                        _ => return,
+                    };
+                    subagent(core, target, &id, &desc, child, false);
+                    task = Some(target.to_owned());
+                    if done { ToolStatus::Done } else { ToolStatus::Running }
+                };
                 let call = ToolCall {
                     tool_id: id.clone(),
                     name: ty.to_owned(),
@@ -2536,18 +2624,19 @@ impl Codex {
                     title: clip_middle(&desc, 200).0,
                     detail: item.get("model").and_then(Value::as_str).map(str::to_owned),
                     input: json!({}),
-                    status: if status == "running" { ToolStatus::Running } else if status == "failed" { ToolStatus::Error } else { ToolStatus::Done },
+                    status,
                     output: None,
                     truncated: false,
                     diffs: Vec::new(),
                     todos: Vec::new(),
-                    task: Some(task_id),
+                    task,
                     exit_code: None,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -2757,6 +2846,37 @@ fn started_of(core: &Core, id: &str) -> i64 {
         Some(Body::Tool(t)) => t.started,
         _ => Core::now(),
     }
+}
+
+/// A collab call can finish while its child keeps working; only the child's state ends its task.
+fn subagent(core: &mut Core, id: &str, tool: &str, desc: &str, status: &str, spawned: bool) {
+    match core.state.tasks.iter_mut().find(|t| t.id == id) {
+        Some(t) => {
+            t.status = status.to_owned();
+            if spawned {
+                t.tool_id = Some(tool.to_owned());
+                t.description = clip_middle(desc, 300).0;
+            }
+            if t.live() {
+                t.ended = None;
+            } else {
+                t.ended.get_or_insert_with(Core::now);
+            }
+        }
+        None => core.state.tasks.push(Task {
+            id: id.to_owned(),
+            tool_id: Some(tool.to_owned()),
+            description: clip_middle(desc, 300).0,
+            kind: "subagent".into(),
+            class: Some("agent".into()),
+            status: status.to_owned(),
+            depth: 1,
+            started: Core::now(),
+            ended: (!matches!(status, "running" | "pending" | "paused")).then(Core::now),
+            ..Task::default()
+        }),
+    }
+    core.touch_state();
 }
 
 fn set_status(core: &mut Core, id: &str, status: ToolStatus) {
@@ -3579,6 +3699,154 @@ mod tests {
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_plans_and_reasoning_parts_keep_their_final_shape() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "plan", "id": "plan", "text": "The "}), false);
+        feed(&mut c, &mut core, &[json!({"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "plan", "delta": "plan"}})]);
+        assert!(core.get("plan").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: true } if text == "The plan")));
+        c.item(&mut core, &json!({"type": "plan", "id": "plan", "text": "The plan"}), true);
+        assert!(core.get("plan").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text == "The plan")));
+        feed(&mut c, &mut core, &[json!({"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "delta-plan", "delta": "Another plan"}})]);
+        assert!(core.get("delta-plan").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: true, .. })));
+        for (index, text) in [(0, "First"), (1, "Second")] {
+            feed(&mut c, &mut core, &[
+                json!({"method": "item/reasoning/summaryPartAdded", "params": {"threadId": "th1", "turnId": "turn", "itemId": "thinking", "summaryIndex": index}}),
+                json!({"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "thinking", "summaryIndex": index, "delta": text}}),
+            ]);
+        }
+        assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: true, .. } if text == "First\n\nSecond")));
+        c.item(&mut core, &json!({"type": "reasoning", "id": "thinking", "summary": ["First", "Second"], "content": []}), true);
+        assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: false, .. } if text == "First\n\nSecond")));
+    }
+
+    #[test]
+    fn capped_tool_previews_stop_updates_without_losing_terminal_output() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "commandExecution", "id": "command", "command": "build", "cwd": "/work", "processId": "123", "status": "inProgress", "commandActions": []}), false);
+        let _ = core.take_out();
+        let output = |delta: &str| json!({"method": "item/commandExecution/outputDelta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "command", "delta": delta}});
+        feed(&mut c, &mut core, &[output("")]);
+        assert!(core.take_out().is_empty());
+        let first = "x".repeat(OUTPUT_MAX * 2);
+        feed(&mut c, &mut core, &[output(&first), output("tail")]);
+        assert!(core.get("command").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.truncated)));
+        let _ = core.take_out();
+        feed(&mut c, &mut core, &[output("more")]);
+        assert!(core.take_out().is_empty());
+        let (bytes, offset, _) = core.task_output.get("terminal-command").ok_or_else(|| anyhow::anyhow!("no terminal output"))?.since(0);
+        assert!(bytes.ends_with(b"tailmore"));
+        assert_eq!(offset, first.len() as u64 + 8);
+        Ok(())
+    }
+
+    #[test]
+    fn child_notifications_cannot_end_or_replace_the_parent_turn() {
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "inProgress", "items": []}}})]);
+        assert_eq!(core.state.status, Status::Running);
+        let started = core.state.turn_started;
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "turnId": "child-turn", "itemId": "child-message", "delta": "Child text"}}),
+            json!({"method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "completed", "items": []}}}),
+            json!({"method": "thread/status/changed", "params": {"threadId": "child", "status": {"type": "idle"}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "old-parent-turn", "status": "completed", "items": []}}}),
+        ]);
+        assert_eq!((core.state.status, c.turn.as_deref(), core.state.turn_started, core.state.usage.turns), (Status::Running, Some("parent-turn"), started, 0));
+        assert!(core.get("child-message").is_none());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "completed", "items": []}}})]);
+        assert_eq!(core.state.status, Status::Idle);
+    }
+
+    #[test]
+    fn opening_a_thread_keeps_its_runtime_status_before_draining_the_queue() {
+        for (status, expected) in [
+            (json!({"type": "active", "activeFlags": []}), Status::Running),
+            (json!({"type": "active", "activeFlags": ["waitingOnUserInput"]}), Status::Waiting),
+            (json!({"type": "systemError"}), Status::Exited),
+        ] {
+            let (mut c, mut core, _) = opened();
+            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            c.open_thread(&mut core, "thread/resume", json!({"threadId": "th1"}));
+            let requests = written(&mut core);
+            respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));
+            assert_eq!(core.state.status, expected);
+            assert_eq!(c.waiting.len(), 1);
+            assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")));
+        }
+    }
+
+    #[test]
+    fn thread_runtime_status_survives_item_updates_and_keeps_approvals_waiting() {
+        let (mut c, mut core, _) = opened();
+        let status = |state: Value| json!({"method": "thread/status/changed", "params": {"threadId": "th1", "status": state}});
+        feed(&mut c, &mut core, &[status(json!({"type": "active", "activeFlags": []}))]);
+        c.item(&mut core, &json!({"type": "agentMessage", "id": "reply", "text": "Still working"}), true);
+        assert_eq!(core.state.status, Status::Running);
+        assert!(c.busy(&core));
+        for flag in ["waitingOnApproval", "waitingOnUserInput"] {
+            feed(&mut c, &mut core, &[status(json!({"type": "active", "activeFlags": [flag]}))]);
+            c.settle(&mut core);
+            assert_eq!(core.state.status, Status::Waiting);
+        }
+        feed(&mut c, &mut core, &[
+            status(json!({"type": "active", "activeFlags": []})),
+            json!({"id": "approval", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th1", "turnId": "turn", "itemId": "command", "command": "build", "cwd": "/work"}}),
+            status(json!({"type": "idle"})),
+        ]);
+        assert_eq!(core.state.status, Status::Waiting);
+        // An approval's resolution can come from a child thread whose request was shown here.
+        feed(&mut c, &mut core, &[json!({"method": "serverRequest/resolved", "params": {"threadId": "child", "requestId": "approval"}})]);
+        assert_eq!(core.state.status, Status::Idle);
+        for (state, expected) in [("notLoaded", Status::Starting), ("systemError", Status::Exited), ("idle", Status::Idle)] {
+            feed(&mut c, &mut core, &[status(json!({"type": state}))]);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "turn", "status": "completed", "items": []}}})]);
+            c.settle(&mut core);
+            assert_eq!(core.state.status, expected);
+            assert_eq!(core.state.exit.is_some(), expected == Status::Exited);
+        }
+    }
+
+    #[test]
+    fn collab_calls_keep_the_receiving_agents_lifetimes() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // codex-cli 0.162.1: the call completed, but its receiving agent is still running.
+        let call = |id: &str, tool: &str, states: Value| json!({"type": "collabAgentToolCall", "id": id, "tool": tool, "senderThreadId": "th1", "receiverThreadIds": ["child"], "status": "completed", "agentsStates": states, "prompt": "Audit the changes"});
+        c.item(&mut core, &call("spawn", "spawnAgent", json!({"child": {"status": "running"}})), true);
+        let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+        assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str(), child.ended), (1, "child", Some("spawn"), "running", None));
+        assert!(core.get("spawn").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done && t.task.as_deref() == Some("child"))));
+        c.item(&mut core, &call("spawn", "spawnAgent", json!({})), true);
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("running"));
+        c.item(&mut core, &call("wait", "wait", json!({"child": {"status": "completed"}, "other": {"status": "errored"}})), true);
+        assert_eq!(core.state.tasks.len(), 2);
+        let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+        assert_eq!((child.status.as_str(), child.tool_id.as_deref()), ("completed", Some("spawn")));
+        assert!(child.ended.is_some());
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "other").map(|t| t.status.as_str()), Some("failed"));
+        c.item(&mut core, &call("resume", "resumeAgent", json!({"child": {"status": "pendingInit"}})), true);
+        assert_eq!(core.state.tasks.first().map(|t| (t.status.as_str(), t.ended)), Some(("pending", None)));
+        // A collab operation without any receiving agent is not itself a new task.
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "list", "tool": "listAgents", "senderThreadId": "th1", "receiverThreadIds": [], "status": "completed", "agentsStates": {}}), true);
+        assert_eq!(core.state.tasks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_activity_uses_its_kind_even_when_the_item_completed() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // Activity items have no status field. Completing a "started" marker does not end its agent.
+        let activity = |id: &str, kind: &str| json!({"type": "subAgentActivity", "id": id, "agentThreadId": "child", "agentPath": "/root/audit", "kind": kind});
+        for (kind, expected) in [("started", "running"), ("completed", "completed"), ("interacted", "running"), ("interrupted", "stopped")] {
+            c.item(&mut core, &activity(kind, kind), true);
+            let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+            assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str()), (1, "child", Some("started"), expected));
+            assert_eq!(child.ended.is_none(), child.live());
+        }
         Ok(())
     }
 

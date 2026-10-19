@@ -277,7 +277,7 @@ mod tests {
             },
             namespace: None,
             properties: BTreeMap::new(),
-            template: None, contacts: Default::default(), archived: false,
+            template: None, contacts: Default::default(), source: None, archived: false,
         }
     }
 

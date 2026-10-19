@@ -131,7 +131,7 @@ enum DeployCmd {
         #[arg(long, visible_alias = "to")]
         env: String,
     },
-    /// The manifests it renders (on Argo CD, those `--version` would).
+    /// The manifests it renders (or those `--version` would).
     Manifests {
         app: String,
         #[arg(long, visible_alias = "to")]
@@ -139,7 +139,7 @@ enum DeployCmd {
         #[arg(long)]
         version: Option<String>,
     },
-    /// What a sync would change (on Argo CD, what deploying `--version` would).
+    /// What a sync would change (or what deploying `--version` would).
     Diff {
         app: String,
         #[arg(long, visible_alias = "to")]
@@ -162,6 +162,31 @@ enum DeployCmd {
         container: Option<String>,
         #[arg(long, default_value_t = 200)]
         tail: u32,
+    },
+    /// A fleet change: one version, or values set (`--set path=value`), released to many apps of
+    /// an environment at once (those given, or of a template, a project or an owner; all registered
+    /// there when none is), each through its gates. With `--show <id>`, how one stands.
+    Fleet {
+        #[arg(long, visible_alias = "to")]
+        env: Option<String>,
+        #[arg(long = "app")]
+        apps: Vec<String>,
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, conflicts_with = "set")]
+        version: Option<String>,
+        /// `path=value` in each app's values: `image.pullPolicy=Always`, `replicaCount=2`.
+        #[arg(long = "set")]
+        set: Vec<String>,
+        /// Asked again with the same key, the same fleet change.
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long, conflicts_with_all = ["env", "version", "set"])]
+        show: Option<String>,
     },
     /// Delivery metrics (DORA's four keys) from the releases: of an app, an environment, or all.
     Metrics {
@@ -227,7 +252,7 @@ enum AppCmd {
         #[arg(long, visible_alias = "to")]
         env: String,
     },
-    /// Change some of an app: owners, properties, contacts, template.
+    /// Change some of an app: owners, properties, contacts, template, source repository.
     Set {
         app: String,
         /// Its owner teams, replacing them: the owner first, then a co-owner and an ops owner.
@@ -247,6 +272,9 @@ enum AppCmd {
         links: Vec<String>,
         #[arg(long)]
         template: Option<String>,
+        /// Its source repository, one kiln has; `--source ''` for none.
+        #[arg(long)]
+        source: Option<String>,
     },
     /// The app as Backstage's catalog reads it (catalog-info.yaml).
     Catalog { app: String },
@@ -264,6 +292,27 @@ enum AppCmd {
     /// Add (or replace) a template from a YAML or JSON file.
     TemplateAdd { file: PathBuf },
     TemplateRm { name: String },
+    /// An app's chart on kiln's base chart, written into a repository: charts/<app> (kiln-base
+    /// vendored in it) and deploy/<env>.yaml, each environment's values to start from. What's
+    /// there is kept unless `--force`; `--base` writes only kiln-base, as this kiln ships it.
+    Init {
+        app: String,
+        /// The repository to write into.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// The image it runs (`ghcr.io/acme/web`); each release gives its tag or digest.
+        #[arg(long)]
+        image: Option<String>,
+        /// The port it listens on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        #[arg(long = "env", default_values_t = ["staging".to_owned(), "production".to_owned()])]
+        environments: Vec<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, conflicts_with = "force")]
+        base: bool,
+    },
 }
 
 /// `kiln app create`: an app and how it is deployed.
@@ -307,6 +356,10 @@ struct NewApp {
     set: Vec<String>,
     #[arg(long)]
     namespace: Option<String>,
+    /// Its source repository, one kiln has (`acme/web`); `--source ''` for none. Unset: the one
+    /// its template makes from its starter, if it makes one.
+    #[arg(long)]
+    source: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -518,6 +571,36 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
+        Some(DeployCmd::Fleet { env, apps, template, project, owner, version, set, key, show }) => {
+            let v = match show {
+                Some(id) => api.call(Method::Get, &format!("/fleets/{}", enc(&id)), None).await?,
+                None => {
+                    let env = env.context("--env: the environment the fleet change goes to")?;
+                    let mut sets = serde_json::Map::new();
+                    for kv in &set {
+                        let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set path=value"))?;
+                        sets.insert(k.to_owned(), json!(v));
+                    }
+                    let body = json!({ "environment": env, "apps": apps, "template": template, "project": project, "owner": owner, "version": version, "set": sets, "idempotency_key": key });
+                    api.call(Method::Post, "/fleets", Some(body)).await?
+                }
+            };
+            api.print(&v, |v| {
+                println!("fleet change {} in {}", s(v, "fleet"), s(v, "environment"));
+                for r in v.get("releases").and_then(Value::as_array).into_iter().flatten() {
+                    match r.get("release") {
+                        Some(rel) => println!("{}  {}", s(rel, "app"), line(rel)),
+                        None if r.get("error").is_some() => println!("{}  not released: {}", s(r, "app"), s(r, "error")),
+                        None => println!("{}", line(r)),
+                    }
+                }
+                if let Some(states) = v.get("states").and_then(Value::as_object) {
+                    let parts: Vec<String> = states.iter().map(|(k, n)| format!("{n} {k}")).collect();
+                    println!("{}{}", parts.join(", "), if v.get("done").and_then(Value::as_bool) == Some(true) { " · done" } else { "" });
+                }
+            });
+            return Ok(());
+        }
         Some(DeployCmd::Metrics { app, env, days }) => {
             let mut q = vec![format!("days={days}")];
             q.extend(app.map(|a| format!("app={}", enc(&a))));
@@ -570,13 +653,17 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             let q = version.map(|v| format!("?version={}", enc(&v))).unwrap_or_default();
             let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/diff{q}", enc(&app), enc(&env)), None).await?;
             api.print(&v, |v| {
-                let changes = v.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
+                // `changes` from a server before both providers answered `diffs`.
+                let all = v.get("diffs").or_else(|| v.get("changes")).and_then(Value::as_array).cloned().unwrap_or_default();
+                let flag = |c: &Value, f: &str| c.get(f).and_then(Value::as_bool).unwrap_or(false);
+                let changes: Vec<Value> = all.into_iter().filter(|c| c.get("hunks").and_then(Value::as_array).is_some_and(|h| !h.is_empty()) || flag(c, "missing") || flag(c, "requires_pruning")).collect();
                 if changes.is_empty() {
                     println!("nothing would change");
                 }
                 for c in changes {
                     let k = |f: &str| c.pointer(&format!("/key/{f}")).and_then(Value::as_str).unwrap_or("").to_owned();
-                    println!("--- {} {}/{}", k("kind"), k("namespace"), k("name"));
+                    let note = if flag(&c, "missing") { " (not there yet: a sync makes it)" } else if flag(&c, "requires_pruning") { " (no longer in git: a sync that prunes deletes it)" } else { "" };
+                    println!("--- {} {}/{}{note}", k("kind"), k("namespace"), k("name"));
                     for h in c.get("hunks").and_then(Value::as_array).into_iter().flatten() {
                         let n = |f: &str| h.get(f).and_then(Value::as_u64).unwrap_or(0);
                         println!("@@ -{},{} +{},{} @@", n("old_start"), n("old_lines"), n("new_start"), n("new_lines"));
@@ -671,8 +758,14 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
 
 /// Runs `kiln app`.
 pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
+    // Writes files where it's run: no server is asked.
+    if let AppCmd::Init { app, dir, image, port, environments, force, base } = &args.cmd {
+        return init(app, dir, image.as_deref(), *port, environments, *force, *base);
+    }
     let api = Api::new(cfg, &args.conn).await?;
     match args.cmd {
+        // Done above, before any server.
+        AppCmd::Init { .. } => {}
         AppCmd::List => {
             let v = api.call(Method::Get, "/apps", None).await?;
             api.print(&v, |v| {
@@ -686,6 +779,9 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             let v = api.call(Method::Get, &format!("/apps/{}", enc(&app)), None).await?;
             api.print(&v, |v| {
                 println!("{app} ({})", v.pointer("/app/project").and_then(Value::as_str).unwrap_or(""));
+                if let Some(r) = v.pointer("/app/source").and_then(Value::as_str) {
+                    println!("  source       {r}");
+                }
                 for e in v.get("environments").and_then(Value::as_array).into_iter().flatten() {
                     let env = e.pointer("/registration/environment").and_then(Value::as_str).unwrap_or("");
                     let running = e.get("running").filter(|r| !r.is_null()).map_or_else(|| "nothing released".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), s(r, "version")));
@@ -694,7 +790,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             });
         }
         AppCmd::Create(new) => {
-            let NewApp { app, template, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace } = *new;
+            let NewApp { app, template, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace, source } = *new;
             let mut sets = BTreeMap::new();
             for kv in &set {
                 let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set name=value"))?;
@@ -712,9 +808,12 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 (None, None, None) if template.is_some() => Value::Null,
                 _ => bail!("how is it deployed? --helm-repo and --chart, --git-repo (and --path), --platform and --spec, or a --template that says"),
             };
-            let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace, "template": template });
+            let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace, "template": template, "source": source });
             let v = api.call(Method::Post, "/apps", Some(body)).await?;
-            api.print(&v, |v| println!("app {} ready: register it in an environment (kiln app register {} --env <env>)", s(v, "name"), s(v, "name")));
+            api.print(&v, |v| {
+                let from = v.get("source").and_then(Value::as_str).map(|r| format!(", its source in {r}")).unwrap_or_default();
+                println!("app {}{from} ready: register it in an environment (kiln app register {} --env <env>)", s(v, "name"), s(v, "name"));
+            });
         }
         AppCmd::Register { app, env } => {
             let v = api.call(Method::Post, &format!("/apps/{}/environments/{}", enc(&app), enc(&env)), None).await?;
@@ -740,7 +839,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 println!("{app} deleted");
             }
         }
-        AppCmd::Set { app, owners, properties, oncall, channels, links, template } => {
+        AppCmd::Set { app, owners, properties, oncall, channels, links, template, source } => {
             let mut patch = serde_json::Map::new();
             if !owners.is_empty() {
                 patch.insert("owners".into(), json!(owners));
@@ -775,6 +874,9 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             }
             if let Some(t) = template {
                 patch.insert("template".into(), json!(t));
+            }
+            if let Some(r) = source {
+                patch.insert("source".into(), json!(r));
             }
             let v = api.call(Method::Patch, &format!("/apps/{}", enc(&app)), Some(Value::Object(patch))).await?;
             api.print(&v, |v| println!("{} updated", s(v, "name")));
@@ -859,6 +961,32 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 println!("environment {env} removed");
             }
         }
+    }
+    Ok(())
+}
+
+/// `kiln app init`: an app's chart on kiln's base chart, written into the repository at `dir`.
+fn init(app: &str, dir: &std::path::Path, image: Option<&str>, port: u16, environments: &[String], force: bool, base: bool) -> Result<()> {
+    let label = !app.is_empty() && app.len() <= 63 && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !app.starts_with('-') && !app.ends_with('-');
+    if !label {
+        bail!("{app:?}: an app's name is lowercase letters, digits and '-', as Kubernetes names things");
+    }
+    let image = image.map_or_else(|| format!("registry.example.com/{app}"), str::to_owned);
+    let files = super::init::files(&super::init::Init { app, image: &image, port, environments });
+    let base_dir = std::path::Path::new("charts").join(app).join("charts/kiln-base");
+    let chosen: Vec<(PathBuf, String)> = if base { files.into_iter().filter(|(p, _)| p.starts_with(&base_dir)).collect() } else { files };
+    let (wrote, kept) = super::init::write(dir, &chosen, force || base).with_context(|| format!("write into {}", dir.display()))?;
+    for p in &wrote {
+        println!("wrote {}", p.display());
+    }
+    for p in &kept {
+        println!("kept {} (it was there: --force writes over it)", p.display());
+    }
+    if !base {
+        println!(
+            "\nNext: commit it, then\n  kiln app create {app} --git-repo <this repository's URL> --path charts/{app} --set 'image.tag=${{{{ release.version }}}}'\n  kiln app register {app} --env {env}\n  kiln deploy {app} <a tag or commit your CI built> --to {env}",
+            env = environments.first().map_or("staging", String::as_str)
+        );
     }
     Ok(())
 }

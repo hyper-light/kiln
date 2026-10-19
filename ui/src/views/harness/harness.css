@@ -877,6 +877,33 @@ textarea.hx-input {
   font-size: 11.5px;
   color: var(--color-subtle);
 }
+/* A command run on another machine (kiln reach): kiln's accent down its edge, and where it ran
+   ahead of the command, in its row and in its step's head (so a folded step says so too). */
+.hx-cmd[data-remote] {
+  border-color: color-mix(in srgb, var(--color-accent) 32%, #202227);
+  box-shadow: inset 2px 0 0 var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 4%, #0b0c0f);
+}
+.hx-step[data-remote] > .hx-step-head .hx-step-icon {
+  color: var(--color-accent);
+}
+.hx-where {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  max-width: min(45%, 260px);
+  min-width: 0;
+  padding: 1px 7px 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  color: var(--color-link);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 16px;
+  white-space: nowrap;
+}
 .hx-out {
   max-height: 320px;
   margin: 0;
@@ -2248,6 +2275,8 @@ textarea.hx-input {
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-secondary);
+  /* A path or an address in it breaks rather than widening the tab. */
+  overflow-wrap: anywhere;
 }
 .hx-skill-search {
   display: flex;

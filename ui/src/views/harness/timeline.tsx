@@ -5,7 +5,7 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, Check, ChevronRight, CircleAlert, Copy, CornerDownRight, Info, TriangleAlert } from "lucide-react";
+import { ArrowDown, ArrowUpRight, Check, ChevronRight, CircleAlert, Copy, CornerDownRight, Info, TriangleAlert } from "lucide-react";
 import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type SessionStore, type Task } from "@/api/harness";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -16,6 +16,11 @@ import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
+import { FilesContext, type ConversationFiles } from "./files";
+import { PageView } from "./page";
+import { pageOf } from "./page-of";
+import { LiveView } from "./live";
+import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, formatThought, thinkingWords, type BeamStatus } from "./signals";
@@ -37,19 +42,24 @@ function Contexts({
   signIn,
   findNow,
   tasks,
+  files,
   children,
 }: {
   asking: ReadonlySet<string>;
   signIn: React.ContextType<typeof SignIn>;
   findNow: FindNow | null;
   tasks: Task[];
+  /** The files its messages mention (files.tsx). */
+  files: ConversationFiles;
   children: React.ReactNode;
 }) {
   return (
     <Asking.Provider value={asking}>
       <SignIn.Provider value={signIn}>
         <Tasks.Provider value={tasks}>
-          <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+          <FilesContext.Provider value={files}>
+            <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+          </FilesContext.Provider>
         </Tasks.Provider>
       </SignIn.Provider>
     </Asking.Provider>
@@ -123,6 +133,29 @@ function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
   );
 }
 
+/** A command that ran (or runs) on another machine (kiln reach). */
+const elsewhere = (c: ToolEvent) => typeof c.runner === "string";
+
+/** Where it ran, as a chip: the runner, what it must be until one is picked, or "another runner". */
+function Where({ runner, title }: { runner: string; title?: string }) {
+  return (
+    <span className="hx-where" title={title ?? (runner ? `Ran on ${runner}, not this agent's machine` : "Runs on another runner")}>
+      <ArrowUpRight size={11} aria-hidden="true" />
+      <span className="hx-trunc">{runner || "another runner"}</span>
+    </span>
+  );
+}
+
+/**
+ * Where a step's commands ran, for its head: the machine when all ran there ("adacachy"), how many
+ * when only some did ("1 on adacachy"), and how many machines when several ("2 on 3 machines").
+ */
+function whereOfStep(calls: ToolEvent[], remote: string[]): string {
+  const n = calls.filter(elsewhere).length;
+  const machines = remote.length === 1 ? remote[0] || "another runner" : `${remote.length} machines`;
+  return n === calls.length && remote.length === 1 ? machines : `${n} on ${machines}`;
+}
+
 function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   const [open, setOpen] = React.useState(Boolean(initial));
   useRevealed(
@@ -133,16 +166,17 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   // Nothing to show while it runs without output yet: the dot and the clock say it's running.
   const out = c.output ? c.output : c.status === "running" ? null : "(no output)";
   return (
-    <div className="hx-cmd" data-failed={failed || undefined} data-ev={c.id}>
+    <div className="hx-cmd" data-failed={failed || undefined} data-remote={elsewhere(c) || undefined} data-ev={c.id}>
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
+        {typeof c.runner === "string" && <Where runner={c.runner} />}
         <code className="hx-cmd-line">{c.title}</code>
         <span className="hx-cmd-meta">
           {c.exit_code !== undefined && <span className={failed ? "hx-bad" : "hx-good"}>exit {c.exit_code}</span>}
           {c.status === "running" ? <Elapsed from={c.started} /> : c.ended ? <span className="hx-meta-num">{duration(c.ended - c.started)}</span> : null}
         </span>
       </button>
-      {c.detail && <div className="hx-cmd-why">{c.detail}</div>}
+      {c.detail && !(elsewhere(c) && c.detail === `on ${c.runner}`) && <div className="hx-cmd-why">{c.detail}</div>}
       {open && out !== null && <Output text={out} truncated={c.truncated} error={failed} />}
     </div>
   );
@@ -295,6 +329,8 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
+  // Commands run on other machines: where, in the step's head, so it shows folded too.
+  const remote = [...new Set(step.calls.filter(elsewhere).map((c) => c.runner ?? ""))];
   const subtitle =
     step.group === "shell" && step.calls.length === 1
       ? first?.title
@@ -312,13 +348,14 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
               : undefined;
 
   return (
-    <div className="hx-step" data-group={step.group} data-status={status} data-ev={step.calls.map((c) => c.id).join(" ")}>
+    <div className="hx-step" data-group={step.group} data-status={status} data-remote={remote.length > 0 || undefined} data-ev={step.calls.map((c) => c.id).join(" ")}>
       <button type="button" className="hx-step-head" aria-expanded={isOpen} onClick={() => setOpen(!isOpen)}>
         <span className="hx-step-icon">
           <ToolIcon kind={STEP_ICON[step.group]} size={13} />
         </span>
         <span className="hx-step-title">{stepSummary(step.group, step.calls)}</span>
         {subtitle && <span className="hx-step-sub">{subtitle}</span>}
+        {remote.length > 0 && <Where runner={whereOfStep(step.calls, remote)} title={remote.filter(Boolean).join(", ") || undefined} />}
         <span className="hx-step-end">
           {stats && (stats.add > 0 || stats.del > 0) && <DiffStat add={stats.add} del={stats.del} />}
           {status === "pending" && (asked ? <span className="hx-warn text-[11px]">waiting for you</span> : <span className="hx-dim text-[11px]">queued</span>)}
@@ -461,7 +498,7 @@ function ItemView({ item, cwd, onOpenTask, effort }: { item: Item; cwd: string; 
       // A tap (or a pointer resting on it) shows its copy icon.
       return (
         <div className="hx-said" data-ev={item.event.id} tabIndex={-1}>
-          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} />
+          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} />
           {!item.event.streaming && item.event.text && <CopyMsg text={item.event.text} label="Copy what it said" className="hx-said-copy" />}
         </div>
       );
@@ -469,6 +506,19 @@ function ItemView({ item, cwd, onOpenTask, effort }: { item: Item; cwd: string; 
       return <Thought e={item.event} more={item.more} effort={effort} />;
     case "notice":
       return <Notice e={item.event} repeats={item.repeats} />;
+    case "page":
+      // The page, or where it'll be while it's being kept; a call that failed says why, as a step.
+      return pageOf(item.event) || item.event.status === "running" || item.event.status === "pending" ? (
+        <PageView call={item.event} />
+      ) : (
+        <StepRow step={{ type: "step", key: item.key, group: "tool", calls: [item.event] }} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />
+      );
+    case "live":
+      return liveOf(item.event) || item.event.status === "running" || item.event.status === "pending" ? (
+        <LiveView call={item.event} />
+      ) : (
+        <StepRow step={{ type: "step", key: item.key, group: "tool", calls: [item.event] }} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />
+      );
   }
 }
 
@@ -479,6 +529,7 @@ function moving(items: Item[]): boolean {
   if (last.type === "note") return Boolean(last.event.streaming);
   if (last.type === "thought") return [last.event, ...(last.more ?? [])].some((t) => t.streaming);
   if (last.type === "step") return last.calls.some((c) => c.status === "running" || c.status === "pending");
+  if (last.type === "page" || last.type === "live") return last.event.status === "running" || last.event.status === "pending";
   return false;
 }
 
@@ -521,6 +572,7 @@ const TurnView = React.memo(function TurnView({
   meta,
   onCommand,
   agentLabel,
+  reading,
 }: {
   /** Who answers (the harness's name), over the agent's side of the turn. */
   agentLabel?: string;
@@ -534,17 +586,21 @@ const TurnView = React.memo(function TurnView({
   onOpenTask?: (t: string) => void;
   meta?: Meta | null;
   onCommand?: (c: Command) => void;
+  /** The part being read stays in the window while the turn grows. */
+  reading: string | null;
 }) {
-  const edits = React.useMemo(() => changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))), [turn]);
+  const edits = React.useMemo(() => (turn.outcome ? changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))) : []), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
   // A turn of hundreds of steps shows its latest; the rest are a tap away (and there for a match
   // you find in them).
   const findNow = React.useContext(FindNowContext);
   const [allSteps, setAllSteps] = React.useState(false);
-  const hidden = allSteps ? 0 : Math.max(0, turn.items.length - STEPS_WINDOW);
-  const sought = hidden > 0 && findNow !== null && turn.items.slice(0, hidden).some((it) => itemHolds(it, findNow.id));
-  const items = hidden > 0 && !sought ? turn.items.slice(hidden) : turn.items;
+  const at = reading ? turn.items.findIndex((it) => itemHolds(it, reading)) : -1;
+  const hidden = allSteps ? 0 : Math.max(0, Math.min(turn.items.length - STEPS_WINDOW, at < 0 ? Infinity : at));
+  const end = allSteps ? turn.items.length : hidden + STEPS_WINDOW;
+  const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
+  const items = sought ? turn.items : turn.items.slice(hidden, end);
   if (turn.divider) {
     return (
       <section className="hx-turn hx-turn-switch">
@@ -571,7 +627,7 @@ const TurnView = React.memo(function TurnView({
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
-          <Prose text={turn.outcome.text} />
+          <Prose text={turn.outcome.text} seq={turn.outcome.seq} />
           <div className="hx-outcome-foot">
             {edits.length > 0 && (
               <span>
@@ -659,6 +715,10 @@ function useKeeper(key: string) {
     s.end = s.tail && s.root.scrollHeight - s.root.scrollTop - s.root.clientHeight < END_PX;
     s.at = s.end ? null : firstInView(s.root);
   }, []);
+  const restore = React.useCallback(() => {
+    const s = k.current;
+    if (s.root && s.at) goTo(s.root, s.at);
+  }, []);
   const save = React.useCallback(() => {
     const s = k.current;
     window.clearTimeout(s.saving);
@@ -711,6 +771,7 @@ function useKeeper(key: string) {
     const s = k.current;
     window.clearTimeout(s.saving);
     s.saving = window.setTimeout(save, 250);
+    return s.at?.id ?? null;
   };
   /** At the end, following what comes. */
   const atEnd = React.useCallback(() => k.current.end, []);
@@ -738,7 +799,7 @@ function useKeeper(key: string) {
     const el = e.target instanceof Element ? e.target.closest<HTMLElement>(PARTS) : null;
     k.current.touched = el && root ? { el, h: el.offsetHeight, offset: el.getBoundingClientRect().top - root.getBoundingClientRect().top, t: performance.now() } : null;
   };
-  return { ref, onScroll, onTouch, read, atEnd, atBottom, setTail, toEnd };
+  return { ref, onScroll, onTouch, read, restore, atEnd, atBottom, setTail, toEnd };
 }
 
 /**
@@ -816,13 +877,17 @@ export const Timeline = React.memo(function Timeline({
   const events = useSession(store, (s) => s.events);
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
+  // The files its messages mention, as the server kept them: shown where they're mentioned.
+  const keptFiles = useSession(store, (s) => s.files);
+  const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
   const going = parent ? task?.status === "running" || task?.status === "pending" : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again.
   const [kept] = React.useState(() => new Map<string, Turn>());
   const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
   const keeper = useKeeper(placeKey(agent, parent));
-  const { read, atEnd, setTail, toEnd } = keeper;
+  const { read, restore, atEnd, setTail, toEnd } = keeper;
+  const [reading, setReading] = React.useState<string | null>(null);
   // The turns in the page (`WINDOW` at a time, `MOST` at most): from the one `anchor` names (null:
   // the latest), through the one `till` names (null: the end). Read back, the window stays put as
   // more comes; gone far back (your place from last time, a match you find), it's a window there,
@@ -832,7 +897,7 @@ export const Timeline = React.memo(function Timeline({
   const anchored = anchor ? turns.findIndex((t) => t.key === anchor) : -1;
   const tilled = till ? turns.findIndex((t) => t.key === till) : -1;
   const from = anchored >= 0 ? anchored : Math.max(0, turns.length - WINDOW);
-  const to = tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length;
+  const to = Math.min(from + MOST, tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length);
   /** A window around turn `i`, when it isn't in the page. */
   const around = (i: number) => {
     if (i < 0 || (i >= from && i < to)) return;
@@ -894,7 +959,7 @@ export const Timeline = React.memo(function Timeline({
     return () => io.disconnect();
   }, []);
   const onScroll = () => {
-    keeper.onScroll();
+    setReading(keeper.onScroll());
     // Back at the end: the page holds the latest turns again, and follows them. Read back, it stays put.
     if (atEnd()) {
       if (anchor !== null) setAnchor(null);
@@ -904,6 +969,7 @@ export const Timeline = React.memo(function Timeline({
   const latest = () => {
     setAnchor(null);
     setTill(null);
+    setReading(null);
     toEnd();
   };
   // Find: every match marked in place (again as the conversation grows), and the one shown brought
@@ -912,12 +978,15 @@ export const Timeline = React.memo(function Timeline({
   const findNow = find?.now ?? null;
   const shown = React.useRef(0);
   const grows = findQ ? events : null;
+  const holds = reading ? turns : null;
   const marks = React.useCallback(
     (flow: HTMLDivElement | null) => {
       const root = flow?.parentElement;
       if (!flow || !root) return;
       // Marked again as the conversation grows, while finding.
       void grows;
+      // A bounded window can move without changing height (so no resize is reported).
+      if (holds && reading) restore();
       const at = findNow ? elementOf(flow, findNow.id) : null;
       const first = mark(flow, findQ, at);
       if (findNow && findNow.n !== shown.current) {
@@ -930,7 +999,7 @@ export const Timeline = React.memo(function Timeline({
       }
       return () => void mark(flow, "", null);
     },
-    [findQ, findNow, grows, read],
+    [findQ, findNow, grows, holds, reading, read, restore],
   );
   const running = state?.status === "running";
   const tasks = state?.tasks ?? NO_TASKS;
@@ -963,7 +1032,7 @@ export const Timeline = React.memo(function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks}>
+    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
       {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
       <div
         ref={keeper.ref}
@@ -1000,6 +1069,7 @@ export const Timeline = React.memo(function Timeline({
               meta={meta}
               onCommand={onCommand}
               agentLabel={agentLabel}
+              reading={reading}
             />
           ))}
           {/* A window further back: what came after joins as you scroll down to it. */}

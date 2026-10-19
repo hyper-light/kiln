@@ -377,7 +377,9 @@ mod tests {
     use super::*;
 
     /// One request on the socket at `path`, from this process (on the blocking pool: the socket is
-    /// served on the runtime).
+    /// served on the runtime). Linux's, as the one test that asks is (on macOS it was never used,
+    /// which its clippy refuses).
+    #[cfg(target_os = "linux")]
     async fn ask(path: PathBuf, req: Value) -> anyhow::Result<Value> {
         crate::rt::blocking(move || -> anyhow::Result<Value> {
             use std::io::{BufRead as _, Write as _};

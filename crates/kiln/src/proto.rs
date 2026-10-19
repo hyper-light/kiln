@@ -26,6 +26,20 @@ pub const LANE_REACH: u32 = 4;
 /// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
 /// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
 pub const LANE_CONVO: u32 = 6;
+/// Files read on a machine for the people viewing its agent sessions (`crate::harness::files`):
+/// what a message mentions, shown in the conversation. Bulk frames of their own, so a video being
+/// read never holds up a job's log, a terminal or the conversation feed. The last of a peer's eight.
+pub const LANE_FILES: u32 = 7;
+/// Pages streamed from a machine (`crate::browser::stream`): their picture and sound up, what their
+/// viewers do down. Interactive frames of their own, so a stream never waits behind a log, a file or
+/// the feed. Past the first eight lanes: a peer allows sixteen (`crate::net::limits`); only runners
+/// announcing [`CAP_STREAM`] open it, and only to a server that asked them to stream.
+pub const LANE_STREAM: u32 = 8;
+/// Ports of agents' machines opened through the server for people's own devices
+/// (`crate::browser::ports`, `crate::harness::opened`): the bytes of each connection both ways.
+/// A lane of its own, so a page's files never wait behind a stream's picture or a terminal; only to
+/// runners announcing [`CAP_PORTS`].
+pub const LANE_PORTS: u32 = 9;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -134,6 +148,32 @@ pub enum AgentMsg {
     /// changes, and every 10 minutes. A machine on battery sleeps when it runs out, and its runner
     /// with it; the server says so first. Appended last: postcard encodes variants by index.
     Power { json: String },
+    /// The answer to a question the server asked by `req` ([`ServerMsg::Diagnose`],
+    /// [`ServerMsg::Repair`]): JSON, or `None` when there's nothing to say. Appended last: postcard
+    /// encodes variants by index.
+    Answer { req: u64, json: Option<String> },
+    /// Answer to [`ServerMsg::HarnessFileRead`] (on [`LANE_FILES`]): `json` a
+    /// [`crate::harness::files::Answer`] (the file's size, type and dimensions, or why it can't
+    /// be read), `data` the bytes asked for. Only from runners announcing [`CAP_FILES`]. Appended
+    /// last: postcard encodes variants by index.
+    HarnessFileData { req: u64, json: String, data: Vec<u8> },
+    /// A chunk of stream `stream` (on [`LANE_STREAM`]): `crate::browser::stream::frame`'s bytes.
+    /// Only from runners announcing [`CAP_STREAM`]. Appended last: postcard encodes variants by
+    /// index.
+    StreamFrame { stream: String, data: Vec<u8> },
+    /// What stream `stream` says (JSON: opened, navigated, loaded, focus, dialog, closed, error), on
+    /// [`LANE_STREAM`]. Appended last: postcard encodes variants by index.
+    StreamEvent { stream: String, json: String },
+    /// Connection `conn` reached its port, or why not (`error`). On [`LANE_PORTS`].
+    PortOpened { conn: u64, error: Option<String> },
+    /// Bytes from connection `conn`'s port: at most `crate::browser::ports::WINDOW` the server
+    /// hasn't acknowledged ([`ServerMsg::PortAck`]).
+    PortData { conn: u64, data: Vec<u8> },
+    /// The runner took `bytes` more of what the server sent connection `conn`.
+    PortAck { conn: u64, bytes: u64 },
+    /// Connection `conn`'s port ended it (or it failed: `error`). Appended last: postcard encodes
+    /// variants by index.
+    PortClose { conn: u64, error: Option<String> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -198,6 +238,21 @@ pub const CAP_REACH: u32 = 1 << 17;
 /// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
 /// observe and updates take (128, 256, 512).
 pub const CAP_CONVO: u32 = 1 << 19;
+/// [`AgentMsg::Build`] capability: the runner looks at its own machine and repairs it
+/// ([`ServerMsg::Diagnose`], [`ServerMsg::Repair`], `crate::doctor`).
+pub const CAP_DOCTOR: u32 = 1 << 21;
+/// [`AgentMsg::Build`] capability: the runner reads files for the people viewing its agent
+/// sessions ([`ServerMsg::HarnessFileRead`], answered on [`LANE_FILES`]).
+pub const CAP_FILES: u32 = 1 << 22;
+/// [`AgentMsg::Build`] capability: the runner streams pages for the people viewing its agent
+/// sessions (`crate::browser::stream`, [`ServerMsg::StreamOpen`], on [`LANE_STREAM`]).
+pub const CAP_STREAM: u32 = 1 << 23;
+/// [`AgentMsg::Build`] capability: the runner says what a person may open live from its sessions
+/// and starts their projects' apps ([`ServerMsg::Preview`], `crate::browser::apps`).
+pub const CAP_PREVIEW: u32 = 1 << 24;
+/// [`AgentMsg::Build`] capability: the runner connects the server to ports its machine's processes
+/// listen on ([`ServerMsg::PortOpen`], on [`LANE_PORTS`], `crate::browser::ports`).
+pub const CAP_PORTS: u32 = 1 << 25;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -360,6 +415,47 @@ pub enum ServerMsg {
     /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
     /// by index.
     UpdateAvailable { commit: String, build: String, from: String },
+    /// Look at this machine and say what's wrong (JSON `crate::doctor::Machine`), answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_DOCTOR`]. Appended last: postcard
+    /// encodes variants by index.
+    Diagnose { req: u64 },
+    /// Make repair `action` on this machine (`crate::doctor::RUNNER_ACTIONS`), answered by
+    /// [`AgentMsg::Answer`] (`{message}` or `{error}`). Only to runners announcing [`CAP_DOCTOR`].
+    /// Appended last: postcard encodes variants by index.
+    Repair { req: u64, action: String },
+    /// Read up to `len` bytes of `path` from `offset`, for whoever views agent session `session`
+    /// (a file one of its messages mentions); answered by [`AgentMsg::HarnessFileData`]. Only to
+    /// runners announcing [`CAP_FILES`]. Appended last: postcard encodes variants by index.
+    HarnessFileRead { req: u64, session: String, path: String, offset: u64, len: u32 },
+    /// Stream a page for whoever views agent session `session` (`json` a
+    /// `crate::browser::stream::Spec`), as `stream`. Only to runners announcing [`CAP_STREAM`].
+    /// Appended last: postcard encodes variants by index.
+    StreamOpen { stream: String, session: String, json: String },
+    /// What a viewer asks of stream `stream` (`crate::browser::stream::Stream::control`). Appended
+    /// last: postcard encodes variants by index.
+    StreamControl { stream: String, session: String, json: String },
+    /// What a viewer did in stream `stream`: `crate::browser::stream::Input`s, in order, as JSON.
+    /// Appended last: postcard encodes variants by index.
+    StreamInput { stream: String, session: String, json: String },
+    /// Close stream `stream`. Appended last: postcard encodes variants by index.
+    StreamClose { stream: String, session: String },
+    /// What a person opens live from agent session `session` (`crate::browser::apps`): `json` is
+    /// `{"op": "look"}` (the ports the machine serves, the project's app), `{"op": "start"}` (its
+    /// app, as its `.kiln/preview.yaml` says) or `{"op": "stop"}`; answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_PREVIEW`]. Appended last: postcard
+    /// encodes variants by index.
+    Preview { req: u64, session: String, json: String },
+    /// Connect connection `conn` to port `port` on agent session `session`'s machine (on loopback,
+    /// a port its processes listen on: `crate::browser::ports`); answered by
+    /// [`AgentMsg::PortOpened`]. Only to runners announcing [`CAP_PORTS`], on [`LANE_PORTS`].
+    PortOpen { conn: u64, session: String, port: u16 },
+    /// Bytes for connection `conn`'s port.
+    PortData { conn: u64, session: String, data: Vec<u8> },
+    /// The server took `bytes` more of what connection `conn`'s runner sent: it may send that many
+    /// more (`crate::browser::ports::WINDOW`).
+    PortAck { conn: u64, session: String, bytes: u64 },
+    /// Connection `conn` is done with. Appended last: postcard encodes variants by index.
+    PortClose { conn: u64, session: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -522,6 +618,129 @@ mod tests {
             assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
             seen |= c;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_diagnosis_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
+        for (i, m) in [ServerMsg::Diagnose { req: 7 }, ServerMsg::Repair { req: 8, action: "prune-versions".into() }].into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + i as u8), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
+        let answer = AgentMsg::Answer { req: 7, json: Some("{}".into()) };
+        let b = encode(&answer)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Answer comes right after Power");
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        Ok(())
+    }
+
+    #[test]
+    fn reading_files_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
+        let ask = ServerMsg::HarnessFileRead { req: 9, session: "s".into(), path: "/tmp/a.png".into(), offset: 1 << 20, len: 1 << 20 };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 3), "HarnessFileRead comes right after Repair");
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
+        let answer = AgentMsg::HarnessFileData { req: 9, json: "{}".into(), data: vec![0x89, b'P', b'N', b'G'] };
+        let b = encode(&answer)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 2), "HarnessFileData comes right after Answer");
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        let taken = CAP_UPGRADE
+            | CAP_TAKEOVER
+            | CAP_DIRS
+            | CAP_TAKEOVER_STOP
+            | CAP_SYNC
+            | CAP_FRONT_DOOR
+            | CAP_REPOS
+            | CAP_OUTPOST
+            | CAP_UPDATES
+            | CAP_BLUE_GREEN
+            | CAP_CI2
+            | CAP_ACTIONS
+            | CAP_DOCKER
+            | CAP_FIRECRACKER
+            | CAP_SHARDS
+            | CAP_FACTS
+            | CAP_JOB_TTY
+            | CAP_DOCKER_ROOTLESS
+            | CAP_REACH
+            | CAP_CONVO
+            | CAP_DOCTOR
+            | 128;
+        assert!(CAP_FILES.is_power_of_two() && CAP_FILES & taken == 0, "CAP_FILES is a bit of its own");
+        let lanes = [LANE_CONTROL, LANE_TERM, LANE_LOGS, LANE_SYNC, LANE_REACH, 5, LANE_CONVO];
+        assert!(LANE_FILES < 8 && !lanes.contains(&LANE_FILES), "a lane of its own, within the eight a peer has");
+        Ok(())
+    }
+
+    #[test]
+    fn ports_are_appended_after_previews() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Preview { req: 3, session: "s".into(), json: "{}".into() })?;
+        let server = [
+            ServerMsg::PortOpen { conn: 1, session: "s".into(), port: 5173 },
+            ServerMsg::PortData { conn: 1, session: "s".into(), data: b"GET / HTTP/1.1\r\n".to_vec() },
+            ServerMsg::PortAck { conn: 1, session: "s".into(), bytes: 65536 },
+            ServerMsg::PortClose { conn: 1, session: "s".into() },
+        ];
+        for (i, m) in server.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::StreamEvent { stream: "v".into(), json: "{}".into() })?;
+        let agent = [
+            AgentMsg::PortOpened { conn: 1, error: None },
+            AgentMsg::PortData { conn: 1, data: b"HTTP/1.1 200 OK\r\n".to_vec() },
+            AgentMsg::PortAck { conn: 1, bytes: 9 },
+            AgentMsg::PortClose { conn: 1, error: Some("reset".into()) },
+        ];
+        for (i, m) in agent.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        assert!(CAP_PORTS.is_power_of_two() && CAP_PORTS > CAP_PREVIEW);
+        assert!(LANE_PORTS == LANE_STREAM + 1 && LANE_PORTS < crate::net::limits(true).lanes_per_peer, "a lane of its own, within what a peer allows");
+        Ok(())
+    }
+
+    #[test]
+    fn previews_are_appended_after_streams() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::StreamClose { stream: "v".into(), session: "s".into() })?;
+        let m = ServerMsg::Preview { req: 3, session: "s".into(), json: "{\"op\":\"look\"}".into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "Preview comes right after StreamClose");
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        assert!(CAP_PREVIEW.is_power_of_two() && CAP_PREVIEW > CAP_STREAM);
+        Ok(())
+    }
+
+    #[test]
+    fn streams_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::HarnessFileRead { req: 1, session: "s".into(), path: "/p".into(), offset: 0, len: 1 })?;
+        let after = [
+            ServerMsg::StreamOpen { stream: "v".into(), session: "s".into(), json: "{}".into() },
+            ServerMsg::StreamControl { stream: "v".into(), session: "s".into(), json: "{}".into() },
+            ServerMsg::StreamInput { stream: "v".into(), session: "s".into(), json: "[]".into() },
+            ServerMsg::StreamClose { stream: "v".into(), session: "s".into() },
+        ];
+        for (i, m) in after.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::HarnessFileData { req: 1, json: "{}".into(), data: vec![] })?;
+        for (i, m) in [AgentMsg::StreamFrame { stream: "v".into(), data: vec![b'v', b'k'] }, AgentMsg::StreamEvent { stream: "v".into(), json: "{}".into() }].into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        assert!(CAP_STREAM.is_power_of_two() && CAP_STREAM > CAP_FILES && CAP_STREAM < 1 << 24);
+        assert!(LANE_STREAM == 8 && LANE_STREAM < crate::net::limits(true).lanes_per_peer, "a lane past the first eight, within what a peer allows");
         Ok(())
     }
 

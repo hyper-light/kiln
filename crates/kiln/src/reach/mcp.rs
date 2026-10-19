@@ -57,7 +57,12 @@ in that machine's home folder). `runners` lists the machines, best first. Long c
 (background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
 `agents_start` them with a clear brief, `agents_wait` for them and read what they concluded with `agents_result`: \
 they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
-skill says how)."
+skill says how). To show the person a file from this machine (a screenshot, a recording, a PDF, a log), write its full \
+path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \
+shows it in the conversation and keeps a copy, so it still shows after the file goes. To show something live (a chart, a \
+table, a diagram, a mock-up, a small tool to try), write a page and show it with show_page: it runs in the conversation, \
+sized to fit, in kiln's look; look at it with preview_page first. A page that needs this machine (your dev server, its files) \
+you show live with show_live: it streams to them as they look, and use_live lets you use it with them."
         .to_owned();
     if !machines.is_empty() {
         s.push_str(&format!(" This kiln's machines: {machines}."));
@@ -197,6 +202,53 @@ fn base_tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
         },
+        {
+            "name": "preview_page",
+            "description": "See a page as a person will, in kiln's own browser on this machine: HTML you wrote, an HTML file, or an address (a dev server here, http://localhost:5173, or the web). You get a picture of it, what its console printed (errors with their stack), how tall it is, and how it behaved for a moment after it loaded: layout shift (0: nothing moved), long tasks, frames a second. Check your work with it before you say it's done or show it. A phone by default (390×844, 2× pixels, dark); set width, height, scale and dark to see others. measure: true also gives its height at each width a viewer's conversation might have. The picture is saved at picture_path: to show it to the person, put that path in your message as a Markdown image. The first preview on a machine downloads the browser once (about 200 MB), so it can take a minute.",
+            "inputSchema": {"type": "object", "properties": {
+                "html": {"type": "string", "description": "A whole HTML document you wrote. Full paths in it (src=\"/tmp/shot.png\") load those files."},
+                "path": {"type": "string", "description": "An HTML file on this machine (or a picture, a PDF)."},
+                "url": {"type": "string", "description": "An address: a dev server on this machine or a page on the web."},
+                "width": {"type": "number", "description": "The window's width in CSS pixels: 390 (a phone) by default, 1280 for a desktop."},
+                "height": {"type": "number", "description": "The window's height: 844 by default."},
+                "scale": {"type": "number", "description": "Pixel density: 2 by default."},
+                "dark": {"type": "boolean", "description": "A dark appearance (prefers-color-scheme): true by default."},
+                "reduced_motion": {"type": "boolean", "description": "prefers-reduced-motion: reduce."},
+                "watch_ms": {"type": "number", "description": "How long to watch it after it loads, in ms: 1500 by default, at most 10000."},
+                "measure": {"type": "boolean", "description": "Also its height at each width a viewer's conversation might have."},
+                "picture": {"type": "string", "enum": ["window", "page", "none"], "description": "The window (the default), the whole page, or none."}
+            }},
+            "annotations": {"readOnlyHint": true, "openWorldHint": true},
+        },
+        {
+            "name": "show_page",
+            "description": "Show the person a page in the conversation, live and interactive: a chart, a table, a diagram, a mock-up, a small tool to try. Write a whole HTML document (or give an HTML file). kiln keeps it with every file it uses: pictures, styles, scripts, fonts, data, by full path or next to the file; libraries from the web (pin their versions) are fetched once by the server and kept. It's shown inline at the conversation's width, as tall as it is, in kiln's look: dark, transparent background, Geist, and kiln's colors as CSS variables (--foreground, --muted-foreground, --border, --card, --accent, --success, --warning, --destructive, --chart-1 to --chart-5, --font-sans, --font-mono, --radius): use them. Make it fit any width from 320 px up (no fixed widths). It runs sandboxed: its scripts work, but it reaches nothing beyond its own files and has no cookies or storage. In it, kiln.reply(value, label) offers the person's choice back to you as their next message; kiln.save(state) keeps what they did, handed back to kiln.onrestore(state) when it's shown again. What moves (animations, video, sound) pauses while it's out of view. Look at it with preview_page first. The answer says what kiln's browser saw: errors it printed, layout shift, its height at each width.",
+            "inputSchema": {"type": "object", "properties": {
+                "title": {"type": "string", "description": "A few words for it: shown with it, and its name."},
+                "html": {"type": "string", "description": "A whole HTML document."},
+                "path": {"type": "string", "description": "Or an HTML file on this machine (files it uses are found next to it)."}
+            }, "required": ["title"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "show_live",
+            "description": "Show the person a page live in the conversation, running here on this machine: your dev server (http://localhost:5173), a page that needs this machine's files, network or GPU, or any site. Its picture and sound stream to them while they look, at their screen's size, and what they do in it (taps, typing, scrolling) goes to it. For a page you wrote that runs on its own, use show_page instead. The answer says which stream it is.",
+            "inputSchema": {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Its address: on this machine (http://localhost:3000) or on the web."},
+                "title": {"type": "string", "description": "A few words for it."}
+            }, "required": ["url"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "use_live",
+            "description": "Use a page you showed with show_live, as the person can: click or tap at a point (CSS pixels of its window), type text, press a key by name (Enter, Tab, Escape, ArrowDown, a), scroll, go to an address, back, forward, reload, wait. Its actions run in order; then you get a picture of it, its address and title. The person sees what you did as you do it, live, in the same page. Record it too: {\"record\": true} starts a recording (video, and a log of what's done in it by you or the person), {\"record\": false} stops it and answers with its files: the video (MP4), the log (.inputs.jsonl) and a Playwright test of what was done (.spec.ts) to turn into a real one. {\"replay\": \"<.inputs.jsonl path>\"} does a recording's log again in the page.",
+            "inputSchema": {"type": "object", "properties": {
+                "stream": {"type": "string", "description": "The stream's id, from show_live's answer."},
+                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"wait_ms\": 500}, {\"record\": true}, {\"record\": false}, {\"replay\": \"/path/live-….inputs.jsonl\"}.", "items": {"type": "object"}},
+                "picture": {"type": "boolean", "description": "A picture of it after (true by default)."}
+            }, "required": ["stream"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
     ])
 }
 
@@ -295,6 +347,20 @@ fn follow(mut client: Client, cell: Cell) {
             cv.notify_all();
         }
     });
+}
+
+/// What a preview saw (on one line, first: the conversation shows that), with its picture for the
+/// agent to look at (unless it's too big to send).
+fn picture_result(answer: &Value, picture: Option<&str>) -> Value {
+    use base64::Engine as _;
+    let mut content = vec![json!({"type": "text", "text": answer.to_string()})];
+    if let Some(path) = picture
+        && let Ok(png) = std::fs::read(path)
+        && png.len() <= 8 << 20
+    {
+        content.push(json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&png), "mimeType": "image/png"}));
+    }
+    json!({"content": content, "structuredContent": answer, "isError": false})
 }
 
 fn text_result(v: &Value, error: bool) -> Value {
@@ -469,6 +535,83 @@ impl Server {
         }
     }
 
+    /// Ask the machine's preview browser, through the runner (`crate::browser::ask`).
+    fn browser(&self, q: &Value) -> anyhow::Result<Value> {
+        let mut c = Client::connect(&self.sock)?;
+        c.send(&Req::Browser { json: q.to_string() })?;
+        match c.event()? {
+            Some(Ev::Answer(j)) => Ok(serde_json::from_str(&j)?),
+            Some(Ev::Error(e)) => anyhow::bail!("{e}"),
+            None => anyhow::bail!("the kiln runner closed the connection (a runner older than kiln's previews doesn't have a browser: upgrade it)"),
+            other => anyhow::bail!("unexpected answer {other:?}"),
+        }
+    }
+
+    /// Show a page live in the conversation (the `show_live` tool): streamed from this machine by
+    /// its runner, through the server, to whoever looks.
+    fn show_live(&self, args: &Value) -> anyhow::Result<Value> {
+        let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
+        let url = s("url").ok_or_else(|| anyhow::anyhow!("which page? Give its address"))?;
+        let title = s("title").unwrap_or_else(|| url.clone());
+        let opened = self.ask(json!({"op": "stream", "do": "open", "url": url, "title": title}))?;
+        match (opened.get("ok"), opened.get("error").and_then(Value::as_str)) {
+            (Some(v), _) => Ok(json!({"kiln_stream": v})),
+            (None, Some(e)) if e.contains("unknown") => anyhow::bail!("this kiln server doesn't stream pages yet: upgrade it"),
+            (None, e) => anyhow::bail!("{}", e.unwrap_or("kiln couldn't stream the page")),
+        }
+    }
+
+    /// Show a page in the conversation (the `show_page` tool): looked at first in this machine's
+    /// browser as the conversation shows it (what it loads, and its heights at each width a viewer
+    /// might have, so its frame is the right size before it loads), then published by the server
+    /// with every file it uses. The answer, and the picture of it.
+    fn show_page(&self, args: &Value) -> anyhow::Result<(Value, Option<String>)> {
+        let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
+        let title = s("title").unwrap_or_else(|| "A page".to_owned());
+        // The page, and where it stands: relative references are in its folder.
+        let (html, entry) = match (s("html"), s("path")) {
+            (Some(html), _) => (html, format!("{}/kiln-page.html", self.cwd.trim_end_matches('/'))),
+            (None, Some(path)) => {
+                let full = crate::harness::files::resolve(&path, &self.cwd).ok_or_else(|| anyhow::anyhow!("{path} isn't a path on this machine"))?;
+                let html = std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{full}: {e}"))?;
+                (html, full)
+            }
+            _ => anyhow::bail!("which page? Give its html, or the path of an HTML file"),
+        };
+        let look = json!({"op": "preview", "html": html, "entry": entry, "as_shown": true, "measure": true, "picture": "window"});
+        let (mut seen, picture, heights, loaded) = match self.browser(&look) {
+            Ok(seen) => {
+                let heights = seen.get("heights").cloned().unwrap_or(Value::Null);
+                let picture = seen.get("picture_path").and_then(Value::as_str).map(str::to_owned);
+                let loaded = seen.get("loaded").cloned().unwrap_or(Value::Null);
+                (seen, picture, heights, loaded)
+            }
+            Err(e) => (json!({"error": format!("kiln's browser here couldn't look at it ({e:#}); it's shown all the same, sized as it loads")}), None, Value::Null, Value::Null),
+        };
+        let published = self.ask(json!({"op": "page", "do": "publish", "title": title, "entry": entry, "html": html, "loaded": loaded}))?;
+        let page = match (published.get("ok"), published.get("error").and_then(Value::as_str)) {
+            (Some(p), _) => p.clone(),
+            (None, Some(e)) if e.contains("unknown") => anyhow::bail!("this kiln server doesn't show pages yet: upgrade it"),
+            (None, e) => anyhow::bail!("{}", e.unwrap_or("kiln couldn't keep the page")),
+        };
+        let id = page.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+        let page = if heights.is_array() {
+            match self.ask(json!({"op": "page", "do": "measured", "id": id, "heights": heights})) {
+                Ok(a) => a.get("ok").cloned().unwrap_or(page),
+                Err(_) => page,
+            }
+        } else {
+            page
+        };
+        if let Some(o) = seen.as_object_mut() {
+            // Said once, in the page's own entry; what it loaded is now the page's.
+            for k in ["heights", "url", "loaded"] {
+                o.remove(k);
+            }
+        }
+        Ok((json!({"kiln_page": page, "seen": seen}), picture))
+    }
+
     /// kiln's operations on the server, for this session (asked again after a minute). When the
     /// server can't be asked, the ones this kiln knows, and why they can't be called: a program
     /// calling one learns that, rather than finding `kiln.ci` undefined.
@@ -510,6 +653,35 @@ impl Server {
                     Err(e) => text_result(&json!({"error": e.message, "code": e.code, "calls": e.calls}), true),
                 }
             }
+            "preview_page" => {
+                let mut q = args.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("op".into(), json!("preview"));
+                }
+                match self.browser(&q) {
+                    Ok(seen) => picture_result(&seen, seen.get("picture_path").and_then(Value::as_str)),
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                }
+            }
+            "use_live" => {
+                let mut q = args.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("op".into(), json!("act"));
+                    o.insert("session".into(), json!(self.session));
+                }
+                match self.browser(&q) {
+                    Ok(done) => picture_result(&done, done.get("picture_path").and_then(Value::as_str)),
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                }
+            }
+            "show_live" => match self.show_live(args) {
+                Ok(answer) => json!({"content": [{"type": "text", "text": answer.to_string()}], "structuredContent": answer, "isError": false}),
+                Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+            },
+            "show_page" => match self.show_page(args) {
+                Ok((answer, picture)) => picture_result(&answer, picture.as_deref()),
+                Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+            },
             "runners" => match self.runners(s("want")) {
                 Ok(v) => text_result(&v, false),
                 Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
@@ -785,6 +957,7 @@ mod tests {
         let names: Vec<&str> = t.as_array().into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
         assert_eq!(names.get(..6), Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]));
         assert!(names.contains(&"agents_start") && names.contains(&"agents_wait") && names.contains(&"agents_result"), "agents' tools too: {names:?}");
+        assert_eq!(names.get(6..10), Some(&["preview_page", "show_page", "show_live", "use_live"][..]), "then pages: {names:?}");
         assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
         assert_eq!(agent_op("run"), None);
         assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));

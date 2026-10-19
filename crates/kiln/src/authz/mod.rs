@@ -16,6 +16,8 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod sso;
+pub mod tokens;
 
 use std::collections::HashMap;
 
@@ -49,6 +51,7 @@ pub const CAPABILITIES: &[&str] = &[
     "environments.deploy",
     "environments.manage",
     "diffs.read",
+    "git.read",
     "diffs.submit",
     "diffs.review",
     "diffs.land",
@@ -339,9 +342,12 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/jobs/*/artifacts", "artifacts.read", At::Job(2)),
     // The CI engine.
     r("POST", "/api/ci/validate", "runs.read", At::Anywhere),
+    r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
+    r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
     r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),
     r("GET", "/api/ci/runs", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/runs/*", "runs.read", At::Run(3)),
+    r("GET", "/api/ci/runs/*/artifacts/*/download", "artifacts.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/**", "runs.read", At::Run(3)),
     r("POST", "/api/ci/runs/*/cancel", "runs.cancel", At::Run(3)),
     // Who may review is the environment's to say too: the handler checks its reviewers.
@@ -357,6 +363,14 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/legs/*/**", "runs.debug", At::Job(3)),
     r("GET", "/api/ci/legs/*/**", "runs.read", At::Job(3)),
     r("GET", "/api/ci/repos/*/names", "workflows.edit", At::Repo(3)),
+    // W23: a repository's CI providers, and its host's pull requests.
+    r("PUT", "/api/ci/repos/*/providers", "settings.manage", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/providers/sync", "runs.read", At::Repo(3)),
+    r("GET", "/api/ci/repos/*/pulls", "diffs.read", At::Repo(3)),
+    r("GET", "/api/ci/repos/*/pulls/*", "diffs.read", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
@@ -394,6 +408,7 @@ pub static ROUTES: &[Rule] = &[
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
     r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/fleets", "environments.deploy", At::Server),
     r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
@@ -404,12 +419,17 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/front-doors", "runners.read", At::Server),
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
+    r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
+    r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),
     r("POST", "/api/updates/binaries", "binaries.publish", At::Server),
+    // A runner upgraded now, or its policy (`crate::doctor`'s `updates.retry` and `updates.policy`).
+    r("POST", "/api/updates/runners/*", "runners.manage", At::Runner(3)),
+    r("PUT", "/api/updates/runners/*", "runners.manage", At::Runner(3)),
     // Agents: the harness, AI sessions, plans, places, voice, model accounts.
     any("/api/harness/**", "agents.run", At::Server),
     any("/api/ai-sessions", "agents.run", At::Server),
