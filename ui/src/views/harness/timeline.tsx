@@ -769,6 +769,7 @@ function useKeeper(key: string) {
   const onScroll = () => {
     read();
     const s = k.current;
+    s.touched = null;
     window.clearTimeout(s.saving);
     s.saving = window.setTimeout(save, 250);
     return s.at?.id ?? null;
