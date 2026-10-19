@@ -241,6 +241,8 @@ enum Ev {
     /// rollback took back), handled as if the server had sent it here.
     #[cfg_attr(not(unix), allow(dead_code))]
     Forwarded(Vec<u8>),
+    /// A test build's fault: the connection drops (W22-AC04).
+    ChaosDrop,
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -782,6 +784,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut dial_backoff = Duration::from_millis(500);
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
+    // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
+    // server late.
+    let chaos = crate::runner::chaos::get();
+    let mut chaos_drop: Option<Instant> = None;
+    let delay_line = chaos.and_then(|c| c.delay).map(|by| crate::runner::chaos::DelayLine::new(net.clone(), by));
     let mut jobs: HashMap<String, Running> = HashMap::new();
     // Pools' executors this runner started (docs/ci.md W13-R09).
     let pool_execs = crate::runner::pool::Executors::default();
@@ -973,6 +980,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
+            () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
@@ -991,6 +999,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     r.cancel.cancel();
                 }
                 return Ok(());
+            }
+            Ev::ChaosDrop => {
+                chaos_drop = None;
+                if connected {
+                    tracing::warn!("chaos: dropping the connection to the server");
+                    net.command(Out::Disconnect { peer: SERVER_PEER }).await;
+                }
             }
             #[cfg(not(unix))]
             Ev::Bg(b) => match b {},
@@ -1445,6 +1460,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -1454,7 +1470,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                let msg = AgentMsg::Hello(hello(jobs.keys().cloned().collect()));
+                // Legs that finished while it was away are its own until their results, waiting in
+                // the buffer, arrive.
+                let mut running: Vec<String> = jobs.keys().cloned().collect();
+                running.extend(buffer.iter().filter(|(lane, ..)| *lane == LANE_CONTROL).filter_map(|(_, _, d)| match proto::decode::<AgentMsg>(d) {
+                    Ok(AgentMsg::JobFinished(r)) => Some(r.job),
+                    _ => None,
+                }));
+                let msg = AgentMsg::Hello(hello(running));
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
@@ -2327,7 +2350,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 };
                 let Ok(data) = data else { continue };
                 if connected {
-                    net.send(SERVER_PEER, lane, kind, data).await;
+                    match &delay_line {
+                        Some(d) => d.send(lane, kind, data),
+                        None => {
+                            net.send(SERVER_PEER, lane, kind, data).await;
+                        }
+                    }
                 } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));

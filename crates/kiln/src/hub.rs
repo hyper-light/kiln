@@ -1355,6 +1355,12 @@ impl Hub {
             if keep.contains(j) {
                 continue;
             }
+            // CI's legs are the dispatcher's to re-adopt, or to stop if they were given up while
+            // the runner was away (`Msg::RunnerUp` below, W05-R05).
+            if self.ci.is_leg(j) {
+                keep.push(j.clone());
+                continue;
+            }
             // The server requeued this job while the agent was away, but the agent kept working:
             // take it back (claim) rather than throwing the work away. Only a job that has since
             // been taken by someone else (or settled) is cancelled on this agent.

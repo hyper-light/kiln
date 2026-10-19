@@ -86,6 +86,11 @@ pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
 /// `start`, serving HTTPS too (on the same port) when `https`: its address is `https://`, the
 /// kiln CA's certificate.
 pub fn start_with(dir: &Path, o: &Options<'_>, https: bool) -> anyhow::Result<Server> {
+    start_env(dir, o, https, &[])
+}
+
+/// `start_with`, the server's environment given `env` too.
+pub fn start_env(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Server> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -144,9 +149,10 @@ enabled = true
     // Its log, for a test that wants to say why it failed (`Server::log`).
     let log = std::fs::File::create(dir.join("server.log"))?;
     cmd.args(["--config", &cfg.to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG"] {
+    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS"] {
         cmd.env_remove(var);
     }
+    cmd.envs(env.iter().copied());
     let child = cmd.spawn()?;
     let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
     let deadline = Instant::now() + Duration::from_secs(60);

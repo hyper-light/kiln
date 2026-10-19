@@ -696,6 +696,13 @@ impl Dispatch {
         let view = self.runner_view(&a);
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
+        // Legs it says it runs that aren't its own now (given up while it was away, past the
+        // reconnect grace): it stops them.
+        let stale: Vec<String> = running.iter().filter(|id| self.hub.ci.is_leg(id) && !self.legs.get(*id).is_some_and(|l| l.agent.as_deref() == Some(agent))).cloned().collect();
+        for leg in stale {
+            self.hub.release_slot(agent, &leg);
+            self.hub.send_to_agent(agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await;
+        }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
         let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: None };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());

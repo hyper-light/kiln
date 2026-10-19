@@ -380,6 +380,9 @@ struct State {
     step_class: Option<&'static str>,
     /// The kernel's OOM kills where the steps run, when last counted.
     oom_seen: Option<u64>,
+    /// A test build's proxy in front of the server for the leg's tools, which corrupts their
+    /// uploads (W22-AC04).
+    corrupting: Option<std::sync::Arc<super::chaos::Corrupting>>,
     /// The running step's, taken by its action.
     action_state: Vec<(String, String)>,
     /// The index the next pre or post step gets (after the job's own steps).
@@ -941,10 +944,11 @@ impl Leg {
             set("RUNNER_DEBUG", "1".into());
         }
         let rt = &a.runtime;
-        set("ACTIONS_RUNTIME_URL", rt.results_url.clone());
+        let via = |u: &String| st.corrupting.as_ref().map_or_else(|| u.clone(), |c| c.route(u));
+        set("ACTIONS_RUNTIME_URL", via(&rt.results_url));
         set("ACTIONS_RUNTIME_TOKEN", rt.runtime_token.clone());
-        set("ACTIONS_RESULTS_URL", rt.results_url.clone());
-        set("ACTIONS_CACHE_URL", rt.cache_url.clone());
+        set("ACTIONS_RESULTS_URL", via(&rt.results_url));
+        set("ACTIONS_CACHE_URL", via(&rt.cache_url));
         // The toolkit takes any server but github.com for GitHub Enterprise Server, and uses its
         // cache protocol (`ACTIONS_CACHE_URL`), which kiln serves (W08-R07).
         if let Some(m) = &rt.cache_mode {
@@ -980,7 +984,7 @@ impl Leg {
                 let out = cli.run(&["exec".into(), id, "cat".into(), "/sys/fs/cgroup/memory.events".into()], &BTreeMap::new(), Duration::from_secs(30)).await.unwrap_or_default();
                 oom_kill_count(&out)
             }
-            None => crate::rt::blocking(host_oom_kills).await.unwrap_or(0),
+            None => crate::rt::blocking(host_oom_kills).await.unwrap_or(0) + super::chaos::oom_kills(),
         };
         let rose = st.oom_seen.is_some_and(|before| now > before);
         st.oom_seen = Some(now);
@@ -1099,6 +1103,7 @@ impl Leg {
             class: None,
             step_class: None,
             oom_seen: None,
+            corrupting: None,
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
             containers: None,
@@ -1132,6 +1137,12 @@ impl Leg {
             }
         }
         st.allow_unsecure = st.env.get("ACTIONS_ALLOW_UNSECURE_COMMANDS").is_some_and(|v| v == "true");
+        if super::chaos::for_leg(a.attempt).is_some_and(|c| c.corrupt) {
+            match super::chaos::Corrupting::start(&a.runtime.results_url) {
+                Ok(p) => st.corrupting = Some(std::sync::Arc::new(p)),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "chaos: the leg's uploads aren't corrupted"),
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         let mut timed_out = false;
         let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
@@ -1885,6 +1896,15 @@ impl Leg {
             (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: open && self.docker_inside(), ..super::docker::Spec::default() }),
             _ => None,
         };
+        // A test build's full disk (W22-AC04): the job container's workspace, a tmpfs that small.
+        let job = match (job, super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib)) {
+            (Some(mut j), Some(mib)) => {
+                let mount = format!("--mount type=tmpfs,destination={workdir},tmpfs-size={},tmpfs-mode=1777", u64::from(mib) << 20);
+                j.options = Some(j.options.map_or_else(|| mount.clone(), |o| format!("{o} {mount}")));
+                Some(j)
+            }
+            (j, _) => j,
+        };
         // W18-R08: a job in a container is contained, its one way out the relay to the runner's
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
@@ -1971,6 +1991,9 @@ impl Leg {
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
         let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
+        // A test build's OOM killer (W22-AC04): a step on the host, killed so long after it starts.
+        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. });
+        let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
                 // In a job container without bash, the default shell is sh (GitHub-exact).
@@ -2057,6 +2080,7 @@ impl Leg {
         };
         let mut running = crate::proc::spawn_group(cmd)?;
         st.groups.push(running.pgid);
+        let mut oom_at = oom_after.map(|d| Instant::now() + d);
         let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false, enospc: false };
         let mut flush = Interval::new(Duration::from_millis(100));
         let mut end: Option<End> = None;
@@ -2090,6 +2114,7 @@ impl Leg {
                 Cancel,
                 Stop,
                 Deadline,
+                Oom,
             }
             // Cleanup isn't cut short by the cancel it may follow.
             let cleanup = st.cleanup;
@@ -2099,6 +2124,12 @@ impl Leg {
                 }
                 self.cancel.cancelled().await;
             });
+            let oom = async move {
+                match oom_at {
+                    Some(t) => crate::rt::sleep_until(t).await,
+                    None => futures::future::pending::<()>().await,
+                }
+            };
             let ev = futures::select_biased! {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
@@ -2106,6 +2137,7 @@ impl Leg {
                 () = stopped => Ev::Stop,
                 () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
+                () = oom.fuse() => Ev::Oom,
             };
             match ev {
                 Ev::Chunk(Some(c)) => self.feed(st, idx, &mut r, &c).await,
@@ -2123,6 +2155,12 @@ impl Leg {
                 Ev::Deadline => {
                     crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await;
                     end = Some(End::TimedOut);
+                }
+                Ev::Oom => {
+                    oom_at = None;
+                    tracing::warn!(leg = %self.a.job_id, step = idx, "chaos: the step is killed as the OOM killer kills");
+                    super::chaos::OOM_KILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    running.kill_group();
                 }
             }
         }

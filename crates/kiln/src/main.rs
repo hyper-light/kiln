@@ -297,6 +297,10 @@ struct AgentArgs {
     no_reach: bool,
     #[arg(long, env = "KILN_SHELL")]
     shell: Option<String>,
+    /// Fault injection, a test build's (docs/ci.md W22-AC04): `drop=2s,delay=300ms,oom=1s,disk=8,corrupt`.
+    #[cfg(feature = "chaos")]
+    #[arg(long, env = "KILN_CHAOS")]
+    chaos: Option<String>,
 }
 
 fn init_tracing(filter: &str, json: bool) {
@@ -409,6 +413,17 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
     // Make the resolved config path visible to children (supervise → server).
     let shutdown = Shutdown::new();
     let _ = kiln::SHUTDOWN.set(shutdown.clone());
+    // A test build's faults, for this process's runner (a server's own runner reads KILN_CHAOS).
+    #[cfg(feature = "chaos")]
+    {
+        let spec = match &cli.cmd {
+            Cmd::Agent(a) => a.chaos.clone(),
+            _ => std::env::var("KILN_CHAOS").ok(),
+        };
+        if let Some(spec) = spec.filter(|s| !s.trim().is_empty()) {
+            kiln::runner::chaos::set(kiln::runner::chaos::parse(&spec)?);
+        }
+    }
     match cli.cmd {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
