@@ -622,14 +622,12 @@ impl Claude {
                 }
             }
             Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
+            // Asked of the CLI whatever kiln last saw, as for "now": it aborts what runs (a long
+            // command with it), and answers an idle one with nothing to stop. The page that asked
+            // gets the state as it is either way.
             Command::Interrupt => {
-                if self.busy(core) {
-                    self.request(core, Pending::Interrupt, json!({"subtype": "interrupt"}));
-                } else {
-                    // Nothing is under way here: a page asking to stop it shows what no longer is,
-                    // so it's sent the state as it is.
-                    core.touch_state();
-                }
+                self.request(core, Pending::Interrupt, json!({"subtype": "interrupt"}));
+                core.touch_state();
             }
             Command::SetMode { mode } => {
                 if mode == "bypassPermissions" && !self.allow_bypass {
@@ -1353,7 +1351,10 @@ impl Claude {
             "session_id": core.state.harness_session.clone().unwrap_or_default(),
             "uuid": id,
         });
-        if busy && mode == SendMode::Now
+        // "Now" goes with priority whatever kiln last saw: the CLI stops what it's running (a long
+        // command too) and takes it, and an idle CLI just takes it. kiln's view of the turn lags
+        // the CLI's (a turn taken up after a restart); a "now" that waits for that is no "now".
+        if mode == SendMode::Now
             && let Some(o) = msg.as_object_mut()
         {
             o.insert("priority".into(), json!("now"));
@@ -3998,6 +3999,25 @@ mod tests {
         c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null}"#);
         assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text == "Interrupted")));
         Ok(())
+    }
+
+    #[test]
+    fn now_and_stop_reach_the_cli_whatever_kiln_saw_of_the_turn() {
+        // A turn kiln never saw start (one taken up after a restart, say): "now" still goes with
+        // priority, so the CLI stops the long command it's running, and Stop is still asked.
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        core.take_writes();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "stop, then this".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        let w = core.take_writes();
+        assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"") && l.contains("stop, then this")), "{w:?}");
+        c.command(&mut core, Command::Interrupt);
+        assert!(core.take_writes().first().is_some_and(|l| l.contains("\"subtype\":\"interrupt\"")));
+        // A queued message while idle still just goes, without priority.
+        c.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed"}"#);
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "later".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        assert!(core.take_writes().first().is_some_and(|l| l.contains("later") && !l.contains("priority")));
     }
 
     #[test]

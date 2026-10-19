@@ -157,6 +157,7 @@ function Removal({ p, question, onDone }: { p: Peer; question: string; onDone: (
 /** A cluster our people open: open it, or finish peering, or start again. */
 function OutRow({ p }: { p: Peer }) {
   const [removing, setRemoving] = React.useState(false);
+  const [moving, setMoving] = React.useState(false);
   const [challenge, setChallenge] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const rechallenge = async () => {
@@ -188,6 +189,9 @@ function OutRow({ p }: { p: Peer }) {
             New challenge
           </Button>
         )}
+        <Button size="xs" variant="ghost" aria-expanded={moving} onClick={() => setMoving(!moving)}>
+          Change address
+        </Button>
         <Button size="xs" variant="ghost" aria-expanded={removing} onClick={() => setRemoving(!removing)}>
           Remove
         </Button>
@@ -202,10 +206,47 @@ function OutRow({ p }: { p: Peer }) {
           </>
         ) : null}
       </div>
+      {moving && <Readdress p={p} onDone={() => setMoving(false)} />}
       {removing && <Removal p={p} question={`Stop opening ${p.name} from here? To open it again takes new codes.`} onDone={() => setRemoving(false)} />}
       {challenge && <Code label="Its new challenge" text={challenge} note={<>Take it to {p.name}: its admin pastes it under Clusters → Let a cluster in, within 30 minutes. The one before no longer works.</>} />}
       {!peered && <Complete p={p} />}
     </li>
+  );
+}
+
+/** Where a cluster is reached from here, changed: its key is what's trusted, so no new codes. */
+function Readdress({ p, onDone }: { p: Peer; onDone: () => void }) {
+  const [url, setUrl] = React.useState(p.url);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr(null);
+    try {
+      await peersApi.readdress(p.id, url.trim());
+      toast({ title: `${p.name}'s address changed`, description: "Open it again from the cluster picker.", tone: "info" });
+      changed();
+      onDone();
+    } catch (e2) {
+      setErr(problem(e2));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form className="cl-form grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end" onSubmit={(e) => void submit(e)}>
+      <TextField label="Its address, as this cluster reaches it" value={url} inputMode="url" onChange={(e) => setUrl(e.target.value)} />
+      <div className="flex gap-2">
+        <Button type="submit" size="sm" variant="secondary" disabled={busy || !url.trim() || url.trim() === p.url}>
+          Save
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onDone}>
+          Cancel
+        </Button>
+      </div>
+      {err && <p className="cl-err sm:col-span-2">{err}</p>}
+    </form>
   );
 }
 

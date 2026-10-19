@@ -318,6 +318,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let host = srv::header_str(&req, &header::HOST).unwrap_or_default().to_owned();
             crate::peers::frame(&hub, &caller, id, &host, is_secure(&hub, &req)).map_err(|(c, m)| err(c, m))
         }
+        (&Method::PUT, ["api", "peers", id]) => {
+            let id = (*id).to_owned();
+            crate::peers::readdress(&hub, &caller.name, &id, req).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::DELETE, ["api", "peers", id]) => crate::peers::remove(&hub, &caller.name, id).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => crate::deploy::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
