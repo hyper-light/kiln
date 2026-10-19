@@ -1041,6 +1041,9 @@ impl Hub {
                     let _ = tx.send((json, data));
                 }
             }
+            // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
+            AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
+            AgentMsg::StreamEvent { stream, json } => self.harness.streams.event(&agent, &stream, json),
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
                 self.updates.on_build(self, &agent, &build);
@@ -1154,7 +1157,7 @@ impl Hub {
                     }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
-                    Some("registry" | "call" | "page") => {
+                    Some("registry" | "call" | "page" | "stream") => {
                         let (hub, runner) = (Arc::clone(self), agent.clone());
                         crate::rt::spawn(async move {
                             let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;

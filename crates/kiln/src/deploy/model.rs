@@ -83,6 +83,26 @@ pub struct Gates {
     /// Held, and why (an incident, a holiday): no release goes until it's lifted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze: Option<String>,
+    /// `auto`: a version that lands in one of `after` is released here by itself, exactly what
+    /// landed (§9.2), through this environment's other gates (its soak, its approvals);
+    /// `manual`, the default: someone releases it.
+    #[serde(default, skip_serializing_if = "Promote::is_manual")]
+    pub promote: Promote,
+}
+
+/// Whether a version moves on from the environments before by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Promote {
+    #[default]
+    Manual,
+    Auto,
+}
+
+impl Promote {
+    pub fn is_manual(&self) -> bool {
+        *self == Promote::Manual
+    }
 }
 
 /// People who approve a release before it goes.

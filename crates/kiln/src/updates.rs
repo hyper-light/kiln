@@ -2238,6 +2238,7 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_REACH
     | crate::proto::CAP_JOB_TTY
     | crate::proto::CAP_FILES
+    | crate::proto::CAP_STREAM
     | crate::proto::CAP_POOLS;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions

@@ -72,6 +72,8 @@ export interface Gates {
   windows?: { allow?: string; deny?: string; duration: string; timezone?: string }[];
   checks?: string[];
   freeze?: string;
+  /** `auto`: a version that lands in one of `after` is released here by itself (§9.2). */
+  promote?: "auto" | "manual";
 }
 
 export interface Environment {

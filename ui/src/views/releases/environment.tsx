@@ -24,7 +24,7 @@ import "./releases.css";
 /** Each gate, in a line. */
 function gateLines(g: Gates): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [];
-  if (g.after?.length) out.push({ label: "After", value: `${g.after.join(", ")}${g.soak ? `, for ${g.soak}` : ""}` });
+  if (g.after?.length) out.push({ label: "After", value: `${g.after.join(", ")}${g.soak ? `, for ${g.soak}` : ""}${g.promote === "auto" ? "; moves on by itself" : ""}` });
   if (g.approvals) {
     const who = g.approvals.reviewers?.length ? ` from ${g.approvals.reviewers.join(", ")}` : "";
     out.push({ label: "Approvals", value: `${g.approvals.count}${who}${g.approvals.self_approve ? ", the requester's own counting" : ""}` });
@@ -55,6 +55,7 @@ function Settings({ e }: { e: Environment }) {
   const g = e.gates;
   const [after, setAfter] = React.useState((g.after ?? []).join(", "));
   const [soak, setSoak] = React.useState(g.soak ?? "");
+  const [promote, setPromote] = React.useState<"auto" | "manual">(g.promote === "auto" ? "auto" : "manual");
   const [approvals, setApprovals] = React.useState(String(g.approvals?.count ?? 0));
   const [reviewers, setReviewers] = React.useState((g.approvals?.reviewers ?? []).join(", "));
   const [selfApprove, setSelfApprove] = React.useState(!!g.approvals?.self_approve);
@@ -77,6 +78,7 @@ function Settings({ e }: { e: Environment }) {
     const gates: Gates = {
       after: names(after),
       soak: soak.trim() || undefined,
+      promote: promote === "auto" && names(after).length ? "auto" : undefined,
       approvals: count > 0 ? { count, reviewers: names(reviewers), self_approve: selfApprove } : undefined,
       windows: windows.map((w) => {
         const when = { duration: w.duration.trim(), timezone: w.timezone.trim() || undefined };
@@ -141,6 +143,19 @@ function Settings({ e }: { e: Environment }) {
           <Plus /> A window
         </Button>
       </div>
+      {names(after).length > 0 && (
+        <div className="rel-settings-row">
+          <Segmented
+            label="A version that lands there comes here"
+            value={promote}
+            onChange={setPromote}
+            options={[
+              { value: "manual", label: "When someone releases it" },
+              { value: "auto", label: "By itself" },
+            ]}
+          />
+        </div>
+      )}
       <div className="rel-settings-row">
         <Segmented
           label="A release asked for while one is on its way"

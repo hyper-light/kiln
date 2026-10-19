@@ -628,6 +628,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        // Pages streamed from its machine (`crate::harness::streams`).
+        (&Method::GET, ["api", "harness", "sessions", id, "streams"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.of(id).iter().map(|l| l.view()).collect::<Vec<_>>())),
+        (&Method::POST, ["api", "harness", "sessions", id, "streams"]) => {
+            let id = (*id).to_owned();
+            stream_open(&hub, &id, req).await
+        }
+        (&Method::GET, ["api", "harness", "sessions", id, "streams", sid, "ws"]) => stream_ws(hub.clone(), id, sid, req),
+        (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
+            let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id);
+            if ours && hub.harness.streams.close(&hub, sid).await { Ok(srv::status(StatusCode::NO_CONTENT)) } else { Err(err(StatusCode::NOT_FOUND, "no such stream")) }
+        }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, id, req).await,
@@ -3491,6 +3502,65 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let sent: Vec<&str> = report.results.iter().filter(|o| o.result == "sent").map(|o| o.id.as_str()).collect();
     Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
+}
+
+/// `POST /api/harness/sessions/:id/streams`: stream a page from the session's machine
+/// (`crate::browser::stream::Spec`'s fields: url, width, height, scale, mobile, codec, bitrate).
+async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "owner".to_owned(), |c| c.name.clone());
+    let spec: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let live = hub.harness.streams.open(hub, id, spec, &by).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::CREATED, &live.view()))
+}
+
+/// `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer of a stream. It's sent the
+/// stream's chunks (binary, as its runner sent them: `crate::browser::stream::frame`) and events
+/// (text, JSON); it sends `{"input": [...]}` (what its person does) and `{"control": {...}}`
+/// (resize, pause, keyframe, go, reload, back, forward).
+fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
+    let live = hub.harness.streams.get(sid).filter(|l| l.session == id).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
+    let (resp, upgrade) = ws::accept_limited(req, 1 << 20).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    crate::rt::spawn(async move {
+        let Ok(socket) = upgrade.await else { return };
+        if let Err(e) = stream_view(hub, live, socket).await {
+            tracing::debug!(error = %format!("{e:#}"), "stream websocket ended");
+        }
+    });
+    Ok(resp)
+}
+
+async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, socket: ws::WebSocket) -> anyhow::Result<()> {
+    use crate::harness::streams::ToViewer;
+    use futures::FutureExt as _;
+    let (mut tx, mut rx) = socket.split();
+    let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
+    let r: anyhow::Result<()> = async {
+        loop {
+            futures::select_biased! {
+                m = rx.next().fuse() => match m {
+                    Some(Ok(Message::Text(t))) => {
+                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
+                        if let Some(events) = v.get("input").filter(|e| e.is_array()) {
+                            live.input(&hub, events).await;
+                        }
+                        if let Some(c) = v.get("control").filter(|c| c.is_object()) {
+                            live.control(&hub, c).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
+                    _ => {}
+                },
+                m = from_stream.recv().fuse() => match m {
+                    Ok(ToViewer::Chunk(b)) => tx.send(ws::binary(b)).await?,
+                    Ok(ToViewer::Event(e)) => tx.send(ws::text(e)).await?,
+                    Err(_) => return Ok(()),
+                },
+            }
+        }
+    }
+    .await;
+    hub.harness.streams.leave(&hub, &live, me).await;
+    r
 }
 
 /// After a snapshot on an agent session's socket: what was resent is complete.

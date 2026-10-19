@@ -214,11 +214,33 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
             }
         }
-        // A page it shows in its conversation (`crate::harness::visuals`): its own session's.
-        Some("page") => match crate::harness::visuals::ask(hub, session, ask).await {
-            Ok(v) => json!({"ok": v}),
-            Err(e) => json!({"error": format!("{e:#}")}),
-        },
+        // A page it shows in its conversation (`crate::harness::visuals`), or one it streams
+        // live there (`crate::harness::streams`): its own session's, audited as the agent acting
+        // for whoever started it.
+        Some(op @ ("page" | "stream")) => {
+            let r = if op == "page" { crate::harness::visuals::ask(hub, session, ask).await } else { crate::harness::streams::ask(hub, session, ask).await };
+            let what = format!("{}.{}", if op == "page" { "pages" } else { "streams" }, ask.get("do").and_then(Value::as_str).unwrap_or("?"));
+            if what != "pages.measured" {
+                let (principal, on_behalf_of) = crate::audit::who(&caller);
+                let entry = crate::audit::Entry {
+                    principal,
+                    on_behalf_of,
+                    action: what,
+                    target: Some(format!("agent session {session}")),
+                    result: if r.is_ok() { "ok".to_owned() } else { "error".to_owned() },
+                    detail: match &r {
+                        Ok(v) => v.get("url").or_else(|| v.get("path")).and_then(Value::as_str).unwrap_or("").to_owned(),
+                        Err(e) => format!("{e:#}"),
+                    },
+                    ..crate::audit::Entry::default()
+                };
+                crate::audit::write(&hub.store, entry).await;
+            }
+            match r {
+                Ok(v) => json!({"ok": v}),
+                Err(e) => json!({"error": format!("{e:#}")}),
+            }
+        }
         _ => json!({"error": "an unknown question"}),
     };
     let size = answer.to_string().len();

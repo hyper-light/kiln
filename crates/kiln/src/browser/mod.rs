@@ -11,6 +11,7 @@ pub mod cdp;
 pub mod install;
 pub mod page;
 pub mod preview;
+pub mod stream;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -30,6 +31,8 @@ pub struct Browser {
     pub(crate) cdp: Arc<Cdp>,
     process: Mutex<Option<Process>>,
     profile: PathBuf,
+    /// Its profile outlives it (a conversation's streams keep their cookies).
+    kept: bool,
     /// Pages open now, and when the last one was (unix ms).
     open: AtomicUsize,
     used: AtomicI64,
@@ -51,6 +54,7 @@ pub async fn ask(json: &str) -> anyhow::Result<String> {
     let v: serde_json::Value = serde_json::from_str(json)?;
     match v.get("op").and_then(serde_json::Value::as_str) {
         Some("preview") => Ok(serde_json::to_string(&preview::preview(home, serde_json::from_value(v)?).await?)?),
+        Some("act") => Ok(serde_json::to_string(&stream::act(home, serde_json::from_value(v)?).await?)?),
         other => anyhow::bail!("the preview browser doesn't do {other:?}"),
     }
 }
@@ -96,12 +100,26 @@ async fn stop_when_idle(b: std::sync::Weak<Browser>) {
     }
 }
 
+/// How a browser starts: in a profile that outlives it (else a fresh one that goes with it), and
+/// with an extension (its folder and id) let do what it asks without anyone's gesture.
+#[derive(Default)]
+pub struct Launch {
+    pub profile: Option<PathBuf>,
+    pub extension: Option<PathBuf>,
+    pub id: &'static str,
+}
+
 impl Browser {
     async fn start(dir: &Path) -> anyhow::Result<Self> {
+        Self::start_with(dir, Launch::default()).await
+    }
+
+    pub(crate) async fn start_with(dir: &Path, launch: Launch) -> anyhow::Result<Self> {
         let exe = install::ensure(dir).await?;
         let profiles = dir.join("browser").join("profiles");
         clear_leftovers(&profiles);
-        let profile = profiles.join(format!("p{}-{}", std::process::id(), crate::util::now_ms()));
+        let kept = launch.profile.is_some();
+        let profile = launch.profile.unwrap_or_else(|| profiles.join(format!("p{}-{}-{}", std::process::id(), crate::util::now_ms(), hex::encode(rand::random::<[u8; 4]>()))));
         std::fs::create_dir_all(&profile)?;
         let mut args: Vec<String> = [
             "--headless=new",
@@ -129,7 +147,14 @@ impl Browser {
         if std::env::var("KILN_BROWSER_SANDBOX").is_ok_and(|v| v == "0") {
             args.push("--no-sandbox".to_owned());
         }
-        let (mut process, cdp) = launch(&exe, args, &profile).await?;
+        if let Some(ext) = &launch.extension {
+            args.push(format!("--load-extension={}", ext.display()));
+            args.push(format!("--disable-extensions-except={}", ext.display()));
+            args.push(format!("--allowlisted-extension-id={}", launch.id));
+            // A streamed page plays its sound when it starts it, as a person's tab would after a tap.
+            args.push("--autoplay-policy=no-user-gesture-required".to_owned());
+        }
+        let (mut process, cdp) = self::launch(&exe, args, &profile).await?;
         // Answering is being ready.
         match crate::rt::timeout(STARTING, cdp.call(None, "Browser.getVersion", serde_json::json!({}))).await {
             Ok(Ok(_)) => {}
@@ -139,18 +164,20 @@ impl Browser {
             }
         }
         tracing::info!(version = install::VERSION, pid = process.id(), "the preview browser started");
-        Ok(Self { cdp, process: Mutex::new(Some(process)), profile, open: AtomicUsize::new(0), used: AtomicI64::new(crate::util::now_ms()) })
+        Ok(Self { cdp, process: Mutex::new(Some(process)), profile, kept, open: AtomicUsize::new(0), used: AtomicI64::new(crate::util::now_ms()) })
     }
 
     pub fn alive(&self) -> bool {
         self.cdp.alive() && self.process.lock().as_mut().is_some_and(Process::alive)
     }
 
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         if let Some(mut p) = self.process.lock().take() {
             p.kill();
         }
-        let _ = std::fs::remove_dir_all(&self.profile);
+        if !self.kept {
+            let _ = std::fs::remove_dir_all(&self.profile);
+        }
     }
 
     /// A page of its own: its own context, so nothing (cookies, storage, cache) is shared with
@@ -158,6 +185,13 @@ impl Browser {
     pub async fn page(self: &Arc<Self>) -> anyhow::Result<page::Page> {
         self.used.store(crate::util::now_ms(), Ordering::Relaxed);
         page::Page::open(self.clone()).await
+    }
+
+    /// A tab of the browser's own (its profile's cookies and storage, its extension's to see),
+    /// opened at `url`.
+    pub async fn tab(self: &Arc<Self>, url: &str) -> anyhow::Result<page::Page> {
+        self.used.store(crate::util::now_ms(), Ordering::Relaxed);
+        page::Page::open_in(self.clone(), None, url).await
     }
 
     pub(crate) fn opened(&self) {
@@ -174,6 +208,31 @@ impl Drop for Browser {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// The first target `pick` takes (`Target.getTargets`' entries), waiting a few seconds for it.
+pub(crate) async fn target(cdp: &Cdp, pick: impl Fn(&serde_json::Value) -> bool) -> anyhow::Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let all = cdp.call(None, "Target.getTargets", serde_json::json!({})).await?;
+        if let Some(t) = all.get("targetInfos").and_then(serde_json::Value::as_array).and_then(|ts| ts.iter().find(|t| pick(t)))
+            && let Some(id) = t.get("targetId").and_then(serde_json::Value::as_str)
+        {
+            return Ok(id.to_owned());
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "the browser has no such target");
+        crate::rt::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `expression`'s value in `session` (a promise waited for).
+pub(crate) async fn evaluate(cdp: &Cdp, session: &str, expression: &str) -> anyhow::Result<serde_json::Value> {
+    let r = cdp.call(Some(session), "Runtime.evaluate", serde_json::json!({"expression": expression, "awaitPromise": true, "returnByValue": true})).await?;
+    if let Some(d) = r.get("exceptionDetails") {
+        let text = d.get("exception").and_then(|x| x.get("description")).and_then(serde_json::Value::as_str).or_else(|| d.get("text").and_then(serde_json::Value::as_str)).unwrap_or("it threw");
+        anyhow::bail!("{text}");
+    }
+    Ok(r.get("result").and_then(|x| x.get("value")).cloned().unwrap_or(serde_json::Value::Null))
 }
 
 /// The browser's process: on Unix spawned with its pipe on fds 3 and 4 (in a process group of its
@@ -220,6 +279,20 @@ impl Process {
     }
 }
 
+/// `fd`, or a copy of it above 4: the low ones it takes on the way are held (in `held`) until the
+/// browser has started, so each copy is the next free one up.
+#[cfg(unix)]
+fn above_four(fd: std::os::fd::OwnedFd, held: &mut Vec<std::os::fd::OwnedFd>) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd as _;
+    let mut fd = fd;
+    while fd.as_raw_fd() <= 4 {
+        let next = fd.try_clone()?;
+        held.push(fd);
+        fd = next;
+    }
+    Ok(fd)
+}
+
 /// A pipe neither of whose ends outlives an `exec` (made so at once where the system can).
 #[cfg(unix)]
 fn pipe() -> anyhow::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
@@ -259,9 +332,14 @@ async fn launch(exe: &Path, mut args: Vec<String>, profile: &Path) -> anyhow::Re
             c(&kv)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    // What it reads (its fd 3) and what it writes (its fd 4); kiln's ends close as it starts.
+    // What it reads (its fd 3) and what it writes (its fd 4); kiln's ends close as it starts. Its
+    // ends are above 4 first: one that were 3 or 4 itself would be lost on the way (a copy onto
+    // itself keeps it closing at exec on macOS; one copied onto 3 before 3 is read gone).
     let (its_in, to_it) = pipe()?;
     let (from_it, its_out) = pipe()?;
+    let mut held = Vec::new();
+    let its_in = above_four(its_in, &mut held)?;
+    let its_out = above_four(its_out, &mut held)?;
     let log = profile.join("browser.log");
     let mut fa = PosixSpawnFileActions::init()?;
     fa.add_open(0, "/dev/null", OFlag::O_RDONLY, Mode::empty())?;
@@ -273,7 +351,7 @@ async fn launch(exe: &Path, mut args: Vec<String>, profile: &Path) -> anyhow::Re
     attr.set_flags(PosixSpawnFlags::POSIX_SPAWN_SETPGROUP)?;
     attr.set_pgroup(nix::unistd::Pid::from_raw(0))?;
     let pid = posix_spawn(exe, &fa, &attr, &argv, &envp).map_err(|e| anyhow::anyhow!("the preview browser didn't start: {e}"))?;
-    drop((its_in, its_out));
+    drop((its_in, its_out, held));
     let mut process = Process::Spawned(pid);
     match Cdp::over_pipe(std::fs::File::from(to_it), std::fs::File::from(from_it)) {
         Ok(cdp) => Ok((process, cdp)),
@@ -331,13 +409,20 @@ fn why_not(profile: &Path) -> String {
     log.lines().rev().find(|l| !l.trim().is_empty()).map_or_else(|| "it said nothing".to_owned(), |l| l.trim().chars().take(300).collect())
 }
 
-/// Profiles an earlier run of kiln left (it stopped without stopping its browser, before the pipe
-/// that ends one with kiln): the browser still using one is stopped (only one whose command line
-/// names that profile), then it goes.
+/// Profiles kiln processes that are gone left (one stopped without stopping its browser, before
+/// the pipe that ends a browser with kiln): the browser still using one is stopped (only one whose
+/// command line names that profile), then it goes. A profile of this process (another of its
+/// browsers) or of another living kiln process (a runner's next build, starting beside it) is in
+/// use, and stays.
 fn clear_leftovers(profiles: &Path) {
     let Ok(entries) = std::fs::read_dir(profiles) else { return };
     for e in entries.flatten() {
         let dir = e.path();
+        // `p<pid>-<ms>`: whose it is.
+        let owner = e.file_name().to_string_lossy().strip_prefix('p').and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok());
+        if owner.is_some_and(|pid| pid == std::process::id() || alive(pid)) {
+            continue;
+        }
         #[cfg(unix)]
         if let Ok(target) = std::fs::read_link(dir.join("SingletonLock"))
             && let Some(pid) = target.to_string_lossy().rsplit('-').next().and_then(|p| p.parse::<i32>().ok())
@@ -346,5 +431,39 @@ fn clear_leftovers(profiles: &Path) {
             let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Whether process `pid` is running (one that can't be asked counts as running).
+fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        i32::try_from(pid).is_ok_and(|p| !matches!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None), Err(nix::errno::Errno::ESRCH)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_profiles_of_gone_processes_are_cleared() -> anyhow::Result<()> {
+        let profiles = std::env::temp_dir().join(format!("kiln-profiles-test-{}", std::process::id()));
+        let mine = profiles.join(format!("p{}-1-aa", std::process::id()));
+        // No process has this pid (beyond what Linux and macOS give out).
+        let gone = profiles.join("p4194399-1-bb");
+        for d in [&mine, &gone] {
+            std::fs::create_dir_all(d)?;
+        }
+        clear_leftovers(&profiles);
+        assert!(mine.exists(), "this process's other browser keeps its profile");
+        assert!(!gone.exists(), "a gone process's profile goes");
+        std::fs::remove_dir_all(&profiles)?;
+        Ok(())
     }
 }
