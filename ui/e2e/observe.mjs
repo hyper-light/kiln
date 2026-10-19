@@ -12,6 +12,7 @@
 // The server needs observe's data to look at: metrics of `app.latency.p95` by `service` and logs
 // with `status:error` among them (what the seed of docs/observe.md §13 writes). playwright-core is
 // not a dependency of the UI's: point PLAYWRIGHT_CORE at one, of the browsers installed.
+import dgram from "node:dgram";
 import fs from "node:fs";
 
 const BASE = process.env.KILN_URL ?? "http://127.0.0.1:17170";
@@ -677,6 +678,48 @@ const scenarios = {
     } finally {
       await api("DELETE", `/api/observe/v1/log_sources/${name}`);
       fs.rmSync(folder, { recursive: true, force: true });
+    }
+  },
+
+  /** A syslog source added from the form, the server listening where it says (tested first): a
+   * datagram sent there is a record, its program its service, its priority its status. */
+  async "a syslog source listens and a datagram sent to it is a record"() {
+    const port = 20_000 + Math.floor(Math.random() * 20_000);
+    const name = `e2e-syslog-${run}`;
+    const sock = dgram.createSocket("udp4");
+    try {
+      await page.goto(`${BASE}/observe/integrations`);
+      await page.getByRole("button", { name: "Add log source", exact: true }).click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Name", { exact: true }), name);
+      await d.getByLabel("Type", { exact: true }).selectOption("syslog");
+      await fillIn(d.getByLabel("Listen on", { exact: true }), `udp://127.0.0.1:${port}`);
+      await d.getByRole("button", { name: "Test", exact: true }).click();
+      await d.getByRole("status").getByText("The server may listen there.").waitFor();
+      await d.getByRole("button", { name: "Add", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      // A datagram before the server listens is lost, as UDP's are: sent until one is stored.
+      const msg = `<11>1 ${new Date().toISOString()} e2e-host e2eapp-${run} 77 - - payment ${run} failed`;
+      const found = await until(
+        "a datagram stored",
+        async () => {
+          sock.send(msg, port, "127.0.0.1");
+          const r = await api("POST", "/api/observe/v1/logs/search", { query: `service:e2eapp-${run}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 10 });
+          return r.body?.records?.length > 0 ? r.body.records : null;
+        },
+        30_000,
+      );
+      const r = found[0];
+      expect(
+        r.message === `payment ${run} failed` && r.status === "error" && r.host === "e2e-host" && r.source === "syslog" && r.attributes["syslog.procid"] === "77",
+        `the record: ${JSON.stringify(r)}`,
+      );
+      const row = page.getByRole("row").filter({ hasText: name });
+      await until("its row says it reads", async () => /Reading/.test((await row.textContent()) ?? ""), 30_000);
+      expect(/udp:\/\/127\.0\.0\.1:/.test((await row.textContent()) ?? ""), "its row says where it listens");
+    } finally {
+      sock.close();
+      await api("DELETE", `/api/observe/v1/log_sources/${name}`);
     }
   },
 

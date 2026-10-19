@@ -27,6 +27,7 @@ const TYPES: { value: LogSourceKind; label: string }[] = [
   { value: "kubernetes", label: "Kubernetes pods" },
   { value: "docker", label: "Docker containers" },
   { value: "journald", label: "systemd journal" },
+  { value: "syslog", label: "Syslog (UDP, TCP)" },
 ];
 const TYPE = Object.fromEntries(TYPES.map((t) => [t.value, t.label])) as Record<LogSourceKind, string>;
 const DEFAULT_PATHS: Partial<Record<LogSourceKind, string>> = { kubernetes: "/var/log/pods/*/*/*.log", docker: "/var/lib/docker/containers/*/*-json.log" };
@@ -56,13 +57,14 @@ const absolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 function stateOf(s: LogSource): keyof typeof STATE {
   if (s.machines.length === 0) return "starting";
   if (s.machines.some((m) => m.state.error)) return "failing";
-  if (s.type !== "journald" && s.machines.every((m) => m.state.files === 0)) return "none";
+  if (s.type !== "journald" && s.type !== "syslog" && s.machines.every((m) => m.state.files === 0)) return "none";
   return "reading";
 }
 
 /** What a source reads, in a line. */
 function reads(s: LogSource): string {
   if (s.type === "journald") return s.units?.length ? s.units.join(", ") : "every unit";
+  if (s.type === "syslog") return (s.listen ?? []).join(", ");
   return (s.paths?.length ? s.paths : [DEFAULT_PATHS[s.type] ?? ""]).join(", ");
 }
 
@@ -200,6 +202,8 @@ interface Form {
   paths: string;
   exclude: string;
   units: string;
+  listen: string;
+  timezone: string;
   format: NonNullable<LogSourceIn["format"]>;
   start: NonNullable<LogSourceIn["start"]>;
   encoding: NonNullable<LogSourceIn["encoding"]>;
@@ -216,6 +220,8 @@ const formOf = (s: LogSource | null): Form => ({
   paths: (s?.paths ?? []).join("\n"),
   exclude: (s?.exclude ?? []).join("\n"),
   units: (s?.units ?? []).join(", "),
+  listen: (s?.listen ?? []).join(", "),
+  timezone: s?.timezone ?? "",
   format: s?.format ?? "auto",
   start: s?.start ?? "end",
   encoding: s?.encoding ?? "utf-8",
@@ -227,11 +233,15 @@ const formOf = (s: LogSource | null): Form => ({
 
 /** The source as it is sent: what its type reads, the rest as given. */
 function bodyOf(f: Form): LogSourceIn {
-  const journal = f.type === "journald";
+  const reads: Partial<LogSourceIn> =
+    f.type === "journald"
+      ? { units: list(f.units), start: f.start }
+      : f.type === "syslog"
+        ? { listen: list(f.listen), timezone: f.timezone.trim() || undefined }
+        : { paths: lines(f.paths), exclude: lines(f.exclude), format: f.format, encoding: f.encoding, start: f.start };
   return {
     type: f.type,
-    ...(journal ? { units: list(f.units) } : { paths: lines(f.paths), exclude: lines(f.exclude), format: f.format, encoding: f.encoding }),
-    start: f.start,
+    ...reads,
     service: f.service.trim() || undefined,
     source: f.source.trim() || undefined,
     tags: list(f.tags),
@@ -270,11 +280,15 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
     setTested(null);
   };
   const journal = f.type === "journald";
+  const syslog = f.type === "syslog";
+  const files = !journal && !syslog;
   const validName = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/.test(f.name);
   const paths = lines(f.paths);
-  const pathsOk = journal || ((f.type !== "file" || paths.length > 0) && [...paths, ...lines(f.exclude)].every(absolute));
-  const rulesOk = f.rules.every((r) => r.pattern.trim() !== "") && f.rules.filter((r) => r.type === "multi_line").length <= 1 && !(journal && f.rules.some((r) => r.type === "multi_line"));
-  const ok = validName && pathsOk && rulesOk;
+  const pathsOk = !files || ((f.type !== "file" || paths.length > 0) && [...paths, ...lines(f.exclude)].every(absolute));
+  const listen = list(f.listen);
+  const listenOk = !syslog || (listen.length > 0 && listen.length <= 4 && listen.every((l) => /^(udp|tcp):\/\/.+:\d+$/.test(l)));
+  const rulesOk = f.rules.every((r) => r.pattern.trim() !== "") && f.rules.filter((r) => r.type === "multi_line").length <= 1 && !(!files && f.rules.some((r) => r.type === "multi_line"));
+  const ok = validName && pathsOk && listenOk && rulesOk;
   const save = async () => {
     setBusy(true);
     try {
@@ -325,7 +339,26 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
             </React.Suspense>
           </div>
           <SelectField label="Type" value={f.type} onChange={(v) => set({ type: v as LogSourceKind })} options={TYPES} />
-          {journal ? (
+          {syslog ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField
+                label="Listen on"
+                value={f.listen}
+                onChange={(e) => set({ listen: e.target.value })}
+                placeholder="udp://0.0.0.0:514, tcp://0.0.0.0:6514"
+                hint={f.listen && !listenOk ? "udp:// or tcp://, an IP address and a port" : "Each machine that reads it listens there."}
+                spellCheck={false}
+              />
+              <TextField
+                label="Timezone (optional)"
+                value={f.timezone}
+                onChange={(e) => set({ timezone: e.target.value })}
+                placeholder="UTC"
+                hint="Of RFC 3164's times, which carry none: an IANA name."
+                spellCheck={false}
+              />
+            </div>
+          ) : journal ? (
             <TextField
               label="Units (optional)"
               value={f.units}
@@ -356,49 +389,51 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
               </Field>
             </div>
           )}
-          <div className={journal ? "grid grid-cols-1 gap-3" : "grid grid-cols-1 gap-3 sm:grid-cols-3"}>
-            {!journal && (
+          {!syslog && (
+            <div className={journal ? "grid grid-cols-1 gap-3" : "grid grid-cols-1 gap-3 sm:grid-cols-3"}>
+              {files && (
+                <SelectField
+                  label="Lines are"
+                  value={f.format}
+                  onChange={(v) => set({ format: v as Form["format"] })}
+                  options={[
+                    { value: "auto", label: "Auto (JSON or text)" },
+                    { value: "text", label: "Text" },
+                    { value: "json", label: "JSON" },
+                    { value: "cri", label: "CRI (Kubernetes)" },
+                    { value: "docker", label: "Docker json-file" },
+                  ]}
+                />
+              )}
               <SelectField
-                label="Lines are"
-                value={f.format}
-                onChange={(v) => set({ format: v as Form["format"] })}
+                label="Start"
+                value={f.start}
+                onChange={(v) => set({ start: v as Form["start"] })}
                 options={[
-                  { value: "auto", label: "Auto (JSON or text)" },
-                  { value: "text", label: "Text" },
-                  { value: "json", label: "JSON" },
-                  { value: "cri", label: "CRI (Kubernetes)" },
-                  { value: "docker", label: "Docker json-file" },
+                  { value: "end", label: "New lines only" },
+                  { value: "beginning", label: "From the beginning" },
                 ]}
               />
-            )}
-            <SelectField
-              label="Start"
-              value={f.start}
-              onChange={(v) => set({ start: v as Form["start"] })}
-              options={[
-                { value: "end", label: "New lines only" },
-                { value: "beginning", label: "From the beginning" },
-              ]}
-            />
-            {!journal && (
-              <SelectField
-                label="Encoding"
-                value={f.encoding}
-                onChange={(v) => set({ encoding: v as Form["encoding"] })}
-                options={[
-                  { value: "utf-8", label: "UTF-8" },
-                  { value: "utf-16le", label: "UTF-16 LE" },
-                  { value: "utf-16be", label: "UTF-16 BE" },
-                ]}
-              />
-            )}
-          </div>
+              {files && (
+                <SelectField
+                  label="Encoding"
+                  value={f.encoding}
+                  onChange={(v) => set({ encoding: v as Form["encoding"] })}
+                  options={[
+                    { value: "utf-8", label: "UTF-8" },
+                    { value: "utf-16le", label: "UTF-16 LE" },
+                    { value: "utf-16be", label: "UTF-16 BE" },
+                  ]}
+                />
+              )}
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <TextField
               label="Service (optional)"
               value={f.service}
               onChange={(e) => set({ service: e.target.value })}
-              placeholder={f.type === "file" ? "the source's name" : "each container's"}
+              placeholder={f.type === "file" ? "the source's name" : syslog ? "each message's program" : journal ? "each entry's program" : "each container's"}
               spellCheck={false}
             />
             <TextField label="Source (optional)" value={f.source} onChange={(e) => set({ source: e.target.value })} placeholder={f.type} spellCheck={false} />
@@ -440,7 +475,7 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
               <Plus /> Add a rule
             </Button>
           </div>
-          {tested && <Tested t={tested} journal={journal} />}
+          {tested && <Tested t={tested} kind={f.type} />}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
@@ -459,7 +494,14 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
 }
 
 /** A test's answer: the files matched on the server and how their last lines read. */
-function Tested({ t, journal }: { t: LogSourceTest; journal: boolean }) {
+function Tested({ t, kind }: { t: LogSourceTest; kind: LogSourceKind }) {
+  const journal = kind === "journald";
+  if (kind === "syslog")
+    return (
+      <div className="field-hint" role="status">
+        {t.error ? <p className="text-[#e2c4c6]">{t.error}</p> : <p>The server may listen there.</p>}
+      </div>
+    );
   return (
     <div className="field-hint space-y-1" role="status">
       {t.error && <p className="text-[#e2c4c6]">{t.error}</p>}

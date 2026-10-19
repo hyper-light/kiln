@@ -27,6 +27,8 @@ fn source(dir: &Path, glob: &str, format: Format, rules: Vec<Rule>) -> Source {
         start: Start::Beginning,
         encoding: Encoding::Utf8,
         units: Vec::new(),
+        listen: Vec::new(),
+        timezone: None,
         service: Some("bench".into()),
         source: None,
         tags: vec!["env:bench".into()],

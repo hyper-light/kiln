@@ -342,7 +342,7 @@ export interface ScrapeTest {
   took_ms?: number;
 }
 
-export type LogSourceKind = "file" | "kubernetes" | "docker" | "journald";
+export type LogSourceKind = "file" | "kubernetes" | "docker" | "journald" | "syslog";
 export type LogRuleKind = "exclude_at_match" | "include_at_match" | "mask_sequences" | "multi_line";
 
 /** Datadog's processing rules, in their order (a multi_line rule first). */
@@ -362,6 +362,9 @@ export interface LogSourceIn {
   start?: "end" | "beginning";
   encoding?: "utf-8" | "utf-16le" | "utf-16be";
   units?: string[];
+  /** A syslog source's: where it listens (`udp://0.0.0.0:514`), the zone of RFC 3164's times. */
+  listen?: string[];
+  timezone?: string;
   service?: string;
   source?: string;
   tags?: string[];
@@ -380,6 +383,9 @@ export interface LogSourceState {
   excluded: number;
   truncated: number;
   lag_bytes: number;
+  /** A syslog source's TCP connections open, and datagrams dropped for want of room. */
+  connections: number;
+  dropped: number;
   last_ms: number | null;
   error: string | null;
   errors: number;

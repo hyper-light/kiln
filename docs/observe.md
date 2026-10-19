@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
-| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor; Datadog's processing rules; each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations), Windows' Event Log and macOS's unified log | in progress |
+| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations), Windows' Event Log and macOS's unified log | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
@@ -527,7 +527,7 @@ its schema (§13). Built:
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
-| `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind, the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines |
+| `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 
@@ -632,7 +632,8 @@ how it goes in its status. A source is:
   namespace, name and uid, its container's name and restarts, its service the container's), `docker`
   (Docker's json-file logs, `/var/lib/docker/containers/*/*-json.log`: the container's id, and from
   its `config.v2.json` where kiln may read it, its name, image and Compose service), or `journald`
-  (the systemd journal, its units or every one);
+  (the systemd journal, its units or every one), or `syslog` (received where it listens,
+  `udp://` and `tcp://` addresses);
 - how its lines read: `auto` (a line that is a JSON object is one, else text), `text`, `json`,
   `cri` (`<time> <stream> <P|F> <text>`, a long line's parts joined) or `docker` (the same in JSON),
   in UTF-8 or UTF-16; where a file there when the source starts, with no place kept, is read from
@@ -682,6 +683,19 @@ cursor of the last record written (Fluent Bit's and Vector's journald sources re
 entries' severity is their syslog priority's (OpenTelemetry's mapping), their service the syslog
 identifier or unit, with the unit, process and boot as attributes. Where there is no journal (macOS,
 Windows, a container without systemd's) its status says so.
+
+**Syslog** is received as Datadog's Agent and rsyslog receive it: a message a UDP datagram, and
+over TCP each message counted (`<length> <message>`) or ended by a newline or a NUL (RFC 6587's
+two framings, told apart by a connection's first byte), 1,024 connections at most, each let go after
+five silent minutes. A message is read as RFC 5424's when its version follows its priority (its
+time, host, app, process, message id and structured data, each `sd.<id>.<name>` an attribute), else
+as RFC 3164's as far as it goes (`Mmm dd hh:mm:ss`, in the source's `timezone`, UTC unless said,
+its year the one it is unless that puts it more than a day ahead; an RFC 3339 time where it goes;
+its host and `tag[pid]:` each optional, a router's sequence number not taken for a program), else
+whole. Its severity and facility are its priority's, its host the one it names (else its sender's
+address, `network.client.ip` either way), its service the source's or its program's. Syslog has no
+acknowledgement: a datagram there is no room for is dropped, and counted, while a TCP sender is held
+back (its connection is not read) until there is.
 
 A source reads what kiln's process may read on each machine that reads it: a maintainer's to give.
 
@@ -1898,9 +1912,16 @@ stderr), a Docker container's json-file log (its name, image and Compose service
 and the journal through a stand-in for `journalctl` that keeps cursors as the real one does: the
 parts joined, the records named as their pods and containers are, the journal's levels its
 priorities'; the runner stopped, an entry more meanwhile, and started: read from after its cursor,
-none twice. Passes. In a browser: a source added from the form, tried on the server first (its file
+none twice. Passes. Syslog: a runner listening on UDP and TCP; RFC 5424 with structured data and RFC 3164
+by datagram, then over TCP two counted messages in one write and one split across two writes,
+and messages ended by a newline and by a NUL: each stored once with its host, program, process,
+facility, level (a priority's: notice is info, critical fatal) and structured data, the sender's
+address, the source's tag; one the rules leave out counted as left out, none dropped. Passes
+(2 min). In a browser: a source added from the form, tried on the server first (its file
 matched, its last lines read, a token masked), its records found by a search once each, its row
-saying it reads, then removed; in Chromium and in WebKit as a phone.
+saying it reads, then removed; and a syslog source made from the form, its address tried, a
+datagram sent there found as a record with its program, level and process; in Chromium and in
+WebKit as a phone.
 
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a

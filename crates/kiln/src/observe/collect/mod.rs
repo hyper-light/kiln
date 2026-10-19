@@ -16,6 +16,7 @@
 
 pub mod files;
 pub mod journald;
+pub mod syslog;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -60,6 +61,8 @@ pub enum Kind {
     Docker,
     /// The systemd journal, read through `journalctl`.
     Journald,
+    /// Syslog received over UDP and TCP (RFC 5424, RFC 3164).
+    Syslog,
 }
 
 /// How a file's lines read.
@@ -149,6 +152,12 @@ pub struct Source {
     /// The journal's units read (`nginx.service`); every unit when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<String>,
+    /// Where a syslog source listens: `udp://0.0.0.0:514`, `tcp://0.0.0.0:6514`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<String>,
+    /// The zone an RFC 3164 time (which has none) is in: an IANA name; UTC unless said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,10 +189,18 @@ impl Source {
     pub fn check(&self) -> Result<(), String> {
         match self.kind {
             Kind::File if self.paths.is_empty() => return Err("a file source's paths: a glob at the least (/var/log/app/*.log)".into()),
-            Kind::Journald if !self.paths.is_empty() || !self.exclude.is_empty() => return Err("the journal is read by its units, not paths".into()),
-            Kind::Journald if self.format != Format::Auto || self.encoding != Encoding::Utf8 => return Err("the journal's entries are records already: no format or encoding".into()),
-            Kind::File | Kind::Kubernetes | Kind::Docker if !self.units.is_empty() => return Err("units are the journal's".into()),
+            Kind::Journald | Kind::Syslog if !self.paths.is_empty() || !self.exclude.is_empty() => return Err("paths are a file source's".into()),
+            Kind::Journald | Kind::Syslog if self.format != Format::Auto || self.encoding != Encoding::Utf8 => return Err("the journal's entries and syslog's messages are records already: no format or encoding".into()),
+            Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Syslog if !self.units.is_empty() => return Err("units are the journal's".into()),
+            Kind::Syslog if self.listen.is_empty() || self.listen.len() > 4 => return Err("a syslog source listens somewhere: udp://0.0.0.0:514, tcp://0.0.0.0:6514 (4 at the most)".into()),
+            Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Journald if !self.listen.is_empty() || self.timezone.is_some() => return Err("listen and timezone are a syslog source's".into()),
             _ => {}
+        }
+        for l in &self.listen {
+            syslog::listen(l)?;
+        }
+        if let Some(z) = &self.timezone {
+            kiln_obs::query::calendar::Zone::named(z)?;
         }
         if self.paths.len() > 64 || self.exclude.len() > 64 {
             return Err("64 paths at the most, and 64 left out".into());
@@ -215,7 +232,7 @@ impl Source {
             regex(&r.pattern)?;
             match r.kind {
                 RuleKind::MaskSequences if r.replace_placeholder.as_deref().is_none_or(|p| p.len() > 256) => return Err("a mask_sequences rule's replace_placeholder: up to 256 characters".into()),
-                RuleKind::MultiLine if self.kind == Kind::Journald => return Err("the journal's entries are records already: no multi_line rule".into()),
+                RuleKind::MultiLine if matches!(self.kind, Kind::Journald | Kind::Syslog) => return Err("the journal's entries and syslog's messages are records already: no multi_line rule".into()),
                 RuleKind::MultiLine => multi += 1,
                 _ => {}
             }
@@ -242,7 +259,7 @@ impl Source {
         match self.kind {
             Kind::Kubernetes => vec!["/var/log/pods/*/*/*.log".into()],
             Kind::Docker => vec!["/var/lib/docker/containers/*/*-json.log".into()],
-            Kind::File | Kind::Journald => Vec::new(),
+            Kind::File | Kind::Journald | Kind::Syslog => Vec::new(),
         }
     }
 
@@ -270,6 +287,7 @@ impl Source {
             Kind::Kubernetes => "kubernetes",
             Kind::Docker => "docker",
             Kind::Journald => "journald",
+            Kind::Syslog => "syslog",
         };
         Ok(Compiled {
             name: name.to_owned(),
@@ -280,6 +298,8 @@ impl Source {
             start: self.start,
             encoding: self.encoding,
             units: self.units.clone(),
+            listen: self.listen.clone(),
+            timezone: self.timezone.as_deref().map_or(Ok(kiln_obs::query::calendar::Zone::UTC), kiln_obs::query::calendar::Zone::named)?,
             service: self.service.clone(),
             source: self.source.clone().unwrap_or_else(|| default_source.to_owned()),
             tags: self.tags.iter().filter_map(|t| t.split_once(':')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
@@ -307,6 +327,8 @@ pub(crate) struct Compiled {
     pub start: Start,
     pub encoding: Encoding,
     pub units: Vec<String>,
+    pub listen: Vec<String>,
+    pub timezone: kiln_obs::query::calendar::Zone,
     pub service: Option<String>,
     pub source: String,
     pub tags: Vec<(String, String)>,
@@ -549,6 +571,9 @@ pub struct State {
     pub truncated: u64,
     /// Bytes of the open files not yet written.
     pub lag_bytes: u64,
+    /// A syslog source's TCP connections open, and datagrams dropped for want of room.
+    pub connections: u64,
+    pub dropped: u64,
     /// Unix ms of the last record written.
     pub last_ms: Option<i64>,
     pub error: Option<String>,
@@ -613,6 +638,25 @@ pub fn test(name: &str, s: &Source, host: &str) -> Value {
     let sampled = match c.kind {
         Kind::Journald => journald::sample(&c, 20),
         Kind::File | Kind::Kubernetes | Kind::Docker => files::sample(&c, 20),
+        // Whether it may listen where it says, here: each address bound a moment.
+        Kind::Syslog => files::Sampled {
+            files: Vec::new(),
+            matched: 0,
+            records: Vec::new(),
+            excluded: 0,
+            error: {
+                let failed: Vec<String> = c
+                    .listen
+                    .iter()
+                    .filter_map(|l| {
+                        let (udp, addr) = syslog::listen(l).ok()?;
+                        let bound = if udp { std::net::UdpSocket::bind(addr).map(drop) } else { std::net::TcpListener::bind(addr).map(drop) };
+                        bound.err().map(|e| format!("{l}: {e}"))
+                    })
+                    .collect();
+                (!failed.is_empty()).then(|| failed.join("; "))
+            },
+        },
     };
     let records: Vec<Value> = sampled
         .records
@@ -630,12 +674,12 @@ pub fn test(name: &str, s: &Source, host: &str) -> Value {
         })
         .collect();
     serde_json::json!({
-        "ok": sampled.error.is_none() && (c.kind == Kind::Journald || sampled.matched > 0),
+        "ok": sampled.error.is_none() && (matches!(c.kind, Kind::Journald | Kind::Syslog) || sampled.matched > 0),
         "files": sampled.files.iter().map(|(p, b)| serde_json::json!({ "path": p, "bytes": b })).collect::<Vec<_>>(),
         "matched": sampled.matched,
         "records": records,
         "excluded": sampled.excluded,
-        "error": sampled.error.or_else(|| (c.kind != Kind::Journald && sampled.matched == 0).then(|| "no file here matches its paths".to_owned())),
+        "error": sampled.error.or_else(|| (!matches!(c.kind, Kind::Journald | Kind::Syslog) && sampled.matched == 0).then(|| "no file here matches its paths".to_owned())),
         "took_ms": u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
 }
@@ -782,6 +826,7 @@ impl Collector {
                             match c.kind {
                                 Kind::Journald => journald::run(&c, &file, &stop2, &state2, &offer_to_observe),
                                 Kind::File | Kind::Kubernetes | Kind::Docker => files::run(&c, &file, &stop2, &state2, &offer_to_observe),
+                                Kind::Syslog => syslog::run(c, &stop2, &state2, &(Arc::new(offer_to_observe) as syslog::Sink)),
                             }
                         })
                         .map_err(|e| lock(&state).error = Some(format!("its thread did not start: {e}")))
@@ -926,6 +971,8 @@ mod tests {
             start: Start::End,
             encoding: Encoding::Utf8,
             units: Vec::new(),
+            listen: Vec::new(),
+            timezone: None,
             service: Some("app".into()),
             source: None,
             tags: vec!["env:prod".into()],
@@ -957,6 +1004,17 @@ mod tests {
         assert!(Source { paths: vec!["C:\\logs\\*.log".into()], ..file_source() }.check().is_ok());
         assert!(Source { kind: Kind::Journald, paths: Vec::new(), units: vec!["nginx.service".into()], ..file_source() }.check().is_ok());
         assert!(Source { kind: Kind::Kubernetes, paths: Vec::new(), ..file_source() }.check().is_ok());
+        let syslog = || Source { kind: Kind::Syslog, paths: Vec::new(), listen: vec!["udp://0.0.0.0:5514".into(), "tcp://127.0.0.1:5514".into()], timezone: Some("Europe/Paris".into()), ..file_source() };
+        assert!(syslog().check().is_ok());
+        for bad in [
+            Source { listen: Vec::new(), ..syslog() },
+            Source { listen: vec!["0.0.0.0:514".into()], ..syslog() },
+            Source { timezone: Some("Mars/Olympus".into()), ..syslog() },
+            Source { paths: vec!["/var/log/*.log".into()], ..syslog() },
+            Source { listen: vec!["udp://0.0.0.0:514".into()], timezone: None, ..file_source() },
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
         assert_eq!(Source { kind: Kind::Kubernetes, paths: Vec::new(), ..file_source() }.globs(), vec!["/var/log/pods/*/*/*.log".to_owned()]);
         let json = r#"{"type":"journald","units":["sshd.service"],"on":"*"}"#;
         let s: Source = serde_json::from_str(json).unwrap_or_else(|_| file_source());

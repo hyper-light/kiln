@@ -306,3 +306,70 @@ fn containers_logs_and_the_journal_are_stored_with_what_they_name() -> anyhow::R
     anyhow::ensure!(at(&st, &["records"]) == 1 && at(&st, &["error"]).is_null(), "journal: {st:#}\n{stored:#?}\n{said}");
     Ok(())
 }
+
+/// A BSD syslog time (`Mmm dd hh:mm:ss`, UTC) of now.
+fn bsd_now() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][usize::from(u8::from(t.month())) - 1];
+    format!("{month} {:>2} {:02}:{:02}:{:02}", t.day(), t.hour(), t.minute(), t.second())
+}
+
+#[test]
+#[ignore = "starts real processes"]
+fn syslog_is_received_over_udp_and_tcp_with_what_its_messages_name() -> anyhow::Result<()> {
+    let t0 = now_ms() - 60_000;
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    let (udp, tcp) = (common::free_port()?, common::free_port()?);
+    put_source(&f, "syslog", &json!({ "type": "syslog", "listen": [format!("udp://127.0.0.1:{udp}"), format!("tcp://127.0.0.1:{tcp}")], "rules": [{ "type": "exclude_at_match", "pattern": "noise" }], "tags": ["site:lab"], "on": "r1" }))?;
+    // Bound once the runner has the source: a datagram before that is lost, as UDP's would be.
+    let start = Instant::now();
+    loop {
+        let st = state(&f, "syslog", "r1", 0)?;
+        if at(&st, &["since_ms"]).is_i64() && at(&st, &["error"]).is_null() {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the source never started on r1: {st:#}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    // RFC 5424 with structured data; RFC 3164; a message the rules leave out.
+    sock.send_to(format!("<165>1 {now} router-1 bgpd 812 PEER [peer@32473 ip=\"10.0.0.2\" state=\"down\"] neighbor 10.0.0.2 went down").as_bytes(), ("127.0.0.1", udp))?;
+    sock.send_to(format!("<34>{} web-1 sudo[4242]: auth failure for ops", bsd_now()).as_bytes(), ("127.0.0.1", udp))?;
+    sock.send_to(format!("<14>{} web-1 app: noise", bsd_now()).as_bytes(), ("127.0.0.1", udp))?;
+    // TCP: counted frames, two in one write and one split across two; then newline and NUL ended.
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", tcp))?;
+    let framed = |m: &str| format!("{} {m}", m.len());
+    let a = format!("<13>1 {now} db-1 postgres - - - checkpoint complete");
+    let b = format!("<11>1 {now} db-1 postgres - - - FATAL: too many connections");
+    let cm = format!("<12>1 {now} db-1 postgres - - - slow query: 2.3 s");
+    c.write_all(format!("{}{}", framed(&a), framed(&b)).as_bytes())?;
+    let whole = framed(&cm);
+    let (first, second) = whole.split_at(whole.len() / 2);
+    c.write_all(first.as_bytes())?;
+    std::thread::sleep(Duration::from_millis(200));
+    c.write_all(second.as_bytes())?;
+    drop(c);
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", tcp))?;
+    c.write_all(format!("<30>{} cache-1 redis[7]: saved the dataset\n<27>{} cache-1 redis[7]: out of memory\0", bsd_now(), bsd_now()).as_bytes())?;
+    drop(c);
+    let got = found(&f, t0, "source:syslog", 7)?;
+    std::thread::sleep(Duration::from_secs(2));
+    let got_now = search(&f, t0, "source:syslog")?;
+    anyhow::ensure!(got.len() == 7 && got_now.len() == 7, "seven messages (the noise left out): {got_now:#?}");
+    let one = |m: &str| got.iter().find(|r| at(r, &["message"]) == m).cloned().unwrap_or(Value::Null);
+    let bgp = one("neighbor 10.0.0.2 went down");
+    // Priority 165: local4, notice (OpenTelemetry's info).
+    anyhow::ensure!(at(&bgp, &["service"]) == "bgpd" && at(&bgp, &["host"]) == "router-1" && at(&bgp, &["status"]) == "info", "{bgp:#}");
+    anyhow::ensure!(at(&bgp, &["attributes", "sd.peer@32473.ip"]) == "10.0.0.2" && at(&bgp, &["attributes", "syslog.facility"]) == "local4" && at(&bgp, &["attributes", "syslog.msgid"]) == "PEER" && at(&bgp, &["attributes", "site"]) == "lab", "{bgp:#}");
+    let sudo = one("auth failure for ops");
+    // Priority 34: auth, critical (fatal).
+    anyhow::ensure!(at(&sudo, &["service"]) == "sudo" && at(&sudo, &["host"]) == "web-1" && at(&sudo, &["status"]) == "fatal" && at(&sudo, &["attributes", "syslog.procid"]) == "4242" && at(&sudo, &["attributes", "network.client.ip"]) == "127.0.0.1", "{sudo:#}");
+    anyhow::ensure!(at(&one("FATAL: too many connections"), &["status"]) == "error" && !one("slow query: 2.3 s").is_null() && !one("checkpoint complete").is_null(), "{got:#?}");
+    anyhow::ensure!(at(&one("out of memory"), &["status"]) == "error" && at(&one("saved the dataset"), &["service"]) == "redis", "{got:#?}");
+    let st = state(&f, "syslog", "r1", 0)?;
+    anyhow::ensure!(at(&st, &["records"]) == 7 && at(&st, &["excluded"]) == 1 && at(&st, &["dropped"]) == 0, "{st:#}");
+    Ok(())
+}

@@ -535,7 +535,7 @@ fn origin(c: &Compiled, path: &Path) -> Origin {
                 service = s;
             }
         }
-        Kind::File | Kind::Journald => {}
+        Kind::File | Kind::Journald | Kind::Syslog => {}
     }
     Origin { attrs, service }
 }
@@ -1078,6 +1078,8 @@ mod tests {
             start: Start::Beginning,
             encoding: Encoding::Utf8,
             units: Vec::new(),
+            listen: Vec::new(),
+            timezone: None,
             service: Some("app".into()),
             source: None,
             tags: Vec::new(),

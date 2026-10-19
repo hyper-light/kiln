@@ -149,6 +149,22 @@ impl Zone {
         let zones = zones().lock().unwrap_or_else(PoisonError::into_inner);
         zones.get(usize::from(self.0)).map_or(TimeZone::UTC, |z| z.1.clone())
     }
+
+    /// A wall-clock time in the zone, as nanoseconds since the epoch: one a change of offset makes
+    /// twice, the earlier, and one it skips, as if the change came after it (jiff's "compatible",
+    /// as RFC 5545 has it). None for a date that is none, or past the years jiff holds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn civil_ns(self, year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8, nanos: i32) -> Option<i64> {
+        let dt = DateTime::new(year, month, day, hour, minute, second, nanos).ok()?;
+        let zoned = dt.to_zoned(self.tz()).ok()?;
+        i64::try_from(zoned.timestamp().as_nanosecond()).ok()
+    }
+
+    /// The year it is in the zone at `ns` (nanoseconds since the epoch).
+    pub fn year_at(self, ns: i64) -> Option<i16> {
+        let t = Timestamp::from_nanosecond(i128::from(ns)).ok()?;
+        Some(t.to_zoned(self.tz()).year())
+    }
 }
 
 /// A calendar's periods: days begun at a time of day, weeks on a weekday, months on a day of the

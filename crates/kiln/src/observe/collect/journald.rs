@@ -340,6 +340,8 @@ mod tests {
             start: Start::End,
             encoding: Encoding::Utf8,
             units: vec!["nginx.service".into()],
+            listen: Vec::new(),
+            timezone: None,
             service: None,
             source: None,
             tags: vec!["env:prod".into()],
