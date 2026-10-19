@@ -74,7 +74,7 @@ pub struct RunArgs {
     /// Run on this server's runners instead.
     #[arg(long)]
     server: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
     /// The repository on that server (`owner/name`); by default the one `origin` points at.
     #[arg(long)]

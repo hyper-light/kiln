@@ -17,7 +17,7 @@ pub struct SecretsArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
     /// The server's admin token.
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: SecretsCmd,
@@ -62,7 +62,7 @@ enum SecretsCmd {
 pub struct VarsArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: VarsCmd,
@@ -153,7 +153,7 @@ impl Api {
 pub struct OidcArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: OidcCmd,
@@ -247,7 +247,7 @@ pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
 pub struct ActionsArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: ActionsCmd,
@@ -324,7 +324,7 @@ pub async fn actions(args: ActionsArgs, cfg: &Config) -> Result<()> {
 pub struct Conn {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
 }
 
