@@ -233,6 +233,7 @@ outlives the server's disk and its own machine both.
 mirrors = 1          # runners that keep a copy of the server's store; 0: none
 mirror_on = []       # runners to pick first, by name
 keep_closed_days = 30  # days an ended agent's transcript is kept (its events stay); 0: for good
+compact = true       # make the store's file compact once a third of it is free (runners and mirrors too)
 ```
 
 ## Milestones
@@ -255,13 +256,23 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
   lesson of c0ffda6 (agents.md).
 - **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
   MB. They are kept compressed, and ended agents' transcripts go after `keep_closed_days`. What
-  that frees is used again for what comes next; the file doesn't shrink by itself. The engine can
-  make it compact (`Engine::compact`: a compact copy, `VACUUM INTO`, takes the file's place; a
-  copy written whole before a crash takes it at the next start, one written in part is removed),
-  but the store never does it on its own. It once did, hourly, and on the first server's store of
-  several GB the copy held the writer and took more memory than the server has: the server was
-  killed for it every minute (2026-10-18). Compacting a big store needs a way that keeps its
-  memory bounded first.
+  that frees is used again for what comes next, and once a third of the file (and 256 MiB) is
+  free, the store makes it compact while it has nothing else to do (`Engine::compact_some`):
+  1. It copies itself into `<file>.compact.tmp` a step at a time: 4 MiB of rows, a transaction of
+     their own there, under the same numbers. The copy's log is written into it each step.
+  2. Then what was written meanwhile, by its numbers, in the order it was written: what a drop
+     took away is taken away from the copy too, and a session changed without a number of its
+     own (where it runs) is copied again.
+  3. Caught up, the copy goes to disk and is counted against the store, table by table.
+  4. With nothing else writing, the rest is copied, the copy counted again, and it takes the
+     file's place.
+
+  Each step holds the store for about a tenth of a second (more on a busy disk), and the swap
+  for well under a second; the memory it takes is a step's. A copy written whole before a crash
+  takes the file's place at the next start; one written in part is removed. It needs room beside
+  the file for what the file holds, and waits until there is. `compact = false` turns it off. It
+  once copied the whole file in one go (`VACUUM INTO`, one transaction), which took more memory
+  than the first server had: it was killed for it every minute until rolled back (2026-10-18).
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status

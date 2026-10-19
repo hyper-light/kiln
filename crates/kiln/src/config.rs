@@ -169,12 +169,21 @@ pub struct Conversations {
     /// Days the server's store keeps an ended agent's transcript (its events stay). 0: for good.
     /// Runners and mirrors keep them the default 30.
     pub keep_closed_days: u32,
+    /// Make the store's file compact once a third of it is free: a copy written a batch at a time
+    /// while the store has nothing else to do, then put in its place. Runners and mirrors compact
+    /// theirs.
+    pub compact: bool,
 }
 
 impl Conversations {
     /// How long ended agents' transcripts are kept (None: for good).
     pub fn keep_closed(&self) -> Option<std::time::Duration> {
         (self.keep_closed_days > 0).then(|| std::time::Duration::from_secs(u64::from(self.keep_closed_days) * 86_400))
+    }
+
+    /// How a store looks after its file, as this says.
+    pub fn upkeep(&self) -> crate::convo::store::Upkeep {
+        crate::convo::store::Upkeep { keep_closed: self.keep_closed(), compact: self.compact.then_some(crate::convo::store::COMPACT_MIN_FREE) }
     }
 }
 
@@ -407,7 +416,7 @@ impl Default for Terminal {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30 }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, compact: true }
     }
 }
 
