@@ -138,10 +138,13 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   display: inline-block;
   width: 7ch;
   flex: none;
-  color: #8f929b;
+  color: #a1a4ad;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
   text-transform: none;
+}
+.ag-turn-time[data-stopped] {
+  color: #7b7e88;
 }
 /* Two thin, masked layers on the existing pause button. Only rotation and opacity animate;
    neither layer participates in layout or changes the button, icon or border thickness. */
@@ -1179,32 +1182,32 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* What it does as they fill, a row each from the same left edge as the windows: its words in their
+   name column and its select where their bars start; then its plan and the way to its cost and status. */
 .hx-usage-foot {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 18px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   color: var(--color-secondary);
   font-size: 12px;
 }
-.hx-usage-stop {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
+.hx-usage-stop,
 .hx-usage-move {
-  display: inline-flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
   align-items: center;
-  gap: 6px 8px;
+  gap: 12px;
+  width: 100%;
   min-width: 0;
 }
-/* Its plan and the way to its cost and status, at the end of the line (on one of their own when it's full). */
+.hx-usage-stop > .hx-pick {
+  justify-self: start;
+}
 .hx-usage-end {
   display: inline-flex;
   align-items: center;
   gap: 12px;
-  margin-left: auto;
 }
 .hx-usage-more {
   min-height: 28px;
@@ -1222,6 +1225,11 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   }
   .hx-usage-reset > .hx-usage-at {
     display: none;
+  }
+  .hx-usage-stop,
+  .hx-usage-move {
+    grid-template-columns: 6.25rem minmax(0, 1fr);
+    gap: 10px;
   }
 }
 .hx-usage-more:hover {
