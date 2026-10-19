@@ -37,15 +37,24 @@ const BATCH_MAX: usize = 256 << 20;
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Msg {
     /// Runner to server, when the link comes up (and when the server says nothing for too long):
-    /// its store.
-    Hello { store: String },
+    /// its store. `restore`: the store is its copy of the server's (a mirror's), sent back for
+    /// the server to restore its own from ([`Msg::Restore`]).
+    Hello {
+        store: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        restore: bool,
+    },
     /// Server to runner: it has `store`'s feed through `rev`; send from there. `zip`: it takes
-    /// batches compressed (a taker from before says nothing, and gets them as they are).
+    /// batches compressed; `kept`: it takes record lines as they are kept, compressed
+    /// ([`RecordRow::kept`](super::rows::RecordRow::kept)). A taker from before says neither,
+    /// and gets them as they are.
     From {
         store: String,
         rev: u64,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         zip: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        kept: bool,
     },
     /// Runner to server: part `part` (from 0) of `parts` of a batch that follows `from` and reads
     /// through `upto` (its bytes: JSON [`Changes`], brotli-compressed when `zip`).
@@ -60,13 +69,18 @@ pub enum Msg {
     },
     /// Server to runner: it has `store`'s feed through `rev`.
     Ack { store: String, rev: u64 },
+    /// Server to a mirror: send back your copy of my store, which is `store` now (the one you
+    /// copied was lost).
+    Restore { store: String },
+    /// Mirror to server: its copy `store` has been sent whole, through `rev`.
+    Restored { store: String, rev: u64 },
 }
 
 impl Msg {
     /// The store it is about.
     pub fn store(&self) -> &str {
         match self {
-            Msg::Hello { store } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } => store,
+            Msg::Hello { store, .. } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } | Msg::Restore { store } | Msg::Restored { store, .. } => store,
         }
     }
 }
@@ -135,8 +149,28 @@ pub struct Shipper {
     tx: async_channel::Sender<Link>,
 }
 
+/// Whether the taker has a row already (by its number): it is left out of what goes to it.
+pub type Skip = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
 impl Shipper {
     pub fn start(store: Store) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+        Self::start_as(store, false, None)
+    }
+
+    /// [`Shipper::start`], leaving out the rows `skip` says the taker has (what a mirror sent
+    /// back to restore this store from isn't sent to it again, [`Echoes`]).
+    pub fn start_skipping(store: Store, skip: Skip) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+        Self::start_as(store, false, Some(skip))
+    }
+
+    /// A mirror's copy of the server's store, sent back for the server to restore its own from
+    /// ([`Msg::Restore`]): everything the copy holds now, then [`Msg::Restored`], and the feed
+    /// ends (what it takes meanwhile, it takes from the server: not sent back).
+    pub fn start_restore(store: Store) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+        Self::start_as(store, true, None)
+    }
+
+    fn start_as(store: Store, restore: bool, skip: Option<Skip>) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
         let (tx, rx) = async_channel::unbounded::<Link>();
         let (out_tx, out_rx) = async_channel::bounded::<(String, Vec<u8>)>(16);
         // Each commit, as a nudge in the same queue.
@@ -149,7 +183,7 @@ impl Shipper {
                 }
             }
         });
-        crate::rt::spawn(ship(store, rx, out_tx));
+        crate::rt::spawn(ship(store, rx, out_tx, restore, skip));
         (Self { tx }, out_rx)
     }
 
@@ -164,6 +198,8 @@ struct Shipping {
     acked: Option<u64>,
     /// The server takes batches compressed (it said so).
     zipped: bool,
+    /// It takes record lines as they are kept (it said so).
+    kept: bool,
     /// Read and sent through here.
     sent: u64,
     /// The batches sent and not yet acknowledged: their `upto`.
@@ -172,11 +208,24 @@ struct Shipping {
     heard: Instant,
 }
 
-async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>) {
+async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>) {
     let me = store.id().to_owned();
+    // A copy sent back goes through where it reads now, and no further.
+    let through = if restore {
+        let s = store.clone();
+        match crate::rt::blocking(move || s.top()).await {
+            Ok(Ok(top)) => Some(top),
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "conversation feed: the copy to send back couldn't be read");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let mut up = false;
-    let mut st = Shipping { acked: None, zipped: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
-    let hello = |out: &async_channel::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone() }), Vec::new())).is_ok();
+    let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
+    let hello = |out: &async_channel::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
     loop {
         let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(ev)) => Some(ev),
@@ -186,7 +235,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
         match ev {
             Some(Link::Up) => {
                 up = true;
-                st = Shipping { acked: None, zipped: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
+                st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
                 hello(&out);
             }
             Some(Link::Down) => {
@@ -194,10 +243,11 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
                 st.acked = None;
                 st.flight.clear();
             }
-            Some(Link::Heard(Msg::From { store, rev, zip })) if store == me => {
+            Some(Link::Heard(Msg::From { store, rev, zip, kept })) if store == me => {
                 // Where to go on from (a first answer, or after something went astray).
                 st.acked = Some(rev);
                 st.zipped = zip;
+                st.kept = kept;
                 st.sent = rev;
                 st.flight.clear();
                 st.heard = Instant::now();
@@ -223,10 +273,22 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
         if st.acked.is_none() {
             continue;
         }
+        // A copy sent back: done once the server has it through where it read when it began.
+        if let (Some(end), Some(acked)) = (through, st.acked)
+            && acked >= end
+            && st.flight.is_empty()
+        {
+            let _ = out.send((encode(&Msg::Restored { store: me.clone(), rev: end }), Vec::new())).await;
+            return;
+        }
         while st.flight.len() < WINDOW {
-            let from = st.sent;
+            // A copy sent back stops reading where it read when it began.
+            if through.is_some_and(|end| st.sent >= end) {
+                break;
+            }
+            let (from, kept) = (st.sent, st.kept);
             let s = store.clone();
-            let batch = match crate::rt::blocking(move || s.changes(from, BATCH_BYTES)).await {
+            let mut batch = match crate::rt::blocking(move || s.changes_as(from, BATCH_BYTES, kept)).await {
                 Ok(Ok(b)) => b,
                 Ok(Err(e)) | Err(e) => {
                     tracing::debug!(error = %format!("{e:#}"), "conversation feed: the store couldn't be read");
@@ -235,6 +297,10 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             };
             if batch.rows.is_empty() {
                 break;
+            }
+            // What the taker has already is left out; the batch still says through where it read.
+            if let Some(skip) = &skip {
+                batch.rows.retain(|c| !skip(c.rev));
             }
             let msgs = match parts(&me, from, &batch, st.zipped) {
                 Ok(m) => m,
@@ -289,23 +355,62 @@ pub enum Brings {
 /// hands back what to answer. The server's takes runners' stores; a mirror's takes the server's.
 pub struct Intake {
     tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, String, Vec<u8>)>,
+    restores: std::sync::Arc<Restores>,
 }
 
+/// What each mirror sent back to restore a store, by the numbers it was written under there: the
+/// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent.
+#[derive(Default)]
+pub struct Echoes(std::sync::Mutex<HashMap<String, Vec<(u64, u64)>>>);
+
+impl Echoes {
+    /// Numbers `first` through `last` were written from `machine`'s copy.
+    pub fn add(&self, machine: &str, first: u64, last: u64) {
+        let mut all = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ranges = all.entry(machine.to_owned()).or_default();
+        match ranges.last_mut() {
+            Some(r) if r.1 + 1 == first => r.1 = last,
+            _ => ranges.push((first, last)),
+        }
+    }
+
+    /// Whether number `rev` was written from `machine`'s copy.
+    pub fn has(&self, machine: &str, rev: u64) -> bool {
+        let all = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.get(machine).is_some_and(|ranges| {
+            let i = ranges.partition_point(|r| r.1 < rev);
+            ranges.get(i).is_some_and(|r| r.0 <= rev)
+        })
+    }
+}
+
+/// The mirrors' copies an intake takes to restore its store from ([`Intake::accept_restore`]).
+type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
+
 impl Intake {
-    pub fn start(store: Store, brings: Brings) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
+    /// `echoes`: where to note what a mirror's copy brought (the server's intake).
+    pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, String, Vec<u8>)>(256);
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
+        let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
+        let restoring = restores.clone();
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut partial: HashMap<(hyper_transport::PeerId, String), Partial> = HashMap::new();
             while let Ok((peer, machine, json, data)) = rx.recv() {
-                for m in take(&store, &mut partial, peer, &machine, brings, &json, data) {
+                for m in take(&store, &mut partial, peer, &machine, brings, &json, data, &restoring, echoes.as_deref()) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
                     }
                 }
             }
         })?;
-        Ok((Self { tx }, out_rx))
+        Ok((Self { tx, restores }, out_rx))
+    }
+
+    /// Take store `store`'s feed as a mirror's copy of this one, sent back to restore it
+    /// ([`super::store::Store::take_copy`]): what it brings fills in what this store lacks.
+    pub fn accept_restore(&self, store: &str) {
+        self.restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(store.to_owned());
     }
 
     /// What runner process `peer` of `machine` sent on the feed's lane. Never blocks: when the
@@ -321,14 +426,26 @@ pub fn peer_name(machine: &str, store: &str) -> String {
 }
 
 /// One message from a runner, taken: what to answer.
-fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>) -> Vec<Msg> {
-    let have = |s: &str| store.peer(&peer_name(machine, s)).unwrap_or(0);
+#[allow(clippy::too_many_arguments)]
+fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
+    // Where the server's copy of a runner's store stands. When that can't be read (the store is
+    // busy or failing), no answer: never "from 0", which would have the runner send everything
+    // again, and every runner at once. The runner asks again after a while ([`STALL`]).
+    let go_on_from = |s: String| match store.peer(&peer_name(machine, &s)) {
+        Ok(rev) => vec![Msg::From { store: s, rev, zip: true, kept: true }],
+        Err(e) => {
+            tracing::warn!(%machine, store = %s, error = %format!("{e:#}"), "conversation feed: where the server's copy stands couldn't be read; the runner asks again");
+            Vec::new()
+        }
+    };
     match decode(json) {
-        Some(Msg::Hello { store: s }) => {
+        Some(Msg::Hello { store: s, .. }) => {
             partial.remove(&(peer, s.clone()));
-            let rev = have(&s);
-            tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
-            vec![Msg::From { store: s, rev, zip: true }]
+            let answer = go_on_from(s.clone());
+            if let Some(Msg::From { rev, .. }) = answer.first() {
+                tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
+            }
+            answer
         }
         Some(Msg::Batch { store: s, from, upto, part, parts, zip }) => {
             let key = (peer, s.clone());
@@ -339,8 +456,7 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
             if !fits {
                 // A part out of place (one went astray): start over from what the server has.
                 partial.remove(&key);
-                let rev = have(&s);
-                return vec![Msg::From { store: s, rev, zip: true }];
+                return go_on_from(s);
             }
             let p = partial.entry(key.clone()).or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new() });
             p.got += 1;
@@ -359,13 +475,20 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: an unreadable batch");
-                    let rev = have(&s);
-                    return vec![Msg::From { store: s, rev, zip: true }];
+                    return go_on_from(s);
                 }
             };
             let theirs = (brings == Brings::TheirMachine).then_some(machine);
-            match store.take(&peer_name(machine, &s), theirs, from, batch) {
-                Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev, zip: true }],
+            let copy = restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&s);
+            let took = if copy { store.take_copy(&peer_name(machine, &s), from, batch) } else { store.take(&peer_name(machine, &s), theirs, from, batch) };
+            if copy
+                && let (Ok(t), Some(echoes)) = (&took, echoes)
+                && let Some((first, last)) = t.wrote
+            {
+                echoes.add(machine, first, last);
+            }
+            match took {
+                Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev, zip: true, kept: true }],
                 Ok(t) => {
                     if t.fenced > 0 {
                         tracing::info!(%machine, fenced = t.fenced, "conversation feed: rows of sessions that went on elsewhere were left out");
@@ -379,7 +502,7 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                 }
             }
         }
-        Some(Msg::From { .. } | Msg::Ack { .. }) | None => Vec::new(),
+        Some(Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. }) | None => Vec::new(),
     }
 }
 
@@ -401,16 +524,16 @@ mod tests {
 
     fn feed_as(runner: &Store, server: &Store, machine: &str, brings: Brings, bytes: usize) -> anyhow::Result<u64> {
         let mut partial = HashMap::new();
-        let hello = take(server, &mut partial, 7, machine, brings, &encode(&Msg::Hello { store: runner.id().to_owned() }), Vec::new());
-        let Some(Msg::From { mut rev, zip, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
+        let hello = take(server, &mut partial, 7, machine, brings, &encode(&Msg::Hello { store: runner.id().to_owned(), restore: false }), Vec::new(), &Restores::default(), None);
+        let Some(Msg::From { mut rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
         loop {
-            let batch = runner.changes(rev, bytes)?;
+            let batch = runner.changes_as(rev, bytes, kept)?;
             if batch.rows.is_empty() {
                 return Ok(rev);
             }
             let mut answer = Vec::new();
             for (m, data) in parts(runner.id(), rev, &batch, zip)? {
-                answer = take(server, &mut partial, 7, machine, brings, &encode(&m), data);
+                answer = take(server, &mut partial, 7, machine, brings, &encode(&m), data, &Restores::default(), None);
             }
             match answer.first() {
                 Some(Msg::Ack { rev: r, .. }) => rev = *r,
@@ -420,7 +543,7 @@ mod tests {
     }
 
     fn line(session: &str, source: &str, n: u64, text: &str) -> super::super::rows::Row {
-        super::super::rows::Row::Record(Box::new(super::super::rows::RecordRow { session: session.into(), source: source.into(), n, end: (n + 1) * 100, line: text.into() }))
+        super::super::rows::Row::Record(Box::new(super::super::rows::RecordRow { session: session.into(), source: source.into(), n, end: (n + 1) * 100, line: text.into(), kept: None }))
     }
 
     #[test]
@@ -496,16 +619,29 @@ mod tests {
         let mut partial = HashMap::new();
         let mut answer = Vec::new();
         for (m, data) in parts(runner.id(), 2, &batch, true)? {
-            answer = take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data);
+            answer = take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data, &Restores::default(), None);
         }
-        assert_eq!(answer, vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true }]);
+        assert_eq!(answer, vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true, kept: true }]);
         assert_eq!(server.kept("a1", 10)?, None);
         // A part out of place: the same.
         let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?, true)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
         let Msg::Batch { store, from, upto, parts: n, .. } = m else { anyhow::bail!("not a batch") };
         let astray = Msg::Batch { store, from, upto, part: 1, parts: n + 1, zip: true };
-        assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data), vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true }]);
+        assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data, &Restores::default(), None), vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true, kept: true }]);
         Ok(())
+    }
+
+    #[test]
+    fn a_server_that_cannot_read_where_it_stands_says_nothing_rather_than_ask_for_everything() {
+        let server = super::super::store::stopped();
+        let mut partial = HashMap::new();
+        let restores = Restores::default();
+        let mut answer = |m: Msg, data: &[u8]| take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data.to_vec(), &restores, None);
+        assert_eq!(answer(Msg::Hello { store: "r".into(), restore: false }, b""), Vec::new());
+        assert_eq!(answer(Msg::Hello { store: "r".into(), restore: true }, b""), Vec::new());
+        // A part out of place, and a batch that can't be read: the same.
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 1, parts: 2, zip: false }, b"{}"), Vec::new());
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 0, parts: 1, zip: false }, b"not json"), Vec::new());
     }
 
     #[test]
@@ -534,6 +670,50 @@ mod tests {
         Ok(())
     }
 
+    /// A mirror's copy sent back restores what the server's store lost: a session it has nothing
+    /// of comes back where it ran, one it has from elsewhere stays as it is, and the copy ends
+    /// with what it held when it began.
+    #[test]
+    fn a_copy_sent_back_restores_what_the_server_lost() -> anyhow::Result<()> {
+        use super::super::rows::Row;
+        crate::rt::block_on(async move {
+            let (_m, mirror) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            // The mirror's copy: a session of a machine that is gone, and one still running.
+            let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 };
+            mirror.put(vec![session("gone"), Row::Machine { session: "gone".into(), machine: "old-box".into() }, session("live")]);
+            mirror.send("gone", &said("g1", 1, "from a machine that is gone"));
+            mirror.send("live", &said("l1", 1, "as it was"));
+            mirror.sync()?;
+            // The server's store, made again: the running session's machine sent it already.
+            server.put(vec![session("live")]);
+            server.send("live", &said("l1", 1, "as it is now"));
+            server.sync()?;
+            let restores = Restores::default();
+            restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(mirror.id().to_owned());
+            let (ship, out) = Shipper::start_restore(mirror.clone());
+            ship.link(Link::Up);
+            let mut partial = HashMap::new();
+            let mut restored = None;
+            for _ in 0..50 {
+                let Ok(Ok((json, data))) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await else { break };
+                if let Some(Msg::Restored { store, rev }) = decode(&json) {
+                    restored = Some((store, rev));
+                    break;
+                }
+                for m in take(&server, &mut partial, 7, "mirror-box", Brings::AsItSays, &json, data, &restores, None) {
+                    ship.link(Link::Heard(m));
+                }
+            }
+            assert_eq!(restored, Some((mirror.id().to_owned(), mirror.top()?)));
+            assert_eq!(server.kept("gone", 10)?.map(|k| k.events.len()), Some(1));
+            assert_eq!(server.unended(0)?.into_iter().find(|u| u.id == "gone").and_then(|u| u.machine).as_deref(), Some("old-box"));
+            assert_eq!(server.kept("live", 10)?.and_then(|k| k.events.first().map(|e| e.text.clone())).as_deref(), Some("as it is now"));
+            assert_eq!(server.end_copy()?, 1);
+            Ok(())
+        })
+    }
+
     #[test]
     fn the_shipper_sends_what_the_store_writes_and_starts_over_after_a_gap() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -544,7 +724,7 @@ mod tests {
             let mut partial = HashMap::new();
             // The server's side, in this test: what the shipper sends is taken, answers go back.
             let answer = |json: String, data: Vec<u8>, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>| {
-                for m in take(&server, partial, 7, "box", Brings::TheirMachine, &json, data) {
+                for m in take(&server, partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
                     ship.link(Link::Heard(m));
                 }
             };
@@ -560,6 +740,67 @@ mod tests {
                 }
             }
             assert_eq!(server.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_taker_that_takes_lines_as_kept_gets_them_compressed_and_one_from_before_gets_text() -> anyhow::Result<()> {
+        let (_r, runner) = super::super::store::scratch()?;
+        let (_s, server) = super::super::store::scratch()?;
+        let long = format!("{{\"type\":\"assistant\",\"text\":\"{}\"}}", "the agent read the file and wrote a patch ".repeat(40));
+        runner.put(vec![line("a1", "s-1", 0, "{\"type\":\"summary\"}"), line("a1", "s-1", 1, &long)]);
+        runner.sync()?;
+        let records = |c: &Changes| -> Vec<(bool, bool)> { c.rows.iter().filter_map(|c| if let super::super::rows::Row::Record(r) = &c.row { Some((r.kept.is_some(), r.line.is_empty())) } else { None }).collect() };
+        // As kept: the long line goes compressed, the short one as it is.
+        assert_eq!(records(&runner.changes_as(0, 1 << 20, true)?), vec![(false, false), (true, true)]);
+        // A taker from before never says `kept`, and gets text.
+        assert_eq!(records(&runner.changes_as(0, 1 << 20, false)?), vec![(false, false), (false, false)]);
+        assert_eq!(decode(r#"{"t":"from","store":"s","rev":1,"zip":true}"#), Some(Msg::From { store: "s".into(), rev: 1, zip: true, kept: false }));
+        assert_eq!(encode(&Msg::From { store: "s".into(), rev: 1, zip: true, kept: false }), r#"{"t":"from","store":"s","rev":1,"zip":true}"#);
+        // The server, which takes them so, keeps them and reads them back the same.
+        feed_all(&runner, &server, "box", 1 << 20)?;
+        assert_eq!(server.record("a1", "s-1", 0, 10)?, vec![(0, "{\"type\":\"summary\"}".to_owned()), (1, long)]);
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_mirror_sent_back_is_known_by_the_numbers_it_was_written_under() {
+        let e = Echoes::default();
+        e.add("m", 5, 9);
+        e.add("m", 10, 12);
+        e.add("m", 20, 20);
+        e.add("other", 1, 100);
+        assert!(e.has("m", 5) && e.has("m", 9) && e.has("m", 10) && e.has("m", 12) && e.has("m", 20));
+        assert!(!e.has("m", 4) && !e.has("m", 13) && !e.has("m", 19) && !e.has("m", 21));
+        assert!(!e.has("nobody", 5));
+    }
+
+    #[test]
+    fn a_shipper_leaves_out_what_the_taker_has_and_still_goes_through_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            for i in 1..=3u64 {
+                runner.send("a1", &said(&format!("m{i}"), i, "x"));
+            }
+            runner.sync()?;
+            let (ship, out) = Shipper::start_skipping(runner.clone(), std::sync::Arc::new(|rev| rev == 2));
+            ship.link(Link::Up);
+            let mut partial = HashMap::new();
+            let at = || server.peer(&peer_name("box", runner.id()));
+            for _ in 0..50 {
+                let Ok(Ok((json, data))) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await else { break };
+                for m in take(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                    ship.link(Link::Heard(m));
+                }
+                if at()? == 3 {
+                    break;
+                }
+            }
+            assert_eq!(at()?, 3, "the taker is through the row left out");
+            let ids: Vec<String> = server.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.id).collect()).unwrap_or_default();
+            assert_eq!(ids, vec!["m1".to_owned(), "m3".to_owned()]);
             Ok(())
         })
     }

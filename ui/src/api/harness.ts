@@ -320,6 +320,19 @@ export interface State {
   manual_resume?: boolean;
   /** At a limit it goes on on another machine whose harness is signed in to an account with room. */
   move_on_limit?: boolean;
+  /** Where it goes on then, as a person chose (sent by runners that take one, empty or not). */
+  move_plan?: MovePlan;
+}
+
+/**
+ * Where an agent goes on at a usage limit (`State.move_plan`): a machine (`agent:<name>`), and a
+ * harness and model there. What isn't said kiln picks: whichever has room, its own harness or one
+ * its conversation can be carried into.
+ */
+export interface MovePlan {
+  to?: string;
+  kind?: string;
+  model?: string;
 }
 
 /** Why a session waits for a usage limit, and until when (`State.pause`). */
@@ -579,6 +592,8 @@ export interface AgentInfo {
   keep_off?: boolean;
   /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
   move_on_limit?: boolean;
+  /** Where it goes on then (as `State.move_plan`). */
+  move_plan?: MovePlan;
   /** Where it pauses as its limits fill (as `State.pause_at`). */
   pause_at?: number;
   cost_usd: number;
@@ -692,8 +707,8 @@ export type Command =
   | { type: "auto_resume"; on: boolean }
   /** Pause once a limit is this full (null: only when one is reached). */
   | { type: "pause_at"; percent: number | null }
-  /** Whether at a limit it goes on on another machine with room. */
-  | { type: "move_on_limit"; on: boolean };
+  /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
+  | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
 export type Update =
   | { t: "open"; info: AgentInfo }
@@ -701,6 +716,8 @@ export type Update =
   | { t: "error"; error: string }
   | { t: "closed" }
   | { t: "state"; state: State }
+  /** What changed in the state since the last one (asked for with `?patch=state`): the fields set, and those gone. */
+  | { t: "state_patch"; set: Partial<State>; gone?: string[] }
   | { t: "meta"; meta: Meta }
   | { t: "events"; events: HEvent[] }
   | { t: "stream"; id: string; text: string }
@@ -766,7 +783,8 @@ export const harnessApi = {
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
-  move: (id: string, to: string, now = false) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now }),
+  move: (id: string, to: string, now = false, kind?: string, model?: string) =>
+    call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
@@ -823,12 +841,35 @@ export interface Snapshot {
   ready: boolean;
   /** A stop asked of the turn under way: which turn, and when (ms). Done with once none runs. */
   stopAsked: { turn: number | undefined; at: number } | null;
+  /** When the turn under way began, kept once it ends: between turns the clock holds the last one's length. */
+  ranFrom: number | null;
+}
+
+/**
+ * When the last turn began, for the clock between turns: as this page saw it start, else (opened
+ * since, or the start went by unseen) when it was last asked something before it ended. Null while
+ * a turn runs, and before one has ended.
+ */
+export function lastTurnFrom(s: Snapshot): number | null {
+  const end = s.state?.last_turn?.at;
+  if (end == null || s.state?.turn_started != null) return null;
+  let asked = 0;
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (e?.kind === "user" && e.at <= end) {
+      asked = e.at;
+      break;
+    }
+  }
+  const seen = s.ranFrom != null && s.ranFrom <= end ? s.ranFrom : 0;
+  // What it saw start, unless a later ask began a turn it didn't see.
+  return seen && seen + 2000 >= asked ? seen : asked || null;
 }
 
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null, ranFrom: null };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -849,6 +890,13 @@ const ENDED_RETRY_MS = 10_000;
 const LINGER_MS = 30_000;
 /** Conversations kept in memory once left (the latest ones). */
 const KEEP = 8;
+/**
+ * The browser unpacks gzip itself (every current one does): a session's snapshot comes packed, a
+ * long conversation's history in a tenth of the bytes.
+ */
+const GUNZIP = typeof DecompressionStream !== "undefined";
+/** A packed message's text. */
+const gunzip = (data: ArrayBuffer): Promise<string> => new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
 
 /**
  * What came, with every part equal to what was there kept as it was (the whole of it when it's all
@@ -888,6 +936,16 @@ const withState = (info: AgentInfo | null, s: State): AgentInfo | null => {
     : { ...info, name: name ?? info.name, status: s.status, title: s.title, model: s.model, mode: s.mode };
 };
 
+/** The state with a patch applied: what it sets, without what's gone, every other field the same object. */
+const patched = (was: State | null, u: { set: Partial<State>; gone?: string[] }): State => {
+  const now: Record<string, unknown> = { ...was, ...u.set };
+  for (const k of u.gone ?? []) delete now[k];
+  return now as unknown as State;
+};
+
+/** The socket's query: a snapshot packed when it can be unpacked here, and a state as what changed in it. */
+const TAKES = GUNZIP ? "?z=gzip&patch=state" : "?patch=state";
+
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
   info: AgentInfo | null;
@@ -923,6 +981,8 @@ export class SessionStore {
   /** Since the last notification: events replaced, new ones, a new snapshot. */
   private touched = new Set<string>();
   private grew = false;
+  /** Ids of the events new since the last notification, as they came. */
+  private fresh: string[] = [];
   private reorder = false;
   private incoming: Incoming | null = null;
   private listeners = new Set<() => void>();
@@ -952,6 +1012,9 @@ export class SessionStore {
   idleSince = 0;
   private replies = new Map<string, (v: unknown) => void>();
   private waiting: { promise: Promise<void>; resolve: () => void } | null = null;
+  /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
+  private unpacking = 0;
+  private inbox: Promise<void> = Promise.resolve();
 
   constructor(readonly id: string) {}
 
@@ -1082,29 +1145,63 @@ export class SessionStore {
     this.incoming = null;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws`));
+      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}`));
     } catch {
       this.retry();
       return;
     }
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
     this.wsAt = Date.now();
+    this.unpacking = 0;
     ws.onmessage = (ev) => {
-      if (this.ws !== ws || typeof ev.data !== "string") return;
-      let u: Update;
-      try {
-        u = JSON.parse(ev.data) as Update;
-      } catch {
+      if (this.ws !== ws) return;
+      if (typeof ev.data === "string") {
+        this.receive(ws, ev.data);
         return;
       }
-      this.frames += 1;
-      this.apply(u);
+      // A packed snapshot (`?z=gzip`): unpacked, then its lines taken in order; what comes after
+      // it waits its turn.
+      const data = ev.data as ArrayBuffer;
+      this.unpacking += 1;
+      this.inbox = this.inbox
+        .then(() => gunzip(data))
+        .then((text) => {
+          if (this.ws === ws) for (const line of text.split("\n")) if (line) this.take1(line);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          this.unpacking -= 1;
+        });
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
       this.lost();
     };
+  }
+
+  /** A message as it came: at once, unless a packed one before it is still being unpacked. */
+  private receive(ws: WebSocket, data: string) {
+    if (this.unpacking === 0) {
+      this.take1(data);
+      return;
+    }
+    this.inbox = this.inbox.then(() => {
+      if (this.ws === ws) this.take1(data);
+    });
+  }
+
+  /** One update, as JSON. */
+  private take1(data: string) {
+    let u: Update;
+    try {
+      u = JSON.parse(data) as Update;
+    } catch {
+      return;
+    }
+    this.frames += 1;
+    this.apply(u);
   }
 
   /** The socket closed: try again (rarely once it has ended, in case it was only away). */
@@ -1201,8 +1298,9 @@ export class SessionStore {
         inc.meta = u.meta;
         break;
       case "state":
-        inc.state = u.state;
-        inc.info = withState(inc.info, u.state);
+      case "state_patch":
+        inc.state = u.t === "state" ? u.state : patched(inc.state, u);
+        inc.info = withState(inc.info, inc.state);
         break;
       case "changes":
         inc.changes = u.files;
@@ -1244,6 +1342,7 @@ export class SessionStore {
       info: share(s.info, inc.info),
       meta: share(s.meta, inc.meta),
       state: share(s.state, inc.state),
+      ranFrom: inc.state?.turn_started ?? s.ranFrom,
       changes: share(s.changes, inc.changes),
       error: null,
       ready: true,
@@ -1278,11 +1377,13 @@ export class SessionStore {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
         break;
-      case "state": {
-        const state = share<State | null>(this.snap.state, u.state) ?? u.state;
+      case "state":
+      case "state_patch": {
+        const now = u.t === "state" ? u.state : patched(this.snap.state, u);
+        const state = share<State | null>(this.snap.state, now) ?? now;
         // A stop asked of a turn holds while one runs; once none does, it's done with.
         const stopAsked = state.status === "running" || state.status === "waiting" ? this.snap.stopAsked : null;
-        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked };
+        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked, ranFrom: state.turn_started ?? this.snap.ranFrom };
         break;
       }
       case "meta":
@@ -1293,6 +1394,7 @@ export class SessionStore {
           const was = this.byId.get(e.id);
           if (!was) {
             this.grew = true;
+            this.fresh.push(e.id);
             this.byId.set(e.id, e);
             continue;
           }
@@ -1323,13 +1425,39 @@ export class SessionStore {
     w?.resolve();
   }
 
-  /** The events in timeline order: the same array while they are, and the same objects. */
+  /**
+   * The events in timeline order: the same array while they are, and the same objects. What's new
+   * almost always comes after the last one, and joins at the end as it is (sorting thousands of
+   * events for each new one stalled long conversations); only one that doesn't sorts them all.
+   */
   private ordered(): HEvent[] {
     const was = this.snap.events;
+    if (this.grew && !this.reorder) {
+      const add = this.fresh.map((id) => this.byId.get(id)).filter((e): e is HEvent => e !== undefined);
+      add.sort((a, b) => a.seq - b.seq);
+      const last = was.length ? (was[was.length - 1]?.seq ?? -Infinity) : -Infinity;
+      if ((add[0]?.seq ?? Infinity) > last) {
+        const next = was.slice();
+        for (const id of this.touched) {
+          const i = this.pos.get(id);
+          const e = this.byId.get(id);
+          if (i !== undefined && e) next[i] = e;
+        }
+        for (const e of add) {
+          this.pos.set(e.id, next.length);
+          next.push(e);
+        }
+        this.grew = false;
+        this.fresh = [];
+        this.touched.clear();
+        return next;
+      }
+    }
     if (this.reorder || this.grew) {
       const next = [...this.byId.values()].sort((a, b) => a.seq - b.seq);
       this.reorder = false;
       this.grew = false;
+      this.fresh = [];
       this.touched.clear();
       const out = next.length === was.length && next.every((e, i) => e === was[i]) ? was : next;
       this.pos = new Map(out.map((e, i) => [e.id, i]));

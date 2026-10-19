@@ -49,15 +49,36 @@ struct Mirror {
     location: Location,
     meta: Value,
     state: Value,
+    /// The state as its viewers last had it sent (what a state patch is made against).
+    sent: Value,
     changes: Value,
     events: Vec<Value>,
     index: HashMap<String, usize>,
-    out: Broadcast<Arc<str>>,
+    out: Broadcast<Frame>,
 }
 
 impl Mirror {
     fn new(info: Info, location: Location) -> Self {
-        Self { info, reported: String::new(), location, meta: Value::Null, state: Value::Null, changes: Value::Null, events: Vec::new(), index: HashMap::new(), out: Broadcast::new(FANOUT) }
+        Self {
+            info,
+            reported: String::new(),
+            location,
+            meta: Value::Null,
+            state: Value::Null,
+            sent: Value::Null,
+            changes: Value::Null,
+            events: Vec::new(),
+            index: HashMap::new(),
+            out: Broadcast::new(FANOUT),
+        }
+    }
+
+    /// The state as a frame for its viewers, with what changed in it since the last one.
+    fn state_frame(&mut self) -> Frame {
+        let text = json!({"t": "state", "state": self.state}).to_string();
+        let patch = (self.out.receiver_count() > 0).then(|| state_patch(&self.sent, &self.state)).flatten();
+        self.sent.clone_from(&self.state);
+        Frame { text: Arc::from(text), patch: patch.map(Arc::from) }
     }
 
     fn reindex(&mut self) {
@@ -81,10 +102,9 @@ impl Mirror {
 
     fn append(&mut self, id: &str, text: &str) {
         if let Some(e) = self.index.get(id).and_then(|i| self.events.get_mut(*i))
-            && let Some(t) = e.get_mut("text")
-            && let Some(s) = t.as_str()
+            && let Some(Value::String(s)) = e.get_mut("text")
         {
-            *t = Value::String(format!("{s}{text}"));
+            s.push_str(text);
         }
     }
 
@@ -131,7 +151,39 @@ pub enum Sent {
 /// What a viewer gets on attach: the catch-up frames and the live ones after them.
 pub struct Attachment {
     pub frames: Vec<String>,
-    pub live: async_broadcast::Receiver<Arc<str>>,
+    pub live: async_broadcast::Receiver<Frame>,
+}
+
+/// A live frame for a session's viewers. A state comes as well as only what changed since the
+/// last one (`patch`), for a viewer that takes that: during a turn its usage and activity change
+/// all the time, its skills, plugins and servers seldom.
+#[derive(Clone)]
+pub struct Frame {
+    pub text: Arc<str>,
+    pub patch: Option<Arc<str>>,
+}
+
+impl Frame {
+    pub fn of(text: String) -> Self {
+        Self { text: Arc::from(text), patch: None }
+    }
+
+    /// The frame for a viewer that takes state patches, or one that doesn't.
+    pub fn for_viewer(&self, patches: bool) -> &str {
+        match &self.patch {
+            Some(p) if patches => p,
+            _ => &self.text,
+        }
+    }
+}
+
+/// `{"t":"state_patch","set":{..},"gone":[..]}`: the top-level fields of `now` that differ from
+/// `was`, and those it no longer has. None when there is nothing to patch (no state before).
+fn state_patch(was: &Value, now: &Value) -> Option<String> {
+    let (Value::Object(was), Value::Object(now)) = (was, now) else { return None };
+    let set: serde_json::Map<String, Value> = now.iter().filter(|(k, v)| was.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let gone: Vec<&String> = was.keys().filter(|k| !now.contains_key(*k)).collect();
+    Some(if gone.is_empty() { json!({"t": "state_patch", "set": set}) } else { json!({"t": "state_patch", "set": set, "gone": gone}) }.to_string())
 }
 
 /// A file uploaded for a message, kept briefly until the message is sent.
@@ -147,6 +199,24 @@ const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const UPLOADS_MAX: usize = 512 << 20;
 /// Pieces a file is sent to a machine in (lane frames are bounded).
 const FILE_CHUNK: usize = 512 * 1024;
+
+/// Restoring the conversation store from a mirror's copy of it (`docs/conversations.md`,
+/// "Mirrors"): `GET /api/conversations/restore`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Restore {
+    Idle,
+    /// `from` was asked for its copy.
+    Asked { from: String, at: i64 },
+    /// `from` is sending its copy `store`.
+    Copying { from: String, store: String, at: i64 },
+    /// Done: `sessions` came back.
+    Done { from: String, sessions: usize, at: i64 },
+    Failed { from: String, error: String, at: i64 },
+}
+
+/// A mirror asked for its copy that hasn't begun sending it after this long isn't answering.
+const RESTORE_ANSWER_MS: i64 = 120_000;
 
 pub struct Registry {
     mirrors: Mutex<HashMap<String, Mirror>>,
@@ -182,6 +252,11 @@ pub struct Registry {
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
     /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
     epochs: Mutex<HashMap<String, u64>>,
+    /// Restoring the conversation store from a mirror's copy of it.
+    restore: Mutex<Restore>,
+    /// The mirrors to ask for their copy as they connect: the store was found empty at start
+    /// while the server had mirrors (it was lost, the rest wasn't).
+    restore_auto: Mutex<Vec<String>>,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -221,8 +296,10 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = crate::convo::open(&dir, conversations.keep_closed());
-        // Runners that keep a store send it here; the server keeps their sessions from that.
-        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine)) {
+        // Runners that keep a store send it here; the server keeps their sessions from that. What
+        // a mirror sends back to restore the store from isn't sent to it again.
+        let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
+        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine, Some(echoes.clone()))) {
             Some(Ok((i, o))) => (Some(i), Some(o)),
             Some(Err(e)) => {
                 tracing::warn!(error = %format!("{e:#}"), "runners' conversation stores won't reach the server's");
@@ -232,11 +309,18 @@ impl Registry {
         };
         let (copies, copies_out) = match convo.clone().filter(|_| conversations.mirrors > 0) {
             Some(st) => {
-                let (m, out) = crate::convo::mirror::Mirrors::start(st, conversations.mirrors, conversations.mirror_on.clone(), dir.join("mirrors.json"));
+                let (m, out) = crate::convo::mirror::Mirrors::start(st, conversations.mirrors, conversations.mirror_on.clone(), dir.join("mirrors.json"), Some(echoes));
                 (Some(m), Some(out))
             }
             None => (None, None),
         };
+        let restore_auto = match (&copies, &convo) {
+            (Some(m), Some(st)) if st.is_empty().unwrap_or(false) => m.chosen_machines(),
+            _ => Vec::new(),
+        };
+        if !restore_auto.is_empty() {
+            tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
+        }
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
@@ -256,6 +340,97 @@ impl Registry {
             epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
+            restore: Mutex::new(Restore::Idle),
+            restore_auto: Mutex::new(restore_auto),
+        }
+    }
+
+    /// Where restoring the conversation store from a mirror's copy stands.
+    pub fn restore_view(&self) -> Restore {
+        let mut r = self.restore.lock();
+        if let Restore::Asked { from, at } = &*r
+            && crate::util::now_ms() - at > RESTORE_ANSWER_MS
+        {
+            *r = Restore::Failed { from: from.clone(), error: "no answer: its kiln may be too old to send its copy back".into(), at: crate::util::now_ms() };
+        }
+        r.clone()
+    }
+
+    /// Ask `machine`, a mirror, for its copy of the conversation store, to restore this one from:
+    /// what the copy brings fills in what the store lacks (`docs/conversations.md`, "Mirrors").
+    pub fn restore_from(&self, hub: &Arc<Hub>, machine: &str) -> anyhow::Result<()> {
+        let st = self.convo.as_ref().ok_or_else(|| anyhow::anyhow!("the conversation store is off"))?;
+        anyhow::ensure!(self.feed.is_some(), "this server takes no conversation feeds");
+        let peer = hub.instances.lock().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{machine} isn't connected, or keeps no conversation store"))?;
+        if matches!(self.restore_view(), Restore::Asked { .. } | Restore::Copying { .. }) {
+            anyhow::bail!("a restore is already under way");
+        }
+        *self.restore.lock() = Restore::Asked { from: machine.to_owned(), at: crate::util::now_ms() };
+        self.restore_auto.lock().clear();
+        tracing::info!(%machine, "asked a mirror for its copy of the conversation store, to restore this one from");
+        let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Restore { store: st.id().to_owned() });
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json, data: Vec::new() }) {
+                h.net.send(peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Mirror `machine` begins sending back its copy `store`: whether it was asked for.
+    pub fn restore_accepts(&self, machine: &str, store: &str) -> bool {
+        let mut r = self.restore.lock();
+        match &*r {
+            Restore::Asked { from, .. } if from == machine => {
+                *r = Restore::Copying { from: machine.to_owned(), store: store.to_owned(), at: crate::util::now_ms() };
+                true
+            }
+            // Said again (it asks again after a silence).
+            Restore::Copying { from, store: s, .. } => from == machine && s == store,
+            _ => false,
+        }
+    }
+
+    /// Mirror `machine` has sent back its copy `store` whole (an empty `store`: it has none):
+    /// the sessions it brought back are listed, away, on the machines they ran on.
+    pub fn restore_done(&self, hub: &Arc<Hub>, machine: &str, store: &str) {
+        let state = self.restore.lock().clone();
+        match state {
+            Restore::Asked { from, .. } if from == machine && store.is_empty() => {
+                *self.restore.lock() = Restore::Failed { from, error: format!("{machine} keeps no copy of the conversation store"), at: crate::util::now_ms() };
+            }
+            Restore::Copying { from, store: s, .. } if from == machine && s == store => {
+                let (h, st) = (Arc::clone(hub), self.convo.clone());
+                crate::rt::spawn(async move {
+                    let ended = match st {
+                        Some(st) => crate::rt::blocking(move || st.end_copy()).await.and_then(|r| r),
+                        None => Err(anyhow::anyhow!("the conversation store is off")),
+                    };
+                    let at = crate::util::now_ms();
+                    match ended {
+                        Ok(sessions) => {
+                            tracing::info!(machine = %from, sessions, "the conversation store was restored from a mirror's copy");
+                            Self::list_away(&h).await;
+                            *h.harness.restore.lock() = Restore::Done { from, sessions, at };
+                        }
+                        Err(e) => *h.harness.restore.lock() = Restore::Failed { from, error: format!("{e:#}"), at },
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Runner `machine` keeping a store connected: asked for its copy when the store was found
+    /// empty at start and it is one of the server's mirrors.
+    pub fn restore_due(&self, hub: &Arc<Hub>, machine: &str) {
+        let due = self.restore_auto.lock().iter().any(|m| m == machine);
+        if due
+            && matches!(self.restore_view(), Restore::Idle)
+            && let Err(e) = self.restore_from(hub, machine)
+        {
+            tracing::warn!(%machine, error = %format!("{e:#}"), "couldn't ask a mirror for its copy of the conversation store");
         }
     }
 
@@ -319,7 +494,8 @@ impl Registry {
             m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
-                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                let frame = m.state_frame();
+                m.out.send(frame);
             }
             m.info.clone()
         };
@@ -389,27 +565,32 @@ impl Registry {
         }
     }
 
+    /// Lists the sessions of machines that are away, from the store (the last month's): after a
+    /// start, and after a restore from a mirror's copy.
+    pub async fn list_away(hub: &Arc<Hub>) {
+        let Some(st) = hub.harness.convo.clone() else { return };
+        const AWAY_DAYS: i64 = 30;
+        const AWAY_EVENTS: usize = 200;
+        let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
+        let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+            let mut out = Vec::new();
+            for u in st.unended(since)? {
+                let events = st.events(&u.id, None, AWAY_EVENTS)?;
+                out.push((u, events));
+            }
+            Ok(out)
+        })
+        .await;
+        match read {
+            Ok(Ok(away)) => hub.harness.restore_away(hub, away),
+            Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
+        }
+    }
+
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
         static RESTORED: std::sync::Once = std::sync::Once::new();
-        // Sessions of machines that are away: listed from the store (the last month's).
-        if let Some(st) = hub.harness.convo.clone() {
-            const AWAY_DAYS: i64 = 30;
-            const AWAY_EVENTS: usize = 200;
-            let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
-            let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
-                let mut out = Vec::new();
-                for u in st.unended(since)? {
-                    let events = st.events(&u.id, None, AWAY_EVENTS)?;
-                    out.push((u, events));
-                }
-                Ok(out)
-            })
-            .await;
-            match read {
-                Ok(Ok(away)) => hub.harness.restore_away(&hub, away),
-                Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
-            }
-        }
+        // Sessions of machines that are away: listed from the store.
+        Self::list_away(&hub).await;
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
@@ -670,11 +851,11 @@ impl Registry {
             }
             // A state goes out with the name given here in it (the machine's may lack it).
             let frame = match &u {
-                Update::State { .. } => Some(json!({"t": "state", "state": m.state}).to_string()),
-                _ => serde_json::to_string(&u).ok(),
+                Update::State { .. } => Some(m.state_frame()),
+                _ => serde_json::to_string(&u).ok().map(Frame::of),
             };
             if let Some(frame) = frame {
-                m.out.send(Arc::from(frame));
+                m.out.send(frame);
             }
             if gone {
                 g.remove(id);
@@ -748,7 +929,7 @@ impl Registry {
                 .collect();
             for id in &gone {
                 if let Some(m) = g.remove(id) {
-                    m.out.send(Arc::from(json!({"t": "closed"}).to_string()));
+                    m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
                 }
             }
             gone
@@ -769,7 +950,8 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                let frame = m.state_frame();
+                m.out.send(frame);
                 infos.push(m.info.clone());
             }
         }
@@ -791,7 +973,8 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                let frame = m.state_frame();
+                m.out.send(frame);
                 infos.push(m.info.clone());
             }
         }
@@ -892,6 +1075,7 @@ impl Registry {
                         last_turn: None,
                         keep_off: false,
                         move_on_limit: false,
+                        move_plan: Default::default(),
                         pause_at: None,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
@@ -1107,7 +1291,7 @@ impl Registry {
         // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(m) = self.mirrors.lock().remove(id) {
-                m.out.send(Arc::from(json!({"t": "closed"}).to_string()));
+                m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
             }
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
@@ -1145,6 +1329,41 @@ mod tests {
         // Renamed here while the machine still reports its old one: the new one shows until the
         // machine takes it.
         assert_eq!(naming("slates-6d", "slates-6d", "Claude Code", true), Naming::Keep);
+    }
+
+    #[test]
+    fn a_state_goes_out_whole_and_as_what_changed_in_it() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info::default(), Location::Local);
+        let mut live = m.out.subscribe();
+        let skills = json!([{"name": "deploy", "description": "Ship it. ".repeat(200)}]);
+        m.state = json!({"status": "running", "activity": "reading", "skills": skills, "pause": {"reason": "limit"}});
+        let f = m.state_frame();
+        // The first goes whole: there is nothing before it to patch.
+        assert!(f.patch.is_none());
+        assert_eq!(f.for_viewer(true), f.for_viewer(false));
+        m.out.send(f);
+        m.state = json!({"status": "running", "activity": "editing", "skills": skills});
+        let f = m.state_frame();
+        m.out.send(f);
+        let first = live.try_recv()?;
+        let second = live.try_recv()?;
+        let whole: Value = serde_json::from_str(second.for_viewer(false))?;
+        assert_eq!(whole, json!({"t": "state", "state": m.state}));
+        // As what changed: the activity set, the pause gone, the skills (most of it) left out.
+        let patch: Value = serde_json::from_str(second.for_viewer(true))?;
+        assert_eq!(patch, json!({"t": "state_patch", "set": {"activity": "editing"}, "gone": ["pause"]}));
+        assert!(second.for_viewer(true).len() * 20 < second.for_viewer(false).len());
+        // Applied to what came first, it makes the state now.
+        let mut had: Value = serde_json::from_str(first.for_viewer(true))?;
+        let had = had.get_mut("state").and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("no state"))?;
+        for (k, v) in patch.get("set").and_then(Value::as_object).into_iter().flatten() {
+            had.insert(k.clone(), v.clone());
+        }
+        for k in patch.get("gone").and_then(Value::as_array).into_iter().flatten() {
+            had.remove(k.as_str().unwrap_or_default());
+        }
+        assert_eq!(Value::Object(had.clone()), m.state);
+        Ok(())
     }
 
     #[test]

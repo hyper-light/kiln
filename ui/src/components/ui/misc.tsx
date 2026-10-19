@@ -182,7 +182,8 @@ export function TextField({
   className,
   ...props
 }: React.InputHTMLAttributes<HTMLInputElement> & { label: string; hint?: React.ReactNode }) {
-  const id = React.useId();
+  const auto = React.useId();
+  const id = props.id ?? auto;
   return (
     <div className={className}>
       <label htmlFor={id} className="field-label">

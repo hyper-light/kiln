@@ -6,6 +6,7 @@ import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Me, Status } from "@/api/types";
 import { Brand } from "./brand";
+import { ClusterBar, ClusterFrames, ClusterPicker, useClusters } from "./clusters";
 import { ConnectionIndicator } from "./connection";
 import { CommandPalette, setPaletteOpen, usePalette } from "./command-palette";
 import { MotionToggle } from "./motion";
@@ -123,6 +124,8 @@ export function AppShell({ me }: { me: Me | null }) {
   const closeMenu = React.useCallback(() => setMenuAt(null), []);
   const menuAway = React.useMemo(() => closeOnPressAway(closeMenu), [closeMenu]);
   const paletteOpen = usePalette((s) => s.open);
+  // A peered cluster is shown: its frame fills the page, this cluster's stays loaded underneath.
+  const away = useClusters((s) => s.shown !== null);
   useRunFailureToasts();
 
   return (
@@ -140,6 +143,9 @@ export function AppShell({ me }: { me: Me | null }) {
           >
             <Brand />
           </Link>
+          <React.Suspense fallback={null}>
+            <ClusterPicker />
+          </React.Suspense>
           <nav className="desktop-nav hidden xl:flex" aria-label="Main navigation">
             {NAV.map((n, i) => (
               <NavLink key={n.to} to={n.to} end={n.end}>
@@ -224,29 +230,35 @@ export function AppShell({ me }: { me: Me | null }) {
             </nav>
           </div>
         )}
+        <React.Suspense fallback={null}>
+          <ClusterBar />
+        </React.Suspense>
         <CommandPalette />
       </header>
 
-      <main id="main" ref={fullHeight ? fitTheWindow : undefined} className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
-        {!onTerminal && (
-          <ErrorBoundary resetKey={location.pathname}>
-            <React.Suspense fallback={<RouteFallback />}>
-              <Outlet />
-            </React.Suspense>
-          </ErrorBoundary>
-        )}
-        {termMounted && (
-          <div className={onTerminal ? "flex min-h-0 flex-1 flex-col" : "hidden"} aria-hidden={!onTerminal}>
-            <ErrorBoundary label="Terminal crashed">
+      <main id="main" ref={fullHeight || away ? fitTheWindow : undefined} className={fullHeight || away ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
+        <div className={away ? "hidden" : "contents"}>
+          {!onTerminal && (
+            <ErrorBoundary resetKey={location.pathname}>
               <React.Suspense fallback={<RouteFallback />}>
-                <TerminalWorkspace visible={onTerminal} />
+                <Outlet />
               </React.Suspense>
             </ErrorBoundary>
-          </div>
-        )}
+          )}
+          {termMounted && (
+            <div className={onTerminal ? "flex min-h-0 flex-1 flex-col" : "hidden"} aria-hidden={!onTerminal}>
+              <ErrorBoundary label="Terminal crashed">
+                <React.Suspense fallback={<RouteFallback />}>
+                  <TerminalWorkspace visible={onTerminal} />
+                </React.Suspense>
+              </ErrorBoundary>
+            </div>
+          )}
+        </div>
+        <ClusterFrames />
       </main>
 
-      {!fullHeight && (
+      {!fullHeight && !away && (
         <footer className="site-footer">
           <div className="container-console flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
             <span className="flex items-center gap-2.5">

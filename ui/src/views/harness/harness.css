@@ -2609,9 +2609,59 @@ textarea.hx-input {
   color: #c3c8d2;
   cursor: pointer;
 }
-.hx-paused-switch {
+/* A select in a line of words (pausing, at a limit, going on now): the size of the words. */
+.hx-pick {
   min-width: 0;
   max-width: 100%;
+}
+.hx-pick select {
+  min-height: 28px;
+  padding: 3px 26px 3px 9px;
+  font-size: 12.5px;
+}
+.hx-pick > svg {
+  right: 8px;
+}
+@media (pointer: coarse) {
+  .hx-pick select {
+    min-height: 34px;
+  }
+}
+.hx-atlimit {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+.hx-pick-why {
+  color: #9aa1ad;
+  font-size: 12px;
+}
+/* Going on now, from a pause: where, in what, go. */
+.hx-goon {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.hx-goon-label {
+  margin-right: 2px;
+  color: #c3c8d2;
+  font-size: 12.5px;
+}
+/* What you did there didn't happen: why, and what works. */
+.hx-paused-stuck {
+  margin: 0;
+  color: #d8c8b0;
+  font-size: 12.5px;
+}
+.hx-paused-stuck a,
+.hx-paused-link {
+  color: #ead8bd;
+  text-decoration: underline;
+  text-decoration-color: rgb(234 216 189 / 45%);
+  text-underline-offset: 2px;
 }
 .hx-paused-kept {
   font-size: 12px;

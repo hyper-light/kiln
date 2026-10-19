@@ -18,7 +18,7 @@ import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindN
 import { Output, Prose, ToolIcon } from "./parts";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { copyText } from "@/views/terminal/clipboard";
-import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, formatThought, type BeamStatus } from "./signals";
+import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, formatThought, thinkingWords, type BeamStatus } from "./signals";
 import { usePlaces, type Place } from "./state";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
@@ -373,7 +373,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
 
 /* ------------------------------------------------------------------ items & turns */
 
-function Thought({ e, more = [] }: { e: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }) {
+function Thought({ e, more = [], effort }: { e: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[]; effort?: string }) {
   const [open, setOpen] = React.useState(false);
   useRevealed(
     (id) => id === e.id || more.some((m) => m.id === id),
@@ -384,7 +384,7 @@ function Thought({ e, more = [] }: { e: Extract<HEvent, { kind: "thinking" }>; m
   const live = all.some((x) => x.streaming);
   return (
     <div className="hx-thought" data-ev={all.map((x) => x.id).join(" ")}>
-      <ThinkingHead live={live} open={open} onToggle={() => setOpen(!open)} />
+      <ThinkingHead live={live} effort={effort} open={open} onToggle={() => setOpen(!open)} />
       {all.length > 1 && !open && <span className="hx-thought-n">{all.length} thoughts</span>}
       {open && (
         <ThinkingBody live={live}>
@@ -480,7 +480,7 @@ function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenT
   return <StepRow step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
 }
 
-function ItemView({ item, cwd, onOpenTask }: { item: Item; cwd: string; onOpenTask?: (t: string) => void }) {
+function ItemView({ item, cwd, onOpenTask, effort }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; effort?: string }) {
   switch (item.type) {
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
@@ -493,7 +493,7 @@ function ItemView({ item, cwd, onOpenTask }: { item: Item; cwd: string; onOpenTa
         </div>
       );
     case "thought":
-      return <Thought e={item.event} more={item.more} />;
+      return <Thought e={item.event} more={item.more} effort={effort} />;
     case "notice":
       return <Notice e={item.event} repeats={item.repeats} />;
   }
@@ -522,15 +522,17 @@ function lastAt(turn: Turn): number {
 /** The end of a turn under way while nothing at its end moves: what it's doing (a model thinking
  *  after a call shows nothing for minutes) and for how long since the last thing it did, so it
  *  never looks stopped while it's at work. */
-function LiveTail({ doing, since }: { doing?: string; since: number }) {
+function LiveTail({ doing, since, effort }: { doing?: string; since: number; effort?: string }) {
   const now = useNow();
   // Between steps it's thinking, whatever its last step was.
-  const what = doing && /^(think|compact|retr|wait|summar)/i.test(doing) ? doing : "Thinking";
+  const what = doing && /^(compact|retr|wait|summar)/i.test(doing) ? doing : thinkingWords(effort);
   return (
     <div className="hx-live-tail" role="status">
-      <Optic state="thinking" />
-      <PrismLabel live>{what}</PrismLabel>
-      {now - since > 3000 && <span className="hx-meta-num">{formatThought((now - since) / 1000)}</span>}
+      <span className="sg-thinking-line">
+        <Optic state="thinking" />
+        <PrismLabel live>{what}</PrismLabel>
+        {now - since > 3000 && <span className="hx-meta-num">{formatThought((now - since) / 1000)}</span>}
+      </span>
     </div>
   );
 }
@@ -541,6 +543,7 @@ const TurnView = React.memo(function TurnView({
   delivery,
   live,
   doing,
+  effort,
   onOpenTask,
   meta,
   onCommand,
@@ -554,6 +557,7 @@ const TurnView = React.memo(function TurnView({
   live: boolean;
   /** What the agent says it's doing, while the turn is live. */
   doing?: string;
+  effort?: string;
   onOpenTask?: (t: string) => void;
   meta?: Meta | null;
   onCommand?: (c: Command) => void;
@@ -561,6 +565,13 @@ const TurnView = React.memo(function TurnView({
   const edits = React.useMemo(() => changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
+  // A turn of hundreds of steps shows its latest; the rest are a tap away (and there for a match
+  // you find in them).
+  const findNow = React.useContext(FindNowContext);
+  const [allSteps, setAllSteps] = React.useState(false);
+  const hidden = allSteps ? 0 : Math.max(0, turn.items.length - STEPS_WINDOW);
+  const sought = hidden > 0 && findNow !== null && turn.items.slice(0, hidden).some((it) => itemHolds(it, findNow.id));
+  const items = hidden > 0 && !sought ? turn.items.slice(hidden) : turn.items;
   if (turn.divider) {
     return (
       <section className="hx-turn hx-turn-switch">
@@ -575,10 +586,15 @@ const TurnView = React.memo(function TurnView({
       {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} onCommand={onCommand} />}
       <div className="hx-work">
         {label && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{label}</div>}
-        {turn.items.map((it) => (
-          <ItemView key={it.key} item={it} cwd={cwd} onOpenTask={onOpenTask} />
+        {hidden > 0 && !sought && (
+          <button type="button" className="hx-earlier-steps" onClick={() => setAllSteps(true)}>
+            {hidden} earlier step{hidden === 1 ? "" : "s"}
+          </button>
+        )}
+        {items.map((it) => (
+          <ItemView key={it.key} item={it} cwd={cwd} onOpenTask={onOpenTask} effort={effort} />
         ))}
-        {live && !turn.outcome && !moving(turn.items) && <LiveTail doing={doing} since={lastAt(turn)} />}
+        {live && !turn.outcome && !moving(turn.items) && <LiveTail doing={doing} since={lastAt(turn)} effort={effort} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
@@ -647,6 +663,8 @@ interface Keep {
   root: HTMLElement | null;
   /** At the end: it follows what comes. */
   end: boolean;
+  /** The page holds the conversation's end (not a window further back): only then is its bottom the end. */
+  tail: boolean;
   /** Otherwise: what's being read, and where. */
   at: { id: string; offset: number } | null;
   /** The part last tapped or keyed in: its height and place then, and when. */
@@ -660,12 +678,12 @@ interface Keep {
  * under your finger. Your place is kept under `key` for the next visit (and a reload).
  */
 function useKeeper(key: string) {
-  const k = React.useRef<Keep>({ root: null, end: true, at: null, touched: null, saving: 0 });
+  const k = React.useRef<Keep>({ root: null, end: true, tail: true, at: null, touched: null, saving: 0 });
   /** Where the view is now. */
   const read = React.useCallback(() => {
     const s = k.current;
     if (!s.root) return;
-    s.end = s.root.scrollHeight - s.root.scrollTop - s.root.clientHeight < END_PX;
+    s.end = s.tail && s.root.scrollHeight - s.root.scrollTop - s.root.clientHeight < END_PX;
     s.at = s.end ? null : firstInView(s.root);
   }, []);
   const save = React.useCallback(() => {
@@ -721,13 +739,57 @@ function useKeeper(key: string) {
     window.clearTimeout(s.saving);
     s.saving = window.setTimeout(save, 250);
   };
+  /** At the end, following what comes. */
+  const atEnd = React.useCallback(() => k.current.end, []);
+  /** At the bottom of what's in the page, wherever that is in the conversation. */
+  const atBottom = React.useCallback(() => {
+    const r = k.current.root;
+    return Boolean(r && r.scrollHeight - r.scrollTop - r.clientHeight < END_PX);
+  }, []);
+  /** Whether the page holds the conversation's end. */
+  const setTail = React.useCallback((tail: boolean) => {
+    k.current.tail = tail;
+    if (!tail) k.current.end = false;
+  }, []);
+  /** To the end, following what comes. */
+  const toEnd = React.useCallback(() => {
+    const s = k.current;
+    s.tail = true;
+    s.end = true;
+    s.at = null;
+    if (s.root) s.root.scrollTop = s.root.scrollHeight;
+  }, []);
   /** A tap or a key on a part: if it changes size because of it, it does so in place. */
   const onTouch = (e: React.SyntheticEvent) => {
     const root = k.current.root;
     const el = e.target instanceof Element ? e.target.closest<HTMLElement>(PARTS) : null;
     k.current.touched = el && root ? { el, h: el.offsetHeight, offset: el.getBoundingClientRect().top - root.getBoundingClientRect().top, t: performance.now() } : null;
   };
-  return { ref, onScroll, onTouch, read };
+  return { ref, onScroll, onTouch, read, atEnd, atBottom, setTail, toEnd };
+}
+
+/**
+ * How much of a long conversation is in the page: its latest turns, this many at a time. What's
+ * further back is added as you scroll up to it (or go to it: your place, a match you find), so a
+ * conversation of thousands of events reads, streams and takes typing as one of a few dozen.
+ */
+const WINDOW = 30;
+/** A turn with more steps than this (an agent working on its own for hours) shows its latest ones; the rest a tap away. */
+const STEPS_WINDOW = 60;
+/** The most turns in the page at once: a window grown past it lets go of its far end. */
+const MOST = 3 * WINDOW;
+
+/** Whether event `id` shows in item `it`. */
+const itemHolds = (it: Item, id: string) => (it.type === "step" ? it.calls.some((c) => c.id === id) : it.event.id === id || (it.type === "thought" && (it.more ?? []).some((m) => m.id === id)));
+
+/** The turn event `id` shows in (what was asked, a step, a word along the way, the answer): its index, or -1. */
+function turnOf(turns: Turn[], id: string | undefined): number {
+  if (!id) return -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
+    if (t && (t.prompt?.id === id || t.outcome?.id === id || t.divider?.id === id || t.items.some((it) => itemHolds(it, id)))) return i;
+  }
+  return -1;
 }
 
 /** Where a conversation's place is kept: the agent's, or one of its subagents' threads. */
@@ -787,7 +849,90 @@ export const Timeline = React.memo(function Timeline({
   const [kept] = React.useState(() => new Map<string, Turn>());
   const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
   const keeper = useKeeper(placeKey(agent, parent));
-  const { read } = keeper;
+  const { read, atEnd, setTail, toEnd } = keeper;
+  // The turns in the page (`WINDOW` at a time, `MOST` at most): from the one `anchor` names (null:
+  // the latest), through the one `till` names (null: the end). Read back, the window stays put as
+  // more comes; gone far back (your place from last time, a match you find), it's a window there,
+  // and what's after it joins as you scroll down to it.
+  const [anchor, setAnchor] = React.useState<string | null>(null);
+  const [till, setTill] = React.useState<string | null>(null);
+  const anchored = anchor ? turns.findIndex((t) => t.key === anchor) : -1;
+  const tilled = till ? turns.findIndex((t) => t.key === till) : -1;
+  const from = anchored >= 0 ? anchored : Math.max(0, turns.length - WINDOW);
+  const to = tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length;
+  /** A window around turn `i`, when it isn't in the page. */
+  const around = (i: number) => {
+    if (i < 0 || (i >= from && i < to)) return;
+    setAnchor(turns[Math.max(0, i - 3)]?.key ?? null);
+    setTill(i + WINDOW < turns.length ? (turns[i + WINDOW - 1]?.key ?? null) : null);
+  };
+  // Your place from last time, once its turns are in: the page opens on it.
+  const [placed, setPlaced] = React.useState<string | null>(() => {
+    const p = usePlaces.getState().places[placeKey(agent, parent)];
+    return p && "id" in p ? p.id : null;
+  });
+  if (placed && turns.length > 0) {
+    setPlaced(null);
+    around(turnOf(turns, placed));
+  }
+  // A match you find, each time one is shown.
+  const shownMatch = find?.now ? `${find.now.id}:${find.now.n}` : null;
+  const [revealed, setRevealed] = React.useState<string | null>(null);
+  if (shownMatch && shownMatch !== revealed) {
+    setRevealed(shownMatch);
+    around(turnOf(turns, find?.now?.id));
+  }
+  // Only a page that holds the end follows what comes at its bottom.
+  const tail = to >= turns.length;
+  setTail(tail);
+  const win = React.useRef({ turns, from, to });
+  win.current = { turns, from, to };
+  // Near the top of what's in the page: what came before joins (the keeper holds your place), and
+  // a window grown past `MOST` lets go of its far end.
+  const earlier = React.useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const io = new IntersectionObserver(
+      ([e]) => {
+        if (!e?.isIntersecting) return;
+        const w = win.current;
+        const start = Math.max(0, w.from - WINDOW);
+        setAnchor(w.turns[start]?.key ?? null);
+        if (w.to - start > MOST) setTill(w.turns[start + MOST - 1]?.key ?? null);
+      },
+      { root: el.closest<HTMLElement>(".hx-timeline"), rootMargin: "1500px 0px 0px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+  // Near the bottom of a window further back: what came after joins, and its near end lets go.
+  const later = React.useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const io = new IntersectionObserver(
+      ([e]) => {
+        if (!e?.isIntersecting) return;
+        const w = win.current;
+        const end = Math.min(w.turns.length, w.to + WINDOW);
+        setTill(end >= w.turns.length ? null : (w.turns[end - 1]?.key ?? null));
+        if (end - w.from > MOST) setAnchor(w.turns[end - MOST]?.key ?? null);
+      },
+      { root: el.closest<HTMLElement>(".hx-timeline"), rootMargin: "0px 0px 1500px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+  const onScroll = () => {
+    keeper.onScroll();
+    // Back at the end: the page holds the latest turns again, and follows them. Read back, it stays put.
+    if (atEnd()) {
+      if (anchor !== null) setAnchor(null);
+    } else if (anchor === null) setAnchor(win.current.turns[win.current.from]?.key ?? null);
+  };
+  /** To the latest, from a window further back. */
+  const latest = () => {
+    setAnchor(null);
+    setTill(null);
+    toEnd();
+  };
   // Find: every match marked in place (again as the conversation grows), and the one shown brought
   // into view when it's chosen (not again after: you may scroll away).
   const findQ = find?.q ?? "";
@@ -851,12 +996,14 @@ export const Timeline = React.memo(function Timeline({
         ref={keeper.ref}
         className="hx-timeline"
         data-scroll-restoration-id={`timeline:${placeKey(agent, parent)}`}
-        onScroll={keeper.onScroll}
+        onScroll={onScroll}
         onPointerDownCapture={keeper.onTouch}
         onKeyDownCapture={keeper.onTouch}
       >
         <div ref={marks} className="hx-flow">
-          {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
+          {/* Keyed by where the page starts: each time more joins, a new watch says at once whether more should. */}
+          {from > 0 && <div key={`from-${from}`} ref={earlier} className="hx-earlier" aria-hidden="true" />}
+          {from === 0 && state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
           {turns.length === 0 &&
             (parent ? (
               <div className="hx-sub-empty">
@@ -867,35 +1014,47 @@ export const Timeline = React.memo(function Timeline({
             ) : (
               <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
-          {turns.map((t, i) => (
+          {turns.slice(from, to).map((t, j) => (
             <TurnView
               key={t.key}
               turn={t}
               cwd={cwd}
               delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-              live={running && i === turns.length - 1}
-              doing={running && i === turns.length - 1 ? state?.doing : undefined}
+              live={running && from + j === turns.length - 1}
+              doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+              effort={running && from + j === turns.length - 1 ? state?.effort : undefined}
               onOpenTask={onOpenTask}
               meta={meta}
               onCommand={onCommand}
               agentLabel={agentLabel}
             />
           ))}
-          {hasAsks && onDecide && (
+          {/* A window further back: what came after joins as you scroll down to it. */}
+          {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
+          {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
                 <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
               ))}
             </div>
           )}
-          {footer}
+          {tail && footer}
           <div className="hx-waiting-anchor">
-            {hasAsks && !asksSeen && (
-              <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
-                <i aria-hidden="true" />
-                {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+            {!tail ? (
+              <button type="button" className="hx-waiting" onClick={latest}>
+                {hasAsks && <i aria-hidden="true" />}
+                {hasAsks ? (pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`) : "Latest"}
                 <ArrowDown size={12} aria-hidden="true" />
               </button>
+            ) : (
+              hasAsks &&
+              !asksSeen && (
+                <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+                  <i aria-hidden="true" />
+                  {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+                  <ArrowDown size={12} aria-hidden="true" />
+                </button>
+              )
             )}
           </div>
         </div>

@@ -20,6 +20,8 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
+import { handleSettings } from "./settings.ts";
+import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongSession, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import {
@@ -1251,6 +1253,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
     // ---- harness accounts (and the demo agents to see them from) ----
+    if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -1573,6 +1576,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
+    if (await handleSettings(req, res, url, { json, err, body })) return;
     if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
 
     return err(res, 404, `no route for ${m} ${p}`);
@@ -1611,7 +1615,7 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!)))) return;
+    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))) return;
     ws.close(1008, "no such socket");
   });
 });

@@ -1,0 +1,105 @@
+/* Peered clusters in the shell (clusters.tsx): the header's picker, the band of clusters opened,
+   and their frames, which fill the page and show nothing of their own: no border, no background. */
+
+.cluster-pick {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  min-height: 32px;
+  max-width: 220px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 12px;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 999px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+.cluster-pick:hover,
+.cluster-pick:focus-within {
+  border-color: rgb(255 255 255 / 22%);
+  color: #fff;
+}
+/* Another cluster is shown: the picker says so. */
+.cluster-pick[data-away] {
+  border-color: rgb(186 176 227 / 45%);
+  color: #e3dcfb;
+}
+.cluster-pick-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The native list, clear over the pill: every platform's own menu, keyboard and screen reader. */
+.cluster-pick select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.cluster-bar {
+  border-top: 1px solid rgb(255 255 255 / 6%);
+}
+.cluster-bar-inner {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.cluster-tab-pair {
+  display: inline-flex;
+  align-items: center;
+}
+.cluster-tab {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  color: #8d9097;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.cluster-tab:hover {
+  color: #fff;
+}
+.cluster-tab[aria-selected="true"] {
+  background: rgb(255 255 255 / 7%);
+  color: #fff;
+}
+.cluster-close {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 5px;
+  color: #6d7078;
+}
+.cluster-close:hover {
+  background: rgb(255 255 255 / 7%);
+  color: #fff;
+}
+
+.cluster-frame-wrap {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+.cluster-frame {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  border: 0;
+  background: transparent;
+  color-scheme: dark;
+}

@@ -10,7 +10,7 @@
  *   The other harnesses' models on the agent's machine follow, by harness: choosing one goes on
  *   there (at the end of the turn under way), the conversation carried over.
  *
- * A choice applies at once, "· UNDO" waits on the line for a few seconds, and the setting folds
+ * A choice applies at once, Undo waits beside the turn timer for a few seconds, and the setting folds
  * away shortly after. Nothing pops up or covers the conversation.
  *
  * `SendWith` is the composer's row for a single message: the same, max effort, or another model.
@@ -428,6 +428,8 @@ export interface RunSettingsProps {
   appliesNextTurn?: { mode?: boolean; model?: boolean; effort?: boolean };
   running?: boolean;
   className?: string;
+  /** Related controls on the same line, divided from the run settings. */
+  trailing?: React.ReactNode;
 }
 
 /** A change just made: what the line shows until the agent reports otherwise, and what Undo restores. */
@@ -465,6 +467,7 @@ export function RunSettings({
   appliesNextTurn,
   running = false,
   className,
+  trailing,
 }: RunSettingsProps) {
   const [open, setOpen] = React.useState<Kind | null>(null);
   const [change, setChange] = React.useState<Change | null>(null);
@@ -505,7 +508,7 @@ export function RunSettings({
   }, []);
 
   // Undo is offered for a few seconds, longer while a keyboard or mouse is on it. The top line shows
-  // the change (and Undo) meanwhile: its timer, set again whenever either changes.
+  // the change meanwhile: its timer, set again whenever either changes.
   const lasting = React.useCallback(
     (top: HTMLDivElement | null) => {
       if (!top || !change || held) return;
@@ -584,9 +587,12 @@ export function RunSettings({
     setTick(0);
   };
 
-  let parts = KINDS.map((k) => ({ k, text: shown(k) ? nameOf(k, shown(k)) : "", empty: false })).filter((p) => p.text);
-  if (parts.length === 0) parts = KINDS.filter(editable).map((k) => ({ k, text: KEY[k], empty: true }));
-  if (parts.length === 0) return null;
+  // Every setting keeps its column, even when a harness has no value for it yet.
+  const parts = KINDS.map((k) => ({
+    k,
+    text: shown(k) ? sets[k].words.find((w) => w.id === shown(k))?.text ?? shown(k) : editable(k) ? KEY[k] : "—",
+    empty: !shown(k),
+  }));
 
   const undoable = change?.undoable ? change : null;
   const panel = (k: Kind) => {
@@ -656,41 +662,39 @@ export function RunSettings({
     >
       <div ref={lasting} className="rs-top">
         <p className="rs-line">
-          {parts.map((p, i) => (
-            <React.Fragment key={p.k}>
-              {i > 0 && (
-                <span className="rs-sep" aria-hidden="true">
-                  {" · "}
-                </span>
-              )}
-              {editable(p.k) ? (
-                <button
-                  ref={(el) => {
-                    values.current[p.k] = el;
-                  }}
-                  type="button"
-                  className="rs-v"
-                  data-empty={p.empty ? "" : undefined}
-                  aria-expanded={open === p.k}
-                  aria-controls={open === p.k ? panelId : undefined}
-                  aria-label={`${KEY[p.k]}: ${p.empty ? "choose" : nameOf(p.k, shown(p.k))}`}
-                  onClick={() => toggle(p.k)}
-                >
-                  {p.text}
-                </button>
-              ) : (
-                <span className="rs-v" data-fixed="">
-                  {p.text}
-                </span>
-              )}
-            </React.Fragment>
-          ))}
+          <span className="rs-values">
+            {parts.map((p, i) => (
+              <React.Fragment key={p.k}>
+                {i > 0 && <span className="rs-sep" aria-hidden="true">·</span>}
+                {editable(p.k) ? (
+                  <button
+                    ref={(el) => { values.current[p.k] = el; }}
+                    type="button"
+                    className="rs-v"
+                    data-kind={p.k}
+                    data-empty={p.empty ? "" : undefined}
+                    aria-expanded={open === p.k}
+                    aria-controls={open === p.k ? panelId : undefined}
+                    aria-label={`${KEY[p.k]}: ${p.empty ? "choose" : nameOf(p.k, shown(p.k))}`}
+                    title={p.empty ? KEY[p.k] : nameOf(p.k, shown(p.k))}
+                    onClick={() => toggle(p.k)}
+                  >
+                    <span className="rs-value-text">{p.text}</span>
+                  </button>
+                ) : (
+                  <span className="rs-v" data-kind={p.k} data-fixed="" title={`${KEY[p.k]}: ${p.empty ? "unavailable" : nameOf(p.k, shown(p.k))}`}>
+                    {p.text}
+                  </span>
+                )}
+              </React.Fragment>
+            ))}
+          </span>
         </p>
+        <div className="rs-extra">
+          {trailing && <><span className="rs-divider" aria-hidden="true">|</span>{trailing}</>}
+        </div>
         {undoable && (
           <span className="rs-after">
-            <span className="rs-dot" aria-hidden="true">
-              ·
-            </span>
             <button type="button" className="rs-undo" aria-label={`Undo: back to ${nameOf(undoable.kind, undoable.prev)}`} onClick={undo}>
               Undo
             </button>

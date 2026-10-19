@@ -125,138 +125,117 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   letter-spacing: -0.025em;
   overflow-wrap: anywhere;
 }
-/* One line, whatever it says: what's doing and where give way (ellipsized) before it would wrap,
-   so the page under the head never moves when "reconnecting…" or a long activity comes and goes. */
-.ag-state {
-  display: flex;
-  flex-wrap: nowrap;
-  align-items: center;
-  gap: 6px 14px;
-  min-width: 0;
-  margin-top: 6px;
-  color: #8f929b;
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-.ag-state > * {
-  flex: none;
-}
-.ag-state > .ag-activity,
-.ag-state > .ag-cwd {
-  flex: 0 1 auto;
-  min-width: 0;
-}
-/* What it left running gives way only once those have. */
-.ag-state > .ag-left {
-  flex: 0 0.001 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ag-activity {
-  max-width: 44ch;
-  overflow: hidden;
-  color: #c4bde4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* The state word keeps the width of its longest ("Needs you"), so "Ready" turning "Working" as a
-   turn starts doesn't move the rest of the row. */
-.ag-state > .st-word {
-  min-width: calc(22px + 9ch + 0.2em);
-}
-/* Its dot sits in a column as wide as the turn's mark above it, centred under it, so the two rows'
-   marks and words line up. */
-.ag-state > .st-word > i {
-  margin: 0 4px;
-}
-/* Between turns there's no mark: the words start where the state's do. */
-.ag-turn-row > .ag-turn-idle {
-  padding-left: 22px;
-}
-/* The turn has a row of its own above the state, there between turns too and always as tall, so
-   nothing moves as a turn starts or ends; what's in it (a taller word, the offer to force a stop)
-   can't make it taller, and what doesn't fit is cut at its end. */
-.ag-turn-row {
-  display: flex;
+/* The clock has a quiet row of its own. Keep its place between turns so the conversation stays put. */
+.ag-clock-row {
   height: 18px;
-  align-items: center;
-  min-width: 0;
-  margin-top: 9px;
-  overflow: hidden;
-  overflow: clip visible;
-  color: #8f929b;
+  margin-top: 6px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px;
+  line-height: 18px;
 }
-.ag-turn-row > .ag-turn {
-  flex: 0 1 auto;
-  min-width: 0;
-}
-/* Said in the row's own words, so offering it doesn't make the row taller; its reach goes past
-   the words without taking room. */
-.ag-turn-force {
-  flex: none;
-  margin: -8px -6px;
-  padding: 8px 6px;
-  color: #d1aaad;
-  font: inherit;
-  text-decoration: underline;
-  text-decoration-color: #d1aaad66;
-  text-underline-offset: 3px;
-}
-.ag-turn-force:hover {
-  color: #e6c3c6;
-}
-.ag-turn {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-/* What gives way when the row is short: what it's doing first, then the effort and how often it
-   was kept going; never the clock or the offer to force a stop. */
-.ag-turn-what.sg-label {
-  flex: 0 1000 auto;
-  min-width: 0;
-  max-width: 44ch;
-  overflow: hidden;
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  text-overflow: ellipsis;
-  text-transform: none;
-  white-space: nowrap;
-}
-.ag-turn-meta {
-  flex: none;
-  color: #8f929b;
-  white-space: nowrap;
-}
-.ag-turn-meta.ag-turn-effort,
-.ag-turn-meta.ag-turn-kept {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* The clock keeps its width as it ticks ("59m 59s", "1h 02m"): nothing after it moves. */
+/* The clock's column stays fixed as the number of digits changes. */
 .ag-turn-time {
-  min-width: 7ch;
-  font-variant-numeric: tabular-nums;
-}
-.ag-cwd {
-  max-width: 40ch;
-  overflow: hidden;
-  color: #7b7e88;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ag-cost {
+  display: inline-block;
+  width: 7ch;
+  flex: none;
   color: #a1a4ad;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-transform: none;
 }
-.ag-warn {
-  color: #d8bb95;
+.ag-turn-time[data-stopped] {
+  color: #7b7e88;
+}
+/* Two thin, masked layers on the existing pause button. Only rotation and opacity animate;
+   neither layer participates in layout or changes the button, icon or border thickness. */
+.ag-actions .ag-turn-control {
+  position: relative;
+  isolation: isolate;
+  border-color: transparent;
+  --ag-rim: conic-gradient(#8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f);
+  --ag-glint: #e1d7f5;
+  --ag-shimmer: 0.35;
+  --ag-current: 24s;
+  --ag-spark: 19s;
+}
+.ag-actions .ag-turn-control:disabled {
+  opacity: 1;
+}
+.ag-actions .ag-turn-control:hover:not(:disabled) {
+  border-color: transparent;
+}
+.ag-turn-control::before,
+.ag-turn-control::after {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+  pointer-events: none;
+  content: "";
+}
+.ag-turn-control::before {
+  background: var(--ag-rim);
+  animation: ag-rim-current var(--ag-current) linear infinite;
+}
+.ag-turn-control::after {
+  background: conic-gradient(transparent 4%, var(--ag-glint) 7%, transparent 10% 33%, var(--ag-glint) 35%, transparent 38% 69%, var(--ag-glint) 73%, transparent 77%);
+  animation: ag-rim-shimmer var(--ag-spark) linear infinite reverse;
+}
+.ag-turn-control[data-state="active"] {
+  --ag-rim: conic-gradient(#b8d9d2, #7194c9 8%, #c8e0ef 13%, #a6c4ed 23%, #8677ad 32%, #d7c1ee 37%, #b8a6d5 46%, #d6a2aa 55%, #eed6bc 59%, #a2bfae 66%, #d8cbb0 77%, #a6c4ed 85%, #d6a2aa 91%, #b8d9d2);
+  --ag-glint: #f5eaff;
+  --ag-shimmer: 0.9;
+  --ag-current: 5.3s;
+  --ag-spark: 3.7s;
+}
+.ag-turn-control[data-state="stopped"] {
+  --ag-rim: conic-gradient(#996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77);
+  --ag-glint: #e9c5c8;
+  --ag-shimmer: 0.2;
+  --ag-current: 52s;
+  --ag-spark: 43s;
+}
+.ag-turn-control[data-state="finished"] {
+  --ag-rim: conic-gradient(#79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a);
+  --ag-glint: #e1f0e5;
+  --ag-shimmer: 0.3;
+  --ag-current: 32s;
+  --ag-spark: 27s;
+}
+.ag-turn-control[data-state="disconnected"] {
+  --ag-rim: conic-gradient(#555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962);
+  --ag-glint: #a3a6ad;
+  --ag-shimmer: 0.1;
+  --ag-current: 100s;
+  --ag-spark: 83s;
+}
+@keyframes ag-rim-current {
+  to { transform: rotate(360deg); }
+}
+/* Unevenly spaced highlights pass the underlying gradient at changing speeds. */
+@keyframes ag-rim-shimmer {
+  0%, 100% { opacity: calc(var(--ag-shimmer) * 0.45); }
+  17% { opacity: var(--ag-shimmer); }
+  43% { opacity: calc(var(--ag-shimmer) * 0.3); }
+  71% { opacity: calc(var(--ag-shimmer) * 0.8); }
+  0% { transform: rotate(0deg); }
+  21% { transform: rotate(41deg); }
+  47% { transform: rotate(192deg); }
+  68% { transform: rotate(243deg); }
+  100% { transform: rotate(360deg); }
+}
+:root[data-motion="paused"] .ag-turn-control::before,
+:root[data-motion="paused"] .ag-turn-control::after {
+  animation-play-state: paused;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ag-turn-control::before,
+  .ag-turn-control::after {
+    animation: none;
+  }
+  .ag-turn-control::after {
+    opacity: calc(var(--ag-shimmer) * 0.45);
+  }
 }
 .ag-actions {
   display: flex;
@@ -284,19 +263,7 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   .ag-actions .ag-wide {
     display: none;
   }
-  .ag-activity,
-  .ag-cwd {
-    max-width: 100%;
-  }
-  .ag-wide-only {
-    display: none;
-  }
-  .ag-turn-row {
-    margin-top: 6px;
-  }
-  .ag-state {
-    margin-top: 4px;
-  }
+
 }
 
 /* ---------------------------------------------------------------- phone tabs: the site's step rail */
@@ -771,21 +738,30 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 .hx-turn .hx-work {
   border-top: 0;
 }
-/* The end of a turn under way while nothing at its end moves: what it's doing, and for how long
-   since its last step. */
-.hx-live-tail {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 0 2px;
+/* Where what came before the turns in the page joins as you scroll up to it: nothing to see. */
+.hx-earlier {
+  height: 1px;
+}
+/* A long turn's earlier steps, a tap away. */
+.hx-earlier-steps {
+  display: block;
+  min-height: 32px;
+  padding: 6px 0;
   color: #8f929b;
   font-family: var(--font-mono);
   font-size: 11px;
+  text-decoration: underline;
+  text-decoration-color: #8f929b55;
+  text-underline-offset: 3px;
 }
-.hx-live-tail .sg-label {
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  text-transform: none;
+.hx-earlier-steps:hover {
+  color: var(--color-bright);
+}
+/* The end of a turn under way while nothing at its end moves: what it's doing, and for how long
+   since its last step. */
+.hx-thought,
+.hx-live-tail {
+  padding: 10px 0 2px;
 }
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {
@@ -1127,7 +1103,7 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 
 /* The run tuner sits under the head's top row, full width. */
 .ag-head .ag-run {
-  margin-top: 10px;
+  margin-top: 2px;
 }
 
 /* ---------------------------------------------------------------- plan usage: the badge opens it in place */
@@ -1206,39 +1182,32 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* What it does as they fill, a row each from the same left edge as the windows: its words in their
+   name column and its select where their bars start; then its plan and the way to its cost and status. */
 .hx-usage-foot {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 18px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   color: var(--color-secondary);
   font-size: 12px;
 }
-.hx-usage-stop {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-.hx-usage-stop .select select {
-  min-height: 28px;
-  padding: 3px 28px 3px 9px;
-  font-size: 12px;
-}
-.hx-usage-stop .select > svg {
-  right: 9px;
-}
+.hx-usage-stop,
 .hx-usage-move {
-  display: inline-flex;
-  min-height: 28px;
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
-  cursor: pointer;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+.hx-usage-stop > .hx-pick {
+  justify-self: start;
 }
 .hx-usage-end {
   display: inline-flex;
   align-items: center;
   gap: 12px;
-  margin-left: auto;
 }
 .hx-usage-more {
   min-height: 28px;
@@ -1257,13 +1226,32 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   .hx-usage-reset > .hx-usage-at {
     display: none;
   }
+  .hx-usage-stop,
+  .hx-usage-move {
+    grid-template-columns: 6.25rem minmax(0, 1fr);
+    gap: 10px;
+  }
 }
 .hx-usage-more:hover {
   color: var(--color-bright);
 }
-.ag-head .hx-limit-badge[aria-expanded="true"] {
-  border-color: #55545e;
-  color: var(--color-bright);
+.ag-run .hx-limit-badge {
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+.ag-run .hx-limit-badge[data-tone="warn"] { color: #ead8bd; }
+.ag-run .hx-limit-badge[data-tone="fail"] { color: #ecc9cb; }
+.ag-run .hx-limit-badge[aria-expanded="true"] { color: var(--color-bright); }
+.ag-run .hx-limit-badge > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 @keyframes ag-usage-in {
   from {

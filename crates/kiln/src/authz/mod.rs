@@ -285,6 +285,8 @@ const fn any(pattern: &'static str, capability: &'static str, at: At) -> Rule {
 /// The API behind authentication (W10-R05), first match wins. docs/ci.md §4.1 lists the CI part.
 pub static ROUTES: &[Rule] = &[
     r("GET", "/api/openapi.json", SIGNED_IN, At::Server),
+    r("GET", "/api/peers/open", SIGNED_IN, At::Server),
+    r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
     r("GET", "/api/overview", "runs.read", At::Server),
     r("GET", "/api/system", "runners.read", At::Server),
@@ -388,6 +390,14 @@ pub static ROUTES: &[Rule] = &[
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),
+    // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
+    // registrations are their management.
+    r("GET", "/api/deploy/**", "runs.read", At::Server),
+    r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
+    r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
+    r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
+    any("/api/deploy/**", "environments.manage", At::Server),
     // Runners and machines.
     r("GET", "/api/agents", "runners.read", At::Server),
     r("GET", "/api/reach/runners", "runners.read", At::Server),

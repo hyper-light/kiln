@@ -15,14 +15,20 @@
  *                          says {"t":"closed"}; then the session is announced on /api/events
  *   MOCK_DROPPED=n   its timeline let go of its first n events, which the conversation store still
  *                    has (an earlier history, before the forty turns, that a search finds)
+ *   MOCK_TURNS=n     n finished turns instead of forty (a long conversation: 600 is the 4,000 events
+ *                    a session keeps)
+ *   MOCK_LIVE_STEPS=n   the turn still going has taken n steps already (a long turn of an agent
+ *                       working on its own: a note and a command each)
  */
+import { gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
 import type { AgentInfo, HEvent, Meta, SaidHit, State } from "../src/api/harness.ts";
 
 const ID = "demo-long";
 /** A fixed start, so the history is the same on every run. */
 const T0 = Date.UTC(2026, 9, 17, 9, 0, 0);
-const TURNS = 40;
+const TURNS = Number(process.env.MOCK_TURNS ?? 40);
+const LIVE_STEPS = Number(process.env.MOCK_LIVE_STEPS ?? 0);
 
 const FILES = ["crates/kiln/src/http/client.rs", "crates/kiln/src/http/retry.rs", "crates/kiln/src/rt/timer.rs", "crates/kiln/tests/retry.rs", "ui/src/api/client.ts"];
 const ASKS = [
@@ -167,6 +173,26 @@ for (let i = 1; i <= TURNS; i++) {
 // The turn still going.
 const LIVE_AT = T0 + (TURNS + 1) * 90_000;
 add({ id: "L-u-live", at: LIVE_AT, kind: "user", text: "Now do the same for the websocket reconnects, and keep going until the suite is green." });
+// A long turn already under way: what it said and ran, step after step.
+for (let k = 1; k <= LIVE_STEPS; k++) {
+  const at = LIVE_AT + 1_000 + k * 20;
+  add({ id: `L-live-n${k}`, at, kind: "assistant", text: `Step ${k}: the reconnect path in \`${FILES[k % FILES.length]}\` reads its backoff from the same clock as the deadline, so I'm checking it next.` });
+  add({
+    id: `L-live-s${k}`,
+    at: at + 5,
+    kind: "tool",
+    tool_id: `tl${k}`,
+    name: "Bash",
+    tool: "shell",
+    title: `cargo test -p kiln ws::reconnect_${k}`,
+    input: {},
+    status: "done",
+    exit_code: 0,
+    output: Array.from({ length: 8 }, (_, j) => `test ws::reconnect_${k}_${j} ... ok`).join("\n") + "\n\ntest result: ok. 8 passed",
+    started: at + 5,
+    ended: at + 15,
+  });
+}
 add({
   id: "L-s-live",
   at: LIVE_AT + 3_000,
@@ -209,15 +235,21 @@ if (PAUSED) {
     text: "Paused: You've hit your session limit · resets 10:30pm (America/Los_Angeles). Queued messages and goals wait; it goes on by itself once the limit resets.",
   });
 }
+/** MOCK_STOP_POINT=1: paused at its stop point for the weekly limit, not at the session limit. */
+const STOP_POINT = process.env.MOCK_STOP_POINT === "1";
+/** When it paused (an old runner's stop point pauses it again as it resumes), and whether a resume took. */
+let pauseSince = LIVE_AT + 7_000;
+let resumed = false;
+let stopOff = false;
 const pause = (): State["pause"] =>
-  PAUSED
+  PAUSED && !resumed
     ? {
-        reason: "limit",
-        window: "five_hour",
-        label: "Session",
-        said: "You've hit your session limit · resets 10:30pm (America/Los_Angeles)",
+        reason: STOP_POINT ? "threshold" : "limit",
+        window: STOP_POINT ? "seven_day" : "five_hour",
+        label: STOP_POINT ? "Weekly" : "Session",
+        said: STOP_POINT ? "Weekly 95% used: its stop point" : "You've hit your session limit · resets 10:30pm (America/Los_Angeles)",
         until: PAUSED_UNTIL,
-        since: LIVE_AT + 7_000,
+        since: pauseSince,
         auto: true,
         by: "harness",
         cut: { message: "L-u-live", text: "Is the client still cancel-safe?", at: LIVE_AT + 7_000 },
@@ -244,12 +276,17 @@ let offlineUntil = Date.now() + Number(process.env.MOCK_OFFLINE_MS ?? 0);
 const offline = () => Date.now() < offlineUntil;
 let pauseAt: number | undefined;
 let moveOn = false;
+/** Where it goes on at a limit (`State.move_plan`). */
+let movePlan: { to?: string; kind?: string; model?: string } = {};
+/** Its runner from before agents went on elsewhere (MOCK_OLD_RUNNER=1): its state says nothing of it. */
+const OLD_RUNNER = process.env.MOCK_OLD_RUNNER === "1";
 
 const info: AgentInfo = {
   id: ID,
   kind: "claude",
   kind_name: "Claude Code",
-  target: "local",
+  // MOCK_LONG_TARGET=agent:<name>: on one of the machines (it can move); else on the server.
+  target: process.env.MOCK_LONG_TARGET ?? "local",
   name: "Retry storm",
   cwd: "/home/ada/src/kiln",
   created_at: T0,
@@ -284,7 +321,7 @@ const meta: Meta = {
     { name: "login", description: "Sign in to Claude Code on this machine", group: "Account", args: "none", route: { kind: "view", view: "login" } },
   ],
   agents: [],
-  features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments"],
+  features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments", "switch_harness"],
 };
 
 let activity = "Running cargo test";
@@ -299,7 +336,7 @@ let lastTurn: State["last_turn"];
 const state = (): State => ({
   status: offline() ? "disconnected" : running ? "running" : "idle",
   pause_at: pauseAt,
-  move_on_limit: moveOn || undefined,
+  ...(OLD_RUNNER ? {} : { move_on_limit: moveOn, move_plan: { ...movePlan } }),
   doing: running ? doing : undefined,
   turn_started: running ? turnStarted : undefined,
   last_turn: running ? undefined : lastTurn,
@@ -327,8 +364,22 @@ const state = (): State => ({
 });
 
 const viewers = new Set<WebSocket>();
+/** Viewers that take a state as what changed in it (`?patch=state`), with the state each has, as the server keeps it. */
+const had = new WeakMap<WebSocket, object>();
 const send = (ws: WebSocket, u: unknown) => {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(u));
+  if (ws.readyState !== ws.OPEN) return;
+  const was = had.get(ws) as Record<string, unknown> | undefined;
+  const f = u as { t?: string; state?: Record<string, unknown> };
+  if (was && f.t === "state" && f.state) {
+    // As it goes over the wire: a field left undefined isn't there.
+    const now = JSON.parse(JSON.stringify(f.state)) as Record<string, unknown>;
+    had.set(ws, now);
+    const set = Object.fromEntries(Object.entries(now).filter(([k, v]) => JSON.stringify(was[k]) !== JSON.stringify(v)));
+    const gone = Object.keys(was).filter((k) => !(k in now));
+    ws.send(JSON.stringify({ t: "state_patch", set, ...(gone.length ? { gone } : {}) }));
+    return;
+  }
+  ws.send(JSON.stringify(u));
 };
 const broadcast = (u: unknown) => viewers.forEach((ws) => send(ws, u));
 
@@ -425,6 +476,12 @@ export function searchSaid(q: string, agent: string | null, until: number | null
 const late = Number(process.env.MOCK_LATE_SESSION ?? 0);
 const knownAt = Date.now() + late;
 if (late > 0) setTimeout(() => emit({ type: "harness", info: longInfo() }), late);
+/** Agents at work send a stream of news (MOCK_CHURN=n): n of its entry from 4 s on, 100 ms apart, the last with an approval waiting. */
+const CHURN = Number(process.env.MOCK_CHURN ?? 0);
+for (let i = 1; i <= CHURN; i++) {
+  const waits = i === CHURN ? [{ id: "churn", tool: "shell" as const, tool_name: "Bash", title: "rm -rf build", at: Date.now() }] : [];
+  setTimeout(() => emit({ type: "harness", info: { ...longInfo(), activity: `Step ${i}`, approvals: waits } }), 4_000 + i * 100);
+}
 // Its machine back: viewers hear it, as the server tells them.
 if (offline())
   setTimeout(() => {
@@ -438,7 +495,7 @@ export function sendAway(ms: number) {
   setTimeout(() => broadcast({ t: "state", state: state() }), ms + 50);
 }
 
-export function handleLongSession(ws: WebSocket, id: string): boolean {
+export function handleLongSession(ws: WebSocket, id: string, packed = false, patches = false): boolean {
   if (id !== ID) return false;
   if (Date.now() < knownAt) {
     // Not known here yet (its machine hasn't reconnected): what the server says, then it hangs up.
@@ -447,16 +504,26 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
     return true;
   }
   const slow = Number(process.env.MOCK_SLOW_SNAPSHOT ?? 0);
+  const first = state();
   const frames: unknown[] = [
     { t: "open", info },
     { t: "meta", meta },
-    { t: "state", state: state() },
+    { t: "state", state: first },
   ];
   // Events in batches, as the server cuts them (by size); the last frame says it's complete.
   for (let i = 0; i < events.length; i += 120) frames.push({ t: "events", events: events.slice(i, i + 120) });
   if (process.env.MOCK_NO_SYNCED !== "1") frames.push({ t: "synced" });
+  // A viewer that unpacks gzip (`?z=gzip`): the whole snapshot packed in one message, a frame a line, as the server sends it.
+  if (packed && slow === 0) {
+    ws.send(gzipSync(frames.map((f) => JSON.stringify(f)).join("\n")));
+    if (patches) had.set(ws, first);
+    viewers.add(ws);
+    if (!timer) timer = setTimeout(tick, 140);
+    frames.length = 0;
+  }
   const go = (i: number) => {
     if (i >= frames.length) {
+      if (patches && !had.has(ws)) had.set(ws, first);
       viewers.add(ws);
       if (!timer) timer = setTimeout(tick, 140);
       return;
@@ -467,7 +534,7 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
   };
   go(0);
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; on?: boolean };
+    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; on?: boolean; to?: string; kind?: string };
     try {
       c = JSON.parse(raw.toString()) as typeof c;
     } catch {
@@ -478,8 +545,25 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
       send(ws, { t: "error", error: "its machine is away" });
       return;
     }
-    if (c.type === "pause_at") pauseAt = c.percent ?? undefined;
-    else if (c.type === "move_on_limit") moveOn = Boolean(c.on);
+    if (c.type === "pause_at") {
+      pauseAt = c.percent ?? undefined;
+      if (c.percent === null) stopOff = true;
+    } else if (c.type === "resume" && PAUSED) {
+      // A runner from before a stop point could be resumed past: it stops again at once, unless
+      // the stop point is off. A newer one goes on.
+      if (OLD_RUNNER && STOP_POINT && !stopOff)
+        setTimeout(() => {
+          pauseSince = Date.now();
+          broadcast({ t: "state", state: state() });
+        }, 600);
+      else if (!OLD_RUNNER || stopOff) {
+        resumed = true;
+        broadcast({ t: "state", state: state() });
+      }
+    } else if (c.type === "move_on_limit" && !OLD_RUNNER) {
+      moveOn = Boolean(c.on);
+      movePlan = moveOn ? { ...(c.to ? { to: c.to } : {}), ...(c.kind ? { kind: c.kind } : {}), ...(c.model ? { model: c.model } : {}) } : {};
+    }
     else if (c.type === "set_mode" && c.mode) info.mode = c.mode;
     else if (c.type === "set_model" && c.model) info.model = c.model;
     else if (c.type === "set_effort" && c.effort) effort = c.effort;

@@ -12,7 +12,7 @@ import "./harness.css";
 import "./console.css";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import { harnessApi, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
+import { harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loading } from "@/components/ui/loading";
@@ -28,7 +28,6 @@ import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
-import { StateWord } from "./parts";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
@@ -359,6 +358,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
   const meta = useSession(store, (s) => s.meta);
   const conn = useSession(store, (s) => s.conn);
   const stopAt = useStopAt(store);
+  const lastFrom = useSession(store, lastTurnFrom);
   const status = state?.status ?? info?.status ?? "starting";
   const actions = useAgentActions(
     {
@@ -395,6 +395,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
         stopAt={stopAt}
         onStop={() => store.stop()}
         onForceStop={() => store.stop(true)}
+        lastTurnFrom={lastFrom}
       />
       {actions.dialogs}
     </>
@@ -503,7 +504,8 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
 function Settings({ store, open, onOpenChange, send }: { store: SessionStore; open: boolean; onOpenChange: (o: boolean) => void; send: (c: Command) => void }) {
   const meta = useSession(store, (s) => s.meta);
   const state = useSession(store, (s) => s.state);
-  return <SettingsSheet open={open} onOpenChange={onOpenChange} meta={meta} state={state} send={send} />;
+  const info = useSession(store, (s) => s.info);
+  return <SettingsSheet open={open} onOpenChange={onOpenChange} agent={info} meta={meta} state={state} send={send} />;
 }
 
 /**
@@ -545,12 +547,9 @@ function AgentLoading() {
               </Link>
             </p>
             <h1 className="ag-title hx-ghost">Agent</h1>
-            <div className="ag-turn-row hx-ghost" aria-hidden="true" />
-            <div className="ag-state hx-ghost" aria-hidden="true">
-              <StateWord a={{ status: "starting", approvals: [] }} />
-            </div>
           </div>
         </div>
+        <div className="ag-clock-row" aria-hidden="true" />
         <div className="ag-run rs-tuner" aria-hidden="true">
           <div className="rs-top">
             <p className="rs-line" />
