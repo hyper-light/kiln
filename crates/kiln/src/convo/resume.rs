@@ -115,7 +115,7 @@ mod tests {
         store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?) });
         store.send("s1", &Update::State { state: Box::new(State { harness_session: Some("cc-1".into()), model: "opus".into(), epoch: 2, ..State::default() }) });
         store.send("s1", &Update::Events { events: vec![Event { id: "m1".into(), seq: 1, at: 5, parent: None, by: None, body: Body::Assistant { text: "done".into(), streaming: false } }] });
-        let line = |n: u64, l: &str| Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n, end: (n + 1) * 10, line: l.into() }));
+        let line = |n: u64, l: &str| Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n, end: (n + 1) * 10, line: l.into(), kept: None }));
         store.put(vec![line(0, "{\"a\":1}"), line(1, "{\"b\":2}")]);
         store.sync()?;
         let pkg = package(&store, "s1", "gone-box", "here", None)?;
@@ -137,7 +137,7 @@ mod tests {
     fn a_record_with_a_line_missing_is_refused() -> anyhow::Result<()> {
         let (_d, store) = crate::convo::store::scratch()?;
         store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?) });
-        store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 1, end: 20, line: "{}".into() }))]);
+        store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 1, end: 20, line: "{}".into(), kept: None }))]);
         store.sync()?;
         let err = package(&store, "s1", "gone-box", "here", None).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("missing line 0"), "{err}");
