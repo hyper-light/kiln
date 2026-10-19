@@ -35,6 +35,8 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 
 ## N: Notifications
 
+How it works, its API and its settings: docs/notifications.md.
+
 **N1 Push to every device you sign in on.** The browser's own notifications (Web Push: the
 service worker, RFC 8291 encryption and RFC 8292 VAPID), on phones and desktops:
 

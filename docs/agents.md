@@ -458,7 +458,7 @@ count. The Runners page shows it under the machine's name ("battery 34% · 2h 15
 "on its charger"). A machine on battery that drops to 20% or less is low: Runners and Mission
 Control say so at the top, with what stops when it sleeps (its agents, its jobs). The server logs
 it, audits it and sends it to webhook subscribers as `machine.battery_low`, once, as the machine
-gets there. A Mac on battery hibernates at about 1%, and its runner, agents and jobs go with it
+gets there, and to the devices of everyone with an agent on it (docs/notifications.md). A Mac on battery hibernates at about 1%, and its runner, agents and jobs go with it
 until it's plugged in; kiln can't keep it up, only say so in time.
 
 ### Tasks: shells, monitors and other work an agent leaves running
