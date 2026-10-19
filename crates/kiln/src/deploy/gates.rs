@@ -97,7 +97,14 @@ pub async fn evaluate(d: &Deploy, r: &Release, env: &Environment, app: &App) -> 
         }
     }
 
-    for check in &g.checks {
+    // The environment's checks, then the app's template's.
+    let mut checks = g.checks.clone();
+    if let Some(name) = &app.template
+        && let Some(t) = store::template(&d.hub.store, name).await?
+    {
+        checks.extend(t.checks.into_iter().filter(|c| !g.checks.contains(c)));
+    }
+    for check in &checks {
         let (passed, detail) = match check.as_str() {
             "no-snapshots" => match r.version.as_deref() {
                 Some(v) if v.to_ascii_lowercase().contains("snapshot") => (false, format!("{v} is a snapshot")),

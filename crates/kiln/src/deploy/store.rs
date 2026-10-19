@@ -95,6 +95,44 @@ pub async fn delete_app(store: &Store, name: &str) -> anyhow::Result<bool> {
     store.call(move |c| Ok(c.execute("DELETE FROM deploy_apps WHERE name = ?1", [name])? > 0)).await
 }
 
+// ------------------------------------------------------------------ templates
+
+pub async fn put_template(store: &Store, t: &super::model::Template) -> anyhow::Result<()> {
+    let (name, spec) = (t.name.clone(), to_json(t)?);
+    store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO deploy_templates (name, spec, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at",
+                params![name, spec, crate::util::now_unix()],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+pub async fn template(store: &Store, name: &str) -> anyhow::Result<Option<super::model::Template>> {
+    let name = name.to_owned();
+    let spec: Option<String> = store.call(move |c| Ok(c.query_row("SELECT spec FROM deploy_templates WHERE name = ?1", [name], |r| r.get(0)).optional()?)).await?;
+    spec.as_deref().map(from_json).transpose()
+}
+
+pub async fn templates(store: &Store) -> anyhow::Result<Vec<super::model::Template>> {
+    let specs: Vec<String> = store
+        .call(|c| {
+            let mut s = c.prepare("SELECT spec FROM deploy_templates ORDER BY name")?;
+            let rows = s.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    specs.iter().map(|s| from_json(s)).collect()
+}
+
+pub async fn delete_template(store: &Store, name: &str) -> anyhow::Result<bool> {
+    let name = name.to_owned();
+    store.call(move |c| Ok(c.execute("DELETE FROM deploy_templates WHERE name = ?1", [name])? > 0)).await
+}
+
 // ------------------------------------------------------------------ registrations
 
 pub async fn put_registration(store: &Store, r: &Registration) -> anyhow::Result<()> {

@@ -266,8 +266,59 @@ pub struct App {
     pub namespace: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, String>,
+    /// The template it was made from (§3.2): its namespace pattern, checks and properties hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Who to reach, and where its release messages go.
+    #[serde(default, skip_serializing_if = "Contacts::is_empty")]
+    pub contacts: Contacts,
     #[serde(default)]
     pub archived: bool,
+}
+
+/// Who to reach about an app (§3.1): on call, the chat channels its release messages go to, links.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Contacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oncall: Option<String>,
+    /// `#deploys`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
+    /// Dashboards, runbooks, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub links: BTreeMap<String, String>,
+}
+
+impl Contacts {
+    pub fn is_empty(&self) -> bool {
+        self.oncall.is_none() && self.channels.is_empty() && self.links.is_empty()
+    }
+}
+
+/// What apps are made from (docs/deploy-api.md §3.2): data, never code. txst's four app types are
+/// four templates; there can be any number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Template {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// The package a new app starts with; `{app}` in it is the app's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<Package>,
+    /// Where its apps run on Kubernetes: `{app}`, `apps-{app}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Checks every release of its apps passes, wherever it goes (§9.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    /// Properties its apps may have, each with the values allowed (none listed: any).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, Vec<String>>,
+    /// The environments its apps may be registered in (none: any).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<String>,
 }
 
 fn default_project() -> String {
