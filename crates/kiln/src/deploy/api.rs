@@ -23,6 +23,8 @@
 //! `idempotency_key`) is the same one when asked for again.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
@@ -71,8 +73,20 @@ fn release_id(s: &str) -> Result<i64, Fail> {
     s.parse().map_err(|_| bad(format!("{s:?} isn't a release number")))
 }
 
-/// Routes `/api/deploy/<rest>`.
-pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
+/// A future made and boxed in a frame of its own, so none of it lands on the stack of the function
+/// awaiting it. A debug build gives each temporary of a function its own stack slot: a router
+/// awaiting many large futures inline had a frame of all of them, and with an outbound TLS
+/// handshake beneath it, a shard's 2 MiB stack overflowed.
+fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>> {
+    Box::pin(make())
+}
+
+/// Routes `/api/deploy/<rest>`, as a boxed future (see [`boxed`]).
+pub fn route<'a>(hub: &'a Arc<Hub>, rest: &'a [&'a str], q: &'a HashMap<String, String>, req: Request) -> Pin<Box<dyn Future<Output = Result<Response, Fail>> + Send + 'a>> {
+    boxed(move || routed(hub, rest, q, req))
+}
+
+async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
     let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who { name: "admin".to_owned(), agent: false }, Who::of);
     let actor = who.name.clone();
@@ -83,21 +97,24 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
     let store = &d.hub.store;
     match (&method, rest) {
         (&Method::GET, ["environments"]) => ok(&json!({ "environments": store::environments(store).await.map_err(internal)? })),
-        (&Method::POST, ["environments"]) => created(&flow::put_environment(&d, &who, body::<Environment>(req.into_body()).await?).await?),
+        (&Method::POST, ["environments"]) => {
+            let e: Environment = body(req.into_body()).await?;
+            created(&boxed(|| flow::put_environment(&d, &who, e)).await?)
+        }
         (&Method::GET, ["environments", name]) => ok(&store::environment(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {name}")))?),
         (&Method::PUT, ["environments", name]) => {
             let e: Environment = body(req.into_body()).await?;
             if e.name != *name {
                 return Err(bad(format!("the body is environment {}, the path {name}", e.name)));
             }
-            ok(&flow::put_environment(&d, &who, e).await?)
+            ok(&boxed(|| flow::put_environment(&d, &who, e)).await?)
         }
         (&Method::DELETE, ["environments", name]) => {
-            flow::delete_environment(&d, &actor, name).await?;
+            boxed(|| flow::delete_environment(&d, &actor, name)).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
 
-        (&Method::GET, ["board"]) => ok(&board(&d).await?),
+        (&Method::GET, ["board"]) => ok(&boxed(|| board(&d)).await?),
         (&Method::GET, ["metrics"]) => {
             let days = q.get("days").and_then(|x| x.parse().ok()).unwrap_or(30i64).clamp(1, 365);
             let list = store::releases(store, store::ReleaseQuery { app: q.get("app").cloned(), environment: q.get("environment").cloned(), limit: 1000, ..store::ReleaseQuery::default() })
@@ -111,50 +128,60 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             ok(&m)
         }
         (&Method::GET, ["templates"]) => ok(&json!({ "templates": store::templates(store).await.map_err(internal)? })),
-        (&Method::POST, ["templates"]) => created(&flow::put_template(&d, &actor, body::<Template>(req.into_body()).await?, adds_repos).await?),
+        (&Method::POST, ["templates"]) => {
+            let t: Template = body(req.into_body()).await?;
+            created(&boxed(|| flow::put_template(&d, &actor, t, adds_repos)).await?)
+        }
         (&Method::GET, ["templates", name]) => ok(&store::template(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no template {name}")))?),
         (&Method::PUT, ["templates", name]) => {
             let t: Template = body(req.into_body()).await?;
             if t.name != *name {
                 return Err(bad(format!("the body is template {}, the path {name}", t.name)));
             }
-            ok(&flow::put_template(&d, &actor, t, adds_repos).await?)
+            ok(&boxed(|| flow::put_template(&d, &actor, t, adds_repos)).await?)
         }
         (&Method::DELETE, ["templates", name]) => {
-            flow::delete_template(&d, &actor, name).await?;
+            boxed(|| flow::delete_template(&d, &actor, name)).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
-        (&Method::GET, ["app-names", name]) => ok(&flow::app_name_free(&d, name).await?),
+        (&Method::GET, ["app-names", name]) => ok(&boxed(|| flow::app_name_free(&d, name)).await?),
 
         (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
-        (&Method::POST, ["apps"]) => created(&flow::create_app(&d, &actor, body::<flow::AppAsk>(req.into_body()).await?).await?),
-        (&Method::PATCH, ["apps", name]) => ok(&flow::patch_app(&d, &actor, name, body::<flow::AppPatch>(req.into_body()).await?).await?),
+        (&Method::POST, ["apps"]) => {
+            let ask: flow::AppAsk = body(req.into_body()).await?;
+            created(&boxed(|| flow::create_app(&d, &actor, ask)).await?)
+        }
+        (&Method::PATCH, ["apps", name]) => {
+            let patch: flow::AppPatch = body(req.into_body()).await?;
+            ok(&boxed(|| flow::patch_app(&d, &actor, name, patch)).await?)
+        }
         (&Method::GET, ["apps", name, "catalog-info.yaml"]) => {
             let a = store::app(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
             Ok(srv::response(StatusCode::OK, "application/yaml", srv::full(flow::catalog_info(&a))))
         }
-        (&Method::GET, ["apps", name]) => ok(&app_json(&d, name).await?),
+        (&Method::GET, ["apps", name]) => ok(&boxed(|| app_json(&d, name)).await?),
         (&Method::PUT, ["apps", name]) => {
             let a: App = body(req.into_body()).await?;
             if a.name != *name {
                 return Err(bad(format!("the body is app {}, the path {name}", a.name)));
             }
-            ok(&flow::put_app(&d, &actor, a).await?)
+            ok(&boxed(|| flow::put_app(&d, &actor, a)).await?)
         }
         (&Method::DELETE, ["apps", name]) => {
             let yes = |k: &str| q.get(k).is_some_and(|v| v == "true" || v == "1");
-            flow::delete_app(&d, &who, name, yes("everywhere"), yes("keep")).await?;
+            boxed(|| flow::delete_app(&d, &who, name, yes("everywhere"), yes("keep"))).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
 
-        (&Method::POST, ["apps", app, "environments", env]) => created(&flow::register(&d, &actor, app, env).await?),
-        (&Method::GET, ["apps", app, "environments", env]) => ok(&registration_json(&d, app, env).await?),
+        (&Method::POST, ["apps", app, "environments", env]) => created(&boxed(|| flow::register(&d, &actor, app, env)).await?),
+        (&Method::GET, ["apps", app, "environments", env]) => ok(&boxed(|| registration_json(&d, app, env)).await?),
         (&Method::DELETE, ["apps", app, "environments", env]) => {
-            flow::deregister(&d, &who, app, env, q.get("keep").is_some_and(|v| v == "true" || v == "1")).await?;
+            let keep = q.get("keep").is_some_and(|v| v == "true" || v == "1");
+            boxed(|| flow::deregister(&d, &who, app, env, keep)).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
-        (&Method::POST, ["apps", app, "environments", env, "pause"]) => ok(&flow::pause(&d, &actor, app, env, true).await?),
-        (&Method::POST, ["apps", app, "environments", env, "resume"]) => ok(&flow::pause(&d, &actor, app, env, false).await?),
+        (&Method::POST, ["apps", app, "environments", env, "pause"]) => ok(&boxed(|| flow::pause(&d, &actor, app, env, true)).await?),
+        (&Method::POST, ["apps", app, "environments", env, "resume"]) => ok(&boxed(|| flow::pause(&d, &actor, app, env, false)).await?),
         (&Method::GET, ["apps", app, "environments", env, what @ ("resources" | "manifests" | "diff" | "logs")]) => {
             let a = store::app(store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
             let environment = store::environment(store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
@@ -173,10 +200,10 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
                     tail: q.get("tail").and_then(|t| t.parse().ok()).unwrap_or(200).clamp(1, 10_000),
                 },
             };
-            ok(&reads::read(&d, &a, &environment, read).await?)
+            ok(&boxed(|| reads::read(&d, &a, &environment, read)).await?)
         }
-        (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": versions(&d, app, env).await? })),
-        (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": flow::candidates(&d, app, env).await? })),
+        (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": boxed(|| versions(&d, app, env)).await? })),
+        (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": boxed(|| flow::candidates(&d, app, env)).await? })),
 
         (&Method::GET, ["releases"]) => {
             let state = match q.get("state") {
@@ -195,16 +222,22 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
         (&Method::POST, ["releases"]) => {
             let mut ask: Ask = body(req.into_body()).await?;
             ask.idempotency_key = ask.idempotency_key.or(key);
-            created(&flow::release(&d, &who, ask).await?)
+            created(&boxed(|| flow::release(&d, &who, ask)).await?)
         }
         (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
-        (&Method::POST, ["releases", id, "approve"]) => ok(&flow::answer(&d, &who, release_id(id)?, true, body::<Note>(req.into_body()).await?.note).await?),
-        (&Method::POST, ["releases", id, "reject"]) => ok(&flow::answer(&d, &who, release_id(id)?, false, body::<Note>(req.into_body()).await?.note).await?),
-        (&Method::POST, ["releases", id, "cancel"]) => ok(&flow::cancel(&d, &who, release_id(id)?, key.is_some()).await?),
+        (&Method::POST, ["releases", id, verdict @ ("approve" | "reject")]) => {
+            let (id, note) = (release_id(id)?, body::<Note>(req.into_body()).await?.note);
+            ok(&boxed(|| flow::answer(&d, &who, id, *verdict == "approve", note)).await?)
+        }
+        (&Method::POST, ["releases", id, "cancel"]) => {
+            let id = release_id(id)?;
+            ok(&boxed(|| flow::cancel(&d, &who, id, key.is_some())).await?)
+        }
         (&Method::POST, ["releases", id, "rollback"]) => {
             let of = store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?;
             let to: RollbackAsk = body(req.into_body()).await?;
-            created(&flow::release(&d, &who, Ask { app: of.app, environment: of.environment, rollback: Some(to), idempotency_key: key, ..Ask::default() }).await?)
+            let ask = Ask { app: of.app, environment: of.environment, rollback: Some(to), idempotency_key: key, ..Ask::default() };
+            created(&boxed(|| flow::release(&d, &who, ask)).await?)
         }
         _ => Err((StatusCode::NOT_FOUND, "not found".into())),
     }
