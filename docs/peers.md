@@ -1,9 +1,12 @@
 # Peered clusters
 
 A kiln cluster can open other kiln clusters through itself: pick one in the header's cluster
-picker and its UI fills the page, in a frame with nothing of its own (no border, no background),
-under a band of the clusters opened so far, to flip between them. Each frame stays loaded once
-opened, so flipping back finds it where it was. This works however you reach your cluster: any
+picker and its UI fills the page, in a frame with nothing of its own (no border, no background).
+There is one header at a time: the opened cluster's page tells ours it's kiln, is told our
+clusters, and shows the same picker in its own header, where picking one switches back (ours steps
+aside meanwhile; a cluster too old to say so keeps ours above it). Each frame stays loaded once
+opened, so flipping back finds it where it was. A cluster is named for the host of its public
+address (else its machine's name). This works however you reach your cluster: any
 runner's front door, or the server's own address.
 
 Peering is not joining. The other cluster keeps its own runners, accounts and settings; ours only
