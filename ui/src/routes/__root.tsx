@@ -30,6 +30,7 @@ export const Route = createRootRoute({
       { name: "color-scheme", content: "dark" },
       { name: "description", content: "kiln — self-hosted CI/CD for the hyper-light stack" },
       // Added to a phone's Home Screen, kiln opens as an app of its own (iPhone: what Web Push needs).
+      { name: "mobile-web-app-capable", content: "yes" },
       { name: "apple-mobile-web-app-capable", content: "yes" },
       { name: "apple-mobile-web-app-title", content: "kiln" },
       { title: "kiln" },
