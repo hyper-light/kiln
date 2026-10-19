@@ -361,7 +361,7 @@ mod tests {
             anyhow::ensure!(reads.len() == 1 && reads.first().is_some_and(|r| r.by == "kilncd" && r.versions == "API_KEY@1,DB_PASSWORD@12"), "{reads:?}");
 
             // Rotation re-seals every value kept under a new data key; the old one goes.
-            anyhow::ensure!(s.rotate().await? == 11, "the eleven values kept");
+            anyhow::ensure!(s.rotate(&ada()).await? == 11, "the eleven values kept");
             let keys: i64 = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM secret_keys", [], |r| r.get(0))?)).await?;
             anyhow::ensure!(keys == 1, "{keys} data keys after a rotation");
             anyhow::ensure!(texts(&s.resolve(&web, &now, &why).await?) == texts(&b), "the same values after a rotation");
@@ -374,6 +374,7 @@ mod tests {
             let agent = Caller { name: "claude".into(), agent: true };
             anyhow::ensure!(matches!(s.put(&web, "X", value("v"), &agent).await, Err(Refused::Forbidden(_))));
             anyhow::ensure!(matches!(s.delete(&web, "API_KEY", &agent).await, Err(Refused::Forbidden(_))));
+            anyhow::ensure!(matches!(s.rotate(&agent).await, Err(Refused::Forbidden(_))));
             anyhow::ensure!(s.list(&web, &agent).await?.len() == 2, "agents list");
             anyhow::ensure!(matches!(s.put(&web, "db-password", value("v"), &ada()).await, Err(Refused::Bad(_))));
             anyhow::ensure!(matches!(s.put(&web, "EMPTY", value(""), &ada()).await, Err(Refused::Bad(_))));

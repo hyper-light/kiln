@@ -21,6 +21,7 @@
 //! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment |
 //! | `GET /apps/{app}/environments/{env}/secrets`; `PUT`, `DELETE …/secrets/{name}` (`?release=false`) | an app's secrets there (§3.5): names and versions; a value is set (`{value}` or `{base64}`), never read back; a change is released |
 //! | `GET …/secrets/{name}/versions`, `GET …/secret-uses?limit` | a secret's versions; each read of the secrets for a delivery |
+//! | `POST /secret-keys/rotate` | every app's secrets re-sealed under a new data key |
 //!
 //! A release, rollback or cancel asked for with an `Idempotency-Key` header (or
 //! `idempotency_key`) is the same one when asked for again.
@@ -218,6 +219,10 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             ok(&boxed(|| secret_delete(&d, &who, app, env, name, release)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "secrets", name, "versions"]) => ok(&boxed(|| secret_versions(&d, &who, app, env, name)).await?),
+        (&Method::POST, ["secret-keys", "rotate"]) => {
+            let n = secrets::of(&d.hub).rotate(&caller(&who)).await.map_err(refused)?;
+            ok(&json!({ "resealed": n }))
+        }
         (&Method::GET, ["apps", app, "environments", env, "secret-uses"]) => {
             let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
             ok(&boxed(|| secret_uses(&d, &who, app, env, limit)).await?)

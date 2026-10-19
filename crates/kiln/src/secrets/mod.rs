@@ -233,6 +233,8 @@ pub enum Action {
     /// A new version.
     Put,
     Delete,
+    /// Every value re-sealed under new keys.
+    Rotate,
 }
 
 /// The service: the policy, over a backend.
@@ -266,7 +268,7 @@ impl Secrets {
     /// path, by capability) come here.
     fn may(&self, who: &Caller, act: Action) -> Result<(), Refused> {
         match act {
-            Action::Put | Action::Delete if who.agent => Err(Refused::Forbidden("agents don't set or delete secrets: a person does".into())),
+            Action::Put | Action::Delete | Action::Rotate if who.agent => Err(Refused::Forbidden("agents don't set, delete or rotate secrets: a person does".into())),
             _ => Ok(()),
         }
     }
@@ -352,8 +354,12 @@ impl Secrets {
         Ok(n)
     }
 
-    pub async fn rotate(&self) -> anyhow::Result<usize> {
-        self.backend.rotate().await
+    /// Re-seals every value the backend keeps under new keys: how many.
+    pub async fn rotate(&self, who: &Caller) -> Result<usize, Refused> {
+        self.may(who, Action::Rotate)?;
+        let n = self.backend.rotate().await?;
+        self.hub.store.audit(who.name.clone(), "secrets.rotate".into(), format!("{} re-sealed {n} values under a new data key", self.backend.name())).await;
+        Ok(n)
     }
 }
 

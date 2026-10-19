@@ -230,8 +230,9 @@ backend: the API, `kiln`, the UI, delivery and audit stay as they are.
 - **API.** `GET /api/deploy/apps/{app}/environments/{env}/secrets` (names, versions, sizes, who,
   when), `PUT …/secrets/{name}` (`{value}`, or `{base64}` for bytes; write-only: a new version),
   `DELETE …/secrets/{name}`, `GET …/secrets/{name}/versions`, `GET …/secret-uses` (each read for
-  a delivery). A change answers with the release that delivers it and what happens next;
-  `?release=false` keeps it for a later release. `kiln app secret set|import|list|rm|versions|uses`
+  a delivery), `POST /api/deploy/secret-keys/rotate` (every value re-sealed under a new data key,
+  the old ones retired). A change answers with the release that delivers it and what happens next;
+  `?release=false` keeps it for a later release. `kiln app secret set|import|list|rm|versions|uses|rotate-keys`
   (a value from stdin, asked for unechoed at a terminal, or `--from-file`: never an argument;
   `--no-release`); `kiln deploy <app> --to <env> --secrets`; `deploy.secrets.list` for agents; a
   Secrets tab on each registration's page.

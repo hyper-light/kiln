@@ -375,6 +375,8 @@ enum SecretCmd {
         #[arg(long)]
         env: String,
     },
+    /// Re-seal every app's secrets under a new data key (the old ones are retired).
+    RotateKeys,
     /// Each read of an app's secrets for a delivery: who read them, for what, which versions.
     Uses {
         app: String,
@@ -584,6 +586,10 @@ async fn secret(api: &Api, cmd: SecretCmd) -> Result<()> {
                     println!("v{:<4} {what} by {} at {}", x.get("version").and_then(Value::as_u64).unwrap_or(0), s(x, "set_by"), when(x, "set_at"));
                 }
             });
+        }
+        SecretCmd::RotateKeys => {
+            let v = api.call(Method::Post, "/secret-keys/rotate", Some(json!({}))).await?;
+            api.print(&v, |v| println!("re-sealed {} values under a new data key", v.get("resealed").and_then(Value::as_u64).unwrap_or(0)));
         }
         SecretCmd::Uses { app, env, limit } => {
             let v = api.call(Method::Get, &format!("{}/secret-uses?limit={limit}", at(&app, &env)), None).await?;
