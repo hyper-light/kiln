@@ -20,6 +20,7 @@
 pub mod acp;
 pub mod antigravity;
 pub mod broadcast;
+pub mod carry;
 pub mod claude;
 pub mod cli;
 pub mod codex;
@@ -49,3 +50,4 @@ pub mod streams;
 pub mod transcript;
 pub mod visuals;
 pub mod wait;
+pub mod worktree;

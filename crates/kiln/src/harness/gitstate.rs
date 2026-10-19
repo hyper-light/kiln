@@ -223,13 +223,23 @@ fn bundle(root: &Path, theirs: &[String]) -> Result<Option<String>, String> {
 /// Puts `st` (from machine `from`) in place in the repository at `root`, its working tree as sync
 /// brings it. What it did, in words, for the session's timeline; what couldn't be is said too.
 pub fn restore(root: &Path, st: &GitState, from: &str) -> Vec<String> {
+    restore_at(root, root, st, from)
+}
+
+/// The commits `st` carries, fetched into the repository at `repo` (a worktree's are made from
+/// them, [`super::worktree::place`]).
+pub fn fetch(repo: &Path, st: &GitState, from: &str) -> Result<(), String> {
+    st.bundle.as_ref().map_or(Ok(()), |b| fetch_bundle(repo, b, from))
+}
+
+/// As [`restore`], with the repository's refs, tags and stash set at `repo` and HEAD and the index
+/// at `tree`: the repository's own working tree, or a worktree of it.
+pub fn restore_at(repo: &Path, tree: &Path, st: &GitState, from: &str) -> Vec<String> {
+    let root = repo;
     let mut said: Vec<String> = Vec::new();
     let mut lacking: Vec<String> = Vec::new();
-    if let Some(b) = &st.bundle {
-        match fetch_bundle(root, b, from) {
-            Ok(()) => {}
-            Err(e) => said.push(format!("Its commits couldn't be added here ({e}); they stay on {from}")),
-        }
+    if let Err(e) = fetch(root, st, from) {
+        said.push(format!("Its commits couldn't be added here ({e}); they stay on {from}"));
     }
     let have = |sha: &str| git_ok(root, &["cat-file", "-e", sha]);
     let head_branch = match &st.head {
@@ -300,20 +310,20 @@ pub fn restore(root: &Path, st: &GitState, from: &str) -> Vec<String> {
     }
     // HEAD, where it was; then the index, as staged there (no file is touched).
     let headed = match &st.head {
-        Head::Branch(b) | Head::Unborn(b) => git_ok(root, &["symbolic-ref", "HEAD", &format!("refs/heads/{b}")]),
-        Head::Detached(sha) => have(sha) && git_ok(root, &["update-ref", "--no-deref", "HEAD", sha]),
+        Head::Branch(b) | Head::Unborn(b) => git_ok(tree, &["symbolic-ref", "HEAD", &format!("refs/heads/{b}")]),
+        Head::Detached(sha) => have(sha) && git_ok(tree, &["update-ref", "--no-deref", "HEAD", sha]),
     };
     if !headed {
         said.push(format!("HEAD couldn't be put where it was on {from}"));
     }
     let indexed = match (&st.index, &st.head) {
-        (Some(c), _) if have(c) => git_ok(root, &["read-tree", &format!("{c}^{{tree}}")]),
+        (Some(c), _) if have(c) => git_ok(tree, &["read-tree", &format!("{c}^{{tree}}")]),
         (Some(_), _) => {
             lacking.push("what was staged".into());
             false
         }
-        (None, Head::Unborn(_)) => git_ok(root, &["read-tree", "--empty"]),
-        (None, _) => git_ok(root, &["read-tree", "HEAD"]),
+        (None, Head::Unborn(_)) => git_ok(tree, &["read-tree", "--empty"]),
+        (None, _) => git_ok(tree, &["read-tree", "HEAD"]),
     };
     // What was fetched for this, gone again.
     if let Ok(del) = git(root, &["for-each-ref", "--format=%(refname)", &format!("{IN}/{}", safe(from))]) {
