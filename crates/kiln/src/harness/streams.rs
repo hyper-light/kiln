@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::hub::Hub;
@@ -54,6 +55,62 @@ pub struct Live {
 pub struct Relay {
     live: Mutex<HashMap<String, Arc<Live>>>,
     next: AtomicU64,
+    /// Streams that ended lately, by id: whose they were (a recording's end can come after).
+    ended: Mutex<HashMap<String, Owner>>,
+    /// Recordings made of each session's streams, as their runners said (`crate::browser::record`).
+    recordings: Mutex<HashMap<String, Vec<Recording>>>,
+}
+
+/// Whose a stream is: its session, its machine, its profile.
+#[derive(Debug, Clone)]
+struct Owner {
+    session: String,
+    machine: String,
+    profile: Option<String>,
+}
+
+/// A recording of a stream, on its machine: its video (MP4), its log of what was done, and that as
+/// a test.
+#[derive(Debug, Clone, Serialize)]
+pub struct Recording {
+    pub id: String,
+    pub stream: String,
+    pub at: i64,
+    pub seconds: f64,
+    pub bytes: u64,
+    pub pictures: u64,
+    pub video: String,
+    pub inputs: String,
+    pub test: String,
+    #[serde(skip)]
+    pub machine: String,
+    #[serde(skip)]
+    profile: Option<String>,
+}
+
+impl Recording {
+    /// Whether `person` may see it: one of a stream in a person's own profile is theirs alone.
+    pub fn for_whom(&self, person: Option<&str>) -> bool {
+        visible(self.profile.as_deref(), person)
+    }
+
+    /// Its file of `what` (`video`, `inputs`, `test`).
+    pub fn file(&self, what: &str) -> Option<&str> {
+        match what {
+            "video" => Some(&self.video),
+            "inputs" => Some(&self.inputs),
+            "test" => Some(&self.test),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `person` may see what's of a stream in `profile`.
+fn visible(profile: Option<&str>, person: Option<&str>) -> bool {
+    match profile {
+        Some(p) if p.starts_with("personal:") => person.is_some_and(|me| personal(me) == p),
+        _ => true,
+    }
 }
 
 impl Relay {
@@ -125,15 +182,23 @@ impl Relay {
 
     /// An event from a runner: kept when a joining viewer needs it, sent on to each viewer; a
     /// stream that closed or failed to open goes.
-    pub fn event(&self, machine: &str, id: &str, json: String) {
+    pub fn event(&self, machine: &str, id: &str, mut json: String) {
+        let mut v: Value = serde_json::from_str(&json).unwrap_or_default();
+        // A recording's end: kept, and said to its viewers with the id to get its files by.
+        if let Some(rid) = v.get("recorded").and_then(|r| self.recorded(machine, id, r)) {
+            if let Some(r) = v.get_mut("recorded").and_then(Value::as_object_mut) {
+                r.insert("id".into(), json!(rid));
+            }
+            json = v.to_string();
+        }
         let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return };
-        let v: Value = serde_json::from_str(&json).unwrap_or_default();
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
             if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected") {
                 live.said.lock().insert(k.clone(), json.clone());
             }
             if matches!(k.as_str(), "closed" | "error") {
                 self.live.lock().remove(id);
+                self.ended(&live);
             }
             if k == "error" {
                 tracing::warn!(stream = id, machine, error = %v.get("error").map(|e| e.to_string()).unwrap_or_default(), "a stream couldn't open");
@@ -177,19 +242,60 @@ impl Relay {
         }
     }
 
+    /// A stream that ended: whose it was, kept a while (a recording's end comes after).
+    fn ended(&self, live: &Live) {
+        let mut g = self.ended.lock();
+        if g.len() > 256 {
+            g.clear();
+        }
+        g.insert(live.id.clone(), Owner { session: live.session.clone(), machine: live.machine.clone(), profile: live.spec.get("profile").and_then(Value::as_str).map(str::to_owned) });
+    }
+
+    /// A recording of stream `id` done on `machine` (its runner's `recorded`): kept with its
+    /// session, when the stream is that machine's.
+    fn recorded(&self, machine: &str, id: &str, r: &Value) -> Option<String> {
+        let owner = self.get(id).map(|l| Owner { session: l.session.clone(), machine: l.machine.clone(), profile: l.spec.get("profile").and_then(Value::as_str).map(str::to_owned) }).or_else(|| self.ended.lock().get(id).cloned());
+        let owner = owner.filter(|o| o.machine == machine)?;
+        let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        let rec = Recording {
+            id: hex::encode(rand::random::<[u8; 16]>()),
+            stream: id.to_owned(),
+            at: r.get("at").and_then(Value::as_i64).unwrap_or_else(crate::util::now_ms),
+            seconds: r.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
+            bytes: r.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+            pictures: r.get("pictures").and_then(Value::as_u64).unwrap_or(0),
+            video: s("video"),
+            inputs: s("inputs"),
+            test: s("test"),
+            machine: owner.machine,
+            profile: owner.profile,
+        };
+        let rid = rec.id.clone();
+        self.recordings.lock().entry(owner.session).or_default().push(rec);
+        Some(rid)
+    }
+
+    /// Session `session`'s recordings `person` may see.
+    pub fn recordings(&self, session: &str, person: Option<&str>) -> Vec<Recording> {
+        self.recordings.lock().get(session).map(|v| v.iter().filter(|r| r.for_whom(person)).cloned().collect()).unwrap_or_default()
+    }
+
     /// Close a stream (its tab goes on its runner).
     pub async fn close(&self, hub: &Hub, id: &str) -> bool {
         let Some(live) = self.live.lock().remove(id) else { return false };
+        self.ended(&live);
         let _ = hub.send_to_agent(&live.machine, LANE_STREAM, &ServerMsg::StreamClose { stream: live.id.clone(), session: live.session.clone() }).await;
         live.send(&ToViewer::Event(json!({"closed": {"why": "it was closed"}}).to_string()));
         true
     }
 
-    /// A conversation that's closed: its streams go.
+    /// A conversation that's closed: its streams go, and its recordings (their files go with it on
+    /// its machine).
     pub async fn forget(&self, hub: &Hub, session: &str) {
         for l in self.of(session) {
             self.close(hub, &l.id).await;
         }
+        self.recordings.lock().remove(session);
     }
 
     /// A machine gone: its streams end (their viewers are told).
@@ -199,6 +305,9 @@ impl Relay {
             let ids: Vec<String> = g.values().filter(|l| l.machine == machine).map(|l| l.id.clone()).collect();
             ids.iter().filter_map(|i| g.remove(i)).collect()
         };
+        for l in &gone {
+            self.ended(l);
+        }
         for l in gone {
             l.send(&ToViewer::Event(json!({"closed": {"why": format!("{machine} went away")}}).to_string()));
         }
@@ -234,10 +343,7 @@ impl Live {
     /// and use it: one in a person's own profile (their sign-ins) is theirs alone, whoever else
     /// the conversation is shared with.
     pub fn for_whom(&self, person: Option<&str>) -> bool {
-        match self.spec.get("profile").and_then(Value::as_str) {
-            Some(p) if p.starts_with("personal:") => person.is_some_and(|me| personal(me) == p),
-            _ => true,
-        }
+        visible(self.spec.get("profile").and_then(Value::as_str), person)
     }
 
     pub fn view(&self) -> Value {
@@ -383,6 +489,34 @@ mod tests {
         // The conversation's own are everyone's it's shared with.
         assert!(live("c", "m1").for_whom(None));
         Ok(())
+    }
+
+    #[test]
+    fn a_recording_is_kept_with_its_session_even_said_after_its_stream_ended() {
+        let r = Relay::default();
+        let l = live("v1", "m1");
+        r.live.lock().insert("v1".into(), l.clone());
+        r.event("m1", "v1", json!({"recorded": {"video": "/s/live-1.mp4", "inputs": "/s/live-1.inputs.jsonl", "test": "/s/live-1.spec.ts", "seconds": 2.5}}).to_string());
+        // Its stream gone, a late one still counts; another machine's never does.
+        r.live.lock().remove("v1");
+        r.ended(&l);
+        r.event("m1", "v1", json!({"recorded": {"video": "/s/live-2.mp4"}}).to_string());
+        r.event("m2", "v1", json!({"recorded": {"video": "/x/theirs.mp4"}}).to_string());
+        let recs = r.recordings("s1", None);
+        assert_eq!(recs.iter().map(|x| x.video.as_str()).collect::<Vec<_>>(), ["/s/live-1.mp4", "/s/live-2.mp4"]);
+        assert_eq!(recs.first().and_then(|x| x.file("test")), Some("/s/live-1.spec.ts"));
+        assert!(recs.first().and_then(|x| x.file("elsewhere")).is_none());
+        // A viewer is told its id.
+        let l = live("v2", "m1");
+        let (tx, rx) = async_channel::bounded(4);
+        l.viewers.lock().push((1, tx));
+        r.live.lock().insert("v2".into(), l);
+        r.event("m1", "v2", json!({"recorded": {"video": "/s/live-3.mp4"}}).to_string());
+        let said: Value = match rx.try_recv() {
+            Ok(ToViewer::Event(e)) => serde_json::from_str(&e).unwrap_or_default(),
+            _ => Value::Null,
+        };
+        assert!(said.pointer("/recorded/id").and_then(Value::as_str).is_some_and(|id| id.len() == 32), "{said}");
     }
 
     #[test]

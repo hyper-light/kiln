@@ -837,6 +837,23 @@ export interface Opened {
   url?: string;
 }
 
+/** A recording of one of a session's streams (`crate::harness::streams::Recording`): its video,
+ *  its log of what was done, and that as a Playwright test, on its machine. */
+export interface Recording {
+  id: string;
+  stream: string;
+  at: number;
+  seconds: number;
+  bytes: number;
+  pictures: number;
+  video: string;
+  inputs: string;
+  test: string;
+}
+
+/** Where a recording's file is read (`video`, `inputs`, `test`). */
+export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => `/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`;
+
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
   /** What a person may open live from it: the ports its machine serves (its agent's first), its project's app. */
@@ -854,6 +871,8 @@ export const harnessApi = {
   /** This person's apps of it open on their devices. */
   opened: (id: string) => call<Opened[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/opened`),
   endOpened: (id: string, opened: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/opened/${opened}`),
+  /** Recordings of its streams. */
+  recordings: (id: string) => call<Recording[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/recordings`),
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
