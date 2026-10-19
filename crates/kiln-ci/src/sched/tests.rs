@@ -1,6 +1,7 @@
 //! Scheduler tests (docs/ci.md W05-AC01 to AC06, AC10, W05-S01 to S04), on the simulator.
 
 use super::groups::GroupConfig;
+use super::pools::{ExecState, PoolSpec};
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
@@ -309,4 +310,117 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
+}
+
+// ------------------------------------------------------------------ pools (W13-R09, W05-R27)
+
+fn docker_host(name: &str) -> RunnerIn {
+    let mut r = linux(name, 2);
+    r.view.labels = vec!["linux".into()];
+    r.view.facts.executors.insert("docker".into(), crate::facts::Executor::default());
+    r
+}
+
+fn pool(min_idle: usize, max: usize, per_host_max: usize, idle: &str) -> Result<super::pools::Pool, String> {
+    PoolSpec {
+        name: "burst".into(),
+        executor: "docker".into(),
+        hosts: Some("executors contains docker".into()),
+        image: Some("kiln/runner-ubuntu-24.04".into()),
+        labels: vec!["burst".into(), "linux".into()],
+        min_idle,
+        max: Some(max),
+        per_host_max: Some(per_host_max),
+        idle_timeout: Some(idle.into()),
+        ..PoolSpec::default()
+    }
+    .pool()
+}
+
+fn pool_leg(id: &str) -> LegIn {
+    LegIn { id: id.into(), run: "run-burst".into(), repo: "acme/x".into(), route: LegRoute { labels: vec!["burst".into()], ..LegRoute::default() }, priority: 50, ..LegIn::default() }
+}
+
+fn counts(sim: &Sim) -> (usize, usize, usize) {
+    sim.sched.pools().first().map_or((0, 0, 0), |p| (p.starting, p.idle, p.busy))
+}
+
+/// A pool keeps `min_idle` executors ready, a leg of its labels runs in one (which is then
+/// discarded), on the hosts its `hosts` names only, and the host's own slots stay its own.
+#[test]
+fn w13_r09_pool_runs_legs_in_its_executors() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pool(2, 4, 4, "10m")?], ..Config::default() });
+    sim.runner(0, docker_host("d1"));
+    sim.runner(0, linux("plain", 2));
+    sim.run(MIN);
+    assert_eq!(counts(&sim), (0, 2, 0), "min_idle ready");
+    assert!(sim.executors_started.iter().all(|(_, _, host)| host == "d1"), "only hosts with Docker: {:?}", sim.executors_started);
+    sim.leg(MIN, pool_leg("p1"), 30_000);
+    sim.leg(MIN, leg("own", "acme/x", 50), 30_000);
+    sim.run(MIN + 1);
+    let p1 = sim.assigned.iter().find(|a| a.leg == "p1").ok_or("p1 never ran")?;
+    assert_eq!(p1.runner, "d1");
+    let slot = sim.runs.is_empty() && sim.started("own").is_some();
+    assert!(slot, "the host's own leg ran in its slots beside the pool's");
+    // Its executor was busy, then discarded; min_idle is kept.
+    sim.run(2 * MIN);
+    assert_eq!(counts(&sim).2, 0, "nothing busy");
+    assert_eq!(counts(&sim).1, 2, "min_idle kept after the leg's executor was discarded");
+    Ok(())
+}
+
+/// W13-AC04, on the simulator (the E2E runs it with Docker): a burst of 200 legs on a pool with
+/// `min_idle = 2` and `max = 32` scales its executors to 32, drains the queue, and is back to
+/// 2 within `idle_timeout`.
+#[test]
+fn w13_ac04_pool_burst_on_the_simulator() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pool(2, 32, 16, "2m")?], ..Config::default() });
+    sim.runner(0, docker_host("h1"));
+    sim.runner(0, docker_host("h2"));
+    sim.run(MIN);
+    assert_eq!(counts(&sim), (0, 2, 0));
+    for i in 0..200 {
+        sim.leg(MIN, pool_leg(&format!("b{i}")), 20_000);
+    }
+    let (mut peak, mut t) = (0, MIN);
+    while sim.settled.len() < 200 && t < 60 * MIN {
+        t += 250;
+        sim.run(t);
+        let (s, i, b) = counts(&sim);
+        peak = peak.max(s + i + b);
+        assert!(s + i + b <= 32, "never more than max: {}", s + i + b);
+    }
+    assert_eq!(sim.settled.len(), 200, "the queue drained");
+    assert!(sim.settled.iter().all(|(_, _, o)| *o == Outcome::Success));
+    assert_eq!(peak, 32, "scaled to max");
+    // Each host held at most per_host_max at once.
+    for host in ["h1", "h2"] {
+        let on: usize = sim.sched.pools().first().map_or(0, |p| p.executors.iter().filter(|e| e.runner == host).count());
+        assert!(on <= 16, "{host}: {on}");
+    }
+    let drained = t;
+    sim.run(drained + 2 * MIN + 1_000);
+    assert_eq!(counts(&sim), (0, 2, 0), "back to min_idle within idle_timeout");
+    Ok(())
+}
+
+/// A host that can't start the pool's executors is left alone, longer each time, and the legs
+/// say why they wait; another host takes them.
+#[test]
+fn w13_r09_failing_host_backs_off() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pool(0, 4, 4, "10m")?], ..Config::default() });
+    sim.failing_hosts.insert("bad".into());
+    sim.runner(0, docker_host("bad"));
+    sim.leg(1, pool_leg("w1"), 10_000);
+    sim.run(20_000);
+    let tries = sim.executors_started.iter().filter(|(_, _, h)| h == "bad").count();
+    assert!((2..=6).contains(&tries), "backing off: {tries} tries in 20 s");
+    assert!(matches!(sim.last_wait("w1"), Some(WaitReason::Pool { .. })), "{:?}", sim.last_wait("w1"));
+    let view = sim.sched.pools();
+    assert!(view.first().and_then(|p| p.last_error.clone()).is_some_and(|(h, _)| h == "bad"));
+    sim.runner(20_000, docker_host("good"));
+    sim.run(40_000);
+    assert_eq!(sim.assigned.iter().find(|a| a.leg == "w1").map(|a| a.runner.as_str()), Some("good"));
+    let _ = ExecState::Idle;
+    Ok(())
 }

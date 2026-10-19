@@ -87,6 +87,21 @@ pub enum Msg {
     ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
     Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, reply: async_channel::Sender<Result<u32, String>> },
+    /// A runner's word on a pool's executor it was asked to start (W13-R09).
+    Executor { agent: String, json: String },
+    /// The stored pools changed: read them again.
+    PoolsChanged,
+    /// The pools and their executors now.
+    Pools { reply: async_channel::Sender<serde_json::Value> },
+}
+
+/// Where and how a leg runs, as the scheduler placed it.
+struct Placement {
+    executor: Option<String>,
+    image: Option<String>,
+    docker: Option<String>,
+    /// The pool's executor it runs in (W13-R09).
+    slot: Option<String>,
 }
 
 pub use kiln_ci::plan::rerun::Mode as RerunMode;
@@ -448,7 +463,9 @@ pub fn spawn(hub: Arc<Hub>) {
         }
         let sources = super::routing::sources(&hub).await;
         let rules = sources.effective();
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(sched_config(&hub, rules)), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
+        let mut cfg = sched_config(&hub, rules);
+        cfg.pools = super::pools::sources(&hub).await;
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -522,6 +539,30 @@ impl Dispatch {
                         tracing::warn!(leg = %id, error = %format!("{e:#}"), "an environment's protection could not be checked");
                     }
                 }
+                Ok(())
+            }
+            Msg::Executor { agent, json } => {
+                let said: crate::runner::pool::Said = serde_json::from_str(&json).unwrap_or_default();
+                let input = match said.state.as_str() {
+                    "ready" => Input::ExecutorReady { executor: said.executor },
+                    _ => {
+                        let error = said.error.unwrap_or_else(|| "it failed".into());
+                        tracing::warn!(runner = %agent, executor = %said.executor, error = %error, "a pool's executor didn't start");
+                        Input::ExecutorFailed { executor: said.executor, error }
+                    }
+                };
+                let cmds = self.sched.handle(input, now_ms());
+                self.commands(cmds).await;
+                Ok(())
+            }
+            Msg::PoolsChanged => {
+                let pools = super::pools::sources(&self.hub).await;
+                let cmds = self.sched.handle(Input::PoolsChanged(pools), now_ms());
+                self.commands(cmds).await;
+                Ok(())
+            }
+            Msg::Pools { reply } => {
+                let _ = reply.try_send(serde_json::to_value(self.sched.pools()).unwrap_or_default());
                 Ok(())
             }
             Msg::RoutingChanged => {
@@ -1191,7 +1232,17 @@ impl Dispatch {
                     self.actions(&run, held).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
-                Command::Assign { leg, runner, attempt, executor, image, docker } => self.assign(&leg, &runner, attempt, executor, image, docker).await,
+                Command::Assign { leg, runner, attempt, executor, image, docker, slot } => self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await,
+                Command::StartExecutor { pool, executor, runner, kind, image } => {
+                    let ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, image.as_deref());
+                    self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
+                    Ok(())
+                }
+                Command::StopExecutor { executor, runner } => {
+                    let ask = serde_json::json!({ "op": "stop", "executor": executor });
+                    self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
+                    Ok(())
+                }
                 Command::Cancel { leg, reason, .. } => {
                     if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
                         self.hub.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason }).await;
@@ -1228,7 +1279,8 @@ impl Dispatch {
     }
 
     /// Sends a leg to its runner (W05, W06).
-    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String>) -> anyhow::Result<()> {
+    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, placed: Placement) -> anyhow::Result<()> {
+        let Placement { executor, image, docker, slot } = placed;
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
@@ -1301,6 +1353,7 @@ impl Dispatch {
         if let Some(d) = docker.filter(|_| r.trusted && a.executor.kind == "docker") {
             a.executor.options = serde_json::json!({ "docker": d });
         }
+        a.executor.slot = slot;
         // Needed jobs' secret outputs, as masked environment only (W04-R22).
         for (k, v) in secret_env {
             a.masks.push(v.clone());
@@ -1465,7 +1518,7 @@ impl Dispatch {
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
             leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total") },
-            executor: wire::ExecutorSpec { image: if executor.as_deref() == Some("docker") { image } else { None }, kind: executor.unwrap_or_else(|| "host".into()), options: serde_json::Value::Null },
+            executor: wire::ExecutorSpec { image: if executor.as_deref() == Some("docker") { image } else { None }, kind: executor.unwrap_or_else(|| "host".into()), options: serde_json::Value::Null, slot: None },
             container: spec.container.clone(),
             services: spec.services.iter().cloned().collect(),
             job_container: job.and_then(|j| j.container.clone()),

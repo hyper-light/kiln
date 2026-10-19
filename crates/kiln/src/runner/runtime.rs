@@ -37,6 +37,8 @@ pub struct Leg {
     pub cancel: Shutdown,
     /// For actions and Node runtimes.
     pub http: std::sync::Arc<crate::http::client::Client>,
+    /// The pool's executor, ready, the leg runs in (docs/ci.md W13-R09).
+    pub warm: std::sync::Arc<parking_lot::Mutex<Option<super::pool::Warm>>>,
 }
 
 /// What a step runs: a script under a shell, or a program (an action's `node main.js`).
@@ -198,8 +200,12 @@ impl Layout {
     /// they are built for another system.
     fn new(work: &Path, leg: &str, repo: &str, hosted: Option<&str>) -> Layout {
         let digest = crate::util::sha256_hex(leg.as_bytes());
+        Layout::within(work, work.join("w").join(digest.get(..8).unwrap_or("leg")), repo, hosted)
+    }
+
+    /// The layout under `runner_workspace`: a leg's own, or a pool's executor's (W13-R09).
+    fn within(work: &Path, runner_workspace: PathBuf, repo: &str, hosted: Option<&str>) -> Layout {
         let tools = work.join("_tool");
-        let runner_workspace = work.join("w").join(digest.get(..8).unwrap_or("leg"));
         let name = repo.rsplit('/').next().unwrap_or("repo");
         let temp = runner_workspace.join("_temp");
         Layout {
@@ -652,10 +658,12 @@ impl Leg {
     pub async fn run(self) -> JobResult {
         let job = self.a.job_id.clone();
         let started = Instant::now();
-        let layout = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, self.hosted_image());
+        let layout = self.layout();
         let ws = layout.runner_workspace;
         super::workspaces::claim(&self.work_dir, &ws).await;
-        let tools = super::workspaces::ToolCache::take(&layout.tool_cache);
+        // A pool's executor's lease, which its container mounted; else the leg's own.
+        let leased = self.warm.lock().as_mut().and_then(|w| w.tools.take());
+        let tools = leased.unwrap_or_else(|| super::workspaces::ToolCache::take(&layout.tool_cache));
         let r = std::panic::AssertUnwindSafe(self.run_inner(tools.path())).catch_unwind().await;
         drop(tools);
         let (status, error) = match r {
@@ -670,6 +678,14 @@ impl Leg {
         }
         let _ = started;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
+    }
+
+    /// The leg's layout: its own directory, or its pool's executor's (W13-R09).
+    fn layout(&self) -> Layout {
+        match self.warm.lock().as_ref().map(|w| w.dir.clone()) {
+            Some(dir) => Layout::within(&self.work_dir, dir, &self.a.repo, self.hosted_image()),
+            None => Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, self.hosted_image()),
+        }
     }
 
     async fn event(&self, e: &JobEventV2) {
@@ -896,7 +912,7 @@ impl Leg {
     async fn run_inner(&self, tool_cache: PathBuf) -> anyhow::Result<Status> {
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
-        let layout = Layout { tool_cache, ..Layout::new(&self.work_dir, &a.job_id, &a.repo, self.hosted_image()) };
+        let layout = Layout { tool_cache, ..self.layout() };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         crate::rt::blocking(move || -> std::io::Result<()> {
@@ -1707,6 +1723,16 @@ impl Leg {
 
     async fn try_init_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
         let a = &self.a;
+        // Its pool's executor, started before the leg came (W13-R09): the leg runs in it as it is.
+        let warm = self.warm.lock().take();
+        if let Some(w) = warm {
+            self.note(idx, &format!("Running in pool {}'s executor {} ({})", w.pool, w.id, w.image)).await;
+            let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
+            let mut c = w.containers;
+            c.cli = c.cli.through(&own, a.runtime.mirrors.clone());
+            st.containers = Some(c);
+            return Ok(());
+        }
         let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("this job uses `container:` or `services:`, and this runner has no working Docker or Podman"))?;
         let config = st.layout.temp.join("_docker_config");
         let l = &st.layout;
@@ -3339,7 +3365,7 @@ mod tests {
         tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = async_channel::unbounded();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default() };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
@@ -3617,7 +3643,7 @@ jobs:
         let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
         let (tx, rx) = async_channel::unbounded();
         let cancel = Shutdown::new();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default() };
         let result = crate::rt::block_on(async move {
             crate::rt::spawn(async move {
                 let until = Instant::now() + Duration::from_secs(120);

@@ -191,6 +191,14 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         // W13-R11: the runner images kiln built.
         (&Method::GET, ["images"]) => super::images::list(hub, q).await,
+        // W13-R09: pools and their executors.
+        (&Method::GET, ["pools"]) => super::pools::list(hub, None).await,
+        (&Method::GET, ["pools", name]) => super::pools::list(hub, Some(name)).await,
+        (&Method::PUT, ["pools", name]) => {
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 64 << 10).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::pools::put(hub, name, &body).await
+        }
+        (&Method::DELETE, ["pools", name]) => super::pools::delete(hub, name).await,
         // W18-R04: whether a digest has kiln's provenance meeting a requirement.
         (&Method::POST, ["attestations", "verify"]) => {
             let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;

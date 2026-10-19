@@ -176,7 +176,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
-| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
+| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); tiers, BuildKit, speed left |
@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
-| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); pools, microVMs, k8s, UI-made image definitions left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); microVM and k8s executors and pool kinds, the Pools page, UI-made image definitions left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); review UI and REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
@@ -1740,7 +1740,15 @@ W20.
     `kiln routing where <labels> [--repo]`) shows where a leg so routed would go and which
     rules applied; `kiln routing rules [--scope] [--set FILE | --clear]`.
 - *Left.*
-  - Pools and scaling (R27, with W13), reservations (R12).
+  - Reservations (R12).
+- *Done.* R27 (with W13-R09): the scheduler keeps each pool's executors (starting, idle, busy) and
+  asks for more when the legs waiting for a pool outnumber its idle and starting executors (or
+  `min_idle`), within `max` and `per_host_max`, the host with the fewest of the pool's first. It
+  stops executors idle past `idle_timeout`, down to `min_idle`. A host that fails to start one is
+  left alone, 2 s at first, doubling to 5 minutes. A pool's leg runs only in an idle executor of
+  its pool, and its wait reason is `pool` (executors, busy, starting, max). On the simulator, a
+  burst of 200 legs scales a pool to its `max` of 32 and back to `min_idle` within
+  `idle_timeout` (`w13_ac04_pool_burst_on_the_simulator`).
   - AC07 (cancel timing on the host executor), AC09 at 10,000 legs, AC11 live.
   - Resource capacity from W13's facts.
 
@@ -3276,10 +3284,35 @@ enforcement points to W18, agent isolation to W20.
   registry. `w13_r11_build_agentfile` does the same for an Agentfile where shards is installed.
   It passed on an Apple silicon Mac with shards 0.1.0: a Linux arm64 microVM image, pushed by
   shards with kiln's helper, and no Docker in the leg's log.
+- *Done.* R09's pools, of the `docker` kind. They come from `[[ci.pools]]` in the server
+  configuration, or are stored with `PUT /api/ci/pools/:name` (`pools.manage`); a stored pool
+  can't take a configured one's name. Each sets `executor`, `hosts` (a constraint over runners'
+  facts, as routing rules write them), `image`, `labels`, `min_idle`, `max`, `per_host_max`,
+  `idle_timeout` and `resources`. A leg whose `runs-on` labels are all one pool's runs in one of
+  its executors (W05-R27 scales them):
+  - A runner that announces `CAP_POOLS` starts a `docker` executor when the server asks
+    (`ServerMsg::Executor`): a started container of the pool's image, laid out as the `docker`
+    executor lays out a leg's, under a directory of its own (`<work>/p/<id>`), with its own lease
+    of the image's tools. It says when the executor is ready or why it failed
+    (`AgentMsg::Executor`).
+  - An image in kiln's registry is pulled with a short-lived token for that image alone.
+  - A pool's leg runs at once in the executor the scheduler gave it, and doesn't count against the
+    runner's own slots. The executor goes with the leg, so every leg starts clean.
+  - A leg the executor can't take as it is (`container:`, `services:`, a contained network) runs
+    the usual way, and the executor is discarded all the same.
+  - A runner's executors don't outlive its connection: on a reconnect it discards them, and the
+    server starts what it wants again.
+
+  `GET /api/ci/pools` and `/:name` show each pool's settings, its executors (state, host,
+  since), the legs waiting for it and its last failure to start one. `w13_ac04_docker_pool_burst`
+  is AC04 on this machine's Docker: 200 legs on a pool with `min_idle = 2` and `max = 32`; the
+  executors reach 32, every leg passes in an executor of its own, and the pool is back to 2 within
+  `idle_timeout`.
 - *Left.*
   - R01's probes and R02.
-  - The `firecracker`, `shards` and `k8s` executors (R05 to R07).
-  - Pools (R09), and R11's other parts: definitions made in the UI ("Save to repo"), the
+  - The `firecracker`, `shards` and `k8s` executors (R05 to R07), and the pool kinds that go with
+    them (today's pod per job becomes the `k8s` kind).
+  - The Pools page (W21), and R11's other parts: definitions made in the UI ("Save to repo"), the
     editor's checks (W21), `POST /api/ci/images` · `/validate` · `/:id/build`, kiln's shipped
     definitions beyond the runner image, and example Agentfiles.
   - The ACs.

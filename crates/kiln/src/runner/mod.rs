@@ -7,6 +7,7 @@ pub mod auth;
 pub mod builtins;
 pub mod credential;
 pub mod docker;
+pub mod pool;
 pub mod egress;
 pub mod hashfiles;
 pub mod kept;

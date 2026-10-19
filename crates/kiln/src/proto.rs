@@ -134,6 +134,10 @@ pub enum AgentMsg {
     /// changes, and every 10 minutes. A machine on battery sleeps when it runs out, and its runner
     /// with it; the server says so first. Appended last: postcard encodes variants by index.
     Power { json: String },
+    /// CI: one of a pool's executors this runner was asked to start is ready, or failed (JSON
+    /// `crate::runner::pool::Said`, docs/ci.md W13-R09). Only from runners announcing
+    /// [`CAP_POOLS`]. Appended last: postcard encodes variants by index.
+    Executor { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -198,6 +202,9 @@ pub const CAP_REACH: u32 = 1 << 17;
 /// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
 /// observe and updates take (128, 256, 512).
 pub const CAP_CONVO: u32 = 1 << 19;
+/// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
+/// Clear of every bit above, and of 1 << 21 (the Kiln Agents lane's `CAP_DOCTOR`).
+pub const CAP_POOLS: u32 = 1 << 22;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -360,6 +367,10 @@ pub enum ServerMsg {
     /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
     /// by index.
     UpdateAvailable { commit: String, build: String, from: String },
+    /// CI: start or stop one of a pool's executors (JSON `crate::runner::pool::Ask`, docs/ci.md
+    /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
+    /// variants by index.
+    Executor { json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

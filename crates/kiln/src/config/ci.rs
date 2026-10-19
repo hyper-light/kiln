@@ -30,6 +30,21 @@ pub struct Ci {
     /// executor = ["host"]
     /// ```
     pub routing: Vec<kiln_ci::sched::routing::Rule>,
+    /// Pools of executors kiln starts and stops (docs/ci.md W13-R09):
+    ///
+    /// ```toml
+    /// [[ci.pools]]
+    /// name = "docker-linux"
+    /// executor = "docker"
+    /// hosts = "executors contains docker"
+    /// image = "kiln/runner-ubuntu-24.04"
+    /// labels = ["ubuntu-latest", "linux", "x64"]
+    /// min_idle = 2
+    /// max = 32
+    /// per_host_max = 16
+    /// idle_timeout = "10m"
+    /// ```
+    pub pools: Vec<kiln_ci::sched::pools::PoolSpec>,
     pub cache: Cache,
     pub artifacts: Artifacts,
     pub oidc: Oidc,

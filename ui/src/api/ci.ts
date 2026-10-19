@@ -504,6 +504,9 @@ export function waitSentence(w: unknown): string | null {
     environment?: string;
     reviewers?: string[];
     until?: number | null;
+    pool?: string;
+    starting?: number;
+    max?: number;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   switch (o.reason) {
@@ -521,6 +524,8 @@ export function waitSentence(w: unknown): string | null {
       return `The repository's limit of ${o.limit ?? 0} running legs is reached.`;
     case "exclusive":
       return "Waiting to run alone on a runner.";
+    case "pool":
+      return `Waiting for an executor of pool ${o.pool ?? ""}: ${o.busy ?? 0} of ${o.max ?? 0} busy${o.starting ? `, ${o.starting} starting` : ""}.`;
     case "retry":
       return `Retrying at ${o.at ? new Date(o.at * 1000).toLocaleTimeString() : "a moment"}.`;
     case "approval":
