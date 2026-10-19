@@ -164,7 +164,9 @@ socket (WebCodecs) otherwise. Nothing changes for the page or its runner: the se
 - **As it was encoded.** H.264 goes out on the payload type the viewer offered for it in fragments
   (packetization mode 1), constrained baseline first; VP8, VP9 and AV1 go on theirs, and the sound
   as Opus. Nothing is decoded or encoded again. A picture's media time is when it's sent, so a
-  still frame sent again sharp shows at once. What a viewer loses is sent again (NACK). Past that
+  still frame sent again sharp shows at once, and each picture says it's to be shown as it comes
+  (playout delay 0): a browser otherwise holds one back now and then to smooth a video's pace,
+  which a page that changes when it does hasn't. What a viewer loses is sent again (NACK). Past that
   (PLI), a key frame is asked of the runner, and nothing more of the picture goes to that viewer
   until it comes.
 - **The socket stays.** The first picture comes over it, while the peer connects. Once the peer
@@ -172,11 +174,12 @@ socket (WebCodecs) otherwise. Nothing changes for the page or its runner: the se
   and keys, is clear over WebRTC's video). If the peer doesn't play within ten seconds (the
   server's port is out of reach), fails, or the server's WebRTC stops, the pictures come over the
   socket again, from a key frame. A page that saw WebRTC fail twice doesn't try it again.
-- **Measured** on one machine (server, runner and viewer together, under load): the first picture
-  came over the socket 0.3 s after Open and the pictures over WebRTC 0.4 s after; a tap showed in
-  them 34 ms later at the median, as over the socket, and the socket carried no pictures
-  meanwhile. Over a real network, a lost packet over WebRTC holds up nothing behind it, as one
-  over the socket's TCP does.
+- **Measured** on one machine (server, runner and viewer together): the first picture came over
+  the socket 0.3 s after Open and the pictures over WebRTC 0.4 s after. A tap's picture came 22 ms
+  after the tap and was shown a millisecond later, on a desktop and a phone alike (the lab notices
+  it at 28 to 35 ms, as it does over the socket), and the socket carried no pictures meanwhile.
+  Over a real network, a lost packet holds up nothing behind it over WebRTC, as one does over the
+  socket's TCP.
 - **In a cluster** the server's UDP port has to reach viewers, as QUIC's does for runners: the
   chart's `ports.webrtc` and `webrtcAdvertise` (and the external Service's NodePort), and on a
   host that forwards LAN ports to it, `KILN_LAN_WEBRTC=1 deploy/cluster/expose-lan.sh up`.

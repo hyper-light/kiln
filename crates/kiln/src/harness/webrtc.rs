@@ -23,6 +23,7 @@ use str0m::crypto::dtls::DtlsCert;
 use str0m::format::{Codec, PayloadParams};
 use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
+use str0m::rtp::Extension;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
 use crate::hub::Hub;
@@ -35,6 +36,8 @@ const QUEUED: usize = 4096;
 const CONNECT_WITHIN: Duration = Duration::from_secs(30);
 /// Datagrams taken at a time before the rest of the loop has a turn.
 const BATCH: usize = 64;
+/// Packets one peer sends at once (a key frame of a big page is a few hundred).
+const MOST_AT_ONCE: u32 = 2048;
 
 /// str0m's code, behind an unwind boundary: what it panics on (a viewer's offer, a datagram from
 /// anyone) ends that peer, and nothing else.
@@ -77,7 +80,8 @@ impl Default for Webrtc {
 
 enum Cmd {
     Add(Box<Peering>),
-    Chunk(u64, Bytes),
+    /// A chunk for a peer, and when it was handed over.
+    Chunk(u64, Bytes, Instant),
     Gone(u64),
 }
 
@@ -91,7 +95,7 @@ pub struct Peer {
 impl Peer {
     /// A chunk of its stream (`crate::browser::stream::frame`), to send.
     pub fn chunk(&self, data: &Bytes) {
-        let _ = self.to_loop.try_send(Cmd::Chunk(self.id, data.clone()));
+        let _ = self.to_loop.try_send(Cmd::Chunk(self.id, data.clone(), Instant::now()));
     }
 }
 
@@ -117,7 +121,15 @@ impl Webrtc {
         anyhow::ensure!(video.is_some(), "its offer takes no picture");
         let (rtc, answer) = contained(|| -> anyhow::Result<(Rtc, String)> {
             let offer = SdpOffer::from_sdp_string(sdp).map_err(|e| anyhow::anyhow!("its offer: {e}"))?;
-            let mut rtc = Rtc::builder().set_ice_lite(true).set_dtls_cert(on.cert.clone()).set_crypto_provider(on.crypto.clone()).build(Instant::now());
+            // Its pictures say they're to be shown as they come (playout delay 0, the viewer's offer
+            // takes it): a browser otherwise holds one back now and then to smooth a video's pace,
+            // which a page that changes when it does hasn't.
+            let mut rtc = Rtc::builder()
+                .set_ice_lite(true)
+                .set_dtls_cert(on.cert.clone())
+                .set_crypto_provider(on.crypto.clone())
+                .set_extension(5, Extension::PlayoutDelay)
+                .build(Instant::now());
             for at in &on.candidates {
                 let c = Candidate::host(*at, "udp").map_err(|e| anyhow::anyhow!("a candidate at {at}: {e}"))?;
                 rtc.add_local_candidate(c);
@@ -315,18 +327,29 @@ impl Peering {
         }
     }
 
-    /// What it has to send, sent; what it says, handled; until it says when it's next due.
+    /// What it has to send, sent; what it says, handled; until it says when it's next due. Without
+    /// a bandwidth estimate str0m paces nothing, yet lets one packet go a time, each after a
+    /// timeout: what's due now goes at once (a frame's packets together), not a turn of the loop
+    /// each.
     async fn drain(&mut self, socket: &UdpSocket) {
+        let (mut sent, mut turns) = (false, 0u32);
         loop {
             if self.broken || !contained(|| self.rtc.is_alive()).unwrap_or(false) {
                 return;
             }
             match contained(|| self.rtc.poll_output()) {
                 Some(Ok(Output::Timeout(t))) => {
+                    let now = Instant::now();
+                    if sent && t <= now && turns < MOST_AT_ONCE {
+                        (sent, turns) = (false, turns + 1);
+                        self.input(Input::Timeout(now));
+                        continue;
+                    }
                     self.due = t;
                     return;
                 }
                 Some(Ok(Output::Transmit(t))) => {
+                    sent = true;
                     if let Err(e) = socket.send_to_writable(&t.contents, t.destination).await {
                         tracing::debug!(error = %e, to = %t.destination, "a WebRTC datagram not sent");
                     }
@@ -419,7 +442,7 @@ impl Peering {
         let sent = contained(|| {
             let w = rtc.writer(mid)?;
             let pt = known.or_else(|| pick(w.payload_params(), family))?;
-            Some(w.write(pt, now, MediaTime::new(ticks, Frequency::NINETY_KHZ), bytes.to_vec()).map(|()| pt))
+            Some(w.playout_delay(MediaTime::ZERO, MediaTime::ZERO).write(pt, now, MediaTime::new(ticks, Frequency::NINETY_KHZ), bytes.to_vec()).map(|()| pt))
         });
         match sent {
             Some(Some(Ok(pt))) => {
@@ -570,10 +593,16 @@ impl Peers {
                         p.say(Said::Gone("this server has as many WebRTC viewers as it takes".into()));
                     }
                 }
-                Next::Cmd(Some(Cmd::Chunk(id, data))) => {
+                Next::Cmd(Some(Cmd::Chunk(id, data, handed))) => {
                     let now = Instant::now();
                     if let Some(p) = self.list.iter_mut().find(|p| p.id == id) {
                         p.chunk(&data, now);
+                        // Sent at once, not at the loop's next turn.
+                        p.drain(&self.socket).await;
+                        let (waited, took) = (now.saturating_duration_since(handed), now.elapsed());
+                        if waited + took > Duration::from_millis(50) {
+                            tracing::debug!(waited_ms = waited.as_millis(), sent_ms = took.as_millis(), bytes = data.len(), "a chunk was slow to go out over WebRTC");
+                        }
                     }
                 }
                 Next::Cmd(Some(Cmd::Gone(id))) => {
@@ -658,6 +687,7 @@ mod tests {
         let (peer, answer) = w.offer("avc1.42E01f", OFFER)?;
         assert!(answer.contains("a=ice-lite") && answer.contains("192.168.1.10 7072"), "{answer}");
         assert!(answer.contains("a=sendonly") && answer.contains("H264/90000"), "{answer}");
+        assert!(answer.contains("a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"), "{answer}");
         let Ok(Cmd::Add(mut p)) = w.from.try_recv() else { anyhow::bail!("no peer for the loop") };
         let (Some(video), Some(audio)) = (p.video, p.audio) else { anyhow::bail!("its media weren't found in its offer") };
         assert_eq!((video.to_string(), audio.to_string()), ("0".to_owned(), "1".to_owned()));
