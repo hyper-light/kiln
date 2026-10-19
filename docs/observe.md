@@ -597,7 +597,8 @@ time, sent again until answered; §5), from:
   `statvfs` never returns), on a thread of its own besides.
 - **The process** (`kiln.process.*`: memory, CPU, open files, threads).
 - **kiln's registry**, what `/metrics` serves Prometheus, scraped under its Prometheus names
-  (`kiln_prom`'s parser takes any text exposition).
+  (`kiln_prom`'s parser takes any text exposition): the server's, and every runner's own (what that
+  process counts: its repositories' sync, its moves), each of its host.
 - **kiln CI**: each job's and run's duration, queue time, footprint and count by repo, pipeline,
   job, status, runner, branch and trigger, and each an event.
 - **kiln CD**: each deploy (by app, trigger, result) and each change of an app's health or sync as
@@ -626,16 +627,25 @@ time, sent again until answered; §5), from:
   `exported_job`, ...: Prometheus's `honor_labels: false`), `host` where every machine reads its
   own, and the target's tags, and writes Prometheus's own series of it: `up`,
   `scrape_duration_seconds`, `scrape_samples_scraped`. A target that starts failing, or recovers,
-  is an event once (`source:kiln.event @event.type:scrape`).
+  is an event once (`source:kiln.event @event.type:scrape`). A histogram is read as an OTLP one
+  is: `p95:http_request_duration_seconds{*}` from its `_bucket`s by `le` (Prometheus's
+  `histogram_quantile`, interpolated within a bucket), `avg:` its `_sum` over its `_count`,
+  `sum:` and `count:` theirs (Prometheus keeps no least or most: `min:` and `max:` are none).
 - **kiln's own spans** (`crate::observe::spans`): each closed `tracing` span of a target observe
   keeps (`kiln::upgrade`: runners' blue/green upgrades, `upgrade`, `upgrade.start`,
-  `upgrade.healthy`, `upgrade.move`, `upgrade.retire`, `upgrade.rollback`) is
+  `upgrade.healthy`, `upgrade.move`, `upgrade.retire`, `upgrade.rollback`; `kiln.sync`: the
+  repositories' sync and agents' moves, `move`, `move.barrier`, `move.files`) is
   `kiln.<span>.duration` (seconds of wall time, a gauge a close) and `kiln.<span>.count`, tagged
-  with the fields low in cardinality (`runner`, `from`, `to`, `what`, `result`, `reason`, …; a
-  child's taken from its ancestors), and an event (`service:kiln.upgrade @event.type:<span>`)
-  holding every field, ids too (`@upgrade_id:…` finds one upgrade's story), an error when its
-  `result` failed or rolled back. A layer of kiln's subscriber with its own filter: `KILN_LOG`
-  does not hide these spans from observe, nor do they reach the log.
+  with the fields low in cardinality (`runner`, `from`, `to`, `what`, `result`, `reason`, `repo`,
+  `machine`, `direction`, `state`, …; a child's taken from its ancestors), and an event
+  (`service:kiln.upgrade @event.type:<span>`) holding every field, ids too (`@upgrade_id:…` finds
+  one upgrade's story), an error when its `result` failed or rolled back. An event of those
+  targets that names itself (an `event` field: `tracing::warn!(target: "kiln.sync", event =
+  "sync.conflict", repo = %r, path = %p, "kept the server's copy")`) is an event too, its level its
+  status, every field and its spans' an attribute; one without stays the log's. `kiln.sync` is
+  written as a name, not a module's path, so the sync's own tracing (`kiln::sync::…`) is not
+  taken. A layer of kiln's subscriber with its own filter: `KILN_LOG` does not hide these from
+  observe, nor do they reach the log.
 
 - **Logs collected on every machine** (§8.1): files, containers' logs and the journal, as a source
   says.

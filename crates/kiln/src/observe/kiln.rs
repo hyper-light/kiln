@@ -15,7 +15,9 @@
 //!   and every change of an app's health or sync, as events (service `kiln.cd`); its apps counted
 //!   by health and sync each interval (`kiln.cd.apps`).
 //! - The registry's families keep their Prometheus names (`kiln_jobs_queued`, ...), but for the
-//!   runners' host samples and the server process's figures, which observe reports itself.
+//!   runners' host samples and the process's figures, which observe reports itself. Every runner's
+//!   own registry is read as the server's is, each tagged with its host; a histogram answers
+//!   percentiles from its `_bucket`s (`p95:kiln_…_seconds{*}`), as a scrape's does.
 
 use std::time::{Duration, Instant};
 
@@ -174,8 +176,9 @@ pub fn cd_status(before: Option<&kiln_cd::engine::Summary>, now: &kiln_cd::engin
     o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity: if bad { 13 } else { 9 }, service: "kiln.cd".into(), host: String::new(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }]);
 }
 
-/// The server's registry, every `every`, as Prometheus would scrape `/metrics`, tagged with the
-/// server's machine; and kiln CD's apps counted by health and sync (`kiln.cd.apps`).
+/// This node's registry (the server's, or a runner's), every `every`, as Prometheus would scrape
+/// `/metrics`, tagged with its machine; and, where kiln CD runs (the server), its apps counted by
+/// health and sync (`kiln.cd.apps`).
 pub fn start_registry(o: Observe, host: String, every: Duration) {
     if every.is_zero() {
         return;

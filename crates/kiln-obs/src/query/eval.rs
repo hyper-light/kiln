@@ -1029,17 +1029,36 @@ fn constant(ast: &Ast, id: usize) -> Option<f64> {
     }
 }
 
-/// Whether `q` names a distribution (`crate::dist`): a metric of its own name holds nothing, its
-/// parts do: its buckets' series (`<name>.dist`), or, one kept without percentiles (a metric from
-/// logs may be), its `.count` and `.sum`.
-fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
+/// What a histogram's parts are named: OpenTelemetry's and kiln's (`<name>.count`, `.sum`,
+/// `.bucket`, `.min`, `.max`), or Prometheus's (`<name>_count`, `_sum`, `_bucket`: no least or
+/// most), as a scrape or kiln's own registry writes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Parts {
+    count: &'static str,
+    sum: &'static str,
+    bucket: &'static str,
+    min: Option<&'static str>,
+    max: Option<&'static str>,
+}
+
+const DOTTED: Parts = Parts { count: ".count", sum: ".sum", bucket: ".bucket", min: Some(".min"), max: Some(".max") };
+const PROMETHEUS: Parts = Parts { count: "_count", sum: "_sum", bucket: "_bucket", min: None, max: None };
+
+/// Whether `q` names a distribution (`crate::dist`) or a histogram, and how its parts are named: a
+/// metric of its own name holds nothing, its parts do: its buckets' series (`<name>.dist`), or, one
+/// kept without percentiles (a metric from logs may be), its `.count` and `.sum`; or Prometheus's
+/// histogram, its `_bucket`s (or its `_count` and `_sum`).
+fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<(&'q str, Parts)> {
     let NameMatch::Exact(name) = &q.metric else { return None };
     let has = |suffix: &str| {
         let mut ids = Vec::new();
         store.select(&Selector { metric: NameMatch::Exact(format!("{name}{suffix}")), clauses: q.filters.clone() }, &mut ids);
         !ids.is_empty()
     };
-    (has(crate::dist::SUFFIX) || (has(".count") && has(".sum") && !has(""))).then_some(name.as_str())
+    if has(crate::dist::SUFFIX) || (has(".count") && has(".sum") && !has("")) {
+        return Some((name.as_str(), DOTTED));
+    }
+    ((has("_bucket") || (has("_count") && has("_sum"))) && !has("")).then_some((name.as_str(), PROMETHEUS))
 }
 
 /// A percentile of an explicit-bucket histogram (an OTLP histogram's `<name>.bucket{le:…}`,
@@ -1049,11 +1068,11 @@ fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
 /// bound positive) to its upper; in the `+Inf` bucket, the highest finite bound. Within a bucket's
 /// width of the truth, as any reading of explicit buckets is.
 #[allow(clippy::too_many_arguments)]
-fn explicit_quantile(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, p: f64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+fn explicit_quantile(store: &Store, q: &MetricQuery, bucket: &str, grid: Grid, spans: Spans<'_>, p: f64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     let NameMatch::Exact(name) = &q.metric else { return Ok(Vec::new()) };
     let mut by = q.by.clone();
     by.push("le".into());
-    let part = MetricQuery { metric: NameMatch::Exact(format!("{name}.bucket")), space: SpaceAgg::Sum, by, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, fill: None, ..q.clone() };
+    let part = MetricQuery { metric: NameMatch::Exact(format!("{name}{bucket}")), space: SpaceAgg::Sum, by, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, fill: None, ..q.clone() };
     let per_le = metric(store, &part, grid, spans, max_series.saturating_mul(64), scratch, scanned)?;
     // Each group (its tags but `le`): its bounds and their counts in each bucket of time.
     let mut groups: std::collections::BTreeMap<Vec<(String, String)>, Vec<(f64, Vec<f64>)>> = std::collections::BTreeMap::new();
@@ -1110,14 +1129,15 @@ fn buckets_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
 /// series' buckets of a group merged for each bucket of time (at the coarsest scale among them),
 /// read as `crate::dist::Merged` reads them; `avg` its sums over its counts; `sum`, `count`, `min`
 /// and `max` its own of those, each a bucket's total.
-fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+#[allow(clippy::too_many_arguments)]
+fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     let NameMatch::Exact(name) = &q.metric else { return Ok(Vec::new()) };
     let part = |suffix: &str, space: SpaceAgg| MetricQuery { metric: NameMatch::Exact(format!("{name}{suffix}")), space, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, ..q.clone() };
     let p = match q.space {
         SpaceAgg::Pct(p) => p,
         SpaceAgg::Avg => {
-            let sums = metric(store, &part(".sum", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
-            let counts = metric(store, &part(".count", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            let sums = metric(store, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            let counts = metric(store, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
             return Ok(sums
                 .into_iter()
                 .filter_map(|mut s| {
@@ -1129,16 +1149,17 @@ fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, ma
                 })
                 .collect());
         }
-        SpaceAgg::Sum => return metric(store, &part(".sum", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
-        SpaceAgg::Count => return metric(store, &part(".count", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
-        SpaceAgg::Min => return metric(store, &MetricQuery { mode: None, ..part(".min", SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned),
-        SpaceAgg::Max => return metric(store, &MetricQuery { mode: None, ..part(".max", SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Sum => return metric(store, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Count => return metric(store, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        // Prometheus's histogram keeps no least or most: none to read.
+        SpaceAgg::Min => return parts.min.map_or(Ok(Vec::new()), |min| metric(store, &MetricQuery { mode: None, ..part(min, SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned)),
+        SpaceAgg::Max => return parts.max.map_or(Ok(Vec::new()), |max| metric(store, &MetricQuery { mode: None, ..part(max, SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned)),
     };
     let mut ids = Vec::new();
     store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
     if ids.is_empty() {
         // No exponential buckets: an explicit histogram's, if it has them.
-        return explicit_quantile(store, q, grid, spans, p, max_series, scratch, scanned);
+        return explicit_quantile(store, q, parts.bucket, grid, spans, p, max_series, scratch, scanned);
     }
     // In the order of the series' fingerprints, the same on every replica: each group's buckets
     // summed in one order everywhere.
@@ -1399,8 +1420,8 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
 
 /// A metric query's series on the grid.
 fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
-    if distribution_of(store, q).is_some() {
-        return distribution(store, q, grid, spans, max_series, scratch, scanned);
+    if let Some((_, parts)) = distribution_of(store, q) {
+        return distribution(store, q, parts, grid, spans, max_series, scratch, scanned);
     }
     let mut ids = Vec::new();
     store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone() }, &mut ids);
@@ -3673,6 +3694,46 @@ mod tests {
         // Together: host b's ten thousand outweigh a's thousand.
         let all = ask("p50:lat{*}");
         assert!((all[0] - 50.0).abs() < 0.1, "{all:?}");
+    }
+
+    /// Prometheus's histogram as a scrape writes it (`_bucket{le}`, `_sum`, `_count`, each a
+    /// counter): its percentiles, average, count and sum read from what rose between scrapes, as
+    /// an OTLP histogram's are; no least or most to read.
+    #[test]
+    fn a_prometheus_histogram_answers_as_an_otlp_one_does() {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let text = |k: f64| {
+            let mut t = String::from("# TYPE req_seconds histogram\n");
+            for i in 1..=10 {
+                t.push_str(&format!("req_seconds_bucket{{le=\"{}\"}} {}\n", f64::from(i) / 10.0, k * 100.0 * f64::from(i)));
+            }
+            t.push_str(&format!("req_seconds_bucket{{le=\"+Inf\"}} {}\nreq_seconds_sum {}\nreq_seconds_count {}\n", k * 1000.0, k * 500.0, k * 1000.0));
+            t
+        };
+        // Two scrapes a minute apart: a thousand values spread evenly over (0, 1] came between.
+        for (at, k) in [(30_000, 1.0), (90_000, 2.0)] {
+            let scraped = crate::prom::parse(&text(k), at, &[("host", "h")]);
+            let mut b = Builder::new();
+            for (key, points) in &scraped.series {
+                b.define(key);
+                b.run(key.fp, points.iter().copied());
+            }
+            s.apply(&b.finish()).unwrap();
+        }
+        let ask = |q: &str| -> Vec<f64> {
+            let mut r = Request::new(q, 60_000, 120_000);
+            r.step = Some(60_000);
+            eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}")).series.into_iter().map(|x| x.values[0]).collect()
+        };
+        let near = |got: Vec<f64>, want: f64| got.len() == 1 && (got[0] - want).abs() < 1e-9;
+        assert!(near(ask("p50:req_seconds{*}"), 0.5), "{:?}", ask("p50:req_seconds{*}"));
+        assert!(near(ask("p95:req_seconds{host:h}"), 0.95), "{:?}", ask("p95:req_seconds{host:h}"));
+        assert!(near(ask("avg:req_seconds{*}"), 0.5));
+        assert!(near(ask("count:req_seconds{*}"), 1000.0));
+        assert!(near(ask("sum:req_seconds{*}"), 500.0));
+        assert!(ask("max:req_seconds{*}").is_empty(), "Prometheus keeps no most");
+        // Its parts read as they are, too.
+        assert!(near(ask("sum:req_seconds_count{*}.as_count()"), 1000.0));
     }
 
     /// A heatmap: a distribution's rows its buckets (made coarser until they fit), each bucket of
