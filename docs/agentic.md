@@ -247,5 +247,21 @@ allows agents (W20-R09). This is W20-R02's coverage, made the same across provid
 **K2** Attached agents and incidents (W20-R08 to R10) show in Mission Control grouped by what they
 look after, and their questions come to Needs you and to notifications (N).
 
-**Ownership.** The provider model, W14 and W20 belong to the CI and CD work (ci.md, cd.md); this
-spec adds the agents' side and uses their operations.
+**Ownership** (agreed 2026-10-18):
+
+- **CI.** The CI work owns W14 (hosting, change requests, review, the land queue) and the CI
+  provider model (ci.md W23: KilnCI, GitHub Actions, GitLab, Bitbucket; `crate::githost`). Its run
+  API is the same for every provider: `GET /api/ci/runs` and `/runs/:id` (with `provider` and
+  `external_url`), rerun, cancel, leg logs and dispatches route to the run's provider. This spec
+  puts them in the operation registry as `kiln.ci.*`.
+- **CD.** The deploy work owns the CD provider model (KilnCD or Argo CD per environment:
+  docs/deploy-api.md, `crate::deploy`). It registers `deploy.*` operations (release, roll back,
+  cancel, status, history, candidates, wait) that refuse agents an environment doesn't allow
+  (`agents_may`).
+- **This spec** owns the agents' side: orchestration, the permission ceiling, notifications, and
+  routing review and CI results back to the authoring agent.
+
+C uses W14's API: a change request opened by pushing `refs/for/<trunk>/branch/<name>`, by
+`POST /api/repos/:repo/change-requests`, or as patches through `POST /api/repos/:repo/submit`;
+read through `GET /api/change-requests/:id` (and `/comments`, `/land`); followed through the
+`run`, `landed`, `review` and `comment` events.
