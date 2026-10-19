@@ -86,7 +86,7 @@ pub enum Msg {
     /// it is cancelled. `false` when the run waits for no approval.
     ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
-    Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, reply: async_channel::Sender<Result<u32, String>> },
+    Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, reply: async_channel::Sender<Result<u32, String>> },
 }
 
 pub use kiln_ci::plan::rerun::Mode as RerunMode;
@@ -300,6 +300,8 @@ struct RunSt {
     /// An outside contributor's run waiting for a maintainer (W18-R06): the concurrency group
     /// it joins once approved.
     awaiting: Option<Awaiting>,
+    /// "Run anyway" (W08-R10): its legs take no earlier result over.
+    no_reuse: bool,
 }
 
 /// What an unapproved run is handed to the scheduler with, once it's approved.
@@ -539,8 +541,8 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, actions, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions).await.map_err(|e| format!("{e:#}"));
+            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, reply } => {
+                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(r);
                 Ok(())
             }
@@ -697,7 +699,7 @@ impl Dispatch {
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, costs, awaiting: None };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, costs, awaiting: None, no_reuse: false };
         self.workflow_run(&st, "requested", None);
         if approval {
             runs::set_approval(&self.hub, &id, "required", None).await?;
@@ -871,7 +873,7 @@ impl Dispatch {
     async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing") }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "no_reuse": settings.get("no_reuse") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -994,7 +996,7 @@ impl Dispatch {
     /// A new attempt of a finished run (W05-R17): the same run, `github.run_attempt` one more,
     /// planned again from its saved workflow and input. The jobs `mode` selects run again; the
     /// others keep the last attempt's legs and results, which the plan takes as they were.
-    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, keep_failed: Option<u32>, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>) -> anyhow::Result<u32> {
+    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, keep_failed: Option<u32>, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
         }
@@ -1034,7 +1036,8 @@ impl Dispatch {
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
         let timing = super::results::timing(&self.hub, &repo.id).await;
-        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing });
+        // "Run anyway" (W08-R10): no leg of this attempt takes an earlier result over.
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "no_reuse": no_reuse });
         self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing }) {
@@ -1049,7 +1052,7 @@ impl Dispatch {
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting: None };
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting: None, no_reuse };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -1112,8 +1115,20 @@ impl Dispatch {
 
     /// A leg the plan queued: its row, then the scheduler.
     async fn queue(&mut self, run: &str, spec: LegSpec) -> anyhow::Result<()> {
+        // W08-R10: a job that opted in takes an earlier leg's result for the same inputs.
+        let reuse = self.reuse_hash(run, &spec).await;
+        if let Some((hash, max_age)) = &reuse {
+            match super::reuse::lookup(&self.hub, hash, *max_age).await {
+                Ok(Some((source, report))) => return Box::pin(self.take_over(run, spec, &source, hash, report_from_json(&report))).await,
+                Ok(None) => {}
+                Err(e) => tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "reuse couldn't be looked up; the leg runs"),
+            }
+        }
         let id = crate::util::new_id();
         runs::insert_leg(&self.hub, run, &id, &spec, Status::Queued, None).await?;
+        if let Some((hash, _)) = &reuse {
+            super::reuse::set_hash(&self.hub, &id, hash).await?;
+        }
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
@@ -1128,6 +1143,40 @@ impl Dispatch {
         let cmds = self.sched.handle(Input::LegQueued(Box::new(leg)), now_ms());
         Box::pin(self.commands(cmds)).await;
         Ok(())
+    }
+
+    /// The leg's input hash and how long a result may be reused, when its job opts in (W08-R10)
+    /// and its run may reuse.
+    async fn reuse_hash(&self, run: &str, spec: &LegSpec) -> Option<(String, u64)> {
+        let reuse = super::reuse::spec_of(spec)?;
+        let (repo, sha, actions, vars, trusted) = {
+            let r = self.runs.get(run).filter(|r| !r.no_reuse)?;
+            (r.repo.clone(), r.event.sha.clone(), r.actions.clone(), r.vars.clone(), r.trusted)
+        };
+        match super::reuse::inputs(&self.hub, &repo, &sha, spec, &reuse, &actions, &vars, trusted).await {
+            Ok(inputs) => Some((kiln_ci::plan::reuse::hash(&inputs), reuse.max_age)),
+            Err(why) => {
+                tracing::warn!(leg = %spec.key, why = %why, "the leg's inputs can't be known; it runs");
+                None
+            }
+        }
+    }
+
+    /// A leg that takes `source`'s result over (W08-R10): its copy in this run, and its report to
+    /// the plan.
+    async fn take_over(&mut self, run: &str, spec: LegSpec, source: &str, hash: &str, report: LegReport) -> anyhow::Result<()> {
+        let id = crate::util::new_id();
+        super::reuse::take_over(&self.hub, run, source, &id, hash).await?;
+        self.hub.emit_job(&id).await;
+        let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
+        r.keys.insert(spec.key.clone(), id);
+        r.seq += 1;
+        let seq = r.seq;
+        let files = Arc::clone(&r.files);
+        let timing = Arc::clone(&r.timing);
+        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing });
+        runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
+        self.actions(run, acts).await
     }
 
     /// Carries out what the scheduler decided.
@@ -1601,6 +1650,13 @@ impl Dispatch {
         runs::finish_leg(&self.hub, leg, status_of(c), c.result(), outputs, reason).await?;
         self.hub.emit_job(leg).await;
         let report = LegReport { conclusion: Some(c), ..l.report };
+        // W08-R10: a success of a job that opted in is kept for the legs with its inputs.
+        if c == PlanC::Success
+            && let Ok(Some(hash)) = super::reuse::hash_of(&self.hub, leg).await
+            && let Err(e) = super::reuse::remember(&self.hub, leg, &l.run, &hash, &report_json(&report)).await
+        {
+            tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a result couldn't be kept for reuse");
+        }
         let Some(run) = self.runs.get_mut(&l.run) else { return Ok(()) };
         run.seq += 1;
         let seq = run.seq;
@@ -1735,7 +1791,7 @@ impl Dispatch {
         } else {
             (None, None)
         };
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());

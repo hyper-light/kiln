@@ -37,6 +37,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("run.succeeded", "a run succeeded"),
     ("run.cancelled", "a run was cancelled"),
     ("approval.waiting", "a run waits for a reviewer to deploy to an environment"),
+    ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),
 ];
 
 /// Sent only when named: they come too often for `*`.

@@ -259,6 +259,7 @@ use serializer::EncryptedPayload;
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
 };
+#[allow(unused_imports)] // kiln: `log_write` is unused in its build
 pub(crate) use serializer::{log_write, LogBufferWrite, LogChunkStream, LogSerializer};
 #[cfg(feature = "conn_raw_api")]
 pub(crate) use serializer::{

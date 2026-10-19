@@ -4,7 +4,8 @@
  * the last data at once while it refreshes in the background, so a page that comes back is there
  * immediately and nothing jumps when the new data lands. A key refreshes:
  * - when it's shown again after being away;
- * - when the server says it changed (`on`: event types from /api/events);
+ * - when the server says it changed (`on`: event types from /api/events), at most once a second;
+ *   or, where the event itself says what changed (`apply`), with it, without loading anything;
  * - on its interval while shown (`pollMs`; not while the tab is hidden);
  * - after the event stream reconnects (the server restarted);
  * - on `invalidate(prefix)`, after a change made here.
@@ -13,15 +14,28 @@
  */
 import { use, useSyncExternalStore } from "react";
 import { events } from "@/api/events";
+import type { ServerEvent } from "@/api/types";
 
 type Fetcher<T> = (signal: AbortSignal) => Promise<T>;
 
-export interface ResourceOptions {
+export interface ResourceOptions<T = unknown> {
   /** Server event types (`ServerEvent["type"]`) after which it's out of date. */
   on?: readonly string[];
+  /**
+   * The data brought up to date with one of the `on` events, from what the event says (undefined:
+   * it can't be, so it's loaded again). An event that carries the whole of what changed then costs
+   * no load: many agents at work send a stream of them, and a list loaded again for each would
+   * fill a slow link.
+   */
+  apply?(data: T, ev: ServerEvent): T | undefined;
   /** Refresh this often while it's shown. */
   pollMs?: number;
 }
+
+/** A load asked for by the server's events waits this long after the last load: a burst of them loads once. */
+const EVENT_GAP_MS = 1000;
+/** Events applied to a key's data (`apply`) are gathered and applied together at most this often. */
+const APPLY_MS = 250;
 
 export interface SuspenseResource<T> {
   data: T;
@@ -51,6 +65,14 @@ interface Entry {
   read: Promise<void> | null;
   /** Asked to refresh while a load was on its way: load once more after it. */
   again: boolean;
+  /** The server's events said it changed while a load was on its way: load again after it, in a while. */
+  later: boolean;
+  /** When its last load ended (ms), and a load waiting on `EVENT_GAP_MS`. */
+  settled: number;
+  soon: number;
+  /** Events to apply to its data, and when they will be. */
+  news: ServerEvent[];
+  applying: number;
   /** Out of date while not shown: refreshed when it's shown again. */
   stale: boolean;
   listeners: Set<() => void>;
@@ -84,6 +106,11 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       promise: null,
       read: null,
       again: false,
+      later: false,
+      settled: 0,
+      soon: 0,
+      news: [],
+      applying: 0,
       stale: false,
       listeners: new Set(),
       sub: () => () => undefined,
@@ -139,9 +166,14 @@ function load(e: Entry): Promise<void> {
     )
     .finally(() => {
       e.promise = null;
+      e.settled = Date.now();
       if (e.again) {
         e.again = false;
+        e.later = false;
         refresh(e);
+      } else if (e.later) {
+        e.later = false;
+        soon(e);
       }
     });
   e.promise = p;
@@ -152,6 +184,51 @@ function load(e: Entry): Promise<void> {
 function refresh(e: Entry) {
   if (e.listeners.size > 0) void load(e);
   else e.stale = true;
+}
+
+/** Refresh for the server's events: not sooner than `EVENT_GAP_MS` after the last load. */
+function soon(e: Entry) {
+  if (e.listeners.size === 0) {
+    e.stale = true;
+    return;
+  }
+  if (e.promise) {
+    e.later = true;
+    return;
+  }
+  if (e.soon) return;
+  const wait = e.settled + EVENT_GAP_MS - Date.now();
+  if (wait <= 0) {
+    void load(e);
+    return;
+  }
+  e.soon = window.setTimeout(() => {
+    e.soon = 0;
+    soon(e);
+  }, wait);
+}
+
+/** Bring `e`'s data up to date with the server's events, gathered (`apply`). */
+function take(e: Entry, ev: ServerEvent) {
+  e.news.push(ev);
+  if (e.applying) return;
+  e.applying = window.setTimeout(() => {
+    e.applying = 0;
+    const news = e.news;
+    e.news = [];
+    let data = e.snap.data;
+    for (const n of news) {
+      const next = e.snap.has ? e.opts.apply?.(data, n) : undefined;
+      if (next === undefined) {
+        soon(e);
+        return;
+      }
+      data = next;
+    }
+    if (data !== e.snap.data) set(e, { data });
+    // A load on its way read the data before these: once it lands, load again.
+    if (e.promise) e.later = true;
+  }, APPLY_MS);
 }
 
 function subscribe(e: Entry, l: () => void) {
@@ -181,7 +258,7 @@ function subscribe(e: Entry, l: () => void) {
  * section in `Loadable`), then always returns data. Keys name what they load ("runners",
  * "front-door/adacachy"), so `invalidate("front-door")` refreshes every one of them.
  */
-export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions = {}): SuspenseResource<T> {
+export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}): SuspenseResource<T> {
   const e = entry(key, fetcher as Fetcher<unknown>, opts);
   const snap = useSyncExternalStore(
     e.sub,
@@ -203,7 +280,7 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
  * each of them first, so their fetches run at once rather than one after another (each read
  * suspends before the next one starts).
  */
-export function preload<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions = {}) {
+export function preload<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}) {
   const e = entry(key, fetcher as Fetcher<unknown>, opts);
   if (!e.snap.has && !e.snap.failed && !e.promise) void load(e);
 }
@@ -219,7 +296,11 @@ export function retryFailed() {
 }
 
 events.on((ev) => {
-  for (const e of entries.values()) if (e.opts.on?.includes(ev.type)) refresh(e);
+  for (const e of entries.values()) {
+    if (!e.opts.on?.includes(ev.type)) continue;
+    if (e.opts.apply) take(e, ev);
+    else soon(e);
+  }
 });
 // The server restarted, or the network came back: what's shown may be out of date.
 events.onReopen(() => invalidate());

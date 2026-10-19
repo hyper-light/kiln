@@ -54,7 +54,7 @@ Ending the agent stops what it left running. kiln's own helpers and MCP servers 
 | POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
-| WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
+| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | run, pause, skip the goal under way, or empty its goal stack |
@@ -69,7 +69,16 @@ Ending the agent stops what it left running. kiln's own helpers and MCP servers 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
 `events {events}` (upserts by id), `stream {id, text}` (text appended to a streaming event),
 `changes {files}` (the whole changeset), `reply {client, value}` (the answer to one client's
-request), `reset` (the timeline starts over), `closed`.
+request), `reset` (the timeline starts over), `synced` (the snapshot is complete), `closed`.
+
+On a slow link most of what a long conversation sends is its snapshot, and during a turn its
+state changes all the time while most of it (skills, plugins, MCP servers) stays the same. A
+viewer can ask for less of both, in the socket's query:
+
+- `z=gzip`: each snapshot comes as one binary message, gzip'd: its frames a line each, `synced`
+  last. A long conversation's arrives in about a tenth of the bytes.
+- `patch=state`: after the snapshot's whole `state`, a state comes as only what changed in it:
+  `state_patch {set, gone?}`, the top-level fields set, and those it no longer has.
 
 `Spec`: `kind`, `cwd?`, `model?`, `mode?`, `effort?`, `resume?` (the harness's own session id),
 `resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`, `takeover_pid?` (set by a
@@ -395,11 +404,12 @@ turn (`harness/pause.rs`):
   paused line above the composer; off by default, a conversation at a time), a pause sends the
   agent to another of your machines instead of waiting (`harness/elsewhere.rs`): one that is
   connected, takes sessions over (reach), and has the same harness signed in to another account,
-  one kiln doesn't know to be as full. A machine with a copy of its repository comes first, then
-  the emptiest account; else its repository is copied there and kept in step. It moves as a move
-  you ask for does (`docs/reach.md` §8), and there its harness, signed in as someone else, ends
-  the pause and goes on with the cut-off turn. With nowhere to go its timeline says why, and kiln
-  looks again every few minutes.
+  one kiln doesn't know to be as full. Failing that, another harness its conversation can be
+  carried into (Claude Code ⇄ Codex), signed in with room, with the first model it lists there.
+  Its own harness comes first, then a machine with a copy of its repository, then the emptiest
+  account; a repository not there yet is copied over and kept in step. It moves as a move you ask
+  for does (`docs/reach.md` §8), and goes on there unpaused, the cut-off turn first. With nowhere
+  to go its timeline says why, and kiln looks again every few minutes.
 - **Restarts.** A pause, its timer, its stop point and going on elsewhere are kept with the session
   on its machine (the runner's `harness.json`, the server's `local.json`) and go on after a restart.
 - **Queued meanwhile.** While it is paused the composer queues (its words and button say so), and
@@ -439,6 +449,17 @@ working: what you send is kept in your browser ("Kept here", editable and remova
 reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
+
+### A machine on battery
+
+A laptop's runner says how its battery stands about once a minute (`AgentMsg::Power`). On macOS it
+reads `pmset -g batt`; on Linux, `/sys/class/power_supply`, where a peripheral's battery doesn't
+count. The Runners page shows it under the machine's name ("battery 34% · 2h 15m left", "charging",
+"on its charger"). A machine on battery that drops to 20% or less is low: Runners and Mission
+Control say so at the top, with what stops when it sleeps (its agents, its jobs). The server logs
+it, audits it and sends it to webhook subscribers as `machine.battery_low`, once, as the machine
+gets there. A Mac on battery hibernates at about 1%, and its runner, agents and jobs go with it
+until it's plugged in; kiln can't keep it up, only say so in time.
 
 ### Tasks: shells, monitors and other work an agent leaves running
 

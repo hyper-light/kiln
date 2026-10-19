@@ -49,15 +49,36 @@ struct Mirror {
     location: Location,
     meta: Value,
     state: Value,
+    /// The state as its viewers last had it sent (what a state patch is made against).
+    sent: Value,
     changes: Value,
     events: Vec<Value>,
     index: HashMap<String, usize>,
-    out: Broadcast<Arc<str>>,
+    out: Broadcast<Frame>,
 }
 
 impl Mirror {
     fn new(info: Info, location: Location) -> Self {
-        Self { info, reported: String::new(), location, meta: Value::Null, state: Value::Null, changes: Value::Null, events: Vec::new(), index: HashMap::new(), out: Broadcast::new(FANOUT) }
+        Self {
+            info,
+            reported: String::new(),
+            location,
+            meta: Value::Null,
+            state: Value::Null,
+            sent: Value::Null,
+            changes: Value::Null,
+            events: Vec::new(),
+            index: HashMap::new(),
+            out: Broadcast::new(FANOUT),
+        }
+    }
+
+    /// The state as a frame for its viewers, with what changed in it since the last one.
+    fn state_frame(&mut self) -> Frame {
+        let text = json!({"t": "state", "state": self.state}).to_string();
+        let patch = (self.out.receiver_count() > 0).then(|| state_patch(&self.sent, &self.state)).flatten();
+        self.sent.clone_from(&self.state);
+        Frame { text: Arc::from(text), patch: patch.map(Arc::from) }
     }
 
     fn reindex(&mut self) {
@@ -81,10 +102,9 @@ impl Mirror {
 
     fn append(&mut self, id: &str, text: &str) {
         if let Some(e) = self.index.get(id).and_then(|i| self.events.get_mut(*i))
-            && let Some(t) = e.get_mut("text")
-            && let Some(s) = t.as_str()
+            && let Some(Value::String(s)) = e.get_mut("text")
         {
-            *t = Value::String(format!("{s}{text}"));
+            s.push_str(text);
         }
     }
 
@@ -131,7 +151,39 @@ pub enum Sent {
 /// What a viewer gets on attach: the catch-up frames and the live ones after them.
 pub struct Attachment {
     pub frames: Vec<String>,
-    pub live: async_broadcast::Receiver<Arc<str>>,
+    pub live: async_broadcast::Receiver<Frame>,
+}
+
+/// A live frame for a session's viewers. A state comes as well as only what changed since the
+/// last one (`patch`), for a viewer that takes that: during a turn its usage and activity change
+/// all the time, its skills, plugins and servers seldom.
+#[derive(Clone)]
+pub struct Frame {
+    pub text: Arc<str>,
+    pub patch: Option<Arc<str>>,
+}
+
+impl Frame {
+    pub fn of(text: String) -> Self {
+        Self { text: Arc::from(text), patch: None }
+    }
+
+    /// The frame for a viewer that takes state patches, or one that doesn't.
+    pub fn for_viewer(&self, patches: bool) -> &str {
+        match &self.patch {
+            Some(p) if patches => p,
+            _ => &self.text,
+        }
+    }
+}
+
+/// `{"t":"state_patch","set":{..},"gone":[..]}`: the top-level fields of `now` that differ from
+/// `was`, and those it no longer has. None when there is nothing to patch (no state before).
+fn state_patch(was: &Value, now: &Value) -> Option<String> {
+    let (Value::Object(was), Value::Object(now)) = (was, now) else { return None };
+    let set: serde_json::Map<String, Value> = now.iter().filter(|(k, v)| was.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let gone: Vec<&String> = was.keys().filter(|k| !now.contains_key(*k)).collect();
+    Some(if gone.is_empty() { json!({"t": "state_patch", "set": set}) } else { json!({"t": "state_patch", "set": set, "gone": gone}) }.to_string())
 }
 
 /// A file uploaded for a message, kept briefly until the message is sent.
@@ -220,7 +272,7 @@ impl Registry {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
-        let convo = crate::convo::open(&dir);
+        let convo = crate::convo::open(&dir, conversations.keep_closed());
         // Runners that keep a store send it here; the server keeps their sessions from that.
         let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine)) {
             Some(Ok((i, o))) => (Some(i), Some(o)),
@@ -319,7 +371,8 @@ impl Registry {
             m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
-                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                let frame = m.state_frame();
+                m.out.send(frame);
             }
             m.info.clone()
         };
@@ -670,11 +723,11 @@ impl Registry {
             }
             // A state goes out with the name given here in it (the machine's may lack it).
             let frame = match &u {
-                Update::State { .. } => Some(json!({"t": "state", "state": m.state}).to_string()),
-                _ => serde_json::to_string(&u).ok(),
+                Update::State { .. } => Some(m.state_frame()),
+                _ => serde_json::to_string(&u).ok().map(Frame::of),
             };
             if let Some(frame) = frame {
-                m.out.send(Arc::from(frame));
+                m.out.send(frame);
             }
             if gone {
                 g.remove(id);
@@ -748,7 +801,7 @@ impl Registry {
                 .collect();
             for id in &gone {
                 if let Some(m) = g.remove(id) {
-                    m.out.send(Arc::from(json!({"t": "closed"}).to_string()));
+                    m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
                 }
             }
             gone
@@ -769,7 +822,8 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                let frame = m.state_frame();
+                m.out.send(frame);
                 infos.push(m.info.clone());
             }
         }
@@ -791,7 +845,8 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                let frame = m.state_frame();
+                m.out.send(frame);
                 infos.push(m.info.clone());
             }
         }
@@ -1107,7 +1162,7 @@ impl Registry {
         // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(m) = self.mirrors.lock().remove(id) {
-                m.out.send(Arc::from(json!({"t": "closed"}).to_string()));
+                m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
             }
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
@@ -1145,6 +1200,41 @@ mod tests {
         // Renamed here while the machine still reports its old one: the new one shows until the
         // machine takes it.
         assert_eq!(naming("slates-6d", "slates-6d", "Claude Code", true), Naming::Keep);
+    }
+
+    #[test]
+    fn a_state_goes_out_whole_and_as_what_changed_in_it() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info::default(), Location::Local);
+        let mut live = m.out.subscribe();
+        let skills = json!([{"name": "deploy", "description": "Ship it. ".repeat(200)}]);
+        m.state = json!({"status": "running", "activity": "reading", "skills": skills, "pause": {"reason": "limit"}});
+        let f = m.state_frame();
+        // The first goes whole: there is nothing before it to patch.
+        assert!(f.patch.is_none());
+        assert_eq!(f.for_viewer(true), f.for_viewer(false));
+        m.out.send(f);
+        m.state = json!({"status": "running", "activity": "editing", "skills": skills});
+        let f = m.state_frame();
+        m.out.send(f);
+        let first = live.try_recv()?;
+        let second = live.try_recv()?;
+        let whole: Value = serde_json::from_str(second.for_viewer(false))?;
+        assert_eq!(whole, json!({"t": "state", "state": m.state}));
+        // As what changed: the activity set, the pause gone, the skills (most of it) left out.
+        let patch: Value = serde_json::from_str(second.for_viewer(true))?;
+        assert_eq!(patch, json!({"t": "state_patch", "set": {"activity": "editing"}, "gone": ["pause"]}));
+        assert!(second.for_viewer(true).len() * 20 < second.for_viewer(false).len());
+        // Applied to what came first, it makes the state now.
+        let mut had: Value = serde_json::from_str(first.for_viewer(true))?;
+        let had = had.get_mut("state").and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("no state"))?;
+        for (k, v) in patch.get("set").and_then(Value::as_object).into_iter().flatten() {
+            had.insert(k.clone(), v.clone());
+        }
+        for k in patch.get("gone").and_then(Value::as_array).into_iter().flatten() {
+            had.remove(k.as_str().unwrap_or_default());
+        }
+        assert_eq!(Value::Object(had.clone()), m.state);
+        Ok(())
     }
 
     #[test]

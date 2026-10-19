@@ -98,6 +98,9 @@ pub struct AgentLive {
     pub busy: u32,
     pub draining: bool,
     pub sample: Option<HostSample>,
+    /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery: Option<crate::os::battery::Battery>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. It takes no jobs and the server doesn't upgrade it.
@@ -453,6 +456,7 @@ impl Hub {
                     busy: 0,
                     draining: false,
                     sample: None,
+                    battery: None,
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
@@ -730,6 +734,32 @@ impl Hub {
         Ok(())
     }
 
+    /// [`AgentMsg::Power`]: a machine's battery. Kept with the machine (the Runners page shows it);
+    /// a machine on battery that gets low is said once, as it gets there, to whoever is watching
+    /// (the UI) and to webhook subscribers (`machine.battery_low`), before it sleeps and its runner
+    /// with it.
+    async fn on_power(&self, agent: &str, json: &str) {
+        let Ok(b) = serde_json::from_str::<crate::os::battery::Battery>(json) else { return };
+        let (changed, was_low, snapshot) = {
+            let mut g = self.agents.lock();
+            let Some(a) = g.get_mut(agent) else { return };
+            let was_low = a.battery.as_ref().is_some_and(crate::os::battery::Battery::low);
+            let changed = a.battery.as_ref() != Some(&b);
+            a.battery = Some(b.clone());
+            (changed, was_low, a.clone())
+        };
+        if changed {
+            self.emit_agent(&snapshot);
+        }
+        if b.low() && !was_low {
+            let left = b.minutes.map(|m| format!(", about {m} min left")).unwrap_or_default();
+            let what = format!("{agent} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", b.percent);
+            tracing::warn!(machine = %agent, percent = b.percent, minutes = ?b.minutes, "a machine on battery is low");
+            self.store.audit("kiln".into(), "machine.battery_low".into(), what.clone()).await;
+            self.emit(&serde_json::json!({"type": "machine.battery_low", "machine": agent, "battery": b, "text": what}));
+        }
+    }
+
     fn agent_of(&self, peer: PeerId) -> Option<String> {
         self.peers.lock().get(&peer).cloned()
     }
@@ -981,6 +1011,7 @@ impl Hub {
                     if let Some(k) = f.kiln.clone() {
                         crate::fleet::remember(self, &k.build, &k.target, &k.commit);
                         self.instances.lock().set_kiln(peer, k);
+                        self.updates.late_by_commit(self, &agent);
                         self.updates.fleet.wake();
                     }
                     // A probe's whole report (a runner that only said its kiln has no CPU count):
@@ -1047,6 +1078,7 @@ impl Hub {
                     }
                 }
             }
+            AgentMsg::Power { json } => self.on_power(&agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -1220,6 +1252,7 @@ impl Hub {
             running: keep,
             draining: false,
             sample: None,
+            battery: None,
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
@@ -1231,6 +1264,8 @@ impl Hub {
         let prev = self.agents.lock().get(&name).cloned();
         // Its facts stay until its new connection's probe reports.
         let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
+        // Its battery as last said, until it says again.
+        let prev_battery = prev.as_ref().and_then(|a| a.battery.clone());
         let draining = prev.as_ref().is_some_and(|a| a.draining);
         {
             let mut inst = self.instances.lock();
@@ -1248,7 +1283,7 @@ impl Hub {
         let busy = u32::try_from(running.len()).unwrap_or(u32::MAX);
         let live = match prev {
             Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
-            _ => AgentLive { draining, running, busy, facts: prev_facts, ..live },
+            _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, ..live },
         };
         self.store
             .upsert_agent(AgentRow {

@@ -1309,6 +1309,12 @@ pub enum Command {
         /// Not waiting for the turn under way: it is interrupted, and picked up over there.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         now: bool,
+        /// It goes on there in another harness (`Kind::id`), its conversation carried over, with
+        /// this model (None: that harness's default).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {
