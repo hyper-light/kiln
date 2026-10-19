@@ -22,6 +22,19 @@ jobs:
           done
       - name: hardware
         run: nproc && grep -m1 "model name" /proc/cpuinfo && free -h | head -2
+  ci-bench:
+    # The CI engine's performance targets (docs/ci.md §1.5, W22-AC08): a miss fails the step; a
+    # result more than 10 % worse than its history fails the job (W16's interval rule).
+    name: CI engine targets (hardware)
+    runs-on: [baremetal, bench]
+    exclusive: true
+    timeout-minutes: 60
+    bench-gate: { metric: "ci.bench.*", max-regression: 10%, same-fingerprint: true, action: fail }
+    steps:
+      - name: build (release)
+        run: cargo build --release --locked -p kiln
+      - name: kiln ci bench
+        run: target/release/kiln ci bench --out target/ci-bench.json
   noise:
     # The bench's own machine: the point is that it waits for the exclusive bench there.
     runs-on: [baremetal, bench]

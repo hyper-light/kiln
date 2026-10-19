@@ -125,6 +125,10 @@ pub struct JobSpec {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub cache: Vec<String>,
+    /// The CI engine's benchmark gate (docs/ci.md W16-R09): kept so a file both run stays valid
+    /// here, where it's ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_gate: Option<serde_yaml::Value>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -400,6 +404,8 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             exclusive: j.kiln.exclusive,
             artifacts: j.kiln.artifacts.clone(),
             cache: j.kiln.cache.iter().map(|c| c.as_str().map(str::to_owned).ok_or_else(|| format!("{} holds more than directories", at("cache")))).collect::<Result<_, _>>()?,
+            // The engine's; v1 doesn't gate on benchmarks.
+            bench_gate: None,
             steps,
         };
         jobs.insert(j.id.clone(), spec);
@@ -568,6 +574,33 @@ jobs:
     steps:
       - run: cargo bench
 "#;
+
+    /// kiln's own `.kiln/*.yaml` read both ways: as v1 pipelines and in the CI engine's kiln
+    /// dialect, so neither grows a key the other refuses.
+    #[test]
+    fn kilns_own_workflows_read_both_ways() -> anyhow::Result<()> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
+        let mut read = 0;
+        for e in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)?;
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // Not every file there is a pipeline (environments.yaml, routing.yaml, …).
+            if !text.lines().any(|l| l.starts_with("jobs:")) {
+                continue;
+            }
+            parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
+            let (wf, diags) = kiln_ci::wf::parse_workflow(&format!(".kiln/{name}"), &text, kiln_ci::expr::Dialect::Kiln);
+            let errors: Vec<String> = diags.iter().filter(|d| d.is_error()).map(|d| format!("{d:?}")).collect();
+            anyhow::ensure!(wf.is_some() && errors.is_empty(), "{name} in the kiln dialect: {errors:?}");
+            read += 1;
+        }
+        anyhow::ensure!(read >= 3, "only {read} of kiln's own workflows read");
+        Ok(())
+    }
 
     #[test]
     fn plans_matrix_and_needs() -> Result<(), SpecError> {

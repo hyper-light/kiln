@@ -286,6 +286,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_starter_is_filled_in_for_its_app_in_its_files_and_their_names() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;

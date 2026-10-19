@@ -193,7 +193,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal) |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
 ---
@@ -4977,8 +4977,36 @@ and AC02.
 
     Actions' tarballs unpack through `tar`'s own checks, and local runs arrive as git packs.
   - Fork isolation is W18-AC03, and signed URL tampering W08-AC04.
+- *AC08* (`crates/kiln/src/ci/bench.rs`): `kiln ci bench` measures §1.5's targets. Each result is
+  the median of `--runs` runs; the hub's measures are single runs.
+  - In process: the scheduler (W05-AC08's load), expressions and a 2,000-line workflow's parse.
+  - Against a hub of its own (an in-memory store, the CI engine running):
+    - run creation: 1,000 pushes, each timed from its event to its run in the store, the
+      workflow already read (git stubbed);
+    - log ingest: 16 legs' output at once, and a line's way to a live viewer;
+    - the cache's store: a 1 GiB entry saved, then restored as a restore streams it.
+
+    The network's part (the runner's link, HTTP, the browser) is the live cluster's to confirm.
+
+  It writes `target/ci-bench.json`, and, in a leg, `$KILN_METRICS` with the runs as samples. It
+  exits 1 on a miss in a release build. `.kiln/bench.yaml`'s `ci-bench` job runs it on the bench
+  machine with `bench-gate: { metric: "ci.bench.*", max-regression: 10% }`, so a regression past
+  10 % (W16's interval rule) fails it. v1 reads that file too and ignores the gate; a test reads
+  kiln's own workflows both ways.
+
+  A release build on a quiet 32-core machine (2026-10-19), against the targets:
+
+  | Measure | Result | Target |
+  | --- | --- | --- |
+  | Scheduler throughput | 64,942 assignments/s | ≥ 2,000 |
+  | An input's p99 / mean | 0.016 / 0.008 ms | < 50 / < 5 ms |
+  | Expressions | 2.94 M evaluations/s | ≥ 1 M |
+  | A 2,000-line workflow | 2.8 ms | < 20 ms |
+
+  Measuring run creation found a git read on every run start, for reusable calls the workflow
+  didn't make. It's skipped now, which cut the p99 from 44 ms to 9 ms in a debug build.
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03 to AC06, AC08 and AC09; the rest of F-21; an authenticated
+  with test tenants (W11-AC03); AC03 to AC06 and AC09; the rest of F-21; an authenticated
   way for legs to read github.com's API (W18's egress proxy).
 
 ---

@@ -131,6 +131,8 @@ enum Cmd {
     /// A benchmark tool's output as CI metrics, added to the step's `$KILN_METRICS`
     /// (criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest, k6).
     Metrics(kiln::ci::cli::MetricsArgs),
+    /// The CI engine's own checks: `kiln ci bench` measures §1.5's performance targets.
+    Ci(kiln::ci::bench::CiArgs),
     /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
     /// server's runners (`--server`), before you push.
     Workflow(kiln::ci::local::WorkflowArgs),
@@ -725,6 +727,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
+        Cmd::Ci(a) => {
+            // On a task of its own, as `kiln workflow run`: not beneath this frame.
+            let code = kiln::rt::spawn(kiln::ci::bench::run(a)).await.map_err(|_| anyhow::anyhow!("the bench ended without an answer"))??;
+            if code != 0 {
+                return Err(anyhow::Error::new(kiln::reach::cli::ExitWith(code)));
+            }
+            Ok(())
+        }
         Cmd::Auth(a) => kiln::runner::auth::cli(a).await,
         Cmd::Sbom(a) => kiln::ci::sbom::cli(a).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),

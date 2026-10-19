@@ -21,6 +21,10 @@ use crate::store::Repo;
 /// also by their path).
 pub async fn files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> HashMap<String, Arc<Workflow>> {
     let mut out: HashMap<String, Arc<Workflow>> = HashMap::new();
+    // A workflow that calls none (most do) needs nothing read: no git for its run to start.
+    if calls(wf).is_empty() {
+        return out;
+    }
     match load::load(hub, repo, sha).await {
         Ok(commit) => {
             for l in commit.workflows {
