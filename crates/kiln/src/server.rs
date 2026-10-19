@@ -100,6 +100,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     hub.terminals.keep_names_in(cfg.server.data_dir.join("terminal-names.json"));
     // Runners' front doors: what the UI set, sent to each runner when it connects.
     hub.front_doors.load(&hub.store).await?;
+    // Peered clusters (docs/peers.md): forwarded to, and their ports open, from the start.
+    crate::peers::start(&hub).await;
     // The tailnet's DNS for them: the Tailscale credential given in the UI, the routes kiln set.
     hub.tailnet.load(&hub.cfg, &hub.store).await;
     // Process restarts by the supervisor count as restarts too (generation 1 = first start).

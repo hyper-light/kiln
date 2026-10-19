@@ -142,7 +142,7 @@ impl FrontDoors {
     }
 
     /// The runners with front-door settings, in name order.
-    fn runners(&self) -> Vec<String> {
+    pub(crate) fn runners(&self) -> Vec<String> {
         let mut v: Vec<String> = self.inner.lock().iter().filter(|(_, e)| e.settings != Settings::default() || e.status.is_some()).map(|(k, _)| k.clone()).collect();
         v.sort();
         v
@@ -186,7 +186,7 @@ pub async fn push(hub: &Hub, machine: &str, issued: Option<String>, custom: Opti
     }
     let Some(peer) = runs else { return false };
     let settings = hub.front_doors.settings(machine);
-    send(hub, peer, &Push { settings, standby: false, issued, custom, renew: false }).await
+    send(hub, peer, &Push { settings, standby: false, issued, custom, renew: false, peers: Some(crate::peers::table(hub)) }).await
 }
 
 /// A runner process said what it can do (`AgentMsg::Build`): one that runs front doors gets
@@ -295,7 +295,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, csr: &str, status: &Statu
     tracing::info!(machine, names = ?names, "front door: issued a certificate from the kiln CA");
     hub.store.audit(machine.to_owned(), "front_door.certificate".into(), format!("kiln CA certificate for {} until {}", names.join(", "), date(until))).await;
     let settings = hub.front_doors.settings(machine);
-    send(hub, peer, &Push { settings, standby: false, issued: Some(pem), custom: None, renew: false }).await;
+    send(hub, peer, &Push { settings, standby: false, issued: Some(pem), custom: None, renew: false, peers: Some(crate::peers::table(hub)) }).await;
 }
 
 fn date(unix: i64) -> String {

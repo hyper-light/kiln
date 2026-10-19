@@ -54,7 +54,7 @@ Ending the agent stops what it left running. kiln's own helpers and MCP servers 
 | POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
-| WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
+| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | run, pause, skip the goal under way, or empty its goal stack |
@@ -69,7 +69,16 @@ Ending the agent stops what it left running. kiln's own helpers and MCP servers 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
 `events {events}` (upserts by id), `stream {id, text}` (text appended to a streaming event),
 `changes {files}` (the whole changeset), `reply {client, value}` (the answer to one client's
-request), `reset` (the timeline starts over), `closed`.
+request), `reset` (the timeline starts over), `synced` (the snapshot is complete), `closed`.
+
+On a slow link most of what a long conversation sends is its snapshot, and during a turn its
+state changes all the time while most of it (skills, plugins, MCP servers) stays the same. A
+viewer can ask for less of both, in the socket's query:
+
+- `z=gzip`: each snapshot comes as one binary message, gzip'd: its frames a line each, `synced`
+  last. A long conversation's arrives in about a tenth of the bytes.
+- `patch=state`: after the snapshot's whole `state`, a state comes as only what changed in it:
+  `state_patch {set, gone?}`, the top-level fields set, and those it no longer has.
 
 `Spec`: `kind`, `cwd?`, `model?`, `mode?`, `effort?`, `resume?` (the harness's own session id),
 `resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`, `takeover_pid?` (set by a
