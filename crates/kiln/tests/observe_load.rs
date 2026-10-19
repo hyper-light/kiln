@@ -293,7 +293,12 @@ fn pct(sorted: &[u64], q: f64) -> u64 {
 
 /// Every point of `load.v` the store holds: each one 1.0, summed bucket by bucket.
 fn stored(f: &Fleet, from: i64, to: i64) -> anyhow::Result<u64> {
-    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:load.v{*}.rollup(sum)", "from": from, "to": to, "points": 200 })))?;
+    // Whole five-minute buckets, the rollups' tier (docs/observe.md §4.7): an hours-long soak's
+    // billion points counted in a moment, not read one by one.
+    let step = 300_000;
+    let (from, to) = (from.div_euclid(step) * step, (to + step - 1).div_euclid(step) * step);
+    let points = ((to - from) / step).clamp(1, 2_000);
+    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:load.v{*}.rollup(sum)", "from": from, "to": to, "step": step, "points": points })))?;
     let total: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
     Ok(total.round() as u64)
 }
@@ -884,6 +889,10 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
             "  {:>6.0} {:>9.0} ({:>4.0}) {:>9.0} ({:>4.0}) {:>8.1} {:>8.1} {:>7} {:>8.1} {:>12}",
             x.at_s, x.server.0, x.server.1, x.runner.0, x.runner.1, x.head_mib, x.index_mib, x.blocks, x.log_mib, x.taken
         );
+        // Every ten minutes, where the server's anonymous memory lies: what a climb is made of.
+        if samples.len() % 60 == 59 {
+            eprintln!("  where      the server's {}", anon_by_mapping(server_pid));
+        }
         samples.push(x);
     }
     stop.store(true, Ordering::Relaxed);
