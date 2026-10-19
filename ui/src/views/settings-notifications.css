@@ -1,0 +1,33 @@
+/* Settings → This device → Notifications (settings-notifications.tsx), in the settings page's type
+   scale (components/ui/settings.css). */
+
+/* What this device hears: its kinds as checkboxes, wrapping as they fit. */
+.st-hears {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.st-hears > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--st-text);
+  font-size: var(--st-body);
+  cursor: pointer;
+}
+/* Your devices, under this one's rows. */
+.st-push-devices {
+  padding-top: 10px;
+  border-top: 1px solid rgb(255 255 255 / 4%);
+}
+.st-group-body > .st-push-devices:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.st-push-devices > .st-label {
+  margin-bottom: 8px;
+}

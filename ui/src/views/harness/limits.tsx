@@ -6,6 +6,7 @@ import * as React from "react";
 import { ChevronDown } from "lucide-react";
 import type { AgentInfo, Limit, StatusItem } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { costText, money } from "./derive";
 import { useClock } from "./dom";
 import { HarnessMark } from "./parts";
 
@@ -132,7 +133,7 @@ export function UsagePanel({
   id,
   limits,
   plan,
-  onMore,
+  cost,
   stopAt,
   onStopAt,
   elsewhere,
@@ -140,7 +141,8 @@ export function UsagePanel({
   id: string;
   limits: Limit[];
   plan?: string;
-  onMore?: () => void;
+  /** What the session has cost so far, as its harness estimates it (none: it doesn't say). */
+  cost?: number;
   /** The agent pauses once a limit is this full (null: only when one is reached). */
   stopAt?: number | null;
   onStopAt?: (percent: number | null) => void;
@@ -178,14 +180,14 @@ export function UsagePanel({
             {elsewhere}
           </span>
         )}
-        <span className="hx-usage-end">
-          {plan && <span className="hx-tag">{plan}</span>}
-          {onMore && (
-            <button type="button" className="hx-usage-more" onClick={onMore}>
-              Cost and status
-            </button>
-          )}
-        </span>
+        {cost != null && cost > 0 && (
+          <p className="hx-usage-cost">
+            <span>Cost</span>
+            <span className="hx-usage-cost-v" title={costText(cost, plan).title}>
+              {money(cost)}
+            </span>
+          </p>
+        )}
       </div>
     </section>
   );

@@ -22,9 +22,11 @@ pub mod flow;
 pub mod gates;
 pub mod host;
 pub mod kilncd;
+pub mod metrics;
 pub mod model;
 pub mod ops;
 pub mod provider;
+pub mod reads;
 pub mod repo;
 pub mod store;
 

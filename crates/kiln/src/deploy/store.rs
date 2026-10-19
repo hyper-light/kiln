@@ -247,6 +247,8 @@ pub struct ReleaseQuery {
     pub app: Option<String>,
     pub environment: Option<String>,
     pub state: Option<State>,
+    /// Those of one version.
+    pub version: Option<String>,
     pub limit: usize,
 }
 
@@ -257,9 +259,9 @@ pub async fn releases(store: &Store, q: ReleaseQuery) -> anyhow::Result<Vec<Rele
         .call(move |c| {
             let mut s = c.prepare(
                 "SELECT spec FROM deploy_releases WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR environment = ?2) AND (?3 IS NULL OR state = ?3)
-                 ORDER BY id DESC LIMIT ?4",
+                 AND (?5 IS NULL OR json_extract(spec, '$.version') = ?5) ORDER BY id DESC LIMIT ?4",
             )?;
-            let rows = s.query_map(params![q.app, q.environment, state, limit], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            let rows = s.query_map(params![q.app, q.environment, state, limit, q.version], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(rows)
         })
         .await?;

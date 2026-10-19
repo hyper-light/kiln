@@ -78,6 +78,9 @@ enum DeployCmd {
         app: Option<String>,
         #[arg(long, visible_alias = "to")]
         env: Option<String>,
+        /// Those of one version.
+        #[arg(long)]
+        version: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -121,6 +124,59 @@ enum DeployCmd {
         env: String,
         #[arg(long)]
         keep: bool,
+    },
+    /// What an app runs in an environment, as its provider sees it.
+    Resources {
+        app: String,
+        #[arg(long, visible_alias = "to")]
+        env: String,
+    },
+    /// The manifests it renders (on Argo CD, those `--version` would).
+    Manifests {
+        app: String,
+        #[arg(long, visible_alias = "to")]
+        env: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// What a sync would change (on Argo CD, what deploying `--version` would).
+    Diff {
+        app: String,
+        #[arg(long, visible_alias = "to")]
+        env: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// The last lines of a workload's pods' logs.
+    Logs {
+        app: String,
+        #[arg(long, visible_alias = "to")]
+        env: String,
+        /// Deployment, StatefulSet, Pod, …
+        #[arg(long, default_value = "Deployment")]
+        kind: String,
+        /// The object's name; the app's by default.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        container: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        tail: u32,
+    },
+    /// Delivery metrics (DORA's four keys) from the releases: of an app, an environment, or all.
+    Metrics {
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long, visible_alias = "to")]
+        env: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+    },
+    /// The versions an app has run in an environment.
+    Versions {
+        app: String,
+        #[arg(long, visible_alias = "to")]
+        env: String,
     },
     /// The environments apps are released to.
     Env {
@@ -341,6 +397,17 @@ impl Api {
     }
 }
 
+/// A duration as people say it: `45s`, `3m 20s`, `2h 5m`, `1d 3h`.
+fn took(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3_599 => format!("{}m {}s", s / 60, s % 60),
+        3_600..=86_399 => format!("{}h {}m", s / 3_600, s % 3_600 / 60),
+        _ => format!("{}d {}h", s / 86_400, s % 86_400 / 3_600),
+    }
+}
+
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(Value::as_str).unwrap_or("")
 }
@@ -432,10 +499,11 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             });
             return Ok(());
         }
-        Some(DeployCmd::History { app, env, limit }) => {
+        Some(DeployCmd::History { app, env, version, limit }) => {
             let mut q = vec![format!("limit={limit}")];
             q.extend(app.map(|a| format!("app={}", enc(&a))));
             q.extend(env.map(|e| format!("environment={}", enc(&e))));
+            q.extend(version.map(|v| format!("version={}", enc(&v))));
             let v = api.call(Method::Get, &format!("/releases?{}", q.join("&")), None).await?;
             api.print(&v, |v| {
                 for r in v.get("releases").and_then(Value::as_array).into_iter().flatten() {
@@ -450,6 +518,90 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
+        Some(DeployCmd::Metrics { app, env, days }) => {
+            let mut q = vec![format!("days={days}")];
+            q.extend(app.map(|a| format!("app={}", enc(&a))));
+            q.extend(env.map(|e| format!("environment={}", enc(&e))));
+            let v = api.call(Method::Get, &format!("/metrics?{}", q.join("&")), None).await?;
+            api.print(&v, |v| {
+                let dur = |p: &str| v.pointer(p).and_then(Value::as_i64).map_or_else(|| "-".to_owned(), took);
+                let n = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
+                println!("over {} days: {} changes, {} landed ({:.2} a day)", n("days"), n("changes"), n("landed"), v.get("per_day").and_then(Value::as_f64).unwrap_or(0.0));
+                println!("lead time (asked to landed): p50 {}, p90 {}", dur("/lead_time_secs/p50"), dur("/lead_time_secs/p90"));
+                match v.get("change_failure_rate").and_then(Value::as_f64) {
+                    Some(r) => println!("change failure rate: {:.0}% ({} failed or rolled back)", r * 100.0, n("failed")),
+                    None => println!("change failure rate: no changes yet"),
+                }
+                println!("time to restore: p50 {}, p90 {}", dur("/time_to_restore_secs/p50"), dur("/time_to_restore_secs/p90"));
+            });
+            return Ok(());
+        }
+        Some(DeployCmd::Versions { app, env }) => {
+            let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/versions", enc(&app), enc(&env)), None).await?;
+            api.print(&v, |v| {
+                for x in v.get("versions").and_then(Value::as_array).into_iter().flatten() {
+                    let runs = if x.get("runs_now").and_then(Value::as_bool) == Some(true) { "  ← runs now" } else { "" };
+                    let n = |k: &str| x.get(k).and_then(Value::as_i64).unwrap_or(0);
+                    println!("{:<20} {} release(s), last #{}{runs}", s(x, "version"), n("releases"), n("last_release"));
+                }
+            });
+            return Ok(());
+        }
+        Some(DeployCmd::Resources { app, env }) => {
+            let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/resources", enc(&app), enc(&env)), None).await?;
+            api.print(&v, |v| {
+                for r in v.get("resources").and_then(Value::as_array).into_iter().flatten() {
+                    println!("{:<12} {:<10} {:<28} {:<40} {}", s(r, "sync"), s(r, "health"), s(r, "kind"), format!("{}/{}", s(r, "namespace"), s(r, "name")), s(r, "message"));
+                }
+            });
+            return Ok(());
+        }
+        Some(DeployCmd::Manifests { app, env, version }) => {
+            let q = version.map(|v| format!("?version={}", enc(&v))).unwrap_or_default();
+            let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/manifests{q}", enc(&app), enc(&env)), None).await?;
+            api.print(&v, |v| {
+                for m in v.get("manifests").and_then(Value::as_array).into_iter().flatten() {
+                    println!("---\n{}", s(m, "yaml").trim_end());
+                }
+            });
+            return Ok(());
+        }
+        Some(DeployCmd::Diff { app, env, version }) => {
+            let q = version.map(|v| format!("?version={}", enc(&v))).unwrap_or_default();
+            let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/diff{q}", enc(&app), enc(&env)), None).await?;
+            api.print(&v, |v| {
+                let changes = v.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
+                if changes.is_empty() {
+                    println!("nothing would change");
+                }
+                for c in changes {
+                    let k = |f: &str| c.pointer(&format!("/key/{f}")).and_then(Value::as_str).unwrap_or("").to_owned();
+                    println!("--- {} {}/{}", k("kind"), k("namespace"), k("name"));
+                    for h in c.get("hunks").and_then(Value::as_array).into_iter().flatten() {
+                        let n = |f: &str| h.get(f).and_then(Value::as_u64).unwrap_or(0);
+                        println!("@@ -{},{} +{},{} @@", n("old_start"), n("old_lines"), n("new_start"), n("new_lines"));
+                        for l in h.get("lines").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                            println!("{l}");
+                        }
+                    }
+                }
+            });
+            return Ok(());
+        }
+        Some(DeployCmd::Logs { app, env, kind, name, container, tail }) => {
+            let name = name.unwrap_or_else(|| app.clone());
+            let mut q = format!("?kind={}&name={}&tail={tail}", enc(&kind), enc(&name));
+            if let Some(c) = container {
+                q.push_str(&format!("&container={}", enc(&c)));
+            }
+            let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/logs{q}", enc(&app), enc(&env)), None).await?;
+            api.print(&v, |v| {
+                for l in v.get("lines").and_then(Value::as_array).into_iter().flatten() {
+                    println!("{} {}", s(l, "pod"), s(l, "text").trim_end());
+                }
+            });
+            return Ok(());
+        }
         Some(DeployCmd::Approve { release, note }) => {
             let v = api.call(Method::Post, &format!("/releases/{release}/approve"), Some(json!({ "note": note }))).await?;
             api.print(&v, |v| println!("{}", line(v)));
