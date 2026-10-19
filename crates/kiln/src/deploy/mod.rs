@@ -11,7 +11,8 @@
 //! - [`check`]: what a release is checked for before it is recorded; [`gates`]: what it waits for
 //!   before its commit.
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
-//! - [`scaffold`]: an app's source repository, made from its template's starter.
+//! - [`scaffold`]: an app's source repository, made from its template's starter; [`init`]: its
+//!   chart on kiln's base chart (`kiln app init`).
 //! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
 //!   operations agents reach through MCP and code mode.
 
@@ -22,6 +23,7 @@ pub mod cli;
 pub mod flow;
 pub mod gates;
 pub mod host;
+pub mod init;
 pub mod kilncd;
 pub mod metrics;
 pub mod model;

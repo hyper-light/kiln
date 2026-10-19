@@ -764,6 +764,138 @@ pub struct RollbackAsk {
     pub to: Option<i64>,
 }
 
+/// A change to many apps of an environment at once (docs/deploy-api.md §3.3): each app selected is
+/// released, at one version, or with values set in its own (a config release each). Each passes
+/// the environment's gates as any release does.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetAsk {
+    pub environment: String,
+    /// The apps: these, or those made from `template`, in `project`, owned by `owner` (each given
+    /// must hold); every app registered in the environment when none is given.
+    #[serde(default)]
+    pub apps: Vec<String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// A deploy of this version to each.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Values set in each app's own values in the environment, by path (`image.pullPolicy`):
+    /// numbers and `true`/`false` as such, the rest as text.
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    /// Asked for again with the same key, it is the same fleet: the same releases.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `set`'s values in a values file, by path; the file as YAML (its comments don't survive).
+pub fn merge_values(text: &str, set: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut doc: serde_yaml::Value = if text.trim().is_empty() { serde_yaml::Value::Mapping(serde_yaml::Mapping::new()) } else { serde_yaml::from_str(text).map_err(|e| format!("its values don't read: {e}"))? };
+    if doc.is_null() {
+        doc = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    for (path, raw) in set {
+        let value = match serde_yaml::from_str::<serde_yaml::Value>(raw) {
+            Ok(v @ (serde_yaml::Value::Number(_) | serde_yaml::Value::Bool(_))) => v,
+            _ => serde_yaml::Value::String(raw.clone()),
+        };
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.iter().any(|p| p.is_empty()) {
+            return Err(format!("`{path}` isn't a path of values (`image.tag`)"));
+        }
+        let mut at = &mut doc;
+        for (i, p) in parts.iter().enumerate() {
+            let above = parts.get(..i).map(|x| x.join(".")).unwrap_or_default();
+            let map = at.as_mapping_mut().ok_or_else(|| format!("{path}: {above} isn't a map of values"))?;
+            let key = serde_yaml::Value::String((*p).to_owned());
+            if i + 1 == parts.len() {
+                map.insert(key, value.clone());
+                break;
+            }
+            at = map.entry(key).or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        }
+    }
+    serde_yaml::to_string(&doc).map_err(|e| format!("{e}"))
+}
+
+/// Releases each selected app of a fleet change (see [`FleetAsk`]): its id, and each app's release,
+/// or why it has none.
+pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
+    if f.version.is_some() == !f.set.is_empty() {
+        return Err(bad("a fleet change is a version to deploy, or values to set: one of them"));
+    }
+    let env = store::environment(&d.hub.store, &f.environment).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {}", f.environment)))?;
+    agents_may(who, &env, "release apps")?;
+    let id = f.idempotency_key.clone().unwrap_or_else(crate::util::new_id);
+    let registered: Vec<String> = store::registrations(&d.hub.store, None, Some(&env.name)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
+    let apps: Vec<App> = store::apps(&d.hub.store)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|a| registered.contains(&a.name))
+        .filter(|a| f.apps.is_empty() || f.apps.contains(&a.name))
+        .filter(|a| f.template.as_ref().is_none_or(|t| a.template.as_ref() == Some(t)))
+        .filter(|a| f.project.as_ref().is_none_or(|p| &a.project == p))
+        .filter(|a| f.owner.as_ref().is_none_or(|o| a.owners.contains(o)))
+        .collect();
+    if apps.is_empty() {
+        return Err(bad(format!("no app registered in {} is selected", env.name)));
+    }
+    let mut out = Vec::new();
+    for a in &apps {
+        let key = Some(format!("fleet:{id}:{}", a.name));
+        let ask = match &f.version {
+            Some(v) => Ask { app: a.name.clone(), environment: env.name.clone(), version: Some(v.clone()), idempotency_key: key, ..Ask::default() },
+            None => {
+                let values = match current_values(d, a, &env).await.and_then(|text| merge_values(&text.unwrap_or_default(), &f.set).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))) {
+                    Ok(v) => v,
+                    Err((code, why)) => {
+                        out.push(json!({ "app": a.name, "status": code.as_u16(), "error": why }));
+                        continue;
+                    }
+                };
+                Ask { app: a.name.clone(), environment: env.name.clone(), values: Some(values), idempotency_key: key, ..Ask::default() }
+            }
+        };
+        match release(d, who, ask).await {
+            Ok(r) => out.push(json!({ "app": a.name, "release": r })),
+            Err((code, why)) => out.push(json!({ "app": a.name, "status": code.as_u16(), "error": why })),
+        }
+    }
+    audit(d, &who.name, "deploy.fleet", format!("{id} in {}: {} apps", env.name, apps.len())).await;
+    Ok(json!({ "fleet": id, "environment": env.name, "releases": out }))
+}
+
+/// A fleet change's releases as they stand, and whether each has finished.
+pub async fn fleet_status(d: &Deploy, id: &str) -> Result<Value, Fail> {
+    let list = store::releases_keyed(&d.hub.store, &format!("fleet:{id}:")).await.map_err(internal)?;
+    if list.is_empty() {
+        return Err(missing(format!("no fleet change {id}")));
+    }
+    let done = list.iter().all(|r| !r.state.in_flight());
+    let mut states: BTreeMap<&str, u32> = BTreeMap::new();
+    for r in &list {
+        *states.entry(r.state.as_str()).or_default() += 1;
+    }
+    Ok(json!({ "fleet": id, "done": done, "states": states, "releases": list }))
+}
+
+/// The values file an app runs with in an environment (`None`: nothing runs, or it has none).
+async fn current_values(d: &Deploy, a: &App, env: &Environment) -> Result<Option<String>, Fail> {
+    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(internal)?;
+    let running = match reg.and_then(|r| r.running) {
+        Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+        None => None,
+    };
+    let Some(commit) = running.and_then(|r| r.commit) else { return Ok(None) };
+    file_at(d, env, &commit, repo::values_file(&env.release_repo, a, &env.name)).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))
+}
+
 /// The releases a registration can roll back to: the last 10 that succeeded, the one running and
 /// any rolled back from left out (as txst's rule).
 pub async fn candidates(d: &Deploy, app_name: &str, env_name: &str) -> Result<Vec<Release>, Fail> {
@@ -1407,9 +1539,51 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
     }
     audit(d, &format!("deploy for {}", r.requested_by), "deploy.release.end", format!("release {} {}{}", r.id, state.as_str(), r.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())).await;
     emit_release(d, &r);
+    if state == State::Succeeded && r.kind == Kind::Deploy {
+        promote_onward(d, &r).await;
+    }
     // A release waiting behind this one may go now.
     d.wake.notify();
     Ok(())
+}
+
+/// The environments a version that landed in `from` moves on to by itself: those that promote
+/// automatically with `from` among their `after`, where the app is registered.
+fn onward(envs: &[Environment], registered: &[String], from: &str) -> Vec<String> {
+    envs.iter()
+        .filter(|e| e.gates.promote == super::model::Promote::Auto && e.gates.after.iter().any(|a| a == from) && registered.contains(&e.name))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// A version that landed, released on by itself (docs/deploy-api.md §9.2): exactly what landed,
+/// to each environment that promotes automatically after this one, through its other gates
+/// (soak, approvals, windows, freezes). Asked for in the name of who asked for the landed one, so
+/// they don't approve their own change on its way; once per landing and environment however often
+/// this runs. One refused (a release already in flight there, an `after` it doesn't run in yet)
+/// goes when the next of its `after` lands, or by hand.
+async fn promote_onward(d: &Deploy, landed: &Release) {
+    let st = &d.hub.store;
+    let next = async {
+        let envs = store::environments(st).await?;
+        let registered: Vec<String> = store::registrations(st, Some(&landed.app), None).await?.into_iter().map(|r| r.environment).collect();
+        anyhow::Ok(onward(&envs, &registered, &landed.environment))
+    };
+    let next = match next.await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(app = %landed.app, error = %format!("{e:#}"), "deploy: the environments a version promotes to by itself didn't read");
+            return;
+        }
+    };
+    let who = Who { name: landed.requested_by.clone(), agent: false };
+    for env in next {
+        let ask = Ask { app: landed.app.clone(), environment: env.clone(), promote_from: Some(landed.environment.clone()), idempotency_key: Some(format!("promote:{}:{env}", landed.id)), ..Ask::default() };
+        match Box::pin(release(d, &who, ask)).await {
+            Ok(r) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, release = r.id, "deploy: a version promoted by itself"),
+            Err((_, why)) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, %why, "deploy: a version didn't promote by itself"),
+        }
+    }
 }
 
 /// The trailer of a commit that reverts a release's: the release.
@@ -1619,6 +1793,40 @@ mod tests {
         assert_eq!(doc.pointer("/metadata/links/0/url"), Some(&json!("https://grafana.example/d/web")));
         assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1oncall"), Some(&json!("ada")));
         Ok(())
+    }
+
+    #[test]
+    fn a_fleet_change_sets_values_in_each_apps_own() -> Result<(), String> {
+        let set = BTreeMap::from([("replicaCount".to_owned(), "2".to_owned()), ("image.pullPolicy".to_owned(), "Always".to_owned()), ("ui.enabled".to_owned(), "true".to_owned())]);
+        let merged = merge_values("# the app's own\nimage:\n  repository: ghcr.io/acme/web\nui:\n  message: hi\n", &set)?;
+        let v: serde_yaml::Value = serde_yaml::from_str(&merged).map_err(|e| e.to_string())?;
+        assert_eq!(v.get("replicaCount"), Some(&serde_yaml::Value::Number(2.into())), "a number stays a number");
+        assert_eq!(v.get("image").and_then(|i| i.get("repository")).and_then(serde_yaml::Value::as_str), Some("ghcr.io/acme/web"), "what it had stays");
+        assert_eq!(v.get("image").and_then(|i| i.get("pullPolicy")).and_then(serde_yaml::Value::as_str), Some("Always"));
+        assert_eq!(v.get("ui").and_then(|u| u.get("enabled")), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(v.get("ui").and_then(|u| u.get("message")).and_then(serde_yaml::Value::as_str), Some("hi"));
+        // From nothing, and where a path runs into something that isn't a map.
+        let fresh = merge_values("", &BTreeMap::from([("a.b".to_owned(), "x".to_owned())]))?;
+        assert_eq!(fresh.trim(), "a:\n  b: x");
+        assert!(merge_values("image: web\n", &BTreeMap::from([("image.tag".to_owned(), "1".to_owned())])).is_err_and(|e| e.contains("image isn't a map")));
+        assert!(merge_values("", &BTreeMap::from([("a..b".to_owned(), "1".to_owned())])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_version_moves_on_by_itself_only_where_an_environment_says() {
+        let after = |name: &str, upstream: &[&str], auto: bool| {
+            let mut e = env(false);
+            e.name = name.into();
+            e.gates.after = upstream.iter().map(|u| (*u).to_owned()).collect();
+            e.gates.promote = if auto { super::super::model::Promote::Auto } else { super::super::model::Promote::Manual };
+            e
+        };
+        let envs = vec![after("staging", &[], false), after("production", &["staging"], true), after("eu", &["staging"], false), after("canary", &["staging"], true)];
+        let registered = vec!["staging".to_owned(), "production".to_owned(), "eu".to_owned()];
+        assert_eq!(onward(&envs, &registered, "staging"), ["production"], "eu promotes by hand; canary doesn't run the app");
+        assert!(onward(&envs, &registered, "production").is_empty(), "nothing comes after production");
+        assert_eq!(serde_json::to_value(super::super::model::Gates::default()).ok(), Some(json!({})), "`manual`, the default, isn't written");
     }
 
     #[test]

@@ -342,6 +342,23 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}, "note": {"type": "string", "description": "Why."}}), &["id"]),
                 route: |v| Ok((Method::POST, path(&["releases", &id(v)?.to_string(), "reject"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(flow::answer(&*service()?, &Who::of(&cx.caller), id(&v)?, false, opt_text(&v, "note")).await?) }),
+            op!("deploy.fleets.create", "A fleet change: one `version`, or values to `set` (by path: `image.pullPolicy`), released to many apps of an environment at once (the `apps` given, or those of a `template`, `project` or `owner`; every app registered there when none is), each through the environment's gates as any release. The fleet's id, and each app's release or why it has none.", ro: false, destructive: false,
+                input: || schema(json!({
+                    "environment": {"type": "string", "description": ENV},
+                    "apps": {"type": "array", "items": {"type": "string"}}, "template": {"type": "string"}, "project": {"type": "string"}, "owner": {"type": "string"},
+                    "version": {"type": "string", "description": "A deploy of this version to each."},
+                    "set": {"type": "object", "description": "Values set in each app's own, by path: `{\"replicaCount\": \"2\"}`.", "additionalProperties": {"type": "string"}},
+                    "idempotency_key": {"type": "string", "description": KEY}
+                }), &["environment"]),
+                route: |_| Ok((Method::POST, path(&["fleets"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let f: flow::FleetAsk = serde_json::from_value(v).map_err(|e| bad(format!("the request doesn't read: {e}")))?;
+                    answer(flow::fleet(&*service()?, &Who::of(&cx.caller), f).await?)
+                }),
+            op!("deploy.fleets.get", "A fleet change as it stands: each of its releases, how many are in each state, and whether all have finished.", ro: true, destructive: false,
+                input: || schema(json!({"id": {"type": "string", "description": "The fleet change's id."}}), &["id"]),
+                route: |v| Ok((Method::GET, path(&["fleets", &text(v, "id")?]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { answer(flow::fleet_status(&*service()?, &text(&v, "id")?).await?) }),
             op!("deploy.releases.wait", "Wait for a release to finish (`until: done`, the default) or to move at all (`until: any`), for at most `timeout_s` seconds (600 at most): the release as it is then, whether it is done, and whether the time ran out.", ro: true, destructive: false,
                 input: || schema(json!({
                     "id": {"type": "integer", "description": RELEASE}, "until": {"type": "string", "enum": ["done", "any"]},
@@ -439,6 +456,7 @@ mod tests {
                 "deploy.environments.put" => json!({ "environment": { "name": "staging" } }),
                 "deploy.apps.put" => json!({ "app": { "name": "web" } }),
                 "deploy.templates.put" => json!({ "template": { "name": "service" } }),
+                "deploy.fleets.get" => json!({ "id": "f1" }),
                 _ => input.clone(),
             };
             let (method, rest, _) = (op.route)(&v)?;

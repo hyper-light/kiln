@@ -305,7 +305,7 @@ impl Registry {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
-        let convo = crate::convo::open(&dir, conversations.keep_closed());
+        let convo = crate::convo::open(&dir, conversations.upkeep());
         // Runners that keep a store send it here; the server keeps their sessions from that. What
         // a mirror sends back to restore the store from isn't sent to it again.
         let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());

@@ -236,6 +236,20 @@ pub async fn release_by_key(store: &Store, app: &str, env: &str, key: &str) -> a
     spec.as_deref().map(from_json).transpose()
 }
 
+/// The releases asked for under one idempotency key's prefix (a fleet's: `fleet:<id>:`), oldest
+/// first.
+pub async fn releases_keyed(store: &Store, prefix: &str) -> anyhow::Result<Vec<Release>> {
+    let like = format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    let specs: Vec<String> = store
+        .call(move |c| {
+            let mut s = c.prepare("SELECT spec FROM deploy_releases WHERE idempotency_key LIKE ?1 ESCAPE '\\' ORDER BY id")?;
+            let rows = s.query_map([like], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    specs.iter().map(|s| from_json(s)).collect()
+}
+
 pub async fn release(store: &Store, id: i64) -> anyhow::Result<Option<Release>> {
     let spec: Option<String> = store.call(move |c| Ok(c.query_row("SELECT spec FROM deploy_releases WHERE id = ?1", [id], |r| r.get(0)).optional()?)).await?;
     spec.as_deref().map(from_json).transpose()
