@@ -585,3 +585,135 @@ a.plan-row-main:hover {
 .ts-pass {
   margin: 2px 0 -2px;
 }
+
+/* ---------------------------------------------------------------- a run of one agent per step */
+.run-title {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 26px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.run-note {
+  margin: 0;
+}
+.run-reason {
+  margin: 0;
+  color: var(--color-warn);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.run-steps {
+  display: grid;
+  margin: 6px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--color-line);
+  list-style: none;
+}
+.run-step {
+  display: grid;
+  gap: 8px;
+  padding: 16px 0 18px;
+  border-bottom: 1px solid var(--color-line);
+}
+.run-step-head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 12px;
+}
+.run-n {
+  flex: none;
+  min-width: 18px;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.run-step-title {
+  min-width: 0;
+  flex: 1;
+  color: var(--color-bright);
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.run-word {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  color: var(--color-meta);
+  font-size: 12.5px;
+}
+.run-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+}
+.run-step[data-stand="working"] .run-word > i {
+  background: var(--color-accent);
+}
+.run-step[data-stand="needs_you"] .run-word,
+.run-step[data-stand="yours"] .run-word {
+  color: var(--color-warn);
+}
+.run-step[data-stand="needs_you"] .run-word > i,
+.run-step[data-stand="yours"] .run-word > i {
+  background: var(--color-warn-dot);
+}
+.run-step[data-stand="met"] .run-word {
+  color: var(--color-ok);
+}
+.run-step[data-stand="met"] .run-word > i {
+  background: var(--color-ok-dot);
+}
+.run-step[data-stand="unmet"] .run-word,
+.run-step[data-stand="stopped"] .run-word {
+  color: var(--color-fail);
+}
+.run-step[data-stand="unmet"] .run-word > i,
+.run-step[data-stand="stopped"] .run-word > i {
+  background: var(--color-fail);
+}
+.run-agent,
+.run-what,
+.run-goal {
+  margin: 0;
+  padding-left: 30px;
+}
+.run-agent {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.run-agent-name {
+  color: var(--color-foreground);
+  font-size: 13.5px;
+}
+.run-agent-name:hover {
+  color: var(--color-link);
+}
+.run-what {
+  width: 100%;
+  min-width: 0;
+  color: var(--color-secondary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.run-agent .run-what {
+  padding-left: 0;
+}
+.run-goal {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-step .plan-actions {
+  padding-left: 30px;
+}
+.plan-meta-line {
+  margin: 0;
+}

@@ -82,7 +82,10 @@ viewer can ask for less of both, in the socket's query:
 
 `Spec`: `kind`, `cwd?`, `model?`, `mode?`, `effort?`, `resume?` (the harness's own session id),
 `resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`, `takeover_pid?` (set by a
-take-over: start only once that process has ended).
+take-over: start only once that process has ended). `parent` and `plan_run` are kiln's to set
+(`agents.start`, `plans.run`): given here they're dropped. An `Info` carries them too (`parent?`:
+the agent that started it; `plan_run?`: the plan run it does a step of), and `no_bypass` when it
+was started without bypass.
 
 ### Terminals beside an agent
 
@@ -212,6 +215,118 @@ timeline when the session turns idle (Codex's latest 100 turns, listed with
 `thread/turns/list`; a notice says when earlier ones are not shown). Claude Code writes a
 `/rename` into its transcript with the next exchange: a name given just before the session ends
 is not kept.
+
+## Agents that run agents
+
+An agent can start agents for parts of its work, on any machine, wait for them and read what
+they concluded (docs/agentic.md, O). Each agent it starts is its **child**: the child's `parent`
+is the agent that asked, which kiln knows from how it asked (its MCP token, its runner vouching
+for it, or the machine seeing its process), never from what it asked. A child gets no more than
+its parent has, and what it asks a person stays the person's: no operation answers another
+agent's approvals, questions or plans.
+
+### Operations
+
+Each is an operation of kiln's one registry: an HTTP route, an MCP tool (`agents_start`, …), a
+code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
+
+| Operation | Route | Input → answer |
+|---|---|---|
+| `agents.list` | `GET /api/harness/agents` | `machine?` (a runner's name, `local` for the server), `harness?`, `state?` (a stand or a status), `parent?`, `plan_run?` → `{agents: [Agent]}` |
+| `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
+| `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now"}` → `{sent, message}` |
+| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?` → `{done, timed_out, waited_ms, until, agents: [Agent]}` |
+| `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
+| `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
+| `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
+| `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
+
+Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
+lists shorten it). `workspace` is `folder` (the folder itself) until agents get workspaces of
+their own; `workspace`, `branch` and `change_request` in a result are `null` until then.
+
+An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
+files_changed, lines_added, lines_removed, cost_usd, doing?, parent?, plan_run?, last_turn?,
+pause?, exit?, needs?}`. `stand` says where it is, in a word:
+
+| `stand` | |
+|---|---|
+| `working` | a turn is under way, or a message waits in its queue or was just sent to it |
+| `idle` | its turn is over, nothing queued |
+| `needs_you` | an approval, a question or a plan waits on a person (`needs` lists them; only a person answers them) |
+| `paused` | its account reached a usage limit |
+| `stopped` | it crashed or couldn't start (`exit` says why) |
+| `offline` | its machine is away; it goes on when it's back |
+| `ended` | it ended, or kiln doesn't list it any more |
+
+### Where a child runs
+
+`on` is a machine's name (`local` or `server` for the server, `agent:<name>` too), or what it
+needs, as reach writes it: `linux/amd64`, `macos`, `arm64`, `+gpu`, `cpus>=16`, `mem>=32g`. Of
+the machines that suit and have the harness installed, the idlest (most idle cores, then free
+memory) gets it; outposts and job pods never do. Without `on`, an agent's child runs on the
+agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
+when it runs agents, else on the best runner with the harness. A child on another machine starts
+in that machine's home unless `cwd` names a folder there.
+
+### No more than its parent
+
+| Rule | |
+|---|---|
+| Its mode | at most its parent's, in one order for every harness: plan < ask < accept edits < auto < bypass. Asked for more: refused, saying which modes it may have. Asked for nothing: its harness's default when that's within its parent's, else the most its harness has that is (always given, so the harness's own settings can't start it higher). |
+| Bypass | only under a parent in bypass that was itself allowed it (`allow_bypass`); a child of a parent without it can't be switched to bypass either |
+| Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
+| Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
+| Children | at most `[agents] max_children` (24) running at once per agent |
+| Steering | an agent sends to, interrupts and ends only itself and the agents it started (and theirs) |
+
+The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk` (ask),
+`acceptEdits` (accept edits), `auto` (auto), `bypassPermissions` (bypass); Codex `read-only`
+(plan), `untrusted` (ask), `auto` (auto), `full-access` (bypass); the Antigravity CLI `plan`,
+`default` (ask), `accept-edits`, `bypass`; ACP agents kiln's `kiln-ask` and `kiln-bypass`, and
+their own modes by their words (`yolo` is bypass, `autoEdit` accept edits, `plan` plan). A mode
+kiln can't place is refused for a child; a parent in one counts as ask. The limits hold when a
+child starts: a person may change its mode later, as for any agent.
+
+### Waiting
+
+`agents.wait` holds no thread and no lock: it listens to the server's changes to the agents it
+waits for and looks again every 5 seconds. It returns as soon as they're `settled` (each idle,
+needing a person, paused, stopped or ended), or with `until: "change"` when anything about them
+changes, or `any` when the first is; else once `timeout_s` passes: by default 300 seconds, **at
+most 600 per call** (call again to wait longer). A message sent with `agents.send`, or a prompt
+`agents.start` gave, counts until the agent has had its turn: an agent idle with a message on
+its way is `working`. An agent kiln no longer lists has `ended`.
+
+### Who asks
+
+| How it asks | Who kiln takes it for |
+|---|---|
+| kiln's MCP server on the server (`/api/mcp`) | the agent whose own MCP token it is: kiln gives every agent it starts on the server a token of its own (`kiln_mcp_session-<id>_…`, in a 0600 config file), which works only while kiln runs that agent |
+| kiln's MCP server on a runner (`kiln reach mcp`) | the agent session the runner runs it for |
+| `kiln spawn`, `kiln agents` on a machine | the agent whose command it is (its harness is an ancestor of the process, or the process carries the agent's `KILN_AGENT` mark), else the person in the kiln shell it runs in |
+
+An agent acts for whoever started it (the owner on a kiln nobody else signs in to): its calls
+are audited as `agent:<id>[@<machine>] for <them>`, and its children act for them too. A person's
+kiln shell acts for whoever opened the terminal, audited as `shell:<id>[@<machine>] for <them>`.
+
+### From a kiln shell
+
+Every harness kiln starts has `KILN_HARNESS_SOCK`, so these work in an agent's own commands as
+in a kiln terminal (run by an agent, what they start are its children):
+
+| Command | |
+|---|---|
+| `kiln spawn codex "fix the tests" --on linux/amd64 [--cwd ~/src/app] [--mode untrusted] [--model …] [-n 2]` | start agents on another machine, picked as above |
+| `kiln agents wait <id>… [--timeout 300] [--any] [--change] [--json]` | wait for agents anywhere, then print where each stands |
+| `kiln agents result <id> [--json]` | its last reply, how its last turn ended, what it changed, its cost |
+
+`kiln spawn` without `--on` starts agents on this machine, as before (run by an agent, through
+the server, as its children); `kiln agents list|send|interrupt|stop` work on this machine's agents
+(an agent sends to and stops only its own). The skill `kiln-agents` (docs: `kiln mcp`, skills)
+says when to fan out, how to brief a child, how to wait and read results, how to keep children's
+permissions low and how to merge their work.
 
 ## Commands
 
@@ -471,7 +586,7 @@ count. The Runners page shows it under the machine's name ("battery 34% · 2h 15
 "on its charger"). A machine on battery that drops to 20% or less is low: Runners and Mission
 Control say so at the top, with what stops when it sleeps (its agents, its jobs). The server logs
 it, audits it and sends it to webhook subscribers as `machine.battery_low`, once, as the machine
-gets there. A Mac on battery hibernates at about 1%, and its runner, agents and jobs go with it
+gets there, and to the devices of everyone with an agent on it (docs/notifications.md). A Mac on battery hibernates at about 1%, and its runner, agents and jobs go with it
 until it's plugged in; kiln can't keep it up, only say so in time.
 
 ### Tasks: shells, monitors and other work an agent leaves running

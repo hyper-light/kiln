@@ -1,16 +1,20 @@
-/** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove. */
+/** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove, mute its notifications. */
 import * as React from "react";
 import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
+import { pushApi, pushStateRes } from "@/api/push";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
+import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
+import { invalidate } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
 import { MoveDialog } from "./move";
 import { ReachDialog } from "./reach";
 import { SpawnDialog } from "./spawn";
+import { useEndWithChildren } from "./family";
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
@@ -33,9 +37,11 @@ export function useAgentActions(
       toast.error(`Couldn't ${what}`, errorMessage(e));
     }
   };
+  // Ending it ends the agents it started too, unless the dialog says otherwise.
+  const ending = useEndWithChildren(a.id);
   const end = async () => {
     try {
-      await harnessApi.stop(a.id);
+      await (live ? ending.end() : harnessApi.stop(a.id));
       after?.onGone?.();
     } catch (e) {
       toast.error(live ? "Couldn't end the agent" : "Couldn't remove the agent", errorMessage(e));
@@ -88,6 +94,9 @@ export function useAgentActions(
               </DropdownMenu.Item>
             ))}
           <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
+          <React.Suspense fallback={null}>
+            <MuteItem id={a.id} />
+          </React.Suspense>
           <DropdownMenu.CheckboxItem
             className="menu-item"
             checked={keeping}
@@ -112,7 +121,12 @@ export function useAgentActions(
         open={act === "end"}
         onOpenChange={(o) => !o && setAct(null)}
         title={`End ${a.name}?`}
-        description={`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
+        description={
+          <>
+            {`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
+            {act === "end" && ending.note}
+          </>
+        }
         confirmLabel="End agent"
         danger
         onConfirm={end}
@@ -144,6 +158,25 @@ export function useAgentActions(
     /** Names it in kiln (and in its harness, which names conversations too); "" gives it back its harness's name. */
     rename: (n: string) => command({ type: "control", id: "rename", value: n }, "rename it"),
   };
+}
+
+/** Mute an agent's notifications for you, on every device (and unmute): where push is on here. */
+function MuteItem({ id }: { id: string }) {
+  const push = useRes(pushStateRes);
+  const muted = push.data.muted.includes(id);
+  if (!push.data.available && !muted) return null;
+  const toggle = () => {
+    push.setData((s) => ({ ...s, muted: muted ? s.muted.filter((m) => m !== id) : [...s.muted, id] }));
+    pushApi.mute(id, !muted).catch((e: unknown) => {
+      toast.error(muted ? "Couldn't unmute it" : "Couldn't mute it", errorMessage(e));
+      invalidate("push/state");
+    });
+  };
+  return (
+    <DropdownMenu.Item className="menu-item" onSelect={toggle}>
+      <span className="flex-1">{muted ? "Unmute notifications" : "Mute notifications"}</span>
+    </DropdownMenu.Item>
+  );
 }
 
 export { NameField } from "@/components/ui/name-field";

@@ -55,6 +55,7 @@ export const peersApi = {
   rechallenge: (id: string) => request<{ peer: Peer; challenge: string }>("POST", at(id, "/challenge"), {}),
   complete: (id: string, response: string) => request<Peer>("POST", at(id, "/complete"), { response }),
   authorize: (challenge: string, role: string) => request<{ peer: Peer; response: string }>("POST", "/api/peers/authorize", { challenge, role }),
+  readdress: (id: string, url: string) => request<Peer>("PUT", at(id), { url }),
   remove: (id: string) => request<void>("DELETE", at(id)),
   frame: (id: string) => request<Frame>("POST", at(id, "/frame"), {}),
 };

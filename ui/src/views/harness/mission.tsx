@@ -17,7 +17,7 @@ import { PageIntro, SelectField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { useAgentsLive } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
+import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
@@ -29,8 +29,13 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
+import { AgentFamilies } from "./family";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
+import { PushOffer } from "./push-offer";
+
+/** A phone: the page's head is one line, and the message box folds. */
+const PHONE = "(max-width: 640px)";
 
 /** Where an agent stands. */
 type Stand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended";
@@ -120,7 +125,7 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
 }
 
 /** A row re-renders only when its own agent changes (or is selected); its clock counts by itself. */
-const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void }) {
+const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void; of?: string }) {
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   const ap = a.approvals[0];
@@ -149,7 +154,10 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
         </div>
       ) : (
         <button type="button" className="ms-main" onClick={open}>
-          <span className="ms-name">{label}</span>
+          <span className="ms-name">
+            {label}
+            {of && <span className="ms-of">started by {of}</span>}
+          </span>
           {line}
         </button>
       )}
@@ -202,8 +210,8 @@ function standsOf(list: AgentInfo[], seen: Record<string, number>) {
 /** What the page's lead says before the agents are known. */
 const LEAD = "Every coding agent kiln runs, on every machine.";
 
-/** The lead: how your agents stand, and where. */
-function Lead() {
+/** The lead: how your agents stand, and where (on a phone, how they stand). */
+function Lead({ short }: { short?: boolean }) {
   const list = useAgentList();
   const seen = useSeen();
   const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
@@ -218,6 +226,7 @@ function Lead() {
   ]
     .filter(Boolean)
     .join(", ");
+  if (short && all.length > 0) return <>{status || "All quiet"}</>;
   return <>{all.length === 0 ? "Start coding agents on any of your machines and run them all from here." : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`}</>;
 }
 
@@ -228,6 +237,7 @@ export default function Mission() {
   // ?new=1 (links from elsewhere) opens New agents: open, it stays so by itself, and the link's
   // mark comes off the address.
   const fromLink = params.get("new") === "1";
+  const phone = useMediaQuery(PHONE);
   const opened = () => {
     if (!fromLink) return;
     setSpawn(true);
@@ -242,20 +252,32 @@ export default function Mission() {
         index={6}
         label="Agents"
         title="Mission control."
+        compact
         lead={
           <React.Suspense fallback={LEAD}>
-            <Lead />
+            <Lead short={phone} />
           </React.Suspense>
         }
         actions={
-          <>
-            <Button asChild variant="secondary">
-              <Link to="/agents/plans">Plans</Link>
-            </Button>
-            <Button onClick={() => setSpawn(true)}>
-              New agents <Plus />
-            </Button>
-          </>
+          phone ? (
+            <>
+              <Button asChild variant="ghost" size="xs">
+                <Link to="/agents/plans">Plans</Link>
+              </Button>
+              <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
+                <Plus />
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button asChild variant="secondary">
+                <Link to="/agents/plans">Plans</Link>
+              </Button>
+              <Button onClick={() => setSpawn(true)}>
+                New agents <Plus />
+              </Button>
+            </>
+          )
         }
       />
       <Loadable label="Loading agents" fallback={<Loading label="Loading agents" block />}>
@@ -402,6 +424,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const seen = useSeen();
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
+  // On a phone the message box stays folded until agents are selected or it's opened.
+  const phone = useMediaQuery(PHONE);
+  const [messaging, setMessaging] = React.useState(false);
 
   const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
@@ -441,15 +466,20 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   // The message goes to what's checked; with nothing checked, to every agent the list shows.
   const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
   const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
+  const message = <MessageBar agents={targets} reach={reach} onEnded={() => setSelected(new Set())} />;
+  const folds = phone && checked.length === 0;
 
   return (
     <>
       {all.length > 0 && (
         <>
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
-          <MessageBar agents={targets} reach={reach} onEnded={() => setSelected(new Set())} />
+          {!phone && message}
           <React.Suspense fallback={null}>
             <Recover rows={all} />
+          </React.Suspense>
+          <React.Suspense fallback={null}>
+            <PushOffer />
           </React.Suspense>
         </>
       )}
@@ -493,12 +523,17 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 <RotateCcw size={12} aria-hidden="true" /> Refresh list
               </button>
             )}
+            {folds && (
+              <button type="button" className="ms-link ms-msg-open" aria-expanded={messaging} onClick={() => setMessaging(!messaging)}>
+                <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
+                Message agents
+              </button>
+            )}
           </div>
+          {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
             <ul className="ms-list">
-              {live.map(({ a, stand }) => (
-                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
-              ))}
+              <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
             </ul>
           ) : filtered && ended.length === 0 ? (
             <p className="ms-quiet">

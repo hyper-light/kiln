@@ -29,6 +29,10 @@ export const Route = createRootRoute({
       { name: "theme-color", content: "#08090a" },
       { name: "color-scheme", content: "dark" },
       { name: "description", content: "kiln — self-hosted CI/CD for the hyper-light stack" },
+      // Added to a phone's Home Screen, kiln opens as an app of its own (iPhone: what Web Push needs).
+      { name: "mobile-web-app-capable", content: "yes" },
+      { name: "apple-mobile-web-app-capable", content: "yes" },
+      { name: "apple-mobile-web-app-title", content: "kiln" },
       { title: "kiln" },
     ],
     links: [
@@ -36,6 +40,8 @@ export const Route = createRootRoute({
       { rel: "stylesheet", href: geistMono },
       { rel: "stylesheet", href: appCss },
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "manifest", href: "/manifest.webmanifest" },
+      { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
     ],
   }),
   shellComponent: Document,

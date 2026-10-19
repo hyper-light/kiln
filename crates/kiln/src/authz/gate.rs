@@ -62,6 +62,10 @@ pub struct Caller {
     pub user: Option<String>,
     /// The token it signed in with (`tokens.id`).
     pub token: Option<String>,
+    /// The agent session it is, when it's one kiln runs: set from how it reached kiln (its MCP
+    /// token, its runner vouching for it, the machine's socket seeing its process), never from
+    /// what it asks. An agent it starts is that agent's child (`harness::lineage`).
+    pub agent: Option<String>,
     /// What the principal may do; `None`: everything.
     rights: Option<Rights>,
     /// A token's own grant: the caller does at most what both allow.
@@ -70,18 +74,18 @@ pub struct Caller {
 
 impl Caller {
     pub fn owner() -> Caller {
-        Caller { kind: Kind::Owner, name: "admin".into(), user: None, token: None, rights: None, limit: None }
+        Caller { kind: Kind::Owner, name: "admin".into(), user: None, token: None, agent: None, rights: None, limit: None }
     }
 
     /// A caller with these rights, for tests and for checks made on someone's behalf.
     pub fn with(kind: Kind, name: &str, rights: Option<Rights>, limit: Option<Rights>) -> Caller {
-        Caller { kind, name: name.to_owned(), user: None, token: None, rights, limit }
+        Caller { kind, name: name.to_owned(), user: None, token: None, agent: None, rights, limit }
     }
 
     /// Someone from a peered cluster, with `role` on this whole server (`crate::peers::caller`).
     pub fn peer(name: &str, role: &str) -> Caller {
         let rights = Rights { grants: vec![Grant { what: role.to_owned(), scope: Scope::Server, deny: false }], custom: HashMap::new() };
-        Caller { kind: Kind::Peer, name: name.to_owned(), user: None, token: None, rights: Some(rights), limit: None }
+        Caller { kind: Kind::Peer, name: name.to_owned(), user: None, token: None, agent: None, rights: Some(rights), limit: None }
     }
 
     /// The highest built-in role it holds on the whole server (the owner: admin), which is the
@@ -167,14 +171,14 @@ fn store_err(e: anyhow::Error) -> Option<Caller> {
 /// Audited as `<name> for <who>`. `None`: that user is gone or disabled.
 pub async fn agent_for(hub: &Hub, name: &str, opener: &str) -> Option<Caller> {
     if opener == "owner" {
-        return Some(Caller { kind: Kind::Agent, name: format!("{name} for admin"), user: None, token: None, rights: None, limit: None });
+        return Some(Caller { kind: Kind::Agent, name: format!("{name} for admin"), user: None, token: None, agent: None, rights: None, limit: None });
     }
     let uid = opener.strip_prefix("user:")?.to_owned();
     let name = name.to_owned();
     hub.store
         .call(move |c| {
             let Some((who, rights)) = user_rights(c, &uid)? else { return Ok(None) };
-            Ok(Some(Caller { kind: Kind::Agent, name: format!("{name} for user:{who}"), user: Some(uid), token: None, rights: Some(rights), limit: None }))
+            Ok(Some(Caller { kind: Kind::Agent, name: format!("{name} for user:{who}"), user: Some(uid), token: None, agent: None, rights: Some(rights), limit: None }))
         })
         .await
         .unwrap_or_else(store_err)
@@ -244,7 +248,7 @@ async fn token(hub: &Hub, t: &str) -> Option<Caller> {
             let limit = Rights { grants: token_grants(&scopes), custom: custom_roles(c)? };
             let short: String = id.chars().take(12).collect();
             let name = if agent { format!("{principal} for {who}") } else { format!("pat:{short} of {who}") };
-            Ok(Some(Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), rights, limit: Some(limit) }))
+            Ok(Some(Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit) }))
         })
         .await
         .unwrap_or_else(store_err)
@@ -281,7 +285,7 @@ async fn job(hub: &Hub, t: &str) -> Option<Caller> {
     if j.may("binaries", Level::Write) {
         give(&["binaries.publish"], &Scope::Server);
     }
-    Some(Caller { kind: Kind::Job, name: format!("job:{}", j.leg), user: None, token: None, rights: Some(Rights { grants, custom: HashMap::new() }), limit: None })
+    Some(Caller { kind: Kind::Job, name: format!("job:{}", j.leg), user: None, token: None, agent: None, rights: Some(Rights { grants, custom: HashMap::new() }), limit: None })
 }
 
 // ------------------------------------------------------------------ users' sessions
@@ -317,7 +321,7 @@ async fn user_session(hub: &Hub, value: &str) -> Option<Caller> {
                 return Ok(None);
             }
             let Some((name, rights)) = user_rights(c, &id)? else { return Ok(None) };
-            Ok(Some(Caller { kind: Kind::User, name: format!("user:{name}"), user: Some(id), token: None, rights: Some(rights), limit: None }))
+            Ok(Some(Caller { kind: Kind::User, name: format!("user:{name}"), user: Some(id), token: None, agent: None, rights: Some(rights), limit: None }))
         })
         .await
         .unwrap_or_else(store_err)

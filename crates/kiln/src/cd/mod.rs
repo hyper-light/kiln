@@ -1446,11 +1446,6 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
             }
         });
     }
-    // Agents kiln starts on this machine get its MCP server and skills.
-    let port = hub.cfg.server.http_addr.rsplit_once(':').map(|(_, p)| p.to_owned()).unwrap_or_else(|| "7070".into());
-    if let Err(e) = crate::mcp::init_kit(&hub, &format!("http://127.0.0.1:{port}")) {
-        tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
-    }
     tracing::info!(apps = cd.apps.read().len(), "deployments ready");
     let _ = hub.shutdown.cancelled().await;
     *CD.write() = None;
