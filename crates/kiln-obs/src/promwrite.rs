@@ -14,7 +14,15 @@
 //!   learned is kept, [`Families`]), else its name's: a name ending `_total`, `_bucket`, `_count` or
 //!   `_sum` a counter, as Prometheus's conventions name them.
 //! - Samples keep their own times (ms). A value that is not a number is a staleness marker (or
-//!   nothing): skipped. Native histograms and exemplars are counted, not yet taken.
+//!   nothing): skipped. Exemplars are counted, not taken.
+//! - A native histogram (Prometheus's sparse exponential one) is kiln's distribution (§4.4), as an
+//!   OpenTelemetry exponential histogram is: its schema is the scale (made coarser past kiln's
+//!   finest), its buckets' indices one past OpenTelemetry's (`(base^(i-1), base^i]`), read from its
+//!   spans and its counts (integers, each the change from the one before), its zero bucket kiln's;
+//!   a counter's (every one but a gauge's) turned into what rose since the sample before, as a
+//!   cumulative OpenTelemetry histogram's is (the first of a series the receiver has not seen:
+//!   none, what came before it not known). `.count` and `.sum` beside its buckets. A float
+//!   histogram (recording rules') or one of custom buckets is counted, not yet taken.
 //!
 //! What a request decodes to is an OTLP request's shape ([`Decoded`]): each series' key once,
 //! found in the receiver's cache ([`Keys`]) after its first time, its samples flat.
@@ -23,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::batch::{Kind, MAX_TAGS};
+use crate::dist;
 use crate::otlp::metrics::{Decoded, Keys};
 use crate::otlp::pb::{Fields, PbError, varints};
 use crate::varint;
@@ -232,8 +241,10 @@ pub struct Taken {
     pub invalid_series: u64,
     pub skipped_samples: u64,
     pub stale: u64,
-    /// Native histograms and exemplars: counted, not yet taken.
+    /// Native histograms, and those taken (a float one, or one of custom buckets, is not yet);
+    /// exemplars, counted, not taken.
     pub histograms: u64,
+    pub histograms_taken: u64,
     pub exemplars: u64,
     /// Metadata of families (1.0).
     pub metadata: u64,
@@ -287,11 +298,10 @@ pub fn decode_into(body: &[u8], version: Version, keys: &Keys, families: &Famili
                             labels.push((name, value));
                         }
                         (3, _) => taken.exemplars += 1,
-                        (4, _) => taken.histograms += 1,
                         _ => {}
                     }
                 }
-                series(ts, 2, &mut labels, None, keys, families, &mut key, out, &mut taken)?;
+                series(ts, 4, &mut labels, None, keys, families, &mut key, out, &mut taken)?;
             }
         }
         Version::V2 => {
@@ -310,7 +320,6 @@ pub fn decode_into(body: &[u8], version: Version, keys: &Keys, families: &Famili
                 for g in Fields::new(ts) {
                     match g? {
                         (1, w) => varints(&w, &mut refs)?,
-                        (3, _) => taken.histograms += 1,
                         (4, _) => taken.exemplars += 1,
                         (5, w) => {
                             for h in Fields::new(w.bytes().unwrap_or_default()) {
@@ -328,17 +337,19 @@ pub fn decode_into(body: &[u8], version: Version, keys: &Keys, families: &Famili
                     let s = |i: u64| usize::try_from(i).ok().and_then(|i| symbols.get(i)).copied().ok_or(WriteError::Symbol);
                     labels.push((s(*n)?, s(*v)?));
                 }
-                series(ts, 2, &mut labels, Some(t), keys, families, &mut key, out, &mut taken)?;
+                series(ts, 3, &mut labels, Some(t), keys, families, &mut key, out, &mut taken)?;
             }
         }
     }
     Ok(taken)
 }
 
-/// One series' samples (`ts`, its message; `field` its samples' field) taken into `out`.
+/// One series' samples (`ts`, its message: its samples field 2, its native histograms
+/// `hist_field`) taken into `out`.
 #[allow(clippy::too_many_arguments)]
-fn series(ts: &[u8], field: u32, labels: &mut Vec<(&str, &str)>, own: Option<Type>, keys: &Keys, families: &Families, key: &mut Vec<u8>, out: &mut Decoded, taken: &mut Taken) -> Result<(), WriteError> {
-    let samples = || Fields::new(ts).filter_map(|g| g.ok()).filter(|(n, _)| *n == field);
+fn series(ts: &[u8], hist_field: u32, labels: &mut Vec<(&str, &str)>, own: Option<Type>, keys: &Keys, families: &Families, key: &mut Vec<u8>, out: &mut Decoded, taken: &mut Taken) -> Result<(), WriteError> {
+    let samples = || Fields::new(ts).filter_map(|g| g.ok()).filter(|(n, _)| *n == 2);
+    let histograms = || Fields::new(ts).filter_map(|g| g.ok()).filter(|(n, _)| *n == hist_field);
     // Its metric, and its other labels with a value, by name; a name twice is no series.
     let name = labels.iter().find(|(n, _)| *n == "__name__").map(|(_, v)| *v).unwrap_or_default();
     labels.retain(|(n, v)| *n != "__name__" && !v.is_empty());
@@ -356,8 +367,15 @@ fn series(ts: &[u8], field: u32, labels: &mut Vec<(&str, &str)>, own: Option<Typ
     let Some(k) = made else {
         taken.invalid_series += 1;
         taken.skipped_samples += samples().count() as u64;
+        taken.histograms += histograms().count() as u64;
         return Ok(());
     };
+    for (_, w) in histograms() {
+        taken.histograms += 1;
+        if native(w.bytes().unwrap_or_default(), name, labels, keys, key, out)? {
+            taken.histograms_taken += 1;
+        }
+    }
     let place = out.keys.len() as u32;
     let mut any = false;
     for (_, w) in samples() {
@@ -383,6 +401,119 @@ fn series(ts: &[u8], field: u32, labels: &mut Vec<(&str, &str)>, own: Option<Typ
         taken.series += 1;
     }
     Ok(())
+}
+
+/// The most buckets a native histogram's spans may hold: Prometheus's own bound
+/// (`native_histogram_bucket_limit`, 160 by default) many times over; past it, it is not taken.
+const NATIVE_BUCKETS: u64 = 4096;
+
+/// A native histogram (remote write's `Histogram`) of series `name` (`labels` sorted, each key
+/// once) into `out` as kiln's distribution; whether it was taken.
+fn native(msg: &[u8], name: &str, labels: &[(&str, &str)], keys: &Keys, key: &mut Vec<u8>, out: &mut Decoded) -> Result<bool, WriteError> {
+    let (mut count, mut sum, mut schema, mut zero, mut reset, mut at) = (None::<u64>, 0.0f64, 0i64, 0u64, 0u64, 0i64);
+    let mut float = false;
+    let (mut pos_spans, mut neg_spans): (Vec<(i64, u64)>, Vec<(i64, u64)>) = (Vec::new(), Vec::new());
+    let (mut pos, mut neg): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+    let span = |b: &[u8], into: &mut Vec<(i64, u64)>| -> Result<(), WriteError> {
+        let (mut offset, mut len) = (0i64, 0u64);
+        for f in Fields::new(b) {
+            match f? {
+                (1, w) => offset = w.sint().unwrap_or(0),
+                (2, w) => len = w.u64().unwrap_or(0),
+                _ => {}
+            }
+        }
+        into.push((offset, len));
+        Ok(())
+    };
+    for f in Fields::new(msg) {
+        match f? {
+            (1, w) => count = w.u64(),
+            (2 | 7 | 10 | 13, _) => float = true,
+            (3, w) => sum = w.f64().unwrap_or(0.0),
+            (4, w) => schema = w.sint().unwrap_or(0),
+            (6, w) => zero = w.u64().unwrap_or(0),
+            (8, w) => span(w.bytes().unwrap_or_default(), &mut neg_spans)?,
+            (9, w) => varints(&w, &mut neg)?,
+            (11, w) => span(w.bytes().unwrap_or_default(), &mut pos_spans)?,
+            (12, w) => varints(&w, &mut pos)?,
+            (14, w) => reset = w.u64().unwrap_or(0),
+            (15, w) => at = w.i64().unwrap_or(0),
+            _ => {}
+        }
+    }
+    // A float histogram, one of custom buckets (schema -53), or a schema no exponential one has.
+    let Ok(schema) = i32::try_from(schema) else { return Ok(false) };
+    let Some(count) = count else { return Ok(false) };
+    if float || !(dist::MIN_SCALE..=8).contains(&schema) || !sum.is_finite() {
+        return Ok(false);
+    }
+    // Its buckets at kiln's scale (each the counts' running sum, its index one less), ascending.
+    let to = schema.min(dist::SCALE);
+    let k = u32::try_from(schema - to).unwrap_or(0);
+    let mut buckets: Vec<(dist::Bucket, u64)> = Vec::new();
+    let mut add = |b: dist::Bucket, n: u64| {
+        if n == 0 {
+            return;
+        }
+        match buckets.iter_mut().find(|(x, _)| *x == b) {
+            Some(e) => e.1 += n,
+            None => buckets.push((b, n)),
+        }
+    };
+    for (spans, deltas, positive) in [(&neg_spans, &neg, false), (&pos_spans, &pos, true)] {
+        if spans.iter().map(|s| s.1).sum::<u64>() > NATIVE_BUCKETS || spans.iter().map(|s| s.1).sum::<u64>() != deltas.len() as u64 {
+            return Ok(false);
+        }
+        let (mut idx, mut running, mut d) = (0i64, 0i64, deltas.iter());
+        for (i, &(offset, len)) in spans.iter().enumerate() {
+            idx = if i == 0 { offset } else { idx.saturating_add(offset) };
+            for _ in 0..len {
+                let delta = d.next().map_or(0, |&z| ((z >> 1) as i64) ^ -((z & 1) as i64));
+                running = running.saturating_add(delta);
+                let Ok(n) = u64::try_from(running) else { return Ok(false) };
+                let j = idx.saturating_sub(1);
+                add(if positive { dist::Bucket::Pos(j) } else { dist::Bucket::Neg(j) }.coarser(k), n);
+                idx = idx.saturating_add(1);
+            }
+        }
+    }
+    add(dist::Bucket::Zero, zero);
+    buckets.sort_unstable_by_key(|(b, _)| b.order());
+    let dist_name = format!("{name}{}", dist::SUFFIX);
+    // A counter's: what rose since the sample before (a gauge's, reset hint 3, as it is).
+    let mut delta = Vec::new();
+    let at_ns = u64::try_from(at).unwrap_or(0).saturating_mul(1_000_000);
+    let (counts, since): (&[(dist::Bucket, u64)], Option<(u64, f64)>) = if reset == 3 {
+        (&buckets, Some((count, sum)))
+    } else {
+        let id = keys.identity(&dist_name, labels, key);
+        let since = keys.delta(id, 0, at_ns.max(1), to, &buckets, count, sum, &mut delta);
+        (&delta, since)
+    };
+    let Some((count, sum)) = since else { return Ok(true) };
+    let put = |out: &mut Decoded, k: Option<crate::batch::SeriesKey>, v: f64| {
+        if let Some(k) = k {
+            out.samples.push((out.keys.len() as u32, at, v));
+            out.keys.push(k);
+            out.points += 1;
+        }
+    };
+    // A label of the bucket tag's own name leaves no room for it: no buckets, as no series can be.
+    if !labels.iter().any(|(k, _)| *k == dist::BUCKET_TAG) {
+        let tags: Vec<String> = counts.iter().map(|&(b, _)| dist::tag_value(to, b)).collect();
+        let mut with: Vec<(&str, &str)> = Vec::with_capacity(labels.len() + 1);
+        for (&(_, n), tag) in counts.iter().zip(&tags) {
+            with.clear();
+            with.extend_from_slice(labels);
+            let place = with.partition_point(|(k, _)| *k < dist::BUCKET_TAG);
+            with.insert(place, (dist::BUCKET_TAG, tag.as_str()));
+            put(out, keys.key(&dist_name, &with, Kind::Count, key), n as f64);
+        }
+    }
+    put(out, keys.key(&format!("{name}.count"), labels, Kind::Count, key), count as f64);
+    put(out, keys.key(&format!("{name}.sum"), labels, Kind::Count, key), sum);
+    Ok(true)
 }
 
 impl Type {
@@ -571,6 +702,76 @@ mod tests {
         assert_eq!(read(&d), vec![("temp_celsius{room:kitchen}".into(), Kind::Gauge, vec![(5_000, 21.5)]), ("doors_opened{}".into(), Kind::Counter, vec![(5_000, 7.0)])]);
         assert_eq!((t.series, t.samples, t.histograms), (2, 2, 1));
         assert_eq!(decode_into(&bad.buf, Version::V2, &keys, &families, &mut d), Err(WriteError::Symbol));
+    }
+
+    /// A native histogram, Prometheus's own encoding: schema, spans (offset, length) and counts as
+    /// the change from the one before (sint64, zigzag).
+    #[allow(clippy::too_many_arguments)]
+    fn histogram(w: &mut Writer, field: u32, count: u64, sum: f64, schema: i64, spans: &[(i64, u64)], deltas: &[i64], reset: u64, at: i64, float: bool) {
+        w.message(field, |h| {
+            if float {
+                h.double(2, count as f64);
+            } else {
+                h.varint(1, count);
+            }
+            h.double(3, sum);
+            h.varint(4, ((schema << 1) ^ (schema >> 63)) as u64);
+            for &(offset, len) in spans {
+                h.message(11, |s| {
+                    s.varint(1, ((offset << 1) ^ (offset >> 63)) as u64);
+                    s.varint(2, len);
+                });
+            }
+            let mut packed = Vec::new();
+            for &d in deltas {
+                crate::varint::put(&mut packed, ((d << 1) ^ (d >> 63)) as u64);
+            }
+            h.bytes(12, &packed);
+            if reset > 0 {
+                h.varint(14, reset);
+            }
+            h.varint(15, at as u64);
+        });
+    }
+
+    /// A native histogram is a distribution: a counter's buckets what rose since its sample before
+    /// (its first, of a series begun before the receiver, only what it rises from), its index one
+    /// past OpenTelemetry's; a gauge's as it is; a float one not yet taken.
+    #[test]
+    fn native_histograms_are_distributions() {
+        let (keys, families, mut d) = (Keys::new(), Families::new(), Decoded::default());
+        let send = |hist: &dyn Fn(&mut Writer), d: &mut Decoded| {
+            let mut w = Writer::default();
+            w.message(1, |ts| {
+                label(ts, 1, "__name__", "rpc_seconds");
+                label(ts, 1, "job", "api");
+                hist(ts);
+            });
+            decode_into(&w.buf, Version::V1, &keys, &families, d).unwrap()
+        };
+        // Buckets (1,2], (2,4], (4,8] (indices 1 to 3 at schema 0): 2, 3 and 1, then 4, 5 and 1.
+        let t = send(&|ts| histogram(ts, 4, 6, 20.0, 0, &[(1, 3)], &[2, 1, -2], 0, 1_000, false), &mut d);
+        assert_eq!((t.histograms, t.histograms_taken, read(&d).len()), (1, 1, 0), "a first sample: what came before not known");
+        send(&|ts| histogram(ts, 4, 10, 35.0, 0, &[(1, 3)], &[4, 1, -4], 0, 16_000, false), &mut d);
+        let got = read(&d);
+        let tag = |i: i64| dist::tag_value(0, dist::Bucket::Pos(i));
+        assert_eq!(
+            got,
+            vec![
+                (format!("rpc_seconds.dist{{dist_bucket:{},job:api}}", tag(0)), Kind::Count, vec![(16_000, 2.0)]),
+                (format!("rpc_seconds.dist{{dist_bucket:{},job:api}}", tag(1)), Kind::Count, vec![(16_000, 2.0)]),
+                ("rpc_seconds.count{job:api}".into(), Kind::Count, vec![(16_000, 4.0)]),
+                ("rpc_seconds.sum{job:api}".into(), Kind::Count, vec![(16_000, 15.0)]),
+            ]
+        );
+        // A gauge histogram (reset hint 3) as it is, its finer schema made kiln's (8 to 5).
+        send(&|ts| histogram(ts, 4, 2, 3.0, 8, &[(0, 2)], &[1, 0], 3, 31_000, false), &mut d);
+        let got = read(&d);
+        assert_eq!(got.iter().filter(|g| g.0.starts_with("rpc_seconds.dist")).map(|g| g.2.iter().map(|p| p.1).sum::<f64>()).sum::<f64>(), 2.0, "{got:?}");
+        assert!(got.iter().all(|g| !g.0.starts_with("rpc_seconds.dist") || g.0.contains("dist_bucket:5:")), "{got:?}");
+        // A float one: counted, not taken.
+        let t = send(&|ts| histogram(ts, 4, 2, 3.0, 0, &[(0, 1)], &[2], 0, 46_000, true), &mut d);
+        assert_eq!((t.histograms, t.histograms_taken), (1, 0));
     }
 
     #[test]

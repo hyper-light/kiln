@@ -171,7 +171,7 @@ impl Keys {
     /// point it has had. Its count and sum are the same interval's as its buckets, so a
     /// distribution's average and its percentiles are of the same values.
     #[allow(clippy::too_many_arguments)]
-    fn delta(&self, id: u64, start_ns: u64, at_ns: u64, scale: i32, buckets: &[(Bucket, u64)], count: u64, sum: f64, out: &mut Vec<(Bucket, u64)>) -> Option<(u64, f64)> {
+    pub(crate) fn delta(&self, id: u64, start_ns: u64, at_ns: u64, scale: i32, buckets: &[(Bucket, u64)], count: u64, sum: f64, out: &mut Vec<(Bucket, u64)>) -> Option<(u64, f64)> {
         out.clear();
         let shard = self.cumulative.get((id >> 60) as usize % SHARDS)?;
         let mut guard = shard.lock().unwrap_or_else(PoisonError::into_inner);
@@ -276,6 +276,16 @@ impl Keys {
         }
         let h = key_hash(&self.hash, key, kind);
         self.get_or_make(h, key, kind, || SeriesKey::new(metric, tags.iter().copied(), kind).ok())
+    }
+
+    /// What a series' state is kept by ([`Keys::delta`]): its canonical key's hash, its kind
+    /// apart. `key` is room for the bytes.
+    pub(crate) fn identity(&self, metric: &str, tags: &[(&str, &str)], key: &mut Vec<u8>) -> u64 {
+        put_canonical_head(key, metric, tags.len());
+        for (k, v) in tags {
+            put_canonical_tag(key, k, v);
+        }
+        key_hash(&self.hash, key, Kind::Count)
     }
 
     /// Keys kept now.

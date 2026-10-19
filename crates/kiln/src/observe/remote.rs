@@ -90,7 +90,7 @@ pub async fn answer(o: &Observe, req: srv::Request) -> srv::Response {
             // 2.0's counts of what was written (1.0's senders pass them over).
             let r = srv::status(StatusCode::NO_CONTENT);
             let r = srv::with_header(r, header::HeaderName::from_static("x-prometheus-remote-write-samples-written"), &t.samples.to_string());
-            let r = srv::with_header(r, header::HeaderName::from_static("x-prometheus-remote-write-histograms-written"), "0");
+            let r = srv::with_header(r, header::HeaderName::from_static("x-prometheus-remote-write-histograms-written"), &t.histograms_taken.to_string());
             srv::with_header(r, header::HeaderName::from_static("x-prometheus-remote-write-exemplars-written"), "0")
         }
         Ok(Answer::Bad(why)) => srv::text(StatusCode::BAD_REQUEST, &why),

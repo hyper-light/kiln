@@ -34,7 +34,7 @@ impl Prometheus {
         let name = format!("kiln-prom-{}-{port}", std::process::id());
         let out = Command::new("docker")
             .args(["run", "-d", "--rm", "--name", &name, "--network", "host", "-v", &format!("{}:/etc/prometheus/prometheus.yml:ro", config.display()), IMAGE])
-            .args(["--config.file=/etc/prometheus/prometheus.yml", &format!("--web.listen-address=127.0.0.1:{port}"), "--storage.tsdb.path=/prometheus"])
+            .args(["--config.file=/etc/prometheus/prometheus.yml", &format!("--web.listen-address=127.0.0.1:{port}"), "--storage.tsdb.path=/prometheus", "--enable-feature=native-histograms"])
             .output()?;
         anyhow::ensure!(out.status.success(), "docker run: {}", String::from_utf8_lossy(&out.stderr));
         let p = Self { name, port };
@@ -107,6 +107,7 @@ remote_write:
       credentials: {ingest}
     queue_config: {{ batch_send_deadline: 1s }}
     metadata_config: {{ send_interval: 2s }}
+    send_native_histograms: true
     write_relabel_configs: [{{ target_label: rw, replacement: v1 }}]
   - url: http://127.0.0.1:{http}/api/v1/write
     protobuf_message: io.prometheus.write.v2.Request
@@ -164,6 +165,19 @@ remote_write:
     let p99 = by(&f, "p99:prometheus_http_request_duration_seconds{handler:/metrics,rw:v1}", "rw", window.0, window.1, 20_000)?;
     let v = p99.values().flatten().flatten().copied().next();
     anyhow::ensure!(v.is_some_and(|x| x > 0.0 && x <= 120.0), "p99 of the /metrics handler's time: {p99:?}");
+    // Its native histograms (Prometheus's own request durations, sent as they are scraped): kiln's
+    // distributions, their buckets what rose between scrapes, read as percentiles.
+    let start = Instant::now();
+    loop {
+        let native = by(&f, "sum:prometheus_http_request_duration_seconds.count{handler:/metrics,rw:v1} by {rw}.as_count()", "rw", window.0, now_ms(), 5_000)?;
+        let p50 = by(&f, "p50:prometheus_http_request_duration_seconds{handler:/metrics,rw:v1} by {rw}", "rw", window.0, now_ms(), 5_000)?;
+        let counted: f64 = native.values().flatten().flatten().sum();
+        if counted > 0.0 && p50.values().flatten().flatten().any(|v| *v > 0.0 && *v < 10.0) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the native histogram's count {native:?} and p50 {p50:?}\n{}", prom.logs());
+        std::thread::sleep(Duration::from_secs(1));
+    }
     // Its kinds as a scrape gives them: the counter a counter, the gauge a gauge.
     let summary = f.call("GET", "/api/observe/v1/metrics/summary/prometheus_http_requests_total", None)?;
     anyhow::ensure!(at(&summary, &["kinds"]).as_array().is_some_and(|k| k.iter().all(|x| at(x, &["kind"]) == "counter")), "{summary}");
