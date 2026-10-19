@@ -8,8 +8,9 @@ description: Hand parts of your work to other coding agents through kiln (any ha
 kiln runs coding agents (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, Antigravity) on
 every machine it has. You can start some yourself: each is your **child**, works on its own,
 and reports back. The tools are `agents_start`, `agents_wait`, `agents_result`, `agents_send`,
-`agents_list`, `agents_get`, `agents_children`, `agents_interrupt` and `agents_stop` (in code
-mode `kiln.agents.*`; in a shell `kiln spawn --on …`, `kiln agents wait`, `kiln agents result`).
+`agents_list`, `agents_get`, `agents_children`, `agents_interrupt`, `agents_stop`,
+`agents_change` and `agents_changes` (in code mode `kiln.agents.*`; in a shell
+`kiln spawn --on …`, `kiln agents wait`, `kiln agents result`).
 
 ## When to fan out
 
@@ -84,6 +85,20 @@ Today children work in real folders. When they're done: read what each changed
 (`agents_result` lists the files), run the tests yourself, and fix conflicts between them before
 you go on. Never assume a child's claim; check it. (Workspaces of their own, merged by kiln, are
 coming: see `workspace` in `agents_start`.)
+
+## Putting work up for review
+
+`agents_change` opens a change request from an agent's work: yours (`agent` is your own id) or
+a child's. It takes the files the agent changed, commits them on the folder's last commit without
+touching the folder's branch, index or working tree, and pushes them as the branch
+`agents/<what it's about>-<id>`: into kiln's review for a repository kiln hosts, as a pull request
+for one on GitHub, GitLab or Bitbucket. Give it a `title` and a `body` that say what changed and
+why. Calling it again pushes a new version.
+
+Then comments on it, requests for changes, failing checks (with the failure's excerpt) and the
+land queue taking it out come to the agent as messages. Answer them by changing the code and
+calling `agents_change` again; landing it is for people and the land queue. `agents_result` and
+`agents_changes` say where each change stands.
 
 ## Never answering for the person
 

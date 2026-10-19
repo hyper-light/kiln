@@ -30,7 +30,8 @@ pub async fn mint_reader(hub: &Hub, repo: &str, days: Option<i64>, note: &str) -
 }
 
 /// An agent token kiln makes for one of its own agent sessions (`agent:<label>`), acting for the
-/// user `user` (their id) with `grants` (`developer@repo:acme/app`; never more than the user may):
+/// user `user` (their id, or `owner` on a kiln nobody else signs in to) with `grants`
+/// (`developer@repo:acme/app`; never more than the user may):
 /// what such an agent pushes (`/git/`, `refs/for/…`), comments and reviews is the agent's, for its
 /// person. It lives `days` (default 30): its id and the token, shown once.
 pub async fn mint_agent(hub: &Hub, label: &str, user: &str, grants: &[&str], days: Option<i64>, note: &str) -> anyhow::Result<(String, String)> {
@@ -44,13 +45,14 @@ pub async fn mint_agent(hub: &Hub, label: &str, user: &str, grants: &[&str], day
     let scopes = json!({ "grants": parsed, "note": note }).to_string();
     let now = crate::util::now_unix();
     let expires = now + days.filter(|d| *d > 0).unwrap_or(30) * 86_400;
-    let (tid, principal, behalf) = (id.clone(), format!("agent:{label}"), format!("user:{}", user.trim_start_matches("user:")));
+    let behalf = if user == "owner" { "owner".to_owned() } else { format!("user:{}", user.trim_start_matches("user:")) };
+    let (tid, principal, whose) = (id.clone(), format!("agent:{label}"), behalf.clone());
     hub.store
         .call(move |c| {
             c.execute("INSERT INTO tokens (id, kind, principal, on_behalf_of, hash, scopes, created_at, expires_at) VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7)", params![tid, principal, behalf, hash, scopes, now, expires])?;
             Ok(())
         })
         .await?;
-    hub.store.audit("kiln".into(), "tokens.create".into(), format!("agent {id} agent:{label} for user:{user} ({})", grants.join(" "))).await;
+    hub.store.audit("kiln".into(), "tokens.create".into(), format!("agent {id} agent:{label} for {whose} ({})", grants.join(" "))).await;
     Ok((id, token))
 }

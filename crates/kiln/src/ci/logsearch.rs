@@ -323,17 +323,29 @@ pub async fn leg(hub: &Hub, id: &str, what: &str, q: &HashMap<String, String>) -
         }
         _ => {
             let lines: usize = q.get("lines").and_then(|l| l.parse().ok()).unwrap_or(40).clamp(5, 400);
-            // The step that failed (else the last that ran), around its first error line, else its end.
-            let failed = steps.iter().find(|s| matches!(s.2.as_str(), "failure" | "failed" | "timed_out")).or_else(|| steps.iter().rev().find(|s| s.2 != "skipped" && s.2 != "pending"));
-            let Some((idx, name, status, exit_code)) = failed.cloned() else { return Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "step": null, "lines": [] }))) };
-            let body = plain(&hub.logs.read(id, idx).await);
-            let body = body.trim_end();
-            let all: Vec<&str> = if body.is_empty() { Vec::new() } else { body.split('\n').collect() };
-            let (from, to) = excerpt(&all, lines);
-            let shown: Vec<Value> = all.get(from..to).unwrap_or_default().iter().enumerate().map(|(i, l)| json!({ "line": from + i + 1, "text": crate::util::truncate(l, 2000) })).collect();
-            Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "step": idx, "step_name": name, "status": status, "exit_code": exit_code, "total_lines": all.len(), "lines": shown })))
+            Ok(srv::json(StatusCode::OK, &failure_of(hub, id, &steps, lines).await))
         }
     }
+}
+
+/// What to read first when leg `id` failed (`lines` of it): `{ leg, step, step_name, status,
+/// exit_code, total_lines, lines: [{ line, text }] }`. For whoever follows a failure (an agent
+/// whose change it is, `crate::workspace::follow`).
+pub async fn failure(hub: &Hub, id: &str, lines: usize) -> Result<Value, Fail> {
+    let steps = steps_of(hub, id).await?;
+    Ok(failure_of(hub, id, &steps, lines.clamp(5, 400)).await)
+}
+
+async fn failure_of(hub: &Hub, id: &str, steps: &[(u32, String, String, Option<i64>)], lines: usize) -> Value {
+    // The step that failed (else the last that ran), around its first error line, else its end.
+    let failed = steps.iter().find(|s| matches!(s.2.as_str(), "failure" | "failed" | "timed_out")).or_else(|| steps.iter().rev().find(|s| s.2 != "skipped" && s.2 != "pending"));
+    let Some((idx, name, status, exit_code)) = failed.cloned() else { return json!({ "leg": id, "step": null, "lines": [] }) };
+    let body = plain(&hub.logs.read(id, idx).await);
+    let body = body.trim_end();
+    let all: Vec<&str> = if body.is_empty() { Vec::new() } else { body.split('\n').collect() };
+    let (from, to) = excerpt(&all, lines);
+    let shown: Vec<Value> = all.get(from..to).unwrap_or_default().iter().enumerate().map(|(i, l)| json!({ "line": from + i + 1, "text": crate::util::truncate(l, 2000) })).collect();
+    json!({ "leg": id, "step": idx, "step_name": name, "status": status, "exit_code": exit_code, "total_lines": all.len(), "lines": shown })
 }
 
 /// Words that mark a line as an error's.

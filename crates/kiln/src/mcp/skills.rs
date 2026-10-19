@@ -117,7 +117,7 @@ mod tests {
         assert!(get("kiln-deploy").is_some());
         // How to run agents: fanning out, briefs, waiting, low permissions, merging, never answering for the person.
         let agents = read("skill://kiln-agents/SKILL.md").and_then(|f| f.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
-        for part in ["## When to fan out", "## Briefing a child", "## Waiting and reading results", "## Keeping children's permissions low", "## Merging their work", "## Never answering for the person"] {
+        for part in ["## When to fan out", "## Briefing a child", "## Waiting and reading results", "## Keeping children's permissions low", "## Merging their work", "## Putting work up for review", "## Never answering for the person"] {
             assert!(agents.contains(part), "kiln-agents: {part}");
         }
         assert!(get("skill://kiln-diagnose/SKILL.md").is_some());

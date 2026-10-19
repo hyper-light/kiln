@@ -2101,6 +2101,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
                     }
+                    ServerMsg::Workspace { req, session, json } => {
+                        // About one of this machine's agents' folders: the session says which, so
+                        // a question can only be about a folder an agent here works in.
+                        let up = uplink.0.clone();
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| std::path::PathBuf::from(s.info().cwd));
+                        crate::rt::spawn(async move {
+                            let answer = match found {
+                                None => serde_json::json!({"error": "no such agent on this machine"}),
+                                Some(cwd) => crate::workspace::serve(&cwd, &json).await,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
+                        });
+                    }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
                         let up = uplink.0.clone();
