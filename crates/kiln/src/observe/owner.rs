@@ -27,6 +27,7 @@ use kiln_obs::group::{self, TICK};
 use kiln_obs::hash::Keyed;
 use kiln_obs::image::{FileKind, Image};
 use kiln_obs::logs::record::Record;
+use kiln_obs::logs::metrics::Touched;
 use kiln_obs::logs::tail::Feed;
 use kiln_obs::machine::{Machine, Shared};
 use kiln_obs::manifest::{Point, plain_name};
@@ -288,6 +289,7 @@ pub struct Observe {
     snaps: PathBuf,
     key: Option<String>,
     feed: Arc<Feed>,
+    touched: Arc<Touched>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -310,9 +312,12 @@ impl Observe {
         };
         let admission = Arc::new(Admission::default());
         let feed = Feed::new();
-        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone() };
+        // The server counts metrics from logs: its replica tells which windows records came in.
+        let touched = Arc::new(Touched::new());
+        let told = matches!(settings.role, Role::Server { .. }).then(|| touched.clone());
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, view, out_tx, tx, admission, feed);
+            let mut owner = Owner::new(settings, store, view, out_tx, tx, admission, feed, told);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
@@ -513,6 +518,12 @@ impl Observe {
         &self.feed
     }
 
+    /// The windows of records' time this node's replica applied records in (the server's: metrics
+    /// from logs count them).
+    pub fn touched(&self) -> &Arc<Touched> {
+        &self.touched
+    }
+
     pub fn view(&self) -> View {
         lock(&self.view).clone()
     }
@@ -605,6 +616,8 @@ struct Owner {
     input: Sender<Input>,
     admission: Arc<Admission>,
     feed: Arc<Feed>,
+    /// Told the times of records the replica applies (the server's).
+    touched: Option<Arc<Touched>>,
     start: Instant,
     batcher: Batcher,
     /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
@@ -658,7 +671,8 @@ fn now_ns(start: Instant) -> u64 {
 }
 
 impl Owner {
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<Arc<Touched>>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -678,6 +692,7 @@ impl Owner {
             input,
             admission,
             feed,
+            touched,
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
             scrapes: Vec::new(),
@@ -781,8 +796,16 @@ impl Owner {
                 // opened: entries applied before a restart are applied again.
                 if let Ok(last) = hyper_raft::Storage::last_index(rep.r.core().store()) {
                     self.feed.seen(last);
+                    if let Some(t) = &self.touched {
+                        t.seen(last);
+                    }
                 }
-                rep.r.machine().shared().write().unwrap_or_else(PoisonError::into_inner).set_feed(Some(self.feed.clone()));
+                {
+                    let shared = rep.r.machine().shared();
+                    let mut s = shared.write().unwrap_or_else(PoisonError::into_inner);
+                    s.set_feed(Some(self.feed.clone()));
+                    s.set_touched(self.touched.clone());
+                }
                 *lock(&self.store) = Some(rep.r.machine().shared());
                 self.opened_at = Some(Instant::now());
                 self.maintain = Some(Maintenance::start(rep.r.machine().shared(), self.dir.clone()));
@@ -1104,6 +1127,9 @@ impl Owner {
                         let _ = std::fs::remove_dir_all(self.dir.join("store"));
                         let _ = std::fs::remove_file(self.dir.join("obs.log"));
                         self.feed.reset();
+                        if let Some(t) = &self.touched {
+                            t.reset();
+                        }
                     }
                     if let Err(e) = save_json(&self.dir.join("member.json"), &me) {
                         self.error = Some(format!("{e:#}"));

@@ -787,6 +787,85 @@ const scenarios = {
     }
   },
 
+  /** A metric from logs tried on the records of the last fifteen minutes, made, counting the
+   * records that come after (as the API's query says), charted, and removed. */
+  async "a metric from logs is tried, made, counts what comes after, and is removed"() {
+    const service = `e2e-lm-${run}`;
+    const name = `e2e.lm.${run}`;
+    const post = (n, at) =>
+      api(
+        "POST",
+        "/api/observe/v1/logs",
+        Array.from({ length: n }, (_, i) => ({
+          message: `GET /pay ${i % 3 === 0 ? 502 : 500}`,
+          timestamp: at,
+          status: "error",
+          service,
+          hostname: "e2e",
+          attributes: { http: { status_code: i % 3 === 0 ? 502 : 500 } },
+        })),
+      );
+    expect((await post(9, Date.now() - 60_000)).status === 202, "posting records before");
+    try {
+      await page.goto(`${BASE}/observe/log-metrics`);
+      await page.getByRole("button", { name: "New metric", exact: true }).click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Name", { exact: true }), name);
+      await fillIn(d.getByLabel("Of the records", { exact: true }), `service:${service} status:error`);
+      await d.getByRole("button", { name: "Group by an attribute", exact: true }).click();
+      await fillIn(d.getByLabel("Attribute 1", { exact: true }), "@http.status_code");
+      await fillIn(d.getByLabel("As the tag", { exact: true }), "code");
+      // Tried on what is held: the nine records, by their codes.
+      await until(
+        "the records stored",
+        async () => (await api("POST", "/api/observe/v1/logs/search", { query: `service:${service}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 20 })).body?.records?.length === 9,
+      );
+      await d.getByRole("button", { name: "Try it", exact: true }).click();
+      await d.getByRole("status").getByText("Of the last fifteen minutes: 9 records, 2 groups.", { exact: true }).waitFor();
+      await d.getByRole("status").getByText("code:500", { exact: true }).waitFor();
+      await d.getByRole("button", { name: "Make it", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      const row = page.getByRole("row").filter({ hasText: name });
+      await row.waitFor();
+      // Counted from the next ten seconds on: records stamped after that are its.
+      const made = (await api("GET", `/api/observe/v1/log_metrics/${name}`)).body;
+      const from = Math.ceil((made.modified + 1) / 10_000) * 10_000;
+      await until("its first window", async () => Date.now() > from + 300, 15_000);
+      expect((await post(6, Date.now())).status === 202, "posting records after");
+      await until(
+        "the records after counted",
+        async () => {
+          const a = await api("POST", "/api/observe/v1/query", { query: `sum:${name}{*} by {code}.as_count()`, from, to: Date.now() + 60_000, step: 60_000 });
+          const total = (a.body?.series ?? []).reduce((t, s) => t + s.values.reduce((x, v) => x + (v ?? 0), 0), 0);
+          return total === 6;
+        },
+        60_000,
+      );
+      // The page's list, read again every ten seconds, says so: its latest window's records.
+      await until("its latest window on the server", async () => (await api("GET", `/api/observe/v1/log_metrics/${name}`)).body?.status?.records === 6, 30_000);
+      await row
+        .getByText(/^6 records, /)
+        .filter({ visible: true })
+        .first()
+        .waitFor({ timeout: 20_000 });
+      // What it computes stays: read-only once made.
+      await row.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+      expect((await d.getByLabel("Computes", { exact: true }).getAttribute("readonly")) !== null, "what it computes read-only");
+      await d.getByRole("button", { name: "Cancel", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      // Charted in the explorer in a click.
+      await row.getByRole("link", { name: `Chart ${name}`, exact: true }).click();
+      await page.waitForURL((u) => u.pathname === "/observe/metrics" && u.searchParams.get("q") === `sum:${name}{*} by {code}.as_count()`);
+      await page.goto(`${BASE}/observe/log-metrics`);
+      await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until("its row gone", async () => (await row.count()) === 0);
+      expect((await api("GET", `/api/observe/v1/log_metrics/${name}`)).status === 404, "removed on the server");
+    } finally {
+      await api("DELETE", `/api/observe/v1/log_metrics/${name}`);
+    }
+  },
+
   /** A ratio SLO made from the form over counts whose share failing is known: its standing as the
    * page and the API say it; its two burn-rate alerts added, then evaluated to the burn rate; its
    * deletion refused while they read it; its target changed; then deleted. */

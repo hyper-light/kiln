@@ -1030,8 +1030,20 @@ fn constant(ast: &Ast, id: usize) -> Option<f64> {
 }
 
 /// Whether `q` names a distribution (`crate::dist`): a metric of its own name holds nothing, its
-/// buckets' series (`<name>.dist`) are there.
+/// parts do: its buckets' series (`<name>.dist`), or, one kept without percentiles (a metric from
+/// logs may be), its `.count` and `.sum`.
 fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
+    let NameMatch::Exact(name) = &q.metric else { return None };
+    let has = |suffix: &str| {
+        let mut ids = Vec::new();
+        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{suffix}")), clauses: q.filters.clone() }, &mut ids);
+        !ids.is_empty()
+    };
+    (has(crate::dist::SUFFIX) || (has(".count") && has(".sum") && !has(""))).then_some(name.as_str())
+}
+
+/// Whether `q` names a distribution whose buckets are kept (`<name>.dist`).
+fn buckets_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
     let NameMatch::Exact(name) = &q.metric else { return None };
     let mut ids = Vec::new();
     store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
@@ -1273,7 +1285,7 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
         return Err(QueryError::EmptyRange);
     }
     if let Some(Node::Metric(q)) = ast.nodes.get(ast.root)
-        && distribution_of(store, q).is_some()
+        && buckets_of(store, q).is_some()
         && let NameMatch::Exact(name) = &q.metric
     {
         let grid = grid_for(&ast, req)?;
@@ -3129,6 +3141,34 @@ mod tests {
         assert_eq!(ask("max:lat{*}")[0].1, all.iter().copied().fold(f64::MIN, f64::max));
         // A metric of its own name is no distribution: its series are read as they are.
         assert!(ask("p99:lat.count{*}")[0].1 > 0.0);
+    }
+
+    /// A distribution kept without its buckets (a metric from logs without percentiles): its
+    /// average, count, sum, least and most are read from its parts; a percentile, nothing.
+    #[test]
+    fn a_distribution_without_buckets_answers_all_but_percentiles() {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        for (h, n, sum, min, max) in [("a", 4.0, 10.0, 1.0, 4.0), ("b", 1.0, 30.0, 30.0, 30.0)] {
+            for (metric, kind, v) in [("took.count", Kind::Count, n), ("took.sum", Kind::Count, sum), ("took.min", Kind::Gauge, min), ("took.max", Kind::Gauge, max)] {
+                let k = SeriesKey::new(metric, [("host", h)], kind).unwrap();
+                b.define(&k);
+                b.run(k.fp, [(30_000, v)]);
+            }
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| -> Vec<f64> {
+            let mut r = Request::new(q, 0, 60_000);
+            r.step = Some(60_000);
+            eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}")).series.into_iter().map(|x| x.values[0]).collect()
+        };
+        assert_eq!(ask("avg:took{*}"), vec![8.0]);
+        assert_eq!(ask("avg:took{*} by {host}"), vec![2.5, 30.0]);
+        assert_eq!(ask("count:took{*}"), vec![5.0]);
+        assert_eq!(ask("sum:took{*}"), vec![40.0]);
+        assert_eq!(ask("min:took{*}"), vec![1.0]);
+        assert_eq!(ask("max:took{*}"), vec![30.0]);
+        assert!(ask("p99:took{*}").is_empty());
     }
 
     /// A heatmap: a distribution's rows its buckets (made coarser until they fit), each bucket of

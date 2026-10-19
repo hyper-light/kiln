@@ -230,7 +230,8 @@ impl Facet {
         }
     }
 
-    fn of<'a>(&self, r: &RecordRef<'a>) -> Option<&'a str> {
+    /// A record's value of it.
+    pub fn of<'a>(&self, r: &RecordRef<'a>) -> Option<&'a str> {
         match self {
             Self::Service => Some(r.service),
             Self::Host => Some(r.host),
@@ -454,9 +455,6 @@ impl Grouping {
 }
 
 impl LogStore {
-    /// Every record in `[from, to]` (ns) that `search` matches, to `f`, across the head, sealed
-    /// blocks and files (blocks a search rules out are never read); the rows read and the blocks
-    /// ruled out.
     /// Every record in `[from, to]` (ns) of every head segment, sealed block and file, in no order,
     /// handed to `f`: one at a time, none kept.
     pub fn each_record(&self, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>)) -> Result<(), LogStoreError> {
@@ -467,6 +465,9 @@ impl LogStore {
         .map(|_| ())
     }
 
+    /// Every record in `[from, to]` (ns) that `search` matches, to `f`, across the head, sealed
+    /// blocks and files (blocks a search rules out are never read); the rows read and the blocks
+    /// ruled out.
     fn each_match<E: From<LogStoreError>>(&self, search: &Search, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<(u64, u64), E> {
         let (mut rows_scanned, mut blocks_pruned) = (0u64, 0u64);
         if to < from {

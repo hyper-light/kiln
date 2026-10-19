@@ -119,9 +119,14 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
         lead={k.lead}
         actions={
           kind === "logs" ? (
-            <Button variant="secondary" asChild>
-              <Link to="/observe/pipelines">Pipelines</Link>
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" asChild>
+                <Link to="/observe/pipelines">Pipelines</Link>
+              </Button>
+              <Button variant="secondary" asChild>
+                <Link to="/observe/log-metrics">Metrics from logs</Link>
+              </Button>
+            </div>
           ) : undefined
         }
       />

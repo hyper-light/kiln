@@ -539,6 +539,56 @@ fn schemas() -> Map<String, Value> {
             &["records"],
         ),
     );
+    // Metrics from logs (§8.3): Datadog's definition, kiln's shape or theirs.
+    let log_metric_fields = [
+        ("name", describe(string(), "the metric's name: a letter, then letters, digits, _ and . (kiln.*, system.* and datadog.* are kiln's)")),
+        (
+            "compute",
+            object(
+                &[
+                    ("aggregation_type", one_of(&["count", "distribution"])),
+                    ("path", describe(string(), "a distribution's attribute (@duration)")),
+                    ("include_percentiles", describe(boolean(), "a distribution's buckets kept, so any percentile is read")),
+                ],
+                &["aggregation_type"],
+            ),
+        ),
+        ("filter", object(&[("query", describe(string(), "a log search; empty: every record"))], &[])),
+        ("group_by", array(object(&[("path", describe(string(), "an attribute (@http.status_code), or service, host, source, status")), ("tag_name", describe(string(), "the tag it becomes (its path without the @)"))], &["path"]))),
+    ];
+    put("LogMetricIn", describe(object(&log_metric_fields, &["name", "compute"]), "kiln's shape; Datadog's (`{\"data\": {\"id\", \"type\": \"logs_metrics\", \"attributes\"}}`) is taken too"));
+    let mut kept: Vec<(&str, Value)> = log_metric_fields.to_vec();
+    kept.push(("created", integer()));
+    kept.push(("modified", describe(integer(), "windows from this (ms) on are counted as it is now")));
+    kept.push((
+        "status",
+        nullable(object(
+            &[("window", describe(integer(), "its latest window with records of it (ms)")), ("records", integer()), ("groups", integer()), ("overflowed", describe(integer(), "records counted in its overflow group (groups past 2000)"))],
+            &["window", "records", "groups", "overflowed"],
+        )),
+    ));
+    put("LogMetric", object(&kept, &["name", "compute", "filter", "group_by", "created", "modified"]));
+    put(
+        "LogMetricCounting",
+        object(
+            &[
+                ("settle_ms", describe(integer(), "how long after a window ends it is first counted, learned from how late records come")),
+                ("windows_counted", integer()),
+                ("windows_recounted", integer()),
+                ("windows_expired", describe(integer(), "windows records came for past the twenty minutes: those not counted")),
+                ("windows_waiting", integer()),
+                ("late_batches", integer()),
+                ("rows_scanned", integer()),
+                ("count_ms", integer()),
+                ("error", nullable(string())),
+            ],
+            &["settle_ms", "windows_counted", "windows_recounted", "windows_expired", "windows_waiting"],
+        ),
+    );
+    put(
+        "LogMetricTest",
+        object(&[("metric", schema("LogMetricIn")), ("from", describe(integer(), "ms; 15 minutes before to")), ("to", describe(integer(), "ms; now"))], &["metric"]),
+    );
     let common = [
         ("interval_s", describe(integer(), "seconds between pulls (300)")),
         ("lookback_s", describe(integer(), "seconds a pull reads back (three intervals)")),
@@ -739,7 +789,7 @@ fn schemas() -> Map<String, Value> {
                     ("service", string()),
                     ("hostname", string()),
                     ("source", describe(string(), "or `ddsource`")),
-                    ("attributes", map_of(any())),
+                    ("attributes", describe(map_of(any()), "nested objects' keys joined by dots, as Datadog's intake reads them (`{\"http\": {\"status_code\": 500}}` is `@http.status_code`)")),
                 ],
                 &["message"],
             )),
@@ -880,6 +930,33 @@ fn ops() -> Vec<Op<'static>> {
         op("post", "/distribution_points", "Writes a distribution's values (Datadog's v1 distribution points)", "observe.write", Some(body("DistributionIntake")), vec![accepted(object(&[("values", integer())], &["values"]))]),
         op("post", "/logs", "Writes log records (Datadog's log intake)", "observe.write", Some(body("LogIntake")), vec![accepted(object(&[("records", integer())], &["records"]))]),
         op("get", "/openapi.json", "This document", "observe.read", None, vec![("200", answer_of("OpenAPI 3.1", any()))]),
+        op(
+            "get",
+            "/log_metrics",
+            "Lists the metrics from logs, each what its latest window with records held, and how counting goes",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the metrics from logs", object(&[("log_metrics", array(schema("LogMetric"))), ("counting", schema("LogMetricCounting"))], &["log_metrics", "counting"])))],
+        ),
+        op(
+            "post",
+            "/log_metrics",
+            "Makes a metric from logs, counted from the next ten seconds on (names written by something else: 409)",
+            "observe.write",
+            Some(body("LogMetricIn")),
+            vec![("201", answer("made", Some("LogMetric"))), ("409", answer("its series have a writer already", Some("Error")))],
+        ),
+        Op { params: vec![name()], ..op("get", "/log_metrics/{name}", "A metric from logs", "observe.read", None, vec![ok("LogMetric")]) },
+        Op { params: vec![name()], ..op("put", "/log_metrics/{name}", "Changes a metric from logs: its filter, groups and percentiles (what it computes stays: 400)", "observe.write", Some(body("LogMetricIn")), vec![ok("LogMetric")]) },
+        Op { params: vec![name()], ..op("delete", "/log_metrics/{name}", "Removes a metric from logs (its series stay, to retention)", "observe.write", None, vec![no_content()]) },
+        op(
+            "post",
+            "/log_metric_test",
+            "What a metric from logs would count of the records held, window by window, its series named preview (preview.count, … a distribution's): nothing written",
+            "observe.read",
+            Some(body("LogMetricTest")),
+            vec![("200", answer_of("its series", object(&[("series", array(object(&[("metric", string()), ("tags", map_of(string())), ("points", array(any()))], &["metric", "tags", "points"]))), ("records", integer()), ("rows_scanned", integer())], &["series", "records"])))],
+        ),
         op("get", "/pipelines", "Lists the log pipelines in the order they apply: kiln's own, then yours", "observe.read", None, vec![("200", answer_of("the pipelines", object(&[("pipelines", array(schema("Pipeline")))], &["pipelines"])))]),
         op("post", "/pipelines", "Makes a log pipeline, last (checked: it compiles)", "observe.manage", Some(body("PipelineIn")), vec![("201", answer("made", Some("Pipeline")))]),
         Op { params: vec![id()], ..op("get", "/pipelines/{id}", "A log pipeline", "observe.read", None, vec![ok("Pipeline")]) },

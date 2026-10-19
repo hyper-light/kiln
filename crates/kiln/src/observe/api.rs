@@ -103,6 +103,87 @@ fn pipelines() -> Result<&'static std::sync::Arc<super::pipeline::kept::Pipeline
     PIPELINES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log pipelines are kept by the server"))
 }
 
+/// The server's metrics from logs, once it started.
+static LOG_METRICS: OnceLock<std::sync::Arc<super::logmetrics::LogMetrics>> = OnceLock::new();
+
+pub fn set_log_metrics(m: std::sync::Arc<super::logmetrics::LogMetrics>) {
+    let _ = LOG_METRICS.set(m);
+}
+
+fn log_metrics() -> Result<&'static std::sync::Arc<super::logmetrics::LogMetrics>, Fail> {
+    LOG_METRICS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "metrics from logs are counted by the server"))
+}
+
+/// A metric from logs as the API shows it: its definition, and what its latest window with records
+/// of it held.
+fn log_metric_json(ms: &super::logmetrics::LogMetrics, k: &super::logmetrics::Kept) -> Value {
+    let mut v = serde_json::to_value(k).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("status".into(), ms.status(&k.def.name).map_or(Value::Null, |s| serde_json::to_value(s).unwrap_or(Value::Null)));
+    }
+    v
+}
+
+/// What a definition would count of the records held, window by window: a test, nothing written.
+#[derive(Debug, Deserialize)]
+struct LogMetricTest {
+    metric: super::logmetrics::DefIn,
+    /// ms; the last 15 minutes when not given, an hour at the most.
+    #[serde(default)]
+    from: Option<i64>,
+    #[serde(default)]
+    to: Option<i64>,
+}
+
+async fn log_metric_test(t: LogMetricTest) -> Result<Response, Fail> {
+    use kiln_obs::logs::metrics::{WINDOW, window_of};
+    // Its series named `preview` (`preview.count`, … a distribution's): what it is called is not
+    // what it counts.
+    let def = super::logmetrics::LogMetricDef { name: "preview".into(), ..t.metric.def(None) };
+    let m = def.compile(0).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let to = t.to.unwrap_or_else(super::clock_ms);
+    let from = t.from.unwrap_or(to - 15 * 60_000);
+    if to < from || to - from > 3_600_000 {
+        return Err(fail(StatusCode::BAD_REQUEST, "from before to, an hour apart at the most"));
+    }
+    let store = shared()?;
+    let answer = crate::rt::blocking(move || -> Result<Value, String> {
+        let metrics = [m];
+        let mut series: std::collections::BTreeMap<Vec<u8>, Vec<(i64, f64)>> = std::collections::BTreeMap::new();
+        let (mut records, mut rows) = (0u64, 0u64);
+        let mut w = window_of(from.saturating_mul(1_000_000));
+        while w <= to.saturating_mul(1_000_000) {
+            // A hold of the store a window: writes go on between.
+            let counted = store.read().unwrap_or_else(PoisonError::into_inner).count_log_metrics(&metrics, w).map_err(|e| e.to_string())?;
+            if let Some(c) = counted {
+                rows += c.rows_scanned;
+                records += c.tallies.first().map_or(0, |t| t.records);
+                for (k, p) in c.series {
+                    series.entry(k.key.to_vec()).or_default().extend(p);
+                }
+            }
+            w += WINDOW;
+        }
+        let out: Vec<Value> = series
+            .iter()
+            .filter_map(|(k, p)| {
+                let key = kiln_obs::batch::parse_key(k).ok()?;
+                let tags: serde_json::Map<String, Value> = key.tags.iter().map(|(k, v)| ((*k).to_owned(), Value::from(*v))).collect();
+                Some(json!({ "metric": key.metric, "tags": tags, "points": p }))
+            })
+            .collect();
+        Ok(json!({ "series": out, "records": records, "rows_scanned": rows }))
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(srv::json(StatusCode::OK, &answer))
+}
+
+fn log_metric_fail((code, e): (u16, String)) -> Fail {
+    fail(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), e)
+}
+
 /// The pipelines now, applied: here from the next record, every runner told.
 fn apply_pipelines(p: &super::pipeline::kept::Pipelines) {
     let defs = p.defs();
@@ -614,6 +695,43 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             apply_pipelines(store);
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
+        (&Method::GET, ["log_metrics"]) => {
+            let ms = log_metrics()?;
+            let list: Vec<Value> = ms.list().iter().map(|k| log_metric_json(ms, k)).collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "log_metrics": list, "counting": ms.counting() })))
+        }
+        (&Method::POST, ["log_metrics"]) => {
+            let def = read_json::<super::logmetrics::DefIn>(req.into_body(), QUERY_BODY).await?.def(None);
+            let ms = log_metrics()?;
+            let kept = reading(move |s| {
+                // A metric's series have one writer: names written already are refused.
+                let written = |n: &str| {
+                    let mut ids = Vec::new();
+                    s.select(&kiln_obs::index::Selector::metric(n), &mut ids);
+                    !ids.is_empty()
+                };
+                ms.create(def, written).map_err(log_metric_fail)
+            })
+            .await?;
+            Ok(srv::json(StatusCode::CREATED, &log_metric_json(log_metrics()?, &kept)))
+        }
+        (&Method::GET, ["log_metrics", name]) => {
+            let ms = log_metrics()?;
+            let k = ms.get(name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric from logs"))?;
+            Ok(srv::json(StatusCode::OK, &log_metric_json(ms, &k)))
+        }
+        (&Method::PUT, ["log_metrics", name]) => {
+            let name = (*name).to_owned();
+            let def = read_json::<super::logmetrics::DefIn>(req.into_body(), QUERY_BODY).await?.def(Some(&name));
+            let ms = log_metrics()?;
+            let k = ms.put(&name, def).map_err(log_metric_fail)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric from logs"))?;
+            Ok(srv::json(StatusCode::OK, &log_metric_json(ms, &k)))
+        }
+        (&Method::DELETE, ["log_metrics", name]) => match log_metrics()?.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
+            true => Ok(srv::status(StatusCode::NO_CONTENT)),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such metric from logs")),
+        },
+        (&Method::POST, ["log_metric_test"]) => log_metric_test(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["pipeline_test"]) => {
             // What a pipeline (or every one, in order) makes of records given: nothing kept.
             let t: PipelineTest = read_json(req.into_body(), QUERY_BODY).await?;
@@ -1470,7 +1588,13 @@ fn ingest_logs(body: Vec<LogIn>) -> Result<Response, Fail> {
             host: l.hostname.unwrap_or_default(),
             source: l.source.unwrap_or_default(),
             message: l.message,
-            attrs: l.attributes.unwrap_or_default().into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect(),
+            // Nested objects' keys joined by dots, as Datadog's intake reads them
+            // (`{"http": {"status_code": 500}}` is `@http.status_code`).
+            attrs: l.attributes.map_or_else(Vec::new, |a| {
+                let mut out = Vec::with_capacity(a.len());
+                super::pipeline::grok::flatten(None, Value::Object(a), 0, &mut out);
+                out
+            }),
             trace_id: None,
             span_id: None,
         })

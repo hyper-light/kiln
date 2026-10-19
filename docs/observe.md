@@ -24,8 +24,9 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations), Windows' Event Log and macOS's unified log | in progress |
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
+| O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. Next: a dashboard query's p99 in a long run (2.2 s, against 0.7 s in its first ten minutes); merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
 
@@ -530,6 +531,7 @@ its schema (§13). Built:
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
 | `GET/POST pipelines`, `GET/PUT/DELETE pipelines/{id}`, `PUT pipeline_order`, `POST pipeline_test` | log pipelines (§8.2), in the order they apply, kiln's own first (read-only but for whether they are on: one is turned off, not removed); a pipeline made or changed is checked (it compiles) and applied from the next record on every machine; `pipeline_test` runs a pipeline given (or every one, in order) on records given and keeps nothing |
+| `GET/POST log_metrics`, `GET/PUT/DELETE log_metrics/{name}`, `POST log_metric_test` | metrics from logs (§8.3): Datadog's definitions, in kiln's shape or their API's envelope; each with what its latest window with records held, and how counting goes (the settle learned, windows counted again, windows too late); a name whose series another writes is refused (409); what a metric computes stays (400); `log_metric_test` counts a definition over the last fifteen minutes (an hour at the most) and writes nothing |
 | `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
@@ -731,6 +733,45 @@ group, which matches the same wherever the atomic one would not have to give any
 kiln carries pipelines for nginx's and Apache's access and error logs (Datadog's own rules, then the
 time, the HTTP status's category as its status, the URL and the user agent read), applied to records
 of `source:nginx` and `source:apache`: read-only, turned off or copied to be changed.
+
+### 8.3 Metrics from logs
+
+Datadog's "generate metrics from ingested logs" (`crate::observe::logmetrics`,
+`kiln_obs::logs::metrics`): a metric that counts the records a search matches, or takes an
+attribute's values as a distribution (its count, sum, least and most, and with percentiles its
+buckets, §4.4), grouped by facets that become its tags, a point each ten seconds of the records'
+time (Datadog's "datapoints for log-based metrics at 10-second intervals"). A definition is Datadog's
+(`compute`, `filter`, `group_by`), taken in their API's envelope too; the metric outlives the logs,
+at metrics' retention.
+
+**One writer, counting whole windows.** A window's points are a function of the records it holds:
+`count` reads them, every metric at once, in one pass over the blocks the window reaches. The
+server's replica holds every record, so the server alone counts (each series has one writer, the
+rule OpenTelemetry's data model states), and when records come for a window it has counted, it
+counts the window again, whole, and writes its points over the ones before (at a time the later
+write wins, §4.5; a window a rollup holds is read from its samples while a later write overlaps it,
+§4.7). So a record is never counted twice, and a restart loses none: the server counts every window
+of the last twenty minutes again as it starts. The replica notes, as it applies a batch, the windows
+its records fall in (`Touched`), taken under the same hold of the store as the count that follows,
+so every record noted is in what that count reads. Records that come more than twenty minutes after
+their window are not counted, as Datadog's ("aggregation only considers logs ingested with a
+timestamp within the past 20 minutes"); they are stored and searched as any.
+
+**When a window is counted.** Once its records have come: the latest any batch's newest record came
+over the last five minutes, a quarter more, 2 to 30 s (learned as records come, so a fleet whose
+records take longer waits longer, and in the steady state each window is counted once). A window
+counted and then given more waits half as long as it has been since it ended before it is counted
+again, so however records trickle in, one is counted some fifteen times at the most; counting takes
+a quarter of each second at the most, never-counted windows first.
+
+**Bounds.** A metric keeps 2,000 groups a window at the most, OpenTelemetry's default cardinality
+limit; the records of the groups past them are counted in one group tagged
+`otel.metric.overflow:true`, as the SDK's overflow is. A tag's value is cut at Datadog's 200
+characters; a record without a group's facet is `N/A`, as log analytics says. Names are Datadog's
+custom metrics' (`kiln.*`, `system.*` and `datadog.*` refused: kiln writes them), and a name whose
+series something else writes already is refused (409), as is one another metric from logs writes:
+a metric has one writer. What a metric computes, and of what, stays; its filter, groups and
+percentiles change, counted so from the next window on.
 
 ## 9. Monitors
 
@@ -1073,6 +1114,12 @@ time range and the search in the address (a page is a link).
   copied to be changed. A pipeline's page lists its processors in order, each edited as its type
   has it (a grok parser's rules tried on its samples as they are written), and tries a record on the
   pipeline as it is, saved or not, before it is kept.
+- **Metrics from logs** (a link from the logs explorer): each metric, what it computes of which
+  records, its tags, and its latest window with records (how many, in how many groups, those past
+  the limit); how long after a
+  window ends it is counted, and what came late. Made and edited in a form (what it computes stays
+  once made) that counts the definition over the last fifteen minutes, each group's total, before it
+  is kept; each charted in the metrics explorer in a click.
 - **Logs kiln collects** (Integrations' fourth part): each source's state over the machines that
   read it (reading, failing, no files), what it reads, its records and how far behind it is;
   added and edited in a form that tests the source on the server (the files it matches, how the
@@ -1984,6 +2031,30 @@ kept inside the pipeline's form saved the pipeline before the processor was in i
 submit still reaches the form React holds it in), and the source tried guessed once from the filter
 as it was when the page opened.
 
+**Metrics from logs** (`observe_logmetrics.rs`): a server and a runner; four metrics (one in
+Datadog's own envelope): errors by status code, a latency's distribution with percentiles by
+environment, a size's without, every record by service; a name of kiln's refused (400), a change of
+what one computes refused (400), and a name whose series the API wrote refused (409). Then 80
+records a second to the server's intake for 40 s, and lines to a file the runner reads beside them:
+each window's points as the records sent make them (counts, sums, the least and most exactly; p50
+and p99 within the 1.09% bound of the value of rank q(n - 1); a distribution without percentiles
+answering its average and no percentile), and each as log analytics counts the records stored, the
+runner's too; a value above what was sent fails at once (a record counted twice never comes
+right). Then 400 records late for two windows counted a minute before, and 50 records 25 minutes
+back; then the server stopped and started, 300 more records late for windows before it, and 15 s
+more. Every window holds what was sent through all of it, and the records 25 minutes back are
+stored and never counted. Passes (4.5 min): each of the 125 windows counted once on time (the
+settle learned at 2 s), exactly the two late windows counted again, and after the restart every
+window of the twenty minutes counted again from the store, alike. In a browser: a metric tried on
+the last fifteen minutes' records (their count and groups), made, the records after it counted (as
+the API's query says, and its row), charted in the explorer from its row, and removed; in Chromium
+and WebKit as a phone. What the runs found: a batch holding records old and new reached every
+window between them (102 of them counted again, each read whole), now each batch's own windows; one
+late batch held every window back five minutes (the settle was the most any batch took), now the
+99th percentile; the entries a server applies again as it opens looked minutes late (the settle 30
+s after a restart), now told apart as the live tail tells them; and the log intake kept a nested
+attribute as one JSON text where Datadog's reads `@http.status_code`, now flattened as theirs.
+
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a
 client asks it (queries, a heatmap, a calendar rollup, a query in the query string, a query that
@@ -2033,6 +2104,17 @@ still running. A digest now visits each record once and keeps none (the same sum
 two versions agree: a test against the digest of before), one at a time a replica, a request
 meanwhile answered by the next. It still holds the replica's writes while it reads (some seconds a
 billion samples): an operator's check, not a routine.
+
+The two hours again with that fix (2026-10-19, the same machine, a release build): 1,438,389,000
+points (199,776 a second) and 14,398,400 records, every one stored once; 45,000 points answered 503
+and sent again (the senders behind 17 times a second, of 200,000 points); the replicas agreed at
+index 49,913 (`dd3c9c946a742a6d`), their digests taken in the run's last check in seconds. The
+server's highest 281 MiB in the second third and 287 in the last (2% more, within the tenth), the
+runner's 140 and 132; where the server's lay, every ten minutes: its heap 1–7 MiB, the arenas
+185–214 MiB (moving both ways, the largest 52–59), the rest 39–41. A request p50 0.70 ms, p99 2.58
+ms; a dashboard query p50 16.5 ms, p99 2.16 s, against 8.5 ms and 693 ms over the run's first ten
+minutes (the ten-minute run's): what a query waits for in a long run (a cut's hold, a merge's
+blocks) is the next thing measured.
 
 What floods leave (§12.11) is a high-water mark, not a leak: after one, the server held some 300 MiB
 more than before, most of it in the C library's per-thread arenas (32 of them, from

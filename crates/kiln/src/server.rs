@@ -160,6 +160,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::api::set_global(obs);
         crate::observe::api::set_dashboards(std::sync::Arc::new(crate::observe::dashboards::Dashboards::open(&cfg.data("observe"))));
         crate::observe::api::set_slos(std::sync::Arc::new(crate::observe::slos::Slos::open(&cfg.data("observe"))));
+        let log_metrics = crate::observe::logmetrics::LogMetrics::open(&cfg.data("observe"));
+        crate::observe::api::set_log_metrics(log_metrics.clone());
+        // Its loop holds nothing that panics (the crate's lints): run, not supervised.
+        crate::rt::spawn(log_metrics.run(shutdown.clone()));
         child!("observe", h => crate::observe::hub::send_loop(h));
         match crate::http::client::Client::public() {
             Ok(http) => {

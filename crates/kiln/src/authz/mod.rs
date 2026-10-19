@@ -416,6 +416,8 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/pipelines", "observe.manage", At::Server),
     any("/api/observe/v1/pipelines/**", "observe.manage", At::Server),
     any("/api/observe/v1/pipeline_order", "observe.manage", At::Server),
+    // Metrics from logs write series, as monitors and dashboards are written; trying one reads.
+    r("POST", "/api/observe/v1/log_metric_test", "observe.read", At::Server),
     r("POST", "/api/observe/v1/compact", "observe.manage", At::Server),
     r("POST", "/api/observe/v1/verify", "observe.manage", At::Server),
     any("/api/observe/v1/**", "observe.write", At::Server),

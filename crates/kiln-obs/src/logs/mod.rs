@@ -3,6 +3,7 @@
 pub mod block;
 pub mod bloom;
 pub mod file;
+pub mod metrics;
 pub mod patterns;
 pub mod record;
 pub mod search;

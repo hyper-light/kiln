@@ -40,6 +40,7 @@ use crate::head::{Appended, CHUNK_SAMPLES, HeadSeries};
 use crate::image::{FileKind, Image, ImageFile};
 use crate::index::{Defined, Index, IndexError, Selector, SeriesInfo};
 use crate::logs::file::LogFile;
+use crate::logs::metrics::{BatchWindows, Touched};
 use crate::logs::search::Search;
 use crate::logs::store::{Found, HeldFile, LogStore, LogStoreError};
 use crate::logs::tail::Feed;
@@ -228,6 +229,8 @@ pub struct Store {
     /// new to them.
     feed: Option<Arc<Feed>>,
     publishing: bool,
+    /// Who is told the records' times applied (metrics from logs count those windows again).
+    touched: Option<Arc<Touched>>,
     /// Whether [`Store::read_rolled`] reads rollups (always, but to measure or check against them).
     read_rollups: bool,
 }
@@ -487,6 +490,7 @@ impl Store {
             pending_at: HashTable::new(),
             feed: None,
             publishing: false,
+            touched: None,
             read_rollups: true,
         }
     }
@@ -494,6 +498,12 @@ impl Store {
     /// Log records applied from here on are published to `feed` (live tail, [`crate::logs::tail`]).
     pub fn set_feed(&mut self, feed: Option<Arc<Feed>>) {
         self.feed = feed;
+    }
+
+    /// The times of log records applied from here on are told to `touched` (metrics from logs,
+    /// [`crate::logs::metrics`]).
+    pub fn set_touched(&mut self, touched: Option<Arc<Touched>>) {
+        self.touched = touched;
     }
 
     /// Opens the store in `dir` (made if missing): the state its manifest states, its files as it
@@ -767,9 +777,13 @@ impl Store {
                     if raw.len() != raw_len {
                         return Err(ApplyError::LogRows);
                     }
-                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon).map_err(|_| ApplyError::LogRows)?;
+                    let mut windows = self.touched.as_ref().map(|_| BatchWindows::default());
+                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon, windows.as_mut()).map_err(|_| ApplyError::LogRows)?;
                     done.counts.logs_ahead += ahead;
                     if rows > 0 {
+                        if let (Some(t), Some(w)) = (&self.touched, &windows) {
+                            t.note(w, self.applied);
+                        }
                         if self.publishing
                             && let Some(f) = self.feed.as_ref().filter(|f| f.following())
                         {
@@ -1155,10 +1169,14 @@ impl Store {
         for e in self.manifest.blocks.iter().chain(&self.manifest.logs) {
             remove_if_there(&dir.join(&e.file))?;
         }
-        let (epoch, feed) = (self.epoch + 1, self.feed.take());
+        let (epoch, feed, touched) = (self.epoch + 1, self.feed.take(), self.touched.take());
         *self = Self::open(&dir, self.hash)?;
         self.epoch = epoch;
         self.feed = feed;
+        if let Some(t) = &touched {
+            t.everything();
+        }
+        self.touched = touched;
         Ok(())
     }
 
@@ -1354,6 +1372,15 @@ impl Store {
     pub fn aggregate_logs_buckets(&self, search: &Search, from: i64, to: i64, step: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
         let buckets = crate::logs::store::Buckets::over(from, to, step)?;
         self.logs.aggregate_buckets(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, buckets, by, measure)
+    }
+
+    /// Every metric from logs' points for the window that begins at `window` (ns): none when the
+    /// logs' cutoff reaches into it (not all its records are held).
+    pub fn count_log_metrics(&self, metrics: &[crate::logs::metrics::LogMetric], window: i64) -> Result<Option<crate::logs::metrics::Counted>, StoreError> {
+        if window < self.logs_cutoff.saturating_mul(1_000_000) {
+            return Ok(None);
+        }
+        Ok(Some(crate::logs::metrics::count(&self.logs, metrics, window)?))
     }
 
     /// Each facet's most common values over the logs a search matches, in one pass
@@ -1563,7 +1590,9 @@ impl Heap {
 
 /// A batch's log rows without those later than `horizon` (ns): the rows as they are when none is
 /// (as nearly always), else written again without them; how many went.
-fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64) -> Result<(Vec<u8>, u32, u64), crate::logs::record::RowError> {
+/// A batch's rows within `horizon` (those past it dropped): the rows, how many, and how many were
+/// dropped; the windows of those kept told to `windows`, if given (metrics from logs).
+fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64, mut windows: Option<&mut BatchWindows>) -> Result<(Vec<u8>, u32, u64), crate::logs::record::RowError> {
     use crate::logs::record::{Rows, put_row_ref};
     let mut it = Rows::new(&raw, rows as usize);
     let mut any = false;
@@ -1571,6 +1600,9 @@ fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64) -> Result<(Vec<u8>, u32, u
         if r.ts > horizon {
             any = true;
             break;
+        }
+        if let Some(w) = windows.as_deref_mut() {
+            w.add(r.ts);
         }
     }
     if !any {
@@ -1583,6 +1615,9 @@ fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64) -> Result<(Vec<u8>, u32, u
         if r.ts > horizon {
             ahead += 1;
             continue;
+        }
+        if let Some(w) = windows.as_deref_mut() {
+            w.add(r.ts);
         }
         put_row_ref(&mut kept, &r, prev);
         prev = r.ts;

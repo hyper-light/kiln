@@ -10,6 +10,7 @@ pub mod github;
 pub mod host;
 pub mod hub;
 pub mod kiln;
+pub mod logmetrics;
 pub mod monitors;
 pub mod notify;
 pub mod openapi;

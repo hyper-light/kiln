@@ -462,6 +462,44 @@ export interface PipelineIn {
 /** A pipeline as the API shows it; kiln's own (`builtin`) read-only but for whether it is on. */
 export type Pipeline = PipelineIn & { id: string; builtin: boolean; created?: number; modified?: number };
 
+/** A metric from logs as it is sent (Datadog's definition): what it computes, of which records, grouped by what. */
+export interface LogMetricIn {
+  name: string;
+  compute: { aggregation_type: "count" | "distribution"; path?: string; include_percentiles?: boolean };
+  filter: { query: string };
+  group_by: { path: string; tag_name?: string }[];
+}
+
+/** What a metric's latest window with records of it held. */
+export interface LogMetricStatus {
+  window: number;
+  records: number;
+  groups: number;
+  overflowed: number;
+}
+
+export type LogMetric = LogMetricIn & { created: number; modified: number; status: LogMetricStatus | null };
+
+/** How the server's counting goes: when a window is first counted (learned), and what came late. */
+export interface LogMetricCounting {
+  settle_ms: number;
+  windows_counted: number;
+  windows_recounted: number;
+  windows_expired: number;
+  windows_waiting: number;
+  late_batches: number;
+  rows_scanned: number;
+  count_ms: number;
+  error: string | null;
+}
+
+/** What a definition counts of the records held, window by window. */
+export interface LogMetricTry {
+  series: { metric: string; tags: Record<string, string>; points: [number, number][] }[];
+  records: number;
+  rows_scanned: number;
+}
+
 /** A record to try pipelines on, and what one makes of it. */
 export interface PipelineSample {
   message: string;
@@ -642,6 +680,11 @@ export const observeApi = {
   orderPipelines: (ids: string[]) => request<void>("PUT", `${BASE}/pipeline_order`, { pipeline_ids: ids }),
   tryPipeline: (pipeline: PipelineIn | null, records: PipelineSample[]) =>
     request<{ records: PipelineResult[] }>("POST", `${BASE}/pipeline_test`, { ...(pipeline ? { pipeline } : {}), records }).then((r) => r.records),
+  logMetrics: (signal?: AbortSignal) => request<{ log_metrics: LogMetric[]; counting: LogMetricCounting }>("GET", `${BASE}/log_metrics`, undefined, { signal }),
+  createLogMetric: (m: LogMetricIn) => request<LogMetric>("POST", `${BASE}/log_metrics`, m),
+  updateLogMetric: (name: string, m: LogMetricIn) => request<LogMetric>("PUT", `${BASE}/log_metrics/${enc(name)}`, m),
+  deleteLogMetric: (name: string) => request<void>("DELETE", `${BASE}/log_metrics/${enc(name)}`),
+  tryLogMetric: (metric: LogMetricIn) => request<LogMetricTry>("POST", `${BASE}/log_metric_test`, { metric }),
   logSources: (signal?: AbortSignal) => request<{ log_sources: LogSource[] }>("GET", `${BASE}/log_sources`, undefined, { signal }).then((r) => r.log_sources),
   putLogSource: (name: string, s: LogSourceIn) => request<void>("PUT", `${BASE}/log_sources/${enc(name)}`, s),
   deleteLogSource: (name: string) => request<void>("DELETE", `${BASE}/log_sources/${enc(name)}`),

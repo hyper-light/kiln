@@ -21,6 +21,8 @@ import {
   type Slo,
   type LogSource,
   type Pipeline,
+  type LogMetric,
+  type LogMetricCounting,
 } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
@@ -426,6 +428,7 @@ export const cloudsRes: Res<Cloud[]> = { key: "observe/clouds", fetch: (s) => ob
 export const scrapesRes: Res<Scrape[]> = { key: "observe/scrapes", fetch: (s) => observeApi.scrapes(s), opts: { pollMs: 10_000 } };
 export const logSourcesRes: Res<LogSource[]> = { key: "observe/log_sources", fetch: (s) => observeApi.logSources(s), opts: { pollMs: 10_000 } };
 export const pipelinesRes: Res<Pipeline[]> = { key: "observe/pipelines", fetch: (s) => observeApi.pipelines(s) };
+export const logMetricsRes: Res<{ log_metrics: LogMetric[]; counting: LogMetricCounting }> = { key: "observe/log_metrics", fetch: (s) => observeApi.logMetrics(s), opts: { pollMs: 10_000 } };
 export const pipelineRes = (id: string): Res<Pipeline> => ({ key: `observe/pipeline/${id}`, fetch: (s) => observeApi.pipeline(id, s) });
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };
 export const dashboardRes = (id: string): Res<Dashboard> => ({ key: `observe/dashboard/${id}`, fetch: (s) => observeApi.dashboard(id, s) });

@@ -1455,6 +1455,24 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     for i in [&i1, &i2] {
         check("DELETE", &format!("{base}/pipelines/{i}"), &ppath, None, 204)?;
     }
+    // Metrics from logs: kiln's shape and Datadog's; a name of kiln's refused, as is a second
+    // writer of one's series; what one computes stays.
+    let lm = json!({ "name": "api.errors", "compute": { "aggregation_type": "count" }, "filter": { "query": "status:error" }, "group_by": [{ "path": "service" }] });
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(lm.clone()), 201)?;
+    let dd = json!({ "data": { "id": "api.latency", "type": "logs_metrics", "attributes": { "compute": { "aggregation_type": "distribution", "path": "@duration", "include_percentiles": true }, "filter": { "query": "service:web" } } } });
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(dd), 201)?;
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(json!({ "name": "kiln.mine", "compute": { "aggregation_type": "count" } })), 400)?;
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(json!({ "name": "api.latency.count", "compute": { "aggregation_type": "count" } })), 409)?;
+    let lpath = format!("{base}/log_metrics/{{name}}");
+    check("GET", &format!("{base}/log_metrics/api.errors"), &lpath, None, 200)?;
+    check("PUT", &format!("{base}/log_metrics/api.errors"), &lpath, Some(json!({ "name": "api.errors", "compute": { "aggregation_type": "count" }, "filter": { "query": "status:warn" } })), 200)?;
+    check("PUT", &format!("{base}/log_metrics/api.errors"), &lpath, Some(json!({ "name": "api.errors", "compute": { "aggregation_type": "distribution", "path": "@d" } })), 400)?;
+    check("GET", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), None, 200)?;
+    check("POST", &format!("{base}/log_metric_test"), &format!("{base}/log_metric_test"), Some(json!({ "metric": lm })), 200)?;
+    for n in ["api.errors", "api.latency"] {
+        check("DELETE", &format!("{base}/log_metrics/{n}"), &lpath, None, 204)?;
+    }
+    check("DELETE", &format!("{base}/log_metrics/api.errors"), &lpath, None, 404)?;
     check("PUT", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), Some(json!({ "kind": "aws", "regions": ["us-east-1"], "paused": true, "log_groups": ["/aws/lambda/*"] })), 204)?;
     check("GET", &format!("{base}/clouds"), &format!("{base}/clouds"), None, 200)?;
     check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 204)?;
