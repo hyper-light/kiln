@@ -253,6 +253,35 @@ export interface CloudStatus {
   records: number;
   records_deferred: number;
   records_total: number;
+  /** What is read as it comes: an Azure integration's event hubs, each one's. */
+  streams?: CloudStream[];
+}
+
+/** An event hub read as its events come (docs/observe.md §10.3). */
+export interface CloudStream {
+  hub: string;
+  state: "starting" | "reading" | "failing";
+  error?: string;
+  warnings?: string[];
+  partitions: number;
+  /** Events not yet read, every partition's. */
+  lag: number;
+  events: number;
+  records: number;
+  /** Metric records passed over (Azure Monitor's metrics are pulled). */
+  skipped: number;
+  last_ms?: number | null;
+}
+
+/** An Azure integration's event hubs. */
+export interface EventHubs {
+  /** Its name, or its host. */
+  namespace: string;
+  hubs: string[];
+  /** With Listen rights; "…" when kept; empty removes it (the integration's credentials then). */
+  connection_string?: string;
+  endpoint?: string;
+  tls?: boolean;
 }
 
 interface CloudCommon {
@@ -311,6 +340,9 @@ export type CloudIn = (
       workspaces?: string[];
       log_query?: string;
       logs_endpoint?: string;
+      /** Azure Monitor's metrics read (unless false: only logs). */
+      metrics?: boolean;
+      event_hubs?: EventHubs;
     }
 ) &
   CloudCommon;

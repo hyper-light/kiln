@@ -1676,8 +1676,18 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     }
     check("DELETE", &format!("{base}/log_metrics/api.errors"), &lpath, None, 404)?;
     check("PUT", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), Some(json!({ "kind": "aws", "regions": ["us-east-1"], "paused": true, "log_groups": ["/aws/lambda/*"] })), 204)?;
+    // An Azure integration's event hub, at an endpoint where nothing answers: its stream's status.
+    let hubs = json!({ "kind": "azure", "metrics": false, "event_hubs": { "namespace": "kiln-e2e", "hubs": ["insights-logs"], "connection_string": "Endpoint=sb://kiln-e2e.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=s", "endpoint": "127.0.0.1:9", "tls": false } });
+    check("PUT", &format!("{base}/clouds/hubs1"), &format!("{base}/clouds/{{name}}"), Some(hubs), 204)?;
+    let start = Instant::now();
+    while !f.call("GET", "/api/observe/v1/clouds", None)?.to_string().contains("\"streams\"") {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "no stream's status");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     check("GET", &format!("{base}/clouds"), &format!("{base}/clouds"), None, 200)?;
-    check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 204)?;
+    for name in ["aws1", "hubs1"] {
+        check("DELETE", &format!("{base}/clouds/{name}"), &format!("{base}/clouds/{{name}}"), None, 204)?;
+    }
     check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 404)?;
     Ok(())
 }

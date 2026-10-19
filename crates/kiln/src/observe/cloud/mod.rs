@@ -21,6 +21,7 @@
 
 pub mod aws;
 pub mod azure;
+pub mod eventhubs;
 pub mod gcp;
 pub mod push;
 pub mod sigv4;
@@ -158,7 +159,13 @@ impl Cloud {
         match self {
             Self::Aws(c) => vec![("secret_access_key", &mut c.secret_access_key), ("session_token", &mut c.session_token)],
             Self::Gcp(c) => vec![("service_account", &mut c.service_account)],
-            Self::Azure(c) => vec![("client_secret", &mut c.client_secret)],
+            Self::Azure(c) => {
+                let mut v = vec![("client_secret", &mut c.client_secret)];
+                if let Some(h) = c.event_hubs.as_mut() {
+                    v.push(("event_hubs.connection_string", &mut h.connection_string));
+                }
+                v
+            }
         }
     }
 
@@ -534,6 +541,31 @@ pub struct Status {
     pub records: u64,
     pub records_deferred: u64,
     pub records_total: u64,
+    /// What is read as it comes (an Azure integration's event hubs), each stream's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<Stream>,
+}
+
+/// A stream's reading (an event hub's), as the API shows it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Stream {
+    pub hub: String,
+    /// `starting`, `reading` or `failing`.
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    pub partitions: usize,
+    /// Events not yet read, every partition's together.
+    pub lag: i64,
+    /// Events read, log records written of them, and metric records passed over, since the server
+    /// started.
+    pub events: u64,
+    pub records: u64,
+    pub skipped: u64,
+    /// Unix ms of the last record written.
+    pub last_ms: Option<i64>,
 }
 
 // ----------------------------------------------------------------------------------------- logs
@@ -645,6 +677,8 @@ pub struct Clouds {
     http: Arc<Client>,
     all: Mutex<BTreeMap<String, Cloud>>,
     running: Mutex<HashMap<String, Running>>,
+    /// Each integration's streams' offsets, kept from one of its runs to the next.
+    kept: Mutex<HashMap<String, Arc<eventhubs::Kept>>>,
     stop: crate::rt::Shutdown,
 }
 
@@ -692,7 +726,7 @@ impl Clouds {
                 Err(e) => tracing::error!(path = %path.display(), error = %e, "observe's cloud integrations could not be read"),
             }
         }
-        let clouds = Arc::new(Self { path, master: master.to_owned(), http, all: Mutex::new(all), running: Mutex::new(HashMap::new()), stop });
+        let clouds = Arc::new(Self { path, master: master.to_owned(), http, all: Mutex::new(all), running: Mutex::new(HashMap::new()), kept: Mutex::new(HashMap::new()), stop });
         for (name, why) in broken {
             let status = Status { state: "failing", error: Some(why), ..Status::default() };
             lock(&clouds.running).insert(name, Running { stop: crate::rt::Shutdown::new(), now: Arc::new(crate::rt::Notify::new()), status: Arc::new(Mutex::new(status)) });
@@ -758,7 +792,19 @@ impl Clouds {
         if let Some(r) = lock(&self.running).remove(name) {
             r.stop.cancel();
         }
+        // Its streams' offsets go with it: one made again reads from its lookback.
+        match lock(&self.kept).remove(name) {
+            Some(k) => k.forget(),
+            None => {
+                let _ = std::fs::remove_file(self.offsets(name));
+            }
+        }
         Ok(had)
+    }
+
+    /// Where an integration's streams keep their offsets.
+    fn offsets(&self, name: &str) -> PathBuf {
+        self.path.with_file_name(format!("eventhubs-{name}.json"))
     }
 
     /// Pulls `name` now, not at its time.
@@ -817,6 +863,18 @@ impl Clouds {
             old.stop.cancel();
         }
         let (http, name, server) = (self.http.clone(), name.to_owned(), self.stop.clone());
+        // An Azure integration's event hubs: a stream each, beside its pulls.
+        if let Cloud::Azure(a) = &c
+            && let Some(hubs) = &a.event_hubs
+            && !a.common.paused
+        {
+            let kept = lock(&self.kept).entry(name.clone()).or_insert_with(|| eventhubs::Kept::open(self.offsets(&name))).clone();
+            for hub in &hubs.hubs {
+                let reader = eventhubs::Reader { name: name.clone(), azure: a.clone(), hub: hub.clone(), kept: kept.clone(), http: http.clone(), status: status.clone() };
+                let (stop, server) = (stop.clone(), server.clone());
+                crate::rt::spawn(async move { eventhubs::run(reader, stop, server).await });
+            }
+        }
         crate::rt::spawn(async move { pull_loop(http, name, c, stop, server, now, status).await });
     }
 }

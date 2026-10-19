@@ -95,7 +95,7 @@ function readsLogs(c: Cloud): boolean {
     case "gcp":
       return c.logs !== undefined;
     case "azure":
-      return (c.workspaces ?? []).length > 0;
+      return (c.workspaces ?? []).length > 0 || (c.event_hubs?.hubs ?? []).length > 0;
   }
 }
 
@@ -109,7 +109,9 @@ function reads(c: Cloud): string {
       return `${some(c.projects, "the credentials' project")} · ${some(c.services, "every service")}${readsLogs(c) ? ` · logs${c.logs ? ` where ${c.logs}` : ""}` : ""}`;
     case "azure": {
       const n = (c.workspaces ?? []).length;
-      return `${some(c.subscriptions, "every subscription")} · ${some(c.resource_types, "every type")}${n > 0 ? ` · logs of ${n} workspace${n === 1 ? "" : "s"}` : ""}`;
+      const hubs = (c.event_hubs?.hubs ?? []).length;
+      const metrics = c.metrics === false ? "no metrics" : `${some(c.subscriptions, "every subscription")} · ${some(c.resource_types, "every type")}`;
+      return `${metrics}${n > 0 ? ` · logs of ${n} workspace${n === 1 ? "" : "s"}` : ""}${hubs > 0 ? ` · ${hubs} event hub${hubs === 1 ? "" : "s"} of ${c.event_hubs?.namespace ?? ""}` : ""}`;
     }
   }
 }
@@ -121,7 +123,7 @@ function credentials(c: Cloud): string {
     case "gcp":
       return c.service_account ? "a service account's key" : "the server's own";
     case "azure":
-      return c.client_secret ? `the app ${c.client_id ?? ""}` : "the server's own";
+      return `${c.client_secret ? `the app ${c.client_id ?? ""}` : "the server's own"}${c.event_hubs?.connection_string ? " · hubs: a connection string" : ""}`;
   }
 }
 
@@ -148,22 +150,29 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void
           <tbody>
             {all.map((c) => {
               const s = c.status;
+              const streams = s.streams ?? [];
+              // A hub that fails is the integration failing, though its pulls do not.
+              const broken = streams.find((x) => x.state === "failing");
+              const state = s.state === "ok" && broken ? "failing" : s.state;
+              const error = s.error ?? (broken ? `${broken.hub}: ${broken.error ?? "failing"}` : undefined);
+              const behind = streams.reduce((n, x) => n + x.lag, 0);
+              const records = (s.records_total ?? 0) + streams.reduce((n, x) => n + x.records, 0);
               return (
                 <tr key={c.name}>
                   <td className="whitespace-nowrap">
                     <span className="status">
-                      <i className="dot" data-status={TONE[s.state]} aria-hidden="true" />
-                      <span className="status-text" data-status={TONE[s.state]}>
-                        {STATE[s.state]}
+                      <i className="dot" data-status={TONE[state]} aria-hidden="true" />
+                      <span className="status-text" data-status={TONE[state]}>
+                        {STATE[state]}
                       </span>
                     </span>
                   </td>
                   <td className="truncate-cell">
                     <div className="truncate text-[13px] text-[#e4e5e7]">{c.name}</div>
                     <div className="truncate text-[12px] text-[#8c8f98] md:hidden">{WORDS[c.kind] ?? c.kind}</div>
-                    {s.error ? (
-                      <div className="truncate text-[12px] text-[#e2c4c6]" title={s.error}>
-                        {s.error}
+                    {error ? (
+                      <div className="truncate text-[12px] text-[#e2c4c6]" title={error}>
+                        {error}
                       </div>
                     ) : (
                       s.warnings &&
@@ -186,8 +195,9 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void
                       <>
                         {relativeTime(s.last_pull / 1000)}
                         <div className="text-[12px] text-[#8c8f98]">
-                          {count(s.series)} series{s.over > 0 ? `, ${count(s.over)} past the limit` : ""}
-                          {readsLogs(c) ? `, ${count(s.records_total ?? 0)} log records` : ""}
+                          {c.kind === "azure" && c.metrics === false ? "" : `${count(s.series)} series${s.over > 0 ? `, ${count(s.over)} past the limit` : ""}`}
+                          {readsLogs(c) ? `${c.kind === "azure" && c.metrics === false ? "" : ", "}${count(records)} log records` : ""}
+                          {streams.length > 0 ? `, ${count(behind)} event${behind === 1 ? "" : "s"} behind` : ""}
                         </div>
                       </>
                     ) : (
@@ -275,6 +285,13 @@ interface Form {
   types: string;
   aggregations: string;
   workspaces: string;
+  /** "yes" or "no": Azure Monitor's metrics read. */
+  metrics: string;
+  hubsNamespace: string;
+  hubs: string;
+  /** The event hubs read with a connection string, or with the integration's credentials. */
+  hubsWith: "string" | "integration";
+  connection: string;
   /** AWS's filter pattern, Google's filter, Azure's query. */
   logFilter: string;
 }
@@ -304,6 +321,11 @@ function formOf(c: Cloud | null): Form {
     types: "",
     aggregations: "",
     workspaces: "",
+    metrics: "yes",
+    hubsNamespace: "",
+    hubs: "",
+    hubsWith: "string",
+    connection: "",
     logFilter: "",
   };
   if (!c) return f;
@@ -340,6 +362,10 @@ function formOf(c: Cloud | null): Form {
         types: (c.resource_types ?? []).join(", "),
         aggregations: (c.aggregations ?? []).join(", "),
         workspaces: (c.workspaces ?? []).join(", "),
+        metrics: c.metrics === false ? "no" : "yes",
+        hubsNamespace: c.event_hubs?.namespace ?? "",
+        hubs: (c.event_hubs?.hubs ?? []).join(", "),
+        hubsWith: c.event_hubs && !c.event_hubs.connection_string ? "integration" : "string",
         logFilter: c.log_query ?? "",
       };
   }
@@ -391,9 +417,22 @@ function bodyOf(f: Form, was: Cloud | null): CloudIn {
     }
     case "azure": {
       const prior = was?.kind === "azure" ? was : null;
+      const hubs = list(f.hubs);
       return {
         ...common,
         kind: "azure",
+        metrics: f.metrics === "no" ? false : undefined,
+        // A connection string left empty is the kept one; read with the integration's, removed.
+        event_hubs:
+          f.hubsNamespace.trim() && hubs.length > 0
+            ? {
+                namespace: f.hubsNamespace.trim(),
+                hubs,
+                connection_string: f.hubsWith === "string" ? f.connection.trim() || undefined : "",
+                endpoint: prior?.event_hubs?.endpoint,
+                tls: prior?.event_hubs?.tls,
+              }
+            : undefined,
         tenant_id: given ? f.tenant.trim() : undefined,
         client_id: f.client.trim() || undefined,
         client_secret: secret(f.key),
@@ -439,7 +478,14 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
       : f.kind === "gcp"
         ? gcpKey && (f.key.trim() !== "" || kept)
         : f.tenant.trim() !== "" && f.client.trim() !== "" && (f.key.trim() !== "" || kept));
-  const ok = validName && Number(f.interval) >= 10 && credsOk && (f.kind !== "aws" || list(f.stats).length > 0);
+  // Event hubs: a namespace and its hubs together, and a connection string unless one is kept or
+  // the integration's credentials read them.
+  const hubsKept = cloud?.kind === "azure" && !!cloud.event_hubs?.connection_string;
+  const hubsOk =
+    f.kind !== "azure" ||
+    (f.hubsNamespace.trim() === "" && list(f.hubs).length === 0) ||
+    (f.hubsNamespace.trim() !== "" && list(f.hubs).length > 0 && (f.hubsWith === "integration" || f.connection.trim() !== "" || hubsKept));
+  const ok = validName && Number(f.interval) >= 10 && credsOk && hubsOk && (f.kind !== "aws" || list(f.stats).length > 0);
   const save = async () => {
     setBusy(true);
     try {
@@ -623,24 +669,37 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
                 />
                 {given && <TextField label="Client secret" type="password" value={f.key} onChange={(e) => set({ key: e.target.value })} autoComplete="new-password" hint={kept ? KEPT : undefined} />}
               </div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField label="Subscriptions" value={f.subscriptions} onChange={(e) => set({ subscriptions: e.target.value })} hint="None: every one the credentials see." spellCheck={false} />
-                <TextField
-                  label="Resource types"
-                  value={f.types}
-                  onChange={(e) => set({ types: e.target.value })}
-                  placeholder="Microsoft.Compute/virtualMachines"
-                  hint="None: every type with metrics."
-                  spellCheck={false}
-                />
-              </div>
-              <TextField
-                label="Aggregations besides each metric's own"
-                value={f.aggregations}
-                onChange={(e) => set({ aggregations: e.target.value })}
-                placeholder="Maximum, Minimum"
-                spellCheck={false}
+              <SelectField
+                label="Metrics"
+                value={f.metrics}
+                onChange={(v) => set({ metrics: v })}
+                options={[
+                  { value: "yes", label: "Read" },
+                  { value: "no", label: "Not read: logs only" },
+                ]}
               />
+              {f.metrics === "yes" && (
+                <>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <TextField label="Subscriptions" value={f.subscriptions} onChange={(e) => set({ subscriptions: e.target.value })} hint="None: every one the credentials see." spellCheck={false} />
+                    <TextField
+                      label="Resource types"
+                      value={f.types}
+                      onChange={(e) => set({ types: e.target.value })}
+                      placeholder="Microsoft.Compute/virtualMachines"
+                      hint="None: every type with metrics."
+                      spellCheck={false}
+                    />
+                  </div>
+                  <TextField
+                    label="Aggregations besides each metric's own"
+                    value={f.aggregations}
+                    onChange={(e) => set({ aggregations: e.target.value })}
+                    placeholder="Maximum, Minimum"
+                    spellCheck={false}
+                  />
+                </>
+              )}
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <TextField
                   label="Log Analytics workspaces"
@@ -661,6 +720,52 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
                   />
                 )}
               </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField
+                  label="Event Hubs namespace"
+                  value={f.hubsNamespace}
+                  onChange={(e) => set({ hubsNamespace: e.target.value })}
+                  placeholder="kiln-logs"
+                  hint="Where diagnostic settings stream logs. None: no event hubs."
+                  spellCheck={false}
+                />
+                {f.hubsNamespace.trim() !== "" && (
+                  <TextField
+                    label="Event hubs"
+                    value={f.hubs}
+                    onChange={(e) => set({ hubs: e.target.value })}
+                    placeholder="insights-activity-logs"
+                    hint="Each read as its events come, over its Kafka endpoint (Standard tier and above)."
+                    spellCheck={false}
+                  />
+                )}
+              </div>
+              {f.hubsNamespace.trim() !== "" && (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <SelectField
+                    label="Event hubs read with"
+                    value={f.hubsWith}
+                    onChange={(v) => set({ hubsWith: v as Form["hubsWith"] })}
+                    options={[
+                      { value: "string", label: "A connection string" },
+                      { value: "integration", label: "These credentials (Entra ID)" },
+                    ]}
+                  />
+                  {f.hubsWith === "string" ? (
+                    <TextField
+                      label="Connection string"
+                      type="password"
+                      value={f.connection}
+                      onChange={(e) => set({ connection: e.target.value })}
+                      autoComplete="new-password"
+                      placeholder="Endpoint=sb://…"
+                      hint={hubsKept ? KEPT : "With Listen rights."}
+                    />
+                  ) : (
+                    <p className="field-hint sm:pt-7">They need the Azure Event Hubs Data Receiver role.</p>
+                  )}
+                </div>
+              )}
             </>
           )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

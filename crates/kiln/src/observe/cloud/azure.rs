@@ -102,8 +102,22 @@ pub struct Config {
     /// (`https://api.loganalytics.us`), a test's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs_endpoint: Option<String>,
+    /// Event hubs whose events are read as they come (`super::eventhubs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_hubs: Option<super::eventhubs::Config>,
+    /// Azure Monitor's metrics read; off, only logs (the workspaces', the event hubs').
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub metrics: bool,
     #[serde(flatten)]
     pub common: Common,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Default for Config {
@@ -121,6 +135,8 @@ impl Default for Config {
             workspaces: Vec::new(),
             log_query: None,
             logs_endpoint: None,
+            event_hubs: None,
+            metrics: true,
             common: Common::default(),
         }
     }
@@ -130,6 +146,9 @@ impl Config {
     pub fn check(&self) -> Result<(), String> {
         if self.client_secret.is_some() && (self.tenant_id.is_none() || self.client_id.is_none()) {
             return Err("a client secret goes with its tenant_id and client_id".into());
+        }
+        if let Some(h) = &self.event_hubs {
+            h.check()?;
         }
         if let Some(s) = self.subscriptions.iter().find(|s| s.is_empty() || s.len() > 64 || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
             return Err(format!("subscription {s:?}: a subscription's id"));
@@ -259,7 +278,7 @@ fn path(id: &str) -> String {
 }
 
 /// An id's segment after `name` (`resourceGroups`), in any case.
-fn segment<'a>(id: &'a str, name: &str) -> Option<&'a str> {
+pub(super) fn segment<'a>(id: &'a str, name: &str) -> Option<&'a str> {
     let mut it = id.split('/');
     while let Some(s) = it.next() {
         if s.eq_ignore_ascii_case(name) {
@@ -282,8 +301,8 @@ fn error(a: &Answer) -> String {
     format!("{} {}", a.status, said.unwrap_or_else(|| a.text()))
 }
 
-struct Token {
-    value: String,
+pub(super) struct Token {
+    pub(super) value: String,
     until: i64,
 }
 
@@ -302,7 +321,7 @@ fn token_of(a: &Answer, what: &str, now: i64) -> anyhow::Result<Token> {
 }
 
 /// A token for `audience` (Resource Manager's root, or Log Analytics').
-async fn token(api: &Api<'_>, cfg: &Config, audience: &str, now: i64) -> anyhow::Result<Token> {
+pub(super) async fn token(api: &Api<'_>, cfg: &Config, audience: &str, now: i64) -> anyhow::Result<Token> {
     let scope = format!("{audience}/.default");
     let resource = format!("{audience}/");
     let entra = |tenant: &str| format!("{}/{}/oauth2/v2.0/token", cfg.login(), encode(tenant));
@@ -546,6 +565,13 @@ impl Puller {
     }
 
     pub async fn pull(&mut self, api: &Api<'_>, now: i64) -> anyhow::Result<Pulled> {
+        if !self.cfg.metrics {
+            let mut out = Pulled::default();
+            if !self.cfg.workspaces.is_empty() {
+                out.logs = self.read_logs(api, now.saturating_sub(self.cfg.common.lookback_ms()), now, &mut out.warnings).await;
+            }
+            return Ok(out);
+        }
         let token = self.bearer(api, now).await?;
         let mut warnings = Vec::new();
         if self.discovered.is_none_or(|t| t.elapsed() >= DISCOVER_EVERY) {

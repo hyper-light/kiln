@@ -682,6 +682,23 @@ fn schemas() -> Map<String, Value> {
         ("workspaces", describe(array(string()), "Log Analytics workspaces' ids")),
         ("log_query", describe(string(), "a table, or KQL; every table unless said")),
         ("logs_endpoint", string()),
+        ("metrics", describe(boolean(), "Azure Monitor's metrics read (true unless said); off, only logs")),
+        (
+            "event_hubs",
+            describe(
+                object(
+                    &[
+                        ("namespace", describe(string(), "its name, or its host")),
+                        ("hubs", array(string())),
+                        ("connection_string", describe(string(), "with Listen rights; sealed at rest, shown \"…\"; none, the integration's credentials (Entra ID)")),
+                        ("endpoint", describe(string(), "host:port of a Kafka endpoint instead of the namespace's")),
+                        ("tls", describe(boolean(), "true unless said; off only with an endpoint of its own")),
+                    ],
+                    &["namespace", "hubs"],
+                ),
+                "event hubs read as their events come, over Event Hubs' Kafka endpoint",
+            ),
+        ),
     ]);
     put("CloudIn", json!({ "oneOf": [object(&aws, &["kind"]), object(&gcp, &["kind"]), object(&azure, &["kind"])] }));
     put(
@@ -705,6 +722,24 @@ fn schemas() -> Map<String, Value> {
                 ("records", integer()),
                 ("records_deferred", integer()),
                 ("records_total", integer()),
+                (
+                    "streams",
+                    array(object(
+                        &[
+                            ("hub", string()),
+                            ("state", one_of(&["starting", "reading", "failing"])),
+                            ("error", string()),
+                            ("warnings", array(string())),
+                            ("partitions", integer()),
+                            ("lag", describe(integer(), "events not yet read, every partition's")),
+                            ("events", integer()),
+                            ("records", integer()),
+                            ("skipped", describe(integer(), "metric records passed over")),
+                            ("last_ms", nullable(integer())),
+                        ],
+                        &["hub", "state", "partitions", "lag", "events", "records", "skipped"],
+                    )),
+                ),
             ],
             &["state", "series", "points", "pulls", "failures", "records", "records_total"],
         ),

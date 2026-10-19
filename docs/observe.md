@@ -26,7 +26,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Event Hubs for Azure's | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1142,6 +1142,56 @@ not taken again (points need it not: the store keeps one value a time). kiln cou
 (`kiln.cloud.push.points`, `.records`, `.again`, `.refused`, `.skipped`, by `via`), added up and
 written every 15 s: a count a push at its own time would keep one of two pushes at one millisecond.
 
+### 10.3 Event Hubs, over Kafka's protocol
+
+`crate::observe::cloud::eventhubs`: what Azure Monitor's diagnostic settings stream to an event hub
+(resources' logs, the activity log, Entra ID's logs), read as it comes by the Azure integration that
+names the hubs (`event_hubs`: the namespace, its hubs, and a connection string with Listen rights,
+sealed and never shown, else the integration's own credentials), over Event Hubs' Kafka endpoint
+(the Standard tier and above), on the server. `metrics: false` makes an Azure integration one of
+logs alone (its workspaces', its hubs'): no metrics pulled, no credentials needed for them.
+
+- **Kafka's protocol, a consumer's part** (`crate::observe::kafka`; the Kafka protocol guide): an
+  `ApiVersions` (v0) first, so a broker that does not answer what kiln asks is said so; SASL
+  (`SaslHandshake` v1, `SaslAuthenticate` v0) with PLAIN (RFC 4616: Event Hubs' `$ConnectionString`
+  user and the connection string) or OAUTHBEARER (RFC 7628: an Entra ID token for the namespace);
+  `Metadata` v1, the partitions and their leaders, a connection to each; `ListOffsets` v1, an offset
+  by time; `Fetch` v4, uncommitted records too (Kafka's consumers' default), 500 ms of waiting, 16 MiB
+  a fetch and 1 MiB a partition (Kafka's consumers' own). These versions are what Kafka 4 still
+  answers (KIP-896 dropped older ones) and Event Hubs (Kafka 1.0 on) too. Record batches of magic 2
+  (Kafka 0.11 on, and Kafka 4's only one), each one's CRC-32C checked, gzip'd or not (Event Hubs'
+  only compression); snappy, lz4 and zstd said, not read; transactions' control batches passed over,
+  their offsets counted; a batch cut short at an answer's end fetched again from its offset. Every
+  length a broker sends is checked against what is there: a malformed answer is an error, never a
+  panic nor an allocation it asks for; records are read in place, a batch's unpacked into one buffer
+  kept for the next.
+- **Offsets kiln keeps**, no consumer group: each partition read from where kiln last read it, else
+  from the integration's lookback ago (the first event since, by `ListOffsets`' time), else from its
+  end. An offset moves only once what came before it is written (its write applied, as a collected
+  log's place moves, §8.1), and is written down each second (`eventhubs-<integration>.json`, beside
+  the integrations); a connection that fails first gives what it offered two seconds to be written,
+  writes the offsets down, and connects again (1 s, doubling to a minute): a stop repeats nothing,
+  nor does a broker gone and back; a kill repeats the last second at most. One stream reads a hub at
+  a time: a change of settings waits for the stream before it to write its offsets down. An offset
+  that retention passed is read from the earliest still there, and how many events were lost is
+  said. Deleted, an integration's offsets go with it.
+- **Records**: an event's body is `{"records": [...]}` (else one record, else text, a record of its
+  own); each record is a log record as Datadog's Azure forwarder makes one: `source`
+  `azure.<provider>` (`Microsoft.Web` `azure.web`, Entra ID's `azure.aadiam`), tags
+  `subscription_id`, `resource_group` and `tenant` from its `resourceId`; `service` the resource's
+  name, as the Log Analytics pull has it (§10.1); its time `time`; its level `level` (`Informational`,
+  `Warning`, `Error`, `Critical`), else a failed `resultType` an error, else its message's; its
+  message `properties.message`, `message`, `resultDescription` or `operationName`, else the record;
+  its other values attributes (`category`, `operationName`, `properties.*`; 32 at the most), with
+  `azure.resource_id`, `azure.event_hub` and the integration's tags. Metric records (a diagnostic
+  setting's `AllMetrics`) are counted and not read: Azure Monitor's metrics are pulled, named by
+  their primary aggregation, which a stream does not say.
+- **What it says**: each hub's stream in its integration's status (`streams`: `reading`, or
+  `failing` and why; its partitions; its lag, the events not yet read; events, records and metric
+  records passed over), shown on the integrations page; kiln's own `kiln.cloud.stream.records` and
+  `kiln.cloud.stream.lag` (by `integration` and `hub`, every 15 s); an event as a stream starts
+  failing and as it recovers (`source:kiln.event @event.type:cloud.stream`).
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -1217,9 +1267,12 @@ time range and the search in the address (a page is a link).
   newest one's last lines read, the rules applied) before it is kept.
 - **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
   each one's mention to copy. The clouds kiln reads: each one's state, what it reads (its logs too:
-  log groups, a filter, workspaces), its credentials and its last pull (series, and the log records
-  it took); added and edited in a form that tests a pull (series, points, log records and the newest
-  of them) before it is kept, a filter's or query's field there once there are logs to filter. And
+  log groups, a filter, workspaces, an Azure namespace's event hubs), its credentials and its last
+  pull (series, and the log records it took; how many events its hubs are behind); added and edited
+  in a form that tests a pull (series, points, log records and the newest of them) before it is
+  kept, a filter's or query's field there once there are logs to filter, Azure's metrics read or
+  not, its event hubs read with a connection string (kept unshown) or the integration's credentials.
+  A hub's stream failing is the integration failing, its error beneath its name. And
   the Prometheus endpoints it scrapes: each
   target's state over the machines that read it (up, down, starting) and its error, its endpoint,
   who reads it and how often, its last scrape; added and edited in a form that tests the endpoint
@@ -2020,7 +2073,11 @@ reads, and one of them refused deletion from its page while the composite reads 
 posted as Datadog's distribution points drawn on a dashboard as a heatmap and as bars, both
 p50 and p99 marked, a cell tapped saying its range and count; a scrape target tested, added, seen
 up and removed; a signed webhook
-added, tested (the receiver checks the signature) and removed. Each makes its own records and checks through the API,
+added, tested (the receiver checks the signature) and removed; an Azure integration's event hubs
+(nothing answering at their endpoint): its row failing with the hub's error and what it reads, the
+form showing metrics not read, its namespace and hubs and the connection string kept, a hub added
+(the connection string, endpoint and TLS kept), the connection string given up for the
+integration's credentials, removed (2026-10-19: passes in Chromium and WebKit as a phone). Each makes its own records and checks through the API,
 not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
@@ -2125,6 +2182,23 @@ token. Their figures are functions of the minute, so what is stored is checked m
   once (seven); a Pub/Sub push of a Cloud Logging entry sent twice, taken once; a wrong token
   refused; kiln's counts of what was taken and sent again.
 2026-10-18: all pass (243 s; the pushes 99 s).
+
+**Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
+KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and
+its connection string, a hub of three partitions; events sent with Kafka's console producer, each
+a diagnostic setting's two App Service logs and a metric record. Thirty sent before the
+integration (within its lookback): its 60 records stored once each, named as Datadog's forwarder
+names them (the six errors by their level; `subscription_id`, `resource_group`, the hub, the
+integration's tags), the 30 metric records counted, the connection string never shown; 30 more
+gzip'd: 120; the server stopped and started again, 10 more: 140 exactly; killed while idle and
+started again, 10 more gzip'd: 160 exactly, its lag 0; the broker restarted while read, 20 more:
+200 exactly, the stream failing and recovering, each an event; a wrong connection string said in
+the broker's words (`SASL_AUTHENTICATION_FAILED`); the integration deleted, its offsets file gone.
+Every count is waited for and then held three seconds more: one record twice would show. Kafka's
+4.1 broker answers every version kiln asks (it dropped those before Kafka 2.1). The first runs
+found two faults since fixed: a fetch with no records was refused (a partition's least size read as
+34 bytes, not 30), and a stream that failed read again what it had offered (its offsets now outlive
+its connection). 2026-10-19: passes (128 s; the records come within 2.5 s of being sent).
 
 **SLOs** (`observe_live.rs`): requests counted a minute for three hours ending at a five-minute
 edge, a thousandth failing but in the last 70 minutes, when half do, and a latency high then; a

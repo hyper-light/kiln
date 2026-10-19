@@ -10,6 +10,7 @@ pub mod downtimes;
 pub mod github;
 pub mod host;
 pub mod hub;
+pub mod kafka;
 pub mod kiln;
 pub mod logmetrics;
 pub mod monitors;

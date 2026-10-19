@@ -628,6 +628,63 @@ const scenarios = {
     }
   },
 
+  /** An Azure integration's event hubs: its stream's failing shown in its row (nothing answers at
+   * its endpoint), its hubs and kept connection string in the form, a hub added, the connection
+   * string given up for the integration's credentials, and removed. */
+  async "an Azure integration's event hubs are shown, kept and changed"() {
+    const name = `e2e-hubs-${run}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    const cloud = async () => (await api("GET", "/api/observe/v1/clouds")).body.clouds.find((c) => c.name === name);
+    try {
+      const made = await api("PUT", `/api/observe/v1/clouds/${name}`, {
+        kind: "azure",
+        metrics: false,
+        event_hubs: {
+          namespace: "kiln-e2e",
+          hubs: ["insights-logs"],
+          connection_string: `Endpoint=sb://kiln-e2e.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=${run}`,
+          endpoint: "127.0.0.1:9",
+          tls: false,
+        },
+      });
+      expect(made.status === 204, `the cloud made, got ${made.status}`);
+      await page.goto(`${BASE}/observe/integrations`);
+      const row = rowOf(name);
+      await until("its hub's failing shown", async () => /Failing/.test((await row.textContent()) ?? "") && /insights-logs:/.test((await row.textContent()) ?? ""), 30_000);
+      if (!phone) await until("what it reads", async () => /no metrics · 1 event hub of kiln-e2e/.test((await row.textContent()) ?? ""));
+      await row.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+      const edit = page.getByRole("dialog");
+      expect((await edit.getByLabel("Metrics", { exact: true }).inputValue()) === "no", "metrics not read");
+      expect((await edit.getByLabel("Subscriptions").count()) === 0, "no subscriptions' field without metrics");
+      expect((await edit.getByLabel("Event Hubs namespace").inputValue()) === "kiln-e2e", "its namespace");
+      await edit.getByText("Kept. Type a new one to replace it.").waitFor();
+      await fillIn(edit.getByLabel("Event hubs", { exact: true }), "insights-logs, insights-activity-logs");
+      await edit.getByRole("button", { name: "Save", exact: true }).click();
+      const after = await until("saved", async () => {
+        const c = await cloud();
+        return c?.event_hubs?.hubs?.length === 2 ? c : undefined;
+      });
+      expect(
+        after.event_hubs.connection_string === "…" && after.event_hubs.endpoint === "127.0.0.1:9" && after.event_hubs.tls === false && after.metrics === false,
+        `its connection string, endpoint and TLS kept: ${JSON.stringify(after)}`,
+      );
+      await row.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+      const again = page.getByRole("dialog");
+      await again.getByLabel("Event hubs read with").selectOption("integration");
+      await again.getByText("They need the Azure Event Hubs Data Receiver role.").waitFor();
+      await again.getByRole("button", { name: "Save", exact: true }).click();
+      await until("its connection string given up", async () => {
+        const c = await cloud();
+        return c?.event_hubs && c.event_hubs.connection_string === undefined;
+      });
+      await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until(`${name} gone`, async () => !(await cloud()));
+    } finally {
+      await api("DELETE", `/api/observe/v1/clouds/${name}`);
+    }
+  },
+
   /** A log source added from the form: tried on the server (its file matched, its last lines read
    * as records, a token masked), kept, read (its records found by a search, once each, masked), and
    * removed. */
