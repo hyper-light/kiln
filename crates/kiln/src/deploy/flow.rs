@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 
 use super::argocd;
 use super::host::{Author, Change, CommitError};
-use super::kilncd::{self, Landed};
+use super::kilncd;
+use super::provider::{Landed, Undelivered};
 use super::model::{App, Artifact, Concurrency, Environment, KILN_HOST, KILNCD, Kind, Origin, Registration, Release, ReleaseFile, State};
 use super::{Deploy, repo, store};
 
@@ -72,6 +73,26 @@ fn argo_of(env: &Environment) -> Option<&str> {
     env.provider.strip_prefix("argocd/")
 }
 
+/// The provider's name, as messages say it.
+fn provider_name(env: &Environment) -> &'static str {
+    if argo_of(env).is_some() { "Argo CD" } else { "KilnCD" }
+}
+
+/// A commit, as messages show it.
+fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// Sets `key` on a release's provider view, which becomes an object if it wasn't one.
+fn note(view: &mut Value, key: &str, v: Value) {
+    if !view.is_object() {
+        *view = json!({});
+    }
+    if let Some(m) = view.as_object_mut() {
+        m.insert(key.to_owned(), v);
+    }
+}
+
 pub async fn put_environment(d: &Deploy, actor: &str, e: Environment) -> Result<Environment, Fail> {
     dns_label("environment", &e.name)?;
     match argo_of(&e) {
@@ -94,8 +115,8 @@ pub async fn put_environment(d: &Deploy, actor: &str, e: Environment) -> Result<
     if e.release_repo.root.split('/').any(|s| s == "..") {
         return Err(bad("the release repository's root can't climb out of it"));
     }
-    if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs {
-        return Err(bad("watch: timeout_secs at least 30, settle_secs at most timeout_secs"));
+    if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
+        return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
     let (hosted, rr) = (d.hosted.clone(), e.release_repo.clone());
     crate::rt::blocking(move || hosted.ensure(&rr.repo, &rr.branch)).await.and_then(|r| r).map_err(|e| bad(format!("{e:#}")))?;
@@ -387,6 +408,13 @@ pub async fn release(d: &Deploy, actor: &str, ask: Ask) -> Result<Release, Fail>
     } else if let Some(enabled) = ask.enabled {
         r.kind = if enabled { Kind::Enable } else { Kind::Disable };
     }
+    // The version is where the package comes from (docs/deploy-api.md §9, step 1).
+    if matches!(r.kind, Kind::Deploy | Kind::Rollback) {
+        let file = repo::release_json(&a, &env.name, &r, None, true);
+        if let Some(why) = super::check::missing_version(&d.hub, &a.package, &file).await {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
+        }
+    }
     if let Some(other) = store::in_flight(&d.hub.store, &a.name, &env.name).await.map_err(internal)? {
         match env.concurrency {
             Concurrency::Reject => return Err(conflict(format!("release {} is in flight for {} in {}: wait for it, or cancel it", other.id, a.name, env.name))),
@@ -404,23 +432,32 @@ pub async fn release(d: &Deploy, actor: &str, ask: Ask) -> Result<Release, Fail>
     Ok(r)
 }
 
-/// Stops a release that is waiting, or being delivered. A delivering one is already in git: the
-/// environment runs what git says until a rollback says otherwise.
+/// Stops a release that is waiting, or being delivered. A delivering one is in git already: the
+/// worker reverts its commit, and hands the provider what ran before (docs/deploy-api.md §9).
 pub async fn cancel(d: &Deploy, actor: &str, id: i64) -> Result<Release, Fail> {
     let mut r = store::release(&d.hub.store, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
     let was = r.state;
-    r.message = Some(match was {
-        State::Waiting => format!("cancelled by {actor}"),
-        State::Delivering => format!("cancelled by {actor}; release {id}'s commit is in git, so the environment still moves to it: roll back to undo it"),
+    match was {
+        State::Waiting | State::Delivering => {}
         State::Committing => return Err(conflict(format!("release {id} is being committed right now: cancel it in a moment, or roll back"))),
         s => return Err(conflict(format!("release {id} is {}: nothing to cancel", s.as_str()))),
-    });
+    }
+    let now = crate::util::now_unix();
+    r.message = Some(format!("cancelled by {actor}"));
     r.state = State::Cancelled;
-    r.ended_at = Some(crate::util::now_unix());
+    r.ended_at = Some(now);
+    let undo = was == State::Delivering;
+    if undo {
+        note(&mut r.provider, "undo", json!(true));
+    }
     if !store::update_release(&d.hub.store, &r, was).await.map_err(internal)? {
         return Err(conflict(format!("release {id} moved meanwhile: look again")));
     }
-    store::done(&d.hub.store, id).await.map_err(internal)?;
+    if undo {
+        store::schedule(&d.hub.store, id, now).await.map_err(internal)?;
+    } else {
+        store::done(&d.hub.store, id).await.map_err(internal)?;
+    }
     d.wake.notify();
     audit(d, actor, "deploy.cancel", format!("release {id}")).await;
     emit_release(d, &r);
@@ -495,10 +532,11 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 emit_release(d, &r);
-                if let Err(e) = deliver(d, &r).await {
-                    r.message = Some(e);
-                    store::update_release(st, &r, State::Delivering).await?;
+                match deliver(d, &r).await {
+                    Ok(()) => note(&mut r.provider, "delivered_at", json!(now)),
+                    Err(e) => r.message = Some(e.to_string()),
                 }
+                store::update_release(st, &r, State::Delivering).await?;
                 store::schedule(st, id, now + 2).await?;
             }
             Err(e) if now - r.created_at > timeout => finish(d, r, State::Failed, Some(format!("not committed: {e}"))).await?,
@@ -512,7 +550,16 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             let Some(commit) = r.commit.clone() else { return finish(d, r, State::Failed, Some("delivering, but no commit was recorded".into())).await };
             let committed_at = r.committed_at.unwrap_or(r.created_at);
             let settle = env.as_ref().map_or(30, |e| i64::try_from(e.watch.settle_secs).unwrap_or(30));
-            match follow(d, &r, &commit).await {
+            let delivered = r.provider.get("delivered_at").and_then(Value::as_i64);
+            // When the provider first held the release: kept from one look to the next.
+            let looked = follow(d, &r, &commit).await.map(|(landed, mut view)| {
+                let held = !matches!(landed, Landed::Refused(_));
+                if let Some(at) = delivered.or(held.then_some(now)) {
+                    note(&mut view, "delivered_at", json!(at));
+                }
+                (landed, view)
+            });
+            match looked {
                 Ok((Landed::Yes, mut view)) => {
                     let since = r.provider.get("landed_at").and_then(Value::as_i64).unwrap_or(now);
                     if now - since >= settle {
@@ -532,6 +579,20 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     r.provider = view;
                     finish(d, r, State::Failed, Some(why)).await?;
                 }
+                Ok((Landed::Refused(why), mut view)) => {
+                    let since = r.provider.get("refused_at").and_then(Value::as_i64).unwrap_or(now);
+                    let grace = env.as_ref().map_or(60, |e| i64::try_from(e.watch.refused_secs).unwrap_or(60));
+                    let name = env.as_ref().map_or("the provider", provider_name);
+                    note(&mut view, "refused_at", json!(since));
+                    r.provider = view;
+                    if now - since >= grace {
+                        let undone = give_back(d, &r, &format!("{name} refused it: {why}")).await;
+                        return finish(d, r, State::Failed, Some(format!("{name} refused it: {why}; {undone}"))).await;
+                    }
+                    r.message = Some(format!("{name} refuses it: {why} (it fails in {}s unless that clears)", grace - (now - since)));
+                    store::update_release(st, &r, State::Delivering).await?;
+                    store::schedule(st, id, now + 5).await?;
+                }
                 Ok((Landed::No, view)) if now - committed_at > timeout => {
                     r.provider = view;
                     finish(d, r, State::Failed, Some(format!("it didn't land within {}s (watch.timeout_secs)", timeout))).await?;
@@ -542,6 +603,11 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + 3).await?;
                 }
+                // The provider never held it: nothing changed there, and git goes back too.
+                Err(e) if now - committed_at > timeout && delivered.is_none() => {
+                    let undone = give_back(d, &r, &format!("it never reached the provider: {e}")).await;
+                    finish(d, r, State::Failed, Some(format!("it never reached the provider within {timeout}s: {e}; {undone}"))).await?;
+                }
                 Err(e) if now - committed_at > timeout => finish(d, r, State::Failed, Some(e)).await?,
                 Err(e) => {
                     r.message = Some(e);
@@ -549,6 +615,15 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     store::schedule(st, id, now + 5).await?;
                 }
             }
+        }
+        State::Cancelled if r.provider.get("undo").and_then(Value::as_bool) == Some(true) => {
+            let undone = undo(d, &r, &format!("{} (release {} was delivering)", r.message.as_deref().unwrap_or("cancelled"), r.id)).await;
+            note(&mut r.provider, "undo", json!(false));
+            r.message = Some(format!("{}; {undone}", r.message.as_deref().unwrap_or("cancelled")));
+            if store::update_release(st, &r, State::Cancelled).await? {
+                emit_release(d, &r);
+            }
+            store::done(st, id).await?;
         }
         _ => store::done(st, id).await?,
     }
@@ -612,7 +687,7 @@ async fn file_at(d: &Deploy, env: &Environment, commit: &str, path: String) -> R
 }
 
 /// Hands a release's commit to the environment's provider.
-async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
+async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
     let commit = r.commit.clone().ok_or("no commit to deliver")?;
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
@@ -627,7 +702,7 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
         let argo = argocd::Argo::of(&d.hub, name).await?;
         let app_name = argocd::application_name(&a, &env.name);
         if !file.enabled {
-            return argo.delete_application(&app_name, r.keep).await;
+            return Ok(argo.delete_application(&app_name, r.keep).await?);
         }
         if file.version.is_none() {
             return Ok(());
@@ -638,7 +713,7 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
             argo.ensure_oci_repo(oci.trim_end_matches('/')).await?;
         }
         let values = file_at(d, &env, &commit, repo::values_file(&env.release_repo, &a, &env.name)).await?;
-        let spec = argocd::application(&argo.namespace, &a, &env, &reg, &file, values.as_deref(), &commit)?;
+        let spec = argocd::application(&argo.namespace, &a, &env, &reg, &file, values.as_deref(), &commit).map_err(Undelivered::Refused)?;
         argo.put_application(&spec).await?;
         // Compared again at once, rather than at Argo CD's next look (3 minutes by default).
         argo.application(&app_name, Some("hard")).await?;
@@ -648,14 +723,14 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), String> {
     let actor = format!("deploy for {}", r.requested_by);
     let id = kilncd::app_id(&a, &env.name);
     if !file.enabled {
-        return kilncd::remove(&d.hub, &cd, &actor, &id, r.keep).await;
+        return Ok(kilncd::remove(&d.hub, &cd, &actor, &id, r.keep).await?);
     }
     if file.version.is_none() {
         // Registered and enabled, but never given a version: nothing runs yet.
         return Ok(());
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(|e| format!("{e:#}"))?;
-    let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url)?;
+    let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url).map_err(Undelivered::Refused)?;
     kilncd::deliver(&d.hub, &cd, &actor, &def).await
 }
 
@@ -670,6 +745,10 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         let app_name = argocd::application_name(&a, &env.name);
         let current = argo.application(&app_name, None).await?;
         if !file.enabled {
+            // Still there and not on its way out: the delete didn't happen, and is asked for again.
+            if current.as_ref().is_some_and(|c| c.pointer("/metadata/deletionTimestamp").is_none()) {
+                deliver(d, r).await.map_err(|e| e.to_string())?;
+            }
             return Ok((if current.is_some() { Landed::No } else { Landed::Yes }, json!({ "application": app_name, "removed": true })));
         }
         let Some(version) = file.version.clone() else {
@@ -679,8 +758,11 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         // written again.
         let stamped = current.as_ref().and_then(|c| c.pointer("/metadata/annotations/kiln.dev~1release").and_then(Value::as_str).map(str::to_owned));
         if stamped.as_deref() != Some(r.id.to_string().as_str()) {
-            deliver(d, r).await?;
-            return Ok((Landed::No, json!({ "application": app_name, "message": "written again" })));
+            return match deliver(d, r).await {
+                Ok(()) => Ok((Landed::No, json!({ "application": app_name, "message": "written again" }))),
+                Err(Undelivered::Refused(why)) => Ok((Landed::Refused(why), json!({ "application": app_name }))),
+                Err(Undelivered::Unreachable(e)) => Err(e),
+            };
         }
         let current = current.unwrap_or(Value::Null);
         return Ok(argocd::landed(&current, r.id, &version));
@@ -689,13 +771,21 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     let id = kilncd::app_id(&a, &env.name);
     let present = cd.apps.read().get(&id).map(|e| e.def.sources.iter().any(|s| s.as_ref.as_deref() == Some("release") && s.revision == commit));
     if !file.enabled {
+        // KilnCD lets go of an app as it deletes it: one still there wasn't deleted, and is again.
+        if cd.apps.read().contains_key(&id) {
+            deliver(d, r).await.map_err(|e| e.to_string())?;
+        }
         return Ok((if cd.apps.read().contains_key(&id) { Landed::No } else { Landed::Yes }, json!({ "app": id, "removed": true })));
     }
     if file.version.is_none() {
         return Ok((Landed::Yes, json!({ "app": id, "message": "registered and enabled; no version deployed yet" })));
     }
     if present != Some(true) {
-        deliver(d, r).await?;
+        match deliver(d, r).await {
+            Ok(()) => {}
+            Err(Undelivered::Refused(why)) => return Ok((Landed::Refused(why), json!({ "app": id }))),
+            Err(Undelivered::Unreachable(e)) => return Err(e),
+        }
     }
     let since_ms = u64::try_from(r.committed_at.unwrap_or(r.created_at)).unwrap_or(0).saturating_mul(1000);
     Ok(kilncd::landed(&cd, &id, commit, since_ms))
@@ -744,6 +834,90 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
     Ok(())
 }
 
+/// The trailer of a commit that reverts a release's: the release.
+const REVERT_TRAILER: &str = "Kiln-Reverts";
+
+/// What a release that couldn't land leaves in git: kiln's own commit is undone; a commit kiln
+/// didn't make is someone's, and stays.
+async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
+    if r.origin == Origin::Git {
+        return "it is a commit kiln didn't make, so git keeps it".to_owned();
+    }
+    undo(d, r, why).await
+}
+
+/// Puts git and the provider back after a release that won't land (refused, or cancelled while
+/// delivering): its commit is reverted, and the provider handed what git says then. Nothing is
+/// deleted on the way: a registration git says is disabled keeps its objects. What was done, as
+/// the release's message says it.
+async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
+    let (reverted, head) = match revert(d, r, why).await {
+        Ok(back) => back,
+        Err(e) => return format!("its commit couldn't be reverted ({e}): roll back to undo it"),
+    };
+    let said = match &reverted {
+        Some(sha) => format!("its commit is reverted in {}", short(sha)),
+        None => "nothing of its commit was left to revert".to_owned(),
+    };
+    let Some(head) = head else { return said };
+    let back = Release { commit: Some(head.clone()), keep: true, ..r.clone() };
+    if let Err(e) = deliver(d, &back).await {
+        return format!("{said}, but handing the provider what git says failed: {e}");
+    }
+    let (a, env) = (store::app(&d.hub.store, &r.app).await.ok().flatten(), store::environment(&d.hub.store, &r.environment).await.ok().flatten());
+    let file = match (&a, &env) {
+        (Some(a), Some(env)) => release_file_at(d, a, env, &head).await.ok(),
+        _ => None,
+    };
+    match file {
+        Some(f) if f.enabled && f.version.is_some() => format!("{said}; release {} runs on", f.release),
+        Some(_) => format!("{said}; nothing runs"),
+        None => said,
+    }
+}
+
+/// Reverts a release's commit: each file it changed goes back to what it was before, unless
+/// someone changed it since. The revert's commit (`None`: nothing to revert), and the head after.
+async fn revert(d: &Deploy, r: &Release, why: &str) -> Result<(Option<String>, Option<String>), String> {
+    let Some(commit) = r.commit.clone() else { return Ok((None, None)) };
+    let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    let rr = env.release_repo.clone();
+    let (hosted, at, key) = (d.hosted.clone(), rr.clone(), r.id.to_string());
+    // Reverted already, before a restart.
+    let found = crate::rt::blocking(move || hosted.find_trailer(&at.repo, &at.branch, REVERT_TRAILER, &key)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    if found.is_some() {
+        return Ok((found.clone(), found));
+    }
+    let paths = [repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name)];
+    let (hosted, at) = (d.hosted.clone(), rr.clone());
+    let (head, changes) = crate::rt::blocking(move || -> anyhow::Result<(Option<String>, Vec<Change>)> {
+        let Some(head) = hosted.head(&at.repo, &at.branch)? else { return Ok((None, Vec::new())) };
+        let mut changes = Vec::new();
+        for path in paths {
+            let ours = hosted.read(&at.repo, &commit, &path)?;
+            // Someone changed it since: theirs stands.
+            if hosted.read(&at.repo, &head, &path)? != ours {
+                continue;
+            }
+            let before = hosted.read(&at.repo, &format!("{commit}^"), &path)?;
+            if before != ours {
+                changes.push(Change { path, content: before });
+            }
+        }
+        Ok((Some(head), changes))
+    })
+    .await
+    .and_then(|x| x)
+    .map_err(|e| format!("{e:#}"))?;
+    if changes.is_empty() {
+        return Ok((None, head));
+    }
+    let message = format!("revert release {} of {} in {}\n\n{}\n\n{REVERT_TRAILER}: {}\n{}: kiln\n", r.id, a.name, env.name, crate::util::truncate(why.trim(), 600), r.id, repo::REQUESTED_BY_TRAILER);
+    let sha = commit_files(d, &env, changes, message, "kiln").await?;
+    Ok((Some(sha.clone()), Some(sha)))
+}
+
 /// Commits on release repositories that kiln didn't make become releases (origin `git`), so the
 /// records never disagree with git (docs/deploy-api.md §6).
 async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
@@ -769,7 +943,7 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
             continue;
         }
         let regs = store::registrations(st, None, Some(&env.name)).await?;
-        for c in commits.iter().filter(|c| c.trailer(repo::RELEASE_TRAILER).is_none() && c.trailer(REGISTRATION_TRAILER).is_none()) {
+        for c in commits.iter().filter(|c| c.trailer(repo::RELEASE_TRAILER).is_none() && c.trailer(REGISTRATION_TRAILER).is_none() && c.trailer(REVERT_TRAILER).is_none()) {
             for reg in &regs {
                 let Some(a) = store::app(st, &reg.app).await? else { continue };
                 let dir = format!("{}/", repo::registration_dir(&rr, &a, &env.name));

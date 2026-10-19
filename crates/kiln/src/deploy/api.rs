@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk};
 use super::model::{App, Environment, State};
-use super::{Deploy, kilncd, store};
+use super::{Deploy, argocd, kilncd, store};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 
@@ -135,14 +135,32 @@ async fn app_view(d: &Deploy, name: &str) -> Result<Response, Fail> {
     ok(&json!({ "app": a, "environments": envs }))
 }
 
-/// A registration: what runs, what's in flight, the latest releases, and what KilnCD says now.
+/// A registration: what runs, what's in flight, the latest releases, and what its provider says now.
 async fn registration_view(d: &Deploy, app: &str, env: &str) -> Result<Response, Fail> {
     let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
     let reg = store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     let recent = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, limit: 20 }).await.map_err(internal)?;
     let in_flight = recent.iter().find(|r| r.state.in_flight()).cloned();
     let running = recent.iter().find(|r| Some(r.id) == reg.running).cloned();
-    let id = kilncd::app_id(&a, env);
-    let provider = crate::cd::get().and_then(|cd| cd.statuses.read().get(&id).map(crate::cd::summary_json)).unwrap_or(Value::Null);
-    ok(&json!({ "registration": reg, "running": running, "in_flight": in_flight, "releases": recent, "provider": { "kind": "kilncd", "app": id, "status": provider } }))
+    let provider = match environment.provider.strip_prefix("argocd/") {
+        Some(name) => {
+            let application = argocd::application_name(&a, env);
+            let status = match argocd::Argo::of(&d.hub, name).await {
+                Ok(argo) => match argo.application(&application, None).await {
+                    Ok(Some(app)) => argocd::status(&app),
+                    Ok(None) => Value::Null,
+                    Err(e) => json!({ "error": e }),
+                },
+                Err(e) => json!({ "error": e }),
+            };
+            json!({ "kind": "argocd", "integration": name, "app": application, "status": status })
+        }
+        None => {
+            let id = kilncd::app_id(&a, env);
+            let status = crate::cd::get().and_then(|cd| cd.statuses.read().get(&id).map(crate::cd::summary_json)).unwrap_or(Value::Null);
+            json!({ "kind": "kilncd", "app": id, "status": status })
+        }
+    };
+    ok(&json!({ "registration": reg, "running": running, "in_flight": in_flight, "releases": recent, "provider": provider }))
 }

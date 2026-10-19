@@ -190,7 +190,7 @@ production:
     checks: [no-snapshots, artifact-signed, { vulnerabilities: { max: high } }, owners-set]
     via: commit                       # or pull-request: the release commit is merged by a reviewer
   sync: { auto: true, prune: true, self_heal: true }
-  watch: { timeout: 15m, settle: 30s }
+  watch: { timeout: 15m, settle: 30s, refused: 60s }
   concurrency: queue                  # a second release waits; or reject
   notify: { chat: ["#deploys"], webhooks: [] }
 ```
@@ -256,6 +256,10 @@ From then on:
 - **One release, one commit.** The message says what changed (`deploy web 1.4.2 to production
   (release 1042)`), and trailers name the release and the people: `Kiln-Release: 1042`,
   `Kiln-Requested-By: ada`, `Kiln-Approved-By: …`.
+- **Git says what runs.** A release the provider refused, or never got, and one cancelled while it
+  was delivered, is reverted by a commit of kiln's (`Kiln-Reverts: 1042`) that puts its files back
+  as they were, unless someone changed them since. A release that ran and then failed stays: roll
+  back, or fix it forward. So does a commit kiln didn't make: it fails, and git keeps it.
 - **JSON for kiln, YAML for people.** Argo CD's git files generator reads `release.json`'s keys as
   parameters. People edit `values.yaml` and `app.yaml` in pull requests like any file.
 - **Safe writes.** kiln commits against the branch head it read and retries on a newer one, keeping
@@ -318,7 +322,11 @@ deployment, read a push webhook, and create a repository from a template.
 commit, synced and healthy, steady for `watch.settle` (default 30 s). **When it failed**: a sync
 failed after its retries, health stayed Degraded past its grace, or `watch.timeout` passed. A
 provider that can't be reached leaves the release `delivering`, retried with backoff until the
-timeout.
+timeout. **When it was refused**: the provider can't make anything of it (Argo CD answers `4xx` to
+its Application, or reports a `ComparisonError`; KilnCD can't read its sources or render them) for
+`watch.refused` (default 60 s, room for a passing trouble to clear). The release fails, its commit
+is reverted, and the provider is handed what git says then: what ran before runs on. A release the
+provider never held before the timeout is reverted the same way.
 
 ### 8.2 KilnCD
 
@@ -379,7 +387,10 @@ kiln deployed through its own tracking annotation. Nothing is recreated either w
 `POST /api/deploy/releases` with `{ app, environment, version | values | rollback | enabled | promote_from }`:
 
 1. **Validate.** The registration exists; the caller may release this app here (§15); the version
-   and its artifacts exist in their registries.
+   and its artifacts exist in their registries: a chart's tag in its OCI registry or its Helm
+   repository's index, a branch or tag of a git package. A registry that says the version isn't
+   there refuses the release (`422`, with the newest versions it has); one kiln can't ask lets it
+   through, and the provider has the last word.
 2. **Concurrency.** One release in flight per registration. Another waits in line or is refused
    (`409`), as the environment says. An `Idempotency-Key` returns the same release to a retried call.
 3. **Gates** (§9.1). A release waiting on one is `waiting`, and says what for.
@@ -403,7 +414,8 @@ deploy-config); a *rollback* goes back to an earlier release (§10); *enable* an
 `enabled`; a *promotion* copies an upstream release's version and artifacts.
 
 **Cancel** stops a release that is waiting or delivering. Once committed, git already says the new
-version: cancelling a delivering release reverts the commit as a new release.
+version: cancelling a delivering release reverts its commit (§6), and the provider is handed what
+git says then.
 
 ### 9.1 Gates
 
@@ -561,7 +573,9 @@ kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's route
 | --- | --- |
 | The commit landed, the record didn't (a crash between them) | `release.json` carries the release number: kiln finds the commit and completes the record |
 | Someone pushed in between | the commit is redone on the new head, keeping their changes |
-| The provider can't be reached | the release stays `delivering`, retried with backoff until its timeout |
+| The provider can't be reached | the release stays `delivering`, retried with backoff until its timeout; then it fails, and if the provider never held it, its commit is reverted |
+| The provider refuses the release (its chart doesn't render, its spec is invalid) | after `watch.refused` the release fails, its commit is reverted and the provider handed what ran before |
+| A version that isn't in its registry | refused before it is recorded (`422`), with the newest versions there |
 | The server restarts mid-release | the watch item's lease lapses and a server takes it again |
 | The release repository can't be reached | `committing` retries until the timeout, then the release fails, nothing changed |
 | A provider deploys a commit kiln didn't make | it is recorded as a release of origin `git` |
@@ -630,4 +644,7 @@ deployments, and aren't carried over.
 | This design | agreed 2026-10-18 |
 | P1: `/api/deploy`, `kiln deploy` and `kiln app`; environments, apps, registrations; deploy, config, rollback, enable, disable, cancel, candidates, history; releases committed in process with their trailers, delivered through KilnCD, followed to landed across restarts; commits kiln didn't make recorded as releases | built. On a live cluster (minikube): a deploy, a config release, a second version and a rollback each landed, the rolled-back release marked so; a server killed mid-release finished it after its restart with one commit; a hand commit pushed to the release repository became a release and landed; disable removed what ran and enable brought it back |
 | P1: release repositories as W14 native repositories, read by token through its endpoint | with CI's native hosting (W14); until then in `<data>/deploy/repos` |
-| P2 to P8 | not yet |
+| Validation and refusals, on both providers | built: a chart version (OCI or Helm repository) or git ref that isn't there is refused before its record (`422`, with the newest versions); a release its provider refuses for `watch.refused` fails and its commit is reverted, as is one cancelled while delivering or never delivered. On live clusters: a missing version refused at once on each provider; values that break a chart (Argo CD) and a chart that won't render (KilnCD) each failed after the grace, reverted to a tree identical to the release before, the provider back on it; a cancel mid-delivery reverted and Argo CD rolled back |
+| P2: Argo CD instances as integrations (kind `argocd`: URL, namespace, CA, an account's token sealed), verified by their version and rights; an environment's provider `argocd/<integration>`; each registration one Application written through Argo CD's API (the package at the release's version, the environment's values inline, `kiln.release` as a Helm parameter), refreshed hard, followed to landed by the release it compared; pause and resume; disable (with `keep`), enable, deregister; status per provider | built. On a real Argo CD (v3.5.4, its own minikube profile): a deploy, a second version, a rollback and a config release each landed with the release they carried; pause turned the Application's automated sync off and resume back on; a disable with `keep` deleted the Application and left its objects, which the next enable adopted; a full disable removed both; a server killed mid-release finished it after its restart with one commit; deregistering removed the Application, its objects and the registration's files |
+| P2: ApplicationSets over the release repository, AppProjects, the repository registered for reading, diff, manifests, resources, logs, actions, the stream rather than polling; moving an environment between providers | not yet: ApplicationSets wait on release repositories being served (W14) |
+| P3 to P8 | not yet |

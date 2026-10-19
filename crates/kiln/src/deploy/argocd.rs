@@ -12,8 +12,8 @@
 
 use serde_json::{Value, json};
 
-use super::kilncd::Landed;
 use super::model::{App, Environment, Package, Registration, ReleaseFile};
+use super::provider::{Landed, Undelivered};
 use super::repo;
 use crate::http::client::{Client, Method, Roots};
 use crate::hub::Hub;
@@ -57,9 +57,12 @@ impl Argo {
 
     async fn call(&self, method: Method, path: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
         let mut req = self.client.request(method, &format!("{}{path}", self.base)).bearer(&self.token).timeout(std::time::Duration::from_secs(30));
-        if let Some(b) = body {
-            req = req.json(b);
-        }
+        req = match body {
+            Some(b) => req.json(b),
+            // Argo CD answers 415 to a change without a JSON content type, even a DELETE.
+            None if !matches!(method, Method::Get | Method::Head) => req.header("content-type", "application/json"),
+            None => req,
+        };
         let resp = req.send().await.map_err(|e| format!("Argo CD at {}: {e:#}", self.base))?;
         let status = resp.status();
         let bytes = resp.bytes(32 << 20).await.map_err(|e| format!("Argo CD: {e:#}"))?;
@@ -72,8 +75,7 @@ impl Argo {
         if (200..300).contains(&status) {
             return Ok(v);
         }
-        let why = v.get("message").or_else(|| v.get("error")).and_then(Value::as_str).map_or_else(|| v.to_string(), str::to_owned);
-        Err(format!("Argo CD answered {status}: {why}"))
+        Err(answered(status, &v))
     }
 
     /// Its version, and that the token works.
@@ -100,15 +102,25 @@ impl Argo {
         match status {
             200 => Ok(Some(v)),
             404 => Ok(None),
-            // Argo CD answers 403 for an Application that doesn't exist, as for one the token can't see.
+            // Argo CD answers 403 for an Application that doesn't exist, as for one the token can't
+            // see: its list, which leaves out what the token can't see, tells them apart.
             403 if v.to_string().contains("not found") => Ok(None),
+            403 => {
+                let (listed, list) = self.call(Method::Get, &format!("/api/v1/applications?name={}&{}", enc(name), self.app_query()), None).await?;
+                let there = list.get("items").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+                if (200..300).contains(&listed) && !there { Ok(None) } else { Err(format!("Argo CD answered 403 for Application {name}: {v}")) }
+            }
             s => Err(format!("Argo CD answered {s} for Application {name}: {v}")),
         }
     }
 
-    /// Creates or replaces an Application.
-    pub async fn put_application(&self, app: &Value) -> Result<(), String> {
-        self.ok(Method::Post, "/api/v1/applications?upsert=true&validate=true", Some(app)).await.map(|_| ())
+    /// Creates or replaces an Application. Argo CD renders it first: one it won't take is refused.
+    pub async fn put_application(&self, app: &Value) -> Result<(), Undelivered> {
+        let (status, v) = self.call(Method::Post, "/api/v1/applications?upsert=true&validate=true", Some(app)).await?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        Err(Undelivered::of_status(status, answered(status, &v)))
     }
 
     /// Deletes an Application: what it deployed too, unless `keep`.
@@ -150,6 +162,12 @@ impl Argo {
 
 fn enc(s: &str) -> String {
     kiln_cd::kube::enc(s)
+}
+
+/// What Argo CD said, when it said no.
+fn answered(status: u16, v: &Value) -> String {
+    let why = v.get("message").or_else(|| v.get("error")).and_then(Value::as_str).map_or_else(|| v.to_string(), str::to_owned);
+    format!("Argo CD answered {status}: {why}")
 }
 
 /// The Application of a registration.
@@ -237,7 +255,28 @@ fn release_of(source: &Value) -> Option<String> {
     source.pointer("/helm/parameters")?.as_array()?.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(RELEASE_PARAM))?.get("value")?.as_str().map(str::to_owned)
 }
 
-/// Where a release stands on Argo CD, from its Application, and the status to show.
+/// What an Application says, as kiln shows it: synced and healthy, the release it carries and the
+/// one Argo CD compared, the sync under way, and its conditions.
+pub fn status(app: &Value) -> Value {
+    let s = |p: &str| app.pointer(p).and_then(Value::as_str).unwrap_or("").to_owned();
+    let compared = app.pointer("/status/sync/comparedTo/source").cloned().unwrap_or(Value::Null);
+    let op = app.pointer("/status/operationState").cloned().unwrap_or(Value::Null);
+    let conditions = app.pointer("/status/conditions").and_then(Value::as_array).cloned().unwrap_or_default();
+    json!({
+        "application": s("/metadata/name"),
+        "sync": s("/status/sync/status"),
+        "health": s("/status/health/status"),
+        "revision": s("/status/sync/revision"),
+        "release": s("/metadata/annotations/kiln.dev~1release"),
+        "compared_release": release_of(&compared),
+        "operation": { "phase": op.get("phase").cloned().unwrap_or(Value::Null), "message": op.get("message").cloned().unwrap_or(Value::Null) },
+        "reconciled_at": s("/status/reconciledAt"),
+        "conditions": conditions.iter().map(|c| json!({ "type": c.get("type"), "message": c.get("message") })).collect::<Vec<_>>(),
+    })
+}
+
+/// Where a release stands on Argo CD, from its Application (the release's: the caller made sure),
+/// and the status to show.
 pub fn landed(app: &Value, release: i64, version: &str) -> (Landed, Value) {
     let s = |p: &str| app.pointer(p).and_then(Value::as_str).unwrap_or("").to_owned();
     let compared = app.pointer("/status/sync/comparedTo/source").cloned().unwrap_or(Value::Null);
@@ -250,19 +289,21 @@ pub fn landed(app: &Value, release: i64, version: &str) -> (Landed, Value) {
     let op_ours = op.pointer("/syncResult/source").map(release_of).is_some_and(|r| r.as_deref() == Some(release.to_string().as_str()))
         || op.pointer("/operation/sync/revision").and_then(Value::as_str) == Some(version);
     let phase = op.get("phase").and_then(Value::as_str).unwrap_or("").to_owned();
-    let view = json!({
-        "application": s("/metadata/name"),
-        "sync": s("/status/sync/status"),
-        "health": s("/status/health/status"),
-        "revision": s("/status/sync/revision"),
-        "compared_release": release_of(&compared),
-        "operation": { "phase": phase, "message": op.get("message").cloned().unwrap_or(Value::Null) },
-        "reconciled_at": s("/status/reconciledAt"),
-    });
+    // Argo CD can't render the spec: its package isn't there, or doesn't render.
+    let refused = app
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|c| matches!(c.get("type").and_then(Value::as_str), Some("ComparisonError" | "InvalidSpecError")))
+        .map(|c| c.get("message").and_then(Value::as_str).unwrap_or("Argo CD can't compare it").to_owned());
+    let view = status(app);
     let landed = if op_ours && matches!(phase.as_str(), "Failed" | "Error") {
         Landed::Failed(op.get("message").and_then(Value::as_str).filter(|m| !m.is_empty()).map_or_else(|| format!("Argo CD's sync {}", phase.to_lowercase()), str::to_owned))
     } else if ours && s("/status/sync/status") == "Synced" && s("/status/health/status") == "Healthy" && !matches!(phase.as_str(), "Running" | "Terminating") {
         Landed::Yes
+    } else if let Some(why) = refused {
+        Landed::Refused(why)
     } else {
         Landed::No
     };
@@ -375,5 +416,14 @@ mod tests {
         assert_eq!(landed(&argo_app("Synced", "Progressing", "42", "Succeeded"), 42, "1.4.2").0, Landed::No, "not healthy yet");
         assert!(matches!(landed(&argo_app("OutOfSync", "Degraded", "42", "Failed"), 42, "1.4.2").0, Landed::Failed(m) if m.contains("failed to apply")));
         assert_eq!(landed(&argo_app("OutOfSync", "Degraded", "41", "Failed"), 42, "1.4.2").0, Landed::No, "an earlier release's failure isn't this one's");
+    }
+
+    #[test]
+    fn a_spec_argo_cd_cannot_render_is_refused() {
+        let mut a = argo_app("Unknown", "Healthy", "41", "Succeeded");
+        if let Some(status) = a.get_mut("status").and_then(Value::as_object_mut) {
+            status.insert("conditions".into(), json!([{ "type": "ComparisonError", "message": "podinfo:0.0.404: not found" }]));
+        }
+        assert!(matches!(landed(&a, 42, "0.0.404").0, Landed::Refused(m) if m.contains("not found")));
     }
 }

@@ -103,7 +103,8 @@ fn yes() -> bool {
     true
 }
 
-/// How long a release is followed, and how long it must stay synced and healthy to count.
+/// How long a release is followed, how long it must stay synced and healthy to count, and how
+/// long its provider may refuse it before it fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchSettings {
@@ -111,11 +112,15 @@ pub struct WatchSettings {
     pub timeout_secs: u64,
     #[serde(default = "half_a_minute")]
     pub settle_secs: u64,
+    /// A provider that keeps refusing a release this long (its package doesn't render, its spec is
+    /// invalid) fails it, and its commit is reverted: a passing trouble gets this long to clear.
+    #[serde(default = "a_minute")]
+    pub refused_secs: u64,
 }
 
 impl Default for WatchSettings {
     fn default() -> Self {
-        Self { timeout_secs: fifteen_minutes(), settle_secs: half_a_minute() }
+        Self { timeout_secs: fifteen_minutes(), settle_secs: half_a_minute(), refused_secs: a_minute() }
     }
 }
 
@@ -125,6 +130,10 @@ fn fifteen_minutes() -> u64 {
 
 fn half_a_minute() -> u64 {
     30
+}
+
+fn a_minute() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

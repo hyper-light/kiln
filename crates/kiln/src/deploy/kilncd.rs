@@ -12,6 +12,7 @@ use kiln_cd::model::{SyncOptions, SyncPolicy, Tracking};
 use serde_json::{Value, json};
 
 use super::model::{App, Environment, Package, Registration, ReleaseFile};
+use super::provider::{Landed, Undelivered};
 use super::repo;
 use crate::cd::Cd;
 use crate::hub::Hub;
@@ -96,10 +97,13 @@ async fn op(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, name: &str, input: Value)
     crate::cd::ops::call(cx(hub, cd, actor), name, input).await.map_err(|(code, msg)| format!("KilnCD {name}: {msg} ({code})"))
 }
 
-/// Puts a release's definition in place and has KilnCD look at it now.
-pub async fn deliver(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, def: &AppDef) -> Result<(), String> {
+/// Puts a release's definition in place and has KilnCD look at it now. A definition KilnCD won't
+/// take is refused.
+pub async fn deliver(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, def: &AppDef) -> Result<(), Undelivered> {
     let id = def.id();
-    op(hub, cd, actor, "cd.apps.create", json!({ "definition": def })).await?;
+    crate::cd::ops::call(cx(hub, cd, actor), "cd.apps.create", json!({ "definition": def }))
+        .await
+        .map_err(|(code, msg)| Undelivered::of_status(code.as_u16(), format!("KilnCD cd.apps.create: {msg} ({code})")))?;
     // Registered just now, KilnCD may not hold it yet: a refresh that misses is no failure.
     let _ = op(hub, cd, actor, "cd.apps.refresh", json!({ "app": id, "hard": true })).await;
     Ok(())
@@ -120,19 +124,9 @@ pub async fn automation(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str, on:
     op(hub, cd, actor, "cd.apps.create", json!({ "definition": def })).await.map(|_| ())
 }
 
-/// Where a release stands on KilnCD.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Landed {
-    /// Synced from the release's commit and healthy.
-    Yes,
-    /// Not yet.
-    No,
-    /// A sync of the release's commit failed: why.
-    Failed(String),
-}
-
 /// What KilnCD says of an app, as a release follows it: whether the commit has landed, and the
-/// status to show.
+/// status to show. The definition is the release's (the caller made sure): an error rendering it
+/// is the release's.
 pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value) {
     let status = cd.statuses.read().get(id).map(crate::cd::summary_json).unwrap_or(Value::Null);
     let entry_error = cd.apps.read().get(id).and_then(|e| e.error.clone());
@@ -140,6 +134,8 @@ pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value)
     // The newest sync of this commit since the release began.
     let ran = history.iter().rev().find(|h| h.at_ms >= since_ms && h.commits.iter().flatten().any(|c| c.as_str() == commit)).cloned();
     let s = |k: &str| status.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    // Its sources can't be read (a chart version that isn't there), or don't render.
+    let refused = entry_error.clone().or_else(|| Some(s("message")).filter(|m| m.starts_with("render failed")));
     let view = json!({
         "app": id,
         "sync": s("sync"),
@@ -149,9 +145,10 @@ pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value)
         "source_error": entry_error,
         "last_sync": ran.as_ref().map(|h| json!({ "succeeded": h.succeeded, "message": h.message, "at_ms": h.at_ms, "id": h.id })),
     });
-    let landed = match ran {
-        Some(h) if !h.succeeded => Landed::Failed(if h.message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { h.message }),
-        Some(_) if s("sync") == "Synced" && s("health") == "Healthy" => Landed::Yes,
+    let landed = match (ran, refused) {
+        (Some(h), _) if !h.succeeded => Landed::Failed(if h.message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { h.message }),
+        (Some(_), _) if s("sync") == "Synced" && s("health") == "Healthy" => Landed::Yes,
+        (None, Some(why)) => Landed::Refused(why),
         _ => Landed::No,
     };
     (landed, view)

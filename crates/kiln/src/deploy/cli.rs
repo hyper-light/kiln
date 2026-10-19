@@ -49,7 +49,7 @@ pub struct DeployArgs {
     /// The version to deploy. Without one, `--values` makes a config release.
     version: Option<String>,
     /// The environment.
-    #[arg(long)]
+    #[arg(long, visible_alias = "env")]
     to: Option<String>,
     /// An artifact the version deploys: `name=repository:tag`, `name=repository@sha256:…`, or both.
     #[arg(long = "artifact")]
@@ -64,16 +64,16 @@ pub struct DeployArgs {
 
 #[derive(clap::Subcommand)]
 enum DeployCmd {
-    /// What runs, what's in flight and what KilnCD says, for an app in an environment.
+    /// What runs, what's in flight and what its provider says, for an app in an environment.
     Status {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
     },
     /// Releases, newest first.
     History {
         app: Option<String>,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -85,6 +85,7 @@ enum DeployCmd {
         app: String,
         #[arg(long)]
         env: String,
+        /// The release to go back to.
         #[arg(long)]
         to: Option<i64>,
         #[arg(long)]
@@ -95,13 +96,13 @@ enum DeployCmd {
     /// Run the app in the environment again, at its last version.
     Enable {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
     },
     /// Stop running the app in the environment: what it runs is removed, unless `--keep`.
     Disable {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
         #[arg(long)]
         keep: bool,
@@ -158,13 +159,13 @@ enum AppCmd {
     /// Register an app in an environment.
     Register {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
     },
     /// Remove an app from an environment: what it runs is removed, unless `--keep`.
     Deregister {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
         #[arg(long)]
         keep: bool,
@@ -172,12 +173,12 @@ enum AppCmd {
     /// Turn the provider's automation off for hand edits; the next release turns it back on.
     Pause {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
     },
     Resume {
         app: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "to")]
         env: String,
     },
     /// Delete an app registered nowhere.
@@ -188,10 +189,13 @@ enum AppCmd {
 enum EnvCmd {
     List,
     Show { env: String },
-    /// Add (or replace) an environment, deployed through KilnCD from a release repository on
-    /// kiln's own git server.
+    /// Add (or replace) an environment, deployed from a release repository on kiln's own git
+    /// server through KilnCD, or through an Argo CD integration (`--provider argocd/<name>`).
     Add {
         env: String,
+        /// `kilncd`, or `argocd/<integration>`.
+        #[arg(long, default_value = "kilncd")]
+        provider: String,
         /// The release repository on kiln's git server.
         #[arg(long, default_value = "kiln/releases")]
         repo: String,
@@ -214,6 +218,10 @@ enum EnvCmd {
         /// How long a landed release must stay synced and healthy, in seconds.
         #[arg(long, default_value_t = 30)]
         settle: u64,
+        /// How long the provider may refuse a release before it fails and its commit is
+        /// reverted, in seconds.
+        #[arg(long, default_value_t = 60)]
+        refused: u64,
         /// A release asked for while another is in flight waits, rather than being refused.
         #[arg(long)]
         queue: bool,
@@ -333,8 +341,15 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
                     println!("in flight: {}", line(f));
                 }
                 let p = v.pointer("/provider/status").cloned().unwrap_or(Value::Null);
-                if !p.is_null() {
-                    println!("KilnCD ({}): {} / {}", v.pointer("/provider/app").and_then(Value::as_str).unwrap_or(""), s(&p, "sync"), s(&p, "health"));
+                let provider = match v.pointer("/provider/kind").and_then(Value::as_str) {
+                    Some("argocd") => format!("Argo CD {}", v.pointer("/provider/integration").and_then(Value::as_str).unwrap_or("")),
+                    _ => "KilnCD".to_owned(),
+                };
+                let app = v.pointer("/provider/app").and_then(Value::as_str).unwrap_or("");
+                match (p.get("error").and_then(Value::as_str), p.is_null()) {
+                    (Some(e), _) => println!("{provider} ({app}): can't be asked: {e}"),
+                    (None, true) => println!("{provider} ({app}): nothing there"),
+                    (None, false) => println!("{provider} ({app}): {} / {}", s(&p, "sync"), s(&p, "health")),
                 }
             });
             return Ok(());
@@ -475,7 +490,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 for e in v.get("environments").and_then(Value::as_array).into_iter().flatten() {
                     let clusters: Vec<&str> = e.pointer("/targets/kubernetes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
                     println!(
-                        "{:<16} {:<8} {}@{}  {}",
+                        "{:<16} {:<18} {}@{}  {}",
                         s(e, "name"),
                         s(e, "provider"),
                         e.pointer("/release_repo/repo").and_then(Value::as_str).unwrap_or(""),
@@ -489,14 +504,14 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, queue } => {
+        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue } => {
             let body = json!({
                 "name": env,
-                "provider": "kilncd",
+                "provider": provider,
                 "release_repo": { "host": "kiln", "repo": repo, "branch": branch, "root": root },
                 "targets": { "kubernetes": clusters },
                 "sync": { "prune": !no_prune, "self_heal": self_heal },
-                "watch": { "timeout_secs": timeout, "settle_secs": settle },
+                "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },
             });
             let v = api.call(Method::Post, "/environments", Some(body)).await?;
