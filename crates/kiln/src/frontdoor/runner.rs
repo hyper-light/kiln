@@ -345,6 +345,10 @@ impl FrontDoor {
             if push.renew {
                 self.renew_now();
             }
+            // The clusters this one is peered with: their addresses are forwarded here.
+            if let Some(t) = push.peers.clone() {
+                *self.https_shared.peers.write() = (!t.peers.is_empty()).then(|| Arc::new(crate::peers::forward::Forwarder::new(t)));
+            }
         }
         self.reconcile();
     }
@@ -797,7 +801,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None, renew: false });
+            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None, renew: false, peers: None });
             fd.on_push(&push(&settings, None, false)?);
             let st = fd.status();
             assert_eq!(st.settings, settings.fingerprint());
@@ -882,7 +886,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: settings.clone(), standby, issued, custom: None, renew: false });
+            let push = |issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: settings.clone(), standby, issued, custom: None, renew: false, peers: None });
             let mut fd = FrontDoor::new(ctx);
             fd.on_push(&push(None, false)?);
             let st = fd.status();
@@ -929,7 +933,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Custom },
                 ..Settings::default()
             };
-            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false });
+            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false, peers: None });
             fd.on_push(&push(None)?);
             let st = fd.status();
             assert_eq!(st.cert.state, State::Error);

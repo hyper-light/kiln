@@ -382,6 +382,9 @@ pub struct Push {
     /// Renew the self-signed certificate now (`POST /api/runners/:name/front-door/cert/renew`):
     /// a new key, and a CSR for it at once. The certificate in use serves until the new one is in.
     pub renew: bool,
+    /// The clusters this one is peered with, which the front door forwards to itself
+    /// (`crate::peers`); `None` from a server that has none to say.
+    pub peers: Option<crate::peers::forward::Table>,
 }
 
 impl std::fmt::Debug for Push {
@@ -574,7 +577,7 @@ mod tests {
     #[test]
     fn settings_and_status_round_trip_as_json() -> anyhow::Result<()> {
         let s = on().validated().map_err(anyhow::Error::msg)?;
-        let push = Push { settings: s.clone(), standby: false, issued: Some("PEM".into()), custom: Some(CustomCert { cert_pem: "C".into(), key_pem: "SECRET KEY".into() }), renew: true };
+        let push = Push { settings: s.clone(), standby: false, issued: Some("PEM".into()), custom: Some(CustomCert { cert_pem: "C".into(), key_pem: "SECRET KEY".into() }), renew: true, peers: None };
         let json = serde_json::to_string(&push)?;
         let back: Push = serde_json::from_str(&json)?;
         assert_eq!(back.settings, s);

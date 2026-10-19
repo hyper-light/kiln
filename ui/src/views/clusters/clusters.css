@@ -1,0 +1,109 @@
+/* The Clusters page (index.tsx): peerings, and the codes that make them. */
+
+.cl-list {
+  display: flex;
+  flex-direction: column;
+}
+.cl-row {
+  padding: 12px 0;
+  border-top: 1px solid rgb(255 255 255 / 6%);
+}
+.cl-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.cl-head {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+.cl-name {
+  color: #ededee;
+  font-size: 14px;
+  font-weight: 500;
+}
+.cl-state {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 6%);
+  color: #a5a7ae;
+  font-size: 11.5px;
+}
+.cl-state[data-state="peered"] {
+  background: rgb(120 200 160 / 12%);
+  color: #a8dcc2;
+}
+.cl-state[data-state="expired"] {
+  background: rgb(216 187 149 / 12%);
+  color: #d8bb95;
+}
+.cl-meta {
+  margin-top: 4px;
+  color: #8d9097;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.cl-fp {
+  color: #c9cbd1;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.cl-made {
+  margin: 12px 0;
+}
+.cl-made-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+/* A code: long, one word; it wraps anywhere and copies whole. */
+.cl-code {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #2a2d34;
+  border-radius: 6px;
+  background: #0b0c0e;
+  color: #cdc4e0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.cl-paste {
+  resize: vertical;
+  outline: none;
+}
+.cl-paste:focus {
+  border-color: #47464f;
+}
+.cl-note {
+  margin-top: 6px;
+  color: #8d9097;
+  font-size: 12.5px;
+}
+.cl-form {
+  margin-top: 10px;
+}
+.cl-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+.cl-err {
+  color: #d8c8b0;
+  font-size: 12.5px;
+}
+.cl-ok {
+  margin-bottom: 10px;
+  color: #c9cbd1;
+  font-size: 13px;
+}
