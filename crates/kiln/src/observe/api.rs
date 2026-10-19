@@ -336,6 +336,19 @@ pub async fn otlp(signal: super::otlp::Signal, req: Request, authorised: bool) -
     }
 }
 
+/// OTLP/gRPC's `Export` on the server, for an authorised exporter (its token in gRPC's metadata,
+/// `authorization: Bearer <the ingest token>`).
+pub async fn otlp_grpc(signal: super::otlp::Signal, req: Request, authorised: bool) -> Response {
+    use super::otlp::{grpc_answer, grpc_code};
+    if !authorised {
+        return grpc_answer(grpc_code::UNAUTHENTICATED, "an OTLP exporter sends authorization: Bearer <the ingest token>");
+    }
+    match get() {
+        Some(o) => super::otlp::grpc(o, signal, req).await,
+        None => grpc_answer(grpc_code::UNAVAILABLE, "observe is starting"),
+    }
+}
+
 /// A request's body, at the most: a query's text is 8,000 bytes (`kiln_obs::query::lex`), an
 /// ingest's points a few MB.
 const QUERY_BODY: usize = 64 << 10;

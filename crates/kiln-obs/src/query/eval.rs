@@ -1042,6 +1042,62 @@ fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
     (has(crate::dist::SUFFIX) || (has(".count") && has(".sum") && !has(""))).then_some(name.as_str())
 }
 
+/// A percentile of an explicit-bucket histogram (an OTLP histogram's `<name>.bucket{le:…}`,
+/// cumulative over `le` as Prometheus's are), as Prometheus's `histogram_quantile` reads one: in
+/// each bucket of time, each group's counts by `le` (what they rose by), the rank's bucket found
+/// and the value interpolated linearly within it, from its lower bound (0 for the first, its upper
+/// bound positive) to its upper; in the `+Inf` bucket, the highest finite bound. Within a bucket's
+/// width of the truth, as any reading of explicit buckets is.
+#[allow(clippy::too_many_arguments)]
+fn explicit_quantile(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, p: f64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+    let NameMatch::Exact(name) = &q.metric else { return Ok(Vec::new()) };
+    let mut by = q.by.clone();
+    by.push("le".into());
+    let part = MetricQuery { metric: NameMatch::Exact(format!("{name}.bucket")), space: SpaceAgg::Sum, by, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, fill: None, ..q.clone() };
+    let per_le = metric(store, &part, grid, spans, max_series.saturating_mul(64), scratch, scanned)?;
+    // Each group (its tags but `le`): its bounds and their counts in each bucket of time.
+    let mut groups: std::collections::BTreeMap<Vec<(String, String)>, Vec<(f64, Vec<f64>)>> = std::collections::BTreeMap::new();
+    for s in per_le {
+        let Some(le) = s.tags.iter().find(|(k, _)| k == "le").and_then(|(_, v)| if v == "+Inf" { Some(f64::INFINITY) } else { v.parse::<f64>().ok() }) else { continue };
+        let tags: Vec<(String, String)> = s.tags.into_iter().filter(|(k, _)| k != "le").collect();
+        groups.entry(tags).or_default().push((le, s.values));
+    }
+    let q01 = (p / 100.0).clamp(0.0, 1.0);
+    let mut out = Vec::with_capacity(groups.len());
+    for (tags, mut les) in groups {
+        les.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut values = vec![f64::NAN; grid.n];
+        for (i, v) in values.iter_mut().enumerate() {
+            // Counts by bound, made monotonic (rounding can make a sum a bound's below the last's).
+            let mut cum: Vec<(f64, f64)> = Vec::with_capacity(les.len());
+            let mut most = 0.0f64;
+            for (le, vals) in &les {
+                let c = vals.get(i).copied().filter(|c| c.is_finite()).unwrap_or(0.0);
+                most = most.max(c);
+                cum.push((*le, most));
+            }
+            let total = cum.last().map_or(0.0, |c| c.1);
+            if total <= 0.0 {
+                continue;
+            }
+            let rank = q01 * total;
+            let Some(at) = cum.iter().position(|&(_, c)| c >= rank) else { continue };
+            let (upper, c_up) = cum.get(at).copied().unwrap_or((f64::NAN, 0.0));
+            let (lower, c_low) = if at == 0 { (if upper > 0.0 { 0.0 } else { upper }, 0.0) } else { cum.get(at - 1).copied().unwrap_or((0.0, 0.0)) };
+            *v = if upper.is_infinite() {
+                // The highest finite bound: past it, nothing says where.
+                lower
+            } else if c_up > c_low {
+                lower + (upper - lower) * (rank - c_low) / (c_up - c_low)
+            } else {
+                upper
+            };
+        }
+        out.push(Series { tags, values, bounds: None, outlier: None });
+    }
+    Ok(out)
+}
+
 /// Whether `q` names a distribution whose buckets are kept (`<name>.dist`).
 fn buckets_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
     let NameMatch::Exact(name) = &q.metric else { return None };
@@ -1080,6 +1136,10 @@ fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, ma
     };
     let mut ids = Vec::new();
     store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+    if ids.is_empty() {
+        // No exponential buckets: an explicit histogram's, if it has them.
+        return explicit_quantile(store, q, grid, spans, p, max_series, scratch, scanned);
+    }
     // In the order of the series' fingerprints, the same on every replica: each group's buckets
     // summed in one order everywhere.
     ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
@@ -3403,6 +3463,49 @@ mod tests {
         assert_eq!(ask("min:took{*}"), vec![1.0]);
         assert_eq!(ask("max:took{*}"), vec![30.0]);
         assert!(ask("p99:took{*}").is_empty());
+    }
+
+    /// An explicit-bucket histogram (OTLP's default, its `le` counts cumulative): percentiles as
+    /// Prometheus's histogram_quantile reads them, by group, the +Inf bucket's its highest bound.
+    #[test]
+    fn an_explicit_histogram_answers_percentiles_interpolated_within_its_buckets() {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        // Host a: 1,000 values spread evenly over (0, 100], a hundred a bound of ten. Host b: ten
+        // times as many, ten more past the last bound.
+        for (host, per, past) in [("a", 100.0, 0.0), ("b", 1_000.0, 10.0)] {
+            let mut cum = 0.0;
+            for le in (10..=100).step_by(10) {
+                cum += per;
+                let k = SeriesKey::new("lat.bucket", [("host", host), ("le", le.to_string().as_str())], Kind::Count).unwrap();
+                b.define(&k);
+                b.run(k.fp, [(30_000, cum)]);
+            }
+            let k = SeriesKey::new("lat.bucket", [("host", host), ("le", "+Inf")], Kind::Count).unwrap();
+            b.define(&k);
+            b.run(k.fp, [(30_000, cum + past)]);
+            for (m, v) in [("lat.count", cum + past), ("lat.sum", 50.0 * cum)] {
+                let k = SeriesKey::new(m, [("host", host)], Kind::Count).unwrap();
+                b.define(&k);
+                b.run(k.fp, [(30_000, v)]);
+            }
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| -> Vec<f64> {
+            let mut r = Request::new(q, 0, 60_000);
+            r.step = Some(60_000);
+            eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}")).series.into_iter().map(|x| x.values[0]).collect()
+        };
+        assert_eq!(ask("p50:lat{host:a}"), vec![50.0]);
+        assert_eq!(ask("p99:lat{host:a}"), vec![99.0]);
+        assert_eq!(ask("p5:lat{host:a}"), vec![5.0], "in the first bucket, from 0");
+        let by = ask("p90:lat{*} by {host}");
+        assert_eq!(by.len(), 2);
+        assert!((by[0] - 90.0).abs() < 1e-9 && (by[1] - 90.0 * 10_010.0 / 10_000.0).abs() < 0.1, "{by:?}");
+        assert_eq!(ask("p100:lat{host:b}"), vec![100.0], "past the last bound: the last bound");
+        // Together: host b's ten thousand outweigh a's thousand.
+        let all = ask("p50:lat{*}");
+        assert!((all[0] - 50.0).abs() < 0.1, "{all:?}");
     }
 
     /// A heatmap: a distribution's rows its buckets (made coarser until they fit), each bucket of

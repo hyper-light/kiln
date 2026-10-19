@@ -17,7 +17,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7), described in OpenAPI 3.1 and held to what its routes answer; Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
-| O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
+| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
@@ -550,9 +550,9 @@ its schema (§13). Built:
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 
-OTLP/HTTP at its standard paths, `/v1/metrics` and `/v1/logs` (protobuf and JSON), on the server and
-on every runner at `127.0.0.1:4318`, so an app on a runner sends to its local runner as it would to
-a collector (O-5).
+OTLP/HTTP at its standard paths, `/v1/metrics` and `/v1/logs` (protobuf and JSON), and OTLP/gRPC,
+on the server and on every runner at `127.0.0.1:4318` and `:4317`, so an app on a runner sends to its
+local runner as it would to a collector (O-5).
 
 ## 8. Ingestion
 
@@ -566,7 +566,22 @@ time, sent again until answered; §5), from:
   `KILN_OTLP_ADDR`, or `off`) as a local collector would. Metrics map by type (gauges;
   sums by temporality and monotonicity; histograms' count, sum, min, max and buckets;
   exponential histograms as distributions (§4.4), a cumulative one turned to deltas; summaries); logs keep their time, severity, body,
-  attributes and trace context, `service` and `host` from the resource.
+  attributes and trace context, `service` and `host` from the resource. An explicit-bucket
+  histogram (an SDK's default) answers percentiles as Prometheus's `histogram_quantile` reads
+  one: each bucket of time's counts by bound, the rank's bucket found, the value interpolated
+  within it (within a bucket's width of the truth; the `+Inf` bucket's, the highest bound).
+- **OTLP/gRPC**: the metrics and logs services' `Export` (`opentelemetry.proto.collector.
+  metrics.v1.MetricsService/Export`, `….logs.v1.LogsService/Export`), unary, over HTTP/2 with TLS
+  (ALPN) or in the clear (prior knowledge, as an SDK's insecure channel speaks), a message
+  gzip-compressed or not, read by the same decoder; the token in gRPC's metadata
+  (`authorization: Bearer …`). It answers the empty response and `grpc-status` in trailers: what
+  does not decode `INVALID_ARGUMENT`, past 20 MiB `RESOURCE_EXHAUSTED`, a node behind on its writes
+  `UNAVAILABLE` (which OTLP exporters retry), without the token `UNAUTHENTICATED`. Every runner
+  also listens on `127.0.0.1:4317` (OTLP/gRPC's port; `KILN_OTLP_GRPC_ADDR`, or `off`), either
+  port taking either protocol. The official Python SDK's gRPC exporters (opentelemetry 1.x,
+  grpcio 1.84) were run against it: a counter exported twice read its increase, a delta counter
+  its sum, a histogram of 1 to 100 its count, average 50.5, p50 50 and p99 99, and log records
+  their service and level, gzip and plain alike.
 - **The node's own host** (`crate::observe::host`, every 15 s, the Datadog Agent's interval), in
   Datadog's names and units: CPU (the split over the interval; Linux), load, memory, swap, every
   mount the process sees, disk I/O and network rates, uptime; in a container or a cgroup-limited
@@ -2199,6 +2214,13 @@ late batch held every window back five minutes (the settle was the most any batc
 99th percentile; the entries a server applies again as it opens looked minutes late (the settle 30
 s after a restart), now told apart as the live tail tells them; and the log intake kept a nested
 attribute as one JSON text where Datadog's reads `@http.status_code`, now flattened as theirs.
+
+**OTLP over gRPC** (`observe_live.rs`): a server and a runner (its gRPC receiver on a port of its
+own); OTLP messages made from OTLP/JSON, each sent as a gRPC call over HTTP/2 in the clear: a gauge
+to the server with its token, another gzip-compressed, a third to the runner's loopback with none,
+log records to the server: each answered with the empty response and `grpc-status: 0`, and each
+stored as sent; then without a token (16), a message cut short (3), bytes that are no OTLP (3, said
+why) and a compression it does not know (12). Passes (67 s).
 
 **Downtimes** (`observe_live.rs`): a server and a webhook; a monitor of two hosts, and a downtime of
 the monitor's tag scoped to host `a` for 40 s, asking to be told of alerts as it expires and to keep

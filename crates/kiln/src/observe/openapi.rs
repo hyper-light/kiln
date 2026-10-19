@@ -1036,8 +1036,8 @@ fn ops() -> Vec<Op<'static>> {
     // What is sent in from outside, at the root, each with the ingest token its own way.
     let raw = |what: &str| json!({ "required": true, "content": { "application/x-protobuf": { "schema": { "type": "string", "format": "binary" } }, "application/json": { "schema": any() } }, "description": what });
     v.extend([
-        Op { body: Some(raw("an ExportMetricsServiceRequest, protobuf or OTLP's JSON, gzip or not")), ..op("post", "/v1/metrics", "OTLP/HTTP metrics", "ingest", None, vec![("200", answer("taken (OTLP's partial success, if any)", None))]) },
-        Op { body: Some(raw("an ExportLogsServiceRequest, protobuf or OTLP's JSON, gzip or not")), ..op("post", "/v1/logs", "OTLP/HTTP logs", "ingest", None, vec![("200", answer("taken", None))]) },
+        Op { body: Some(raw("an ExportMetricsServiceRequest, protobuf or OTLP's JSON, gzip or not")), ..op("post", "/v1/metrics", "OTLP/HTTP metrics (OTLP/gRPC's: opentelemetry.proto.collector.metrics.v1.MetricsService/Export, over HTTP/2, the token as metadata)", "ingest", None, vec![("200", answer("taken (OTLP's partial success, if any)", None))]) },
+        Op { body: Some(raw("an ExportLogsServiceRequest, protobuf or OTLP's JSON, gzip or not")), ..op("post", "/v1/logs", "OTLP/HTTP logs (OTLP/gRPC's: opentelemetry.proto.collector.logs.v1.LogsService/Export)", "ingest", None, vec![("200", answer("taken", None))]) },
         Op {
             params: vec![param("X-Amz-Firehose-Access-Key", "header", true, string(), "observe's ingest token"), param("X-Amz-Firehose-Request-Id", "header", true, string(), "Firehose's request id, echoed")],
             body: Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("requestId", string()), ("timestamp", integer()), ("records", array(object(&[("data", describe(string(), "base64"))], &["data"])))], &["records"]) } }, "description": "CloudWatch Metric Streams' JSON, CloudWatch Logs' subscriptions; gzip or not" })),

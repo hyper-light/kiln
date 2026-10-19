@@ -233,6 +233,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
             return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
         }
+        // OTLP/gRPC (`crate::observe::otlp::grpc`): the same token, as gRPC's metadata.
+        (&Method::POST, [service, "Export"]) if crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).is_some() => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            let signal = crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).unwrap_or(crate::observe::otlp::Signal::Metrics);
+            return Ok(crate::observe::api::otlp_grpc(signal, req, ok).await);
+        }
         // The clouds' pushes (`crate::observe::cloud::push`), with the ingest token or the admin's:
         // Firehose sends it as its access key, a Pub/Sub push subscription in its endpoint's query.
         (&Method::POST, ["v1", "firehose"]) => {

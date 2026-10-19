@@ -1,7 +1,8 @@
 //! OTLP over HTTP (`docs/observe.md` §8): `POST /v1/metrics` and `POST /v1/logs`, as the
 //! OpenTelemetry protocol specifies them (opentelemetry-proto v1.5.0, "OTLP/HTTP"): a request's body
 //! in protobuf (`application/x-protobuf`) or JSON (`application/json`), gzip-compressed or not,
-//! answered in the request's own encoding.
+//! answered in the request's own encoding. And OTLP over gRPC: the metrics and logs services'
+//! `Export` ([`grpc`]), its message read by the same decoder.
 //!
 //! JSON is put into protobuf's wire format here and read by the same decoder as protobuf
 //! (`kiln_obs::otlp`), so one mapping serves both. The JSON is OTLP's "JSON Protobuf Encoding":
@@ -473,6 +474,108 @@ pub async fn answer(o: &Observe, signal: Signal, req: crate::http::server::Reque
     }
 }
 
+/// OTLP over gRPC's paths: the collector services' unary `Export` (opentelemetry-proto v1.5.0,
+/// "OTLP/gRPC"), over HTTP/2 (with TLS, or without: prior knowledge).
+pub const GRPC_METRICS: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+pub const GRPC_LOGS: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+
+/// The signal a gRPC path exports, if it is one.
+pub fn grpc_signal(path: &str) -> Option<Signal> {
+    match path {
+        GRPC_METRICS => Some(Signal::Metrics),
+        GRPC_LOGS => Some(Signal::Logs),
+        _ => None,
+    }
+}
+
+/// gRPC's status codes kiln answers with (grpc/doc/statuscodes.md).
+pub mod grpc_code {
+    pub const OK: u32 = 0;
+    pub const INVALID_ARGUMENT: u32 = 3;
+    pub const RESOURCE_EXHAUSTED: u32 = 8;
+    pub const UNIMPLEMENTED: u32 = 12;
+    pub const INTERNAL: u32 = 13;
+    pub const UNAVAILABLE: u32 = 14;
+    pub const UNAUTHENTICATED: u32 = 16;
+}
+
+/// A status's message as gRPC's trailers carry one: percent-encoded outside printable ASCII
+/// (and `%` itself).
+fn grpc_message(m: &str) -> String {
+    let mut out = String::with_capacity(m.len());
+    for b in m.bytes() {
+        if (0x20..=0x7e).contains(&b) && b != b'%' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A gRPC answer: 200, `application/grpc`, the export's response (an empty message) when it
+/// worked, and its status in trailers.
+pub fn grpc_answer(code: u32, message: &str) -> crate::http::server::Response {
+    use http_body_util::BodyExt as _;
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("grpc-status", http::HeaderValue::from(code));
+    if code != grpc_code::OK
+        && let Ok(v) = http::HeaderValue::from_str(&grpc_message(message))
+    {
+        trailers.insert("grpc-message", v);
+    }
+    let mut frames: Vec<Result<http_body::Frame<bytes::Bytes>, std::io::Error>> = Vec::with_capacity(2);
+    if code == grpc_code::OK {
+        // The response message: uncompressed, empty (an ExportServiceResponse with no partial
+        // success to say).
+        frames.push(Ok(http_body::Frame::data(bytes::Bytes::from_static(&[0, 0, 0, 0, 0]))));
+    }
+    frames.push(Ok(http_body::Frame::trailers(trailers)));
+    let body = http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed();
+    let mut r = crate::http::server::response(http::StatusCode::OK, "application/grpc", body);
+    r.headers_mut().insert("grpc-accept-encoding", http::HeaderValue::from_static("identity,gzip"));
+    r
+}
+
+/// An OTLP/gRPC request answered: its one length-prefixed message (gzip-compressed as its
+/// `grpc-encoding` says, or not) taken as an OTLP/HTTP request's protobuf is, and the outcome as
+/// gRPC's status: a body that does not decode `INVALID_ARGUMENT`, past [`MAX_BODY`]
+/// `RESOURCE_EXHAUSTED`, this node behind on its writes `UNAVAILABLE` (which OTLP exporters retry).
+pub async fn grpc(o: &Observe, signal: Signal, req: crate::http::server::Request) -> crate::http::server::Response {
+    use crate::http::server as srv;
+    let ct = srv::header_str(&req, &http::header::CONTENT_TYPE).unwrap_or("");
+    if !ct.trim().to_ascii_lowercase().starts_with("application/grpc") {
+        return srv::text(http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "OTLP/gRPC: content-type application/grpc");
+    }
+    let encoding = req.headers().get("grpc-encoding").and_then(|v| v.to_str().ok()).unwrap_or("identity").trim().to_ascii_lowercase();
+    let body = match srv::body_bytes(req.into_body(), MAX_BODY + 6).await {
+        Ok(b) => b,
+        Err(_) => return grpc_answer(grpc_code::RESOURCE_EXHAUSTED, "an OTLP request is taken up to 20 MiB"),
+    };
+    // One message: a compressed flag, a length (big-endian), the message.
+    let (Some(&flag), Some(len)) = (body.first(), body.get(1..5).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_be_bytes)) else {
+        return grpc_answer(grpc_code::INVALID_ARGUMENT, "a gRPC message: a flag and a length, then the message");
+    };
+    let Some(msg) = body.get(5..).filter(|m| m.len() == len as usize) else {
+        return grpc_answer(grpc_code::INVALID_ARGUMENT, "a unary call's one message, whole");
+    };
+    let gzip = match (flag, encoding.as_str()) {
+        (0, _) => false,
+        (1, "gzip") => true,
+        (1, other) => return grpc_answer(grpc_code::UNIMPLEMENTED, &format!("{other}: compressed as identity or gzip")),
+        _ => return grpc_answer(grpc_code::INVALID_ARGUMENT, "a message's compressed flag: 0 or 1"),
+    };
+    let msg = msg.to_vec();
+    let (o, now_ns) = (o.clone(), super::clock_ms().saturating_mul(1_000_000));
+    match crate::rt::blocking(move || take(&o, signal, "application/x-protobuf", gzip, &msg, now_ns)).await {
+        Ok(Answer::Ok { .. }) => grpc_answer(grpc_code::OK, ""),
+        Ok(Answer::Bad(why)) => grpc_answer(grpc_code::INVALID_ARGUMENT, &why),
+        Ok(Answer::TooLarge) => grpc_answer(grpc_code::RESOURCE_EXHAUSTED, "an OTLP request is taken up to 20 MiB"),
+        Ok(Answer::Busy) => grpc_answer(grpc_code::UNAVAILABLE, "behind on writes: try again"),
+        Err(e) => grpc_answer(grpc_code::INTERNAL, &format!("{e:#}")),
+    }
+}
+
 /// A runner's OTLP receiver on its loopback (`127.0.0.1:4318`, OTLP/HTTP's port, unless
 /// `KILN_OTLP_ADDR` says another, or `off`): what an app on the machine sends to, as to a collector.
 /// Loopback alone, so it asks no token.
@@ -487,18 +590,32 @@ impl crate::http::server::Handler for Local {
         match (req.method().clone(), req.uri().path()) {
             (Method::POST, "/v1/metrics") => answer(&self.o, Signal::Metrics, req).await,
             (Method::POST, "/v1/logs") => answer(&self.o, Signal::Logs, req).await,
+            (Method::POST, path) if grpc_signal(path).is_some() => match grpc_signal(path) {
+                Some(signal) => grpc(&self.o, signal, req).await,
+                None => grpc_answer(grpc_code::UNIMPLEMENTED, "an OTLP service: metrics or logs"),
+            },
             (Method::GET, "/healthz") => srv::text(StatusCode::OK, "ok"),
-            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics or /v1/logs"),
+            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics or /v1/logs; OTLP/gRPC: the metrics and logs services' Export"),
         }
     }
 }
 
 /// The address a runner's receiver listens on, if any.
 pub fn local_addr() -> Option<std::net::SocketAddr> {
-    match std::env::var("KILN_OTLP_ADDR") {
+    addr_of("KILN_OTLP_ADDR", 4318)
+}
+
+/// The address a runner's receiver also listens on for gRPC, OTLP/gRPC's port (`127.0.0.1:4317`
+/// unless `KILN_OTLP_GRPC_ADDR` says another, or `off`): either address takes either protocol.
+pub fn local_grpc_addr() -> Option<std::net::SocketAddr> {
+    addr_of("KILN_OTLP_GRPC_ADDR", 4317)
+}
+
+fn addr_of(var: &str, port: u16) -> Option<std::net::SocketAddr> {
+    match std::env::var(var) {
         Ok(v) if v.trim().eq_ignore_ascii_case("off") => None,
         Ok(v) => v.trim().parse().ok(),
-        Err(_) => Some(std::net::SocketAddr::from(([127, 0, 0, 1], 4318))),
+        Err(_) => Some(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
     }
 }
 
@@ -512,7 +629,7 @@ pub async fn serve_local(addr: std::net::SocketAddr, o: Observe, shutdown: crate
             return;
         }
     };
-    tracing::info!(%addr, "OTLP/HTTP receiver listening");
+    tracing::info!(%addr, "OTLP receiver listening (HTTP/1.1 and HTTP/2: OTLP/HTTP and OTLP/gRPC)");
     let handler = std::sync::Arc::new(Local { o });
     loop {
         let accepted = futures::select_biased! {

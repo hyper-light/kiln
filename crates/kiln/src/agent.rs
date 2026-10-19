@@ -757,8 +757,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // This machine's own figures, as the server's are.
         let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
         crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
-        // Apps on this machine send OTLP here, as to a collector.
-        if let Some(addr) = crate::observe::otlp::local_addr() {
+        // Apps on this machine send OTLP here, as to a collector: OTLP/HTTP's port and OTLP/gRPC's,
+        // each taking either.
+        for addr in [crate::observe::otlp::local_addr(), crate::observe::otlp::local_grpc_addr()].into_iter().flatten() {
             crate::rt::spawn(crate::observe::otlp::serve_local(addr, obs.clone(), shutdown.clone()));
         }
         let (up, out) = (up_tx.clone(), obs.outgoing());

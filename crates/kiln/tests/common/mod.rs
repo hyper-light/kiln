@@ -187,6 +187,8 @@ host_seconds = 3600
             .command(&dir.join("home"), name)?
             .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--labels", "baremetal", "--no-terminal", "--no-reach"])
             .env("KILN_OTLP_ADDR", format!("127.0.0.1:{otlp}"))
+            // OTLP/gRPC's port is a machine's own: a test that wants it gives one of its own.
+            .env("KILN_OTLP_GRPC_ADDR", "off")
             .env("KILN_OBSERVE_HOST_SECONDS", "3600")
             .arg("--state-dir")
             .arg(dir.join("state"))

@@ -510,6 +510,105 @@ fn a_downtime_holds_its_groups_and_tells_what_is_still_wrong_as_it_ends() -> any
     Ok(())
 }
 
+/// One OTLP/gRPC call over HTTP/2 in the clear (prior knowledge, as an SDK's insecure channel
+/// speaks): its HTTP status, its gRPC status and message (from trailers, or headers when it has none
+/// else), and its response's bytes.
+fn grpc_call(addr: std::net::SocketAddr, path: &str, token: Option<&str>, encoding: Option<&str>, frame: Vec<u8>) -> anyhow::Result<(u16, u32, String, Vec<u8>)> {
+    let (path, token, encoding) = (path.to_owned(), token.map(str::to_owned), encoding.map(str::to_owned));
+    kiln::rt::block_on(async move {
+        use http_body_util::BodyExt as _;
+        let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (mut send, conn) = hyper::client::conn::http2::handshake(kiln::http::io::RtExec, kiln::http::io::RtIo::new(tcp)).await?;
+        let _conn = kiln::rt::spawn(conn);
+        let mut req = http::Request::builder().method("POST").uri(format!("http://127.0.0.1{path}")).header("content-type", "application/grpc").header("te", "trailers");
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        if let Some(e) = encoding {
+            req = req.header("grpc-encoding", e);
+        }
+        let resp = send.send_request(req.body(http_body_util::Full::new(bytes::Bytes::from(frame)))?).await?;
+        let status = resp.status().as_u16();
+        let head = resp.headers().clone();
+        let got = resp.into_body().collect().await?;
+        let trailers = got.trailers().cloned().unwrap_or_default();
+        let from = |k: &str| trailers.get(k).or_else(|| head.get(k)).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let code = from("grpc-status").and_then(|c| c.parse().ok()).unwrap_or(u32::MAX);
+        Ok((status, code, from("grpc-message").unwrap_or_default(), got.to_bytes().to_vec()))
+    })
+}
+
+/// A gRPC message: uncompressed (0) or compressed (1), its length, its bytes.
+fn grpc_frame(compressed: bool, msg: &[u8]) -> Vec<u8> {
+    let mut f = vec![u8::from(compressed)];
+    f.extend_from_slice(&u32::try_from(msg.len()).unwrap_or(u32::MAX).to_be_bytes());
+    f.extend_from_slice(msg);
+    f
+}
+
+/// OTLP over gRPC: the metrics and logs services' `Export`, over HTTP/2 in the clear, on the
+/// server (the ingest token as gRPC's metadata) and on a runner's loopback receiver (a port of its
+/// own), a message gzip-compressed or not. What is taken is stored; what is not is told by gRPC's
+/// status: without a token UNAUTHENTICATED, a message cut short or not OTLP INVALID_ARGUMENT, a
+/// compression it does not know UNIMPLEMENTED. (The official Python SDK's gRPC exporters were
+/// checked against it by hand: §13.)
+#[test]
+#[ignore = "starts real processes"]
+fn otlp_over_grpc_is_taken_on_the_server_and_a_runner() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut f = Fleet::new()?;
+    let port = common::free_port()?;
+    f.start_runner_with("r1", &[("KILN_OTLP_GRPC_ADDR", &format!("127.0.0.1:{port}"))])?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    let now_ns = crate_now() * 1_000_000;
+    let metrics = |name: &str, v: f64| -> anyhow::Result<Vec<u8>> {
+        let j = json!({ "resourceMetrics": [{ "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "grpc-e2e" } }] }, "scopeMetrics": [{ "metrics": [{ "name": name, "gauge": { "dataPoints": [{ "asDouble": v, "timeUnixNano": now_ns.to_string(), "attributes": [{ "key": "host", "value": { "stringValue": "g1" } }] }] } }] }] }] });
+        Ok(kiln::observe::otlp::json_to_pb(&serde_json::to_vec(&j)?, kiln::observe::otlp::Signal::Metrics)?)
+    };
+    let logs = json!({ "resourceLogs": [{ "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "grpc-e2e" } }] }, "scopeLogs": [{ "logRecords": [{ "timeUnixNano": now_ns.to_string(), "severityNumber": 17, "body": { "stringValue": "grpc rust e2e" } }] }] }] });
+    let logs = kiln::observe::otlp::json_to_pb(&serde_json::to_vec(&logs)?, kiln::observe::otlp::Signal::Logs)?;
+    let gz = |b: &[u8]| -> anyhow::Result<Vec<u8>> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b)?;
+        Ok(e.finish()?)
+    };
+    let server: std::net::SocketAddr = format!("127.0.0.1:{}", f.http).parse()?;
+    let runner: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let (m, l) = (kiln::observe::otlp::GRPC_METRICS, kiln::observe::otlp::GRPC_LOGS);
+    // Taken: the server's (with its token), plain and gzip; the runner's (no token: its loopback).
+    let ok = |r: (u16, u32, String, Vec<u8>)| r.0 == 200 && r.1 == 0 && r.3 == [0, 0, 0, 0, 0];
+    let r = grpc_call(server, m, Some(&f.admin), None, grpc_frame(false, &metrics("grpc.rust.server", 42.5)?))?;
+    anyhow::ensure!(ok(r.clone()), "the server's export: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), Some("gzip"), grpc_frame(true, &gz(&metrics("grpc.rust.gzip", 7.0)?)?))?;
+    anyhow::ensure!(ok(r.clone()), "a gzip export: {r:?}");
+    let r = grpc_call(runner, m, None, None, grpc_frame(false, &metrics("grpc.rust.runner", 3.0)?))?;
+    anyhow::ensure!(ok(r.clone()), "the runner's export: {r:?}");
+    let r = grpc_call(server, l, Some(&f.admin), None, grpc_frame(false, &logs))?;
+    anyhow::ensure!(ok(r.clone()), "a logs export: {r:?}");
+    // Not taken, and said so.
+    let r = grpc_call(server, m, None, None, grpc_frame(false, &metrics("grpc.rust.nope", 1.0)?))?;
+    anyhow::ensure!(r.1 == 16, "without a token: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), None, vec![0, 0, 0, 0, 9, 1, 2])?;
+    anyhow::ensure!(r.1 == 3, "a message cut short: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), None, grpc_frame(false, &[0xff, 0xff, 0xff]))?;
+    anyhow::ensure!(r.1 == 3 && !r.2.is_empty(), "not OTLP: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), Some("snappy"), grpc_frame(true, &[1, 2, 3]))?;
+    anyhow::ensure!(r.1 == 12, "a compression it does not know: {r:?}");
+    // What was taken is stored.
+    let start = Instant::now();
+    loop {
+        let got: Vec<Option<f64>> = ["grpc.rust.server", "grpc.rust.gzip", "grpc.rust.runner"].iter().map(|n| f.query(&format!("max:{n}{{*}}"), crate_now() - 120_000, crate_now() + 10_000).ok().and_then(|q| q.values().flatten().flatten().copied().reduce(f64::max))).collect();
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "\"grpc rust e2e\"", "from": crate_now() - 120_000, "to": crate_now() + 60_000, "limit": 5 })))?;
+        let logged = at(&found, &["records"]).as_array().is_some_and(|r| r.len() == 1 && r.first().is_some_and(|x| at(x, &["service"]) == "grpc-e2e" && at(x, &["status"]) == "error"));
+        if got == [Some(42.5), Some(7.0), Some(3.0)] && logged {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "stored: {got:?}, the record {logged}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     use hmac::{KeyInit as _, Mac as _};
     match hmac::Hmac::<sha2::Sha256>::new_from_slice(key) {
