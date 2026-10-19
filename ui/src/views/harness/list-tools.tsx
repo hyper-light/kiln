@@ -135,9 +135,12 @@ function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
   }
 }
 
+/** Agents that need you come first, whatever the sort; the sort orders the rest. */
+const needsFirst = (x: ViewRow, y: ViewRow) => Number(y.stand === "needs") - Number(x.stand === "needs");
+
 export function sortRows<T extends ViewRow>(rows: T[], sort: SortId): T[] {
   const by = sortBy(SORTS.some((s) => s.value === sort) ? sort : "newest");
-  return [...rows].sort((x, y) => by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
+  return [...rows].sort((x, y) => needsFirst(x, y) || by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
 }
 
 /** Matches the typed words (its name or title) and every facet chosen (any of a facet's options). */
@@ -176,7 +179,7 @@ function facetsOf(rows: ViewRow[], q: string, chosen: Chosen): Facet[] {
   });
 }
 
-/** The filter field and the sort, side by side (stacked on a phone). */
+/** The filter field and the sort, side by side (on a phone too). */
 export function ListBar({ rows, q, onQuery, view, onView }: { rows: ViewRow[]; q: string; onQuery: (q: string) => void; view: ListView; onView: (v: ListView) => void }) {
   const facets = React.useMemo(() => facetsOf(rows, q, view.facets), [rows, q, view.facets]);
   return (

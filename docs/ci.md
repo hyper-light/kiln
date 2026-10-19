@@ -4238,7 +4238,9 @@ channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
   - Rules come from trunk's `.kiln/notify.yaml` and the server's `[[ci.notify]]`, as written
     above: `on`, `where` (an expression over `github` and `run`), `to` and `throttle`.
   - Events so far: `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and
-    `approval.waiting`, announced once per leg.
+    `approval.waiting`, announced once per leg; and an agent's `agent.needs_you`,
+    `agent.finished`, `agent.stopped` and `agent.paused` (docs/notifications.md), which only the
+    server's rules take, `where` reading `agent`.
   - Channels are W11-R06's integration kinds (`slack`, `discord`, `teams`, `telegram`,
     `pagerduty`, `opsgenie`, `webhook`), named `kind:target`: the integration called `target`,
     or the first the repository may use, with `target` as its channel or chat.
@@ -4259,6 +4261,8 @@ channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
     - `run`, `job`, `agent`, `queue`, `cd_plan`, `cd_apps` and `cd_app_deleted`, as kiln's own
       clients hear them;
     - R06's `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and `approval.waiting`;
+    - `machine.battery_low`, and an agent's `agent.needs_you`, `agent.finished`, `agent.stopped`
+      and `agent.paused` (docs/notifications.md), to server-wide subscriptions;
     - or `*`, which is all of them but the busy `queue`.
 
     Naming anything else is refused. Sign-in flows, terminals and host samples never leave.

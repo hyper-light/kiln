@@ -24,6 +24,7 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongSession, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handlePush, pushHeard } from "./push.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -459,6 +460,7 @@ function historicalRun(created: number, seed: number) {
 /* ------------------------------------------------------------------ */
 
 function emit(ev: ServerEvent) {
+  pushHeard(ev);
   const msg = JSON.stringify(ev);
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
@@ -1173,6 +1175,7 @@ const MIME: Record<string, string> = {
   ".woff": "font/woff",
   ".png": "image/png",
   ".json": "application/json",
+  ".webmanifest": "application/manifest+json",
   ".ico": "image/x-icon",
 };
 
@@ -1575,6 +1578,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
     if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;

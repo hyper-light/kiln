@@ -134,6 +134,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("agent-screens", h => crate::harness::screen::watch(h));
         child!("goal-stacks", h => crate::goals::run(h));
         child!("harness", h => crate::harness::registry::Registry::run_local(h));
+        child!("push", h => crate::push::run(h));
         child!("gitops-discover", h => crate::gitops::discover_loop(h));
         child!("gitops-poll", h => crate::gitops::poll_loop(h));
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
