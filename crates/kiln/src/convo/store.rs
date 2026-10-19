@@ -34,11 +34,11 @@ const SQUEEZE_BATCH: usize = 2000;
 const SQUEEZE_EVERY: Duration = Duration::from_millis(200);
 /// This often, while the writer has nothing else to do, it looks after the file: the records of
 /// sessions that ended long enough ago go, this many lines at a time (as often as compressing
-/// goes); then the file is made compact if that and compressing left enough of it free.
+/// goes). It never makes the file compact by itself ([`Engine::compact`]): copying a store of
+/// several GB holds the writer for minutes and takes more memory than a server may have (on the
+/// first server, it was killed for it over and over).
 const LOOK_EVERY: Duration = Duration::from_secs(3600);
 const PRUNE_BATCH: usize = 2000;
-/// Free pages that make compacting worth it (and a third of the file).
-const COMPACT_MIN_FREE: u64 = 256 << 20;
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -350,8 +350,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
     // Looking after the file while nothing else waits, once compressing is done and then every
-    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go, then the
-    // file is made compact if enough of it is free.
+    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go.
     let (mut looking, mut pruned, mut look_at) = (false, 0usize, Instant::now());
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
@@ -404,17 +403,6 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                                 tracing::info!(lines = pruned, days = keep_closed.map_or(0, |k| k.as_secs() / 86_400), "conversation store: the records of sessions that ended long ago were let go");
                             }
                             (looking, pruned, look_at) = (false, 0, Instant::now() + LOOK_EVERY);
-                            engine = match engine.compact(COMPACT_MIN_FREE) {
-                                Ok((e, Some((before, after)))) => {
-                                    tracing::info!(before, after, "conversation store: its file was made compact");
-                                    e
-                                }
-                                Ok((e, None)) => e,
-                                Err(e) => {
-                                    tracing::error!(error = %format!("{e:#}"), "conversation store: the compact file couldn't be opened; the store stops until kiln starts again, which finishes it");
-                                    return;
-                                }
-                            };
                         }
                         Ok(n) => (looking, pruned) = (true, pruned.saturating_add(n)),
                         Err(e) => {
@@ -453,6 +441,13 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
     let dir = tempfile::tempdir()?;
     let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), None)?;
     Ok((dir, store))
+}
+
+/// A store whose writer has stopped: everything asked of it fails at once, for tests.
+#[cfg(test)]
+pub fn stopped() -> Store {
+    let (tx, _) = mpsc::sync_channel(1);
+    Store { tx, id: "stopped".into(), dropped: Arc::default(), watchers: Arc::default() }
 }
 
 #[cfg(test)]

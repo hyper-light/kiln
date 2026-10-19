@@ -1,9 +1,11 @@
 /**
  * Mission control's one quiet line about notifications (docs/notifications.md): when this device
  * could have them and doesn't, it offers to turn them on, right here, in one step (the browser asks
- * for permission on that click). "Not now" puts it away in this browser.
+ * for permission on that click). When that fails, it says why and links to Settings. "Not now" puts
+ * it away in this browser.
  */
 import * as React from "react";
+import { Link } from "@/lib/router";
 import { pushDevicesRes, pushStateRes, thisDeviceRes, turnOn } from "@/api/push";
 import { useRes } from "@/lib/data";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
@@ -36,9 +38,15 @@ export function PushOffer() {
       <span className="ms-offer-text" title="Turned on, this device hears when an agent needs you, finishes, stops or pauses.">
         {problem ?? "Notifications are off here."}
       </span>
-      <button type="button" className="ms-link" disabled={busy} onClick={() => void go()}>
-        Turn them on
-      </button>
+      {problem ? (
+        <Link to="/settings#device.notifications" className="ms-link">
+          Settings
+        </Link>
+      ) : (
+        <button type="button" className="ms-link" disabled={busy} onClick={() => void go()}>
+          Turn them on
+        </button>
+      )}
       <button type="button" className="ms-link ms-offer-not" onClick={() => setDismissed(true)}>
         Not now
       </button>

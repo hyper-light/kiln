@@ -150,7 +150,7 @@ where
 /// Serve an HTTP/2 connection: every request at once over the one connection, each its own task.
 /// Requests reach the handler shaped as HTTP/1.1's ([`as_http1`]). WebSockets stay HTTP/1.1's: no
 /// extended CONNECT is offered, so a browser opens an HTTP/1.1 connection for them.
-async fn serve_h2<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
+pub(crate) async fn serve_h2<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     H: Handler,
