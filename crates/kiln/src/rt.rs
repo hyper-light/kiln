@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bytes::Bytes;
+use futures::FutureExt as _;
 use hyper_rt::{RtError, Runtime, RuntimeConfig, SlotHolder, TaskId};
 
 // ------------------------------------------------------------------------------------- sizing
@@ -266,11 +267,17 @@ where
     rt()?;
     let (tx, mut rx) = hyper_rt::sync::oneshot::<anyhow::Result<T>>().map_err(|e| anyhow::anyhow!("oneshot: {e}"))?;
     spawn_boxed(Box::pin(async move {
-        let _ = tx.send(fut.await);
+        // A panic says what it was (a failed assertion, in a test), rather than leaving it lost on
+        // the thread that ran it.
+        let out = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(r) => r,
+            Err(p) => Err(anyhow::anyhow!("the task panicked: {}", crate::sup::panic_message(p.as_ref()))),
+        };
+        let _ = tx.send(out);
     }));
     match rx.blocking_recv() {
         Ok(r) => r,
-        Err(_) => anyhow::bail!("the task ended without a result (it panicked or could not start)"),
+        Err(_) => anyhow::bail!("the task ended without a result (it could not start)"),
     }
 }
 

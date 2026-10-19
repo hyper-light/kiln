@@ -506,18 +506,35 @@ pub struct Status {
 }
 
 /// A port for a test to listen on (TCP and UDP): below Linux's ephemeral range, where no
-/// connection's own end and no other test's `bind(0)` lands, and never one this process handed out
-/// before. Taking a port from `bind(0)` and binding it again races every test running alongside.
+/// connection's own end and no other test's `bind(0)` lands, never one this process handed out
+/// before, and claimed for the process's life by a lock file, so test suites running side by side
+/// (several at once on a busy machine) never take the same one. The OS lets go of the lock when the
+/// process ends. Taking a port from `bind(0)` and binding it again races every test alongside.
 #[cfg(test)]
 pub(crate) fn test_port() -> std::io::Result<u16> {
     use std::sync::atomic::{AtomicU16, Ordering};
+    const LOW: u16 = 20_000;
+    const HIGH: u16 = 32_000;
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let start = 20_000 + u16::try_from(std::process::id() % 10_000).unwrap_or(0);
+    static CLAIMS: parking_lot::Mutex<Vec<std::fs::File>> = parking_lot::Mutex::new(Vec::new());
+    let dir = std::env::temp_dir().join("kiln-test-ports");
+    std::fs::create_dir_all(&dir)?;
+    let start = LOW + u16::try_from(std::process::id() % 10_000).unwrap_or(0);
     let _ = NEXT.compare_exchange(0, start, Ordering::SeqCst, Ordering::SeqCst);
-    for _ in 0..500 {
-        let port = NEXT.fetch_add(1, Ordering::SeqCst);
+    for _ in 0..usize::from(HIGH - LOW) {
+        let mut port = NEXT.fetch_add(1, Ordering::SeqCst);
+        if !(LOW..HIGH).contains(&port) {
+            NEXT.store(LOW + 1, Ordering::SeqCst);
+            port = LOW;
+        }
+        // Claimed by another test process (it holds the lock for its life): the next.
+        let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(format!("{port}.lock")))?;
+        if claim.try_lock().is_err() {
+            continue;
+        }
         let free = std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok();
         if free {
+            CLAIMS.lock().push(claim);
             return Ok(port);
         }
     }
