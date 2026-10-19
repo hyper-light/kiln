@@ -16,6 +16,7 @@ import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
+import { FilesContext, type ConversationFiles } from "./files";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, formatThought, thinkingWords, type BeamStatus } from "./signals";
@@ -37,19 +38,24 @@ function Contexts({
   signIn,
   findNow,
   tasks,
+  files,
   children,
 }: {
   asking: ReadonlySet<string>;
   signIn: React.ContextType<typeof SignIn>;
   findNow: FindNow | null;
   tasks: Task[];
+  /** The files its messages mention (files.tsx). */
+  files: ConversationFiles;
   children: React.ReactNode;
 }) {
   return (
     <Asking.Provider value={asking}>
       <SignIn.Provider value={signIn}>
         <Tasks.Provider value={tasks}>
-          <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+          <FilesContext.Provider value={files}>
+            <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+          </FilesContext.Provider>
         </Tasks.Provider>
       </SignIn.Provider>
     </Asking.Provider>
@@ -461,7 +467,7 @@ function ItemView({ item, cwd, onOpenTask, effort }: { item: Item; cwd: string; 
       // A tap (or a pointer resting on it) shows its copy icon.
       return (
         <div className="hx-said" data-ev={item.event.id} tabIndex={-1}>
-          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} />
+          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} />
           {!item.event.streaming && item.event.text && <CopyMsg text={item.event.text} label="Copy what it said" className="hx-said-copy" />}
         </div>
       );
@@ -571,7 +577,7 @@ const TurnView = React.memo(function TurnView({
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
-          <Prose text={turn.outcome.text} />
+          <Prose text={turn.outcome.text} seq={turn.outcome.seq} />
           <div className="hx-outcome-foot">
             {edits.length > 0 && (
               <span>
@@ -816,6 +822,9 @@ export const Timeline = React.memo(function Timeline({
   const events = useSession(store, (s) => s.events);
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
+  // The files its messages mention, as the server kept them: shown where they're mentioned.
+  const keptFiles = useSession(store, (s) => s.files);
+  const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
   const going = parent ? task?.status === "running" || task?.status === "pending" : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again.
@@ -963,7 +972,7 @@ export const Timeline = React.memo(function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks}>
+    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
       {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
       <div
         ref={keeper.ref}

@@ -24,7 +24,7 @@ import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import {
   AUTOJOIN,
@@ -1257,6 +1257,8 @@ const server = http.createServer(async (req, res) => {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));
       return json(res, 200, { ok: true });
     }
+    // ---- files the long session's messages mention ----
+    if (handleLongFiles(p, url, req, res)) return;
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

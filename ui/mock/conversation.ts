@@ -20,9 +20,11 @@
  *   MOCK_LIVE_STEPS=n   the turn still going has taken n steps already (a long turn of an agent
  *                       working on its own: a note and a command each)
  */
-import { gzipSync } from "node:zlib";
+import { createHash } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { crc32, deflateSync, gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
-import type { AgentInfo, HEvent, Meta, SaidHit, State } from "../src/api/harness.ts";
+import type { AgentInfo, HEvent, KeptFile, Meta, SaidHit, State } from "../src/api/harness.ts";
 
 const ID = "demo-long";
 /** A fixed start, so the history is the same on every run. */
@@ -153,6 +155,100 @@ for (let i = 1; i <= TURNS; i++) {
 
 // The turn still going.
 const LIVE_AT = T0 + (TURNS + 1) * 90_000;
+
+/* ---- files a message mentions (docs/agents.md, "Files in messages") ---- */
+
+/** A PNG of a phone's head, drawn here: bands like the console's, so a check can see it. */
+function phonePng(w: number, h: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const head = Buffer.alloc(4);
+    head.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body) >>> 0);
+    return Buffer.concat([head, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr.set([8, 2, 0, 0, 0], 8);
+  const rows = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y++) {
+    const band = y < 140 ? [12, 13, 16] : y < 190 ? [26, 24, 34] : (y >> 5) % 2 ? [16, 17, 20] : [20, 21, 25];
+    for (let x = 0; x < w; x++) rows.set(band, y * (w * 3 + 1) + 1 + x * 3);
+  }
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", deflateSync(rows)), chunk("IEND", Buffer.alloc(0))]);
+}
+const MOCK_DIR = "/tmp/kiln-mock";
+const PHONE = phonePng(390, 844);
+const NOTES = Buffer.from("# Notes\n\n- The head's clock holds the last turn's length.\n- The usage panel reads Cost $4.21.\n");
+const RUN_LOG = Buffer.from(Array.from({ length: 40 }, (_, i) => `[${i}] test http::client::retry_${i} ... ok`).join("\n") + "\n");
+const sha256 = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+add({ id: "L-u-files", at: LIVE_AT - 60_000, kind: "user", text: "Show me the phone view, and the notes." });
+const filesSaid = add({
+  id: "L-a-files",
+  at: LIVE_AT - 50_000,
+  kind: "assistant",
+  text: `Here's the head at a phone's width:\n\n![phone view](${MOCK_DIR}/phone.png)\n\nThe notes are in [notes](${MOCK_DIR}/notes.md), the run's log is ${MOCK_DIR}/run.log, and the recording was \`${MOCK_DIR}/flow.webm\`.`,
+});
+const FILES_AT = LIVE_AT - 120_000;
+/** What the server kept of them: the picture and the notes (by content), the log only listed (read now), the recording gone. */
+const kept: KeptFile[] = [
+  { path: `${MOCK_DIR}/phone.png`, seq: filesSaid.seq, meta: { size: PHONE.length, mtime: FILES_AT, mime: "image/png", width: 390, height: 844 }, sha: sha256(PHONE) },
+  { path: `${MOCK_DIR}/notes.md`, seq: filesSaid.seq, meta: { size: NOTES.length, mtime: FILES_AT, mime: "text/markdown; charset=utf-8" }, sha: sha256(NOTES) },
+  { path: `${MOCK_DIR}/run.log`, seq: filesSaid.seq, meta: { size: RUN_LOG.length, mtime: FILES_AT, mime: "text/plain; charset=utf-8" } },
+  { path: `${MOCK_DIR}/flow.webm`, seq: filesSaid.seq, error: `${MOCK_DIR}/flow.webm isn't there any more` },
+];
+const blobs = new Map<string, Buffer>([
+  [sha256(PHONE), PHONE],
+  [sha256(NOTES), NOTES],
+]);
+const onDisk = new Map<string, Buffer>([
+  [`${MOCK_DIR}/phone.png`, PHONE],
+  [`${MOCK_DIR}/notes.md`, NOTES],
+  [`${MOCK_DIR}/run.log`, RUN_LOG],
+]);
+
+/** The long session's files, as the server serves them: a kept copy by its content (for good), or
+ *  a mentioned path read now; both take `Range`. */
+export function handleLongFiles(path: string, url: URL, req: IncomingMessage, res: ServerResponse): boolean {
+  const byContent = /^\/api\/harness\/sessions\/demo-long\/files\/([0-9a-f]{64})$/.exec(path);
+  if (!byContent && path !== "/api/harness/sessions/demo-long/file") return false;
+  const sha = byContent?.[1];
+  const asked = url.searchParams.get("path") ?? "";
+  const entry = kept.find((k) => (sha ? k.sha === sha : k.path === asked));
+  const body = sha ? blobs.get(sha) : onDisk.get(asked);
+  if (!entry?.meta || !body) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: entry?.error ?? "no message of this conversation mentions that file" }));
+    return true;
+  }
+  const size = body.length;
+  let [start, end] = [0, size - 1];
+  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
+  if (range) {
+    if (range[1] === "") start = Math.max(0, size - Number(range[2]));
+    else {
+      start = Number(range[1]);
+      if (range[2] !== "") end = Math.min(end, Number(range[2]));
+    }
+    if (start > end) {
+      res.writeHead(416, { "Content-Range": `bytes */${size}` });
+      res.end();
+      return true;
+    }
+  }
+  res.writeHead(range ? 206 : 200, {
+    "Content-Type": entry.meta.mime,
+    "Content-Length": end - start + 1,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": sha ? "private, max-age=31536000, immutable" : "private, no-cache",
+    ...(range ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
+  });
+  res.end(body.subarray(start, end + 1));
+  return true;
+}
+
 add({ id: "L-u-live", at: LIVE_AT, kind: "user", text: "Now do the same for the websocket reconnects, and keep going until the suite is green." });
 // A long turn already under way: what it said and ran, step after step.
 for (let k = 1; k <= LIVE_STEPS; k++) {
@@ -476,6 +572,8 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
     { t: "meta", meta },
     { t: "state", state: first },
   ];
+  // What's kept of the files its messages mention, ahead of the events (MOCK_FILES=0: none yet).
+  if (process.env.MOCK_FILES !== "0") frames.push({ t: "files", files: kept });
   // Events in batches, as the server cuts them (by size); the last frame says it's complete.
   for (let i = 0; i < events.length; i += 120) frames.push({ t: "events", events: events.slice(i, i + 120) });
   if (process.env.MOCK_NO_SYNCED !== "1") frames.push({ t: "synced" });

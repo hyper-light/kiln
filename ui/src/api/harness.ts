@@ -249,6 +249,36 @@ export interface ExitInfo {
 }
 
 /** One file's change since the agent first touched it (the server keeps it cumulative). */
+/** A file as its machine had it (`crate::harness::files::Meta`). */
+export interface FileMeta {
+  size: number;
+  /** Unix ms. */
+  mtime: number;
+  mime: string;
+  /** In pixels as it shows, for a picture or a recording whose start says. */
+  width?: number;
+  height?: number;
+}
+
+/**
+ * A file a finished message mentioned, as the server kept it (`crate::harness::kept::Kept`): the
+ * file as it was when the message (`seq`) was done. `sha`: a copy is kept (served for good);
+ * without one it's read from its machine when someone looks. `error`: why it couldn't be read.
+ */
+export interface KeptFile {
+  path: string;
+  seq: number;
+  meta?: FileMeta;
+  sha?: string;
+  error?: string;
+}
+
+/** A conversation's kept files with these added (each path and message once). */
+function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
+  const fresh = added.filter((a) => !was.some((w) => w.path === a.path && w.seq === a.seq));
+  return fresh.length ? [...was, ...fresh] : was;
+}
+
 export interface FileChange {
   path: string;
   created?: boolean;
@@ -726,6 +756,8 @@ export type Command =
 export type Update =
   | { t: "open"; info: AgentInfo }
   | { t: "changes"; files: FileChange[] }
+  /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
+  | { t: "files"; files: KeptFile[] }
   | { t: "error"; error: string }
   | { t: "closed" }
   | { t: "state"; state: State }
@@ -853,6 +885,8 @@ export interface Snapshot {
   events: HEvent[];
   /** The changeset, file by file (null until the server sends one). */
   changes: FileChange[] | null;
+  /** Files its finished messages mention, as the server kept them. */
+  files: KeptFile[];
   error: string | null;
   /** The first snapshot is in: until then there's nothing to show but a loader. */
   ready: boolean;
@@ -886,7 +920,7 @@ export function lastTurnFrom(s: Snapshot): number | null {
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null, ranFrom: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -969,6 +1003,7 @@ interface Incoming {
   meta: Meta | null;
   state: State | null;
   changes: FileChange[] | null;
+  files: KeptFile[] | null;
   byId: Map<string, HEvent>;
   /** Some of its events came. */
   events: boolean;
@@ -1301,7 +1336,7 @@ export class SessionStore {
 
   private begin(info: AgentInfo | null, told: boolean) {
     window.clearTimeout(this.hold);
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, byId: new Map(), events: false, told };
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, files: null, byId: new Map(), events: false, told };
     this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
     this.wait();
   }
@@ -1321,6 +1356,9 @@ export class SessionStore {
         break;
       case "changes":
         inc.changes = u.files;
+        break;
+      case "files":
+        inc.files = withFiles(inc.files ?? [], u.files);
         break;
       case "events":
         inc.events = true;
@@ -1361,6 +1399,7 @@ export class SessionStore {
       state: share(s.state, inc.state),
       ranFrom: inc.state?.turn_started ?? s.ranFrom,
       changes: share(s.changes, inc.changes),
+      files: inc.files ? share(s.files, inc.files) : s.files,
       error: null,
       ready: true,
     };
@@ -1393,6 +1432,9 @@ export class SessionStore {
     switch (u.t) {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
+        break;
+      case "files":
+        this.snap = { ...this.snap, files: withFiles(this.snap.files, u.files) };
         break;
       case "state":
       case "state_patch": {

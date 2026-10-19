@@ -581,6 +581,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
         (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
         (&Method::POST, ["api", "conversations", "restore"]) => conversation_restore(&hub, req).await,
+        // Files the conversation's messages mention: kept by the server, or read on its machine now.
+        (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => harness_kept_file(&hub, id, sha, &req).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "file"]) => harness_file(&hub, id, q.get("path").cloned(), &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -591,6 +594,185 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+// ------------------------------------------------------------------ files in conversations
+
+/// The part of a `size`-byte file a request asks for (`Range: bytes=…`): `Ok(None)` for all of it,
+/// `Err` when it asks for none of it.
+fn byte_range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(v) = srv::header_str(req, &header::RANGE) else { return Ok(None) };
+    let Some(spec) = v.trim().strip_prefix("bytes=") else { return Ok(None) };
+    // More than one part: all of it (a player asks for one).
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let (a, b) = spec.split_once('-').ok_or(())?;
+    let last = size.checked_sub(1).ok_or(())?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        ("", n) => {
+            let n: u64 = n.parse().map_err(|_| ())?;
+            if n == 0 {
+                return Err(());
+            }
+            (size.saturating_sub(n), last)
+        }
+        (s, "") => (s.parse().map_err(|_| ())?, last),
+        (s, e) => (s.parse().map_err(|_| ())?, e.parse::<u64>().map_err(|_| ())?.min(last)),
+    };
+    if start > end {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+/// `Content-Disposition` for a file shown in place, under its own name.
+fn inline_named(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut enc = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+            enc.push(char::from(b));
+        } else {
+            enc.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("inline; filename*=UTF-8''{enc}")
+}
+
+/// A file shown in a conversation: its type (one that can run code, SVG or HTML, runs none: it's
+/// sandboxed, away from the session), how long a copy holds, and which part of it this is.
+fn file_response(meta: &crate::harness::files::Meta, path: &str, etag: &str, immutable: bool, range: Option<(u64, u64)>, body: srv::Body) -> Response {
+    let (status, len) = match range {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, b - a + 1),
+        None => (StatusCode::OK, meta.size),
+    };
+    let mime = if meta.mime.is_empty() { "application/octet-stream" } else { meta.mime.as_str() };
+    let mut r = srv::response(status, mime, body);
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(len));
+    h.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static(if immutable { "private, max-age=31536000, immutable" } else { "private, no-cache" }));
+    if let Ok(v) = header::HeaderValue::from_str(etag) {
+        h.insert(header::ETAG, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(&inline_named(path)) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if let Some((a, b)) = range
+        && let Ok(v) = header::HeaderValue::from_str(&format!("bytes {a}-{b}/{}", meta.size))
+    {
+        h.insert(header::CONTENT_RANGE, v);
+    }
+    if mime.starts_with("image/svg") || mime.starts_with("text/html") || mime.starts_with("text/xml") {
+        h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox"));
+    }
+    r
+}
+
+/// The answer when a viewer already has this version (`If-None-Match`).
+fn unchanged(req: &Request, etag: &str, immutable: bool) -> Option<Response> {
+    let have = srv::header_str(req, &header::IF_NONE_MATCH)?;
+    if !have.split(',').any(|t| t.trim() == etag || t.trim() == "*") {
+        return None;
+    }
+    let mut r = srv::status(StatusCode::NOT_MODIFIED);
+    if let Ok(v) = header::HeaderValue::from_str(etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static(if immutable { "private, max-age=31536000, immutable" } else { "private, no-cache" }));
+    Some(r)
+}
+
+/// A range past the end of a `size`-byte file.
+fn unsatisfiable(size: u64) -> Response {
+    let mut r = srv::status(StatusCode::RANGE_NOT_SATISFIABLE);
+    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes */{size}")) {
+        r.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
+    r
+}
+
+/// `GET /api/harness/sessions/:id/files/:sha`: a file one of the conversation's messages
+/// mentioned, as the server kept it (`crate::harness::kept`). That never changes: cached for good.
+async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -> R {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let gone = || err(StatusCode::NOT_FOUND, "no such file in this conversation");
+    let kept = hub.harness.keeper.find(id, sha).ok_or_else(gone)?;
+    let blob = hub.harness.keeper.blob(sha).ok_or_else(gone)?;
+    let meta = kept.meta.clone().unwrap_or_default();
+    let etag = format!("\"{}\"", sha.to_ascii_lowercase());
+    if let Some(r) = unchanged(req, &etag, true) {
+        return Ok(r);
+    }
+    let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+    let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    let size = meta.size;
+    crate::rt::spawn(async move {
+        let Ok(Ok(mut file)) = crate::rt::blocking(move || std::fs::File::open(&blob)).await else { return };
+        let mut at = start;
+        while size > 0 && at <= end {
+            let want = (end - at + 1).min(256 * 1024);
+            let read = crate::rt::blocking(move || -> std::io::Result<(std::fs::File, Vec<u8>)> {
+                file.seek(SeekFrom::Start(at))?;
+                let mut buf = Vec::new();
+                (&mut file).take(want).read_to_end(&mut buf)?;
+                Ok((file, buf))
+            })
+            .await;
+            let Ok(Ok((f, buf))) = read else { return };
+            if buf.is_empty() {
+                return;
+            }
+            file = f;
+            at += buf.len() as u64;
+            if tx.send(Bytes::from(buf)).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(file_response(&meta, &kept.path, &etag, true, range, srv::channel_body(rx)))
+}
+
+/// `GET /api/harness/sessions/:id/file?path=`: a file one of the conversation's messages mentions,
+/// read on its machine now: one that isn't kept (too big, past a budget, from before kiln kept
+/// files), in pieces as the viewer takes it.
+async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
+    use crate::harness::kept::piece;
+    let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
+    let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    // What it is, and how big, before the part asked for.
+    let (answer, _) = piece(hub, &location, id, &path, 0, 0)
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{e:#}")))?
+        .ok_or_else(|| err(StatusCode::NOT_IMPLEMENTED, "this agent's machine runs a kiln too old to show files: upgrade its runner"))?;
+    let Some(meta) = answer.meta else { return Err(err(StatusCode::NOT_FOUND, answer.error.unwrap_or_else(|| "it can't be read".to_owned()))) };
+    let etag = format!("W/\"{}-{}\"", meta.size, meta.mtime);
+    if let Some(r) = unchanged(req, &etag, false) {
+        return Ok(r);
+    }
+    let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+    let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    let (tx, rx) = async_channel::bounded::<Bytes>(2);
+    let (h, session, p, m) = (hub.clone(), id.to_owned(), path.clone(), meta.clone());
+    crate::rt::spawn(async move {
+        let mut at = start;
+        while m.size > 0 && at <= end {
+            let want = u32::try_from((end - at + 1).min(u64::from(crate::harness::files::PIECE))).unwrap_or(crate::harness::files::PIECE);
+            let Ok(Some((a, d))) = piece(&h, &location, &session, &p, at, want).await else { return };
+            // It changed on the way: stop, and the viewer asks again.
+            if a.meta.as_ref().is_none_or(|n| n.size != m.size || n.mtime != m.mtime) || d.is_empty() {
+                return;
+            }
+            at += d.len() as u64;
+            if tx.send(Bytes::from(d)).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(file_response(&meta, &path, &etag, false, range, srv::channel_body(rx)))
 }
 
 /// A front-door handler's answer as the API's.
