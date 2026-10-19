@@ -110,6 +110,9 @@ pub struct Spec {
     /// For a `docker` executor's container: the host user (uid, gid) its steps run as, through
     /// the image's `runner` user.
     pub user: Option<(u32, u32)>,
+    /// A test build's full disk (docs/ci.md W22-AC04): the job container's workspace, a volume of
+    /// this many bytes in place of the host's directory.
+    pub workspace_size: Option<u64>,
 }
 
 /// The group that owns the host's Docker socket.
@@ -720,8 +723,14 @@ impl Containers {
                         args.extend([s("--group-add"), gid.to_string()]);
                     }
                 }
-                for m in map.mounts() {
-                    args.extend([s("-v"), m]);
+                for (host, inside) in &map.0 {
+                    // A workspace of its own size isn't the host's directory.
+                    if spec.workspace_size.is_none() || inside != workdir {
+                        args.extend([s("-v"), format!("{}:{inside}", host.to_string_lossy())]);
+                    }
+                }
+                if let Some(bytes) = spec.workspace_size {
+                    args.extend([s("--mount"), format!("type=tmpfs,destination={workdir},tmpfs-size={bytes},tmpfs-mode=1777")]);
                 }
                 if !shared {
                     for p in &spec.ports {

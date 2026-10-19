@@ -260,6 +260,10 @@ pub const CAP_PORTS: u32 = 1 << 25;
 /// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`,
 /// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`).
 pub const CAP_POOLS: u32 = 1 << 26;
+/// [`AgentMsg::Build`] capability: the runner keeps a job's result and its events (each with its
+/// `seq`) until the server says it has the result ([`ServerMsg::Received`]), and sends them again
+/// after a reconnect, so what was in flight as the connection dropped isn't lost.
+pub const CAP_RECEIVED: u32 = 1 << 27;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -467,6 +471,12 @@ pub enum ServerMsg {
     /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
     /// variants by index.
     Executor { json: String },
+    /// The server has job `job`'s result ([`AgentMsg::JobFinished`]): the runner forgets it and
+    /// the job's events. With no `job`, said as the server hears the runner's capabilities: it
+    /// takes each event once (by its `seq`), so the runner may send them again after a reconnect.
+    /// Only to runners announcing [`CAP_RECEIVED`]. Appended last: postcard encodes variants by
+    /// index.
+    Received { job: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -769,6 +779,17 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&b)?, said);
         let others = CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
         assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
+        Ok(())
+    }
+
+    #[test]
+    fn receipts_are_appended_after_pool_executors() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::Executor { json: "{}".into() })?;
+        let got = ServerMsg::Received { job: "j".into() };
+        let b = encode(&got)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "ServerMsg::Received comes right after Executor");
+        assert_eq!(decode::<ServerMsg>(&b)?, got);
+        assert!(CAP_RECEIVED.is_power_of_two() && CAP_RECEIVED > CAP_POOLS);
         Ok(())
     }
 

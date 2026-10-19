@@ -28,6 +28,9 @@ use crate::terminal::{self, PtyOut, PtySession};
 
 /// Bytes of output/results held while disconnected before the oldest log chunks are shed.
 const UPLINK_BUFFER: usize = 128 << 20;
+/// How long a job's result is kept for a server that never says it has it: well past the grace a
+/// runner gets to reconnect, after which the server has given its legs up.
+const UNRECEIVED_FOR: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -780,7 +783,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
+    // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
+    // sent again after a reconnect, so one sent as the connection dropped isn't lost.
+    let mut unreceived: HashMap<String, (Instant, Vec<u8>)> = HashMap::new();
+    // Each job's events (`AgentMsg::JobEvent`, numbered by their `seq`), encoded, until its result
+    // is received, by job: sent again after a reconnect too, to a server that takes each once (it
+    // said so: `receipts`). The count goes on after (a kept leg's step rerun, W17-R04).
+    let mut journal: HashMap<String, (Instant, u64, Vec<Vec<u8>>)> = HashMap::new();
+    let mut receipts = false;
     let mut connected = false;
+    // The server has taken this connection's Hello (it said Welcome). Logs, on a lane of their own,
+    // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
+    // with them, to come after what was held.
+    let mut welcomed = false;
     let mut dial_backoff = Duration::from_millis(500);
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
@@ -949,8 +964,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     };
 
     loop {
-        // Ephemeral agents leave once their one job is done and everything is delivered.
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() {
+        // Ephemeral agents leave once their one job is done and everything is delivered: its
+        // result received, or given 30 s (a server older than receipts never says).
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
@@ -1447,6 +1463,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // and dial directly; the tunnel stays open until that connection is up.
                 if paths.tick(connected, Instant::now()) {
                     connected = false;
+                    welcomed = false;
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
@@ -1470,13 +1487,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                // Legs that finished while it was away are its own until their results, waiting in
-                // the buffer, arrive.
+                // Jobs whose results the server hasn't said it has are its own still: they come
+                // again below. A server that never says (one older than receipts) has them for a
+                // while only.
+                unreceived.retain(|_, (at, _)| at.elapsed() < UNRECEIVED_FOR);
                 let mut running: Vec<String> = jobs.keys().cloned().collect();
-                running.extend(buffer.iter().filter(|(lane, ..)| *lane == LANE_CONTROL).filter_map(|(_, _, d)| match proto::decode::<AgentMsg>(d) {
-                    Ok(AgentMsg::JobFinished(r)) => Some(r.job),
-                    _ => None,
-                }));
+                running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
                 let msg = AgentMsg::Hello(hello(running));
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
@@ -1531,10 +1547,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Up);
                 }
-                while let Some((lane, kind, data)) = buffer.pop_front() {
-                    buffered = buffered.saturating_sub(data.len());
-                    net.send(SERVER_PEER, lane, kind, data).await;
-                }
                 // How the front door does, after everything older (an older server skips it).
                 front_door_sent = None;
                 if let Some(json) = front_door.as_ref().and_then(crate::frontdoor::runner::Handle::latest)
@@ -1556,6 +1568,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     at_once = paths.dial_failed(now);
                 }
                 connected = false;
+                welcomed = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -1598,6 +1611,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 match msg {
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        // What waited for the connection, in order: what was held while it was
+                        // down, the jobs' events again, then their results not yet received.
+                        welcomed = true;
+                        while let Some((lane, kind, data)) = buffer.pop_front() {
+                            buffered = buffered.saturating_sub(data.len());
+                            net.send(SERVER_PEER, lane, kind, data).await;
+                        }
+                        if receipts {
+                            for (_, _, events) in journal.values() {
+                                for data in events {
+                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                                }
+                            }
+                        }
+                        for (_, data) in unreceived.values() {
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                        }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
                         if !o.ephemeral && !retiring {
@@ -1658,6 +1688,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             anyhow::bail!("refused: {reason}");
                         }
                         connected = false;
+                        welcomed = false;
                         if let Some(s) = &sync {
                             s.connected(false);
                         }
@@ -2166,6 +2197,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
+                        // A new attempt: its events count from one.
+                        journal.remove(&id);
+                        unreceived.remove(&id);
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -2317,6 +2351,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::KeepExtend { job, minutes } => {
                         crate::runner::kept::extend(&job, minutes);
                     }
+                    ServerMsg::Received { job } if job.is_empty() => receipts = true,
+                    ServerMsg::Received { job } => {
+                        unreceived.remove(&job);
+                        if let Some((_, _, events)) = journal.get_mut(&job) {
+                            events.clear();
+                        }
+                    }
                     ServerMsg::JobRerunStep { job, step, idx } => {
                         if !crate::runner::runtime::rerun_step(&job, step, idx) {
                             tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
@@ -2353,7 +2394,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 };
                 uplink.0.send(Up::Term(msg)).await.ok();
             }
-            Ev::Up(up) => {
+            Ev::Up(mut up) => {
+                // A job's event: numbered, and kept until the job's result is received.
+                let mut journaled = None;
+                if let Up::Msg(AgentMsg::JobEvent { job, json }) = &mut up {
+                    let (at, seq, _) = journal.entry(job.clone()).or_insert_with(|| (Instant::now(), 0, Vec::new()));
+                    *at = Instant::now();
+                    *seq += 1;
+                    if let Some(rest) = json.strip_prefix('{') {
+                        *json = format!("{{\"seq\":{seq}{}{rest}", if rest.trim_start().starts_with('}') { "" } else { "," });
+                    }
+                    journaled = Some(job.clone());
+                }
                 let (lane, kind, data) = match &up {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
@@ -2366,13 +2418,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
-                if connected {
+                if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
+                    events.push(data.clone());
+                }
+                // Logs and jobs' messages wait for the Welcome too, and come after what waited.
+                if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
                     match &delay_line {
                         Some(d) => d.send(lane, kind, data),
                         None => {
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
                     }
+                } else if matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some()) {
+                    // Sent from `unreceived` and `journal` once connected again.
                 } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
@@ -2402,6 +2460,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if jobs.is_empty() {
                         exclusive = false;
                     }
+                    if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
+                        unreceived.insert(r.job.clone(), (Instant::now(), b));
+                    }
                     uplink.msg(AgentMsg::JobFinished(r)).await;
                 } else {
                     // Reported over already: a cancelled job let go of after its grace that ended
@@ -2410,6 +2471,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // Counts of jobs long done (a kept leg is let go well within a day).
+                journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
                 if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;

@@ -45,6 +45,31 @@ ORDER = [
 ]
 FINISHED = {"succeeded", "failed", "cancelled", "timed_out", "skipped"}
 
+# Failures that aren't kiln's, by what their notes say: the reason the table gives.
+KNOWN = [
+    (r"deploy-pages|Failed to create deployment \(status: 501\)", "GitHub Pages is outside kiln (docs/ci.md §1.3)"),
+]
+
+
+def triggers(text):
+    """The events a workflow runs on: `ci/conformance/starters.py`'s reading of its `on`."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("starters", os.path.join(HERE, "starters.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m.triggers(text)
+
+
+def no_run(repo, name, event="push"):
+    """Why `event` (a push to the default branch, a pull request to it) started no run of a
+    workflow."""
+    with open(os.path.join(CORPUS, repo.replace("/", "_"), name)) as f:
+        on = sorted(triggers(f.read()))
+    if event in on:
+        return f"its `{event}` filters (branches, tags, paths or types) leave this one out"
+    return "it runs on " + ", ".join(f"`{e}`" for e in on)
+
 
 def sources():
     """`owner/name` → the commit F-03 took its workflows at."""
@@ -75,8 +100,8 @@ class Api:
             raise RuntimeError(f"{method} {path}: {e.code} {e.read().decode(errors='replace')[:300]}") from None
 
 
-def git(cwd, *args, check=True):
-    env = dict(os.environ, GIT_AUTHOR_NAME="kiln", GIT_AUTHOR_EMAIL="kiln@example.com", GIT_COMMITTER_NAME="kiln", GIT_COMMITTER_EMAIL="kiln@example.com", GIT_TERMINAL_PROMPT="0")
+def git(cwd, *args, check=True, env=None):
+    env = dict(os.environ, GIT_AUTHOR_NAME="kiln", GIT_AUTHOR_EMAIL="kiln@example.com", GIT_COMMITTER_NAME="kiln", GIT_COMMITTER_EMAIL="kiln@example.com", GIT_TERMINAL_PROMPT="0", **(env or {}))
     r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()[:400]}")
@@ -161,30 +186,56 @@ def leg_detail(api, leg):
     return (f or {}).get("step_name") or "", (lines[-1] if lines else "")[:300]
 
 
-def run_repo(api, args, repo, commit):
-    """Runs `repo`'s corpus workflows; their results."""
-    print(f"{repo}: preparing", flush=True)
-    dest, branch = snapshot(args.work, repo, commit)
-    known = {r["name"] for r in (api.call("GET", "/api/repos") or [])}
-    if repo not in known:
-        api.call("POST", "/api/repos", {"name": repo, "clone_url": "file://" + dest, "branches": [branch], "poll_seconds": 5})
-    # The first poll takes the repository as it is.
-    deadline = time.time() + 600
-    while time.time() < deadline:
-        r = next((x for x in api.call("GET", "/api/repos") or [] if x["name"] == repo), None)
-        if r and r.get("last_polled_at"):
-            break
-        time.sleep(3)
-    sha = only_corpus(dest, repo)
-    print(f"{repo}: pushed {sha[:8]} on {branch}; waiting for its runs", flush=True)
-    corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
+# The empty tree: git has it without its being stored.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+# What the corpus raises, in order: a pull request of the whole tree, then a push of it.
+EVENTS = ("pull_request", "push")
+
+
+def commits(dest, repo):
+    """An empty trunk and, on it, the tree with only F-03's workflows (kept as tags, so a second
+    invocation reads the runs of the first): their shas."""
+    have = [git(dest, "rev-parse", "--verify", "-q", f"refs/tags/kiln-corpus-{t}", check=False) for t in ("trunk", "tree")]
+    if all(have):
+        return have[0], have[1]
+    tree = git(dest, "rev-parse", only_corpus(dest, repo) + "^{tree}")
+    trunk = git(dest, "commit-tree", EMPTY_TREE, "-m", "F-03: an empty trunk")
+    top = git(dest, "commit-tree", tree, "-p", trunk, "-m", f"F-03: {repo}, its corpus workflows alone")
+    git(dest, "tag", "-f", "kiln-corpus-trunk", trunk)
+    git(dest, "tag", "-f", "kiln-corpus-tree", top)
+    return trunk, top
+
+
+def native(api, repo):
+    """kiln's own repository `repo` (one of that name polled from elsewhere, from an earlier
+    pass, goes)."""
+    found = next((r for r in api.call("GET", "/api/repos") or [] if r["name"] == repo), None)
+    if found and found.get("mode") != "native":
+        api.call("DELETE", "/api/repos/" + found["id"])
+        found = None
+    if not found:
+        api.call("POST", "/api/repos", {"name": repo, "mode": "native"})
+
+
+def push(api, dest, repo, refspec):
+    """Pushes to kiln's repository `repo`, the token in a header (not in the URL)."""
+    import base64
+
+    basic = base64.b64encode(f"x:{api.token}".encode()).decode()
+    env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": "Authorization: Basic " + basic}
+    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", refspec, env=env)
+
+
+def settle(api, repo, event, sha, since, timeout):
+    """`repo`'s runs of `event` (at `sha`, or since `since` for a pull request, whose commit is
+    the diff's), by workflow file, once every one has settled; and those blocked."""
     runs, quiet_since, blocked = {}, time.time(), set()
-    deadline = time.time() + args.timeout
+    deadline = time.time() + timeout
     while time.time() < deadline:
         listing = api.call("GET", "/api/ci/runs?" + urllib.parse.urlencode({"repo": repo, "limit": 200}))["runs"]
         before = len(runs)
         for r in listing:
-            if r.get("sha") == sha:
+            if r.get("event") == event and (r.get("sha") == sha if event == "push" else (r.get("created_at") or 0) >= since):
                 runs[os.path.basename(r.get("workflow", ""))] = r
         if len(runs) != before:
             quiet_since = time.time()
@@ -192,7 +243,7 @@ def run_repo(api, args, repo, commit):
             if r.get("status") not in FINISHED and n not in blocked and stuck(api, r):
                 blocked.add(n)
         settled = [n for n, r in runs.items() if r.get("status") in FINISHED or n in blocked]
-        print(f"  {len(runs)} runs, {len(settled)} settled", flush=True)
+        print(f"  {event}: {len(runs)} runs, {len(settled)} settled", flush=True)
         # Every run settled, and no new one for two minutes: done.
         if runs and len(settled) == len(runs) and time.time() - quiet_since > 120:
             break
@@ -200,11 +251,16 @@ def run_repo(api, args, repo, commit):
         if not runs and time.time() - quiet_since > 600:
             break
         time.sleep(30)
-    results = {}
+    return runs, blocked
+
+
+def results(api, repo, event, corpus, runs, blocked):
+    """Each corpus workflow's result for `event`."""
+    out = {}
     for n in corpus:
         r = runs.get(n)
         if not r:
-            results[n] = {"result": "no run", "notes": ["its push started no run of it"]}
+            out[n] = {"result": "no run", "notes": [no_run(repo, n, event)]}
             continue
         legs = (api.call("GET", "/api/ci/runs/" + r["id"]).get("legs")) or []
         notes = []
@@ -217,12 +273,32 @@ def run_repo(api, args, repo, commit):
         passed = sum(1 for leg in legs if leg.get("conclusion") == "success")
         if r.get("status") not in FINISHED:
             api.call("POST", f"/api/ci/runs/{r['id']}/cancel", {})
-            results[n] = {"result": "blocked" if n in blocked else "unfinished", "legs": f"{passed} of {len(legs)} legs passed", "notes": notes}
+            out[n] = {"result": "blocked" if n in blocked else "unfinished", "legs": f"{passed} of {len(legs)} legs passed", "notes": notes}
             continue
         if not notes and r.get("error"):
             notes.append(r["error"])
-        results[n] = {"result": "pass" if r.get("conclusion") == "success" else (r.get("conclusion") or r.get("status")), "legs": f"{passed} of {len(legs)} legs passed", "notes": notes, "run": r["id"]}
-    return {"repo": repo, "commit": commit, "branch": branch, "sha": sha, "workflows": results}
+        out[n] = {"result": "pass" if r.get("conclusion") == "success" else (r.get("conclusion") or r.get("status")), "legs": f"{passed} of {len(legs)} legs passed", "notes": notes, "run": r["id"]}
+    return out
+
+
+def run_repo(api, args, repo, commit):
+    """Runs `repo`'s corpus workflows, as kiln's own repository: the whole tree submitted for
+    review against an empty trunk (`pull_request`, every file changed), then pushed to the trunk
+    (`push`). Their results, by event."""
+    print(f"{repo}: preparing", flush=True)
+    dest, branch = snapshot(args.work, repo, commit)
+    trunk, top = commits(dest, repo)
+    native(api, repo)
+    push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
+    corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
+    out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}
+    for event in EVENTS:
+        since = int(time.time()) - 5
+        push(api, dest, repo, f"{top}:refs/{'for' if event == 'pull_request' else 'heads'}/{branch}")
+        print(f"{repo}: {event} of {top[:8]} on {branch}; waiting for its runs", flush=True)
+        runs, blocked = settle(api, repo, event, top, since, args.timeout)
+        out["events"][event] = results(api, repo, event, corpus, runs, blocked)
+    return out
 
 
 def write(out_dir):
@@ -231,24 +307,45 @@ def write(out_dir):
         p = os.path.join(out_dir, repo.replace("/", "_") + ".json")
         if os.path.exists(p):
             with open(p) as f:
-                done.append(json.load(f))
-    total = sum(len(d["workflows"]) for d in done)
-    passed = sum(1 for d in done for w in d["workflows"].values() if w["result"] == "pass")
+                d = json.load(f)
+            # An earlier pass ran pushes only (from a polled repository).
+            d.setdefault("events", {"push": d.get("workflows", {})})
+            done.append(d)
+    rows = [(d, n) for d in done for n in sorted({n for e in d["events"].values() for n in e})]
+    ran = [(d, n) for d, n in rows if any(e.get(n, {}).get("result") != "no run" for e in d["events"].values())]
+    passed = [(d, n) for d, n in ran if all(e.get(n, {}).get("result") in ("pass", "no run", None) for e in d["events"].values())]
     lines = [
         "# CI conformance: F-03's popular repositories",
         "",
         "Generated by `ci/conformance/corpus.py` (docs/ci.md W22-AC01): the workflows F-03 took of",
         "each repository, run unmodified on kiln against that repository at the commit F-03 took them",
-        "at. The starter workflows are in `docs/ci-conformance.md`.",
+        "at, as kiln's own repository: the whole tree submitted for review against an empty trunk",
+        "(`pull_request`, every file changed), then pushed to the trunk (`push`). The starter workflows",
+        "are in `docs/ci-conformance.md`.",
         "",
-        f"**{passed} of {total} workflows passed** in {len(done)} of {len(ORDER)} repositories run so far.",
+        f"**{len(passed)} of {len(ran)} workflows that ran passed** ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
         "",
     ]
     for d in done:
-        lines += [f"## `{d['repo']}` at `{d['commit'][:12]}`", "", "| Workflow | Result | Notes |", "| --- | --- | --- |"]
-        for n, w in sorted(d["workflows"].items()):
-            notes = "; ".join(([w["legs"]] if w.get("legs") else []) + w.get("notes", [])).replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| `{n}` | {w['result']} | {notes} |")
+        events = [e for e in EVENTS if e in d["events"]]
+        lines += [f"## `{d['repo']}` at `{d['commit'][:12]}`", "", "| Workflow | " + " | ".join(f"`{e}`" for e in events) + " | Notes |", "| --- | " + " | ".join("---" for _ in events) + " | --- |"]
+        for n in sorted({n for e in d["events"].values() for n in e}):
+            cells, notes = [], []
+            for e in events:
+                w = d["events"][e].get(n, {"result": "no run", "notes": []})
+                said = w.get("notes", [])
+                if w["result"] == "no run":
+                    said = [no_run(d["repo"], n, e)]
+                result = w["result"]
+                why = next((r for pat, r in KNOWN if any(re.search(pat, x) for x in said)), None)
+                if why and result != "pass":
+                    result += f": {why}"
+                cells.append(result)
+                said = ([w["legs"]] if w.get("legs") else []) + said
+                if said:
+                    notes.append(f"{e}: " + "; ".join(said) if len(events) > 1 else "; ".join(said))
+            text = " / ".join(notes).replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| `{n}` | " + " | ".join(cells) + f" | {text} |")
         lines.append("")
     with open(OUT, "w") as f:
         f.write("\n".join(lines))

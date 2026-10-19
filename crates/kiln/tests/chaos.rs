@@ -76,17 +76,30 @@ fn state(legs: &[Value], key: &str) -> (String, i64) {
     (l.and_then(|l| l.get("conclusion")).and_then(Value::as_str).unwrap_or_default().to_owned(), l.and_then(|l| l.get("attempt")).and_then(Value::as_i64).unwrap_or(0))
 }
 
+/// A leg's log, every step's.
 fn log(s: &Server, legs: &[Value], key: &str) -> anyhow::Result<String> {
     let id = leg(legs, key).and_then(|l| l.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
-    let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{id}/logs?step=0"), &s.admin, None)?;
-    Ok(text)
+    let mut all = String::new();
+    for step in 0..4 {
+        let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{id}/logs?step={step}"), &s.admin, None)?;
+        all.push_str(&text);
+    }
+    Ok(all)
 }
 
 /// Dropped every 3 s and every frame 200 ms late, the runner reconnects and the leg goes on: it
 /// isn't lost or retried, its log arrives whole, and its output reaches the job after it.
 #[test]
 fn w22_ac04_dropped_and_late() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().to_path_buf();
+    // KILN_CHAOS_KEEP: the server's directory stays, to read its whole log.
+    let _tmp = if std::env::var_os("KILN_CHAOS_KEEP").is_some() {
+        eprintln!("keeping {}", tmp.keep().display());
+        None
+    } else {
+        Some(tmp)
+    };
     let workflow = r#"on: push
 jobs:
   talk:
@@ -102,15 +115,16 @@ jobs:
     needs: talk
     runs-on: local
     steps:
-      - run: echo "heard ${{ needs.talk.outputs.said }}"
+      - run: |
+          echo "heard ${{ needs.talk.outputs.said }}"
+          test "${{ needs.talk.outputs.said }}" = forty
 "#;
-    let (s, _, legs) = run(dir.path(), "drop=3s,delay=200ms", workflow)?;
+    let (s, _, legs) = run(&dir, "drop=3s,delay=200ms", workflow)?;
     assert_eq!(state(&legs, "talk"), ("success".to_owned(), 1), "a dropped connection loses nothing\n{legs:?}\n{}", s.log());
     let said = log(&s, &legs, "talk")?;
     let missing: Vec<u32> = (1..=40).filter(|i| !said.contains(&format!("line {i} of 40"))).collect();
     assert!(missing.is_empty(), "lines lost: {missing:?}\n{said}");
-    assert_eq!(state(&legs, "after"), ("success".to_owned(), 1));
-    assert!(log(&s, &legs, "after")?.contains("heard forty"), "the output arrived");
+    assert_eq!(state(&legs, "after"), ("success".to_owned(), 1), "the output arrived\n{}\n{}", log(&s, &legs, "after")?, s.log());
     assert!(s.log().contains("chaos: dropping the connection"), "the connection was dropped\n{}", s.log());
     Ok(())
 }

@@ -328,7 +328,15 @@ fn host_oom_kills() -> u64 {
 
 /// Whether the volume `path` is on is as good as full (under 64 MiB left).
 fn nearly_full(path: &Path) -> bool {
-    crate::os::disk_available(path).is_some_and(|free| free < 64 << 20)
+    crate::os::disk_available(path).is_some_and(|free| free < FULL_BELOW)
+}
+
+/// Below this much free, a volume is full (W05-R15).
+const FULL_BELOW: u64 = 64 << 20;
+
+/// The space `df -Pk` says is available, in bytes (its output's second line, fourth column).
+fn df_available(out: &str) -> Option<u64> {
+    out.lines().nth(1)?.split_whitespace().nth(3)?.parse::<u64>().ok().map(|kib| kib << 10)
 }
 
 /// An action's `runs.env`, evaluated with its own `inputs` in context, as GitHub evaluates it (a
@@ -989,6 +997,21 @@ impl Leg {
         let rose = st.oom_seen.is_some_and(|before| now > before);
         st.oom_seen = Some(now);
         rose
+    }
+
+    /// Whether the volume the steps work on is full (W05-R15): in a job container, its workspace as
+    /// the container has it (a volume of its own, or not the host's).
+    async fn work_full(&self, st: &State) -> bool {
+        match st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c.cli.clone(), j.id.clone(), j.map.translate(&st.layout.workspace.to_string_lossy())))) {
+            Some((cli, id, dir)) => {
+                let out = cli.run(&["exec".into(), id, "df".into(), "-Pk".into(), dir], &BTreeMap::new(), Duration::from_secs(30)).await.unwrap_or_default();
+                df_available(&out).is_some_and(|free| free < FULL_BELOW)
+            }
+            None => {
+                let ws = st.layout.workspace.clone();
+                crate::rt::blocking(move || nearly_full(&ws)).await.unwrap_or(false)
+            }
+        }
     }
 
     /// When the server serves HTTPS (it sent its certificate authority): that authority and a
@@ -1805,7 +1828,7 @@ impl Leg {
             Some(o) => Some(st.render(o, site, "options")?),
             None => None,
         };
-        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, user: None })
+        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, user: None, workspace_size: None })
     }
 
     /// "Initialize containers" (W13-R08): the leg's network, services and job container, before
@@ -1896,15 +1919,8 @@ impl Leg {
             (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: open && self.docker_inside(), ..super::docker::Spec::default() }),
             _ => None,
         };
-        // A test build's full disk (W22-AC04): the job container's workspace, a tmpfs that small.
-        let job = match (job, super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib)) {
-            (Some(mut j), Some(mib)) => {
-                let mount = format!("--mount type=tmpfs,destination={workdir},tmpfs-size={},tmpfs-mode=1777", u64::from(mib) << 20);
-                j.options = Some(j.options.map_or_else(|| mount.clone(), |o| format!("{o} {mount}")));
-                Some(j)
-            }
-            (j, _) => j,
-        };
+        // A test build's full disk (W22-AC04): the job container's workspace, a volume that small.
+        let job = job.map(|j| super::docker::Spec { workspace_size: super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib).map(|mib| u64::from(mib) << 20), ..j });
         // W18-R08: a job in a container is contained, its one way out the relay to the runner's
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
@@ -2254,7 +2270,7 @@ impl Leg {
         // (SIGKILL, and its count rose), a full disk (ENOSPC said, or the work volume full).
         if matches!(end, End::Exit(Some(137) | None)) && self.oom_rose(st).await {
             st.step_class = Some("oom");
-        } else if !matches!(end, End::Exit(Some(0)) | End::Cancelled) && (r.enospc || nearly_full(&st.layout.workspace)) {
+        } else if !matches!(end, End::Exit(Some(0)) | End::Cancelled) && (r.enospc || self.work_full(st).await) {
             st.step_class = Some("disk-full");
         }
         Ok(Ran { end, outputs, state })
@@ -3818,6 +3834,18 @@ jobs:
         assert!(step.contains("id token: aud=kiln-f20 sub=repo:acme/app:ref:refs/heads/main"), "{step}");
         assert!(step.contains("the token itself: ***") && !all.contains(&jwt), "the token is masked: {step}");
         Ok(())
+    }
+
+    /// What's left of a job container's workspace, as busybox's and GNU's `df -Pk` say it: a tool
+    /// that fails without saying ENOSPC (busybox's `dd`) still fails as `disk-full` (W05-R15).
+    #[test]
+    fn w05_r15_a_containers_full_workspace() {
+        let busybox = "Filesystem           1024-blocks    Used Available Capacity Mounted on\ntmpfs                     8192      8192         0 100% /__w/acme/acme\n";
+        assert_eq!(df_available(busybox), Some(0));
+        let gnu = "Filesystem     1024-blocks      Used Available Capacity Mounted on\noverlay         490691512 312345678 153404312      68% /\n";
+        assert_eq!(df_available(gnu), Some(153_404_312 << 10));
+        assert!(df_available(busybox).is_some_and(|free| free < FULL_BELOW) && !df_available(gnu).is_some_and(|free| free < FULL_BELOW));
+        assert_eq!(df_available("df: /nowhere: No such file or directory\n"), None);
     }
 
     /// A job container's paths are GitHub's, the workspace's parent among them: what a step

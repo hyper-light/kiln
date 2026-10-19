@@ -193,7 +193,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
 ---
@@ -5132,6 +5132,37 @@ and AC02.
     - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
       host is not Ubuntu. *Fixed:* `ubuntu-latest` legs now run in kiln's Ubuntu runner image
       (W13-R04), where it installs CPython 3.12.
+- *AC04* (`crates/kiln/tests/chaos.rs`: `cargo test -p kiln --features chaos --test chaos`,
+  in kiln's gate). `kiln agent --chaos <spec>`, or `KILN_CHAOS` for a server's own runner, is
+  compiled only with the `chaos` feature (`crate::runner::chaos`):
+  - `drop=<duration>`: the runner drops its connection that often;
+  - `delay=<duration>`: what it sends the server arrives that late;
+  - `oom=<duration>`: a step on the host is killed that long after it starts, as the OOM killer
+    kills, and counted where kiln counts the OOM killer's kills;
+  - `disk=<MiB>`: a job container's workspace is a volume that small;
+  - `corrupt`: the leg's tools reach the server through a proxy that flips a byte of each upload
+    to the blob store.
+
+  A leg's faults hit its first attempt only, so its retry shows the recovery. Under each:
+  - dropped every 3 s and 200 ms late, a leg goes on: it's neither lost nor retried, its log
+    arrives whole, and its outputs reach the job after it;
+  - the OOM kill is `oom`, the full disk `disk-full`, each retried by the policy that names it;
+  - a corrupted upload fails FinalizeArtifact's hash check (W08), its log line retries it, and
+    only the retry's artifact is there;
+  - nothing of a failed attempt is left: the killed step's processes, its containers.
+
+  Found and fixed on the way:
+  - A runner reconnecting within the grace was told to cancel its CI legs (the v1 reconcile took
+    them for v1 jobs), and their reports were dropped. The hub keeps them now, and the dispatcher
+    stops only legs given up while their runner was away.
+  - What was in flight as the connection dropped was lost: a leg's outputs (the next job saw
+    none), its failure's class, its result (the leg then lost with its runner). The runner now
+    numbers each leg's events (`seq`, in their JSON) and keeps them and the leg's result until the
+    server says it has the result (`ServerMsg::Received`, `CAP_RECEIVED`), sending them again after
+    a reconnect. The dispatcher takes each event once, and a leg's result only from the runner
+    it's on.
+  - A full disk that the failing tool doesn't name (busybox's `dd`) was a plain `failure`: a job
+    container's workspace is measured in the container now.
 - *AC07* (`crates/kiln/tests/security.rs`, against a server of its own):
   - **Token scope.** Every route of the route table refuses a token that may do nothing. That is an
     agent's for a user without a grant: 403 for it, and 401 without a token, on 128 routes.

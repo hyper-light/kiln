@@ -1015,12 +1015,17 @@ impl Hub {
             }
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
+                let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
                     if self.ci.is_leg(&r.job) {
                         self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
                     } else {
                         self.job_done(&agent, r).await?;
                     }
+                }
+                // Heard (taken, or not this runner's to give any more): it needn't send it again.
+                if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
+                    self.send_peer(peer, &ServerMsg::Received { job }).await;
                 }
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
@@ -1096,6 +1101,11 @@ impl Hub {
             AgentMsg::PortClose { conn, error } => self.harness.ports.ended(&agent, conn, error),
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
+                // It may send its legs' events and results again after a reconnect: they're taken
+                // once (a receipt without a job says so).
+                if caps & proto::CAP_RECEIVED != 0 {
+                    self.send_peer(peer, &ServerMsg::Received { job: String::new() }).await;
+                }
                 self.updates.on_build(self, &agent, &build);
                 self.updates.fleet.wake();
                 self.emit(&serde_json::json!({ "type": "updates" }));

@@ -404,6 +404,15 @@ struct LegSt {
     /// Its deployment (W15-R04), once it started, and the `environment.url` it evaluated.
     deployment: Option<i64>,
     env_url: Option<String>,
+    /// The last of the attempt's events taken (their `seq`): a runner sends them again after a
+    /// reconnect, and those taken already are skipped.
+    seq: u64,
+}
+
+/// An event's place in its attempt (`seq`, from runners that send events again after a reconnect).
+#[derive(serde::Deserialize)]
+struct Seq {
+    seq: Option<u64>,
 }
 
 /// A leg its environment's protection holds back (W15-R03, R04): not yet the scheduler's.
@@ -1227,7 +1236,7 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
-        self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None });
+        self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0 });
         self.hub.emit_job(&id).await;
         // A leg bound to an environment starts when its protection lets it (W15-R04).
         if let Some(env) = self.legs.get(&id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
@@ -1303,6 +1312,7 @@ impl Dispatch {
                 Command::Retry { leg, attempt, at } => {
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.attempt = attempt;
+                        l.seq = 0;
                         l.agent = None;
                         l.report = LegReport::default();
                         l.class = None;
@@ -1443,6 +1453,7 @@ impl Dispatch {
         }
         if let Some(l) = self.legs.get_mut(leg) {
             l.agent = Some(runner.to_owned());
+            l.seq = 0;
             if deployment.is_some() {
                 l.deployment = deployment;
             }
@@ -1651,6 +1662,12 @@ impl Dispatch {
 
     /// What a runner says about a leg while it runs (W06, §2.5).
     async fn event(&mut self, agent: &str, leg: &str, json: &str) -> anyhow::Result<()> {
+        if let (Ok(Seq { seq: Some(seq) }), Some(l)) = (serde_json::from_str::<Seq>(json), self.legs.get_mut(leg)) {
+            if seq <= l.seq {
+                return Ok(());
+            }
+            l.seq = seq;
+        }
         let e: JobEventV2 = serde_json::from_str(json)?;
         match e {
             JobEventV2::StepStarted { idx, name, kind, action } => {
@@ -1731,6 +1748,11 @@ impl Dispatch {
     /// A leg's attempt ended on its runner: the scheduler decides on a retry, else the plan hears.
     async fn finished(&mut self, agent: &str, r: JobResult) -> anyhow::Result<()> {
         self.hub.release_slot(agent, &r.job);
+        // A result sent again (its receipt was lost with the connection), or of a leg given up
+        // while its runner was away: the leg has gone on without it.
+        if self.legs.get(&r.job).is_some_and(|l| l.agent.as_deref() != Some(agent)) {
+            return Ok(());
+        }
         self.hub.logs.finish(&r.job);
         // The attempt's GITHUB_TOKEN dies with it (W10-R03).
         if let Err(e) = super::token::revoke_leg(&self.hub, &r.job).await {
@@ -1971,7 +1993,7 @@ impl Dispatch {
                 }
             };
             self.hub.ci.legs.lock().insert(id.clone());
-            self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None });
+            self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0 });
             let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
             match (s, agent) {
                 (Status::Running, Some(a)) => {
