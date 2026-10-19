@@ -132,17 +132,55 @@ row reads *upgrade failed* or *build failed*, with the upgrade's output under it
   machine. A way that can't be taken now says why (no binary yet, a release run still building one,
   no checkout, terminals turned off), so a runner kiln is waiting on can still be upgraded the
   other way.
-- **Diagnose** opens New agents on that machine with a first message written for it: what kiln
-  knows (the build it runs and the one it was going to, the error, the upgrade's last lines) and
-  where to look (the runner's log, a build's whole output in
-  `~/.cache/kiln/self-build/build-<job>.log`, disk, memory, toolchains). It asks the agent to fix
-  the cause on the machine without stopping or reinstalling the runner, and to say what it changed.
-  Read and change the message before starting it; the agent asks before commands and edits unless
-  you choose otherwise.
+- **Diagnose** (on every connected runner) looks at it, and lists in its row what's wrong, worst
+  first, each with the repair that fixes it when kiln can make it (below).
+- **Ask an agent**, under a diagnosis, opens New agents on that machine with a first message
+  written for it: what kiln knows (the build it runs and the one it was going to, the error, the
+  upgrade's last lines, what the diagnosis found) and where to look (the runner's log, a build's
+  whole output in `~/.cache/kiln/self-build/build-<job>.log`, disk, memory, toolchains). It asks the
+  agent to fix the cause on the machine without stopping or reinstalling the runner, and to say what
+  it changed. Read and change the message before starting it; the agent asks before commands and
+  edits unless you choose otherwise.
 
 `POST /api/updates/runners/{name}` with `{"way": "download" | "build"}` does the same as the
 buttons (no body: the way kiln picks). `GET /api/updates` lists each runner's `ways`, each with `ok`
 and `why`.
+
+### Diagnosing and repairing a runner
+
+A diagnosis has two halves (`crate::doctor`):
+
+- **What the server knows:** whether the runner is connected (and when it was last heard), the
+  kiln it runs against the newest and what it does next, its last upgrade (failed, with its error
+  and last lines; under way; or done), the Rust a failed self-build needed as cargo said it, and
+  memory nearly full.
+- **What the machine finds about itself**, asked over its link to the server (runners from this
+  build on: an older one says so, and is diagnosed from what the server knows): room on the volumes
+  where it works and keeps its state, what its self-builds keep (`~/.cache/kiln/self-build`), the
+  newest self-build's log and whether it ended with errors, its clock against the server's, and on
+  a Mac whether kiln is signed (docs above).
+
+Each finding is `ok`, `info`, `warn` or `fail`, with a title, what was seen, and the repair that
+fixes it when kiln can make it:
+
+| Repair | What it does |
+|---|---|
+| `retry-upgrade` (with `way`) | upgrades it now, that way (the other way after a failed one, when it's open) |
+| `clear-self-build-cache` | removes what self-builds compiled (the next one compiles from scratch); its logs stay. Refused while an upgrade of it is under way |
+| `prune-versions` | removes older kiln builds the runner keeps; the one running and the newest few stay |
+| `re-sign` | signs kiln again (a Mac whose signing is set up; setting it up is `kiln signing setup` at the Mac, which macOS asks about) |
+
+No repair stops what the machine runs: none restarts its runner. A runner's own repairs run on
+the machine itself, and come back with what they did.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/agents/{name}/diagnose` | `{runner, at, worst, findings: [{id, level, title, detail?, fix?: {action, label, way?}}], machine_checked, why, updates}`, worst first (`runners.read`) |
+| POST | `/api/agents/{name}/repair` | `{action, way?}` → `{ok, action, message}` (or `{ok, action, job}` for an upgrade); 409 with why when it can't (`runners.manage`) |
+
+Agents do the same through kiln's operations (`runners.list`, `runners.diagnose`, `runners.repair`,
+`updates.list`, `updates.retry`, `updates.policy`), with the rights of whoever they act for: a person
+who can't manage runners can't have an agent repair one.
 
 An upgrade kiln stopped waiting for can still finish: the runner switches once it's idle. When its
 new build reports in later (and, upgrading blue/green, takes over), the job reads as done after all

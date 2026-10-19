@@ -244,7 +244,9 @@ function sendHeld(store: SessionStore, agent: string) {
   if (s.conn !== "open" || s.state?.status === "disconnected") return;
   const went: string[] = [];
   for (const m of useHeld.getState().held[agent] ?? []) {
-    if (!store.send({ type: "send", id: m.id, text: m.text, mode: "queue", attachments: m.attachments, overrides: m.overrides })) break;
+    // As it was to go: a "now" kept through a reconnection still stops what runs.
+    const running = s.state?.status === "running" || s.state?.status === "waiting";
+    if (!store.send({ type: "send", id: m.id, text: m.text, mode: running ? (m.mode ?? "queue") : "queue", attachments: m.attachments, overrides: m.overrides })) break;
     went.push(m.id);
   }
   if (went.length) useHeld.getState().drop(agent, ...went);
@@ -490,8 +492,11 @@ export function Composer({
     if ((!body && files.length === 0) || pending > 0) return;
     const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined };
     // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
-    // can, in order — never lost, never blocked.
-    if (held.length > 0 || !(reachable && store.send({ type: "send", ...m, mode: running ? mode : "queue" }))) useHeld.getState().hold(agent, { ...m, at: Date.now() });
+    // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
+    // they're for the turn under way.
+    const go = running ? mode : "queue";
+    const behind = held.length > 0 && go === "queue";
+    if (behind || !(reachable && store.send({ type: "send", ...m, mode: go }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now() });
     write("");
     clear();
     setOverride({});
