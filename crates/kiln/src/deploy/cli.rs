@@ -57,6 +57,9 @@ pub struct DeployArgs {
     /// A config release: this file becomes the environment's values.yaml.
     #[arg(long)]
     values: Option<PathBuf>,
+    /// A promotion: what this environment runs, the same version and artifacts.
+    #[arg(long = "from")]
+    from: Option<String>,
     /// Return once the release is asked for, without following it.
     #[arg(long)]
     no_wait: bool,
@@ -93,6 +96,18 @@ enum DeployCmd {
     },
     /// Stop a release that is waiting or being delivered.
     Cancel { release: i64 },
+    /// Approve a release waiting for approval.
+    Approve {
+        release: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reject a release waiting for approval: it is cancelled.
+    Reject {
+        release: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Run the app in the environment again, at its last version.
     Enable {
         app: String,
@@ -228,6 +243,10 @@ enum EnvCmd {
         /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
         #[arg(long)]
         agents: bool,
+        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after, soak,
+        /// approvals, windows, checks, freeze.
+        #[arg(long)]
+        gates: Option<PathBuf>,
     },
     Rm { env: String },
 }
@@ -319,6 +338,9 @@ async fn follow(api: &Api, mut r: Value) -> Result<bool> {
         let shown = format!("{state} {}", s(&r, "message"));
         if shown != last && !api.json {
             println!("{}", line(&r));
+            if state == "waiting_approval" {
+                println!("        approve it: kiln deploy approve {id}");
+            }
             last = shown;
         }
         match state.as_str() {
@@ -375,6 +397,16 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
+        Some(DeployCmd::Approve { release, note }) => {
+            let v = api.call(Method::Post, &format!("/releases/{release}/approve"), Some(json!({ "note": note }))).await?;
+            api.print(&v, |v| println!("{}", line(v)));
+            return Ok(());
+        }
+        Some(DeployCmd::Reject { release, note }) => {
+            let v = api.call(Method::Post, &format!("/releases/{release}/reject"), Some(json!({ "note": note }))).await?;
+            api.print(&v, |v| println!("{}", line(v)));
+            return Ok(());
+        }
         Some(DeployCmd::Cancel { release }) => {
             let v = api.call(Method::Post, &format!("/releases/{release}/cancel"), None).await?;
             api.print(&v, |v| println!("{}", line(v)));
@@ -386,6 +418,21 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
         None => {
             let app = args.app.context("which app? kiln deploy <app> <version> --to <env>")?;
             let env = args.to.context("which environment? --to <env>")?;
+            if let Some(from) = args.from {
+                if args.version.is_some() || args.values.is_some() {
+                    bail!("--from promotes what another environment runs: no version or --values with it");
+                }
+                let ask = json!({ "app": app, "environment": env, "promote_from": from });
+                let r = api.call(Method::Post, "/releases", Some(ask)).await?;
+                if args.no_wait {
+                    api.print(&r, |r| println!("{}", line(r)));
+                    return Ok(());
+                }
+                if !follow(&api, r).await? {
+                    bail!("the release didn't succeed");
+                }
+                return Ok(());
+            }
             let ask = match (args.version, args.values) {
                 (Some(v), None) => {
                     let mut arts = serde_json::Map::new();
@@ -507,7 +554,14 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents } => {
+        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates } => {
+            let gates: Value = match gates {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+                    serde_yaml::from_str(&text).with_context(|| format!("{} doesn't read as YAML", path.display()))?
+                }
+                None => Value::Null,
+            };
             let body = json!({
                 "name": env,
                 "provider": provider,
@@ -517,6 +571,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },
                 "agents": { "deploy": agents },
+                "gates": gates,
             });
             let v = api.call(Method::Post, "/environments", Some(body)).await?;
             api.print(&v, |v| println!("environment {} ready", s(v, "name")));

@@ -184,7 +184,7 @@ production:
   gates:
     after: [staging]                  # the version ran healthy there (txst's required environments)
     soak: 30m                         # …for at least this long
-    approvals: { reviewers: [ada], count: 1, agents: false }
+    approvals: { reviewers: [ada], count: 1 }   # agents answer only with agents.approve
     windows:
       - { deny: "0 0 * * 6,0", duration: 48h, timezone: UTC }
     checks: [no-snapshots, artifact-signed, { vulnerabilities: { max: high } }, owners-set]
@@ -436,11 +436,29 @@ git says then.
 Each gate's result is recorded on the release, with its evidence. A release kiln can't gate is
 refused, never let through.
 
+How each one holds or refuses (built: all but the external and signature checks):
+
+- **Refused at once** (`409`): a version that doesn't run upstream (`after`), or runs there with
+  other artifacts; a failed check; a window that doesn't read. Nothing waiting would change them.
+- **Held** (`waiting`, the reason in its message): a freeze, a deny window (until it closes) or no
+  allow window open (until one opens), a soak still running, the same version still on its way
+  upstream (an upstream release of it in flight).
+- **Held for people** (`waiting_approval`; the event says `needs: approval` and who): too few
+  approvals. `POST /releases/{id}/approve` (`runs.approve`, a note optional) counts one per
+  person, a token or agent counting as the person it acts for; `…/reject` cancels the release,
+  with who and why. Whoever asked doesn't approve their own release unless `self_approve`;
+  reviewers, when named, are the only ones who may; agents answer only with `agents.approve`.
+- `after` and `soak` hold a new version; a rollback, a config change or an enable runs what passed
+  them before, and only freezes, windows, checks and approvals hold it.
+- Changing an environment wakes what waits on its gates, so lifting a freeze lets releases go at
+  once; otherwise each looks again when its gate says, at least every five minutes.
+
 ### 9.2 Promotion
 
-`promote_from: staging` releases exactly what staging runs: the same version, the same digests.
-An environment with `promote: auto` does this by itself once `after` and `soak` pass, and asks for
-approvals as usual.
+`promote_from: staging` releases exactly what staging runs: the same version, the same digests,
+recorded as `promoted_from` (built: `kiln deploy web --to production --from staging`). An
+environment with `promote: auto` does this by itself once `after` and `soak` pass, and asks for
+approvals as usual (not yet).
 
 ## 10. Rollback, versions and history
 
@@ -479,7 +497,7 @@ signed with kiln's OIDC issuer (ci.md W10), as txst signs its deployment tokens.
 | `/api/deploy/environments` | list, add, show, update, remove |
 | `/api/deploy/apps` | list (filters: owner, template, name), create, show, update, archive, delete |
 | `/api/deploy/apps/{app}/environments/{env}` | register, show (status, history, candidates), update, deregister, `pause`, `resume`, `enable`, `disable`, `diff`, `manifests`, `resources`, `logs`, `actions` |
-| `/api/deploy/releases` | create, list (filters: app, environment, state, kind, person, time), show, `approve`, `deny`, `cancel`, `rollback` |
+| `/api/deploy/releases` | create, list (filters: app, environment, state, kind, person, time), show, `approve`, `reject`, `cancel`, `rollback` |
 | `/api/deploy/events` | a stream (SSE or WebSocket) of releases and their progress, filtered |
 
 Every call is in kiln's OpenAPI document with the capability it needs (§15).
@@ -491,11 +509,11 @@ kiln app create web --owner shop --template service --repo github:acme/web
 kiln app register web --env staging
 kiln deploy web 1.4.2 --to staging          # follows the release to the end
 kiln deploy web --to production --from staging
-kiln deploy web --to production --config values-hotfix.yaml
+kiln deploy web --to production --values values-hotfix.yaml
 kiln deploy status web --env production
 kiln deploy history web --env production
 kiln deploy rollback web --env production [--to 1040]
-kiln deploy approve 1042
+kiln deploy approve 1042 [--note …]          # or reject: cancelled, with why
 kiln deploy env add production --provider argocd/prod-argo --repo github:acme/releases
 ```
 
@@ -665,4 +683,5 @@ deployments, and aren't carried over.
 | P2: Argo CD instances as integrations (kind `argocd`: URL, namespace, CA, an account's token sealed), verified by their version and rights; an environment's provider `argocd/<integration>`; each registration one Application written through Argo CD's API (the package at the release's version, the environment's values inline, `kiln.release` as a Helm parameter), refreshed hard, followed to landed by the release it compared; pause and resume; disable (with `keep`), enable, deregister; status per provider | built. On a real Argo CD (v3.5.4, its own minikube profile): a deploy, a second version, a rollback and a config release each landed with the release they carried; pause turned the Application's automated sync off and resume back on; a disable with `keep` deleted the Application and left its objects, which the next enable adopted; a full disable removed both; a server killed mid-release finished it after its restart with one commit; deregistering removed the Application, its objects and the registration's files |
 | P2: ApplicationSets over the release repository, AppProjects, the repository registered for reading, diff, manifests, resources, logs, actions, the stream rather than polling; moving an environment between providers | not yet: ApplicationSets wait on release repositories being served (W14) |
 | The `deploy.*` operations (P8's MCP half, early, for agents: §12.3), the environment's `agents` policy, idempotency keys, the `deploy` event | built. Over MCP on the test server: a release with a key asked for twice was one release; `deploy.releases.wait` answered as it moved and when it landed; a missing version refused; a rollback with its key landed |
-| P3 to P8 | not yet |
+| P4: gates (`after`, `soak`, approvals with reviewers and `self_approve`, allow and deny windows, the checks `no-snapshots` and `owners-set`, freezes), `waiting_approval`, approve and reject (HTTP, `kiln`, `deploy.releases.approve`/`reject`), promotion | built. On the test servers (upstream on Argo CD, downstream on KilnCD): a version not upstream refused; one upstream held for its soak, then for approval; the requester's own approval refused; a named reviewer's approval let it go and it landed; a rejection cancelled one; a freeze and a deny window each held one and released it the moment they were lifted. External checks, signatures, `promote: auto`, freezes by API and signed results between servers: not yet |
+| P3, P5 to P8 | not yet |

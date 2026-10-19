@@ -129,7 +129,7 @@ pub async fn automation(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str, on:
 /// is the release's.
 pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value) {
     let status = cd.statuses.read().get(id).map(crate::cd::summary_json).unwrap_or(Value::Null);
-    let entry_error = cd.apps.read().get(id).and_then(|e| e.error.clone());
+    let (entry_error, at_commit) = cd.apps.read().get(id).map_or((None, false), |e| (e.error.clone(), e.commits.iter().flatten().any(|c| c.as_str() == commit)));
     let history = cd.store.read(|d| d.history.get(id).cloned()).unwrap_or_default();
     // The newest sync of this commit since the release began.
     let ran = history.iter().rev().find(|h| h.at_ms >= since_ms && h.commits.iter().flatten().any(|c| c.as_str() == commit)).cloned();
@@ -145,10 +145,14 @@ pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value)
         "source_error": entry_error,
         "last_sync": ran.as_ref().map(|h| json!({ "succeeded": h.succeeded, "message": h.message, "at_ms": h.at_ms, "id": h.id })),
     });
+    let settled = s("sync") == "Synced" && s("health") == "Healthy";
+    let syncing = status.pointer("/operation/phase").and_then(Value::as_str).is_some_and(|p| matches!(p, "DryRun" | "Running" | "Failing" | "Terminating"));
     let landed = match (ran, refused) {
         (Some(h), _) if !h.succeeded => Landed::Failed(if h.message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { h.message }),
-        (Some(_), _) if s("sync") == "Synced" && s("health") == "Healthy" => Landed::Yes,
+        (Some(_), _) if settled => Landed::Yes,
         (None, Some(why)) => Landed::Refused(why),
+        // Nothing to sync: KilnCD read the release's commit, and what it renders runs already.
+        (None, None) if at_commit && settled && !syncing => Landed::Yes,
         _ => Landed::No,
     };
     (landed, view)
@@ -165,7 +169,7 @@ mod tests {
             provider: "kilncd".into(),
             release_repo: RepoRef::default(),
             targets: Targets { kubernetes: vec!["dev".into()] },
-            gates: Value::Null,
+            gates: Default::default(),
             sync: Default::default(),
             watch: Default::default(),
             concurrency: Default::default(),

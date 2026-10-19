@@ -337,7 +337,7 @@ mod tests {
             provider: "argocd/prod".into(),
             release_repo: RepoRef::default(),
             targets: Targets { kubernetes: vec!["prod-us".into()] },
-            gates: Value::Null,
+            gates: Default::default(),
             sync: Default::default(),
             watch: Default::default(),
             concurrency: Default::default(),
