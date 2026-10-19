@@ -424,6 +424,19 @@ async fn trunks(hub: &Hub, path: &str) -> (Vec<String>, Review) {
     (list, review)
 }
 
+/// Reads what's left of a refused push and drops it: at most 4 GiB, for ten minutes, and nothing
+/// once the client pauses for a minute.
+async fn drain(body: &mut hyper::body::Incoming) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut read = 0u64;
+    while read < 4 << 30 && std::time::Instant::now() < deadline {
+        match crate::rt::timeout(std::time::Duration::from_secs(60), srv::next_chunk(body)).await {
+            Ok(Ok(Some(chunk))) => read += chunk.len() as u64,
+            _ => break,
+        }
+    }
+}
+
 /// More of a push's start: its next chunk, into `head`.
 async fn more(head: &mut Vec<u8>, body: &mut hyper::body::Incoming) -> Result<(), Fail> {
     if head.len() >= 1 << 20 {
@@ -519,6 +532,9 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
         let message = no.iter().map(|(u, why)| format!("{}: {why}", u.name)).collect::<Vec<_>>().join("\n");
         hub.store.audit(user.clone(), "repo.push".into(), format!("{} refused: {}", repo.name, message.replace('\n', "; "))).await;
+        // The rest of the push (its pack) is read and dropped first: answered while it still
+        // sends, git sees the connection close, not why.
+        drain(&mut body).await;
         return Ok(srv::response(StatusCode::OK, "application/x-git-receive-pack-result", srv::full(bytes::Bytes::from(refusal(&all, &caps, &message)))));
     }
     let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
@@ -577,6 +593,19 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     }
     // What git took (`ok <ref>`), before kiln says more.
     let took: std::collections::HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
+    // The first branch pushed to an empty repository is its default, as on GitHub, when the one
+    // it was made on (its HEAD) isn't among those pushed.
+    if empty
+        && let Some(first) = updates.iter().filter(|u| u.creates() && took.contains(&u.name)).find_map(|u| u.name.strip_prefix("refs/heads/"))
+        && trunk_list.last().is_some_and(|head| !updates.iter().any(|u| u.name == format!("refs/heads/{head}")))
+        && crate::gitops::run_git(hub, &["-C", &p, "symbolic-ref", "HEAD", &format!("refs/heads/{first}")], crate::gitops::LS_REMOTE_TIMEOUT).await.is_ok()
+    {
+        let (id, branch) = (repo.id.clone(), first.to_owned());
+        if let Err(e) = hub.store.call(move |c| Ok(c.execute("UPDATE repos SET default_branch = ?2 WHERE id = ?1", rusqlite::params![id, branch])?)).await {
+            tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the default branch could not be recorded");
+        }
+        said.push(format!("{first} is the repository's default branch: the first pushed"));
+    }
     if let Some(target) = &target {
         let at = report.lines.iter().position(|l| *l == format!("ok {}", target.name));
         if let (Some(at), Some((spec, suffix))) = (at, for_ref(&target.name)) {

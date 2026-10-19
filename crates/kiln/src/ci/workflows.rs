@@ -188,6 +188,24 @@ struct NamedDispatchAsk {
 }
 
 /// `POST /api/ci/repos/:repo/dispatch { workflow, ref, inputs }` (§4.1's form of the same).
+/// `POST /api/ci/repos/:repo/agent` `{ workflow, ref, inputs }`: kiln's `agent` event (W03-R09),
+/// `agent` (the caller) asking for the run.
+pub async fn agent_run(hub: &Hub, repo: &str, agent: &str, body: Incoming) -> Result<Response, Fail> {
+    #[derive(serde::Deserialize)]
+    struct AgentAsk {
+        workflow: String,
+        #[serde(default, rename = "ref")]
+        git_ref: String,
+        #[serde(default)]
+        inputs: serde_json::Map<String, serde_json::Value>,
+    }
+    let repo = find_repo(hub, repo).await?;
+    let ask: AgentAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    let git_ref = if ask.git_ref.is_empty() { super::events::facts(hub, &repo).await.default_branch } else { ask.git_ref.clone() };
+    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, agent).await.map_err(|r| (r.status, r.message))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: NamedDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;

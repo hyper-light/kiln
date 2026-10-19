@@ -142,7 +142,7 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     let (id, number, n, kind, rebase_only) = made;
     if kind != "unchanged" {
         let _ = gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/CR{number}/v{n}"), &s.head], LS_REMOTE_TIMEOUT).await;
-        let fresh = diffs::Fresh { number, n, sha: s.head.clone(), parent: s.base.clone(), title: title.clone(), summary: summary.clone(), message: summary.clone(), draft, rebase_only, branch: Some(branch.to_owned()) };
+        let fresh = diffs::Fresh { number, n, sha: s.head.clone(), parent: s.base.clone(), title: title.clone(), summary: summary.clone(), message: summary.clone(), draft, rebase_only, branch: Some(branch.to_owned()), labels: diffs::labels(hub, &id).await };
         let (hub2, repo2, trunk2, author2, base2) = (hub.clone(), repo.clone(), trunk.to_owned(), by.author.clone(), s.base.clone());
         // A job's token (its push, or its `POST /pulls`) starts no run, as on GitHub.
         if !diffs::by_job(&by.pushed_by) {

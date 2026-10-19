@@ -19,6 +19,7 @@ Docker, as for the starter workflows (ci/conformance/starters.py).
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -200,21 +201,23 @@ def commits(dest, repo):
         return have[0], have[1]
     tree = git(dest, "rev-parse", only_corpus(dest, repo) + "^{tree}")
     trunk = git(dest, "commit-tree", EMPTY_TREE, "-m", "F-03: an empty trunk")
-    top = git(dest, "commit-tree", tree, "-p", trunk, "-m", f"F-03: {repo}, its corpus workflows alone")
+    # A diff's commit names its change (W14-R03).
+    change = "I" + hashlib.sha1(f"F-03 {repo}".encode()).hexdigest()
+    top = git(dest, "commit-tree", tree, "-p", trunk, "-m", f"F-03: {repo}, its corpus workflows alone\n\nChange-Id: {change}")
     git(dest, "tag", "-f", "kiln-corpus-trunk", trunk)
     git(dest, "tag", "-f", "kiln-corpus-tree", top)
     return trunk, top
 
 
-def native(api, repo):
-    """kiln's own repository `repo` (one of that name polled from elsewhere, from an earlier
-    pass, goes)."""
+def native(api, repo, branch):
+    """kiln's own repository `repo`, its default branch `branch` (one of that name polled from
+    elsewhere, from an earlier pass, or on another branch, goes)."""
     found = next((r for r in api.call("GET", "/api/repos") or [] if r["name"] == repo), None)
-    if found and found.get("mode") != "native":
+    if found and (found.get("mode") != "native" or found.get("default_branch") != branch):
         api.call("DELETE", "/api/repos/" + found["id"])
         found = None
     if not found:
-        api.call("POST", "/api/repos", {"name": repo, "mode": "native"})
+        api.call("POST", "/api/repos", {"name": repo, "mode": "native", "default_branch": branch})
 
 
 def push(api, dest, repo, refspec):
@@ -288,7 +291,7 @@ def run_repo(api, args, repo, commit):
     print(f"{repo}: preparing", flush=True)
     dest, branch = snapshot(args.work, repo, commit)
     trunk, top = commits(dest, repo)
-    native(api, repo)
+    native(api, repo, branch)
     push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
     out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}

@@ -322,6 +322,21 @@ pub(crate) struct Fresh {
     pub rebase_only: bool,
     /// A change request's branch (`None`: a diff).
     pub branch: Option<String>,
+    /// Its labels (W14-R11), for `github.event.pull_request.labels`.
+    pub labels: Vec<String>,
+}
+
+/// A diff's labels, by name.
+pub(crate) fn label_names(c: &rusqlite::Connection, diff_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut st = c.prepare("SELECT name FROM diff_labels WHERE diff_id = ?1 ORDER BY name")?;
+    let rows = st.query_map([diff_id], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// A diff's labels, by name (none when they can't be read).
+pub(crate) async fn labels(hub: &Hub, diff_id: &str) -> Vec<String> {
+    let id = diff_id.to_owned();
+    hub.store.call(move |c| Ok(label_names(c, &id)?)).await.unwrap_or_default()
 }
 
 /// Makes the submission's diffs and versions (W14-R03), refused whole, saying why, when any of its
@@ -407,7 +422,8 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                         params![diff_id, n, p.sha, p.parent, base, patch_id, message, opts.message, rebase_only, pushed_by, now],
                     )?;
                     let draft: String = tx.query_row("SELECT state FROM diffs WHERE id = ?1", [&diff_id], |r| r.get(0))?;
-                    fresh.push(Fresh { number, n, sha: p.sha.clone(), parent: p.parent.clone(), title: p.title.clone(), summary: p.summary.clone(), message, draft: draft == "draft", rebase_only, branch: None });
+                    let labels = label_names(&tx, &diff_id)?;
+                    fresh.push(Fresh { number, n, sha: p.sha.clone(), parent: p.parent.clone(), title: p.title.clone(), summary: p.summary.clone(), message, draft: draft == "draft", rebase_only, branch: None, labels });
                 }
                 // `-o reviewer=` asks for review of what the push changed.
                 for r in opts.reviewers.iter().filter(|_| kind != "unchanged") {
@@ -457,7 +473,7 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         draft: Some(f.draft),
         state: "open".into(),
         author: Some(author.0.clone()),
-        labels: Some(Vec::new()),
+        labels: Some(f.labels.clone()),
         head: Side { branch: f.branch.clone().unwrap_or_else(|| format!("D{}", f.number)), sha: f.sha.clone(), repo: ctx.clone() },
         base: Side { branch: trunk.to_owned(), sha: base_sha.to_owned(), repo: ctx.clone() },
     };
@@ -558,7 +574,7 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
     let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name == d.repo) else { return Ok(()) };
     let Some(latest) = versions(hub, &d).await?.pop() else { return Ok(()) };
     let facts = super::events::facts(hub, &repo).await;
-    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone() };
+    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
     let (pr, _) = events_of(&repo, &facts.repo, &d.trunk, &latest.base, &author, &f, None);
     // `user:ada` is GitHub's `ada`; an agent's name is its first word.
@@ -633,7 +649,7 @@ pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Dif
         .await?;
     gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/{}/v{n}", d.name), &v.commit], LS_REMOTE_TIMEOUT).await?;
     let (title, summary) = review::title_and_summary(&v.message);
-    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone() };
+    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await };
     let (hub2, repo2, trunk, author, base) = (hub.clone(), repo.clone(), d.trunk.clone(), (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" }), v.base.clone());
     crate::rt::spawn(async move {
         if let Err(e) = checks(&hub2, &repo2, &trunk, &base, &author, &f).await {
@@ -658,20 +674,43 @@ pub(crate) struct NewVersion {
 }
 
 /// `pull_request` `closed` for a diff that landed (`merged`) or was abandoned (W03-R09's table).
-pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool) -> anyhow::Result<()> {
-    if !hub.ci.enabled() {
+pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool, by: &str) -> anyhow::Result<()> {
+    activity(hub, repo, d, "closed", by, |p| {
+        if let Some(pr) = p.get_mut("pull_request").and_then(Value::as_object_mut) {
+            pr.insert("state".into(), json!("closed"));
+            pr.insert("merged".into(), json!(merged));
+        }
+    })
+    .await
+}
+
+/// `pull_request` (and `pull_request_target`) `action` for what was done to a diff or change
+/// request (W03-R02's native table: `closed`, `reopened`, `ready_for_review`, `edited`, `labeled`,
+/// `unlabeled`, `enqueued`, `dequeued`), its latest version as the diff is now, sent by `by`;
+/// `tweak` adds what the action says (GitHub's `label`, `changes`). What a job's token did starts
+/// no run, as on GitHub.
+pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by: &str, tweak: impl FnOnce(&mut serde_json::Map<String, Value>)) -> anyhow::Result<()> {
+    if !hub.ci.enabled() || by_job(by) {
         return Ok(());
     }
     let Some(v) = versions(hub, d).await?.pop() else { return Ok(()) };
     let ctx = super::events::facts(hub, repo).await.repo;
     let (title, summary) = (d.title.clone(), d.summary.clone());
-    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: false, rebase_only: v.rebase_only, branch: d.branch.clone() };
+    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
     let (mut e, _) = events_of(repo, &ctx, &d.trunk, &v.base, &author, &f, None);
-    e.action = "closed".into();
-    if let Some(p) = e.payload.pointer_mut("/pull_request").and_then(Value::as_object_mut) {
-        p.insert("state".into(), json!("closed"));
-        p.insert("merged".into(), json!(merged));
+    e.action = action.into();
+    if let Some(p) = e.payload.as_object_mut() {
+        p.insert("action".into(), json!(action));
+    }
+    if !by.is_empty() {
+        e.actor = by.to_owned();
+        if let Some(p) = e.payload.as_object_mut() {
+            p.insert("sender".into(), json!({ "login": by, "type": "User" }));
+        }
+    }
+    if let Some(p) = e.payload.as_object_mut() {
+        tweak(p);
     }
     let commit = super::load::load(hub, repo, &v.commit).await?;
     for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
@@ -1070,7 +1109,112 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
         .await
         .map_err(fail)?;
     hub.store.audit(caller.name.clone(), format!("diffs.{action}"), format!("{} {}", d.repo, d.name)).await;
+    // GitHub's events for it (W03-R02's native table): workflows see the diff as it is now.
+    let event = match action {
+        "ready" => Some("ready_for_review"),
+        "abandon" => Some("closed"),
+        "reclaim" => Some("reopened"),
+        _ => None,
+    };
+    if let Some(event) = event
+        && let Ok(Some(now)) = find(hub, &d.id).await
+        && let Some(repo) = hub.store.repos().await.map_err(fail)?.into_iter().find(|r| r.name == d.repo)
+    {
+        let by = caller.name.clone();
+        let started = if event == "closed" { closed(hub, &repo, &now, false, &by).await } else { activity(hub, &repo, &now, event, &by, |_| {}).await };
+        if let Err(e) = started {
+            tracing::warn!(diff = %d.name, %event, error = %format!("{e:#}"), "its workflows didn't start");
+        }
+    }
     Ok(json!({ "diff": d.name, "state": to.as_str(), "author": author.unwrap_or_else(|| d.author.clone()) }))
+}
+
+/// A diff's title or summary edited by its author (or an owner): GitHub's `edited`, with what
+/// they were (`changes`).
+async fn edit(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let who = author_of(&caller.name, Some(caller.kind)).0;
+    if !caller.is_owner() && !d.author.eq_ignore_ascii_case(&who) {
+        return Err((StatusCode::FORBIDDEN, format!("{} is {}'s to edit", d.name, d.author)));
+    }
+    let title = body.get("title").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).filter(|t| *t != d.title);
+    let summary = body.get("summary").or_else(|| body.get("body")).and_then(Value::as_str).map(str::to_owned).filter(|t| *t != d.summary);
+    if body.get("title").is_none() && body.get("summary").is_none() && body.get("body").is_none() {
+        return Err((StatusCode::BAD_REQUEST, "nothing to edit: `title` or `summary`".into()));
+    }
+    let mut changes = serde_json::Map::new();
+    if title.is_some() {
+        changes.insert("title".into(), json!({ "from": d.title }));
+    }
+    if summary.is_some() {
+        changes.insert("body".into(), json!({ "from": d.summary }));
+    }
+    if !changes.is_empty() {
+        let (id, t, b) = (d.id.clone(), title.clone(), summary.clone());
+        hub.store
+            .call(move |c| Ok(c.execute("UPDATE diffs SET title = COALESCE(?2, title), summary = COALESCE(?3, summary), updated_at = ?4 WHERE id = ?1", params![id, t, b, crate::util::now_unix()])?))
+            .await
+            .map_err(fail)?;
+        hub.store.audit(caller.name.clone(), "diffs.edit".into(), format!("{} {}", d.repo, d.name)).await;
+        if let (Ok(Some(now)), Some(repo)) = (find(hub, &d.id).await, hub.store.repos().await.map_err(fail)?.into_iter().find(|r| r.name == d.repo))
+            && let Err(e) = activity(hub, &repo, &now, "edited", &caller.name, |p| {
+                p.insert("changes".into(), Value::Object(changes));
+            })
+            .await
+        {
+            tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "its `edited` workflows didn't start");
+        }
+    }
+    let now = find(hub, &d.id).await.map_err(fail)?.unwrap_or_else(|| d.clone());
+    Ok(json!({ "diff": now.name, "title": now.title, "summary": now.summary }))
+}
+
+/// Labels put on a diff (`add`) or one taken off (`remove`): GitHub's `labeled` and `unlabeled`,
+/// an event a label, with it as `label`. Its labels after.
+async fn relabel(hub: &Hub, d: &Diff, caller: &Caller, add: Vec<String>, remove: Option<String>) -> Result<Value, Fail> {
+    if add.iter().any(|n| n.chars().count() > 50) {
+        return Err((StatusCode::BAD_REQUEST, "a label's name is at most 50 characters".into()));
+    }
+    let (id, by, off) = (d.id.clone(), caller.name.clone(), remove.clone());
+    let (added, removed) = hub
+        .store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = crate::util::now_unix();
+            let mut added = Vec::new();
+            for n in &add {
+                if tx.execute("INSERT OR IGNORE INTO diff_labels (diff_id, name, added_by, added_at) VALUES (?1, ?2, ?3, ?4)", params![id, n, by, now])? > 0 {
+                    added.push(n.clone());
+                }
+            }
+            let removed = match &off {
+                Some(n) => tx.execute("DELETE FROM diff_labels WHERE diff_id = ?1 AND name = ?2", params![id, n])? > 0,
+                None => false,
+            };
+            tx.commit()?;
+            Ok((added, removed))
+        })
+        .await
+        .map_err(fail)?;
+    if let Some(n) = remove.as_ref().filter(|_| !removed) {
+        return Err((StatusCode::NOT_FOUND, format!("{} has no label `{n}`", d.name)));
+    }
+    let events: Vec<(&str, String)> = added.into_iter().map(|n| ("labeled", n)).chain(remove.filter(|_| removed).map(|n| ("unlabeled", n))).collect();
+    if !events.is_empty() {
+        hub.store.audit(caller.name.clone(), "diffs.label".into(), format!("{} {}: {}", d.repo, d.name, events.iter().map(|(a, n)| format!("{a} {n}")).collect::<Vec<_>>().join(", "))).await;
+        if let Some(repo) = hub.store.repos().await.map_err(fail)?.into_iter().find(|r| r.name == d.repo) {
+            for (action, name) in events {
+                let label = json!({ "name": name, "color": "ededed", "default": false, "description": null });
+                if let Err(e) = activity(hub, &repo, d, action, &caller.name, |p| {
+                    p.insert("label".into(), label);
+                })
+                .await
+                {
+                    tracing::warn!(diff = %d.name, %action, error = %format!("{e:#}"), "its workflows didn't start");
+                }
+            }
+        }
+    }
+    Ok(json!({ "diff": d.name, "labels": labels(hub, &d.id).await }))
 }
 
 /// `/api/diffs/<id>[/…]`, `/api/repos/<repo>/diffs` and `/api/stacks/<id>`; the route table
@@ -1143,6 +1287,19 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     }
                     ok(act(hub, &d, action, caller).await?)
                 }
+                (&Method::PATCH, []) => {
+                    if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {
+                        return Err((StatusCode::FORBIDDEN, "editing needs `diffs.submit`".into()));
+                    }
+                    ok(edit(hub, &d, caller, body).await?)
+                }
+                (&Method::POST | &Method::DELETE, ["labels", ..]) if !caller.can("diffs.review", &Scope::Repo { repo: d.repo.clone() }) => Err((StatusCode::FORBIDDEN, "labels need `diffs.review`".into())),
+                (&Method::POST, ["labels"]) => {
+                    let list = body.get("labels").and_then(Value::as_array).cloned().unwrap_or_default();
+                    let add: Vec<String> = list.iter().filter_map(|l| l.as_str().or_else(|| l.get("name").and_then(Value::as_str))).map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+                    ok(relabel(hub, &d, caller, add, None).await?)
+                }
+                (&Method::DELETE, ["labels", name]) => ok(relabel(hub, &d, caller, Vec::new(), Some(srv::decode(name))).await?),
                 _ => Err((StatusCode::NOT_FOUND, "not found".into())),
             }
         }

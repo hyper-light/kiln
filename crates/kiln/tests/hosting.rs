@@ -588,6 +588,11 @@ jobs:
         run: test ! -f BAD
 "#,
     )?;
+    // GitHub's merge queue events (W03-R02): each entry's enqueued and dequeued, with why.
+    std::fs::write(
+        work.join(".github/workflows/queue.yml"),
+        "name: queue\non:\n  pull_request:\n    types: [enqueued, dequeued]\njobs:\n  q:\n    runs-on: local\n    steps:\n      - run: echo \"queue ${{ github.event.action }} ${{ github.event.reason }} D${{ github.event.pull_request.number }}\"\n",
+    )?;
     std::fs::write(work.join("README.md"), "app\n")?;
     must(git(&home, &work, &["add", "."]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
@@ -648,6 +653,20 @@ jobs:
     let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
     let d6 = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D6"])))).cloned().unwrap_or_default();
     assert!(text(&d6, "reason").contains("needs rebase") && text(&d6, "reason").contains("README.md"), "{d6}");
+    // Each entry's merge queue events, with GitHub's reasons.
+    let wanted = ["queue enqueued  D1", "queue dequeued MERGE D1", "queue dequeued CI_FAILURE D2", "queue dequeued MERGE D5", "queue dequeued INVALID_MERGE_COMMIT D6"];
+    until(240, "the merge queue events", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=200", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut said = String::new();
+        for r in runs.iter().filter(|r| text(r, "workflow").ends_with("queue.yml") && r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let detail = api(&s, &s.admin, "GET", &format!("/api/ci/runs/{}", text(r, "id")))?;
+            let leg = detail.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
+            said.push_str(&log);
+        }
+        Ok((!wanted.iter().all(|w| said.contains(w))).then_some(said))
+    })?;
     Ok(())
 }
 
@@ -1465,4 +1484,234 @@ fn w03_r09_native_conversation_events() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "not every conversation event ran: {logs:?}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(700));
     }
+}
+
+/// The first branch pushed to an empty repository is its default, as on GitHub (W14-R01): one made
+/// on `main` takes `master` when that's what comes first, and `refs/for/master` is a trunk's then.
+/// A push refused while its pack is still coming says why: git hears the refusal, not a broken
+/// connection.
+#[test]
+fn w14_r01_first_branch_and_refusals_said() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/first.git", s.admin, s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/first", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "master"]), "init")?;
+    std::fs::write(work.join("README.md"), "first\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let said = must(git(&home, &work, &["push", &url, "master"]), "the first branch")?;
+    assert!(said.contains("master is the repository's default branch"), "{said}");
+    let (_, repos) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+    let repos: Value = serde_json::from_str(&repos)?;
+    let first = repos.as_array().and_then(|r| r.iter().find(|x| x.get("name").and_then(Value::as_str) == Some("acme/first"))).cloned().unwrap_or_default();
+    assert_eq!(first.get("default_branch").and_then(Value::as_str), Some("master"), "{first}");
+    // A pack of a few MiB (incompressible), pushed somewhere refused.
+    let noise: Vec<u8> = (0..6u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    std::fs::write(work.join("noise.bin"), noise)?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "noise"]), "commit")?;
+    let (ok, out) = git(&home, &work, &["push", &url, "HEAD:refs/for/nowhere"])?;
+    assert!(!ok, "refused: {out}");
+    assert!(out.contains("isn't a trunk") && !out.contains("RPC failed"), "git hears why: {out}");
+    // And a trunk's review takes it.
+    must(git(&home, &work, &["commit", "-q", "--amend", "-m", "noise\n\nChange-Id: I0123456789abcdef0123456789abcdef01234567"]), "amend")?;
+    let out = must(git(&home, &work, &["push", &url, "HEAD:refs/for/master"]), "a submission to master")?;
+    assert!(out.contains("D1"), "{out}");
+    Ok(())
+}
+
+/// kiln's other native events (W03-R02, R09): a change request's `pull_request` activity (ready
+/// for review, edited, labeled and unlabeled, closed by abandoning, reopened by reclaiming), and
+/// kiln's `agent` (an agent asks for a run), `webhook` (a signed call to a hook of the repository)
+/// and `pipeline` (another workflow's run finished) events.
+#[test]
+fn w03_r09_native_activity_and_kiln_events() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\ngithub_workflows = \"on\"", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".github/workflows/activity.yml"),
+        "on:\n  pull_request:\n    types: [ready_for_review, closed, reopened, edited, labeled, unlabeled]\njobs:\n  j:\n    runs-on: local\n    steps:\n      - run: echo \"pr ${{ github.event.action }} label=${{ github.event.label.name }} from=${{ github.event.changes.title.from }} merged=${{ github.event.pull_request.merged }} labels=${{ join(github.event.pull_request.labels.*.name, ',') }}\"\n",
+    )?;
+    std::fs::write(work.join(".kiln/ask.yaml"), "on:\n  agent:\n    agents: [\"*\"]\n    inputs:\n      what: { type: string, required: true }\njobs:\n  a:\n    runs-on: local\n    steps:\n      - run: echo \"asked by ${{ github.actor }} for ${{ inputs.what }}\"\n")?;
+    std::fs::write(work.join(".kiln/picky.yaml"), "on:\n  agent:\n    agents: [triage]\njobs:\n  a:\n    runs-on: local\n    steps:\n      - run: echo picky\n")?;
+    std::fs::write(work.join(".kiln/hooked.yaml"), "name: hooked\non:\n  webhook:\n    filter: \"event.env == 'prod'\"\njobs:\n  h:\n    runs-on: local\n    steps:\n      - run: echo \"hooked ${{ github.event.action }} for ${{ github.event.env }}\"\n")?;
+    std::fs::write(work.join(".kiln/after.yaml"), "on:\n  pipeline:\n    name: hooked\n    conclusion: [success]\njobs:\n  p:\n    runs-on: local\n    steps:\n      - run: echo \"after ${{ github.event.workflow_run.name }}\"\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "workflows"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the trunk")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/app") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    // A draft change request, then what its author and reviewers do to it.
+    must(git(&home, &work, &["checkout", "-q", "-b", "feature"]), "branch")?;
+    std::fs::write(work.join("change.txt"), "one\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "a change"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "feature"]), "the branch")?;
+    let (st, cr) = http(s.port, "POST", "/api/repos/acme%2Fapp/change-requests", &s.admin, Some(&json!({ "branch": "feature", "draft": true, "title": "First title" })))?;
+    anyhow::ensure!(st == 200, "change request: {st} {cr}");
+    let name = serde_json::from_str::<Value>(&cr)?.get("change_request").and_then(Value::as_str).unwrap_or_default().to_owned();
+    for (method, path, b) in [
+        ("POST", "ready", json!({})),
+        ("PATCH", "", json!({ "title": "Second title" })),
+        ("POST", "labels", json!({ "labels": ["ci:full"] })),
+        ("DELETE", "labels/ci%3Afull", json!({})),
+        ("POST", "abandon", json!({})),
+        ("POST", "reclaim", json!({})),
+    ] {
+        let at = if path.is_empty() { format!("/api/change-requests/{name}") } else { format!("/api/change-requests/{name}/{path}") };
+        let (st, out) = http(s.port, method, &at, &s.admin, Some(&b))?;
+        anyhow::ensure!(st == 200, "{method} {at}: {st} {out}");
+        // In order: each action's run is made before the next changes the request.
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    // An agent asks; one the workflow doesn't name is refused.
+    let (st, out) = http(s.port, "POST", "/api/ci/repos/acme%2Fapp/agent", &s.admin, Some(&json!({ "workflow": "ask.yaml", "inputs": { "what": "a smoke test" } })))?;
+    anyhow::ensure!(st == 204, "agent: {st} {out}");
+    let (st, out) = http(s.port, "POST", "/api/ci/repos/acme%2Fapp/agent", &s.admin, Some(&json!({ "workflow": "picky.yaml" })))?;
+    assert_eq!(st, 403, "an agent picky.yaml doesn't name: {out}");
+    // A hook, called signed (twice: one its filter takes), and unsigned.
+    let (st, hook) = http(s.port, "POST", "/api/ci/repos/acme%2Fapp/hooks", &s.admin, Some(&json!({ "name": "release-bot" })))?;
+    anyhow::ensure!(st == 201, "hook: {st} {hook}");
+    let hook: Value = serde_json::from_str(&hook)?;
+    let (id, secret) = (text(&hook, "id").to_owned(), text(&hook, "secret").to_owned());
+    for (env, signed) in [("prod", true), ("dev", true), ("prod", false)] {
+        let body = json!({ "action": "released", "env": env }).to_string();
+        let sig = if signed { kiln::util::hmac_hex(secret.as_bytes(), body.as_bytes()) } else { "0".repeat(64) };
+        let out = Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "Content-Type: application/json", "-H", &format!("X-Kiln-Signature-256: sha256={sig}"), "--data-binary", &body, &format!("http://127.0.0.1:{}/api/ci/hooks/{id}", s.port)]).output()?;
+        let code = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(code, if signed { "202" } else { "401" }, "the hook's call ({env}, signed: {signed})");
+    }
+    let wanted = [
+        ("pull_request", "pr ready_for_review label= from= merged="),
+        ("pull_request", "pr edited label= from=First title"),
+        ("pull_request", "pr labeled label=ci:full from= merged= labels=ci:full"),
+        ("pull_request", "pr unlabeled label=ci:full"),
+        ("pull_request", "pr closed label= from= merged=false"),
+        ("pull_request", "pr reopened"),
+        ("agent", "asked by admin for a smoke test"),
+        ("webhook", "hooked released for prod"),
+        ("pipeline", "after hooked"),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=50", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut logs: Vec<(String, String)> = Vec::new();
+        for r in runs.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let id = text(r, "id").to_owned();
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
+            logs.push((text(r, "event").to_owned(), log));
+        }
+        if wanted.iter().all(|(event, said)| logs.iter().any(|(e, l)| e == event && l.contains(said))) {
+            // The hook's filter took the `prod` call alone; nothing ran for `opened`, which the
+            // workflow's `types` leave out.
+            assert_eq!(logs.iter().filter(|(e, _)| e == "webhook").count(), 1, "{logs:?}");
+            assert!(!logs.iter().any(|(_, l)| l.contains("pr opened")), "{logs:?}");
+            assert!(!logs.iter().any(|(_, l)| l.contains("picky")), "{logs:?}");
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "not every event ran: {logs:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(700));
+    }
+}
+
+/// W07-R01's `kiln://owner/repo/path@ref`: an action in one of kiln's own repositories, pinned at
+/// run start from kiln's own git and run like GitHub's; its owner's repositories' to use, so
+/// another owner's workflow fails at the start with why.
+#[test]
+fn w07_r01_kiln_actions() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let push = |name: &str, files: &[(&str, &str)], tag: Option<&str>| -> anyhow::Result<()> {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
+        anyhow::ensure!(st == 200, "{name}: {st} {body}");
+        let work = dir.path().join(name.replace('/', "_"));
+        std::fs::create_dir_all(&work)?;
+        must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+        for (path, text) in files {
+            let p = work.join(path);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(p, text)?;
+        }
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+        if let Some(t) = tag {
+            must(git(&home, &work, &["tag", t]), "tag")?;
+        }
+        let url = format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port);
+        must(git(&home, &work, &["push", "-q", &url, "main", "--tags"]), "push")?;
+        Ok(())
+    };
+    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n")], Some("v1"))?;
+    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1\n        with:\n          who: ${{ github.repository }}\n";
+    // The first push only records refs; the workflow comes with the second.
+    for name in ["acme/app", "other/app"] {
+        push(name, &[("README.md", "app\n")], None)?;
+    }
+    until(60, "the first polls", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    for name in ["acme/app", "other/app"] {
+        let work = dir.path().join(name.replace('/', "_"));
+        std::fs::create_dir_all(work.join(".kiln"))?;
+        std::fs::write(work.join(".kiln/use.yaml"), using)?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", "use kiln tools"]), "commit")?;
+        let url = format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port);
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    }
+    let settled = |name: &str| -> anyhow::Result<Option<(String, String)>> {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo={name}&limit=5"), &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) else { return Ok(None) };
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (_, l) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+        let l: Value = serde_json::from_str(&l)?;
+        let notes: Vec<String> = l.get("annotations").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
+        let mut log = String::new();
+        for step in 0..3 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            log.push_str(&t);
+        }
+        Ok(Some((text(r, "conclusion").to_owned(), format!("{}\n{log}", notes.join("\n")))))
+    };
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let (ours, theirs) = loop {
+        if let (Some(a), Some(b)) = (settled("acme/app")?, settled("other/app")?) {
+            break (a, b);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the runs didn't finish\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(ours.0, "success", "{}", ours.1);
+    assert!(ours.1.contains("hello from kiln tools to acme/app"), "{}", ours.1);
+    assert_eq!(theirs.0, "failure", "{}", theirs.1);
+    assert!(theirs.1.contains("another owner's repository"), "{}", theirs.1);
+    Ok(())
 }

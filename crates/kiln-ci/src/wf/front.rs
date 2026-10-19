@@ -26,6 +26,18 @@ pub(crate) fn is_job_id(s: &str) -> bool {
 }
 
 impl Fe<'_> {
+    /// `kiln: { chain-depth }`: from 1 to 10 (W03-R13).
+    pub(crate) fn chain_depth(&mut self, v: &Node) -> Option<u32> {
+        let n = v.get("chain-depth")?;
+        match n.as_scalar() {
+            Some(Scalar::Int(i)) if (1..=10).contains(i) => u32::try_from(*i).ok(),
+            _ => {
+                self.err("KCI1015", "`chain-depth` is a number from 1 to 10 (GitHub's `workflow_run` chains stop at 3)", n.range, "kiln.chain-depth");
+                None
+            }
+        }
+    }
+
     fn kiln(&self) -> bool {
         self.dialect == Dialect::Kiln
     }
@@ -205,7 +217,10 @@ impl Fe<'_> {
                 "supersede" => wf.supersede = Some(self.yval(v)),
                 "routing" => wf.routing_infer = v.get("infer").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)),
                 "run-env" => wf.run_env = self.bool(v, "run-env").unwrap_or(false),
-                "kiln" => wf.honour_skip_ci = v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)),
+                "kiln" => {
+                    wf.honour_skip_ci = v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true));
+                    wf.chain_depth = self.chain_depth(v);
+                }
                 "checkout" => wf.checkout = self.bool(v, "checkout").unwrap_or(true),
                 _ => {
                     let _ = kr;

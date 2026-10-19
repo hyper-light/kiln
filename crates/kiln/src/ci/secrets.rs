@@ -112,6 +112,12 @@ fn master(hub: &Hub) -> anyhow::Result<[u8; 32]> {
     }
 }
 
+/// A key of its own for `label`, from the master key: one kiln checks with and never stores (an
+/// inbound webhook's secret, W03-R02).
+pub(crate) fn derived(hub: &Hub, label: &str) -> anyhow::Result<String> {
+    Ok(crate::util::hmac_hex(&master(hub)?, label.as_bytes()))
+}
+
 fn key(bytes: &[u8; 32]) -> anyhow::Result<LessSafeKey> {
     Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, bytes).map_err(|_| anyhow::anyhow!("bad key"))?))
 }

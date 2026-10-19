@@ -273,7 +273,7 @@ fn refused(status: http::StatusCode, message: impl Into<String>) -> Refused {
 }
 
 /// The full ref and commit `r` names: a branch, a tag, or a `refs/…` name.
-async fn named_ref(hub: &Hub, repo: &Repo, r: &str) -> Result<(String, String), Refused> {
+pub(crate) async fn named_ref(hub: &Hub, repo: &Repo, r: &str) -> Result<(String, String), Refused> {
     let refs: std::collections::HashMap<String, String> = hub.store.refs(repo.id.clone()).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().collect();
     for full in [r.to_owned(), format!("refs/heads/{r}"), format!("refs/tags/{r}")] {
         if let Some(sha) = refs.get(&full) {
@@ -362,6 +362,37 @@ pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &st
     Ok(())
 }
 
+/// kiln's `agent` event (W03-R09, W20): agent `agent` asks for a run of workflow `which` at
+/// `git_ref`, one that takes it (`on: { agent: { agents, inputs } }`, its `agents` naming it or
+/// `*`), with `inputs` typed and checked as `workflow_dispatch`'s are. The agent is the run's actor.
+pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, agent: &str) -> Result<(), Refused> {
+    if !hub.ci.enabled() {
+        return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
+    }
+    let (full_ref, sha) = named_ref(hub, repo, git_ref).await?;
+    let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let Some(l) = commit.workflows.iter().find(|l| l.path == which || l.path.rsplit('/').next() == Some(which)) else {
+        return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {git_ref}")));
+    };
+    let Some(declared) = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "agent")).map(|t| t.inputs.clone()) else {
+        return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("{} doesn't take kiln's `agent` event (`on: agent`)", l.path)));
+    };
+    let (typed, strings) = kiln_ci::trigger::dispatch::inputs(&declared, given).map_err(|m| refused(http::StatusCode::UNPROCESSABLE_ENTITY, m))?;
+    let f = facts(hub, repo).await;
+    let (message, _) = gitops::commit_info(hub, repo, &sha).await;
+    let mut e = Event { name: "agent".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: agent.to_owned(), trusted: true, source: Source::Agent, message: Some(message.clone()), ..Event::default() };
+    e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
+    if let Some(p) = e.payload.as_object_mut() {
+        p.insert("sender".into(), serde_json::json!({ "login": agent, "type": "Bot" }));
+        p.insert("kiln".into(), serde_json::json!({ "agent": agent }));
+    }
+    match start(hub, repo, &e, l, &message, agent, typed).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(refused(http::StatusCode::FORBIDDEN, format!("{} doesn't take a run asked for by {agent} (its `agents`)", l.path))),
+        Err(err) => Err(refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))),
+    }
+}
+
 /// `repository_dispatch` (W03-R11): runs the default branch's workflows that listen for
 /// `event_type`, with `client_payload` in the event.
 pub async fn repository_dispatch(hub: &Hub, repo: &Repo, event_type: &str, client_payload: &serde_json::Value, actor: &str) -> Result<usize, Refused> {
@@ -417,12 +448,15 @@ pub async fn registry_package(hub: &Hub, repo: &Repo, action: &str, package: &se
 
 /// A run's chain of `workflow_run` triggers is at most this deep (W03-R13, GitHub-exact).
 pub const MAX_WORKFLOW_RUN_DEPTH: u64 = 3;
+/// How deep a kiln workflow may say it takes part in a chain (`kiln: { chain-depth }`).
+pub const MAX_CHAIN_DEPTH: u64 = 10;
 
 /// `workflow_run` (W03-R02, W03-R13): a run was requested or completed. The default branch's
-/// workflows that listen for it run there, with the run in `github.event.workflow_run`. Chains
-/// stop at three levels.
+/// workflows that listen for it run there, with the run in `github.event.workflow_run`; kiln's
+/// `pipeline` too, once it completed. Chains stop at three levels, or as deep as a listening
+/// workflow's `kiln: { chain-depth }` says (ten at most).
 pub async fn workflow_run(hub: &Hub, repo: &Repo, action: &str, run: &context::RunSummary, depth: u64) {
-    if depth >= MAX_WORKFLOW_RUN_DEPTH {
+    if depth >= MAX_CHAIN_DEPTH {
         tracing::debug!(repo = %repo.name, run = run.id, depth, "workflow_run chain at its limit");
         return;
     }
@@ -432,7 +466,9 @@ pub async fn workflow_run(hub: &Hub, repo: &Repo, action: &str, run: &context::R
         Ok(c) => c,
         Err(e) => return tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "workflow_run: the default branch's workflows could not be read"),
     };
-    let listening: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && !l.has_errors() && l.workflow.as_ref().is_some_and(|w| w.on.iter().any(|t| t.event == "workflow_run"))).collect();
+    let takes = |w: &kiln_ci::wf::ir::Workflow, event: &str| w.on.iter().any(|t| t.event == event) && depth < w.chain_depth.map_or(MAX_WORKFLOW_RUN_DEPTH, |d| u64::from(d).min(MAX_CHAIN_DEPTH));
+    let completed = action == "completed";
+    let listening: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && !l.has_errors() && l.workflow.as_ref().is_some_and(|w| takes(w, "workflow_run") || (completed && takes(w, "pipeline")))).collect();
     if listening.is_empty() {
         return;
     }
@@ -458,9 +494,14 @@ pub async fn workflow_run(hub: &Hub, repo: &Repo, action: &str, run: &context::R
         workflow_branch: Some(run.head_branch.clone()),
         ..Event::default()
     };
+    // kiln's: another workflow's run finished (by its kiln name or path).
+    let pipeline = Event { name: "pipeline".into(), ..e.clone() };
     for l in listening {
-        if let Err(err) = start(hub, repo, &e, l, &message, &run.actor, serde_json::Value::Null).await {
-            tracing::warn!(repo = %repo.name, workflow = %l.path, error = %format!("{err:#}"), "workflow_run");
+        let Some(w) = l.workflow.as_ref() else { continue };
+        for ev in [Some(&e).filter(|_| takes(w, "workflow_run")), Some(&pipeline).filter(|_| completed && takes(w, "pipeline"))].into_iter().flatten() {
+            if let Err(err) = start(hub, repo, ev, l, &message, &run.actor, serde_json::Value::Null).await {
+                tracing::warn!(repo = %repo.name, workflow = %l.path, event = %ev.name, error = %format!("{err:#}"), "workflow_run");
+            }
         }
     }
 }

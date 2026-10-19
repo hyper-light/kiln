@@ -357,7 +357,7 @@ pub const WORKFLOW: &[Key] = &[
     kiln("supersede", Ty::Any, "kiln: cancel or deprioritize older runs (W05-R08)."),
     kiln("routing", Ty::Any, "kiln: `{ infer: true }` (W05-R19)."),
     kiln_only("run-env", Ty::Bool, "kiln: collect `$KILN_RUN_ENV` into `run.env` (W04-R21)."),
-    kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci }` (W03-R06)."),
+    kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci, chain-depth }` (W03-R06, R13)."),
     kiln_only("checkout", Ty::Bool, "kiln: `false` turns the implicit checkout off."),
 ];
 

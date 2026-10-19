@@ -459,10 +459,12 @@ struct Dispatch {
     runs: HashMap<String, RunSt>,
     legs: HashMap<String, LegSt>,
     timers: BTreeSet<i64>,
-    /// What a command left for the command loop to do next ([`Dispatch::fail_unstarted`]): run
-    /// by the loop, not a level down from it, which in a debug build would take more stack than a
-    /// shard has.
+    /// What a command left for the command loop to do next ([`Dispatch::fail_unstarted`], and
+    /// any commands a command's own work made): run by the loop, not a level down from it, which
+    /// in a debug build would take more stack than a shard has.
     next: Vec<Command>,
+    /// The command loop is running: commands made inside it wait in `next` for their turn.
+    in_commands: bool,
 }
 
 fn now_ms() -> i64 {
@@ -517,7 +519,7 @@ pub fn spawn(hub: Arc<Hub>) {
         let rules = sources.effective();
         let mut cfg = sched_config(&hub, rules);
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new() };
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(), in_commands: false };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -1284,6 +1286,14 @@ impl Dispatch {
 
     /// Carries out what the scheduler decided.
     async fn commands(&mut self, cmds: Vec<Command>) {
+        // One loop does them all. What a command makes as it runs (a cancel's settles, a settle's
+        // next legs, their assignments) comes right after it, as if it had done it itself, rather
+        // than a level down: a chain of them doesn't deepen the stack.
+        if self.in_commands {
+            self.next.extend(cmds);
+            return;
+        }
+        self.in_commands = true;
         let mut todo: std::collections::VecDeque<Command> = cmds.into();
         while let Some(c) = todo.pop_front() {
             let r = match c {
@@ -1341,6 +1351,7 @@ impl Dispatch {
                 todo.push_front(c);
             }
         }
+        self.in_commands = false;
     }
 
     /// Sends a leg to its runner (W05, W06).

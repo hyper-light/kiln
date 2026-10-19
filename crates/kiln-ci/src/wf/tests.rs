@@ -282,3 +282,18 @@ fn needs_of_itself_and_twice_end() {
     let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    needs: [a, b]\n    steps: [{run: b}]\n");
     assert!(errors(&d).iter().any(|e| e.contains("form a cycle")), "{d:?}");
 }
+
+/// `kiln: { chain-depth }` (W03-R13): how deep a `workflow_run` chain a workflow takes part in,
+/// from 1 to 10; GitHub's three when unset.
+#[test]
+fn w03_r13_chain_depth() {
+    let (w, d) = kiln("on:\n  pipeline: { name: build }\nkiln:\n  chain-depth: 6\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(w.and_then(|w| w.chain_depth), Some(6));
+    let (w, _) = kiln("on: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert_eq!(w.and_then(|w| w.chain_depth), None);
+    for bad in ["11", "0", "deep"] {
+        let (_, d) = kiln(&format!("on: push\nkiln:\n  chain-depth: {bad}\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: echo}}]\n"));
+        assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("1 to 10")), "{bad}: {d:?}");
+    }
+}

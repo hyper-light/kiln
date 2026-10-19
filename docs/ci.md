@@ -174,11 +174,11 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
-| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native `pull_request_target`, comments and reviews (GitHub's and kiln's), nothing started by a job's token; `pull_request`'s other types, `land` and the CD and agent events left |
+| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; the whole native table: `pull_request`'s activity types and `pull_request_target`, comments and reviews, the merge queue's `enqueued`/`dequeued`; kiln's `land`, `agent`, `webhook` (inbound hooks), `pipeline` and `deploy`; `chain-depth`; nothing started by a job's token; the App's events and AC04/05/07–09 left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
-| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
+| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); tiers, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
@@ -1202,11 +1202,33 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
   recorded before the poller looks), the versions and pull requests it makes, and its comments
   and reviews. Checked: a job that pushes a branch and opens a pull request for it, under a
   workflow that runs on both, leaves its one run alone (`w14_r11_pull_requests_jobs_open_and_label`).
+- *Done.* The rest of the native table (R02, R09), checked end to end
+  (`w03_r09_native_activity_and_kiln_events`, `w14_ac03_queue`):
+  - a diff's or change request's `pull_request` activity, `pull_request_target` beside it: made
+    ready (`ready_for_review`), edited (`PATCH /api/diffs/:id`: `edited`, the old title and body
+    in `changes`), labeled and unlabeled (`/api/diffs/:id/labels`: `labeled`, `unlabeled`, the
+    label in `label`), abandoned (`closed`, not merged), reclaimed (`reopened`); queued to land
+    and out again (`enqueued`, `dequeued` with GitHub's reason: `MERGE`, `MANUAL`, `CI_FAILURE`,
+    `INVALID_MERGE_COMMIT`, `BRANCH_PROTECTIONS`). A landed diff's `closed` is sent by whoever
+    asked it to land. Payloads carry the pull request's labels.
+  - kiln's `land` and `merge_group` for the land queue's candidates (W14).
+  - kiln's `agent`: an agent asks for a run (`POST /api/ci/repos/:repo/agent`, MCP's
+    `ci.runs.ask`) of a workflow that takes it, its `agents` naming the caller or `*`, its inputs
+    typed as `workflow_dispatch`'s; the agent is the run's actor.
+  - kiln's `webhook`: a repository's inbound hooks (`/api/ci/repos/:repo/hooks`, made with
+    `secrets.manage`); a call to `POST /api/ci/hooks/:id` signed with HMAC-SHA256 over its body
+    (`X-Kiln-Signature-256`, or GitHub's `X-Hub-Signature-256`) runs the default branch's
+    workflows that take it, the body as the event, through their `hook` and `filter`. A hook's
+    secret is derived from the server's master key and its id, never stored; an unknown hook
+    and a bad signature answer alike.
+  - kiln's `pipeline`, beside `workflow_run` when a run completes.
+  - kiln's `deploy` (W15-R06): as KilnCD publishes its apps' statuses, an app turning synced
+    (in sync and healthy, or a sync of it succeeding again), degraded, or whose sync failed
+    raises it in the repository whose `.kiln/deploy.yaml` defines it.
+  - R13: `kiln: { chain-depth }` lets a workflow take part in `workflow_run` and `pipeline`
+    chains up to ten deep (GitHub's three otherwise).
 - *Left.*
   - The App's events (with W14-R10).
-  - kiln's other native events: `pull_request`'s other types (edited, reopened, labeled,
-    ready_for_review), `land`, the CD and agent events (with W14, W15 and W20).
-  - kiln dialect raising the `workflow_run` depth.
   - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05 as an integration
     test, AC07 to AC09.
 
@@ -2261,8 +2283,12 @@ Gives step execution for `uses:`.
   main and post steps, and each main step's reaches its post step. They run in GitHub's order:
   the pre steps first, in step order (`Pre js kind`, `Pre docker kind`); then the job's steps;
   then the post steps, in reverse.
+- *Done.* R01's `kiln://owner/repo[/path]@ref` (`w07_r01_kiln_actions`): an action in one of
+  kiln's own repositories, pinned at run start from kiln's own git, mirrored and served apart
+  from GitHub's of the same name (`/_kiln/actions/kiln/…`), run as GitHub's are. It's its owner's
+  repositories' to use, as a private action on GitHub is its owner's: another owner's workflow
+  fails at the start, saying so, and a leg of another owner's can't download it.
 - *Left.*
-  - R01's `kiln://`.
   - The pins on the run page and its "rerun with fresh actions" (the API and CLI have it), and
     storing tarballs in W08's store (today they are files under `<data>/actions/tar`).
   - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
@@ -3592,6 +3618,11 @@ adapts [review.md](review.md), which it replaces.
 land queue, the GitHub App and the review UI (AC06) are built; the rest of the facade's REST half
 is left.
 
+- *Done.* Pushing to a new repository (R01, R02), as on GitHub
+  (`w14_r01_first_branch_and_refusals_said`): the first branch pushed to an empty repository is
+  its default when the branch it was made on isn't among those pushed. A refused push says why:
+  kiln reads the rest of the pack before it answers, where git would otherwise see the
+  connection close ("RPC failed") and not the reason.
 - *Done.* AC06, against a real server: `ci/ui/review_setup.py` makes a diff with a 10,000-line
   change, a moved block, a one-word edit, a generated file and an image, and a reviewer's thread
   waiting for the author. `ci/ui/review_ac06.mjs` checks the review pages (W21-R09) in Chromium and

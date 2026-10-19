@@ -592,6 +592,10 @@ pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
                     {
                         tracing::warn!(diff = %v.get("diff").and_then(serde_json::Value::as_str).unwrap_or_default(), error = %format!("{e:#}"), "a diff's conversation started no workflows");
                     }
+                    // CD's apps moving raise kiln's `deploy` (W03-R09, W15-R06).
+                    if v.get("type").and_then(Value::as_str) == Some("cd_apps") {
+                        super::cd_events::observe(&hub, &v).await;
+                    }
                     let finished = v.get("type").and_then(Value::as_str) == Some("run")
                         && v.pointer("/run/status").and_then(Value::as_str).is_some_and(|s| matches!(s, "succeeded" | "failed" | "cancelled" | "timed_out" | "skipped"));
                     if finished

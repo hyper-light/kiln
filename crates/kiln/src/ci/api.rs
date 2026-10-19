@@ -55,6 +55,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         ["_kiln", "attestations", "sbom"] if req.method() == Method::POST => Some(super::attest::upload(hub, req).await),
         ["_kiln", "attestations"] => Some(super::attest::for_leg(hub, &req).await),
         ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub).await),
+        // W03-R02: an inbound webhook's call, checked by its signature.
+        ["api", "ci", "hooks", id] if req.method() == Method::POST => Some(super::inbound::call(hub, id, req).await),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -68,7 +70,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 
 /// Is this path one of [`open`]'s? (So the caller can hand the request over without cloning it.)
 pub fn is_open(seg: &[&str]) -> bool {
-    git_path(seg) || matches!(seg, ["git", rest @ ..] if git_path(rest)) || super::rest::is_web(seg) || super::rest::is_download(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"] | ["api", "uploads", ..])
+    git_path(seg) || matches!(seg, ["git", rest @ ..] if git_path(rest)) || super::rest::is_web(seg) || super::rest::is_download(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"] | ["api", "uploads", ..] | ["api", "ci", "hooks", _])
 }
 
 /// First segments that are kiln's own, never a repository owner.
@@ -303,6 +305,22 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::POST, ["repos", repo, "repository-dispatch"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
         // W03-R11: dispatches.
         (&Method::POST, ["repos", repo, "dispatches"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
+        // W03-R02: inbound webhooks (`/api/ci/hooks/:id` is their call).
+        (&Method::GET, ["repos", repo, "hooks"]) => super::inbound::list(hub, repo).await,
+        (&Method::POST, ["repos", repo, "hooks"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 20).await.unwrap_or(serde_json::Value::Null);
+            super::inbound::create(hub, repo, &body, &by).await
+        }
+        (&Method::DELETE, ["repos", repo, "hooks", id]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            super::inbound::delete(hub, repo, id, &by).await
+        }
+        // W03-R09: kiln's `agent` event, the caller the agent asking.
+        (&Method::POST, ["repos", repo, "agent"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "kiln".to_owned(), |c| c.name.clone());
+            workflows::agent_run(hub, repo, &by, req.into_body()).await
+        }
         // W17-R06: runs of a working tree (`kiln workflow run`).
         (&Method::GET, ["repos", repo, "heads"]) => super::uploads::heads(hub, repo).await,
         (&Method::POST, ["repos", repo, "packs"]) => {

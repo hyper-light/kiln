@@ -147,13 +147,34 @@ async fn tell(hub: &Hub, e: &Entry, state: &str, reason: Option<&str>) {
     hub.emit(&json!({ "type": "queue", "entry": e.id, "state": state, "reason": reason, "strategy": e.strategy.as_str(), "diffs": list, "enqueued_by": e.enqueued_by }));
 }
 
-/// Takes an entry out of the queue, saying why; its diffs go back to their review state.
-async fn eject(hub: &Hub, e: &Entry, reason: &str) -> anyhow::Result<()> {
+/// GitHub's merge queue events for diffs (W03-R02's native table): `pull_request` `enqueued`, or
+/// `dequeued` with GitHub's `reason` (`MERGE`, `MANUAL`, `CI_FAILURE`, `INVALID_MERGE_COMMIT`,
+/// `BRANCH_PROTECTIONS`, `UNKNOWN_REMOVAL_REASON`), sent by `by`.
+async fn queue_event(hub: &Hub, ids: &[String], action: &str, reason: Option<&str>, by: &str) {
+    for id in ids {
+        let Ok(Some(d)) = diffs::find(hub, id).await else { continue };
+        let Some(repo) = hub.store.repos().await.ok().and_then(|r| r.into_iter().find(|r| r.name == d.repo)) else { continue };
+        if let Err(err) = diffs::activity(hub, &repo, &d, action, by, |p| {
+            if let Some(r) = reason {
+                p.insert("reason".into(), json!(r));
+            }
+        })
+        .await
+        {
+            tracing::warn!(diff = %d.name, %action, error = %format!("{err:#}"), "its workflows didn't start");
+        }
+    }
+}
+
+/// Takes an entry out of the queue, saying why (`code`: GitHub's reason, for `dequeued`); its
+/// diffs go back to their review state.
+async fn eject(hub: &Hub, e: &Entry, reason: &str, code: &str) -> anyhow::Result<()> {
     let (id, why) = (e.id.clone(), reason.to_owned());
     hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()]).map(|_| ())?)).await?;
     set_diff_state(hub, &e.diffs, State::Accepted).await?;
     hub.store.audit("kiln".into(), "queue.eject".into(), format!("{}: {reason}", e.id)).await;
     tell(hub, e, "ejected", Some(reason)).await;
+    queue_event(hub, &e.diffs, "dequeued", Some(code), "kiln").await;
     tracing::info!(entry = %e.id, %reason, "ejected from the land queue");
     Ok(())
 }
@@ -218,6 +239,7 @@ pub async fn enqueue(hub: &Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) ->
         .map_err(fail)?;
     set_diff_state(hub, &ids, State::Landing).await.map_err(fail)?;
     hub.store.audit(caller.name.clone(), "diffs.land".into(), format!("{} {} ({}) by {}", repo.name, names.join(" "), d.trunk, strategy.as_str())).await;
+    queue_event(hub, &ids, "enqueued", None, &caller.name).await;
     kick();
     Ok(json!({ "entry": entry, "diffs": names, "trunk": d.trunk, "strategy": strategy.as_str(), "state": "queued" }))
 }
@@ -267,6 +289,7 @@ pub async fn cancel(hub: &Hub, entry: &str, caller: &Caller) -> Result<Value, Fa
         hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'queued', batch = NULL, candidate = NULL, base = NULL WHERE batch = ?1 AND state = 'testing'", [&b]).map(|_| ())?)).await.map_err(fail)?;
     }
     hub.store.audit(caller.name.clone(), "queue.cancel".into(), e.id.clone()).await;
+    queue_event(hub, &e.diffs, "dequeued", Some("MANUAL"), &caller.name).await;
     kick();
     Ok(json!({ "entry": e.id, "state": "cancelled" }))
 }
@@ -600,7 +623,7 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
 async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
     let Some(path) = super::hosting::native_path(hub, repo) else {
         for e in entries(hub, &repo.id, trunk, &["queued", "testing"]).await? {
-            eject(hub, &e, "the repository isn't hosted here").await?;
+            eject(hub, &e, "the repository isn't hosted here", "UNKNOWN_REMOVAL_REASON").await?;
         }
         return Ok(());
     };
@@ -637,7 +660,7 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
                 tracing::info!(repo = %repo.name, %trunk, %reason, "a batch failed: testing it in halves");
             } else {
                 // The culprit, alone: out, and the rest tested whole again.
-                eject(hub, first, &reason).await?;
+                eject(hub, first, &reason, "CI_FAILURE").await?;
                 failures().lock().remove(&key);
                 kick();
             }
@@ -676,9 +699,9 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
             }
             Err(Refusal::Conflict(files)) => {
                 let shown: Vec<String> = files.iter().take(5).cloned().collect();
-                eject(hub, &e, &format!("needs rebase: conflicts in {}{}", shown.join(", "), if files.len() > 5 { ", …" } else { "" })).await?;
+                eject(hub, &e, &format!("needs rebase: conflicts in {}{}", shown.join(", "), if files.len() > 5 { ", …" } else { "" }), "INVALID_MERGE_COMMIT").await?;
             }
-            Err(Refusal::Other(why)) => eject(hub, &e, &why).await?,
+            Err(Refusal::Other(why)) => eject(hub, &e, &why, "UNKNOWN_REMOVAL_REASON").await?,
         }
     }
     if built.is_empty() {
@@ -704,7 +727,7 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
     if !missing.is_empty() {
         let _ = gitops::run_git(hub, &["-C", &path, "update-ref", "-d", &format!("refs/kiln/land/{trunk}/{batch}")], LS_REMOTE_TIMEOUT).await;
         for (e, _) in &built {
-            eject(hub, e, &format!("{} must pass on the candidate, and no workflow runs it there: add `on: merge_group` (or kiln's `on: land`)", missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", "))).await?;
+            eject(hub, e, &format!("{} must pass on the candidate, and no workflow runs it there: add `on: merge_group` (or kiln's `on: land`)", missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ")), "BRANCH_PROTECTIONS").await?;
         }
         return Ok(());
     }
@@ -747,6 +770,8 @@ async fn requeue(hub: &Hub, list: &[Entry]) -> anyhow::Result<()> {
 /// The trunk is at `tip`: the batch's entries and diffs landed; the open diffs above them restacked.
 async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[Entry], tip: &str) -> anyhow::Result<()> {
     let mut all = Vec::new();
+    // Each diff's closing event is sent by whoever asked it to land.
+    let mut landed_by: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for e in batch {
         let (id, commits) = (e.id.clone(), e.commits.clone());
         hub.store
@@ -760,8 +785,10 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
             })
             .await?;
         all.extend(e.diffs.iter().cloned());
+        landed_by.extend(e.diffs.iter().map(|d| (d.clone(), e.enqueued_by.clone())));
         hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk} at {tip}: entry {} by {}", repo.name, e.id, e.enqueued_by)).await;
         tell(hub, e, "landed", None).await;
+        queue_event(hub, &e.diffs, "dequeued", Some("MERGE"), &e.enqueued_by).await;
     }
     tracing::info!(repo = %repo.name, %trunk, %tip, diffs = all.len(), "landed");
     // For whoever follows lands (deploy's releases of origin `git`, docs/deploy-api.md).
@@ -778,7 +805,7 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
     hub.gitops_kick.notify();
     for id in &all {
         if let Ok(Some(d)) = diffs::find(hub, id).await
-            && let Err(e) = diffs::closed(hub, repo, &d, true).await
+            && let Err(e) = diffs::closed(hub, repo, &d, true, landed_by.get(id).map_or("kiln", String::as_str)).await
         {
             tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "a landed diff's closing event didn't start");
         }

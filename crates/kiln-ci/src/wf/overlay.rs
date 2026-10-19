@@ -15,6 +15,7 @@ pub struct Overlay {
     pub supersede: Option<YVal>,
     pub routing_infer: Option<bool>,
     pub honour_skip_ci: Option<bool>,
+    pub chain_depth: Option<u32>,
     pub jobs: Vec<OverlayJob>,
 }
 
@@ -46,7 +47,10 @@ pub(crate) fn parse(root: &Node, diags: &mut Vec<Diag>) -> Overlay {
         match k.as_str() {
             "supersede" => ov.supersede = Some(fe.yval(v)),
             "routing" => ov.routing_infer = Some(v.get("infer").and_then(Node::as_scalar) == Some(&Scalar::Bool(true))),
-            "kiln" => ov.honour_skip_ci = Some(v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true))),
+            "kiln" => {
+                ov.honour_skip_ci = Some(v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)));
+                ov.chain_depth = fe.chain_depth(v);
+            }
             "jobs" => {
                 let Some(map) = v.as_map() else { continue };
                 for (jk, jv) in map {
@@ -169,6 +173,9 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
     }
     if let Some(b) = ov.honour_skip_ci {
         wf.honour_skip_ci = b;
+    }
+    if ov.chain_depth.is_some() {
+        wf.chain_depth = ov.chain_depth;
     }
     for oj in &ov.jobs {
         let Some(job) = wf.jobs.iter_mut().find(|j| j.id == oj.id) else {

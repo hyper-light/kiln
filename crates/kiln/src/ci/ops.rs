@@ -126,6 +126,24 @@ pub fn ops() -> &'static [Op] {
                     super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx)).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "dispatched": true, "ref": git_ref }))
                 }),
+            op!("ci.runs.ask", "As an agent, ask for a run of a workflow that takes kiln's `agent` event (`on: { agent: { agents, inputs } }`, its `agents` naming you or `*`), at a branch or tag, with its inputs. You are the run's actor.", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "workflow": {"type": "string", "description": "Its path or file name."},
+                    "ref": {"type": "string", "description": "A branch or tag; the default branch when left out."}, "inputs": {"type": "object"}
+                }), &["repo", "workflow"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "agent"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let repo = text(&v, "repo")?;
+                    let repos = cx.hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                    let r = repos.into_iter().find(|r| r.name == repo || r.id == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
+                    let git_ref = match v.get("ref").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        Some(x) => x.to_owned(),
+                        None => super::events::facts(&cx.hub, &r).await.default_branch,
+                    };
+                    let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx)).await.map_err(|e| (e.status, e.message))?;
+                    Ok(json!({ "asked": true, "ref": git_ref }))
+                }),
             op!("ci.runs.compare", "What changed between two runs of a workflow, or since its last green run (`other`: a run's id or `last-green`, the default): the actions, variables, environment, images, machines and cache that differ, the files changed between the commits, and each leg's steps side by side.", ro: true, destructive: false,
                 input: || schema(json!({"run": {"type": "string", "description": RUN}, "other": {"type": "string", "description": "The run to compare with, or `last-green`."}}), &["run"]),
                 route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "compare", v.get("other").and_then(Value::as_str).unwrap_or("last-green")]), HashMap::new())),

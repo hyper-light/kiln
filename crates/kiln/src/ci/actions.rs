@@ -27,18 +27,24 @@ use crate::store::Repo;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// A remote action: `owner/repo[/path]@ref`.
+/// A remote action: `owner/repo[/path]@ref`, or in the kiln dialect `kiln://owner/repo[/path]@ref`,
+/// one of kiln's own repositories (`native`, W07-R01).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
     pub owner: String,
     pub repo: String,
     pub path: String,
     pub git_ref: String,
+    pub native: bool,
 }
 
 impl Remote {
     pub fn parse(uses: &str) -> Option<Remote> {
-        if uses.starts_with("./") || uses.starts_with("$/") || uses.starts_with("docker://") || uses.starts_with("kiln/") || uses.starts_with("kiln://") {
+        let (uses, native) = match uses.strip_prefix("kiln://") {
+            Some(rest) => (rest, true),
+            None => (uses, false),
+        };
+        if uses.starts_with("./") || uses.starts_with("$/") || uses.starts_with("docker://") || (!native && uses.starts_with("kiln/")) {
             return None;
         }
         let (name, git_ref) = uses.split_once('@')?;
@@ -51,11 +57,31 @@ impl Remote {
         if !safe(owner) || !safe(repo) || git_ref.starts_with('-') || git_ref.contains("..") {
             return None;
         }
-        Some(Remote { owner: owner.into(), repo: repo.into(), path: parts.next().unwrap_or_default().trim_matches('/').into(), git_ref: git_ref.into() })
+        Some(Remote { owner: owner.into(), repo: repo.into(), path: parts.next().unwrap_or_default().trim_matches('/').into(), git_ref: git_ref.into(), native })
     }
 
     fn full(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// Its mirror: one of kiln's own repositories' apart from GitHub's of the same name.
+    pub(crate) fn mirror(&self, hub: &Hub) -> PathBuf {
+        if self.native { hub.cfg.data("actions").join("kiln").join(format!("{}__{}.git", self.owner, self.repo)) } else { mirror(hub, &self.owner, &self.repo) }
+    }
+
+    /// Where a leg downloads it at `sha`.
+    fn url(&self, sha: &str) -> String {
+        format!("/_kiln/actions/{}{}/{}/{sha}.tar.gz", if self.native { "kiln/" } else { "" }, self.owner, self.repo)
+    }
+
+    /// Whether a workflow of `caller` may use it: one of kiln's own repositories is its owner's
+    /// own repositories' to use, as GitHub's private actions are their owner's (W07-R01).
+    pub(crate) fn usable_by(&self, caller: &str) -> Result<(), String> {
+        let theirs = caller.split('/').next().unwrap_or_default();
+        if self.native && !self.owner.eq_ignore_ascii_case(theirs) {
+            return Err(format!("`kiln://{}` is another owner's repository: {caller}'s workflows use `kiln://` actions of `{theirs}/`'s repositories", self.full()));
+        }
+        Ok(())
     }
 }
 
@@ -65,6 +91,11 @@ pub(crate) fn mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
 
 fn tarball_path(hub: &Hub, owner: &str, repo: &str, sha: &str) -> PathBuf {
     hub.cfg.data("actions").join("tar").join(format!("{owner}__{repo}")).join(format!("{sha}.tar.gz"))
+}
+
+/// A `kiln://` action's tarball, apart from GitHub's of the same name.
+fn native_tarball_path(hub: &Hub, owner: &str, repo: &str, sha: &str) -> PathBuf {
+    hub.cfg.data("actions").join("tar").join("kiln").join(format!("{owner}__{repo}")).join(format!("{sha}.tar.gz"))
 }
 
 fn steps_uses(steps: &[Step], out: &mut Vec<String>) {
@@ -190,11 +221,14 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         if depth > 9 {
             return Err(format!("`{uses}`: composite actions nest at most 10 deep"));
         }
-        let key = (r.full(), r.git_ref.clone());
+        let key = (format!("{}{}", if r.native { "kiln://" } else { "" }, r.full()), r.git_ref.clone());
         let pinned = match shas.get(&key) {
             Some(s) => s.clone(),
             None => {
-                let s = pin(hub, &r).await.map_err(|e| format!("{e:#}"));
+                let s = match r.usable_by(&repo.name) {
+                    Ok(()) => pin(hub, &r).await.map_err(|e| format!("{e:#}")),
+                    Err(why) => Err(why),
+                };
                 shas.insert(key, s.clone());
                 s
             }
@@ -210,7 +244,7 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
                 continue;
             }
         };
-        let mut a = ActionRef { repo: r.full(), sha: sha.clone(), path: r.path.clone(), url: format!("/_kiln/actions/{}/{}/{sha}.tar.gz", r.owner, r.repo), ..ActionRef::default() };
+        let mut a = ActionRef { repo: r.full(), sha: sha.clone(), path: r.path.clone(), url: r.url(&sha), ..ActionRef::default() };
         if let Some(meta) = metadata(hub, &r, &sha).await
             && let (Some(action), _) = kiln_ci::wf::parse_action(&meta)
         {
@@ -248,12 +282,20 @@ pub(crate) fn source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<Strin
     }
 }
 
+/// A `kiln://` action's repository: kiln's own.
+fn native_source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<String> {
+    super::hosting::path_of(hub, &format!("{owner}/{repo}"))
+        .filter(|p| p.join("HEAD").exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("`kiln://{owner}/{repo}` is no repository kiln hosts"))
+}
+
 /// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
 /// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
 pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
-    let dir = mirror(hub, &r.owner, &r.repo);
+    let dir = r.mirror(hub);
     let d = dir.to_string_lossy().to_string();
-    let url = source(hub, &r.owner, &r.repo)?;
+    let url = if r.native { native_source(hub, &r.owner, &r.repo)? } else { source(hub, &r.owner, &r.repo)? };
     if dir.join("HEAD").exists() {
         // The source may have moved (`[[ci.actions.sources]]` changed): fetch from where it is now.
         let _ = gitops::run_git(hub, &["-C", &d, "remote", "set-url", "origin", &url], GIT_TIMEOUT).await;
@@ -310,7 +352,7 @@ async fn own_metadata(hub: &Hub, repo: &Repo, sha: &str, path: &str) -> Option<S
 
 /// `action.yml` (or `.yaml`) of an action at a commit.
 async fn metadata(hub: &Hub, r: &Remote, sha: &str) -> Option<String> {
-    let d = mirror(hub, &r.owner, &r.repo).to_string_lossy().to_string();
+    let d = r.mirror(hub).to_string_lossy().to_string();
     let base = if r.path.is_empty() { String::new() } else { format!("{}/", r.path) };
     for name in ["action.yml", "action.yaml"] {
         if let Ok(o) = gitops::run_git(hub, &["-C", &d, "show", &format!("{sha}:{base}{name}")], GIT_TIMEOUT).await {
@@ -324,6 +366,11 @@ async fn metadata(hub: &Hub, r: &Remote, sha: &str) -> Option<String> {
 /// `?path=`, a `$/` action: that directory of the leg's own repository at the commit, from the
 /// repository's mirror (W07-R01).
 pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Response, Fail> {
+    // `kiln/<owner>/<repo>/<sha>.tar.gz`: a `kiln://` action, one of kiln's own repositories.
+    let (native, rest) = match rest {
+        ["kiln", more @ ..] if more.len() == 3 => (true, more),
+        _ => (false, rest),
+    };
     let [owner, repo, file] = rest else { return Err((StatusCode::NOT_FOUND, "no such action".into())) };
     let sha = file.trim_end_matches(".tar.gz");
     let ok_name = |s: &str| !s.is_empty() && !s.starts_with('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
@@ -333,7 +380,15 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
     let Some(leg) = token::from_headers(req.headers()).and_then(|t| token::verify(hub, &t)) else {
         return Err((StatusCode::UNAUTHORIZED, "a leg's token is needed".into()));
     };
-    let own = srv::query(req).get("path").cloned();
+    let own = srv::query(req).get("path").cloned().filter(|_| !native);
+    if native {
+        // Its owner's repositories' legs only.
+        let mine = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.id == leg.repo);
+        let r = Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native: true };
+        if mine.is_none_or(|m| r.usable_by(&m.name).is_err()) {
+            return Err((StatusCode::FORBIDDEN, "a `kiln://` action is its owner's repositories' to use".into()));
+        }
+    }
     let (path, mirror_dir, args) = match &own {
         Some(p) => {
             if p.split('/').any(|s| s == ".." || s == ".git") {
@@ -349,6 +404,7 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
             let args = if p.is_empty() { vec![sha.to_owned()] } else { vec![sha.to_owned(), "--".to_owned(), p] };
             (file, gitops::mirror_path(hub, &mine.name), args)
         }
+        None if native => (native_tarball_path(hub, owner, repo, sha), Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native: true }.mirror(hub), vec![sha.to_owned()]),
         None => (tarball_path(hub, owner, repo, sha), mirror(hub, owner, repo), vec![sha.to_owned()]),
     };
     if !path.exists() {
@@ -468,7 +524,7 @@ async fn catalog(hub: &Hub, q: &str) -> Vec<Value> {
             .collect();
         let newest = versions.first().and_then(|v| v.get("sha")).and_then(Value::as_str).map(str::to_owned);
         let meta = match newest {
-            Some(sha) => metadata(hub, &Remote { owner: owner.clone(), repo: repo.clone(), path: String::new(), git_ref: sha.clone() }, &sha).await,
+            Some(sha) => metadata(hub, &Remote { owner: owner.clone(), repo: repo.clone(), path: String::new(), git_ref: sha.clone(), native: false }, &sha).await,
             None => None,
         };
         let action = meta.as_deref().and_then(|m| kiln_ci::wf::parse_action(m).0).map(|a| {
@@ -491,10 +547,26 @@ mod tests {
 
     #[test]
     fn forms() {
-        assert_eq!(Remote::parse("actions/checkout@v4"), Some(Remote { owner: "actions".into(), repo: "checkout".into(), path: String::new(), git_ref: "v4".into() }));
+        assert_eq!(Remote::parse("actions/checkout@v4"), Some(Remote { owner: "actions".into(), repo: "checkout".into(), path: String::new(), git_ref: "v4".into(), native: false }));
         assert_eq!(Remote::parse("github/codeql-action/init@v3").map(|r| r.path), Some("init".into()));
-        for local in ["./.github/actions/x", "$/actions/y", "docker://alpine:3", "kiln/cache@v1", "nope", "a/b@", "../x/y@v1", "a/b@-x"] {
+        for local in ["./.github/actions/x", "$/actions/y", "docker://alpine:3", "kiln/cache@v1", "nope", "a/b@", "../x/y@v1", "a/b@-x", "kiln://a/b@", "kiln://../x@v1"] {
             assert!(Remote::parse(local).is_none(), "{local}");
         }
+    }
+
+    /// W07-R01: `kiln://owner/repo[/path]@ref`, one of kiln's own repositories, its owner's
+    /// repositories' to use, mirrored and served apart from GitHub's of the same name.
+    #[test]
+    fn w07_r01_kiln_forms() {
+        let r = Remote::parse("kiln://acme/tools/lint@v2");
+        assert_eq!(r, Some(Remote { owner: "acme".into(), repo: "tools".into(), path: "lint".into(), git_ref: "v2".into(), native: true }));
+        let r = r.unwrap_or_else(|| Remote { owner: String::new(), repo: String::new(), path: String::new(), git_ref: String::new(), native: true });
+        assert!(r.usable_by("acme/app").is_ok() && r.usable_by("ACME/web").is_ok());
+        assert!(r.usable_by("other/app").is_err_and(|e| e.contains("another owner's")));
+        assert_eq!(r.url(&"a".repeat(40)), format!("/_kiln/actions/kiln/acme/tools/{}.tar.gz", "a".repeat(40)));
+        // GitHub's `acme/tools` is anyone's to use, and lives apart.
+        let gh = Remote { native: false, ..r.clone() };
+        assert!(gh.usable_by("other/app").is_ok());
+        assert_eq!(gh.url(&"a".repeat(40)), format!("/_kiln/actions/acme/tools/{}.tar.gz", "a".repeat(40)));
     }
 }
