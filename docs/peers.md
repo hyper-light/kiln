@@ -53,16 +53,20 @@ certificate is accepted on first use, and nothing is fetched to decide.
   you are here, the most you may do there (your role on our whole cluster, at most admin), which
   cluster it's for, until when (8 hours), signed with our key. Opening a cluster again close to
   the end gets a new one.
-- **Its address.** Every cluster we open has an address of its own here, so its UI runs unchanged
-  at the root of an origin of its own: `peer-<name>.<domain>` for a runner's front-door domain
-  (every front door answers its domain's wildcard, in DNS and in its certificate: the same site
-  as the page, so the frame keeps its cookie), and otherwise a port of its own on the server (the
-  HTTP port + 100, + 101, …) on the host the page is at, for kiln reached by address or at
-  `localhost`. (The server also answers `peer-<name>.localhost` by name, for testing; browsers take
-  each `*.localhost` name for a site of its own, so the picker doesn't use it.)
-- **Entering.** The frame starts with the grant posted to `/.kiln-peer/enter` at that address (a
-  form post, so it's in no address or history): it becomes that address's cookie
-  (`kiln_peer_<name>`, HTTP-only), and the frame goes to the cluster's home page.
+- **Where it opens.** At a runner's front-door domain, at an address of its own,
+  `peer-<name>.<domain>` (every front door answers its domain's wildcard, in DNS and in its
+  certificate: the same site as the page, so the frame keeps its cookie), where its own UI runs
+  unchanged. Anywhere else (kiln reached by address, as `http://192.168.1.77:7070`, or at
+  `localhost`), under ours, at `/.kiln-peer/<name>/`, through the same port as everything else:
+  there our own app draws it from its API, which the server forwards at `/.kiln-peer/<name>/api/…`.
+  Nothing it answers runs as our page: its answers come back with
+  `Content-Security-Policy: sandbox` (no `allow-same-origin`) and `nosniff`. (The server also
+  answers `peer-<name>.localhost` by name, for testing; browsers take each `*.localhost` name for a
+  site of its own, so the picker doesn't use it.)
+- **Entering.** The frame starts with the grant posted to `/.kiln-peer/enter` at its address, or
+  `/.kiln-peer/<name>/enter` under ours (a form post, so it's in no address or history): it
+  becomes a cookie for that address, or that path, alone (`kiln_peer_<name>`, HTTP-only), and the
+  frame goes to the cluster's home page.
 - **Forwarding.** Whatever answers that address forwards each request to the cluster, from its own
   machine: a runner's front door for its domain's names, the server for the rest (and for a front
   door too old to do it, which passes everything to the server). Requests go with what they carried
@@ -97,9 +101,9 @@ with. A runner holds no secret.
 
 - Opening a cluster takes a role on the whole of ours: a grant carries one role, for the whole of
   the other cluster.
-- A front door's `.local` name and a tailnet's MagicDNS name have no wildcard: from there, and from
-  an address on HTTPS, a peered cluster opens at the server's address (by its port) only over
-  plain HTTP, else at a front-door domain.
+- A front door's `.local` name and a tailnet's MagicDNS name have no wildcard: from there, a
+  peered cluster opens under that address, drawn by our app (its pages are our version's, its data
+  its own), rather than as its own UI.
 - A grant is like a session cookie: whoever holds it opens that cluster as you until it expires.
   Between the clusters, use HTTPS (the other cluster's front door) where the network isn't yours.
 - Each forwarded request opens its own connection to the other cluster.

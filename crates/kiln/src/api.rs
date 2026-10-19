@@ -168,6 +168,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         let secure = is_secure(&hub, &req);
         return Ok(f.serve(&slug, req, secure).await);
     }
+    // A peered cluster under this one's own address (`/.kiln-peer/<slug>/`, kiln reached by
+    // address): its API forwarded, its pages this cluster's app (in the browser) drawing it.
+    if let Some((f, slug, page)) = crate::peers::route_path(&hub, &req) {
+        if page {
+            return Ok(crate::ui::shell(&req));
+        }
+        let secure = is_secure(&hub, &req);
+        return Ok(f.serve_path(&slug, req, secure).await);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let seg = segments(&path);

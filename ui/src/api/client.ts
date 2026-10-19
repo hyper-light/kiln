@@ -1,3 +1,4 @@
+import { apiPath } from "@/lib/peer-base";
 import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
@@ -195,7 +196,7 @@ export const api = {
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),
 
   job: (id: string, signal?: AbortSignal) => get<Job>(`/api/jobs/${enc(id)}`, signal),
-  jobLogsUrl: (id: string, step: number) => `/api/jobs/${enc(id)}/logs${qs({ step })}`,
+  jobLogsUrl: (id: string, step: number) => apiPath(`/api/jobs/${enc(id)}/logs${qs({ step })}`),
   jobLogs: (id: string, step: number) => request<string>("GET", `/api/jobs/${enc(id)}/logs${qs({ step })}`, undefined, { raw: true }),
 
   agents: (signal?: AbortSignal) => get<Agent[]>("/api/agents", signal),
@@ -284,7 +285,7 @@ export const frontDoorApi = {
   /** A new key and self-signed certificate now (409 for your own certificate, or with HTTPS off). */
   renewCert: (runner: string) => post<FrontDoorView>(`/api/runners/${enc(runner)}/front-door/cert/renew`, {}),
   /** The certificate chain the runner serves, as a PEM download (certificates only, never the key). */
-  certUrl: (runner: string) => `/api/runners/${enc(runner)}/front-door/cert`,
+  certUrl: (runner: string) => apiPath(`/api/runners/${enc(runner)}/front-door/cert`),
 };
 
 /** The tailnet's split DNS for the front doors (one Tailscale credential for the server). */

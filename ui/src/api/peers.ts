@@ -14,7 +14,6 @@ export interface Peer {
   /** In: what its people may do here. Out: what it said we may do there. */
   role: string;
   slug: string;
-  port: number;
   state: PeerState;
   /** Its key, as people compare it (once known). */
   fingerprint: string | null;

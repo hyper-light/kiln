@@ -1,6 +1,7 @@
 /**
  * The browser's entry: watch for new builds, then hydrate what the server rendered.
  */
+import "./lib/peer-base";
 import { StrictMode } from "react";
 import { hydrateRoot } from "react-dom/client";
 import { StartClient } from "@tanstack/react-start/client";
