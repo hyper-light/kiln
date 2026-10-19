@@ -2111,9 +2111,15 @@ impl Codex {
             }
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                if d.is_empty() {
+                    return;
+                }
                 // A terminal's whole output is kept (the call shows only its start).
                 if let Some(task) = core.state.tasks.iter().find(|t| t.tool_id.as_deref() == Some(id) && t.process.is_some()).map(|t| t.id.clone()) {
                     core.task_output.entry(task).or_default().append(d.as_bytes());
+                }
+                if core.get(id).is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.truncated && t.output.as_ref().is_some_and(|out| out.len() >= OUTPUT_MAX * 2))) {
+                    return;
                 }
                 if let Some(e) = core.get_mut(id)
                     && let Body::Tool(t) = &mut e.body
@@ -3710,6 +3716,26 @@ mod tests {
         assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: true, .. } if text == "First\n\nSecond")));
         c.item(&mut core, &json!({"type": "reasoning", "id": "thinking", "summary": ["First", "Second"], "content": []}), true);
         assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: false, .. } if text == "First\n\nSecond")));
+    }
+
+    #[test]
+    fn capped_tool_previews_stop_updates_without_losing_terminal_output() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "commandExecution", "id": "command", "command": "build", "cwd": "/work", "processId": "123", "status": "inProgress", "commandActions": []}), false);
+        let _ = core.take_out();
+        let output = |delta: &str| json!({"method": "item/commandExecution/outputDelta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "command", "delta": delta}});
+        feed(&mut c, &mut core, &[output("")]);
+        assert!(core.take_out().is_empty());
+        let first = "x".repeat(OUTPUT_MAX * 2);
+        feed(&mut c, &mut core, &[output(&first), output("tail")]);
+        assert!(core.get("command").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.truncated)));
+        let _ = core.take_out();
+        feed(&mut c, &mut core, &[output("more")]);
+        assert!(core.take_out().is_empty());
+        let (bytes, offset, _) = core.task_output.get("terminal-command").ok_or_else(|| anyhow::anyhow!("no terminal output"))?.since(0);
+        assert!(bytes.ends_with(b"tailmore"));
+        assert_eq!(offset, first.len() as u64 + 8);
+        Ok(())
     }
 
     #[test]
