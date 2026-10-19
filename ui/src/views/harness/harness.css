@@ -795,7 +795,8 @@ textarea.hx-input {
   color: #b9dccb;
 }
 .hx-step-title {
-  flex: none;
+  flex: 0 1 auto;
+  overflow-wrap: anywhere;
   font-size: 13px;
   color: var(--color-foreground);
 }
