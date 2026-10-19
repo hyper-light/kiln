@@ -185,6 +185,41 @@ policies. `kiln app init` scaffolds a service and an application chart on it, wi
 value files. The base chart is versioned like any chart, and moving apps to a new version is a
 fleet change (§3.3).
 
+### 3.5 Secrets per app (proposed, not built: for the user to decide)
+
+An app's secrets for an environment (a database password, an API key) come from kiln's secret
+store and reach what runs without ever passing through git.
+
+- **Where they live.** kiln's secret store (ci.md W09: sealed with AES-256-GCM, each value bound
+  to its scope and name, rotated with the store): a new scope, `app:<app>:<environment>`. Like an
+  integration's own credential, it is never resolved for a CI leg. Its values are never read
+  back through the API: only their names, who set them and when.
+- **Who.** Set and removed by people with `secrets.manage` on the app (or a new
+  `apps.secrets` capability); agents may list names, never set or read values.
+- **API.** `PUT /api/deploy/apps/{app}/environments/{env}/secrets/{name}` (the value in the body,
+  write-only), `GET …/secrets` (names, set by, set at), `DELETE …/secrets/{name}`;
+  `kiln app secret set web DB_PASSWORD --env production` (the value from stdin);
+  `deploy.secrets.list` for agents.
+- **On KilnCD.** At render, KilnCD adds a Kubernetes Secret `<app>-kiln` in the app's namespace
+  with the app's secrets for the environment, as it adds image pull secrets now: tracked as the
+  app's own, applied by a sync, shown masked in manifests, diffs and plans. The values' digest
+  (never the values) is part of the render key, so a changed secret renders and syncs again.
+  The app's chart reads it by name (`envFrom: [{secretRef: {name: <app>-kiln}}]`); the base
+  chart (§3.4) does so by default.
+- **On Argo CD.** Argo CD renders from git alone, so the Secret can't be added at render. Two
+  ways, chosen per environment: Sealed Secrets (kiln seals each value with the cluster's public
+  key and commits the SealedSecret to the release repository: git holds only ciphertext), or the
+  External Secrets Operator with kiln as its webhook provider (the chart carries an
+  ExternalSecret; the operator fetches values from kiln with a token scoped to that app and
+  environment).
+- **A change is a release.** Setting or removing a secret makes a config release ("secrets:
+  DB_PASSWORD changed"), so the environment's gates, history and audit apply. History records
+  which names changed, by whom, never values; a rollback restores a release's configuration, not
+  older secret values.
+- **Platforms.** Lambda, ECS, Workers and Vercel take them their own way (their secret stores or
+  environment variables), through KilnCD's providers, later.
+- **Each delivery is recorded**, as a delivery to a leg is (W09-R04).
+
 ## 4. Environments
 
 `POST /api/deploy/environments`, `kiln env add`, or trunk's `.kiln/environments.yaml` (the file
