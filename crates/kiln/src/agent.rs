@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -2105,6 +2105,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::StreamClose { stream, session: _ } => {
                         crate::rt::spawn(async move { crate::browser::stream::streams().close(&stream).await });
                     }
+                    // A port of this machine's, for a person's own device (`crate::browser::ports`):
+                    // one its session's machine lists, on loopback.
+                    ServerMsg::PortOpen { conn, session, port } => {
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| *s.pid.lock());
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let allowed = match found {
+                                Some(root) => crate::rt::blocking(move || crate::browser::ports::allowed(&session, root, port)).await.unwrap_or(false),
+                                None => false,
+                            };
+                            crate::browser::ports::serve_open(conn, port, allowed, up).await;
+                        });
+                    }
+                    ServerMsg::PortData { conn, session: _, data } => crate::browser::ports::data(conn, data),
+                    ServerMsg::PortAck { conn, session: _, bytes } => crate::browser::ports::ack(conn, bytes),
+                    ServerMsg::PortClose { conn, session: _ } => crate::browser::ports::close(conn),
                     // What a person opens live from one of its sessions (`crate::browser::apps`).
                     ServerMsg::Preview { req, session, json } => {
                         let (up, dir) = (uplink.0.clone(), o.state_dir.clone());
@@ -2347,6 +2363,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
                     Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
                     Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
+                    Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {

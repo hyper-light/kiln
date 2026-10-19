@@ -35,6 +35,9 @@ pub enum Up {
     /// A streamed page's chunks and events (`crate::browser::stream`), on their own lane: never
     /// buffered across a disconnect (a viewer wants what's now, from the next key frame).
     Stream(AgentMsg),
+    /// Connections to the machine's ports (`crate::browser::ports`), on their own lane: never
+    /// buffered across a disconnect (a connection doesn't outlive it).
+    Port(AgentMsg),
 }
 
 #[derive(Clone)]

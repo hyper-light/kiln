@@ -182,6 +182,36 @@ Your own profile is kept on the agent's machine, as files of the user the runner
 running on that machine can read them. It's for a person signed in as themselves (the owner or a
 user), never a job, an agent or a token with a narrower grant.
 
+### On your device
+
+A port of the agent's machine also opens on the person's own device, in that device's own browser:
+"Open on this device" (or "Copy a link", for another device) in the Tools tab's Live pages.
+
+- **At pages' own site only.** It needs `[server] pages_url` (see "Its own address" above). The
+  app is served at that site's root, so a dev server's absolute paths work as they do on its own
+  address. kiln never serves an app from kiln's own address, where it would be one of kiln's pages
+  with the person's kiln session.
+- **A link, then a cookie.** kiln makes a link with a code good once, for ten minutes. Followed,
+  the code becomes that site's cookie for the opening (`kiln_open`, HttpOnly, never sent on to the
+  app), and the device goes on to the app's page. One opening at a time per device: the latest
+  link followed is the one it shows.
+- **As the app's own.** Each request goes over a connection through the agent's runner to the app's
+  port, on loopback (`127.0.0.1`, else `::1`), and only to a port the session's machine lists. Its
+  `Host`, `Origin` and `Referer` are the app's own `localhost` address, so a dev server's host and
+  origin checks hold; `X-Forwarded-Host` and `X-Forwarded-Proto` say where it was asked. Bodies
+  stream both ways under flow control (at most 4 MiB a connection's runner sends ahead), and an
+  upgrade (a dev server's hot reload) goes through: asked of the app first, then the two
+  connections are piped. Its redirects to its own address stay at pages' site, and its cookies
+  are that site's alone. A service worker isn't let in: it would outlive the opening, on a site
+  every page and opening shares.
+- **Ending.** After twelve hours, with End in the Tools tab, or when its conversation closes. A
+  device then sees that it ended. Opening and ending are in the audit log (`agent.opened.create`,
+  `agent.opened.end`). An opening is its person's: nobody else lists or ends it.
+
+Connections run on the runner link's own lane (`LANE_PORTS`, runners with `CAP_PORTS`):
+`ServerMsg::PortOpen`, `PortData`, `PortAck` and `PortClose` down, `AgentMsg::PortOpened`,
+`PortData`, `PortAck` and `PortClose` up (`crate::browser::ports`, `crate::harness::opened`).
+
 ### API
 
 - `POST /api/harness/sessions/:id/streams` with `{url, width, height, scale, mobile, codec,
@@ -193,6 +223,10 @@ user), never a job, an agent or a token with a narrower grant.
   [{port, address, pid, command, agents}], app: {configured, start, port, path, running, error}}`
   (`running`: the app's address while it runs). `POST /api/harness/sessions/:id/preview/stop`
   stops the app. Runners answer these with `CAP_PREVIEW`.
+- `POST /api/harness/sessions/:id/opened` with `{port, path}`: the app on that port opened on the
+  person's own device: `{id, port, path, at, until, url}`, `url` its link (good once, for ten
+  minutes). `GET` lists the person's openings of the session (without their links), and
+  `DELETE /api/harness/sessions/:id/opened/:opened` ends one.
 - `GET /api/harness/sessions/:id/streams`: the session's streams (not another person's own).
 - `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer's socket. It's sent binary chunks
   (`crate::browser::stream::frame`: kind `v`, `a` or `c`, flags, timestamp in µs, part, parts, the
