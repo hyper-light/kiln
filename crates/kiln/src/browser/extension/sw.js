@@ -1,0 +1,17 @@
+// kiln's capture extension, its worker (crate::browser::stream): a tab's picture and sound handed
+// to the offscreen document, which encodes them. kiln calls these over the DevTools protocol.
+globalThis.kiln = {
+  // The tab whose address ends in `#kiln-<mark>` (kiln opens each streamed tab so), its id.
+  async tab(mark) {
+    const tabs = await chrome.tabs.query({});
+    const t = tabs.find((t) => (t.url || t.pendingUrl || "").endsWith(`#kiln-${mark}`));
+    return t ? t.id : null;
+  },
+  async capture(tabId, stream, opts) {
+    const mediaId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+    if (!(await chrome.offscreen.hasDocument())) {
+      await chrome.offscreen.createDocument({ url: "offscreen.html", reasons: ["USER_MEDIA", "AUDIO_PLAYBACK"], justification: "kiln streams a page it shows" });
+    }
+    return await chrome.runtime.sendMessage({ kind: "start", stream, mediaId, opts });
+  },
+};

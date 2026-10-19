@@ -265,6 +265,8 @@ pub struct Registry {
     pub keeper: Keeper,
     /// Pages agents show in their conversations (`super::visuals`).
     pub visuals: super::visuals::Visuals,
+    /// Pages streamed from agents' machines, relayed to their viewers (`super::streams`).
+    pub streams: super::streams::Relay,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -354,6 +356,7 @@ impl Registry {
             restore_auto: Mutex::new(restore_auto),
             keeper,
             visuals,
+            streams: super::streams::Relay::default(),
         }
     }
 
@@ -969,6 +972,7 @@ impl Registry {
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub fn machine_lost(&self, hub: &Hub, machine: &str) {
+        self.streams.machine_lost(machine);
         let mut infos = Vec::new();
         {
             let mut g = self.mirrors.lock();
@@ -1353,6 +1357,7 @@ impl Registry {
             }
             self.keeper.forget(id);
             self.visuals.forget(id);
+            self.streams.forget(hub, id).await;
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }

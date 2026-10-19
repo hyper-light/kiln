@@ -44,6 +44,11 @@ pub fn describe(server: &str, tool: &str, input: &serde_json::Value) -> Option<(
         "output" => (ToolKind::Shell, format!("output of {}", s("id").unwrap_or_default()), None),
         "stop" => (ToolKind::Shell, format!("stop {}", s("id").unwrap_or_default()), None),
         "show_page" => (ToolKind::Mcp, s("title").unwrap_or_else(|| "A page".to_owned()), None),
+        "show_live" => (ToolKind::Web, s("title").or_else(|| s("url")).unwrap_or_else(|| "A live page".to_owned()), s("url")),
+        "use_live" => {
+            let n = input.get("actions").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+            (ToolKind::Web, format!("Used the live page ({n} {})", if n == 1 { "action" } else { "actions" }), None)
+        }
         "preview_page" => {
             let what = s("url").or_else(|| s("path")).unwrap_or_else(|| "a page".to_owned());
             let w = input.get("width").and_then(serde_json::Value::as_u64).unwrap_or(390);
@@ -72,7 +77,7 @@ pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
     let tool = tool_name.strip_prefix("mcp__kiln__").or_else(|| tool_name.strip_prefix("mcp__kiln-reach__")).or_else(|| tool_name.strip_prefix("mcp__kiln_reach__"))?;
     // A page shown or previewed: what it said, on one line (its picture is for the agent; the
     // conversation shows the page itself).
-    if matches!(tool, "show_page" | "preview_page") {
+    if matches!(tool, "show_page" | "preview_page" | "show_live" | "use_live") {
         let text = match result {
             serde_json::Value::String(s) => s.lines().find(|l| l.starts_with('{')).map(str::to_owned),
             serde_json::Value::Object(o) => o

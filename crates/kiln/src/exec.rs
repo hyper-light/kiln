@@ -32,6 +32,9 @@ pub enum Up {
     /// Files read for the people viewing an agent session (`crate::harness::files`), on their own
     /// lane: never buffered across a disconnect (whoever asked has given up by then).
     File(AgentMsg),
+    /// A streamed page's chunks and events (`crate::browser::stream`), on their own lane: never
+    /// buffered across a disconnect (a viewer wants what's now, from the next key frame).
+    Stream(AgentMsg),
 }
 
 #[derive(Clone)]

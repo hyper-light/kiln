@@ -21,7 +21,8 @@ pub struct Said {
 
 pub struct Page {
     browser: Arc<Browser>,
-    context: String,
+    /// Its own context (none: the browser's own).
+    context: Option<String>,
     target: String,
     session: String,
     events: async_channel::Receiver<Event>,
@@ -30,10 +31,18 @@ pub struct Page {
 
 impl Page {
     pub(super) async fn open(browser: Arc<Browser>) -> anyhow::Result<Self> {
-        let cdp = browser.cdp.clone();
-        let ctx = cdp.call(None, "Target.createBrowserContext", json!({"disposeOnDetach": true})).await?;
+        let ctx = browser.cdp.call(None, "Target.createBrowserContext", json!({"disposeOnDetach": true})).await?;
         let context = field(&ctx, "browserContextId")?;
-        let made = cdp.call(None, "Target.createTarget", json!({"url": "about:blank", "browserContextId": context})).await?;
+        Self::open_in(browser, Some(context), "about:blank").await
+    }
+
+    /// A page at `url`, in `context` (none: the browser's own).
+    pub(super) async fn open_in(browser: Arc<Browser>, context: Option<String>, url: &str) -> anyhow::Result<Self> {
+        let cdp = browser.cdp.clone();
+        let made = match &context {
+            Some(c) => cdp.call(None, "Target.createTarget", json!({"url": url, "browserContextId": c})).await?,
+            None => cdp.call(None, "Target.createTarget", json!({"url": url})).await?,
+        };
         let target = field(&made, "targetId")?;
         let attached = cdp.call(None, "Target.attachToTarget", json!({"targetId": target, "flatten": true})).await?;
         let session = field(&attached, "sessionId")?;
@@ -62,6 +71,11 @@ impl Page {
 
     pub(crate) fn session(&self) -> &str {
         &self.session
+    }
+
+    /// Its target's id (the browser closes it by that).
+    pub(crate) fn target(&self) -> &str {
+        &self.target
     }
 
     /// The window's size in CSS pixels, its pixel density, and whether it's a phone's (touch, a
@@ -194,7 +208,9 @@ impl Page {
     pub async fn close(self) {
         let cdp = self.browser.cdp.clone();
         let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": self.target})).await;
-        let _ = cdp.call(None, "Target.disposeBrowserContext", json!({"browserContextId": self.context})).await;
+        if let Some(c) = &self.context {
+            let _ = cdp.call(None, "Target.disposeBrowserContext", json!({"browserContextId": c})).await;
+        }
         self.browser.closed();
     }
 }

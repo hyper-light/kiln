@@ -19,6 +19,8 @@ import { Output, Prose, ToolIcon } from "./parts";
 import { FilesContext, type ConversationFiles } from "./files";
 import { PageView } from "./page";
 import { pageOf } from "./page-of";
+import { LiveView } from "./live";
+import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, formatThought, thinkingWords, type BeamStatus } from "./signals";
@@ -511,6 +513,12 @@ function ItemView({ item, cwd, onOpenTask, effort }: { item: Item; cwd: string; 
       ) : (
         <StepRow step={{ type: "step", key: item.key, group: "tool", calls: [item.event] }} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />
       );
+    case "live":
+      return liveOf(item.event) || item.event.status === "running" || item.event.status === "pending" ? (
+        <LiveView call={item.event} />
+      ) : (
+        <StepRow step={{ type: "step", key: item.key, group: "tool", calls: [item.event] }} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />
+      );
   }
 }
 
@@ -521,7 +529,7 @@ function moving(items: Item[]): boolean {
   if (last.type === "note") return Boolean(last.event.streaming);
   if (last.type === "thought") return [last.event, ...(last.more ?? [])].some((t) => t.streaming);
   if (last.type === "step") return last.calls.some((c) => c.status === "running" || c.status === "pending");
-  if (last.type === "page") return last.event.status === "running" || last.event.status === "pending";
+  if (last.type === "page" || last.type === "live") return last.event.status === "running" || last.event.status === "pending";
   return false;
 }
 

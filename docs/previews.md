@@ -1,8 +1,9 @@
 # Previews
 
 What an agent makes shows in its conversation, live: files it mentions (docs/agents.md, "Files in
-messages"), and pages it shows. Nothing is a picture standing in for the real thing. A page runs
-in the viewer's own browser, whichever browser and system that is.
+messages"), pages it shows, and pages it streams from its machine. Nothing is a picture standing
+in for the real thing. A page it wrote runs in the viewer's own browser, whichever browser and
+system that is; one that needs the agent's machine runs there and streams.
 
 ## Pages
 
@@ -97,3 +98,52 @@ An agent's MCP server publishes through its runner, for its own session only (`c
 where the page stands on its machine; `loaded`: what kiln's browser there saw it load), then
 `{"op": "page", "do": "measured", "id", "heights"}`. Pages are kept in `<data>/harness/visuals/`,
 their content beside the files conversations keep, and they go when their conversation closes.
+
+## Streams
+
+When a page needs the agent's machine (its dev server at `http://localhost:5173`, its files, its
+network, its GPU), kiln runs it there and streams it. An agent shows one with `show_live`, and the
+page appears in the conversation, live.
+
+- **A real browser on the agent's machine.** Each stream is a tab of a browser of its own profile.
+  A conversation's streams share its cookies and storage, kept between them, and nobody else's.
+  kiln's capture extension (`crates/kiln/src/browser/extension`) captures the tab as its
+  compositor draws it, only when something changed, so a still page costs nothing. It encodes it
+  right there with WebCodecs: H.264 (VP8, VP9 or AV1 when asked) at the viewer's own window size and
+  pixel density, and the page's sound as Opus. Once the page is still, its last picture is sent
+  again, sharp.
+- **Relayed by the server.** Chunks go up the runner's stream lane (`LANE_STREAM`, runners with
+  `CAP_STREAM`) and out to each viewer's socket. A viewer that joins gets the decoders'
+  configuration and a fresh key frame at once. One too slow for a chunk loses it, and the next key
+  frame mends it. With nobody looking, the stream pauses: nothing is captured, encoded or sent.
+  After ten minutes unwatched it closes.
+- **Shown in the viewer's browser** with WebCodecs (Chrome, Edge, Firefox and Safari have it). The
+  frame is the page's window: the conversation's width, as tall as the conversation shows. The
+  page lays out at that size on the agent's machine, as a phone lays it out for a phone. Its
+  sound plays once the person turns it on.
+- **What the person does goes to it:** taps and the mouse (as touch from a phone), the wheel, keys
+  by meaning (a Mac's Command is Control on a page elsewhere, for its shortcuts), text from a
+  phone's keyboard (Type), compositions, a paste. Measured on one machine, a tap shows in the
+  picture 12 to 30 ms later (17 ms at the median).
+- **Shared with the agent.** `use_live` clicks, taps, types, presses keys, scrolls and goes places
+  in the same page, and gets a picture back. The person sees it happen, and where the agent
+  touched.
+- **Where it is:** the frame shows the page's address. Type another, or go back, forward, reload.
+- **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
+  that ended can be started again from the frame.
+
+### API
+
+- `POST /api/harness/sessions/:id/streams` with `{url, width, height, scale, mobile, codec,
+  bitrate}`: a stream of a page, on the session's machine.
+- `GET /api/harness/sessions/:id/streams`: the session's streams.
+- `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer's socket. It's sent binary chunks
+  (`crate::browser::stream::frame`: kind `v`, `a` or `c`, flags, timestamp in µs, part, parts, the
+  bytes) and JSON events (`opened`, `navigated`, `loaded`, `focus`, `dialog`, `agent`, `closed`,
+  `error`). It sends `{"input": [...]}` (what the person does) and `{"control": {...}}`
+  (`resize`, `pause`, `keyframe`, `go`, `back`, `forward`, `reload`).
+- `DELETE /api/harness/sessions/:id/streams/:stream`: close it (its tab goes).
+
+An agent's MCP server opens one through its runner, for its own session only (`{"op": "stream",
+"do": "open", "url", "title"}`, `crate::harness::streams::ask`). `use_live` acts in the stream
+where it runs (`crate::browser::stream::act`).

@@ -61,7 +61,8 @@ skill says how). To show the person a file from this machine (a screenshot, a re
 path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \
 shows it in the conversation and keeps a copy, so it still shows after the file goes. To show something live (a chart, a \
 table, a diagram, a mock-up, a small tool to try), write a page and show it with show_page: it runs in the conversation, \
-sized to fit, in kiln's look; look at it with preview_page first."
+sized to fit, in kiln's look; look at it with preview_page first. A page that needs this machine (your dev server, its files) \
+you show live with show_live: it streams to them as they look, and use_live lets you use it with them."
         .to_owned();
     if !machines.is_empty() {
         s.push_str(&format!(" This kiln's machines: {machines}."));
@@ -227,6 +228,25 @@ fn base_tools() -> Value {
                 "html": {"type": "string", "description": "A whole HTML document."},
                 "path": {"type": "string", "description": "Or an HTML file on this machine (files it uses are found next to it)."}
             }, "required": ["title"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "show_live",
+            "description": "Show the person a page live in the conversation, running here on this machine: your dev server (http://localhost:5173), a page that needs this machine's files, network or GPU, or any site. Its picture and sound stream to them while they look, at their screen's size, and what they do in it (taps, typing, scrolling) goes to it. For a page you wrote that runs on its own, use show_page instead. The answer says which stream it is.",
+            "inputSchema": {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Its address: on this machine (http://localhost:3000) or on the web."},
+                "title": {"type": "string", "description": "A few words for it."}
+            }, "required": ["url"]},
+            "annotations": {"readOnlyHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "use_live",
+            "description": "Use a page you showed with show_live, as the person can: click or tap at a point (CSS pixels of its window), type text, press a key by name (Enter, Tab, Escape, ArrowDown, a), scroll, go to an address, back, forward, reload, wait. Its actions run in order; then you get a picture of it, its address and title. The person sees what you did as you do it, live, in the same page.",
+            "inputSchema": {"type": "object", "properties": {
+                "stream": {"type": "string", "description": "The stream's id, from show_live's answer."},
+                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"wait_ms\": 500}.", "items": {"type": "object"}},
+                "picture": {"type": "boolean", "description": "A picture of it after (true by default)."}
+            }, "required": ["stream"]},
             "annotations": {"readOnlyHint": false, "openWorldHint": true},
         },
     ])
@@ -527,6 +547,20 @@ impl Server {
         }
     }
 
+    /// Show a page live in the conversation (the `show_live` tool): streamed from this machine by
+    /// its runner, through the server, to whoever looks.
+    fn show_live(&self, args: &Value) -> anyhow::Result<Value> {
+        let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
+        let url = s("url").ok_or_else(|| anyhow::anyhow!("which page? Give its address"))?;
+        let title = s("title").unwrap_or_else(|| url.clone());
+        let opened = self.ask(json!({"op": "stream", "do": "open", "url": url, "title": title}))?;
+        match (opened.get("ok"), opened.get("error").and_then(Value::as_str)) {
+            (Some(v), _) => Ok(json!({"kiln_stream": v})),
+            (None, Some(e)) if e.contains("unknown") => anyhow::bail!("this kiln server doesn't stream pages yet: upgrade it"),
+            (None, e) => anyhow::bail!("{}", e.unwrap_or("kiln couldn't stream the page")),
+        }
+    }
+
     /// Show a page in the conversation (the `show_page` tool): looked at first in this machine's
     /// browser as the conversation shows it (what it loads, and its heights at each width a viewer
     /// might have, so its frame is the right size before it loads), then published by the server
@@ -629,6 +663,20 @@ impl Server {
                     Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
                 }
             }
+            "use_live" => {
+                let mut q = args.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("op".into(), json!("act"));
+                }
+                match self.browser(&q) {
+                    Ok(done) => picture_result(&done, done.get("picture_path").and_then(Value::as_str)),
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                }
+            }
+            "show_live" => match self.show_live(args) {
+                Ok(answer) => json!({"content": [{"type": "text", "text": answer.to_string()}], "structuredContent": answer, "isError": false}),
+                Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+            },
             "show_page" => match self.show_page(args) {
                 Ok((answer, picture)) => picture_result(&answer, picture.as_deref()),
                 Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
@@ -908,7 +956,7 @@ mod tests {
         let names: Vec<&str> = t.as_array().into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
         assert_eq!(names.get(..6), Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]));
         assert!(names.contains(&"agents_start") && names.contains(&"agents_wait") && names.contains(&"agents_result"), "agents' tools too: {names:?}");
-        assert_eq!(names.get(6..8), Some(&["preview_page", "show_page"][..]), "then pages: {names:?}");
+        assert_eq!(names.get(6..10), Some(&["preview_page", "show_page", "show_live", "use_live"][..]), "then pages: {names:?}");
         assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
         assert_eq!(agent_op("run"), None);
         assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));

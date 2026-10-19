@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -2055,6 +2055,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::File(AgentMsg::HarnessFileData { req, json, data })).await;
                         });
                     }
+                    // Pages streamed for whoever views one of its sessions (`crate::browser::stream`).
+                    ServerMsg::StreamOpen { stream, session, json } => {
+                        crate::rt::spawn(crate::browser::stream::serve_open(o.state_dir.clone(), stream, session, json, uplink.0.clone()));
+                    }
+                    ServerMsg::StreamControl { stream, session: _, json } => {
+                        crate::rt::spawn(crate::browser::stream::serve_control(stream, json));
+                    }
+                    ServerMsg::StreamInput { stream, session: _, json } => crate::browser::stream::serve_input(&stream, &json),
+                    ServerMsg::StreamClose { stream, session: _ } => {
+                        crate::rt::spawn(async move { crate::browser::stream::streams().close(&stream).await });
+                    }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
                         let up = uplink.0.clone();
@@ -2247,6 +2258,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
                     Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
+                    Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
