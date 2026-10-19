@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as AppIndexRouteImport } from './routes/_app.index'
 import { Route as AppSplatRouteImport } from './routes/_app.$'
+import { Route as AppClustersRouteImport } from './routes/_app.clusters'
 import { Route as AppInsightsRouteImport } from './routes/_app.insights'
 import { Route as AppLogsRouteImport } from './routes/_app.logs'
 import { Route as AppReposRouteImport } from './routes/_app.repos'
@@ -50,6 +51,11 @@ const AppIndexRoute = AppIndexRouteImport.update({
 const AppSplatRoute = AppSplatRouteImport.update({
   id: '/$',
   path: '/$',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppClustersRoute = AppClustersRouteImport.update({
+  id: '/clusters',
+  path: '/clusters',
   getParentRoute: () => AppRoute,
 } as any)
 const AppInsightsRoute = AppInsightsRouteImport.update({
@@ -182,6 +188,7 @@ const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/$': typeof AppSplatRoute
+  '/clusters': typeof AppClustersRoute
   '/insights': typeof AppInsightsRoute
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
@@ -210,6 +217,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/$': typeof AppSplatRoute
+  '/clusters': typeof AppClustersRoute
   '/insights': typeof AppInsightsRoute
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
@@ -241,6 +249,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/_app/$': typeof AppSplatRoute
+  '/_app/clusters': typeof AppClustersRoute
   '/_app/insights': typeof AppInsightsRoute
   '/_app/logs': typeof AppLogsRoute
   '/_app/repos': typeof AppReposRoute
@@ -273,6 +282,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/$'
+    | '/clusters'
     | '/insights'
     | '/logs'
     | '/repos'
@@ -301,6 +311,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/$'
+    | '/clusters'
     | '/insights'
     | '/logs'
     | '/repos'
@@ -331,6 +342,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_app'
     | '/_app/$'
+    | '/_app/clusters'
     | '/_app/insights'
     | '/_app/logs'
     | '/_app/repos'
@@ -385,6 +397,13 @@ declare module '@tanstack/react-router' {
       path: '/$'
       fullPath: '/$'
       preLoaderRoute: typeof AppSplatRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/clusters': {
+      id: '/_app/clusters'
+      path: '/clusters'
+      fullPath: '/clusters'
+      preLoaderRoute: typeof AppClustersRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/insights': {
@@ -567,6 +586,7 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppSplatRoute: typeof AppSplatRoute
+  AppClustersRoute: typeof AppClustersRoute
   AppInsightsRoute: typeof AppInsightsRoute
   AppLogsRoute: typeof AppLogsRoute
   AppReposRoute: typeof AppReposRoute
@@ -596,6 +616,7 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppSplatRoute: AppSplatRoute,
+  AppClustersRoute: AppClustersRoute,
   AppInsightsRoute: AppInsightsRoute,
   AppLogsRoute: AppLogsRoute,
   AppReposRoute: AppReposRoute,

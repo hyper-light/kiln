@@ -189,6 +189,8 @@ pub struct Hub {
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
+    /// Peered clusters (`crate::peers`).
+    pub peered: crate::peers::Peers,
     /// The tailnet's split DNS for the front doors' names (`crate::frontdoor::tailnet`).
     pub tailnet: crate::frontdoor::tailnet::TailnetDns,
     /// Repo sync: every synced repo's group, led from here (`crate::sync`).
@@ -259,6 +261,7 @@ impl Hub {
             lost_instances: Mutex::new(HashMap::new()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
+            peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
             reach: Mutex::new(crate::reach::relay::Relay::default()),
@@ -1022,6 +1025,7 @@ impl Hub {
                     if let Some(k) = f.kiln.clone() {
                         crate::fleet::remember(self, &k.build, &k.target, &k.commit);
                         self.instances.lock().set_kiln(peer, k);
+                        self.updates.late_by_commit(self, &agent);
                         self.updates.fleet.wake();
                     }
                     // A probe's whole report (a runner that only said its kiln has no CPU count):

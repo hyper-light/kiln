@@ -1611,7 +1611,7 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!)))) return;
+    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))) return;
     ws.close(1008, "no such socket");
   });
 });

@@ -7,6 +7,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Facts, PageIntro, Panel, TextField } from "@/components/ui/misc";
 import { MotionToggle } from "@/components/shell/motion";
+import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { useAuth } from "@/lib/auth";
 import { usePref } from "@/lib/prefs";
@@ -40,6 +41,16 @@ function SettingsPanels({ updates, password }: { updates: React.ReactNode; passw
     <div className="space-y-4">
       {updates}
       <DeploySettings />
+      <Panel
+        eyebrow="Peering"
+        title="Clusters"
+        description="Other kiln clusters, opened through this one from the picker in the header."
+        actions={
+          <Button asChild size="sm" variant="secondary">
+            <Link to="/clusters">Manage</Link>
+          </Button>
+        }
+      />
       <Panel eyebrow="Integrations" title="Grafana" description="Linked from the Metrics page. kiln ships dashboards as ConfigMaps under deploy/.">
         <form
           className="flex flex-wrap items-end gap-3"

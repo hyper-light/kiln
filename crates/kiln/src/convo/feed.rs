@@ -381,13 +381,24 @@ pub fn peer_name(machine: &str, store: &str) -> String {
 /// One message from a runner, taken: what to answer.
 #[allow(clippy::too_many_arguments)]
 fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores) -> Vec<Msg> {
-    let have = |s: &str| store.peer(&peer_name(machine, s)).unwrap_or(0);
+    // Where the server's copy of a runner's store stands. When that can't be read (the store is
+    // busy or failing), no answer: never "from 0", which would have the runner send everything
+    // again, and every runner at once. The runner asks again after a while ([`STALL`]).
+    let go_on_from = |s: String| match store.peer(&peer_name(machine, &s)) {
+        Ok(rev) => vec![Msg::From { store: s, rev, zip: true }],
+        Err(e) => {
+            tracing::warn!(%machine, store = %s, error = %format!("{e:#}"), "conversation feed: where the server's copy stands couldn't be read; the runner asks again");
+            Vec::new()
+        }
+    };
     match decode(json) {
         Some(Msg::Hello { store: s, .. }) => {
             partial.remove(&(peer, s.clone()));
-            let rev = have(&s);
-            tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
-            vec![Msg::From { store: s, rev, zip: true }]
+            let answer = go_on_from(s.clone());
+            if let Some(Msg::From { rev, .. }) = answer.first() {
+                tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
+            }
+            answer
         }
         Some(Msg::Batch { store: s, from, upto, part, parts, zip }) => {
             let key = (peer, s.clone());
@@ -398,8 +409,7 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
             if !fits {
                 // A part out of place (one went astray): start over from what the server has.
                 partial.remove(&key);
-                let rev = have(&s);
-                return vec![Msg::From { store: s, rev, zip: true }];
+                return go_on_from(s);
             }
             let p = partial.entry(key.clone()).or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new() });
             p.got += 1;
@@ -418,8 +428,7 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: an unreadable batch");
-                    let rev = have(&s);
-                    return vec![Msg::From { store: s, rev, zip: true }];
+                    return go_on_from(s);
                 }
             };
             let theirs = (brings == Brings::TheirMachine).then_some(machine);
@@ -567,6 +576,19 @@ mod tests {
         let astray = Msg::Batch { store, from, upto, part: 1, parts: n + 1, zip: true };
         assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data, &Restores::default()), vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true }]);
         Ok(())
+    }
+
+    #[test]
+    fn a_server_that_cannot_read_where_it_stands_says_nothing_rather_than_ask_for_everything() {
+        let server = super::super::store::stopped();
+        let mut partial = HashMap::new();
+        let restores = Restores::default();
+        let mut answer = |m: Msg, data: &[u8]| take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data.to_vec(), &restores);
+        assert_eq!(answer(Msg::Hello { store: "r".into(), restore: false }, b""), Vec::new());
+        assert_eq!(answer(Msg::Hello { store: "r".into(), restore: true }, b""), Vec::new());
+        // A part out of place, and a batch that can't be read: the same.
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 1, parts: 2, zip: false }, b"{}"), Vec::new());
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 0, parts: 1, zip: false }, b"not json"), Vec::new());
     }
 
     #[test]

@@ -207,7 +207,10 @@ outlives the server's disk and its own machine both.
     machine, who said it, when, and the words around the match, marked. A match opens its agent
     with the find bar already looking for the same words. An agent that ended and is forgotten has
     its matches listed, but not as links.
-  - **An agent's find bar** finds what its timeline holds. When the timeline holds only the latest
+  - **A long conversation** opens on its latest 30 turns. Earlier ones join as you scroll up, without
+    moving what you're reading, and back at the end it holds the latest again. A long turn shows its
+    latest 60 steps, with *N earlier steps* to show the rest.
+  - **An agent's find bar** finds what its timeline holds, and opens the turn of the match it shows. When the timeline holds only the latest
     events (`MAX_EVENTS`), the matches before them, from its history, are listed under the bar
     (*N earlier, in its history*) to read in place.
   - The UI mock answers the search too: `MOCK_DROPPED=n` gives its long conversation an earlier
@@ -246,11 +249,13 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
   lesson of c0ffda6 (agents.md).
 - **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
   MB. They are kept compressed, and ended agents' transcripts go after `keep_closed_days`. What
-  that frees is used again for what comes next, and the file is made compact once it is worth it:
-  hourly, while the store has nothing else to do, when a third of its file and 256 MiB are free.
-  The store writes a compact copy (`VACUUM INTO`), which takes the file's place; reads and writes
-  wait meanwhile. A copy written whole before a crash takes the file's place at the next start;
-  one written in part is removed. The copy needs room beside the file while it is written.
+  that frees is used again for what comes next; the file doesn't shrink by itself. The engine can
+  make it compact (`Engine::compact`: a compact copy, `VACUUM INTO`, takes the file's place; a
+  copy written whole before a crash takes it at the next start, one written in part is removed),
+  but the store never does it on its own. It once did, hourly, and on the first server's store of
+  several GB the copy held the writer and took more memory than the server has: the server was
+  killed for it every minute (2026-10-18). Compacting a big store needs a way that keeps its
+  memory bounded first.
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status
@@ -263,5 +268,5 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
 | C4 search UI | live (dfbbd1a, 2026-10-18): Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
 | C5 mirrors | live (dfbbd1a, 2026-10-18): the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |
 | Compression | built (2540397): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |
-| Pruning and compaction | built (902b999): an ended agent's transcript goes after `keep_closed_days`; the file is made compact when a third of it is free. 215 MB made 108 MB in about a second |
+| Pruning and compaction | pruning built (902b999): an ended agent's transcript goes after `keep_closed_days`. Compaction (215 MB made 108 MB in about a second) went live with c98ae28 and took the first server down (out of memory on its store of several GB, every minute, until rolled back); the store no longer compacts itself, and a server answers nothing rather than "from 0" when it can't read where a runner's store stands (which had every runner send everything again) |
 | Restore from a mirror | built: a server that starts with an empty store asks a mirror named in `mirrors.json` for its copy, or `POST /api/conversations/restore` asks one; the copy fills in what the store lacks and never overwrites what a machine's own feed brought. Lab C6 (12 checks): the store deleted and the agent's machine killed, the server restores by itself, the agent is listed away and moved on with its context; a second restore changes nothing |

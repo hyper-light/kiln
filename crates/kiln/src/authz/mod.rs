@@ -285,6 +285,8 @@ const fn any(pattern: &'static str, capability: &'static str, at: At) -> Rule {
 /// The API behind authentication (W10-R05), first match wins. docs/ci.md §4.1 lists the CI part.
 pub static ROUTES: &[Rule] = &[
     r("GET", "/api/openapi.json", SIGNED_IN, At::Server),
+    r("GET", "/api/peers/open", SIGNED_IN, At::Server),
+    r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
     r("GET", "/api/overview", "runs.read", At::Server),
     r("GET", "/api/system", "runners.read", At::Server),
