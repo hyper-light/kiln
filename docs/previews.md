@@ -36,6 +36,12 @@ animation, sound, forms.
   have (320 to 1144 px, laid out as a frame lays it out, whatever the page tells a phone), so the
   frame takes its height before the page loads and nothing moves. The agent gets a picture of it,
   what its console printed, its layout shift, long tasks and frame rate.
+- **And in other engines.** Where the agent's machine has Firefox, the page is measured in it too,
+  the same way. In WebKit, viewers' own browsers measure it: a frame in Safari tells kiln the
+  height its page said at its width, once it's settled, and kiln keeps it with the page, so the
+  next viewer in Safari has the frame at the page's height before it loads. A frame takes its own
+  engine's height where one was measured near its width (within 24 px), or two around it (within
+  160 px each way), and Chromium's otherwise.
 - **In kiln's look.** The page gets kiln's theme first in its head: dark, a transparent
   background, Geist and Geist Mono, and kiln's colors as CSS variables (`--foreground`,
   `--muted-foreground`, `--border`, `--card`, `--accent`, `--success`, `--warning`,
@@ -92,6 +98,12 @@ the runner's environment.
 - `GET /v/<id>/`: leads to the page (open: its address is its key).
 - `GET /v/<id>/<path>`: the page, or a file it uses, at its path (takes `Range`).
 - `GET /v/_/fonts/geist.woff2`, `/v/_/fonts/geist-mono.woff2`: kiln's fonts, for pages.
+- `GET /api/harness/sessions/:id/pages/:page/heights`: a page the session showed, its heights:
+  `heights` (Chromium's, at each width) and `engines` (`firefox`, `webkit`: its machine's
+  Firefox, viewers' own browsers at their widths).
+- `POST /api/harness/sessions/:id/pages/:page/heights` with `{engine, width, height}`: the height a
+  viewer's own browser measured the page at, at its width (Firefox's and WebKit's; Chromium's are
+  its machine's). At most 24 widths are kept an engine.
 
 An agent's MCP server publishes through its runner, for its own session only (`crate::harness::visuals::ask`):
 `{"op": "page", "do": "publish", "title", "entry", "html", "loaded": {"local", "web"}}` (`entry`:
