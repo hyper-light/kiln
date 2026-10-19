@@ -326,9 +326,43 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0" } });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: m.events });
+  const files = CHANGESETS[id];
+  if (files) send({ t: "changes", files });
   if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
   return true;
 }
+
+/** What the family's agents changed, as their machines report it. */
+const CHANGESETS: Record<string, unknown[]> = {
+  "fam-tests": [
+    {
+      path: "/home/ada/src/kiln/crates/kiln/src/http/client.rs",
+      added: 6,
+      removed: 2,
+      at: Date.now() - 600_000,
+      hunks: [
+        {
+          old_start: 212,
+          old_lines: 6,
+          new_start: 212,
+          new_lines: 10,
+          lines: [
+            "     let mut tries = 0;",
+            "-    loop {",
+            "-        match send(&req).await {",
+            "+    // Each try waits on its own deadline, so a slow first answer can't use up the next's.",
+            "+    loop {",
+            "+        let deadline = Instant::now() + per_try;",
+            "+        match timeout_at(deadline, send(&req)).await {",
+            "             Ok(r) => return Ok(r),",
+            "+            Err(_) if tries + 1 < max => {}",
+            "             Err(e) if tries + 1 >= max => return Err(e),",
+          ],
+        },
+      ],
+    },
+  ],
+};
 
 function end(id: string): boolean {
   if (!family.delete(id)) return false;
@@ -336,12 +370,43 @@ function end(id: string): boolean {
   return true;
 }
 
+/** Agents' change requests (`agents.change`), by agent: the flaky-test fixer's is up for review. */
+const changes = new Map<string, Record<string, unknown>>([
+  [
+    "fam-tests",
+    {
+      agent: "fam-tests",
+      repo: "hyper-light/kiln",
+      provider: "kiln",
+      change: "CR7",
+      url: "/diffs/CR7",
+      branch: "agents/fix-the-flaky-retry-test-famtests",
+      trunk: "main",
+      sha: "9f3c2e1a7b6d5c4e3f2a1b0c9d8e7f6a5b4c3d2e",
+      version: 2,
+      files: ["crates/kiln/src/http/client.rs"],
+      title: "Fix the flaky retry test",
+      state: "open",
+      review: "needs-review",
+      checks: "failed",
+      fix_checks: true,
+      opened_at: Math.floor(Date.now() / 1000) - 3600,
+      updated_at: Math.floor(Date.now() / 1000) - 600,
+    },
+  ],
+]);
+
 /** The `agents.*` routes. True when it answered. */
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
   if (await handleRun(req, res, url)) return true;
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
+  if (p === "/api/harness/changes" && m === "GET") {
+    const one = url.searchParams.get("agent");
+    json(res, 200, { changes: [...changes.values()].filter((c) => !one || c.agent === one) });
+    return true;
+  }
   if (p === "/api/harness/agents" && m === "GET") {
     const parent = url.searchParams.get("parent");
     const run = url.searchParams.get("plan_run");
@@ -367,7 +432,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     });
     return true;
   }
-  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt))?$/);
+  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change))?$/);
   if (!am) return false;
   const id = decodeURIComponent(am[1] ?? "");
   const what = am[2];
@@ -387,9 +452,41 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       machine: a.target.replace(/^agent:/, ""),
       cost_usd: a.cost_usd,
       workspace: null,
-      branch: null,
-      change_request: null,
+      branch: changes.get(id)?.branch ?? null,
+      change_request: changes.get(id) ?? null,
     });
+  } else if (what === "change" && m === "POST") {
+    if (!(a.files_changed ?? 0)) {
+      json(res, 409, { error: `${a.name} hasn't changed any files yet` });
+      return true;
+    }
+    const b = await body<{ title?: string; fix_checks?: boolean }>(req);
+    const was = changes.get(id);
+    const now = Math.floor(Date.now() / 1000);
+    const slug = (b.title || a.title || a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+    const c = was
+      ? { ...was, version: Number(was.version) + 1, checks: undefined, updated_at: now, sha: Math.random().toString(16).slice(2).padEnd(40, "0") }
+      : {
+          agent: id,
+          repo: "hyper-light/kiln",
+          provider: "kiln",
+          change: "CR44",
+          url: "/diffs/CR44",
+          branch: `agents/${slug}-${id.replace(/[^a-z0-9]/gi, "").slice(0, 8)}`,
+          trunk: "main",
+          sha: Math.random().toString(16).slice(2).padEnd(40, "0"),
+          version: 1,
+          files: ["docs/agents.md"],
+          title: b.title || a.title || a.name,
+          state: "open",
+          review: "needs-review",
+          fix_checks: b.fix_checks ?? true,
+          opened_at: now,
+          updated_at: now,
+        };
+    changes.set(id, c);
+    emitEvent({ type: "agent_change", agent: id, change: c });
+    json(res, 200, { change_request: c });
   } else if (what === "stop" && m === "POST") {
     const b = await body<{ children?: boolean }>(req);
     const ended = [...(b.children ? descendants(id, all(), false).reverse() : []).filter((c) => end(c.id)).map((c) => c.id), ...(end(id) ? [id] : [])];

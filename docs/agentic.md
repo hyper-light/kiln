@@ -30,7 +30,7 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 | P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P3 for steps in order (parallel steps run one at a time until workspaces exist, and say so); P4 waits on C |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R3 and R5 (docs/releases.md, "Diagnosing and repairing a runner"); R4, a runner doctor that wakes by itself, waits on attachments (ci.md W20-R08) |
 | W | Workspaces: Slates volumes, then Shards microVMs | — (Shards: its networking and file device) | designing |
-| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | C5 built: the review UI (Repositories → Review: the inbox, a diff or change request's page, stacks, the land queue); C1–C4 wait on agent authorship and review events reaching main (ci.md W14, branch ci-actions) |
+| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI. Agents reply in threads once review operations agents can call exist (W14's); until then they answer with a new version |
 | K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | coordinating |
 
 ## N: Notifications
@@ -221,11 +221,14 @@ are still to come in Shards. Until then New agents shows Shards with why it isn'
 ## C: From changes to landed
 
 **C1 Into review.** **Open change request** in an agent's Changes (or the agent itself, through
-`kiln.ci.diffs.submit_patch` or the change-request operations): its work, from its volume or
-folder, committed on `agents/<name>` and pushed to kiln's git as a change request (W14-R04), or as a
-stack (W14-R03). The author is `agent:<id>`, on behalf of its person. For a repository whose
-provider is elsewhere (GitHub, GitLab, Bitbucket), a branch pushed there and a pull request opened
-through that provider.
+`agents.change`): its work, from its volume or folder, committed on `agents/<name>` and pushed to
+kiln's git as a change request (W14-R04). The author is `agent:<id>`, on behalf of its person.
+For a repository whose provider is elsewhere (GitHub, GitLab, Bitbucket), a branch pushed there
+and a pull request opened through that provider. Built: the commit is made beside the folder (a
+scratch index from its last commit, with the agent's files), so a person's branch, index, working
+tree and own edits are never touched; where kiln has no integration with the provider, the branch
+is pushed with the machine's credentials and the change's link opens the pull request. A stack of
+an agent's work (W14-R03) comes with P4.
 
 **C2 CI comes back to the agent.** The checks on its change show in its Changes; a failure goes to
 the agent as a message with the failure excerpt (W20-R10's bundle) when its person allows it

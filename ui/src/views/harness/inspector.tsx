@@ -17,6 +17,8 @@ import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
+import { Loadable } from "@/components/ui/loading";
+import { ChangeBar } from "./change-bar";
 
 const NO_EVENTS: HEvent[] = [];
 
@@ -36,8 +38,8 @@ function fromServer(files: ServerChange[]): FileChange[] {
   }));
 }
 
-/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). */
-export const Changes = React.memo(function Changes({ events, changes, cwd }: { events: HEvent[]; changes: ServerChange[] | null; cwd: string }) {
+/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them. */
+export const Changes = React.memo(function Changes({ events, changes, cwd, agentId }: { events: HEvent[]; changes: ServerChange[] | null; cwd: string; agentId?: string }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
   const [sel, setSel] = React.useState<string | null>(null);
@@ -47,6 +49,11 @@ export const Changes = React.memo(function Changes({ events, changes, cwd }: { e
   if (files.length === 0) return <div className="hx-empty">No changes yet.</div>;
   return (
     <div className="hx-changes">
+      {agentId && (
+        <Loadable label="Loading its change request" fallback={<div className="hx-change-bar" aria-busy="true" />}>
+          <ChangeBar agentId={agentId} />
+        </Loadable>
+      )}
       <div className="hx-files">
         <button type="button" className="hx-file" aria-pressed={sel === null} onClick={() => setSel(null)}>
           <span className="hx-file-name">All files · {files.length}</span>
@@ -299,7 +306,7 @@ export function Inspector({
         ))}
       </div>
       <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} />}
+        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} />}
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>

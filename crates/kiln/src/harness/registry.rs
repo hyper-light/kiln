@@ -1402,6 +1402,12 @@ impl Registry {
         let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
         Some((m.state.clone(), reply, m.changes.clone()))
     }
+
+    /// Tests: session `id`'s changeset, as its machine would report it.
+    #[cfg(test)]
+    pub fn set_changes(&self, id: &str, files: Value) -> bool {
+        self.mirrors.lock().get_mut(id).map(|m| m.changes = files).is_some()
+    }
 }
 
 /// A finished message's mentions of files, to keep (`super::kept`): what the person or the agent

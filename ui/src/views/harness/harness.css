@@ -1615,6 +1615,43 @@ textarea.hx-input {
   overscroll-behavior: contain;
   padding: 14px;
 }
+.hx-change-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid #1f2126;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #dfe3ea;
+}
+.hx-change-bar[data-state="landed"] {
+  border-color: rgb(166 205 180 / 24%);
+}
+.hx-change-what {
+  flex: 1;
+  min-width: 12ch;
+}
+.hx-change-what a:hover {
+  text-decoration: underline;
+}
+.hx-change-sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+.hx-change-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #b4b5ba;
+}
 .hx-files {
   display: flex;
   flex-direction: column;
