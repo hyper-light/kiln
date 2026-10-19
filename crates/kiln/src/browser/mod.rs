@@ -7,6 +7,7 @@
 //! On Unix kiln speaks to it over a pipe only kiln holds: nothing else on the machine can drive it
 //! (a DevTools port on loopback is anyone's there), and it ends when kiln does, however kiln ends.
 
+pub mod apps;
 pub mod cdp;
 pub mod install;
 pub mod page;

@@ -236,9 +236,13 @@ pub const CAP_FILES: u32 = 1 << 22;
 /// [`AgentMsg::Build`] capability: the runner streams pages for the people viewing its agent
 /// sessions (`crate::browser::stream`, [`ServerMsg::StreamOpen`], on [`LANE_STREAM`]).
 pub const CAP_STREAM: u32 = 1 << 23;
+/// [`AgentMsg::Build`] capability: the runner says what a person may open live from its sessions
+/// and starts their projects' apps ([`ServerMsg::Preview`], `crate::browser::apps`).
+pub const CAP_PREVIEW: u32 = 1 << 24;
 /// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
-/// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`).
-pub const CAP_POOLS: u32 = 1 << 24;
+/// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`,
+/// 1 << 24 `CAP_PREVIEW`).
+pub const CAP_POOLS: u32 = 1 << 25;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -425,6 +429,12 @@ pub enum ServerMsg {
     StreamInput { stream: String, session: String, json: String },
     /// Close stream `stream`. Appended last: postcard encodes variants by index.
     StreamClose { stream: String, session: String },
+    /// What a person opens live from agent session `session` (`crate::browser::apps`): `json` is
+    /// `{"op": "look"}` (the ports the machine serves, the project's app), `{"op": "start"}` (its
+    /// app, as its `.kiln/preview.yaml` says) or `{"op": "stop"}`; answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_PREVIEW`]. Appended last: postcard
+    /// encodes variants by index.
+    Preview { req: u64, session: String, json: String },
     /// CI: start or stop one of a pool's executors (JSON `crate::runner::pool::Ask`, docs/ci.md
     /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
     /// variants by index.
@@ -651,6 +661,17 @@ mod tests {
     }
 
     #[test]
+    fn previews_are_appended_after_streams() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::StreamClose { stream: "v".into(), session: "s".into() })?;
+        let m = ServerMsg::Preview { req: 3, session: "s".into(), json: "{\"op\":\"look\"}".into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "Preview comes right after StreamClose");
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        assert!(CAP_PREVIEW.is_power_of_two() && CAP_PREVIEW > CAP_STREAM);
+        Ok(())
+    }
+
+    #[test]
     fn streams_are_appended_after_every_older_variant() -> anyhow::Result<()> {
         let last_server = encode(&ServerMsg::HarnessFileRead { req: 1, session: "s".into(), path: "/p".into(), offset: 0, len: 1 })?;
         let after = [
@@ -677,17 +698,17 @@ mod tests {
 
     #[test]
     fn pool_executors_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        let last_server = encode(&ServerMsg::StreamClose { stream: "v".into(), session: "s".into() })?;
+        let last_server = encode(&ServerMsg::Preview { req: 1, session: "s".into(), json: "{}".into() })?;
         let start = ServerMsg::Executor { json: "{}".into() };
         let b = encode(&start)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after StreamClose");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after Preview");
         assert_eq!(decode::<ServerMsg>(&b)?, start);
         let last_agent = encode(&AgentMsg::StreamEvent { stream: "v".into(), json: "{}".into() })?;
         let said = AgentMsg::Executor { json: "{}".into() };
         let b = encode(&said)?;
         assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Executor comes right after StreamEvent");
         assert_eq!(decode::<AgentMsg>(&b)?, said);
-        let others = CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
+        let others = CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
         assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
         Ok(())
     }

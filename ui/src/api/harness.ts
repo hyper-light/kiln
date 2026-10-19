@@ -796,8 +796,46 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return (await res.json()) as T;
 }
 
+/** A port an agent's machine listens on (`crate::browser::apps::Listening`). */
+export interface Listening {
+  port: number;
+  address: string;
+  pid?: number;
+  command: string;
+  /** One of the session's own processes. */
+  agents: boolean;
+}
+
+/** What a person may open live from a session (`GET .../preview`). */
+export interface PreviewLook {
+  ports: Listening[];
+  app: { configured: boolean; start?: string; port?: number; path?: string; running?: string | null; error?: string };
+}
+
+/** A live page of a session, as the server relays it (`crate::harness::streams::Live::view`). */
+export interface StreamView {
+  id: string;
+  session: string;
+  machine: string;
+  spec: { url?: string; title?: string; profile?: string };
+  by: string;
+  at: number;
+  viewers: number;
+  said: { opened?: unknown; navigated?: { url?: string }; loaded?: { title?: string } };
+}
+
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
+  /** What a person may open live from it: the ports its machine serves (its agent's first), its project's app. */
+  preview: (id: string) => call<PreviewLook>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/preview`),
+  /** Stop the project's app kiln started. */
+  stopApp: (id: string) => call<{ stopped: boolean }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/preview/stop`),
+  /** Its live pages. */
+  streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
+  /** Open a live page: an address, or (`start`) the project's app; in a profile. */
+  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
+    call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
+  closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),

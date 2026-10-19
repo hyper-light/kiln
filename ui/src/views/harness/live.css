@@ -8,7 +8,8 @@
   gap: 2px;
   margin: 2px 0 6px;
 }
-.lv-address {
+.lv-address,
+.lv-mirror {
   flex: 1 1 auto;
   min-width: 0;
   height: 28px;
@@ -17,9 +18,10 @@
   font-family: var(--font-mono);
   font-size: 11.5px;
 }
-/* As tall as the conversation shows (--lv-h, set as it changes), less its own controls. */
+/* As tall as the conversation shows (--lv-h, set as it changes), less its own controls; while a
+   phone's keyboard is up, what's left above it (--lv-kb-h). */
 .lv-box {
-  height: clamp(260px, var(--lv-h, 60dvh), 900px);
+  height: var(--lv-kb-h, clamp(260px, var(--lv-h, 60dvh), 900px));
   background: #0c0d10;
 }
 .lv-canvas {
@@ -34,17 +36,36 @@
 .lv-canvas:focus-visible {
   box-shadow: inset 0 0 0 2px #bab0e3;
 }
-.lv-typing {
+/* The viewer's own field for the page's (live.tsx `shape`): in the address's place while it's
+   typed in; out of sight otherwise, yet there to take the focus in a tap's own gesture. */
+.lv-bar {
+  position: relative;
+}
+.lv-mirror-off {
   position: absolute;
-  bottom: 0;
+  top: 0;
   left: 0;
   width: 1px;
+  min-width: 0;
   height: 1px;
+  margin: 0;
   padding: 0;
   border: 0;
   opacity: 0;
-  resize: none;
   pointer-events: none;
+}
+.lv-typing-what {
+  flex: none;
+  max-width: 30%;
+  margin-left: 6px;
+  overflow: hidden;
+  color: #bab0e3;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 .lv-over {
   position: absolute;
@@ -90,4 +111,54 @@
     animation: none;
     opacity: 0.8;
   }
+}
+
+/* Live pages you open (live-pages.tsx): what to open and in which profile, in a row that wraps on
+   a phone; the ones open under it. */
+.lp {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lp-open {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+.lp-what {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.lp-profile {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+.lp-go {
+  flex: none;
+  min-height: 40px;
+}
+.lp-says {
+  margin: 0;
+}
+.lp-app {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #a1a3ab;
+  font-size: 12px;
+}
+.lp-app code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #c9cbd3;
+  overflow-wrap: anywhere;
+}
+.lp-error {
+  margin: 0;
+  color: #e3a7a0;
+  font-size: 12px;
+  line-height: 1.5;
 }

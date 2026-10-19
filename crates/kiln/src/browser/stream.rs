@@ -2,8 +2,9 @@
 //! machine (its dev server, its files, its network, its GPU) runs here, in a real browser, and its
 //! picture and sound go to whoever looks at it, live; what they do in it comes back.
 //!
-//! Each stream is a tab of a browser of its own profile (a conversation's: its cookies kept
-//! between streams; or a clean one each time), with kiln's capture extension in it (`extension/`).
+//! Each stream is a tab of a browser of its profile's (a conversation's: its cookies kept between
+//! its streams, removed as it closes; a person's own, kept across conversations; or a clean one,
+//! a browser of the stream's own), with kiln's capture extension in it (`extension/`).
 //! The extension captures the tab as its compositor draws it, only when something changed, and
 //! encodes it with WebCodecs: H.264 (or VP8/VP9/AV1 when asked) at the viewer's own size and pixel
 //! density, Opus for its sound, a sharp key frame once the page is still. Its chunks come to kiln
@@ -43,13 +44,17 @@ const IDLE_BROWSER: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
     pub url: String,
+    /// A phone's until its viewer says its own size.
+    #[serde(default = "phone_width")]
     pub width: u32,
+    #[serde(default = "phone_height")]
     pub height: u32,
     #[serde(default = "two")]
     pub scale: f64,
     #[serde(default)]
     pub mobile: bool,
-    /// `conversation:<session>` (kept between its streams) or `clean` (fresh each time).
+    /// `conversation:<session>` (kept between its streams), `personal:<them>` (a person's own,
+    /// kept across conversations) or `clean` (new each time).
     #[serde(default = "clean")]
     pub profile: String,
     /// "h264" (the default), "vp8", "vp9", "av1".
@@ -66,12 +71,19 @@ pub struct Spec {
 fn two() -> f64 {
     2.0
 }
+fn phone_width() -> u32 {
+    390
+}
+fn phone_height() -> u32 {
+    640
+}
 fn clean() -> String {
     "clean".to_owned()
 }
 
 /// What a stream sends the server: a chunk (`data`: kind, flags, timestamp, part, then the
-/// bytes; see [`frame`]) or an event (JSON: opened, navigated, focus, closed, an error).
+/// bytes; see [`frame`]) or an event (JSON: opened, navigated, loaded, focus, fields, selected,
+/// copied, a dialog, closed, an error).
 #[derive(Debug, Clone)]
 pub enum Out {
     Frame { stream: String, data: Vec<u8> },
@@ -110,10 +122,17 @@ fn extension(dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(at)
 }
 
+/// The folder name of a kept profile ("conversation:<session>", "personal:<who>").
+fn profile_key(profile: &str) -> String {
+    profile.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_")
+}
+
 /// A profile's browser, streaming: its extension's worker and offscreen document attached, and
 /// where each stream's chunks go.
 struct Streamer {
     browser: Arc<Browser>,
+    /// A clean profile's: its one stream's, stopped (and its profile removed) as that closes.
+    alone: bool,
     worker: String,
     offscreen: futures::lock::Mutex<Option<String>>,
     outs: Arc<Mutex<HashMap<String, async_channel::Sender<Out>>>>,
@@ -130,6 +149,8 @@ pub struct Stream {
     inputs: async_channel::Sender<Vec<Input>>,
     /// Laid out as a phone's (touch, a phone's viewport): what its viewer is.
     mobile: std::sync::atomic::AtomicBool,
+    /// In a person's own profile (their sign-ins): theirs to use, not an agent's.
+    personal: bool,
     /// Where what it says goes (its viewers, through the server).
     out: async_channel::Sender<Out>,
 }
@@ -157,20 +178,22 @@ impl Streams {
             return Ok(s.clone());
         }
         let ext = extension(dir)?;
-        let key = profile.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_");
-        let persistent = profile.starts_with("conversation:").then(|| dir.join("browser").join("streams").join(&key));
+        // A conversation's or a person's profile is kept between its streams; a clean one isn't.
+        let persistent = (profile.starts_with("conversation:") || profile.starts_with("personal:")).then(|| dir.join("browser").join("streams").join(profile_key(profile)));
         let browser = Arc::new(Browser::start_with(dir, super::Launch { profile: persistent, extension: Some(ext), id: EXTENSION_ID }).await?);
         let cdp = browser.cdp.clone();
         let worker = super::target(&cdp, |t| t.get("type").and_then(Value::as_str) == Some("service_worker") && t.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with(&format!("chrome-extension://{EXTENSION_ID}/")))).await?;
         let worker = cdp.call(None, "Target.attachToTarget", json!({"targetId": worker, "flatten": true})).await?.get("sessionId").and_then(Value::as_str).unwrap_or("").to_owned();
-        let s = Arc::new(Streamer { browser, worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default() });
+        let s = Arc::new(Streamer { browser, alone: profile.starts_with("clean:"), worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default() });
         g.insert(profile.to_owned(), s.clone());
         Ok(s)
     }
 
     /// Open a stream of `spec` as `id`; its chunks and events go to `out`.
     pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
-        let s = self.streamer(dir, &spec.profile).await?;
+        // A clean profile is new each time: a browser of the stream's own.
+        let profile = if spec.profile == "clean" { format!("clean:{id}") } else { spec.profile.clone() };
+        let s = self.streamer(dir, &profile).await?;
         let mark = hex::encode(rand::random::<[u8; 8]>());
         let page = s.browser.tab(&format!("about:blank#kiln-{mark}")).await?;
         let scale = spec.scale.clamp(1.0, 3.0);
@@ -204,7 +227,7 @@ impl Streams {
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), out: out.clone() });
+        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), personal: spec.profile.starts_with("personal:"), out: out.clone() });
         crate::rt::spawn(watch(stream.clone(), out.clone()));
         // What viewers do, applied in the order they did it.
         let applying = Arc::downgrade(&stream);
@@ -260,7 +283,7 @@ impl Streams {
     }
 
     /// Close a stream: its capture stops, its tab goes. A browser left with no streams stops a
-    /// while later (unless one opens meanwhile).
+    /// while later (unless one opens meanwhile); a clean profile's stops now, and its profile goes.
     pub async fn close(&self, id: &str) {
         let Some(s) = self.open.lock().remove(id) else { return };
         let cdp = s.streamer.browser.cdp.clone();
@@ -271,6 +294,11 @@ impl Streams {
         let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": s.page.target()})).await;
         let streamer = s.streamer.clone();
         drop(s);
+        if streamer.alone {
+            self.streamers.lock().await.retain(|_, s| !Arc::ptr_eq(s, &streamer));
+            streamer.browser.stop();
+            return;
+        }
         crate::rt::spawn(async move {
             crate::rt::sleep(IDLE_BROWSER).await;
             streams().stop_if_idle(&streamer).await;
@@ -288,11 +316,21 @@ impl Streams {
         }
     }
 
-    /// A session's streams on this machine close (it closed).
-    pub async fn close_session(&self, session: &str) {
+    /// A session's streams on this machine close (it closed), and its conversation's profile goes
+    /// with them: its browser stops, its cookies and storage are removed.
+    pub async fn close_session(&self, dir: &Path, session: &str) {
         let ids: Vec<String> = self.open.lock().values().filter(|s| s.session == session).map(|s| s.id.clone()).collect();
         for id in ids {
             self.close(&id).await;
+        }
+        let profile = format!("conversation:{session}");
+        let browser = self.streamers.lock().await.remove(&profile);
+        if let Some(s) = browser {
+            s.browser.stop();
+        }
+        let kept = dir.join("browser").join("streams").join(profile_key(&profile));
+        if kept.exists() {
+            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(kept)).await;
         }
     }
 }
@@ -357,6 +395,9 @@ pub async fn serve_control(id: String, json: String) {
 #[derive(Debug, Deserialize)]
 pub struct Act {
     pub stream: String,
+    /// The agent session asking (its MCP server's): only its own streams are its to use.
+    #[serde(default)]
+    pub session: String,
     #[serde(default)]
     pub actions: Vec<Value>,
     #[serde(default = "yes")]
@@ -368,7 +409,8 @@ fn yes() -> bool {
 }
 
 pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
-    let s = streams().get(&a.stream).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
+    let s = streams().get(&a.stream).filter(|s| s.session == a.session).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
+    anyhow::ensure!(!s.personal, "that page is open in its person's own profile (their sign-ins): it's theirs to use, not yours. Show it yourself with show_live to use it");
     let mut did = Vec::new();
     let point = |v: &Value| -> Option<(f64, f64)> {
         let p = v.as_array()?;
@@ -451,16 +493,48 @@ fn chunk(payload: &str) -> Option<(String, Vec<Out>)> {
     Some((stream.to_owned(), out))
 }
 
-/// Tells kiln when a field that takes text has the focus (so a phone's keyboard comes up for it),
-/// and when it hasn't.
+/// Tells kiln what the page's focused field is when one takes text (so the viewer's own field is
+/// like it: its keyboard comes up for it, its password manager fills it), where the page's fields
+/// are (so a tap on one brings the keyboard up at once, in the tap's own gesture), and whether
+/// text is selected (to copy). Each said only when it changed.
 const FOCUS: &str = r"(() => {
   if (window.__kilnFocus) return;
   window.__kilnFocus = true;
-  const editable = (e) => e && (e.isContentEditable || (e.tagName === 'INPUT' && !['button','checkbox','color','file','hidden','image','radio','range','reset','submit'].includes(e.type)) || e.tagName === 'TEXTAREA' || e.tagName === 'SELECT');
-  const say = () => { try { const e = document.activeElement; kilnFocus(JSON.stringify({ editable: !!editable(e), type: e && e.type || '', mode: e && e.inputMode || '' })); } catch (x) {} };
-  addEventListener('focusin', say, true);
-  addEventListener('focusout', () => setTimeout(say, 0), true);
+  const editable = (e) => e && (e.isContentEditable || (e.tagName === 'INPUT' && !['button','checkbox','color','file','hidden','image','radio','range','reset','submit'].includes(e.type)) || e.tagName === 'TEXTAREA');
+  const like = (e) => ({ type: e.isContentEditable ? 'text' : (e.type || 'text'), mode: e.inputMode || '', ac: (e.getAttribute('autocomplete') || '').trim(), hint: e.enterKeyHint || '',
+    label: ((e.labels && e.labels[0] && e.labels[0].textContent) || e.placeholder || e.getAttribute('aria-label') || '').trim().slice(0, 60), multi: e.tagName === 'TEXTAREA' || e.isContentEditable });
+  const said = {};
+  const tell = (k, v) => { const s = JSON.stringify({ [k]: v }); if (said[k] !== s) { said[k] = s; try { kilnFocus(s); } catch (x) {} } };
+  const focus = () => { const e = document.activeElement; tell('focus', editable(e) && !e.disabled && !e.readOnly ? { editable: true, ...like(e) } : { editable: false }); };
+  addEventListener('focusin', focus, true);
+  addEventListener('focusout', () => setTimeout(focus, 0), true);
+  let soon = 0;
+  const fields = () => {
+    soon = 0;
+    const out = [];
+    for (const e of document.querySelectorAll('input,textarea,[contenteditable]')) {
+      if (!editable(e) || e.disabled || e.readOnly) continue;
+      const r = e.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
+      const l = like(e);
+      out.push([Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height), l.type, l.mode, l.ac]);
+      if (out.length >= 40) break;
+    }
+    tell('fields', out);
+  };
+  const later = () => { if (!soon) soon = setTimeout(fields, 200); };
+  addEventListener('scroll', later, { capture: true, passive: true });
+  addEventListener('resize', later);
+  addEventListener('load', later);
+  new MutationObserver(later).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['style', 'class', 'hidden', 'disabled', 'readonly'] });
+  const selected = () => { const e = document.activeElement; tell('selected', e && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') ? e.type !== 'password' && typeof e.selectionStart === 'number' && e.selectionEnd > e.selectionStart : !!String(getSelection() || '')); };
+  document.addEventListener('selectionchange', selected, true);
+  addEventListener('focusin', selected, true);
 })();";
+
+/// What's selected in the page, to copy: a field's selection (never a password's), else the
+/// document's.
+const SELECTED: &str = r"(() => { const e = document.activeElement; if (e && typeof e.selectionStart === 'number' && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA')) return e.type === 'password' ? '' : e.value.slice(e.selectionStart, e.selectionEnd); return String(getSelection() || ''); })()";
 
 /// What the tab does that its viewer's side shows: where it is (its address and title), a field
 /// taking text or not, a dialog (dismissed), its end.
@@ -476,9 +550,10 @@ async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
                 let title = s.page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
                 Some(json!({"loaded": {"title": title}}))
             }
-            "Runtime.bindingCalled" if e.params.get("name").and_then(Value::as_str) == Some("kilnFocus") => {
-                serde_json::from_str::<Value>(e.params.get("payload").and_then(Value::as_str).unwrap_or("{}")).ok().map(|f| json!({"focus": f}))
-            }
+            // `{"focus": ...}`, `{"fields": [...]}` or `{"selected": bool}`, as the page said it.
+            "Runtime.bindingCalled" if e.params.get("name").and_then(Value::as_str) == Some("kilnFocus") => serde_json::from_str::<Value>(e.params.get("payload").and_then(Value::as_str).unwrap_or("{}"))
+                .ok()
+                .filter(|v| v.as_object().is_some_and(|o| o.len() == 1 && ["focus", "fields", "selected"].iter().any(|k| o.contains_key(*k)))),
             // A page's alert, confirm or prompt would hold it still: answered, and said.
             "Page.javascriptDialogOpening" => {
                 let _ = s.page.call("Page.handleJavaScriptDialog", json!({"accept": true})).await;
@@ -590,16 +665,77 @@ fn key_code(key: &str, code: &str) -> i64 {
         "ContextMenu" => 93,
         k if k.len() > 1 && k.starts_with('F') && k.get(1..).and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| (1..=24).contains(&n)) => 111 + k.get(1..).and_then(|n| n.parse::<i64>().ok()).unwrap_or(1),
         _ => {
-            // A letter or a digit by where it is (`KeyA`, `Digit1`), else what it types.
+            // A letter or a digit by where it is (`KeyA`, `Digit1`), punctuation by its key's own
+            // code (`Period` is 190: its character's, 46, is Delete's).
             if let Some(c) = code.strip_prefix("Key").and_then(|c| c.chars().next()) {
                 i64::from(u32::from(c.to_ascii_uppercase()))
             } else if let Some(c) = code.strip_prefix("Digit").and_then(|c| c.chars().next()) {
                 i64::from(u32::from(c))
+            } else if let Some(n) = oem(code) {
+                n
             } else {
-                key.chars().next().map_or(0, |c| i64::from(u32::from(c.to_ascii_uppercase())))
+                // Nowhere (a phone's keyboard): by what it types; something else, none (its text
+                // is what it types).
+                match key.chars().next() {
+                    Some(c) if c.is_ascii_alphanumeric() => i64::from(u32::from(c.to_ascii_uppercase())),
+                    Some(c) => punctuation(c).unwrap_or(0),
+                    None => 0,
+                }
             }
         }
     }
+}
+
+/// Windows' codes for the keys of punctuation and the number pad, by where they are.
+fn oem(code: &str) -> Option<i64> {
+    Some(match code {
+        "Space" => 32,
+        "Semicolon" => 186,
+        "Equal" => 187,
+        "Comma" => 188,
+        "Minus" => 189,
+        "Period" => 190,
+        "Slash" => 191,
+        "Backquote" => 192,
+        "BracketLeft" => 219,
+        "Backslash" => 220,
+        "BracketRight" => 221,
+        "Quote" => 222,
+        "NumpadMultiply" => 106,
+        "NumpadAdd" => 107,
+        "NumpadSubtract" => 109,
+        "NumpadDecimal" => 110,
+        "NumpadDivide" => 111,
+        c => return c.strip_prefix("Numpad").and_then(|d| d.parse::<i64>().ok()).filter(|d| (0..=9).contains(d)).map(|d| 96 + d),
+    })
+}
+
+/// The same, by what they type (as a US keyboard has them).
+fn punctuation(c: char) -> Option<i64> {
+    Some(match c {
+        ';' | ':' => 186,
+        '=' | '+' => 187,
+        ',' | '<' => 188,
+        '-' | '_' => 189,
+        '.' | '>' => 190,
+        '/' | '?' => 191,
+        '`' | '~' => 192,
+        '[' | '{' => 219,
+        '\\' | '|' => 220,
+        ']' | '}' => 221,
+        '\'' | '"' => 222,
+        ')' => 48,
+        '!' => 49,
+        '@' => 50,
+        '#' => 51,
+        '$' => 52,
+        '%' => 53,
+        '^' => 54,
+        '&' => 55,
+        '*' => 56,
+        '(' => 57,
+        _ => return None,
+    })
 }
 
 impl Stream {
@@ -697,6 +833,8 @@ impl Stream {
             let mobile = r.get("mobile").and_then(Value::as_bool).unwrap_or(false);
             self.page.viewport(w, h, scale, mobile).await?;
             self.mobile.store(mobile, std::sync::atomic::Ordering::Relaxed);
+            // A field being typed in stays in sight as the window shrinks (a phone's keyboard came up).
+            let _ = self.page.eval("document.activeElement && document.activeElement !== document.body && document.activeElement.scrollIntoView({ block: 'nearest' })").await;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let (pw, ph) = ((f64::from(w) * scale).round() as u32, (f64::from(h) * scale).round() as u32);
             super::evaluate(cdp, &off, &format!("kiln.resize({id}, {pw}, {ph})")).await?;
@@ -706,6 +844,11 @@ impl Stream {
         }
         if c.get("keyframe").and_then(Value::as_bool) == Some(true) {
             super::evaluate(cdp, &off, &format!("kiln.keyframe({id})")).await?;
+        }
+        // What's selected, for its viewer's clipboard (at most a megabyte of it).
+        if c.get("copy").and_then(Value::as_bool) == Some(true) {
+            let text: String = self.page.eval(SELECTED).await?.as_str().unwrap_or("").chars().take(1 << 20).collect();
+            let _ = self.out.send(Out::Event { stream: self.id.clone(), json: json!({"copied": {"text": text}}).to_string() }).await;
         }
         if let Some(url) = c.get("go").and_then(Value::as_str) {
             self.page.call("Page.navigate", json!({"url": url})).await?;
@@ -792,10 +935,18 @@ mod tests {
     }
 
     #[test]
-    fn keys_that_type_nothing_have_their_codes() {
+    fn keys_have_their_codes_and_punctuation_is_no_other_key() {
         assert_eq!(key_code("Enter", "Enter"), 13);
         assert_eq!(key_code("a", "KeyA"), 65);
         assert_eq!(key_code("!", "Digit1"), 49);
         assert_eq!(key_code("F5", "F5"), 116);
+        // A period isn't Delete (46), nor a percent sign the left arrow (37).
+        assert_eq!(key_code(".", "Period"), 190);
+        assert_eq!(key_code(".", ""), 190);
+        assert_eq!(key_code("%", ""), 53);
+        assert_eq!(key_code("-", "Minus"), 189);
+        assert_eq!(key_code("'", ""), 222);
+        assert_eq!(key_code("4", "Numpad4"), 100);
+        assert_eq!(key_code("é", ""), 0);
     }
 }

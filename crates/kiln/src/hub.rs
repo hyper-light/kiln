@@ -583,6 +583,51 @@ impl Hub {
         }
     }
 
+    /// What the runner process holding what `msg` is about (`crate::instances`' routing) says it
+    /// can do: 0 for nothing, or no such process. One that has just connected says it a moment
+    /// after (its build, then its capabilities), so this waits up to three seconds for it.
+    pub async fn routed_caps(&self, machine: &str, msg: &ServerMsg) -> u32 {
+        for _ in 0..30 {
+            let caps = {
+                let mut inst = self.instances.lock();
+                let to = inst.route(machine, msg);
+                to.and_then(|p| inst.get(p).map(|i| i.caps)).unwrap_or(0)
+            };
+            if caps != 0 {
+                return caps;
+            }
+            crate::rt::sleep(Duration::from_millis(100)).await;
+        }
+        0
+    }
+
+    /// Ask the runner process holding what `msg` is about (a session, say: `crate::instances`'
+    /// routing) something, if it announced `cap`, and wait up to `wait` for its
+    /// [`AgentMsg::Answer`]. `Ok(None)`: that process doesn't know `cap` (its kiln is too old).
+    pub async fn ask_routed(&self, machine: &str, cap: u32, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<String>>> {
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let msg = msg(req);
+        if self.instances.lock().newest(machine).is_none() {
+            anyhow::bail!("{machine} is not connected");
+        }
+        if self.routed_caps(machine, &msg).await & cap != cap {
+            return Ok(None);
+        }
+        let Some(peer) = self.instances.lock().route(machine, &msg) else { return Ok(None) };
+        let frame = proto::encode(&msg)?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(json)) => Ok(Some(json)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
     /// Ask machine `machine` something by its newest runner process announcing `cap` (`msg` given
     /// the question's number), and wait up to `wait` for its [`AgentMsg::Answer`]. `Ok(None)`: no
     /// process of it announces `cap` (its kiln is too old); `Ok(Some(json))`: what it answered.

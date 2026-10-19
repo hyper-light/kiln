@@ -629,15 +629,26 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
         // Pages streamed from its machine (`crate::harness::streams`).
-        (&Method::GET, ["api", "harness", "sessions", id, "streams"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.of(id).iter().map(|l| l.view()).collect::<Vec<_>>())),
+        (&Method::GET, ["api", "harness", "sessions", id, "streams"]) => {
+            let me = person(&req);
+            Ok(srv::json(StatusCode::OK, &hub.harness.streams.of(id).iter().filter(|l| l.for_whom(me.as_deref())).map(|l| l.view()).collect::<Vec<_>>()))
+        }
         (&Method::POST, ["api", "harness", "sessions", id, "streams"]) => {
             let id = (*id).to_owned();
             stream_open(&hub, &id, req).await
         }
         (&Method::GET, ["api", "harness", "sessions", id, "streams", sid, "ws"]) => stream_ws(hub.clone(), id, sid, req),
+        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => preview_look(&hub, id, "look").await,
+        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => preview_look(&hub, id, "stop").await,
         (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
-            let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id);
-            if ours && hub.harness.streams.close(&hub, sid).await { Ok(srv::status(StatusCode::NO_CONTENT)) } else { Err(err(StatusCode::NOT_FOUND, "no such stream")) }
+            let me = person(&req);
+            let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id && l.for_whom(me.as_deref()));
+            if ours && hub.harness.streams.close(&hub, sid).await {
+                hub.store.audit("admin".into(), "agent.stream.close".into(), format!("{id}: {sid}")).await;
+                Ok(srv::status(StatusCode::NO_CONTENT))
+            } else {
+                Err(err(StatusCode::NOT_FOUND, "no such stream"))
+            }
         }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
@@ -3506,11 +3517,52 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
 
 /// `POST /api/harness/sessions/:id/streams`: stream a page from the session's machine
 /// (`crate::browser::stream::Spec`'s fields: url, width, height, scale, mobile, codec, bitrate).
+/// Who asks, as a person, for what's theirs alone (a stream in their own profile): the owner, or a
+/// user signed in as themselves; nobody for a job, an agent, or a token with a narrower grant.
+fn person(req: &Request) -> Option<String> {
+    match req.extensions().get::<crate::authz::Caller>() {
+        None => Some("owner".to_owned()),
+        Some(c) if c.agent.is_some() => None,
+        Some(c) => c.opener(),
+    }
+}
+
 async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "owner".to_owned(), |c| c.name.clone());
-    let spec: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let me = person(&req);
+    let mut spec: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // `{"start": true}`: the project's app first (its `.kiln/preview.yaml`), then its page.
+    if spec.get("start").and_then(serde_json::Value::as_bool) == Some(true) {
+        let started = crate::harness::streams::preview(hub, id, "start").await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+        if started.get("started").and_then(serde_json::Value::as_bool) == Some(true) {
+            hub.store.audit("admin".into(), "agent.app.start".into(), format!("{id}: {}", started.get("url").and_then(serde_json::Value::as_str).unwrap_or(""))).await;
+        }
+        if let (Some(o), Some(url)) = (spec.as_object_mut(), started.get("url").cloned()) {
+            o.insert("url".into(), url);
+        }
+    }
+    let profile = crate::harness::streams::profile_for(id, spec.get("profile").and_then(serde_json::Value::as_str), me.as_deref()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if let Some(o) = spec.as_object_mut() {
+        o.insert("profile".into(), serde_json::json!(profile));
+        // A phone's size until its viewer says its own (a runner from before needs one).
+        o.entry("width").or_insert(serde_json::json!(390));
+        o.entry("height").or_insert(serde_json::json!(640));
+    }
     let live = hub.harness.streams.open(hub, id, spec, &by).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    let kind = profile.split(':').next().unwrap_or("conversation");
+    hub.store.audit("admin".into(), "agent.stream.open".into(), format!("{id}: {} ({kind} profile)", live.spec.get("url").and_then(serde_json::Value::as_str).unwrap_or(""))).await;
     Ok(srv::json(StatusCode::CREATED, &live.view()))
+}
+
+/// `GET /api/harness/sessions/:id/preview`: what a person may open live from the session (the
+/// ports its machine serves, its agent's first; its project's app); `POST .../preview/stop` stops
+/// that app.
+async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
+    let v = crate::harness::streams::preview(hub, id, op).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    if op == "stop" && v.get("stopped").and_then(serde_json::Value::as_bool) == Some(true) {
+        hub.store.audit("admin".into(), "agent.app.stop".into(), id.to_owned()).await;
+    }
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 /// `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer of a stream. It's sent the
@@ -3518,7 +3570,8 @@ async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
 /// (text, JSON); it sends `{"input": [...]}` (what its person does) and `{"control": {...}}`
 /// (resize, pause, keyframe, go, reload, back, forward).
 fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
-    let live = hub.harness.streams.get(sid).filter(|l| l.session == id).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
+    let me = person(&req);
+    let live = hub.harness.streams.get(sid).filter(|l| l.session == id && l.for_whom(me.as_deref())).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
     let (resp, upgrade) = ws::accept_limited(req, 1 << 20).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };

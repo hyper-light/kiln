@@ -105,9 +105,9 @@ When a page needs the agent's machine (its dev server at `http://localhost:5173`
 network, its GPU), kiln runs it there and streams it. An agent shows one with `show_live`, and the
 page appears in the conversation, live.
 
-- **A real browser on the agent's machine.** Each stream is a tab of a browser of its own profile.
-  A conversation's streams share its cookies and storage, kept between them, and nobody else's.
-  kiln's capture extension (`crates/kiln/src/browser/extension`) captures the tab as its
+- **A real browser on the agent's machine.** Each stream is a tab of a browser of its profile's
+  (see "Profiles" below): by default the conversation's, whose cookies and storage its streams
+  share, and nobody else's. kiln's capture extension (`crates/kiln/src/browser/extension`) captures the tab as its
   compositor draws it, only when something changed, so a still page costs nothing. It encodes it
   right there with WebCodecs: H.264 (VP8, VP9 or AV1 when asked) at the viewer's own window size and
   pixel density, and the page's sound as Opus. Once the page is still, its last picture is sent
@@ -125,6 +125,16 @@ page appears in the conversation, live.
   by meaning (a Mac's Command is Control on a page elsewhere, for its shortcuts), text from a
   phone's keyboard (Type), compositions, a paste. Measured on one machine, a tap shows in the
   picture 12 to 30 ms later (17 ms at the median).
+- **Its fields have the viewer's own.** The page says which of its fields has the focus and where
+  its fields are. A field that takes text gets one of the viewer's in the address's place, made
+  like it: a password's hides what's typed, the keyboard is the one it wants (email, a number
+  pad), and its autocomplete is the page field's, so the viewer's password manager fills a
+  username, a password or a one-time code. A tap on a field brings the keyboard up at once, in the
+  tap itself (a phone only allows it then). Enter, Tab and the arrows go to the page; nothing typed
+  stays in the viewer's field. While a phone's keyboard is up, the page's window is what's left
+  above it, and the page keeps its field in sight.
+- **Copy:** what's selected in the page comes to the viewer's clipboard (Copy, or the shortcut),
+  never a password field's text.
 - **Shared with the agent.** `use_live` clicks, taps, types, presses keys, scrolls and goes places
   in the same page, and gets a picture back. The person sees it happen, and where the agent
   touched.
@@ -132,18 +142,67 @@ page appears in the conversation, live.
 - **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
   that ended can be started again from the frame.
 
+### Opening a page
+
+A person opens one too, from the agent's Tools tab (Live pages): pick what to open and a profile,
+and it streams there, live, with Close to end it.
+
+- **What its machine serves.** The ports its machine listens on, read from the system
+  (`/proc/net/tcp` on Linux, `lsof` on a Mac, `netstat` on Windows), with what serves each
+  (`node vite`, `python3 http.server`). The agent's own servers come first, and so does anything
+  its processes started. The system's services (ports under 1024) aren't listed, nor (on Linux and
+  Macs) other users' servers.
+- **The project's app.** A project says how its app starts in `.kiln/preview.yaml`:
+
+  ```yaml
+  start: npm run dev     # how it starts, in the session's folder
+  port: 5173             # where it listens
+  path: /                # the page to open (/ by default)
+  env: { BROWSER: none } # what it's started with besides
+  ready_s: 60            # how long it may take to listen (60 s by default, at most 600)
+  ```
+
+  "Start the app" starts it on the agent's machine and opens it once it listens (on `127.0.0.1`
+  or `::1`). Its output goes to `browser/apps/<session>.log` in the runner's state folder. It runs
+  until it's stopped (Stop the app) or its conversation closes.
+- **Another address**, typed: `localhost:3000` is `http://localhost:3000`.
+
+#### Profiles
+
+| Profile | What it keeps | Who uses it |
+| --- | --- | --- |
+| This conversation's (the default) | Cookies and storage, between the conversation's streams (the agent's too). Removed when it closes. | Everyone who may use agents here (`agents.run`). |
+| Clean | Nothing. Each stream is a browser of its own, stopped and removed as the stream closes. | Everyone who may use agents here. |
+| Your own | Cookies and storage, across conversations: a site you sign in to stays signed in. | You alone: it isn't listed to anyone else, and they can't watch or close it. |
+
+An agent uses (`use_live`) its own conversation's streams, never one in a person's own profile.
+Opening and closing a stream, and starting and stopping an app, are in the audit log
+(`agent.stream.open`, `agent.stream.close`, `agent.app.start`, `agent.app.stop`).
+Your own profile is kept on the agent's machine, as files of the user the runner runs as: agents
+running on that machine can read them. It's for a person signed in as themselves (the owner or a
+user), never a job, an agent or a token with a narrower grant.
+
 ### API
 
 - `POST /api/harness/sessions/:id/streams` with `{url, width, height, scale, mobile, codec,
-  bitrate}`: a stream of a page, on the session's machine.
-- `GET /api/harness/sessions/:id/streams`: the session's streams.
+  bitrate, profile}`: a stream of a page, on the session's machine. `profile` is `conversation`
+  (the default), `clean` or `personal`; width and height are a phone's (390 by 640) until a
+  viewer says its own. With `{"start": true}` instead of a url, the project's app starts first
+  (its `.kiln/preview.yaml`) and its page opens.
+- `GET /api/harness/sessions/:id/preview`: what a person may open from the session: `{ports:
+  [{port, address, pid, command, agents}], app: {configured, start, port, path, running, error}}`
+  (`running`: the app's address while it runs). `POST /api/harness/sessions/:id/preview/stop`
+  stops the app. Runners answer these with `CAP_PREVIEW`.
+- `GET /api/harness/sessions/:id/streams`: the session's streams (not another person's own).
 - `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer's socket. It's sent binary chunks
   (`crate::browser::stream::frame`: kind `v`, `a` or `c`, flags, timestamp in µs, part, parts, the
-  bytes) and JSON events (`opened`, `navigated`, `loaded`, `focus`, `dialog`, `agent`, `closed`,
-  `error`). It sends `{"input": [...]}` (what the person does) and `{"control": {...}}`
-  (`resize`, `pause`, `keyframe`, `go`, `back`, `forward`, `reload`).
+  bytes) and JSON events (`opened`, `navigated`, `loaded`, `focus`, `fields`, `selected`,
+  `copied`, `dialog`, `agent`, `closed`, `error`). It sends `{"input": [...]}` (what the person
+  does) and `{"control": {...}}` (`resize`, `pause`, `keyframe`, `go`, `back`, `forward`,
+  `reload`, `copy`).
 - `DELETE /api/harness/sessions/:id/streams/:stream`: close it (its tab goes).
 
 An agent's MCP server opens one through its runner, for its own session only (`{"op": "stream",
-"do": "open", "url", "title"}`, `crate::harness::streams::ask`). `use_live` acts in the stream
-where it runs (`crate::browser::stream::act`).
+"do": "open", "url", "title"}`, `crate::harness::streams::ask`). `use_live` acts in its own
+session's streams where they run (`crate::browser::stream::act`), never one in a person's own
+profile.
