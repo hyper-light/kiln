@@ -1167,7 +1167,7 @@ impl Codex {
     fn ready(&mut self, core: &mut Core) {
         self.refresh_controls(core);
         core.touch_state();
-        core.set_status(Status::Idle);
+        core.set_status(self.thread_status.unwrap_or(Status::Idle));
         // The thread's own MCP connections (their runtime state).
         self.ask_mcp(core);
         self.compose_status(core);
@@ -2056,7 +2056,9 @@ impl Codex {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
                 self.turn = None;
-                self.thread_status = Some(Status::Idle);
+                if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
+                    self.thread_status = Some(Status::Idle);
+                }
                 // How it ended, for kiln's keep-going.
                 let how = match status {
                     "completed" => "done",
@@ -3699,6 +3701,24 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_thread_keeps_its_runtime_status_before_draining_the_queue() {
+        for (status, expected) in [
+            (json!({"type": "active", "activeFlags": []}), Status::Running),
+            (json!({"type": "active", "activeFlags": ["waitingOnUserInput"]}), Status::Waiting),
+            (json!({"type": "systemError"}), Status::Exited),
+        ] {
+            let (mut c, mut core, _) = opened();
+            c.waiting.push(QueueItem { id: "queued".into(), text: "Next task".into(), at: Core::now(), attachments: Vec::new(), overrides: None });
+            c.open_thread(&mut core, "thread/resume", json!({"threadId": "th1"}));
+            let requests = written(&mut core);
+            respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));
+            assert_eq!(core.state.status, expected);
+            assert_eq!(c.waiting.len(), 1);
+            assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")));
+        }
+    }
+
+    #[test]
     fn thread_runtime_status_survives_item_updates_and_keeps_approvals_waiting() {
         let (mut c, mut core, _) = opened();
         let status = |state: Value| json!({"method": "thread/status/changed", "params": {"threadId": "th1", "status": state}});
@@ -3722,6 +3742,7 @@ mod tests {
         assert_eq!(core.state.status, Status::Idle);
         for (state, expected) in [("notLoaded", Status::Starting), ("systemError", Status::Exited), ("idle", Status::Idle)] {
             feed(&mut c, &mut core, &[status(json!({"type": state}))]);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "turn", "status": "completed", "items": []}}})]);
             c.settle(&mut core);
             assert_eq!(core.state.status, expected);
             assert_eq!(core.state.exit.is_some(), expected == Status::Exited);
@@ -3734,18 +3755,19 @@ mod tests {
         // codex-cli 0.162.1: the call completed, but its receiving agent is still running.
         let call = |id: &str, tool: &str, states: Value| json!({"type": "collabAgentToolCall", "id": id, "tool": tool, "senderThreadId": "th1", "receiverThreadIds": ["child"], "status": "completed", "agentsStates": states, "prompt": "Audit the changes"});
         c.item(&mut core, &call("spawn", "spawnAgent", json!({"child": {"status": "running"}})), true);
-        let child = &core.state.tasks[0];
+        let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
         assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str(), child.ended), (1, "child", Some("spawn"), "running", None));
         assert!(core.get("spawn").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done && t.task.as_deref() == Some("child"))));
         c.item(&mut core, &call("spawn", "spawnAgent", json!({})), true);
-        assert_eq!(core.state.tasks[0].status, "running");
+        assert_eq!(core.state.tasks.first().map(|t| t.status.as_str()), Some("running"));
         c.item(&mut core, &call("wait", "wait", json!({"child": {"status": "completed"}, "other": {"status": "errored"}})), true);
         assert_eq!(core.state.tasks.len(), 2);
-        assert_eq!((core.state.tasks[0].status.as_str(), core.state.tasks[0].tool_id.as_deref()), ("completed", Some("spawn")));
-        assert!(core.state.tasks[0].ended.is_some());
-        assert_eq!(core.state.tasks[1].status, "failed");
+        let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
+        assert_eq!((child.status.as_str(), child.tool_id.as_deref()), ("completed", Some("spawn")));
+        assert!(child.ended.is_some());
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "other").map(|t| t.status.as_str()), Some("failed"));
         c.item(&mut core, &call("resume", "resumeAgent", json!({"child": {"status": "pendingInit"}})), true);
-        assert_eq!((core.state.tasks[0].status.as_str(), core.state.tasks[0].ended), ("pending", None));
+        assert_eq!(core.state.tasks.first().map(|t| (t.status.as_str(), t.ended)), Some(("pending", None)));
         // A collab operation without any receiving agent is not itself a new task.
         c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "list", "tool": "listAgents", "senderThreadId": "th1", "receiverThreadIds": [], "status": "completed", "agentsStates": {}}), true);
         assert_eq!(core.state.tasks.len(), 2);
@@ -3759,7 +3781,7 @@ mod tests {
         let activity = |id: &str, kind: &str| json!({"type": "subAgentActivity", "id": id, "agentThreadId": "child", "agentPath": "/root/audit", "kind": kind});
         for (kind, expected) in [("started", "running"), ("completed", "completed"), ("interacted", "running"), ("interrupted", "stopped")] {
             c.item(&mut core, &activity(kind, kind), true);
-            let child = &core.state.tasks[0];
+            let child = core.state.tasks.first().ok_or_else(|| anyhow::anyhow!("no child task"))?;
             assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str()), (1, "child", Some("started"), expected));
             assert_eq!(child.ended.is_none(), child.live());
         }
