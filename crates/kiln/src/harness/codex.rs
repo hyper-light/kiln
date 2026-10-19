@@ -2502,33 +2502,50 @@ impl Codex {
             }
             "collabAgentToolCall" | "subAgentActivity" => {
                 let desc = item.get("prompt").or_else(|| item.get("agentPath")).and_then(Value::as_str).unwrap_or("subagent").to_owned();
-                let status = match item.get("status").and_then(Value::as_str) {
-                    Some("completed") => "completed",
-                    Some("failed") => "failed",
-                    _ if done => "completed",
-                    _ => "running",
-                };
-                let task_id = item.get("agentThreadId").and_then(Value::as_str).unwrap_or(&id).to_owned();
-                match core.state.tasks.iter_mut().find(|t| t.id == task_id) {
-                    Some(t) => {
-                        t.status = status.to_owned();
-                        if done {
-                            t.ended.get_or_insert_with(Core::now);
+                let mut task = None;
+                let status = if ty == "collabAgentToolCall" {
+                    let status = match item.get("status").and_then(Value::as_str) {
+                        Some("completed") => ToolStatus::Done,
+                        Some("failed") => ToolStatus::Error,
+                        Some("interrupted") => ToolStatus::Cancelled,
+                        _ => ToolStatus::Running,
+                    };
+                    let spawned = item.get("tool").and_then(Value::as_str) == Some("spawnAgent");
+                    let states = item.get("agentsStates").and_then(Value::as_object);
+                    let mut targets: Vec<&str> = item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+                    for target in states.into_iter().flat_map(|s| s.keys().map(String::as_str)) {
+                        if !targets.contains(&target) {
+                            targets.push(target);
                         }
                     }
-                    None => core.state.tasks.push(Task {
-                        id: task_id.clone(),
-                        tool_id: Some(id.clone()),
-                        description: clip_middle(&desc, 300).0,
-                        kind: item.get("kind").and_then(Value::as_str).unwrap_or("subagent").to_owned(),
-                        status: status.to_owned(),
-                        depth: 1,
-                        started: Core::now(),
-                        ended: done.then(Core::now),
-                        ..Task::default()
-                    }),
-                }
-                core.touch_state();
+                    for target in targets {
+                        let child = match states.and_then(|s| s.get(target)).and_then(|s| s.get("status")).and_then(Value::as_str) {
+                            Some("pendingInit") => Some("pending"),
+                            Some("running") => Some("running"),
+                            Some("completed") => Some("completed"),
+                            Some("errored") => Some("failed"),
+                            Some("interrupted" | "shutdown" | "notFound") => Some("stopped"),
+                            _ if spawned && status == ToolStatus::Done && !core.state.tasks.iter().any(|t| t.id == target) => Some("pending"),
+                            _ => None,
+                        };
+                        if let Some(child) = child {
+                            subagent(core, target, &id, &desc, child, spawned);
+                        }
+                        task.get_or_insert_with(|| target.to_owned());
+                    }
+                    status
+                } else {
+                    let Some(target) = item.get("agentThreadId").and_then(Value::as_str) else { return };
+                    let child = match item.get("kind").and_then(Value::as_str) {
+                        Some("started" | "interacted") => "running",
+                        Some("interrupted") => "stopped",
+                        Some("completed") => "completed",
+                        _ => return,
+                    };
+                    subagent(core, target, &id, &desc, child, false);
+                    task = Some(target.to_owned());
+                    if done { ToolStatus::Done } else { ToolStatus::Running }
+                };
                 let call = ToolCall {
                     tool_id: id.clone(),
                     name: ty.to_owned(),
@@ -2536,12 +2553,12 @@ impl Codex {
                     title: clip_middle(&desc, 200).0,
                     detail: item.get("model").and_then(Value::as_str).map(str::to_owned),
                     input: json!({}),
-                    status: if status == "running" { ToolStatus::Running } else if status == "failed" { ToolStatus::Error } else { ToolStatus::Done },
+                    status,
                     output: None,
                     truncated: false,
                     diffs: Vec::new(),
                     todos: Vec::new(),
-                    task: Some(task_id),
+                    task,
                     exit_code: None,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
@@ -2757,6 +2774,37 @@ fn started_of(core: &Core, id: &str) -> i64 {
         Some(Body::Tool(t)) => t.started,
         _ => Core::now(),
     }
+}
+
+/// A collab call can finish while its child keeps working; only the child's state ends its task.
+fn subagent(core: &mut Core, id: &str, tool: &str, desc: &str, status: &str, spawned: bool) {
+    match core.state.tasks.iter_mut().find(|t| t.id == id) {
+        Some(t) => {
+            t.status = status.to_owned();
+            if spawned {
+                t.tool_id = Some(tool.to_owned());
+                t.description = clip_middle(desc, 300).0;
+            }
+            if t.live() {
+                t.ended = None;
+            } else {
+                t.ended.get_or_insert_with(Core::now);
+            }
+        }
+        None => core.state.tasks.push(Task {
+            id: id.to_owned(),
+            tool_id: Some(tool.to_owned()),
+            description: clip_middle(desc, 300).0,
+            kind: "subagent".into(),
+            class: Some("agent".into()),
+            status: status.to_owned(),
+            depth: 1,
+            started: Core::now(),
+            ended: (!matches!(status, "running" | "pending" | "paused")).then(Core::now),
+            ..Task::default()
+        }),
+    }
+    core.touch_state();
 }
 
 fn set_status(core: &mut Core, id: &str, status: ToolStatus) {
@@ -3579,6 +3627,44 @@ mod tests {
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
+        Ok(())
+    }
+
+    #[test]
+    fn collab_calls_keep_the_receiving_agents_lifetimes() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // codex-cli 0.162.1: the call completed, but its receiving agent is still running.
+        let call = |id: &str, tool: &str, states: Value| json!({"type": "collabAgentToolCall", "id": id, "tool": tool, "senderThreadId": "th1", "receiverThreadIds": ["child"], "status": "completed", "agentsStates": states, "prompt": "Audit the changes"});
+        c.item(&mut core, &call("spawn", "spawnAgent", json!({"child": {"status": "running"}})), true);
+        let child = &core.state.tasks[0];
+        assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str(), child.ended), (1, "child", Some("spawn"), "running", None));
+        assert!(core.get("spawn").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done && t.task.as_deref() == Some("child"))));
+        c.item(&mut core, &call("spawn", "spawnAgent", json!({})), true);
+        assert_eq!(core.state.tasks[0].status, "running");
+        c.item(&mut core, &call("wait", "wait", json!({"child": {"status": "completed"}, "other": {"status": "errored"}})), true);
+        assert_eq!(core.state.tasks.len(), 2);
+        assert_eq!((core.state.tasks[0].status.as_str(), core.state.tasks[0].tool_id.as_deref()), ("completed", Some("spawn")));
+        assert!(core.state.tasks[0].ended.is_some());
+        assert_eq!(core.state.tasks[1].status, "failed");
+        c.item(&mut core, &call("resume", "resumeAgent", json!({"child": {"status": "pendingInit"}})), true);
+        assert_eq!((core.state.tasks[0].status.as_str(), core.state.tasks[0].ended), ("pending", None));
+        // A collab operation without any receiving agent is not itself a new task.
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "list", "tool": "listAgents", "senderThreadId": "th1", "receiverThreadIds": [], "status": "completed", "agentsStates": {}}), true);
+        assert_eq!(core.state.tasks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_activity_uses_its_kind_even_when_the_item_completed() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // Activity items have no status field. Completing a "started" marker does not end its agent.
+        let activity = |id: &str, kind: &str| json!({"type": "subAgentActivity", "id": id, "agentThreadId": "child", "agentPath": "/root/audit", "kind": kind});
+        for (kind, expected) in [("started", "running"), ("completed", "completed"), ("interacted", "running"), ("interrupted", "stopped")] {
+            c.item(&mut core, &activity(kind, kind), true);
+            let child = &core.state.tasks[0];
+            assert_eq!((core.state.tasks.len(), child.id.as_str(), child.tool_id.as_deref(), child.status.as_str()), (1, "child", Some("started"), expected));
+            assert_eq!(child.ended.is_none(), child.live());
+        }
         Ok(())
     }
 
