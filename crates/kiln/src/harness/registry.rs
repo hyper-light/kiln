@@ -296,8 +296,10 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = crate::convo::open(&dir, conversations.keep_closed());
-        // Runners that keep a store send it here; the server keeps their sessions from that.
-        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine)) {
+        // Runners that keep a store send it here; the server keeps their sessions from that. What
+        // a mirror sends back to restore the store from isn't sent to it again.
+        let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
+        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine, Some(echoes.clone()))) {
             Some(Ok((i, o))) => (Some(i), Some(o)),
             Some(Err(e)) => {
                 tracing::warn!(error = %format!("{e:#}"), "runners' conversation stores won't reach the server's");
@@ -307,7 +309,7 @@ impl Registry {
         };
         let (copies, copies_out) = match convo.clone().filter(|_| conversations.mirrors > 0) {
             Some(st) => {
-                let (m, out) = crate::convo::mirror::Mirrors::start(st, conversations.mirrors, conversations.mirror_on.clone(), dir.join("mirrors.json"));
+                let (m, out) = crate::convo::mirror::Mirrors::start(st, conversations.mirrors, conversations.mirror_on.clone(), dir.join("mirrors.json"), Some(echoes));
                 (Some(m), Some(out))
             }
             None => (None, None),
