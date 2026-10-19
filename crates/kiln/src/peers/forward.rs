@@ -1,6 +1,6 @@
 //! Forwarding to a peered cluster (docs/peers.md), the same on the server and in every runner's
-//! front door: a peer's address (`peer-<slug>.<domain>`, or its port on the server for kiln reached
-//! by address) is its UI, as if opened there.
+//! front door: a peer's address (`peer-<slug>.<domain>`, or its port, on the server and on every
+//! runner whose front door runs, for kiln reached by address) is its UI, as if opened there.
 //!
 //! * **Entering.** A frame starts at [`ENTER`], posted the grant the server signed for the person
 //!   (`crate::peers::frame`). The grant becomes a cookie for that address alone and the frame goes

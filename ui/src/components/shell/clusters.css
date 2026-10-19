@@ -81,3 +81,36 @@
   background: transparent;
   color-scheme: dark;
 }
+
+/* A peer this browser can't reach: what to change, where the frame would be. */
+.cluster-unreached {
+  max-width: 640px;
+  margin: 48px auto 0;
+  padding: 0 24px;
+  color: #a5a8b0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.cluster-unreached-title {
+  margin-bottom: 8px;
+  color: #ededee;
+  font-size: 16px;
+}
+.cluster-unreached code {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 7%);
+  color: #e3dcfb;
+  font-size: 13px;
+}
+.cluster-unreached-retry {
+  min-height: 36px;
+  margin-top: 16px;
+  padding: 0 14px;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 999px;
+  color: #ededee;
+}
+.cluster-unreached-retry:hover {
+  border-color: rgb(255 255 255 / 28%);
+}

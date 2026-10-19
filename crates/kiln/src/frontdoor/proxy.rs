@@ -561,6 +561,63 @@ pub fn listen_redirect(port: u16, redirect: &Arc<Redirect>) -> io::Result<Listen
     Ok(Listening { stop, bound })
 }
 
+/// Serves one peered cluster on its port (kiln reached by address), with the forwarder `shared`
+/// holds now.
+struct PeerPort {
+    shared: Arc<Shared>,
+    slug: String,
+}
+
+impl srv::Handler for PeerPort {
+    async fn handle(self: Arc<Self>, req: Request) -> Response {
+        let f = self.shared.peers.read().clone();
+        match f {
+            Some(f) => f.serve(&self.slug, req, false).await,
+            None => srv::text(StatusCode::NOT_FOUND, "no such peered cluster here"),
+        }
+    }
+}
+
+/// Plain HTTP on `port` for the peered cluster `slug`: its port, as the server opens it, on this
+/// machine too. kiln reached at this machine's address (the server behind a forward here, as in
+/// Kubernetes) opens the peer here, through this runner, as it opens `peer-<slug>.<domain>`.
+pub fn listen_peer(port: u16, shared: &Arc<Shared>, slug: &str) -> io::Result<Listening> {
+    let (std_listener, bound) = bind(port)?;
+    let stop = Shutdown::new();
+    let (handler, sd) = (Arc::new(PeerPort { shared: Arc::clone(shared), slug: slug.to_owned() }), stop.clone());
+    crate::rt::spawn(async move {
+        let listener = match adopt(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "front door: cannot hand a peered cluster's port to the runtime");
+                return;
+            }
+        };
+        let open = Arc::new(AtomicUsize::new(0));
+        loop {
+            let accepted = futures::select_biased! {
+                () = sd.cancelled().fuse() => return,
+                r = listener.accept().fuse() => r,
+            };
+            let Ok(stream) = accepted else {
+                crate::rt::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            if open.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                continue;
+            }
+            open.fetch_add(1, Ordering::Relaxed);
+            let (h, sd, n) = (Arc::clone(&handler), sd.clone(), Arc::clone(&open));
+            crate::rt::spawn_spread(async move {
+                let remote = stream.peer_addr().ok();
+                let _ = crate::discovery::until_stopped(&sd, srv::serve_connection(crate::http::io::RtIo::new(stream), h, remote)).await;
+                n.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+    });
+    Ok(Listening { stop, bound })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

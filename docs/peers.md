@@ -56,16 +56,22 @@ certificate is accepted on first use, and nothing is fetched to decide.
 - **Its address.** Every cluster we open has an address of its own here, so its UI runs unchanged
   at the root of an origin of its own: `peer-<name>.<domain>` for a runner's front-door domain
   (every front door answers its domain's wildcard, in DNS and in its certificate: the same site
-  as the page, so the frame keeps its cookie), and otherwise a port of its own on the server (the
-  HTTP port + 100, + 101, …) on the host the page is at, for kiln reached by address or at
-  `localhost`. (The server also answers `peer-<name>.localhost` by name, for testing; browsers take
-  each `*.localhost` name for a site of its own, so the picker doesn't use it.)
+  as the page, so the frame keeps its cookie), and otherwise a port of its own (the server's HTTP
+  port + 100, + 101, …) on the host the page is at, for kiln reached by address or at
+  `localhost`. The server opens those ports, and so does every runner whose front door runs: kiln
+  reached at a machine's address, with its server behind a forward to one port there (as in
+  Kubernetes, `deploy/cluster/expose-lan.sh`), opens its peers through that machine's runner. The
+  port has to get through that machine's firewall (`sudo ufw allow 7170/tcp`); a frame whose
+  address gives the browser no answer says so, and which port, rather than staying blank. (The
+  server also answers `peer-<name>.localhost` by name, for testing; browsers take each
+  `*.localhost` name for a site of its own, so the picker doesn't use it.)
 - **Entering.** The frame starts with the grant posted to `/.kiln-peer/enter` at that address (a
   form post, so it's in no address or history): it becomes that address's cookie
   (`kiln_peer_<name>`, HTTP-only), and the frame goes to the cluster's home page.
 - **Forwarding.** Whatever answers that address forwards each request to the cluster, from its own
-  machine: a runner's front door for its domain's names, the server for the rest (and for a front
-  door too old to do it, which passes everything to the server). Requests go with what they carried
+  machine: a runner's front door for its domain's names and for the ports on its machine, the
+  server for the rest (and for a front door too old to do it, which passes everything to the
+  server). Requests go with what they carried
   except our cookies and credentials, the grant in their place as the other cluster's session, and
   `Host`, `Origin` and `Referer` naming its own address. Bodies stream both ways; a WebSocket's
   upgrade is asked of the cluster first, then the two connections are piped. The cluster's own

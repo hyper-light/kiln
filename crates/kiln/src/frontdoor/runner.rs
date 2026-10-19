@@ -241,6 +241,10 @@ struct FrontDoor {
     redirect: Arc<proxy::Redirect>,
     http: Option<proxy::Listening>,
     http_failure: Option<Failure>,
+    /// The peered clusters' ports, open here (kiln reached at this machine's address opens its
+    /// peers through them), each with its peer; and those that wouldn't open, with why.
+    peer_ports: HashMap<u16, (String, proxy::Listening)>,
+    peer_ports_failed: HashMap<u16, String>,
 
     mdns: Option<MdnsRun>,
     /// What Tailscale says about this machine (asked while the settings want the tailnet).
@@ -278,6 +282,8 @@ impl FrontDoor {
             redirect: Arc::default(),
             http: None,
             http_failure: None,
+            peer_ports: HashMap::new(),
+            peer_ports_failed: HashMap::new(),
             mdns: None,
             tailnet: tailnet::Watcher::start(),
             cert: CertStatus::default(),
@@ -378,6 +384,7 @@ impl FrontDoor {
         self.dns = None;
         self.https = None;
         self.http = None;
+        self.peer_ports.clear();
         self.mdns = None;
     }
 
@@ -409,6 +416,7 @@ impl FrontDoor {
             None
         };
         self.reconcile_https(&s, active, tls);
+        self.reconcile_peer_ports(active && s.https.enabled);
         self.reconcile_mdns(&s, active);
         let primary = seen.as_ref().and_then(|x| x.local.as_ref().ok()).and_then(crate::tailscale::Local::primary);
         let listening = primary.is_some_and(|ip| self.dns.as_ref().is_some_and(|d| d.bound().contains(&SocketAddr::new(ip, super::DNS_PORT))));
@@ -571,6 +579,38 @@ impl FrontDoor {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "front door: cannot make a certificate request");
                 self.csr = None;
+            }
+        }
+    }
+
+    /// The peered clusters' ports, as the server opens them, open here too while the front door
+    /// runs here (`on`): kiln reached at this machine's address (its server behind a forward to
+    /// one port, as in Kubernetes) opens its peers on them, through this runner.
+    fn reconcile_peer_ports(&mut self, on: bool) {
+        let want: HashMap<u16, String> = match self.https_shared.peers.read().as_ref() {
+            Some(f) if on => f.table().peers.iter().filter(|r| r.port != 0).map(|r| (r.port, r.slug.clone())).collect(),
+            _ => HashMap::new(),
+        };
+        self.peer_ports.retain(|port, (slug, _)| want.get(port) == Some(slug));
+        self.peer_ports_failed.retain(|port, _| want.contains_key(port));
+        for (port, slug) in want {
+            if self.peer_ports.contains_key(&port) {
+                continue;
+            }
+            match proxy::listen_peer(port, &self.https_shared, &slug) {
+                Ok(l) => {
+                    tracing::info!(port, peer = %slug, "front door: a peered cluster's port is open here");
+                    self.peer_ports_failed.remove(&port);
+                    self.peer_ports.insert(port, (slug, l));
+                }
+                Err(e) => {
+                    // Said once (tried again every reconcile): the server on this machine may hold it.
+                    let why = e.to_string();
+                    if self.peer_ports_failed.get(&port) != Some(&why) {
+                        tracing::warn!(port, peer = %slug, error = %why, "front door: a peered cluster's port can't be opened here");
+                        self.peer_ports_failed.insert(port, why);
+                    }
+                }
             }
         }
     }

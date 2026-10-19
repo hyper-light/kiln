@@ -32,6 +32,8 @@ interface Opened {
   frame: Frame;
   /** A new grant posted into its frame makes a new one. */
   key: number;
+  /** Its address gave this browser no answer (it says why, not a blank frame). */
+  unreached?: boolean;
 }
 
 /** Which cluster is shown (`null`: this one), every one opened, and those whose page speaks kiln. */
@@ -42,6 +44,20 @@ export const useImmersed = () => useClusters((s) => s.shown !== null && s.framed
 
 /** Within this of its grant ending, a frame is opened anew with a new one. */
 const FRESH_MS = 60_000;
+/** How long a peer's address has to answer this browser at all. */
+const REACH_MS = 8_000;
+
+/** Whether this browser gets any answer from `origin` (the forwarder there answers anything). */
+async function reaches(origin: string): Promise<boolean> {
+  try {
+    await fetch(`${origin}/.kiln-peer/enter`, { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(REACH_MS) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const mark = (id: string, unreached: boolean) => useClusters.setState((s) => ({ opened: s.opened.map((o) => (o.id === id ? { ...o, unreached } : o)) }));
 
 /** Show a peered cluster: opened (with a grant of its own) when it isn't, or its grant is ending. */
 export async function openCluster(id: string, name: string) {
@@ -59,6 +75,7 @@ export async function openCluster(id: string, name: string) {
       // A new page in its frame says again whether it speaks kiln.
       framed: s.framed.filter((f) => f !== id),
     }));
+    if (!(await reaches(frame.origin))) mark(id, true);
   } catch (e) {
     toast.error(`Couldn't open ${name}`, e instanceof ApiError ? e.message : String(e));
   }
@@ -234,11 +251,44 @@ function PeerFrame({ o, visible, whole }: { o: Opened; visible: boolean; whole: 
   );
   return (
     <div className={visible ? "cluster-frame-wrap" : "hidden"} data-whole={whole ? "" : undefined} aria-hidden={!visible}>
-      <iframe ref={known} name={target} title={o.name} className="cluster-frame" allow="clipboard-read; clipboard-write; fullscreen" />
+      {o.unreached && <Unreached o={o} />}
+      <iframe ref={known} name={target} title={o.name} className={o.unreached ? "hidden" : "cluster-frame"} allow="clipboard-read; clipboard-write; fullscreen" />
       <form key={o.key} ref={post} method="post" action={o.frame.action} target={target} hidden>
         <input type="hidden" name="g" value={o.frame.grant} />
         <input type="hidden" name="to" value="/" />
       </form>
+    </div>
+  );
+}
+
+/** A peer whose address this browser got no answer from: which address, and what lets it through. */
+function Unreached({ o }: { o: Opened }) {
+  const url = new URL(o.frame.origin);
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  const byPort = url.protocol === "http:" && url.port !== "";
+  return (
+    <div className="cluster-unreached" role="alert">
+      <p className="cluster-unreached-title">This browser can't reach {o.name} at {o.frame.origin}</p>
+      {byPort ? (
+        <p>
+          Opened at an address, a peered cluster loads on its own port there ({port}), served by the kiln server or a runner's front door on {url.hostname}. Let port {port} through that machine's firewall (with ufw: <code>sudo ufw allow {port}/tcp</code>), or open kiln at a front door's domain.
+        </p>
+      ) : (
+        <p>The front door at {url.hostname} didn't answer: check that this device resolves that name and reaches the machine it names.</p>
+      )}
+      <button
+        type="button"
+        className="cluster-unreached-retry"
+        onClick={() => {
+          mark(o.id, false);
+          void reaches(o.frame.origin).then((ok) => {
+            if (!ok) mark(o.id, true);
+            else useClusters.setState((s) => ({ opened: s.opened.map((x) => (x.id === o.id ? { ...x, key: x.key + 1 } : x)) }));
+          });
+        }}
+      >
+        Try again
+      </button>
     </div>
   );
 }
