@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use super::rows::{EventRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Compacting, Engine, Kept, Mark, Query, SearchFrom, Took, Unended};
+use super::store::{Change, Changes, Compacting, Engine, Kept, Look, Mark, Query, SearchFrom, Took, Unended};
+use super::telemetry::CompactView;
 
 /// How often a statement that finds the database busy tries again, and how long it waits between.
 const BUSY_TRIES: u32 = 50;
@@ -69,8 +70,11 @@ struct Compaction {
     scans: Vec<(&'static str, Option<i64>)>,
     /// What was written under a number after this was written while copying: copied again.
     through: u64,
-    /// The file's size when compacting began.
+    /// The file's size when compacting began, what it held then (its size less what was free),
+    /// and when (unix ms).
     before: u64,
+    held: u64,
+    began: i64,
     /// Caught up once, the copy on disk and counted against the store: a copy that doesn't hold
     /// what the store holds stops before the swap, and the swap's count reads what this one read.
     counted: Counted,
@@ -826,7 +830,15 @@ impl Turso {
         copy.exec(&format!("PRAGMA cache_size = -{}", COMPACT_CACHE >> 10))?;
         let copier = Copier::start(copy)?;
         self.touched.borrow_mut().clear();
-        self.compaction = Some(Box::new(Compaction { copier, scans: COMPACT_SCANNED.iter().map(|t| (*t, Some(0))).collect(), through: self.rev, before: size, counted: Counted::No }));
+        self.compaction = Some(Box::new(Compaction {
+            copier,
+            scans: COMPACT_SCANNED.iter().map(|t| (*t, Some(0))).collect(),
+            through: self.rev,
+            before: size,
+            held: size - free,
+            began: crate::util::now_ms(),
+            counted: Counted::No,
+        }));
         tracing::info!(file = %self.path.display(), size, free, "conversation store: its file is being made compact, a step at a time");
         Ok(true)
     }
@@ -1199,6 +1211,16 @@ impl Engine for Turso {
         Ok(self.one_int(sql::PEER_GET, &[txt(peer)])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
     }
 
+    fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        let mut stmt = self.prepare(sql::PEERS_ALL)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[], |r| {
+            out.push((r.get::<String>(0).map_err(fail)?, u(r, 1), r.get::<i64>(2).unwrap_or(0)));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
         let mut sources = self.prepare(sql::RECORD_SOURCES)?;
         let mut last: Vec<(String, u64)> = Vec::new();
@@ -1322,6 +1344,26 @@ impl Engine for Turso {
                 Ok((self, Compacting::Not))
             }
         }
+    }
+
+    fn look(&mut self, count: bool) -> anyhow::Result<Look> {
+        let pages = |p: &str| -> anyhow::Result<u64> { Ok(self.one_int(&format!("PRAGMA {p}"), &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0)) };
+        let page = pages("page_size")?;
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let compacting = self.compaction.as_ref().map(|c| {
+            let (phase, table) = match c.scans.iter().find(|(_, at)| at.is_some()) {
+                Some((t, _)) => ("copy", Some((*t).to_owned())),
+                None => match c.counted {
+                    Counted::No => ("catch_up", None),
+                    Counted::Asked(..) => ("count", None),
+                    Counted::Yes => ("swap", None),
+                },
+            };
+            let part = beside(&self.path, ".compact.tmp");
+            CompactView { phase: phase.to_owned(), table, copied: size(&part) + size(&beside(&part, "-wal")), of: c.held, began: c.began }
+        });
+        let sessions = if count { self.one_int("SELECT count(*) FROM sessions", &[])?.and_then(|n| u64::try_from(n).ok()) } else { None };
+        Ok(Look { bytes: pages("page_count")? * page, free: pages("freelist_count")? * page, wal: size(&beside(&self.path, "-wal")), top: self.rev, sessions, compacting })
     }
 
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {

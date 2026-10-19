@@ -140,6 +140,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
         }
         child!("sampler", h => h.sampler_loop());
+        child!("conversation-stores", h => crate::harness::stores::run(h));
         child!("retention", h => h.retention_loop());
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));

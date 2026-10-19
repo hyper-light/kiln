@@ -45,6 +45,7 @@ pub mod screen;
 pub mod session;
 pub mod survivors;
 pub mod socket;
+pub mod stores;
 pub mod streams;
 pub mod transcript;
 pub mod visuals;

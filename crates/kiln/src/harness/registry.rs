@@ -242,6 +242,8 @@ pub struct Registry {
     /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
     pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
     copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
+    /// Every store, as the server sees it: the System page's (`super::stores`).
+    pub board: crate::convo::board::Board,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -355,6 +357,7 @@ impl Registry {
             feed_out,
             copies,
             copies_out,
+            board: crate::convo::board::Board::default(),
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
