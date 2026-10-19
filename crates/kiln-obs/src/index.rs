@@ -234,6 +234,11 @@ impl Index {
         &self.metrics
     }
 
+    /// The series of metric `metric`, by id, sorted.
+    pub fn series_of(&self, metric: Sym) -> &[u32] {
+        self.postings(Owner::Metric(metric))
+    }
+
     /// Every value of tag `key`.
     pub fn tag_values(&self, symbols: &Symbols, key: &str) -> Vec<Sym> {
         symbols.find(key).map(|k| self.values_of(k).to_vec()).unwrap_or_default()

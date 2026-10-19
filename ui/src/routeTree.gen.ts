@@ -35,6 +35,7 @@ import { Route as AppObserveLiveRouteImport } from './routes/_app.observe.live'
 import { Route as AppObserveLogMetricsRouteImport } from './routes/_app.observe.log-metrics'
 import { Route as AppObserveLogsRouteImport } from './routes/_app.observe.logs'
 import { Route as AppObserveMetricsRouteImport } from './routes/_app.observe.metrics'
+import { Route as AppObserveMetricsSummaryRouteImport } from './routes/_app.observe.metrics-summary'
 import { Route as AppObserveSyntheticsRouteImport } from './routes/_app.observe.synthetics'
 import { Route as AppRunnersIndexRouteImport } from './routes/_app.runners.index'
 import { Route as AppRunnersAddRouteImport } from './routes/_app.runners.add'
@@ -184,6 +185,12 @@ const AppObserveMetricsRoute = AppObserveMetricsRouteImport.update({
   path: '/observe/metrics',
   getParentRoute: () => AppRoute,
 } as any)
+const AppObserveMetricsSummaryRoute =
+  AppObserveMetricsSummaryRouteImport.update({
+    id: '/observe/metrics-summary',
+    path: '/observe/metrics-summary',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppObserveSyntheticsRoute = AppObserveSyntheticsRouteImport.update({
   id: '/observe/synthetics',
   path: '/observe/synthetics',
@@ -306,6 +313,7 @@ export interface FileRoutesByFullPath {
   '/observe/log-metrics': typeof AppObserveLogMetricsRoute
   '/observe/logs': typeof AppObserveLogsRoute
   '/observe/metrics': typeof AppObserveMetricsRoute
+  '/observe/metrics-summary': typeof AppObserveMetricsSummaryRoute
   '/observe/synthetics': typeof AppObserveSyntheticsRoute
   '/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
@@ -352,6 +360,7 @@ export interface FileRoutesByTo {
   '/observe/log-metrics': typeof AppObserveLogMetricsRoute
   '/observe/logs': typeof AppObserveLogsRoute
   '/observe/metrics': typeof AppObserveMetricsRoute
+  '/observe/metrics-summary': typeof AppObserveMetricsSummaryRoute
   '/observe/synthetics': typeof AppObserveSyntheticsRoute
   '/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
@@ -400,6 +409,7 @@ export interface FileRoutesById {
   '/_app/observe/log-metrics': typeof AppObserveLogMetricsRoute
   '/_app/observe/logs': typeof AppObserveLogsRoute
   '/_app/observe/metrics': typeof AppObserveMetricsRoute
+  '/_app/observe/metrics-summary': typeof AppObserveMetricsSummaryRoute
   '/_app/observe/synthetics': typeof AppObserveSyntheticsRoute
   '/_app/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
@@ -448,6 +458,7 @@ export interface FileRouteTypes {
     | '/observe/log-metrics'
     | '/observe/logs'
     | '/observe/metrics'
+    | '/observe/metrics-summary'
     | '/observe/synthetics'
     | '/runners/add'
     | '/shared/plans/$token'
@@ -494,6 +505,7 @@ export interface FileRouteTypes {
     | '/observe/log-metrics'
     | '/observe/logs'
     | '/observe/metrics'
+    | '/observe/metrics-summary'
     | '/observe/synthetics'
     | '/runners/add'
     | '/shared/plans/$token'
@@ -541,6 +553,7 @@ export interface FileRouteTypes {
     | '/_app/observe/log-metrics'
     | '/_app/observe/logs'
     | '/_app/observe/metrics'
+    | '/_app/observe/metrics-summary'
     | '/_app/observe/synthetics'
     | '/_app/runners/add'
     | '/shared/plans/$token'
@@ -754,6 +767,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveMetricsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/observe/metrics-summary': {
+      id: '/_app/observe/metrics-summary'
+      path: '/observe/metrics-summary'
+      fullPath: '/observe/metrics-summary'
+      preLoaderRoute: typeof AppObserveMetricsSummaryRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/observe/synthetics': {
       id: '/_app/observe/synthetics'
       path: '/observe/synthetics'
@@ -913,6 +933,7 @@ interface AppRouteChildren {
   AppObserveLogMetricsRoute: typeof AppObserveLogMetricsRoute
   AppObserveLogsRoute: typeof AppObserveLogsRoute
   AppObserveMetricsRoute: typeof AppObserveMetricsRoute
+  AppObserveMetricsSummaryRoute: typeof AppObserveMetricsSummaryRoute
   AppObserveSyntheticsRoute: typeof AppObserveSyntheticsRoute
   AppRunnersAddRoute: typeof AppRunnersAddRoute
   AppAgentsIndexRoute: typeof AppAgentsIndexRoute
@@ -959,6 +980,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveLogMetricsRoute: AppObserveLogMetricsRoute,
   AppObserveLogsRoute: AppObserveLogsRoute,
   AppObserveMetricsRoute: AppObserveMetricsRoute,
+  AppObserveMetricsSummaryRoute: AppObserveMetricsSummaryRoute,
   AppObserveSyntheticsRoute: AppObserveSyntheticsRoute,
   AppRunnersAddRoute: AppRunnersAddRoute,
   AppAgentsIndexRoute: AppAgentsIndexRoute,

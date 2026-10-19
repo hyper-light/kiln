@@ -28,6 +28,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
 | O-16 | Synthetic tests (§10.4): Datadog's API tests, HTTP (its time cut into DNS, connection, TLS, first byte, download and redirects), TCP, DNS and TLS (a certificate's days left), from the server and runners as locations; Datadog's assertions and series; a location failing or recovering an event once; alerting by a monitor each test owns (at least N locations failing for a while); tried once from the server, run now everywhere; their page; checked live (a server and a runner, an endpoint switched to 500 and back, a TLS endpoint with a CA of its own) and in browsers (§13) | done |
+| O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -529,6 +530,7 @@ its schema (§13). Built:
 | --- | --- |
 | `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at; a series with a band (`anomalies()`, `forecast()`) has `bounds` (`lower`, `upper`, `score`, `k`, `algorithm`, and a forecast's `forecast_from`, its first bucket forecast; `to` past now draws it). With `heatmap: <rows>`, a heatmap instead: `rows` (each `[lo, hi]`) and `counts` (each bucket of time, each row's): a distribution's merged buckets (made coarser until they fit), or another query's series' values in equal rows |
 | `GET metrics?match=` , `GET tags?key=&match=` | metric names and tag values, sorted (autocomplete) |
+| `GET metrics/summary?match=&limit=`, `GET metrics/summary/{name}` | what each metric is and costs, Datadog's Metrics Summary: its series (its cardinality) by kind, each tag's values and the series carrying it (the tag of most values first; a metric's own with each tag's ten values of most series), the samples applied since the server started and of late a second, its newest sample's time; the metrics of most series first (100 unless said, 1,000 at the most), and how many matched. From the index and the counts kept as samples are applied: nothing read from disk |
 | `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned |
 | `POST series` | ingest points as Datadog's v1 series API takes them (`metric`, `type`, `tags`, `points` of `[seconds, value]`) |
 | `POST distribution_points` | ingest a distribution's values as Datadog's v1 API takes them (`metric`, `tags`, `host`, `points` of `[seconds, [values]]`): their buckets, count, sum, least and most (§4.4) |
@@ -1290,6 +1292,11 @@ time range and the search in the address (a page is a link).
   solid to its last point, then dashed in its color with its band; its figures (last, average, least,
   most; a widget's value) are its data's alone. An `outliers()` chart draws its outliers in their
   colors and every other member grey. A calendar rollup's buckets are drawn at their own starts.
+- **Metrics summary** (linked from the explorer): every metric kiln keeps, the most series first,
+  each with its kind, its series, its tags with their values' counts (what makes the series many)
+  and the samples it brings a second and when it last did; found by a part of its name; a click on
+  its tags lists each tag's values of most series, one on its name opens it in the explorer. On a
+  phone its tags under its name.
 - **Patterns** (the logs explorer's and the event stream's other view, `?view=patterns`): the
   search's records grouped by their template (Drain), the most common first, each its count, its
   worst status, its template (variables a quiet `*`) and when last seen; a click narrows the search
@@ -2162,7 +2169,10 @@ added, tested (the receiver checks the signature) and removed; an Azure integrat
 form showing metrics not read, its namespace and hubs and the connection string kept, a hub added
 (the connection string, endpoint and TLS kept), the connection string given up for the
 integration's credentials, removed (2026-10-19: passes in Chromium and WebKit as a phone); a
-synthetic test made from the form (an endpoint in the scenario), tried (`Passed in … · 200`), kept
+metric posted as six series (three hosts, two environments) found in the metrics summary by a part
+of its name, its row saying six series, host 3 and env 2, its tags' values listed in a click (each
+host on two series), and opened in the explorer from it (2026-10-19: passes in Chromium and WebKit as
+a phone); a synthetic test made from the form (an endpoint in the scenario), tried (`Passed in … · 200`), kept
 as made, run now and seen passing, an assertion added the endpoint does not meet, tried
 (`body contains "nope": was …`), saved, run and seen failing with why, removed (2026-10-19: passes in
 Chromium and WebKit as a phone); an email

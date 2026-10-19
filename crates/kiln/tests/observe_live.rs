@@ -1631,6 +1631,12 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     for name in ["hook", "og", "mail"] {
         check("DELETE", &format!("{base}/integrations/{name}"), &ipath, None, 204)?;
     }
+    // What each metric is and costs: the list, and one metric's own.
+    let summary = check("GET", &format!("{base}/metrics/summary?limit=5"), &format!("{base}/metrics/summary"), None, 200)?;
+    let first = at(&summary, &["metrics"]).as_array().and_then(|m| m.first()).and_then(|m| at(m, &["name"]).as_str()).unwrap_or("").to_owned();
+    anyhow::ensure!(!first.is_empty(), "no metric summarized: {summary}");
+    check("GET", &format!("{base}/metrics/summary/{first}"), &format!("{base}/metrics/summary/{{name}}"), None, 200)?;
+    check("GET", &format!("{base}/metrics/summary/no.such.metric"), &format!("{base}/metrics/summary/{{name}}"), None, 404)?;
     // A synthetic test of the server's own: kept, tried, run, listed with its state, removed.
     let spath = format!("{base}/synthetics/{{name}}");
     let syn = json!({ "type": "http", "url": "http://127.0.0.1:9/health", "every_s": 3600, "timeout_s": 2, "assertions": [{ "type": "status_code", "operator": "is", "target": 200 }], "alert": { "message": "x", "min_locations": 1 } });

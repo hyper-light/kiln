@@ -1071,3 +1071,45 @@ fn applied_log_records_reach_a_follower_once_through_a_reopen_and_an_image() {
     t.apply_entry(5, &entry(5)).unwrap();
     assert_eq!(read(&mut f), ["event 8", "event 9"]);
 }
+
+/// A metric's summary: its series by kind, each tag's values and the series carrying it (the most
+/// values first, each tag's values of most series first), the samples applied and its newest time;
+/// the metrics of most series first; counts carried over when retention numbers the symbols anew.
+#[test]
+fn metrics_are_summarized_by_series_tags_and_samples() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let mut b = Builder::new();
+    let mut keys = Vec::new();
+    for (host, env) in [("a", "prod"), ("b", "prod"), ("c", "dev")] {
+        keys.push(SeriesKey::new("http.requests", [("host", host), ("env", env)], Kind::Count).unwrap());
+    }
+    let old = SeriesKey::new("batch.done", [("job", "nightly")], Kind::Gauge).unwrap();
+    let late = SeriesKey::new("http.requests", [("host", "d"), ("env", "prod")], Kind::Gauge).unwrap();
+    for k in keys.iter().chain([&old, &late]) {
+        b.define(k);
+    }
+    for k in &keys {
+        b.run(k.fp, (0..10).map(|i| (100_000 + i * 1000, 1.0)));
+    }
+    b.run(late.fp, [(130_000, 2.0)]);
+    b.run(old.fp, (0..3).map(|i| (1_000 + i * 1000, 1.0)));
+    s.apply(&b.finish()).unwrap();
+    let (matched, all) = s.metric_summaries(&|_| true, 10, 2);
+    assert_eq!(matched, 2);
+    let names: Vec<(&str, usize, u64)> = all.iter().map(|m| (m.name.as_str(), m.series, m.samples)).collect();
+    assert_eq!(names, vec![("http.requests", 4, 31), ("batch.done", 1, 3)]);
+    let h = all.first().unwrap();
+    assert_eq!(h.kinds, vec![(Kind::Count, 3), (Kind::Gauge, 1)], "a metric written as two kinds says so");
+    assert_eq!(h.last_ms, Some(130_000));
+    let tag = |m: &MetricSummary, k: &str| m.tags.iter().find(|t| t.key == k).cloned().unwrap();
+    assert_eq!((tag(h, "host").values, tag(h, "host").series), (4, 4));
+    assert_eq!(tag(h, "env").top, vec![("prod".to_owned(), 3), ("dev".to_owned(), 1)]);
+    assert_eq!(h.tags.first().map(|t| t.key.as_str()), Some("host"), "the tag of most values first");
+    assert_eq!(s.metric_summary("nope", 1), None);
+    // Retention past the old series: its metric goes, the other's counts stay theirs.
+    assert!(s.retain_logical(50_000, i64::MIN) > 0);
+    let (matched, all) = s.metric_summaries(&|n| n.starts_with("http"), 10, 0);
+    assert_eq!(matched, 1);
+    assert_eq!(all.first().map(|m| (m.series, m.samples)), Some((4, 31)));
+    assert!(s.metric_summary("batch.done", 0).is_none());
+}

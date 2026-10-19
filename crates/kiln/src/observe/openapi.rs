@@ -452,6 +452,36 @@ fn schemas() -> Map<String, Value> {
             &["ok", "took_ms"],
         ),
     );
+    // What each metric is and costs.
+    put(
+        "MetricSummary",
+        object(
+            &[
+                ("name", string()),
+                ("series", describe(integer(), "its series: its cardinality")),
+                ("kinds", array(object(&[("kind", one_of(&["gauge", "count", "counter"])), ("series", integer())], &["kind", "series"]))),
+                (
+                    "tags",
+                    describe(
+                        array(object(
+                            &[
+                                ("key", string()),
+                                ("values", describe(integer(), "its values among the metric's series")),
+                                ("series", describe(integer(), "the series carrying it")),
+                                ("top", describe(array(object(&[("value", string()), ("series", integer())], &["value", "series"])), "a metric's own summary: the values of most series")),
+                            ],
+                            &["key", "values", "series"],
+                        )),
+                        "the tag of most values first",
+                    ),
+                ),
+                ("samples", describe(integer(), "samples applied since the server started")),
+                ("samples_per_s", describe(nullable(number()), "of late (against a count ten seconds to a minute before); none until there is one")),
+                ("last_ms", nullable(integer())),
+            ],
+            &["name", "series", "kinds", "tags", "samples"],
+        ),
+    );
     // Synthetic tests (docs/observe.md §10.4).
     let assertion = object(
         &[
@@ -1053,6 +1083,11 @@ fn ops() -> Vec<Op<'static>> {
             params: vec![param("match", "query", false, string(), "a glob of names (`system.*`)"), param("limit", "query", false, integer(), "names at the most (10,000)")],
             ..op("get", "/metrics", "Lists metric names", "observe.read", None, vec![("200", answer_of("the names", object(&[("metrics", array(string()))], &["metrics"])))])
         },
+        Op {
+            params: vec![param("match", "query", false, string(), "a glob of names"), param("limit", "query", false, integer(), "metrics at the most (100 unless said; 1,000)")],
+            ..op("get", "/metrics/summary", "Each metric's series, kinds, tags' cardinalities and samples, the metrics of most series first", "observe.read", None, vec![("200", answer_of("the metrics", object(&[("matched", integer()), ("metrics", array(schema("MetricSummary")))], &["matched", "metrics"])))])
+        },
+        Op { params: vec![path_param("name", "the metric's name")], ..op("get", "/metrics/summary/{name}", "A metric's summary, each tag's values of most series with it", "observe.read", None, vec![ok("MetricSummary")]) },
         Op {
             params: vec![param("key", "query", true, string(), "the tag's key"), param("match", "query", false, string(), "a glob of values"), param("limit", "query", false, integer(), "values at the most")],
             ..op("get", "/tags", "Lists a tag's values", "observe.read", None, vec![("200", answer_of("the values", object(&[("key", string()), ("values", array(string()))], &["key", "values"])))])

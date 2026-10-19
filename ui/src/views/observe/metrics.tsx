@@ -115,6 +115,12 @@ function Names({ onPick }: { onPick: (name: string) => void }) {
     <div className="grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
       <section aria-label="Metrics kiln keeps">
         <SearchField label="Find a metric" value={filter} onChange={setFilter} placeholder={`${names.length.toLocaleString()} metrics`} className="mb-3" />
+        <p className="mb-3 text-[12px] text-[#8c8f98]">
+          <Link to="/observe/metrics-summary" className="text-link">
+            Metrics summary
+          </Link>
+          : each metric&apos;s series, tags and samples.
+        </p>
         {shown.length === 0 ? (
           <p className="empty-line py-10 text-center">{names.length === 0 ? "No metrics yet: they arrive as hosts, CI and OTLP exporters report." : "No metric of that name."}</p>
         ) : (

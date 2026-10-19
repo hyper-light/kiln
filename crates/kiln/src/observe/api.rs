@@ -409,6 +409,57 @@ async fn reading<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store) -> R
     .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
 }
 
+/// Each metric's samples a second of late: reckoned against what was counted at least ten seconds
+/// before (the counts are kept, a minute at a time, here); none until there is such a count.
+fn sample_rates(s: &kiln_obs::store::Store) -> std::collections::HashMap<String, f64> {
+    type Counted = (std::time::Instant, std::collections::HashMap<String, u64>);
+    static BEFORE: std::sync::Mutex<Option<Counted>> = std::sync::Mutex::new(None);
+    let now: std::collections::HashMap<String, u64> = s.metric_samples().into_iter().map(|(n, c)| (n.to_owned(), c)).collect();
+    let mut before = BEFORE.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut rates = std::collections::HashMap::new();
+    if let Some((at, then)) = before.as_ref() {
+        let secs = at.elapsed().as_secs_f64();
+        if secs >= 10.0 {
+            for (name, &c) in &now {
+                // A count lower than before: the store opened again; no rate.
+                if let Some(&t) = then.get(name).filter(|&&t| t <= c) {
+                    rates.insert(name.clone(), (c - t) as f64 / secs);
+                }
+            }
+        }
+    }
+    if before.as_ref().is_none_or(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(60)) {
+        *before = Some((std::time::Instant::now(), now));
+    }
+    rates
+}
+
+/// A metric's summary as the API shows it.
+fn summary_json(m: &kiln_obs::store::MetricSummary, rate: Option<f64>) -> Value {
+    let kind = |k: kiln_obs::batch::Kind| match k {
+        kiln_obs::batch::Kind::Gauge => "gauge",
+        kiln_obs::batch::Kind::Count => "count",
+        kiln_obs::batch::Kind::Counter => "counter",
+    };
+    json!({
+        "name": m.name,
+        "series": m.series,
+        "kinds": m.kinds.iter().map(|(k, n)| json!({ "kind": kind(*k), "series": n })).collect::<Vec<_>>(),
+        "tags": m.tags.iter().map(|t| {
+            let mut v = json!({ "key": t.key, "values": t.values, "series": t.series });
+            if !t.top.is_empty()
+                && let Some(o) = v.as_object_mut()
+            {
+                o.insert("top".into(), json!(t.top.iter().map(|(value, n)| json!({ "value": value, "series": n })).collect::<Vec<_>>()));
+            }
+            v
+        }).collect::<Vec<_>>(),
+        "samples": m.samples,
+        "samples_per_s": rate,
+        "last_ms": m.last_ms,
+    })
+}
+
 /// An SLO as the API shows it: its definition and its standing (`days`: day by day too).
 fn slo_json(s: &kiln_obs::store::Store, d: &super::slos::SloDef, now: i64, days: bool) -> Value {
     let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
@@ -438,6 +489,27 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             reading(move |s| {
                 let names: Vec<&str> = s.metric_names().into_iter().filter(|n| pattern.as_deref().is_none_or(|p| kiln_obs::index::glob(p, n))).take(limit).collect();
                 Ok(srv::json(StatusCode::OK, &json!({ "metrics": names })))
+            })
+            .await
+        }
+        (&Method::GET, ["metrics", "summary"]) => {
+            // The metrics of most series first: what each is and costs.
+            let pattern = q.get("match").cloned();
+            let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
+            reading(move |s| {
+                let rates = sample_rates(s);
+                let (matched, all) = s.metric_summaries(&|n| pattern.as_deref().is_none_or(|p| kiln_obs::index::glob(p, n)), limit, 0);
+                let metrics: Vec<Value> = all.iter().map(|m| summary_json(m, rates.get(m.name.as_str()).copied())).collect();
+                Ok(srv::json(StatusCode::OK, &json!({ "matched": matched, "metrics": metrics })))
+            })
+            .await
+        }
+        (&Method::GET, ["metrics", "summary", name]) => {
+            let name = (*name).to_owned();
+            reading(move |s| {
+                let rates = sample_rates(s);
+                let m = s.metric_summary(&name, 10).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric"))?;
+                Ok(srv::json(StatusCode::OK, &summary_json(&m, rates.get(m.name.as_str()).copied())))
             })
             .await
         }

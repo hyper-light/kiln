@@ -246,6 +246,19 @@ export type IntegrationIn =
   | { kind: "opsgenie"; api_key: string; url?: string }
   | { kind: "email"; to: string[]; from: string; host: string; port?: number; security?: SmtpSecurity; username?: string; password?: string; ca?: string };
 
+/** What a metric is and costs: its series (its cardinality) by kind, each tag's values, its samples. */
+export interface MetricSummary {
+  name: string;
+  series: number;
+  kinds: { kind: "gauge" | "count" | "counter"; series: number }[];
+  /** The tag of most values first; a metric's own summary has each tag's values of most series. */
+  tags: { key: string; values: number; series: number; top?: { value: string; series: number }[] }[];
+  /** Samples applied since the server started; of late a second (none until it can say). */
+  samples: number;
+  samples_per_s: number | null;
+  last_ms: number | null;
+}
+
 /** A synthetic test's kind (docs/observe.md §10.4). */
 export type SyntheticType = "http" | "tcp" | "dns" | "tls";
 export type SyntheticAssertionType = "status_code" | "response_time" | "header" | "body" | "certificate_days" | "address";
@@ -831,6 +844,9 @@ export const observeApi = {
   testCloud: (name: string, c: CloudIn) => request<CloudTest>("POST", `${BASE}/clouds/${enc(name)}/test`, c),
   scrapes: (signal?: AbortSignal) => request<{ scrapes: Scrape[] }>("GET", `${BASE}/scrapes`, undefined, { signal }).then((r) => r.scrapes),
   putScrape: (name: string, t: ScrapeIn) => request<void>("PUT", `${BASE}/scrapes/${enc(name)}`, t),
+  metricsSummary: (match: string | undefined, limit: number, signal?: AbortSignal) =>
+    request<{ matched: number; metrics: MetricSummary[] }>("GET", `${BASE}/metrics/summary?limit=${limit}${match ? `&match=${encodeURIComponent(match)}` : ""}`, undefined, { signal }),
+  metricSummary: (name: string, signal?: AbortSignal) => request<MetricSummary>("GET", `${BASE}/metrics/summary/${enc(name)}`, undefined, { signal }),
   synthetics: (signal?: AbortSignal) => request<{ synthetics: Synthetic[] }>("GET", `${BASE}/synthetics`, undefined, { signal }).then((r) => r.synthetics),
   putSynthetic: (name: string, t: SyntheticIn) => request<void>("PUT", `${BASE}/synthetics/${enc(name)}`, t),
   deleteSynthetic: (name: string) => request<void>("DELETE", `${BASE}/synthetics/${enc(name)}`),

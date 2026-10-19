@@ -628,6 +628,33 @@ const scenarios = {
     }
   },
 
+  /** The metrics summary: a metric posted with six series (three hosts, two environments) found by
+   * a part of its name, its series and tags' cardinalities in its row, its tags' values of most
+   * series in a click, and the metric opened in the explorer from it. */
+  async "the metrics summary says a metric's series and tags"() {
+    const name = `e2e.summary.r${run}`;
+    const now = Math.floor(Date.now() / 1000);
+    const series = [];
+    for (const host of ["h1", "h2", "h3"]) for (const env of ["prod", "dev"]) series.push({ metric: name, points: [[now - 10, 1]], tags: [`host:${host}`, `env:${env}`], type: "gauge" });
+    const posted = await api("POST", "/api/observe/v1/series", { series });
+    expect(posted.status < 300, `the series posted: ${posted.status}`);
+    await until("the metric kept", async () => (await api("GET", `/api/observe/v1/metrics/summary?match=${encodeURIComponent(name)}`)).body.metrics?.length === 1, 20_000);
+    await page.goto(`${BASE}/observe/metrics-summary`);
+    await fillIn(page.getByRole("searchbox", { name: "Find a metric" }), `summary.r${run}`);
+    const row = page.locator("table.data-table tbody tr").filter({ has: page.getByText(name, { exact: true }) });
+    await until("its row: six series, three hosts, two environments", async () => {
+      const t = (await row.textContent()) ?? "";
+      return ((await row.locator("td").nth(1).textContent()) ?? "").trim() === "6" && /host 3/.test(t) && /env 2/.test(t);
+    });
+    await row.getByRole("button", { name: phone ? /host 3/ : `The tags of ${name}` }).click();
+    const d = page.getByRole("dialog");
+    await d.getByText("3 values · on 6 of 6 series").waitFor();
+    await d.getByText(/h1 \(2\), h2 \(2\), h3 \(2\)/).waitFor();
+    await page.keyboard.press("Escape");
+    await row.getByRole("link", { name, exact: true }).click();
+    await until("the explorer, the metric asked", async () => decodeURIComponent(page.url()).includes(`avg:${name}{*}`));
+  },
+
   /** A synthetic test made from the form and tried once (the endpoint a server here), run now and
    * seen passing; an assertion added that the endpoint does not meet, tried and saved, run, seen
    * failing with why; removed. */

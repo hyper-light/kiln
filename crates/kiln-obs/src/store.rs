@@ -46,7 +46,7 @@ use crate::logs::store::{Found, HeldFile, LogStore, LogStoreError};
 use crate::logs::tail::Feed;
 use crate::manifest::{self, BlockEntry, Manifest, ManifestError, Membership, Point, Session};
 use crate::rollup::{self, Col, Rolled};
-use crate::symbols::Symbols;
+use crate::symbols::{Sym, Symbols};
 
 /// Senders a store keeps sessions for at the most; past it, the one whose last write is oldest in
 /// the log goes (Ongaro's thesis §6.3 expires sessions by a rule every server applies alike). A
@@ -208,6 +208,10 @@ pub struct Store {
     head: Vec<HeadSeries>,
     /// Each series' newest sample's time, by id: what retention weighs it by.
     last: Vec<i64>,
+    /// Samples applied since the store opened, by metric (its symbol's number): what each metric
+    /// costs, as a summary says it ([`Store::metric_summaries`]). This process's alone, not
+    /// replicated state.
+    metric_samples: Vec<u64>,
     blocks: Vec<OpenBlock>,
     logs: LogStore,
     dir: Option<PathBuf>,
@@ -274,6 +278,27 @@ impl<'a> SeriesRef<'a> {
     pub fn tag(&self, key: &str) -> Option<&'a str> {
         self.tags().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
+}
+
+/// What a metric is and costs: its series (its cardinality), by kind; each tag key's values and
+/// the series carrying it, the most values first, with the values of most series; the samples
+/// applied since the store opened; its newest sample's time (ms).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricSummary {
+    pub name: String,
+    pub series: usize,
+    pub kinds: Vec<(Kind, usize)>,
+    pub tags: Vec<TagSummary>,
+    pub samples: u64,
+    pub last_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagSummary {
+    pub key: String,
+    pub values: usize,
+    pub series: usize,
+    pub top: Vec<(String, usize)>,
 }
 
 /// Files wholly older than the durable cutoff, and the manifest without them.
@@ -509,6 +534,7 @@ impl Store {
             index: Index::new(hash),
             head: Vec::new(),
             last: Vec::new(),
+            metric_samples: Vec::new(),
             blocks: Vec::new(),
             logs: LogStore::default(),
             dir: None,
@@ -635,6 +661,22 @@ impl Store {
             head.push(self.head.get_mut(id as usize).map(std::mem::take).unwrap_or_default());
             last.push(self.last.get(id as usize).copied().unwrap_or(i64::MIN));
         }
+        // The metrics' counts carried over by name: the symbols are numbered anew.
+        let mut counted = Vec::new();
+        for (i, &n) in self.metric_samples.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let Some(new) = u32::try_from(i).ok().and_then(|i| symbols.find(self.symbols.get(Sym(i)))) else { continue };
+            let at = new.0 as usize;
+            if counted.len() <= at {
+                counted.resize(at + 1, 0);
+            }
+            if let Some(c) = counted.get_mut(at) {
+                *c += n;
+            }
+        }
+        self.metric_samples = counted;
         self.symbols = symbols;
         self.index = index;
         self.head = head;
@@ -881,6 +923,7 @@ impl Store {
                         (None, None) => continue,
                     };
                     let (Some(series), Some(last)) = (self.head.get_mut(id as usize), self.last.get_mut(id as usize)) else { continue };
+                    let before = done.counts.samples;
                     let mut next = Some(first);
                     while let Some((t, v)) = next {
                         if t < cutoff {
@@ -897,6 +940,18 @@ impl Store {
                             done.counts.samples += 1;
                         }
                         next = d.next_sample()?;
+                    }
+                    let taken = done.counts.samples - before;
+                    if taken > 0
+                        && let Some(info) = self.index.info(id)
+                    {
+                        let at = info.metric.0 as usize;
+                        if self.metric_samples.len() <= at {
+                            self.metric_samples.resize(at + 1, 0);
+                        }
+                        if let Some(c) = self.metric_samples.get_mut(at) {
+                            *c += taken;
+                        }
                     }
                 }
             }
@@ -1509,6 +1564,67 @@ impl Store {
 
     pub fn totals(&self) -> Counts {
         self.totals
+    }
+
+    /// Each metric `matching` its name, what it is and costs ([`MetricSummary`]): the `limit` of
+    /// most series (their tags' cardinalities read for those alone), the most first. Series and
+    /// samples counted from the index and this process's counts: nothing read from disk.
+    pub fn metric_summaries(&self, matching: &dyn Fn(&str) -> bool, limit: usize, top_values: usize) -> (usize, Vec<MetricSummary>) {
+        let mut all: Vec<(Sym, usize)> = self.index.metrics().iter().filter(|&&m| matching(self.symbols.get(m))).map(|&m| (m, self.index.series_of(m).len())).collect();
+        let matched = all.len();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| self.symbols.get(a.0).cmp(self.symbols.get(b.0))));
+        all.truncate(limit);
+        (matched, all.into_iter().map(|(m, _)| self.summarize(m, top_values)).collect())
+    }
+
+    /// Every metric's samples applied since the store opened: what a rate is reckoned from.
+    pub fn metric_samples(&self) -> Vec<(&str, u64)> {
+        self.index.metrics().iter().map(|&m| (self.symbols.get(m), self.metric_samples.get(m.0 as usize).copied().unwrap_or(0))).collect()
+    }
+
+    /// Metric `name`'s summary, each tag's `top_values` values with the most series.
+    pub fn metric_summary(&self, name: &str, top_values: usize) -> Option<MetricSummary> {
+        let m = self.symbols.find(name)?;
+        self.index.metrics().contains(&m).then(|| self.summarize(m, top_values))
+    }
+
+    fn summarize(&self, m: Sym, top_values: usize) -> MetricSummary {
+        let ids = self.index.series_of(m);
+        let mut kinds: Vec<(Kind, usize)> = Vec::new();
+        // Each tag key: its values' series counts.
+        let mut keys: std::collections::HashMap<Sym, std::collections::HashMap<Sym, usize>> = std::collections::HashMap::new();
+        let mut last = i64::MIN;
+        for &id in ids {
+            let Some(info) = self.index.info(id) else { continue };
+            match kinds.iter_mut().find(|(k, _)| *k == info.kind) {
+                Some(k) => k.1 += 1,
+                None => kinds.push((info.kind, 1)),
+            }
+            for &(k, v) in self.index.tags(&info) {
+                *keys.entry(k).or_default().entry(v).or_default() += 1;
+            }
+            last = last.max(self.last.get(id as usize).copied().unwrap_or(i64::MIN));
+        }
+        kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+        let mut tags: Vec<TagSummary> = keys
+            .into_iter()
+            .map(|(k, values)| {
+                let series = values.values().sum();
+                let mut top: Vec<(Sym, usize)> = values.iter().map(|(&v, &n)| (v, n)).collect();
+                top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| self.symbols.get(a.0).cmp(self.symbols.get(b.0))));
+                top.truncate(top_values);
+                TagSummary { key: self.symbols.get(k).to_owned(), values: values.len(), series, top: top.into_iter().map(|(v, n)| (self.symbols.get(v).to_owned(), n)).collect() }
+            })
+            .collect();
+        tags.sort_by(|a, b| b.values.cmp(&a.values).then_with(|| a.key.cmp(&b.key)));
+        MetricSummary {
+            name: self.symbols.get(m).to_owned(),
+            series: ids.len(),
+            kinds,
+            tags,
+            samples: self.metric_samples.get(m.0 as usize).copied().unwrap_or(0),
+            last_ms: (last > i64::MIN).then_some(last),
+        }
     }
 
     pub fn series_count(&self) -> usize {
