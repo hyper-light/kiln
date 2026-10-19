@@ -4,6 +4,7 @@
  * provider (KilnCD or Argo CD) makes run; it waits on the environment's gates first.
  */
 import { request } from "./client";
+import type { CdDiff, CdResourceKey } from "./types";
 
 export type ReleaseState = "waiting" | "waiting_approval" | "committing" | "delivering" | "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded";
 export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable";
@@ -136,6 +137,19 @@ export interface AppAsk {
   source?: string;
 }
 
+/** What changes in an app: only what is given. A property set to `null` is removed; `source: ""` unlinks. */
+export interface AppPatch {
+  project?: string;
+  owners?: string[];
+  package?: Package;
+  namespace?: string;
+  properties?: Record<string, string | null>;
+  template?: string;
+  contacts?: App["contacts"];
+  source?: string;
+  archived?: boolean;
+}
+
 /** One registration on the board: what runs, and what's on its way. */
 export interface Cell {
   registration: Registration;
@@ -161,6 +175,27 @@ export interface RegistrationDetail {
 export interface AppDetail {
   app: App;
   environments: { registration: Registration; running: Release | null }[];
+}
+
+/** One object of what runs, as the provider sees it (KilnCD's shape, from either provider). */
+export interface RunningObject extends CdResourceKey {
+  sync: string;
+  health: string | null;
+  message: string | null;
+  missing?: boolean;
+  requires_pruning?: boolean;
+  hook?: boolean;
+  why?: string | null;
+}
+
+/** A workload's pods' logs, the last lines of each (Argo CD gives only the lines). */
+export interface LogRead {
+  lines: { pod: string; ts: string; text: string }[];
+  pods?: string[];
+  more_pods?: number;
+  container?: string | null;
+  containers?: string[];
+  errors?: string[];
 }
 
 /** DORA's four keys, from the releases (durations in seconds). */
@@ -221,7 +256,23 @@ export const deployApi = {
   environments: (signal?: AbortSignal) => request<{ environments: Environment[] }>("GET", "/api/deploy/environments", undefined, { signal }).then((r) => r.environments),
   nameFree: (name: string) => request<{ name: string; available: boolean; why?: string | null }>("GET", `/api/deploy/app-names/${enc(name)}`),
   createApp: (ask: AppAsk) => request<App>("POST", "/api/deploy/apps", ask),
+  patchApp: (name: string, patch: AppPatch) => request<App>("PATCH", `/api/deploy/apps/${enc(name)}`, patch),
+  deleteApp: (name: string, o: { everywhere: boolean; keep: boolean }) => request<void>("DELETE", `/api/deploy/apps/${enc(name)}?everywhere=${o.everywhere}&keep=${o.keep}`),
+  environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
+  putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
   register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
+  resources: (app: string, env: string, signal?: AbortSignal) => request<{ resources: RunningObject[] }>("GET", `${reg(app, env)}/resources`, undefined, { signal }).then((r) => r.resources),
+  manifests: (app: string, env: string, version?: string, signal?: AbortSignal) =>
+    request<{ manifests: { key: CdResourceKey; yaml: string }[] }>("GET", `${reg(app, env)}/manifests${version ? `?version=${enc(version)}` : ""}`, undefined, { signal }).then((r) => r.manifests),
+  diff: (app: string, env: string, version?: string, signal?: AbortSignal) =>
+    request<{ diffs: CdDiff[] }>("GET", `${reg(app, env)}/diff${version ? `?version=${enc(version)}` : ""}`, undefined, { signal }).then((r) => r.diffs),
+  logs: (app: string, env: string, q: { kind: string; name: string; namespace?: string; container?: string; tail: number }, signal?: AbortSignal) => {
+    const qs = Object.entries(q)
+      .filter(([, v]) => v !== undefined && v !== "")
+      .map(([k, v]) => `${enc(k)}=${enc(String(v))}`)
+      .join("&");
+    return request<LogRead>("GET", `${reg(app, env)}/logs?${qs}`, undefined, { signal });
+  },
   pause: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/pause`, {}),
   resume: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/resume`, {}),
 };
@@ -230,6 +281,8 @@ export const boardHref = "/deployments/releases";
 export const newAppHref = "/deployments/releases/new";
 export const releaseHref = (id: number) => `/deployments/releases/${id}`;
 export const releaseAppHref = (app: string) => `/deployments/releases/apps/${enc(app)}`;
+export const releaseEnvHref = (env: string) => `/deployments/releases/environments/${enc(env)}`;
+export const registrationHref = (app: string, env: string) => `/deployments/releases/apps/${enc(app)}/environments/${enc(env)}`;
 
 /** The status dot a release's state shows as. */
 export const STATE_DOT: Record<ReleaseState, string> = {

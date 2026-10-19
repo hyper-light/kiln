@@ -376,3 +376,104 @@
 .rel-gap {
   margin-top: 0.75rem;
 }
+.rel-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.rel-keep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--color-foreground);
+}
+.rel-env-page {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 16px;
+  margin: 20px 0 16px;
+}
+.rel-stack {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+.rel-stack > .rel-register {
+  margin-top: 0;
+}
+.rel-board thead th a {
+  color: inherit;
+}
+.rel-board thead th a:hover {
+  color: var(--color-link);
+}
+
+/* ---------------------------------------------------------------- what runs, as the provider sees it */
+.rel-reads {
+  margin-top: 16px;
+}
+.rel-objects {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rel-objects li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  border-bottom: 1px solid var(--color-line);
+  padding: 10px 0;
+  font-size: 13px;
+}
+.rel-objects li:last-child {
+  border-bottom: 0;
+}
+.rel-object {
+  display: inline-flex;
+  min-width: min(100%, 18rem);
+  flex: 1 1 18rem;
+  align-items: center;
+  gap: 8px;
+}
+.rel-object-name {
+  overflow-wrap: anywhere;
+}
+.rel-manifests {
+  display: grid;
+  gap: 8px;
+}
+.rel-manifest summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 6px 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.rel-log {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-code);
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rel-title-in {
+  color: var(--color-faint);
+}
+.rel-tabs {
+  margin-top: 8px;
+}
+.rel-log {
+  margin-top: 12px;
+}

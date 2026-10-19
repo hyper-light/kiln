@@ -343,7 +343,7 @@ pub fn said(trees: &[(Ran, Vec<u32>)], now_s: u64) -> String {
 /// (how a process that runs apart is found by its mark). macOS hides the environment of Apple's own
 /// programs (`/bin/sleep`), and copies of them can't run (arm64e), so there it is Python's. `None`
 /// on a Mac without Python.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn sleeper(secs: u32) -> Option<String> {
     if cfg!(target_os = "macos") {
         let python = std::process::Command::new("python3").args(["-c", "pass"]).output().is_ok_and(|o| o.status.success());
