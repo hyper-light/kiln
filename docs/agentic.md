@@ -236,6 +236,20 @@ the file, the lines, the version and a link; it answers, amends and pushes a new
 **C4 Mission Control.** A finished agent with an open change shows **Review** on its row; landed
 shows as such.
 
+**C5 The review UI** (ci.md W21-R09, built to W14-R06 and checked against W14-AC06 in Chromium and
+WebKit): the inbox (needs your review, your stacks, your agents' stacks, your conversations), the
+change request and diff page (versions and interdiffs, threads on any line or range, suggestions,
+viewed files, next and previous unresolved), the stack, the land control with its strategy, and the
+land queue. Diffs: syntax highlighting with the editor's grammars, word-level changes, moved
+blocks, a whitespace toggle, split and unified (unified on phones), generated and `-diff` files
+folded, renames, copies, binary and image diffs, and a 10,000-line diff scrolling at 60 fps.
+
+**C6 Pushing as the agent.** An agent's work reaches kiln's git with an agent token (`kiln_agt_…`,
+minted for `agent:<id>` acting for its person and limited to the repository), never with an MCP
+token (those act as the owner). The change request records `author: agent:<id>` and `author_for`,
+which is how comments, reviews, CI results (`diff_run`) and queue events (`queue`: ejected, needs
+rebase) find their way back to the agent.
+
 ## K: Agentic control of CI/CD, whatever the provider
 
 **K1** Every CI/CD operation a person has is an operation agents can call, for each provider kiln
