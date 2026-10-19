@@ -7,7 +7,7 @@ import * as React from "react";
 import { Link } from "@/lib/router";
 import { Check, Plus, X } from "lucide-react";
 
-import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release } from "@/api/deploy";
+import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseEnvHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel } from "@/components/ui/misc";
@@ -156,8 +156,11 @@ function BoardView() {
               <th scope="col">App</th>
               {board.environments.map((e) => (
                 <th key={e.name} scope="col">
-                  <span>{e.name}</span>
-                  <small>{providerName(e.provider)}</small>
+                  <Link to={releaseEnvHref(e.name)}>{e.name}</Link>
+                  <small>
+                    {providerName(e.provider)}
+                    {e.gates.freeze ? " · frozen" : ""}
+                  </small>
                 </th>
               ))}
             </tr>
