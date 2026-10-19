@@ -255,6 +255,12 @@ fn machine(work_dir: &Path) -> RunnerFacts {
 pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
     let dir = work_dir.to_path_buf();
     let mut f = crate::rt::blocking(move || machine(&dir)).await.unwrap_or_default();
+    // A test build posing as a runner of another platform (`--chaos platform=`, docs/ci.md
+    // W04-AC07): that platform's OS and architecture, and so the labels they give.
+    if let Some(p) = super::chaos::get().and_then(|c| c.platform.as_deref()).and_then(|p| kiln_ci::plan::matrix::Platform::parse(p).ok()) {
+        f.arch_variant = p.variant.clone().or_else(|| (p.fact_arch == "aarch64").then(|| "v8".to_owned()));
+        (f.os, f.arch) = (p.fact_os.to_owned(), p.fact_arch.to_owned());
+    }
     // Hypervisor.framework on a Mac: the kernel says whether it's supported.
     if cfg!(target_os = "macos") {
         f.virt.hvf = output("sysctl", &["-n", "kern.hv_support"]).await.is_some_and(|v| v.trim() == "1");

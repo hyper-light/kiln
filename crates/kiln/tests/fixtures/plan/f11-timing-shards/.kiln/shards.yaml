@@ -1,0 +1,24 @@
+# F-11 (docs/ci.md Appendix F; W04-AC05, AC07, S04): forty test files, split by their recorded
+# times into legs of about five minutes. Each leg reports its files' times (a minute each, as
+# a run of them would), so the first run, with no history, is one leg, and the next has eight
+# of five files each.
+name: shards
+on: push
+jobs:
+  test:
+    runs-on: self-hosted
+    strategy:
+      shard: { files: 'tests/**/*_test.py', target: 5m, balance: timing }
+    steps:
+      - run: |
+          test -s "$KILN_SHARD_ITEMS"
+          {
+            echo '<testsuite name="py">'
+            while read -r f; do
+              echo "  <testcase classname=\"py\" name=\"$f\" file=\"$f\" time=\"60\"/>"
+            done < "$KILN_SHARD_ITEMS"
+            echo '</testsuite>'
+          } > report.xml
+      - uses: kiln/test-results@v1
+        with:
+          path: report.xml

@@ -121,13 +121,16 @@ pub async fn get(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Res
     let legs = legs(hub, id, attempt_of(q)).await?;
     // The actions the run pinned when it started (W07-R02).
     let rid = id.to_owned();
-    let input: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT input FROM ci_plans WHERE run_id = ?1", [&rid], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let saved: Option<(String, Option<String>)> = hub.store.call(move |c| Ok(c.query_row("SELECT input, removed FROM ci_plans WHERE run_id = ?1", [&rid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await.map_err(internal)?;
+    let (input, removed) = saved.map_or((None, None), |(i, r)| (Some(i), r));
+    // The combinations `exclude` and `where` removed, by job, with why (W04-R29).
+    let removed: Value = removed.and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_else(|| json!({}));
     let actions: Vec<Value> = input
         .and_then(|i| serde_json::from_str::<Value>(&i).ok())
         .and_then(|v| v.get("actions").and_then(Value::as_object).cloned())
         .map(|m| m.into_iter().map(|(uses, a)| json!({ "uses": uses, "repo": a.get("repo"), "sha": a.get("sha") })).collect())
         .unwrap_or_default();
-    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "legs": legs, "actions": actions })))
+    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "legs": legs, "actions": actions, "removed": removed })))
 }
 
 /// `GET /api/ci/runs/:id/graph`: the jobs as nodes (their legs inside), `needs` as edges, and the

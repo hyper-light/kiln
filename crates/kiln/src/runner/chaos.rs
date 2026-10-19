@@ -8,7 +8,9 @@
 //! - `oom=<duration>`: a leg's step on the host is killed that long after it starts, as the OOM
 //!   killer kills (SIGKILL, and counted where kiln counts the OOM killer's kills);
 //! - `disk=<MiB>`: a leg's job container gets a workspace of that size, so filling it is ENOSPC;
-//! - `corrupt`: a leg's uploads to the server's blob store arrive with a byte flipped.
+//! - `corrupt`: a leg's uploads to the server's blob store arrive with a byte flipped;
+//! - `platform=<os>/<arch>`: the runner reports that platform's OS and architecture (and the
+//!   labels they give), a stand-in for a runner of another platform (W04-AC07).
 //!
 //! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
 //! recovers; `drop` and `delay` are the connection's.
@@ -32,6 +34,7 @@ pub struct Chaos {
     pub oom_after: Option<Duration>,
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
+    pub platform: Option<String>,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -58,7 +61,11 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "oom" => c.oom_after = Some(d()?),
             "disk" => c.disk_mib = Some(v.parse().map_err(|_| anyhow::anyhow!("chaos `disk` takes MiB, not `{v}`"))?),
             "corrupt" => c.corrupt = true,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, delay, oom, disk or corrupt"),
+            "platform" => {
+                kiln_ci::plan::matrix::Platform::parse(v).map_err(|e| anyhow::anyhow!("chaos `platform`: {e}"))?;
+                c.platform = Some(v.to_owned());
+            }
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, delay, oom, disk, corrupt or platform"),
         }
     }
     Ok(c)
@@ -238,8 +245,10 @@ mod tests {
         let c = parse("drop=2s, delay=300ms,oom=1s,disk=8,corrupt")?;
         assert_eq!(
             c,
-            Chaos { drop_every: Some(Duration::from_secs(2)), delay: Some(Duration::from_millis(300)), oom_after: Some(Duration::from_secs(1)), disk_mib: Some(8), corrupt: true }
+            Chaos { drop_every: Some(Duration::from_secs(2)), delay: Some(Duration::from_millis(300)), oom_after: Some(Duration::from_secs(1)), disk_mib: Some(8), corrupt: true, platform: None }
         );
+        assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
+        assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));
         assert!(parse("oom=soon").is_err());
         assert_eq!(parse("")?, Chaos::default());

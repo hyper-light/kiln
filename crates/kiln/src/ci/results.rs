@@ -118,6 +118,7 @@ pub async fn ingest(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
     }
     let leg = claims.sub.clone();
     let Some(of) = leg_of(hub, &leg).await.map_err(|e| internal(&e))? else { return Err((StatusCode::NOT_FOUND, "the leg is gone".into())) };
+    let repo_id = of.repo.clone();
     let now = crate::util::now_unix();
     let (entries, bad_list) = quarantine_of(hub, &of.repo).await;
     let verdict = quarantine::judge(&entries, &report.cases, now);
@@ -162,6 +163,8 @@ pub async fn ingest(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         .await
         .map_err(|e| internal(&e))?;
     hub.emit_job(&leg).await;
+    // The repository's next run shards by these times too (W16-R06).
+    TIMING.lock().remove(&repo_id);
     let label = |c: &Case| if c.suite.is_empty() { c.name.clone() } else { format!("{} {}", c.suite, c.name) };
     let failures: Vec<String> = report.cases.iter().filter(|c| c.outcome.is_failure()).take(20).map(label).collect();
     let mut warnings: Vec<String> = Vec::new();
@@ -639,13 +642,16 @@ pub async fn repo_metrics(hub: &Hub, repo: &str, q: &HashMap<String, String>) ->
 /// The most items a run's timing table keeps.
 const MAX_TIMING: usize = 5000;
 
+type TimingCache = parking_lot::Mutex<HashMap<String, (std::time::Instant, Arc<HashMap<String, f64>>)>>;
+
+/// Each repository's timing table, for ten minutes or until its next report.
+static TIMING: std::sync::LazyLock<TimingCache> = std::sync::LazyLock::new(Default::default);
+
 /// A repository's recorded durations (W16-R06), in seconds, for shards balanced by timing
 /// (W04-R14): each test file's (the sum of its tests in a leg, the median across legs), and each
 /// test's (by name, and by suite and name), over the last two weeks. Cached for ten minutes.
 pub async fn timing(hub: &Hub, repo_id: &str) -> Arc<HashMap<String, f64>> {
-    type Cache = parking_lot::Mutex<HashMap<String, (std::time::Instant, Arc<HashMap<String, f64>>)>>;
-    static CACHE: std::sync::LazyLock<Cache> = std::sync::LazyLock::new(Default::default);
-    if let Some((at, t)) = CACHE.lock().get(repo_id)
+    if let Some((at, t)) = TIMING.lock().get(repo_id)
         && at.elapsed() < std::time::Duration::from_secs(600)
     {
         return Arc::clone(t);
@@ -691,7 +697,7 @@ pub async fn timing(hub: &Hub, repo_id: &str) -> Arc<HashMap<String, f64>> {
         out.entry(n).or_insert_with(|| median(v));
     }
     let t = Arc::new(out);
-    CACHE.lock().insert(repo_id.to_owned(), (std::time::Instant::now(), Arc::clone(&t)));
+    TIMING.lock().insert(repo_id.to_owned(), (std::time::Instant::now(), Arc::clone(&t)));
     t
 }
 

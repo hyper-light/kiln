@@ -90,6 +90,12 @@ fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
 
 /// Debug logging (`RUNNER_DEBUG=1`, `runner.debug`, what `core.isDebug()` reads): a debug rerun,
 /// or `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` set.
+/// A shard's or chunk's items as `$KILN_SHARD_ITEMS` holds them, one a line (W04-R14); `None` for
+/// a leg that isn't one.
+fn shard_items(a: &AssignmentV2) -> Option<String> {
+    (!a.items.is_empty() || a.contexts.matrix.get("shard").is_some()).then(|| a.items.iter().map(|i| format!("{i}\n")).collect())
+}
+
 fn runner_debug(a: &AssignmentV2) -> bool {
     a.debug.runner_debug || a.debug.step_debug || debug_flag(a, "ACTIONS_RUNNER_DEBUG") || debug_flag(a, "ACTIONS_STEP_DEBUG")
 }
@@ -977,6 +983,9 @@ impl Leg {
         set("KILN_TOKEN", rt.github_token.clone());
         set("KILN_JOB", a.job_id.clone());
         set("KILN_RUN", a.run_id.clone());
+        if shard_items(a).is_some() {
+            set("KILN_SHARD_ITEMS", l.temp.join("_kiln").join("shard-items").to_string_lossy().into_owned());
+        }
         // The server's own certificate authority beside the machine's roots (§2.6): Node adds
         // it to its own; git, curl, Python and OpenSSL take the bundle. A job's own say wins.
         if let Some((ca, bundle)) = &st.trust {
@@ -1055,11 +1064,16 @@ impl Leg {
         let layout = Layout { tool_cache, ..self.layout() };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
+        let items = shard_items(a);
         crate::rt::blocking(move || -> std::io::Result<()> {
             let _ = std::fs::remove_dir_all(&temp);
             std::fs::create_dir_all(&ws)?;
             std::fs::create_dir_all(&cmds)?;
             std::fs::create_dir_all(temp.join("_github_workflow"))?;
+            if let Some(text) = items {
+                std::fs::create_dir_all(temp.join("_kiln"))?;
+                std::fs::write(temp.join("_kiln").join("shard-items"), text)?;
+            }
             std::fs::write(temp.join("_github_workflow").join("event.json"), event)
         })
         .await??;
@@ -4226,6 +4240,24 @@ jobs:
             _ => None,
         });
         assert_eq!(post.and_then(|i| finished(&events, i)).map(|f| f.1), Some(Conclusion::Success), "{events:?}");
+        Ok(())
+    }
+
+    /// W04-R14 on the runner: a shard's leg reads its items from `$KILN_SHARD_ITEMS`, one a line;
+    /// a leg that isn't one has no such file.
+    #[cfg(unix)]
+    #[test]
+    fn w04_r14_shard_items() -> anyhow::Result<()> {
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: echo \"items=$(tr '\\n' ' ' < \"$KILN_SHARD_ITEMS\")\"\n";
+        let tweak = |a: &mut AssignmentV2| {
+            a.items = vec!["tests/a_test.py".into(), "tests/b c_test.py".into()];
+            a.contexts.matrix = serde_json::json!({ "shard": { "index": 0, "total": 2 } });
+        };
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&0).is_some_and(|l| l.contains("items=tests/a_test.py tests/b c_test.py")), "{logs:?}");
+        let (r, logs, _) = run_leg("on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: test -z \"$KILN_SHARD_ITEMS\"\n", &[])?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         Ok(())
     }
 

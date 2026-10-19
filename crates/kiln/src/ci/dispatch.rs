@@ -349,6 +349,10 @@ struct RunSt {
     given: Given,
     /// The timing table its shards were balanced by (W16-R06), saved with its input.
     timing: Arc<HashMap<String, f64>>,
+    /// The commit's files its shards and chunks split, by pattern, saved with its input too.
+    tree: Arc<HashMap<String, Vec<String>>>,
+    /// How many combinations its plan had removed when they were last saved (W04-R29).
+    removed: usize,
     /// Each job's median seconds lately: what the scheduler expects its legs to cost (W05-R10).
     costs: Arc<HashMap<String, f64>>,
     /// An outside contributor's run waiting for a maintainer (W18-R06): the concurrency group
@@ -431,6 +435,8 @@ struct Source<'a> {
     files: &'a HashMap<String, Arc<Workflow>>,
     /// Recorded durations by test file and test (W16-R06), for shards balanced by timing.
     timing: &'a HashMap<String, f64>,
+    /// The commit's files that shards and chunks split (`files:`), by pattern.
+    tree: &'a HashMap<String, Vec<String>>,
 }
 
 impl PlanSource for Source<'_> {
@@ -442,11 +448,54 @@ impl PlanSource for Source<'_> {
     fn durations(&self, _job: &str, items: &[String]) -> Vec<Option<f64>> {
         items.iter().map(|i| self.timing.get(i).or_else(|| self.timing.get(i.trim_start_matches("./"))).copied()).collect()
     }
+
+    fn files(&self, pattern: &str) -> Vec<String> {
+        self.tree.get(pattern).cloned().unwrap_or_default()
+    }
 }
 
 /// The timing table a run's saved input kept, so a replay shards as the run did.
 fn saved_timing(v: &serde_json::Value) -> Arc<HashMap<String, f64>> {
     Arc::new(v.get("timing").and_then(serde_json::Value::as_object).map(|o| o.iter().filter_map(|(k, x)| Some((k.clone(), x.as_f64()?))).collect()).unwrap_or_default())
+}
+
+/// The commit's files a run's saved input kept for its shards (`files:`), so a replay splits them
+/// as the run did.
+fn saved_tree(v: &serde_json::Value) -> Arc<HashMap<String, Vec<String>>> {
+    Arc::new(v.get("tree").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default())
+}
+
+/// The commit's files that the shards and chunks of a workflow, and of those it calls, split
+/// (`files:`, W04-R14), by pattern: listed once when a run starts, and saved with its input.
+async fn shard_files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow, called: &HashMap<String, Arc<Workflow>>) -> HashMap<String, Vec<String>> {
+    let patterns: std::collections::BTreeSet<String> = std::iter::once(wf)
+        .chain(called.values().map(|w| &**w))
+        .flat_map(|w| &w.jobs)
+        .filter_map(|j| j.strategy.as_ref())
+        .flat_map(|s| [s.shard.as_ref(), s.chunk.as_ref()])
+        .flatten()
+        .filter_map(|v| v.get("files").and_then(kiln_ci::wf::ir::YVal::as_str))
+        .map(str::to_owned)
+        .collect();
+    if patterns.is_empty() {
+        return HashMap::new();
+    }
+    let mirror = super::events::facts(hub, repo).await.mirror;
+    let listing = match crate::gitops::run_git(hub, &["-C", &mirror, "ls-tree", "-r", "-z", "--name-only", "--full-tree", sha], crate::gitops::LS_REMOTE_TIMEOUT).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(repo = %repo.name, sha, error = %format!("{e:#}"), "the commit's files for its shards");
+            return HashMap::new();
+        }
+    };
+    let all: Vec<String> = listing.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    patterns
+        .into_iter()
+        .map(|p| {
+            let matched = kiln_ci::trigger::pattern::Patterns::new(&[p.as_str()]).map(|m| all.iter().filter(|f| m.matches(f)).cloned().collect()).unwrap_or_default();
+            (p, matched)
+        })
+        .collect()
 }
 
 struct Dispatch {
@@ -787,10 +836,11 @@ impl Dispatch {
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
         let only: serde_json::Map<String, serde_json::Value> = s.given.only_matrix.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
         let timing = super::results::timing(&self.hub, &s.repo.id).await;
-        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing });
-        self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &settings).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
-        let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&settings), &Source { files: &files, timing: &timing });
+        let tree = Arc::new(shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await);
+        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree });
+        self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &settings).await?;
+        let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&settings), &Source { files: &files, timing: &timing, tree: &tree });
         let (plan, actions) = match started {
             Ok(x) => x,
             Err(e) => {
@@ -802,7 +852,7 @@ impl Dispatch {
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, costs, awaiting: None, no_reuse: false };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false };
         self.workflow_run(&st, "requested", None);
         if approval {
             runs::set_approval(&self.hub, &id, "required", None).await?;
@@ -938,7 +988,8 @@ impl Dispatch {
         let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
         let timing = super::results::timing(&self.hub, &s.repo.id).await;
-        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings_with(&serde_json::json!({ "default_permissions": perms })), &Source { files: &files, timing: &timing }) {
+        let tree = shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await;
+        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings_with(&serde_json::json!({ "default_permissions": perms })), &Source { files: &files, timing: &timing, tree: &tree }) {
             Ok(p) => p,
             Err(e) => return serde_json::json!({ "error": e }),
         };
@@ -977,7 +1028,7 @@ impl Dispatch {
     async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "no_reuse": settings.get("no_reuse") }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -1062,6 +1113,7 @@ impl Dispatch {
                     }
                 }
                 PlanAction::Finish(c) => {
+                    self.save_removed(run).await?;
                     runs::finish_run(&self.hub, run, status_of(c), c.result(), None).await?;
                     // W19-R06: who wants to hear of it.
                     crate::rt::spawn(super::notify::run_finished(Arc::clone(&self.hub), run.to_owned()));
@@ -1079,7 +1131,20 @@ impl Dispatch {
                 }
             }
         }
-        Ok(())
+        self.save_removed(run).await
+    }
+
+    /// The combinations the run's plan removed (`exclude`, `where`), by job, with why, saved when
+    /// there are more than were (W04-R29): the run shows them, as the preview does.
+    async fn save_removed(&mut self, run: &str) -> anyhow::Result<()> {
+        let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
+        let n: usize = r.plan.removed().values().map(Vec::len).sum();
+        if n == r.removed {
+            return Ok(());
+        }
+        r.removed = n;
+        let (run, json) = (run.to_owned(), serde_json::to_string(r.plan.removed()).unwrap_or_default());
+        self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET removed = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
 
     /// A leg of a rerun that keeps the last attempt's result: its copy, and its report to the plan.
@@ -1093,7 +1158,8 @@ impl Dispatch {
         let seq = r.seq;
         let files = Arc::clone(&r.files);
         let timing = Arc::clone(&r.timing);
-        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing });
+        let tree = Arc::clone(&r.tree);
+        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
         self.actions(run, acts).await
     }
@@ -1142,10 +1208,11 @@ impl Dispatch {
         let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
         let timing = super::results::timing(&self.hub, &repo.id).await;
         // "Run anyway" (W08-R10): no leg of this attempt takes an earlier result over.
-        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "no_reuse": no_reuse });
-        self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
-        let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing }) {
+        let tree = Arc::new(shard_files(&self.hub, &repo, &event.sha, &wf, &files).await);
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse });
+        self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
+        let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing, tree: &tree }) {
             Ok(x) => x,
             Err(e) => {
                 runs::finish_run(&self.hub, run, Status::Failed, "failure", Some(format!("The run could not start: {e}"))).await?;
@@ -1157,7 +1224,7 @@ impl Dispatch {
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting: None, no_reuse };
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -1317,7 +1384,8 @@ impl Dispatch {
         let seq = r.seq;
         let files = Arc::clone(&r.files);
         let timing = Arc::clone(&r.timing);
-        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing });
+        let tree = Arc::clone(&r.tree);
+        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
         self.actions(run, acts).await
     }
@@ -1918,7 +1986,8 @@ impl Dispatch {
         let seq = run.seq;
         let files = Arc::clone(&run.files);
         let timing = Arc::clone(&run.timing);
-        let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &files, timing: &timing });
+        let tree = Arc::clone(&run.tree);
+        let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, &l.run, seq, "leg", Some(l.key.clone()), Some(report_json(&report))).await?;
         self.actions(&l.run, acts).await
     }
@@ -1935,7 +2004,8 @@ impl Dispatch {
         let seq = r.seq;
         let files = Arc::clone(&r.files);
         let timing = Arc::clone(&r.timing);
-        let acts = r.plan.on_cancel(&Source { files: &files, timing: &timing });
+        let tree = Arc::clone(&r.tree);
+        let acts = r.plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "cancel", None, Some(serde_json::json!({ "reason": reason }).to_string())).await?;
         Box::pin(self.actions(run, acts)).await
     }
@@ -1973,7 +2043,8 @@ impl Dispatch {
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
         let timing = saved_timing(&v);
-        let (mut plan, initial) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing }).map_err(|e| anyhow::anyhow!(e))?;
+        let tree = saved_tree(&v);
+        let (mut plan, initial) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files, timing: &timing, tree: &tree }).map_err(|e| anyhow::anyhow!(e))?;
         let run_owned = run.to_owned();
         let (log, last_seq): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
             let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
@@ -1990,12 +2061,12 @@ impl Dispatch {
         for (_, kind, leg, report) in log {
             match kind.as_str() {
                 "cancel" => {
-                    let _ = plan.on_cancel(&Source { files: &files, timing: &timing });
+                    let _ = plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree });
                 }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
                     let key = leg.unwrap_or_default();
-                    let _ = plan.on_leg_finished(&key, rep, &Source { files: &files, timing: &timing });
+                    let _ = plan.on_leg_finished(&key, rep, &Source { files: &files, timing: &timing, tree: &tree });
                     reported.insert(key);
                 }
             }
@@ -2047,7 +2118,7 @@ impl Dispatch {
         } else {
             (None, None)
         };
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false) };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -2108,7 +2179,8 @@ impl Dispatch {
             let seq = r.seq;
             let files = Arc::clone(&r.files);
             let timing = Arc::clone(&r.timing);
-            let acts = r.plan.on_leg_finished(&key, report.clone(), &Source { files: &files, timing: &timing });
+            let tree = Arc::clone(&r.tree);
+            let acts = r.plan.on_leg_finished(&key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
             runs::log(&self.hub, run, seq, "leg", Some(key), Some(report_json(&report))).await?;
             self.actions(run, acts).await?;
         }
