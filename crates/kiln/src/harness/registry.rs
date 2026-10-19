@@ -263,6 +263,8 @@ pub struct Registry {
     restore_auto: Mutex<Vec<String>>,
     /// Files finished messages mention, kept so they still show after they go (`super::kept`).
     pub keeper: Keeper,
+    /// Pages agents show in their conversations (`super::visuals`).
+    pub visuals: super::visuals::Visuals,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -301,7 +303,7 @@ impl Registry {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
-        let convo = crate::convo::open(&dir, conversations.keep_closed());
+        let convo = crate::convo::open(&dir, conversations.upkeep());
         // Runners that keep a store send it here; the server keeps their sessions from that. What
         // a mirror sends back to restore the store from isn't sent to it again.
         let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
@@ -329,6 +331,7 @@ impl Registry {
         }
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         let keeper = Keeper::new(&dir);
+        let visuals = super::visuals::Visuals::new(&dir);
         Self {
             mirrors: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
@@ -350,6 +353,7 @@ impl Registry {
             restore: Mutex::new(Restore::Idle),
             restore_auto: Mutex::new(restore_auto),
             keeper,
+            visuals,
         }
     }
 
@@ -898,6 +902,7 @@ impl Registry {
         }
         if gone {
             self.keeper.forget(id);
+            self.visuals.forget(id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -1347,6 +1352,7 @@ impl Registry {
                 m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
             }
             self.keeper.forget(id);
+            self.visuals.forget(id);
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }

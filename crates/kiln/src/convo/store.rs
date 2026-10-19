@@ -34,11 +34,36 @@ const SQUEEZE_BATCH: usize = 2000;
 const SQUEEZE_EVERY: Duration = Duration::from_millis(200);
 /// This often, while the writer has nothing else to do, it looks after the file: the records of
 /// sessions that ended long enough ago go, this many lines at a time (as often as compressing
-/// goes). It never makes the file compact by itself ([`Engine::compact`]): copying a store of
-/// several GB holds the writer for minutes and takes more memory than a server may have (on the
-/// first server, it was killed for it over and over).
+/// goes); then the file is made compact if enough of it is free ([`Engine::compact_some`]), a
+/// step at a time.
 const LOOK_EVERY: Duration = Duration::from_secs(3600);
 const PRUNE_BATCH: usize = 2000;
+/// Compacting is worth it once this much of the file is free, and a third of it.
+pub const COMPACT_MIN_FREE: u64 = 256 << 20;
+/// Each step of compacting copies about this much, as often as compressing goes: the memory it
+/// takes, and about how long the writer is held (a copy of the whole file in one go took more
+/// memory than the first server had, which killed it over and over, 2026-10-18).
+const COMPACT_STEP: usize = 4 << 20;
+
+/// How a store looks after its file while it has nothing else to do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Upkeep {
+    /// How long the records of sessions that ended are kept (None: for good).
+    pub keep_closed: Option<Duration>,
+    /// Make the file compact once this many bytes of it are free, and a third of it (None: never).
+    pub compact: Option<u64>,
+}
+
+/// What a step of compacting did ([`Engine::compact_some`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compacting {
+    /// Nothing more to do: not worth it, no room for the copy, or it stopped (and said why).
+    Not,
+    /// A step was taken; more follow.
+    Going,
+    /// The compact copy took the file's place: its size before and after.
+    Done { before: u64, after: u64 },
+}
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -180,11 +205,13 @@ pub trait Engine: Send + 'static {
     /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
     /// how many went (0: none are left). Their events stay.
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
-    /// Make the database's file compact when compressing and letting go left `min_free` bytes of
-    /// it free, and a third of it: the engine to go on with (this one, or one on the compact
-    /// file), and the file's size before and after when it was made compact. An error: the
-    /// engine is gone (the compact file couldn't be opened; the next start finishes it).
-    fn compact(self: Box<Self>, min_free: u64) -> anyhow::Result<(Box<dyn Engine>, Option<(u64, u64)>)>;
+    /// A step of making the database's file compact, once compressing and letting go left
+    /// `min_free` bytes of it free, and a third of it: a copy, `step_bytes` at a time, under the
+    /// same numbers, then what was written meanwhile, then the copy takes the file's place. The
+    /// engine to go on with (this one, or one on the compact file once it took its place). An
+    /// error: the engine is gone (the compact file couldn't be opened; the next start finishes
+    /// putting it in place).
+    fn compact_some(self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)>;
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -212,14 +239,13 @@ pub struct Store {
 }
 
 impl Store {
-    /// The store, its writer thread started on `engine`. `keep_closed`: how long the records of
-    /// sessions that ended are kept (None: for good).
-    pub fn start(engine: Box<dyn Engine>, keep_closed: Option<Duration>) -> anyhow::Result<Self> {
+    /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says.
+    pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let w = watchers.clone();
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, keep_closed))?;
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep))?;
         Ok(Self { tx, id, dropped: Arc::default(), watchers })
     }
 
@@ -399,14 +425,17 @@ impl SendWait for mpsc::SyncSender<Msg> {
 
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, keep_closed: Option<Duration>) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep) {
+    let keep_closed = upkeep.keep_closed;
     let mut pending: Vec<Row> = Vec::new();
     let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
     // Looking after the file while nothing else waits, once compressing is done and then every
-    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go.
+    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go, then the
+    // file is made compact if enough of it is free, a step at a time.
     let (mut looking, mut pruned, mut look_at) = (false, 0usize, Instant::now());
+    let mut compacting = false;
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
             return;
@@ -418,7 +447,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
     };
     loop {
-        let idle = if squeezing || looking { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY) };
+        let idle = if squeezing || looking || compacting { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY) };
         let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
         match rx.recv_timeout(wait) {
             Ok(Msg::Rows(rows)) => {
@@ -447,6 +476,21 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             squeezing = false;
                         }
                     }
+                } else if compacting && !had {
+                    engine = match engine.compact_some(upkeep.compact.unwrap_or(COMPACT_MIN_FREE), COMPACT_STEP) {
+                        Ok((e, Compacting::Going)) => e,
+                        Ok((e, done)) => {
+                            if let Compacting::Done { before, after } = done {
+                                tracing::info!(before, after, "conversation store: its file was made compact");
+                            }
+                            (compacting, look_at) = (false, Instant::now() + LOOK_EVERY);
+                            e
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"), "conversation store: the compact copy couldn't be opened; the store stops until kiln starts again, which puts it in place");
+                            return;
+                        }
+                    };
                 } else if !had && (looking || Instant::now() >= look_at) {
                     let gone = match keep_closed {
                         Some(keep) => engine.prune_some(crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX)), PRUNE_BATCH),
@@ -457,7 +501,13 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             if pruned > 0 {
                                 tracing::info!(lines = pruned, days = keep_closed.map_or(0, |k| k.as_secs() / 86_400), "conversation store: the records of sessions that ended long ago were let go");
                             }
-                            (looking, pruned, look_at) = (false, 0, Instant::now() + LOOK_EVERY);
+                            (looking, pruned) = (false, 0);
+                            // Then the file is made compact, if that is worth it.
+                            if upkeep.compact.is_some() {
+                                compacting = true;
+                            } else {
+                                look_at = Instant::now() + LOOK_EVERY;
+                            }
                         }
                         Ok(n) => (looking, pruned) = (true, pruned.saturating_add(n)),
                         Err(e) => {
@@ -494,7 +544,7 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
 #[cfg(test)]
 pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
     let dir = tempfile::tempdir()?;
-    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), None)?;
+    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), Upkeep::default())?;
     Ok((dir, store))
 }
 
@@ -517,7 +567,7 @@ mod tests {
     #[test]
     fn the_writer_lets_go_of_the_records_of_sessions_that_ended_long_ago_while_idle() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Some(Duration::from_secs(60)))?;
+        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
         let now = crate::util::now_ms();
         let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
         let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into(), kept: None }));
@@ -530,6 +580,53 @@ mod tests {
             std::thread::sleep(SQUEEZE_EVERY * 3);
         }
         assert_eq!(store.marks("new")?.len(), 1, "a session that ended just now keeps its record");
+        Ok(())
+    }
+
+    #[test]
+    fn the_writer_makes_the_file_compact_by_itself_once_enough_of_it_is_free_and_goes_on() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(super::super::FILE);
+        let store = Store::start(Box::new(super::super::turso::Turso::open(&path)?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: Some(1) })?;
+        let now = crate::util::now_ms();
+        // Lines that hardly compress: a file of a few MB.
+        let noise = |n: u64| -> String {
+            let mut x = n.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (0..2_000)
+                .map(|_| {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    char::from(b'a' + u8::try_from((x >> 33) % 26).unwrap_or(0))
+                })
+                .collect()
+        };
+        let line = |s: &str, n: u64, text: String| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: text, kept: None }));
+        let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+        // An agent that ended an hour ago, with a long record: let go, which leaves most of the
+        // file free; then the file is made compact.
+        store.put(vec![session("old")]);
+        for chunk in (0..3_000u64).collect::<Vec<_>>().chunks(500) {
+            assert!(store.put_wait(chunk.iter().map(|n| line("old", *n, noise(*n))).collect()));
+        }
+        store.put(vec![Row::Closed { session: "old".into(), at: now - 3_600_000 }, session("live"), line("live", 0, "{\"kept\":true}".into())]);
+        store.sync()?;
+        let size = || std::fs::metadata(&path).map_or(0, |m| m.len());
+        let (mut most, until) = (size(), Instant::now() + Duration::from_secs(60));
+        loop {
+            let now = size();
+            most = most.max(now);
+            if most > 2 << 20 && now * 4 < most {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < until, "the file wasn't made compact: {most} bytes at most, {now} now");
+            std::thread::sleep(SQUEEZE_EVERY * 3);
+        }
+        assert!(!dir.path().join(format!("{}.compact.tmp", super::super::FILE)).exists());
+        // The store goes on in the compact file, holding what it held.
+        assert_eq!(store.record("live", "cc", 0, 10)?, vec![(0, "{\"kept\":true}".to_owned())]);
+        store.put(vec![line("live", 1, "{\"after\":true}".into())]);
+        store.sync()?;
+        assert_eq!(store.record("live", "cc", 0, 10)?.len(), 2);
+        assert!(store.marks("old")?.is_empty());
         Ok(())
     }
 

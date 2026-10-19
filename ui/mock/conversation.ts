@@ -21,6 +21,7 @@
  *                       working on its own: a note and a command each)
  */
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { crc32, deflateSync, gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
@@ -265,6 +266,106 @@ export function handleLongFiles(path: string, url: URL, req: IncomingMessage, re
     ...(range ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
   });
   res.end(body.subarray(start, end + 1));
+  return true;
+}
+
+// A page the agent showed (`show_page`): live in the conversation, sized before it loads.
+export const PAGE_ID = "3f1c0de5a2b94e7a8c6d0b1e2f3a4b5c";
+/** Its height at each width, as kiln's browser on the agent's machine measured it. */
+const PAGE_HEIGHT = Number(process.env.MOCK_PAGE_HEIGHT ?? 310);
+const PAGE_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Retry latency</title>
+<style>
+  body { font: 13px/1.5 var(--font-sans); padding: 12px 14px 14px; }
+  h1 { font: 500 10px/18px var(--font-mono); letter-spacing: .09em; text-transform: uppercase; color: var(--muted-foreground); margin: 0 0 8px; }
+  canvas { display: block; width: 100%; height: 220px; }
+  .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; height: 28px; }
+  button { font: 12px/26px var(--font-mono); color: var(--foreground); background: var(--card); border: 1px solid var(--border); border-radius: 6px; height: 28px; padding: 0 10px; }
+  a { color: var(--accent); font: 12px/28px var(--font-mono); }
+  #more div { padding: 6px 0; border-top: 1px solid var(--border); }
+</style></head>
+<body>
+<h1>p50 / p95 by attempt</h1>
+<canvas id="c"></canvas>
+<div class="row"><button id="pick">Use attempt 3</button><button id="count">Clicked 0</button><button id="add">More</button><a id="docs" href="https://example.com/docs">Docs</a></div>
+<div id="more"></div>
+<script>
+  const c = document.getElementById("c"), g = c.getContext("2d");
+  window.__frames = 0;
+  const p50 = [42, 61, 88, 130, 190], p95 = [90, 140, 210, 330, 480];
+  const draw = (t) => {
+    window.__frames++;
+    const w = (c.width = c.clientWidth * devicePixelRatio), h = (c.height = c.clientHeight * devicePixelRatio);
+    const css = getComputedStyle(document.documentElement);
+    const bar = w / (p50.length * 3), grow = Math.min(1, t / 900);
+    p50.forEach((v, i) => {
+      const x = bar * (1 + i * 3);
+      g.fillStyle = css.getPropertyValue("--chart-2");
+      g.fillRect(x, h - (v / 500) * h * grow, bar, (v / 500) * h * grow);
+      g.fillStyle = css.getPropertyValue("--chart-4");
+      g.fillRect(x + bar, h - (p95[i] / 500) * h * grow, bar * 0.9, (p95[i] / 500) * h * grow);
+    });
+    requestAnimationFrame(draw);
+  };
+  requestAnimationFrame(draw);
+  let n = 0;
+  const count = document.getElementById("count");
+  count.onclick = () => { n++; count.textContent = "Clicked " + n; kiln.save({ n }); };
+  kiln.onrestore = (s) => { n = (s && s.n) || 0; count.textContent = "Clicked " + n; };
+  document.getElementById("pick").onclick = () => kiln.reply({ attempt: 3 }, "Use attempt 3");
+  document.getElementById("add").onclick = () => {
+    const d = document.createElement("div");
+    d.textContent = "Attempt " + (document.querySelectorAll("#more div").length + 6) + ": 690 ms";
+    document.getElementById("more").append(d);
+  };
+</script></body></html>`;
+add({ id: "L-u-page", at: LIVE_AT - 45_000, kind: "user", text: "Chart the retry latencies by attempt." });
+add({
+  id: "L-page",
+  at: LIVE_AT - 40_000,
+  kind: "tool",
+  tool_id: "tpage",
+  name: "mcp__kiln__show_page",
+  tool: "mcp",
+  title: "Retry latency by attempt",
+  input: { title: "Retry latency by attempt", html: PAGE_HTML },
+  status: "done",
+  output: JSON.stringify({
+    kiln_page: { id: PAGE_ID, title: "Retry latency by attempt", path: `/v/${PAGE_ID}/`, files: 0, heights: [320, 360, 390, 430, 520, 640, 728, 860, 1000, 1144].map((w) => [w, PAGE_HEIGHT]) },
+    seen: { width: 390, height: 844, content_height: PAGE_HEIGHT, said: [], layout_shift: 0, long_tasks: 0, longest_task_ms: 0, fps: 60 },
+  }),
+  started: LIVE_AT - 40_000,
+  ended: LIVE_AT - 38_000,
+});
+add({ id: "L-a-page", at: LIVE_AT - 37_000, kind: "assistant", text: "Attempt 3 is where p95 crosses 200 ms; the chart is above." });
+
+/** kiln's bridge and theme, as the server puts them first in a page (crates/kiln/src/harness). */
+const BRIDGE = readFileSync(new URL("../../crates/kiln/src/harness/bridge.js", import.meta.url), "utf8");
+const PAGE_HEAD = `<meta name="color-scheme" content="dark light"><style data-kiln>:root{--background:transparent;--foreground:#e9ebee;--muted-foreground:#8f929b;--card:#0c0d10;--border:#2b2d32;--accent:#bab0e3;--chart-2:#a6c4ed;--chart-4:#d6a2aa;--font-sans:"Geist Variable",ui-sans-serif,system-ui,sans-serif;--font-mono:"Geist Mono Variable",ui-monospace,monospace;color-scheme:dark}html,body{margin:0;background:var(--background);color:var(--foreground);font-family:var(--font-sans)}html{scrollbar-width:none}</style><script data-kiln>${BRIDGE}</script>`;
+
+/** Pages, as the server serves them: sandboxed, framed only by kiln, never cached by anyone else. */
+export function handleShownPages(path: string, res: ServerResponse): boolean {
+  const m = /^\/v\/([0-9a-f]{32})(\/?)$/.exec(path);
+  if (!m) return false;
+  if (m[1] !== PAGE_ID) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("no such page");
+    return true;
+  }
+  if (!m[2]) {
+    res.writeHead(308, { Location: `/v/${PAGE_ID}/` });
+    res.end();
+    return true;
+  }
+  const html = PAGE_HTML.replace("<head>", `<head>${PAGE_HEAD}`);
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Security-Policy":
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock; default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' 'unsafe-inline' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' data: blob:; worker-src 'self' data: blob:; frame-src 'self' data: blob:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "private, max-age=31536000, immutable",
+  });
+  res.end(html);
   return true;
 }
 

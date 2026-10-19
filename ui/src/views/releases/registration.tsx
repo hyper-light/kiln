@@ -1,8 +1,8 @@
 /**
  * An app in one environment, as its provider sees it (docs/deploy-api.md §8.1): its objects with
  * their sync and health, the manifests it renders, what a sync would change, and its workloads'
- * logs, from KilnCD or Argo CD alike. On Argo CD another version is previewed: what it would
- * render, and what deploying it would change.
+ * logs, from KilnCD or Argo CD alike; and another version previewed: what it would render, and
+ * what deploying it would change.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
@@ -142,8 +142,6 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
   const [version, setVersion] = React.useState("");
   const [preview, setPreview] = React.useState("");
   const argo = d.provider.kind === "argocd";
-  // Another version previews on Argo CD only (KilnCD shows what runs, and what git would change).
-  const shown = argo ? preview : "";
   return (
     <>
       <header className="cd-head">
@@ -176,7 +174,7 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
           { value: "logs", label: "Logs" },
         ]}
       />
-      {argo && (tab === "manifests" || tab === "diff") && (
+      {d.running && (tab === "manifests" || tab === "diff") && (
         <div className="rel-register">
           <TextField label="Another version" placeholder="6.11.0" value={version} spellCheck={false} onChange={(e) => setVersion(e.target.value)} />
           <Button size="sm" variant="secondary" disabled={!version.trim()} onClick={() => setPreview(version.trim())}>
@@ -199,8 +197,8 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
       <div className="rel-reads">
         <Loadable label={tab === "resources" ? "its objects" : tab}>
           {tab === "resources" && <Objects app={app} env={env} />}
-          {tab === "manifests" && <Manifests app={app} env={env} version={shown} />}
-          {tab === "diff" && <Diffs app={app} env={env} version={shown} />}
+          {tab === "manifests" && <Manifests app={app} env={env} version={preview} />}
+          {tab === "diff" && <Diffs app={app} env={env} version={preview} />}
           {tab === "logs" && <Logs app={app} env={env} />}
         </Loadable>
       </div>

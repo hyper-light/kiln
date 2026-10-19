@@ -1,7 +1,8 @@
 //! What runs for a registration, as its provider sees it (docs/deploy-api.md §8.1): its resources,
 //! the manifests it renders, what a sync would change, and its logs (txst's resources, render,
-//! diff and logs), from KilnCD or Argo CD alike, in KilnCD's shapes. On Argo CD a `version`
-//! previews another one: the manifests it renders, and what deploying it would change.
+//! diff and logs), from KilnCD or Argo CD alike, in KilnCD's shapes. A `version` previews another
+//! one: the manifests it renders, and what deploying it would change against what the deployed
+//! one renders (Argo CD renders it; KilnCD renders what runs at that version).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,7 +34,17 @@ pub async fn read(d: &Deploy, app: &App, env: &Environment, what: Read) -> Resul
             let argo = argocd::Argo::of(&d.hub, integration).await.map_err(unavailable)?;
             argo_read(&argo, &argocd::application_name(app, &env.name), what).await
         }
-        None => kilncd_read(d, &kilncd::app_id(app, &env.name), what).await,
+        None => match what {
+            Read::Manifests { version: Some(v) } => {
+                let (_, then) = super::flow::kilncd_preview(d, app, env, &v).await?;
+                Ok(json!({ "version": v, "manifests": then.into_iter().filter(synced).map(|o| json!({ "key": key_of_object(&o), "yaml": yaml(&masked(o)) })).collect::<Vec<_>>() }))
+            }
+            Read::Diff { version: Some(v) } => {
+                let (now, then) = super::flow::kilncd_preview(d, app, env, &v).await?;
+                Ok(json!({ "version": v, "diffs": compare(now, then) }))
+            }
+            what => kilncd_read(d, &kilncd::app_id(app, &env.name), what).await,
+        },
     }
 }
 
@@ -45,7 +56,7 @@ async fn kilncd_read(d: &Deploy, id: &str, what: Read) -> Result<Value, Fail> {
         Read::Manifests { version: None } => ("cd.apps.manifests", json!({ "app": id })),
         Read::Diff { version: None } => ("cd.apps.diff", json!({ "app": id })),
         Read::Manifests { version: Some(_) } | Read::Diff { version: Some(_) } => {
-            return Err((StatusCode::NOT_IMPLEMENTED, "previewing another version on KilnCD isn't built yet: it shows what runs, and what git would change".into()));
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "a version is previewed by read(), not here".into()));
         }
         Read::Logs { group, kind, name, namespace, container, tail } => {
             let group = group.unwrap_or_else(|| group_of(&kind).to_owned());
@@ -98,24 +109,9 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
             Ok(json!({ "diffs": changes }))
         }
         Read::Diff { version: Some(v) } => {
-            // What `v` renders, against what the deployed version renders: the chart's own change,
-            // without the fields a cluster fills in.
-            let keyed = |objects: Vec<Value>| -> BTreeMap<String, (Value, Value)> { objects.into_iter().map(|o| (key_text(&key_of_object(&o)), (key_of_object(&o), strip(&masked(o))))).collect() };
-            let now = keyed(argo.manifests(name, None).await.map_err(unavailable)?);
-            let then = keyed(argo.manifests(name, Some(&v)).await.map_err(unavailable)?);
-            let mut changes = Vec::new();
-            for (kt, (key, after)) in &then {
-                match now.get(kt) {
-                    Some((_, before)) if before == after => {}
-                    before => changes.push(change(key.clone(), before.map(|(_, b)| b), Some(after))),
-                }
-            }
-            for (kt, (key, before)) in &now {
-                if !then.contains_key(kt) {
-                    changes.push(change(key.clone(), Some(before), None));
-                }
-            }
-            Ok(json!({ "version": v, "diffs": changes }))
+            let now = argo.manifests(name, None).await.map_err(unavailable)?;
+            let then = argo.manifests(name, Some(&v)).await.map_err(unavailable)?;
+            Ok(json!({ "version": v, "diffs": compare(now, then) }))
         }
         Read::Logs { group, kind, name: object, namespace, container, tail } => {
             let group = group.unwrap_or_else(|| group_of(&kind).to_owned());
@@ -123,6 +119,32 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
             Ok(json!({ "lines": lines }))
         }
     }
+}
+
+/// What another version renders (`then`) against what the deployed one renders (`now`), object by
+/// object: the chart's own change, Secrets masked, without the fields a cluster fills in.
+fn compare(now: Vec<Value>, then: Vec<Value>) -> Vec<Value> {
+    let keyed = |objects: Vec<Value>| -> BTreeMap<String, (Value, Value)> { objects.into_iter().filter(synced).map(|o| (key_text(&key_of_object(&o)), (key_of_object(&o), strip(&masked(o))))).collect() };
+    let (now, then) = (keyed(now), keyed(then));
+    let mut changes = Vec::new();
+    for (kt, (key, after)) in &then {
+        match now.get(kt) {
+            Some((_, before)) if before == after => {}
+            before => changes.push(change(key.clone(), before.map(|(_, b)| b), Some(after))),
+        }
+    }
+    for (kt, (key, before)) in &now {
+        if !then.contains_key(kt) {
+            changes.push(change(key.clone(), Some(before), None));
+        }
+    }
+    changes
+}
+
+/// Whether a sync applies `o`: Helm's test hooks are rendered (each time with new random names),
+/// and never synced.
+fn synced(o: &Value) -> bool {
+    !o.pointer("/metadata/annotations/helm.sh~1hook").and_then(Value::as_str).is_some_and(|h| h.contains("test"))
 }
 
 /// The API group of a kind whose pods have logs, when none is given.
@@ -202,5 +224,25 @@ mod tests {
         let rendered = json!({ "kind": "ConfigMap", "metadata": { "name": "a", "annotations": {} }, "data": { "x": "1" } });
         assert_eq!(strip(&live), strip(&rendered));
         assert_eq!(key_text(&key_of_object(&json!({ "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web", "namespace": "shop" } }))), "apps/Deployment/shop/web");
+    }
+
+    #[test]
+    fn another_version_is_what_it_renders_against_what_runs_renders() {
+        let deploy = |tag: &str| json!({ "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web", "namespace": "shop" }, "spec": { "image": format!("web:{tag}") } });
+        let test_pod = |name: &str| json!({ "apiVersion": "v1", "kind": "Pod", "metadata": { "name": name, "namespace": "shop", "annotations": { "helm.sh/hook": "test-success" } } });
+        let config = json!({ "apiVersion": "v1", "kind": "ConfigMap", "metadata": { "name": "same", "namespace": "shop" }, "data": { "a": "1" } });
+        let gone = json!({ "apiVersion": "v1", "kind": "Service", "metadata": { "name": "old", "namespace": "shop" } });
+        let secret = json!({ "apiVersion": "v1", "kind": "Secret", "metadata": { "name": "db", "namespace": "shop" }, "data": { "password": "c2VjcmV0" } });
+        let now = vec![deploy("1.0"), test_pod("web-test-a1b2c"), config.clone(), gone];
+        let then = vec![deploy("1.1"), test_pod("web-test-z9y8x"), config, secret];
+        let changes = compare(now, then);
+        let names: Vec<&str> = changes.iter().filter_map(|c| c.pointer("/key/name").and_then(Value::as_str)).collect();
+        assert_eq!(names, ["db", "web", "old"], "the new Secret, the changed Deployment, the Service gone; no test hook, nothing unchanged");
+        let web = changes.iter().find(|c| c.pointer("/key/name").and_then(Value::as_str) == Some("web"));
+        let lines: Vec<&str> = web.and_then(|c| c.pointer("/hunks/0/lines")).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        assert!(lines.contains(&"-  image: web:1.0") && lines.contains(&"+  image: web:1.1"), "{lines:?}");
+        let db = changes.iter().find(|c| c.pointer("/key/name").and_then(Value::as_str) == Some("db"));
+        let shown = db.and_then(|c| c.get("predicted")).and_then(Value::as_str).unwrap_or_default();
+        assert!(shown.contains("++++++++") && !shown.contains("c2VjcmV0"), "a Secret's values never show: {shown}");
     }
 }

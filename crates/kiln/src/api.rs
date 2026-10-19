@@ -173,6 +173,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let seg = segments(&path);
     let s: Vec<&str> = seg.iter().map(String::as_str).collect();
 
+    // Pages' own address (`[server] pages_url`): pages agents show, and nothing of kiln's.
+    if pages_site(&hub).is_some_and(|site| asks_for(&req, &site)) {
+        return match (&method, s.as_slice()) {
+            (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => Ok(page_font(name)),
+            (&Method::GET | &Method::HEAD, ["v", id, ..]) => page(&hub, id, &req).await,
+            _ => Err(err(StatusCode::NOT_FOUND, "not found")),
+        };
+    }
     // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
     // of its own (an upload streams for as long as it takes).
     if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
@@ -292,6 +300,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["ca.pem"]) => return Ok(crate::frontdoor::control::ca(&hub, "pem")),
         (&Method::GET, ["ca.crt"]) => return Ok(crate::frontdoor::control::ca(&hub, "crt")),
         (&Method::GET, ["ca.mobileconfig"]) => return Ok(crate::frontdoor::control::ca(&hub, "mobileconfig")),
+        // Pages agents show in their conversations (`crate::harness::visuals`): open, each at an
+        // address nobody can guess, sandboxed so their scripts run away from kiln and the viewer.
+        // With an address of their own, pages are served only there.
+        (&Method::GET | &Method::HEAD, ["v", ..]) if hub.cfg.server.pages_url.is_some() => return Ok(to_pages(&hub, &req)),
+        (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => return Ok(page_font(name)),
+        (&Method::GET | &Method::HEAD, ["v", id, ..]) => return page(&hub, id, &req).await,
         _ => {}
     }
     // CI's open routes: runtime services, job ID tokens, the OIDC issuer (docs/ci.md §2.6).
@@ -718,6 +732,145 @@ fn file_response(meta: &crate::harness::files::Meta, path: &str, etag: &str, imm
     if mime.starts_with("image/svg") || mime.starts_with("text/html") || mime.starts_with("text/xml") {
         h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox"));
     }
+    r
+}
+
+/// What a page agents show may do in the viewer's browser: run its scripts and forms in a sandbox
+/// of its own (an opaque origin: no kiln cookies or storage, nothing of the page it's framed in),
+/// and load only its own files (its copies, kiln's fonts, what it makes itself). Who may frame it
+/// follows (`frame-ancestors`): kiln.
+const PAGE_POLICY: &str = "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock; \
+default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' 'unsafe-inline' data:; \
+img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' data: blob:; \
+worker-src 'self' data: blob:; frame-src 'self' data: blob:; form-action 'none'; base-uri 'none'";
+
+/// The origin of a URL (`https://host[:port]`), when it has one.
+fn origin_of(url: &str) -> Option<String> {
+    let uri: http::Uri = url.trim().parse().ok()?;
+    let scheme = uri.scheme_str().filter(|s| matches!(*s, "http" | "https"))?;
+    Some(format!("{scheme}://{}", uri.authority()?.as_str().to_ascii_lowercase()))
+}
+
+/// Pages' own site (`[server] pages_url`): its host, and its port when it says one.
+fn pages_site(hub: &Hub) -> Option<(String, Option<u16>)> {
+    let uri: http::Uri = hub.cfg.server.pages_url.as_deref()?.trim().parse().ok()?;
+    Some((uri.host()?.to_ascii_lowercase(), uri.port_u16()))
+}
+
+/// Whether `req` was sent to `site`.
+fn asks_for(req: &Request, (host, port): &(String, Option<u16>)) -> bool {
+    let asked = req.uri().authority().map(|a| a.as_str().to_owned()).or_else(|| srv::header_str(req, &header::HOST).map(str::to_owned));
+    let Some(asked) = asked.and_then(|a| format!("http://{a}/").parse::<http::Uri>().ok()) else { return false };
+    asked.host().is_some_and(|h| h.eq_ignore_ascii_case(host)) && (port.is_none() || asked.port_u16() == *port)
+}
+
+/// `GET /v/...` on kiln's own address when pages have one of their own: there.
+fn to_pages(hub: &Hub, req: &Request) -> Response {
+    let base = hub.cfg.server.pages_url.as_deref().unwrap_or("").trim_end_matches('/');
+    let to = format!("{base}{}", req.uri().path_and_query().map_or("/", http::uri::PathAndQuery::as_str));
+    let mut r = srv::status(StatusCode::TEMPORARY_REDIRECT);
+    if let Ok(v) = header::HeaderValue::from_str(&to) {
+        r.headers_mut().insert(header::LOCATION, v);
+    }
+    r.headers_mut().insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    r
+}
+
+/// Who may frame a page: kiln. On kiln's own address, itself; on pages' own, kiln's addresses
+/// (its public one, its runners' front doors).
+fn page_ancestors(hub: &Hub) -> String {
+    if hub.cfg.server.pages_url.is_none() {
+        return "frame-ancestors 'self'".to_owned();
+    }
+    let mut origins: Vec<String> = std::iter::once(hub.cfg.server.public_url.clone()).chain(hub.front_doors.origins()).filter_map(|u| origin_of(&u)).collect();
+    origins.sort();
+    origins.dedup();
+    format!("frame-ancestors {}", if origins.is_empty() { "'none'".to_owned() } else { origins.join(" ") })
+}
+
+/// Headers every answer of a page's carries: its sandbox, no referrer (its address is its key), and
+/// to any origin (the page's own is opaque), for fonts and modules.
+fn page_headers(hub: &Hub, h: &mut header::HeaderMap) {
+    let policy = format!("{PAGE_POLICY}; {}", page_ancestors(hub));
+    if let Ok(v) = header::HeaderValue::from_str(&policy) {
+        h.insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    h.insert(header::HeaderName::from_static("x-robots-tag"), header::HeaderValue::from_static("noindex, nofollow"));
+}
+
+/// `GET /v/:id/...`: a page an agent showed, and the files it uses, each at the path it had on its
+/// machine (`crate::harness::visuals`); `/v/:id/` itself leads to the page. In ranges, for media.
+async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let missing = || err(StatusCode::NOT_FOUND, "no such page or file (its conversation may have closed)");
+    let h = hub.clone();
+    let id_owned = id.to_owned();
+    let v = crate::rt::blocking(move || h.harness.visuals.get(&id_owned)).await.ok().flatten().ok_or_else(missing)?;
+    let raw = req.uri().path();
+    let rest = raw.strip_prefix(&format!("/v/{id}")).unwrap_or("");
+    if rest.is_empty() || rest == "/" {
+        let mut r = srv::status(StatusCode::FOUND);
+        if let Ok(to) = header::HeaderValue::from_str(&format!("/v/{}{}", v.id, crate::harness::visuals::url_path(&v.entry))) {
+            r.headers_mut().insert(header::LOCATION, to);
+        }
+        page_headers(hub, r.headers_mut());
+        return Ok(r);
+    }
+    let at = srv::decode(rest);
+    let used = v.files.iter().find(|f| f.path == at).cloned().ok_or_else(missing)?;
+    let blob = hub.harness.visuals.blob(&used.sha);
+    let b = blob.clone();
+    let size = crate::rt::blocking(move || std::fs::metadata(b).map(|m| m.len())).await.ok().and_then(Result::ok).ok_or_else(missing)?;
+    let meta = crate::harness::files::Meta { size, mtime: 0, mime: used.mime.clone(), width: None, height: None };
+    let etag = format!("\"{}\"", used.sha);
+    if let Some(mut r) = unchanged(req, &etag, true) {
+        page_headers(hub, r.headers_mut());
+        return Ok(r);
+    }
+    let Ok(range) = byte_range(req, size) else { return Ok(unsatisfiable(size)) };
+    let (start, end) = range.unwrap_or((0, size.saturating_sub(1)));
+    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    crate::rt::spawn(async move {
+        let Ok(Ok(mut file)) = crate::rt::blocking(move || std::fs::File::open(&blob)).await else { return };
+        let mut at = start;
+        while size > 0 && at <= end {
+            let want = (end - at + 1).min(256 * 1024);
+            let read = crate::rt::blocking(move || -> std::io::Result<(std::fs::File, Vec<u8>)> {
+                file.seek(SeekFrom::Start(at))?;
+                let mut buf = Vec::new();
+                (&mut file).take(want).read_to_end(&mut buf)?;
+                Ok((file, buf))
+            })
+            .await;
+            let Ok(Ok((f, buf))) = read else { return };
+            if buf.is_empty() {
+                return;
+            }
+            file = f;
+            at += buf.len() as u64;
+            if tx.send(Bytes::from(buf)).await.is_err() {
+                return;
+            }
+        }
+    });
+    let name = used.path.rsplit('/').next().unwrap_or("file").to_owned();
+    let mut r = file_response(&meta, &name, &etag, true, range, srv::channel_body(rx));
+    // The page's own policy, for it and for every file of it (a script or a style is the page's).
+    page_headers(hub, r.headers_mut());
+    Ok(r)
+}
+
+/// `GET /v/_/fonts/:name`: the fonts kiln's console reads in, for pages to read in too.
+fn page_font(name: &str) -> Response {
+    let Some(data) = crate::ui::font(name) else { return srv::status(StatusCode::NOT_FOUND) };
+    let mut r = srv::response(StatusCode::OK, "font/woff2", srv::full(data));
+    let h = r.headers_mut();
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("public, max-age=86400"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
     r
 }
 
@@ -1507,6 +1660,8 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
             "public_url": hub.cfg.server.public_url,
+            // Where pages agents show are served, when not here (docs/previews.md).
+            "pages_url": hub.cfg.server.pages_url,
             // Where else browsers find this server: its runners' front doors (HTTPS).
             "origins": hub.front_doors.origins(),
             "version": env!("CARGO_PKG_VERSION"),

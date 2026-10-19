@@ -7,7 +7,7 @@ import * as React from "react";
 import { Link } from "@/lib/router";
 import { Check, Plus, X } from "lucide-react";
 
-import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseEnvHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release } from "@/api/deploy";
+import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseEnvHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release, type Template } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel } from "@/components/ui/misc";
@@ -17,6 +17,7 @@ import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
+import { NewEnvironment } from "./new-environment";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
@@ -25,6 +26,7 @@ export const DEPLOY_EVENTS = ["deploy", "deploy_registration"] as const;
 
 export const boardRes: Res<Board> = { key: "deploy/board", fetch: (s) => deployApi.board(s), opts: { on: DEPLOY_EVENTS, pollMs: 30_000 } };
 export const environmentsRes: Res<Environment[]> = { key: "deploy/environments", fetch: (s) => deployApi.environments(s), opts: { on: DEPLOY_EVENTS } };
+export const templatesRes: Res<Template[]> = { key: "deploy/templates", fetch: (s) => deployApi.templates(s), opts: { on: DEPLOY_EVENTS } };
 
 /** A release's state, as a dot and its words. */
 export function ReleaseState({ r }: { r: Release }) {
@@ -195,11 +197,14 @@ export default function Releases() {
         <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases" }]} />
         <div className="rel-head-row">
           <h1 className="cd-title">Releases</h1>
-          <Button asChild size="sm">
-            <Link to={newAppHref}>
-              <Plus /> New app
-            </Link>
-          </Button>
+          <div className="rel-head-actions">
+            <NewEnvironment />
+            <Button asChild size="sm">
+              <Link to={newAppHref}>
+                <Plus /> New app
+              </Link>
+            </Button>
+          </div>
         </div>
         <p className="cd-note">
           Every app across its environments: what runs in each, what is on its way, and what waits for you. A release is a commit to an environment's release repository, made to run by its

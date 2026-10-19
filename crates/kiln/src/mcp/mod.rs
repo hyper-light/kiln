@@ -178,7 +178,8 @@ const RUNNER_ANSWER_MAX: usize = 4 << 20;
 
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
 /// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
-/// operations, or `{"op": "call", "session", "name", "input"}` to run one. The session must be one
+/// operations, `{"op": "call", "session", "name", "input"}` to run one, or `{"op": "page",
+/// "session", "do", ...}` for a page it shows (`crate::harness::visuals::ask`). The session must be one
 /// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner
 /// on a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The
 /// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`.
@@ -213,6 +214,11 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
             }
         }
+        // A page it shows in its conversation (`crate::harness::visuals`): its own session's.
+        Some("page") => match crate::harness::visuals::ask(hub, session, ask).await {
+            Ok(v) => json!({"ok": v}),
+            Err(e) => json!({"error": format!("{e:#}")}),
+        },
         _ => json!({"error": "an unknown question"}),
     };
     let size = answer.to_string().len();

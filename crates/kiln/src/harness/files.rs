@@ -56,6 +56,18 @@ impl Answer {
 
 /// Read up to `len` bytes of `path` from `offset` (at most [`PIECE`]), with what the file is.
 /// `path` is absolute, or starts at the home folder (`~/`).
+/// All of a file, up to `most` bytes, as [`read`] allows it (never a secret, only types a person
+/// or a page can use): for the pages agents look at on their own machine (`crate::browser`).
+pub fn read_whole(path: &str, most: u64) -> Result<(Meta, Vec<u8>), String> {
+    let (meta, _) = read(path, 0, 0)?;
+    if meta.size > most {
+        return Err(format!("{path} is {} MB; a page's file may be up to {} MB", meta.size >> 20, most >> 20));
+    }
+    let p = expand(path).ok_or_else(|| format!("{path} isn't a full path"))?;
+    let data = std::fs::read(&p).map_err(|e| why(path, &e))?;
+    Ok((meta, data))
+}
+
 pub fn read(path: &str, offset: u64, len: u32) -> Result<(Meta, Vec<u8>), String> {
     let p = expand(path).ok_or_else(|| format!("{path} isn't a full path"))?;
     if secret(&p) {
@@ -165,7 +177,13 @@ pub fn secret(path: &Path) -> bool {
 /// Whether a person can look at a file of this type in the conversation.
 pub fn viewable(mime: &str) -> bool {
     let m = mime.split(';').next().unwrap_or(mime).trim();
-    m.starts_with("image/") || m.starts_with("video/") || m.starts_with("audio/") || m.starts_with("text/") || m == "application/pdf" || m == "application/json"
+    m.starts_with("image/")
+        || m.starts_with("video/")
+        || m.starts_with("audio/")
+        || m.starts_with("text/")
+        || m.starts_with("font/")
+        || m.starts_with("model/")
+        || matches!(m, "application/pdf" | "application/json" | "application/wasm")
 }
 
 /// Text files by their name: what they are, whatever a general table guesses (".ts" is not a
@@ -233,6 +251,19 @@ pub fn sniff(head: &[u8], path: &Path) -> String {
         "image/x-icon"
     } else if (ext == "svg" || at(0, b"<?xml") || at(0, b"<svg")) && find(head, b"<svg").is_some() {
         "image/svg+xml"
+    // What pages agents show use (`super::visuals`): fonts, WebAssembly, 3D models.
+    } else if at(0, b"wOF2") {
+        "font/woff2"
+    } else if at(0, b"wOFF") {
+        "font/woff"
+    } else if at(0, b"OTTO") {
+        "font/otf"
+    } else if (at(0, b"\0\x01\0\0") || at(0, b"true")) && matches!(ext.as_str(), "ttf" | "ttc") {
+        "font/ttf"
+    } else if at(0, b"\0asm") {
+        "application/wasm"
+    } else if at(0, b"glTF") {
+        "model/gltf-binary"
     } else if let Some(t) = text_type(&name) {
         if head.contains(&0) {
             return "application/octet-stream".to_owned();
@@ -635,6 +666,12 @@ mod tests {
         assert_eq!(sniff(b"# Notes\n", Path::new("/w/notes.md")), "text/markdown; charset=utf-8");
         assert_eq!(sniff(b"\0\x01binary", Path::new("/w/a.log")), "application/octet-stream");
         assert!(!viewable("application/octet-stream") && viewable("video/webm") && viewable("text/plain; charset=utf-8"));
+        // What pages use: fonts, WebAssembly, models.
+        assert_eq!(sniff(b"wOF2\0\x01\0\0", Path::new("/w/geist.woff2")), "font/woff2");
+        assert_eq!(sniff(b"\0asm\x01\0\0\0", Path::new("/w/lib.wasm")), "application/wasm");
+        assert_eq!(sniff(b"glTF\x02\0\0\0", Path::new("/w/robot.glb")), "model/gltf-binary");
+        assert_eq!(sniff(b"\0\x01\0\0\0\x0f", Path::new("/w/a.ttf")), "font/ttf");
+        assert!(viewable("font/woff2") && viewable("application/wasm") && viewable("model/gltf-binary"));
     }
 
     #[test]

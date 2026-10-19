@@ -4,15 +4,16 @@
 
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
-use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, Row as TRow, SqliteDialect, Statement, StepResult, Value};
+use turso_core::{CheckpointMode, Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, Row as TRow, SqliteDialect, Statement, StepResult, Value};
 
 use std::collections::HashMap;
 
 use super::rows::{EventRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Engine, Kept, Mark, Query, SEARCH_MAX, Took, Unended};
+use super::store::{Change, Changes, Compacting, Engine, Kept, Mark, Query, SEARCH_MAX, Took, Unended};
 
 /// How often a statement that finds the database busy tries again, and how long it waits between.
 const BUSY_TRIES: u32 = 50;
@@ -23,6 +24,16 @@ const FEED_PAGE: usize = 512;
 /// How long opening waits for whoever else holds the file to let go of it: this process's last
 /// writer still closing, or the runner process before this one on its way out after an upgrade.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The big tables, copied a batch at a time while compacting: every row of them has a number
+/// (`rev`), so what is written meanwhile is copied again by its number, and what a drop took away
+/// is taken away from the copy too. The other tables are small, and go whole at the swap.
+const COMPACT_SCANNED: [&str; 4] = ["sessions", "events", "records", "drops"];
+/// Rows in one step of compacting, at most (a step also stops at its bytes).
+const COMPACT_ROWS: i64 = 4096;
+/// The copy's page cache while compacting.
+const COMPACT_CACHE: usize = 64 << 20;
+/// Batches the copier may have to write, at most: the memory a compaction takes is a few.
+const COMPACT_AHEAD: usize = 2;
 
 /// A Turso database file.
 pub struct Turso {
@@ -41,6 +52,166 @@ pub struct Turso {
     copying: bool,
     /// The rows being written are a copy's ([`Engine::take_copy`]).
     filling: bool,
+    /// A compaction under way ([`Engine::compact_some`]).
+    compaction: Option<Box<Compaction>>,
+    /// Sessions changed while compacting without a number of their own (where they run): copied
+    /// again at the swap.
+    touched: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+/// A compaction under way: the store copied into `<file>.compact.tmp` a batch at a time, under the
+/// same numbers; then what was written meanwhile, by its numbers; then, with nothing else writing,
+/// the swap. The writer reads each batch; the copier writes it, on a thread of its own, so a read
+/// of the store never waits on the copy's disk. It takes the memory of a few batches.
+struct Compaction {
+    copier: Copier,
+    /// Each big table copied through this rowid (None: all of it).
+    scans: Vec<(&'static str, Option<i64>)>,
+    /// What was written under a number after this was written while copying: copied again.
+    through: u64,
+    /// The file's size when compacting began.
+    before: u64,
+    /// Caught up once, the copy on disk and counted against the store: a copy that doesn't hold
+    /// what the store holds stops before the swap, and the swap's count reads what this one read.
+    counted: Counted,
+}
+
+enum Counted {
+    No,
+    /// The store's counts, and the copier's to come.
+    Asked(Vec<Option<i64>>, mpsc::Receiver<anyhow::Result<Vec<Option<i64>>>>),
+    Yes,
+}
+
+/// What the copier does to the copy, in the order it is given.
+enum CopyJob {
+    /// Whole rows into a table, as they are; the log written into the file after, when `true`
+    /// (each batch: the swap leaves it to its count, which writes it once).
+    Put(&'static str, Vec<Vec<Value>>, bool),
+    /// What was written while copying, in the order it was written ([`Turso::replay`]); the log
+    /// as for `Put`.
+    Replay(Vec<(u64, &'static str, Vec<Value>)>, bool),
+    /// A small table's rows, the table emptied first.
+    Replace(String, Vec<Vec<Value>>),
+    /// How many rows each table holds, the copy put on disk first when `true`.
+    Count(Vec<String>, bool, mpsc::Sender<anyhow::Result<Vec<Option<i64>>>>),
+}
+
+/// The thread that writes the copy.
+struct Copier {
+    tx: Option<mpsc::SyncSender<CopyJob>>,
+    /// Jobs given and not yet done.
+    pending: Arc<AtomicUsize>,
+    /// What went wrong in it, if anything: it takes nothing more then.
+    failed: Arc<Mutex<Option<String>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Copier {
+    fn start(mut copy: Turso) -> anyhow::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<CopyJob>(COMPACT_AHEAD);
+        let (pending, failed) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+        let (left, wrong) = (pending.clone(), failed.clone());
+        let thread = std::thread::Builder::new().name("kiln-convo-copy".into()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let began = std::time::Instant::now();
+                let done = match job {
+                    CopyJob::Put(table, rows, flush) => copy.transaction(|t| t.put_rows(table, &rows)).and_then(|()| if flush { copy.flush() } else { Ok(()) }),
+                    CopyJob::Replay(rows, flush) => copy.replay(&rows).and_then(|()| if flush { copy.flush() } else { Ok(()) }),
+                    CopyJob::Replace(table, rows) => copy.transaction(|t| {
+                        t.exec(&format!("DELETE FROM {table}"))?;
+                        t.put_rows(&table, &rows)
+                    }),
+                    CopyJob::Count(tables, sync, answer) => {
+                        let counted = (|| {
+                            if sync {
+                                copy.flush()?;
+                                sync_file(&copy.path)?;
+                            }
+                            copy.counts(&tables)
+                        })();
+                        let _ = answer.send(counted);
+                        Ok(())
+                    }
+                };
+                tracing::debug!(ms = ms(began.elapsed()), "conversation store: the copier wrote a batch");
+                left.fetch_sub(1, Ordering::SeqCst);
+                if let Err(e) = done {
+                    *wrong.lock().unwrap_or_else(PoisonError::into_inner) = Some(format!("{e:#}"));
+                    return;
+                }
+            }
+        })?;
+        Ok(Self { tx: Some(tx), pending, failed, thread: Some(thread) })
+    }
+
+    /// Jobs given and not yet done.
+    fn busy(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    /// What went wrong in the copier, as an error.
+    fn check(&self) -> anyhow::Result<()> {
+        match self.failed.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            Some(e) => anyhow::bail!("the compact copy couldn't be written: {e}"),
+            None => Ok(()),
+        }
+    }
+
+    /// A job, after those given before it (waiting for room, which a step makes sure there is).
+    fn give(&self, job: CopyJob) -> anyhow::Result<()> {
+        self.check()?;
+        let tx = self.tx.as_ref().ok_or_else(|| anyhow::anyhow!("the copier has ended"))?;
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if tx.send(job).is_err() {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.check()?;
+            anyhow::bail!("the copier has ended");
+        }
+        Ok(())
+    }
+
+    /// The copy's counts of `tables`, once it has done what it was given before.
+    fn count(&self, tables: Vec<String>, sync: bool) -> anyhow::Result<mpsc::Receiver<anyhow::Result<Vec<Option<i64>>>>> {
+        let (answer, counted) = mpsc::channel();
+        self.give(CopyJob::Count(tables, sync, answer))?;
+        Ok(counted)
+    }
+
+    /// Everything given done, and the copy closed.
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        self.check()
+    }
+}
+
+impl Drop for Copier {
+    /// Stopped: the copy closes before its files go.
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A file's bytes on disk. Opened for writing: Windows flushes no file opened only to read.
+fn sync_file(path: &Path) -> anyhow::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// Milliseconds, for the log.
+fn ms(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// About how many bytes a value is.
+fn value_bytes(v: &Value) -> usize {
+    v.to_text().map(str::len).or_else(|| v.to_blob().map(<[u8]>::len)).unwrap_or(8)
 }
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
@@ -71,8 +242,9 @@ fn beside(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// What a compaction left behind it ([`Engine::compact`]): a compact copy written whole takes the
-/// store's place (the compaction stopped between the copy and the swap); one written in part goes.
+/// What a compaction left behind it ([`Engine::compact_some`]): a compact copy written whole takes
+/// the store's place (the compaction stopped between the copy and the swap); one written in part
+/// goes.
 fn finish_compact(path: &Path) -> anyhow::Result<()> {
     for part in [".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
         let _ = std::fs::remove_file(beside(path, part));
@@ -122,7 +294,7 @@ impl Turso {
             }
         };
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0, copying: false, filling: false };
+        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0, copying: false, filling: false, compaction: None, touched: std::cell::RefCell::default() };
         t.migrate(schema)?;
         if schema < 2 {
             return Ok(t);
@@ -227,6 +399,7 @@ impl Turso {
                     let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
                     if theirs {
                         t.run(&mut at, &[txt(session), txt(machine)], |_| Ok(()))?;
+                        t.touch(session);
                     }
                 }
             }
@@ -527,6 +700,7 @@ impl Turso {
                 )?;
                 if *open {
                     self.run(&mut w.open, &[txt(session)], none)?;
+                    self.touch(session);
                 }
             }
             Row::Event(e) => self.run(
@@ -559,7 +733,10 @@ impl Turso {
                 self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
             }
             // Where it runs isn't a write of its own: it goes with the session's row.
-            Row::Machine { session, machine } => self.run(&mut w.machine, &[txt(session), txt(machine)], none)?,
+            Row::Machine { session, machine } => {
+                self.run(&mut w.machine, &[txt(session), txt(machine)], none)?;
+                self.touch(session);
+            }
         }
         Ok(())
     }
@@ -585,6 +762,319 @@ impl Turso {
         })?;
         let more = full || out.len() >= FEED_PAGE;
         Ok((out, more))
+    }
+
+    /// A session changed without a number of its own: while compacting, copied again at the swap.
+    fn touch(&self, session: &str) {
+        if self.compaction.is_some() {
+            self.touched.borrow_mut().insert(session.to_owned());
+        }
+    }
+
+    /// The store's tables (the engine's own left out).
+    fn tables(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[], |r| {
+            if let Ok(name) = r.get::<String>(0) {
+                out.push(name);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The rows `sql` answers, each without its first column (what they go in the order of; the
+    /// last one's comes back too), until they come to `budget` bytes.
+    fn rows_from(&self, sql: &str, params: &[Value], budget: usize) -> anyhow::Result<(Vec<Vec<Value>>, i64)> {
+        let mut stmt = self.prepare(sql)?;
+        let (mut rows, mut bytes, mut last) = (Vec::new(), 0usize, 0i64);
+        self.run_while(&mut stmt, params, |r| {
+            last = r.get::<i64>(0).map_err(fail)?;
+            let row: Vec<Value> = r.get_values().skip(1).cloned().collect();
+            bytes += row.iter().map(value_bytes).sum::<usize>();
+            rows.push(row);
+            Ok(bytes < budget)
+        })?;
+        Ok((rows, last))
+    }
+
+    /// Whole rows into `table` as they are, their columns in order: what is there under the same
+    /// key is replaced.
+    fn put_rows(&self, table: &str, rows: &[Vec<Value>]) -> anyhow::Result<()> {
+        let Some(first) = rows.first() else { return Ok(()) };
+        let mut stmt = self.prepare(&format!("INSERT OR REPLACE INTO {table} VALUES ({})", vec!["?"; first.len()].join(", ")))?;
+        for row in rows {
+            self.run(&mut stmt, row, |_| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    /// Whether compacting is worth it, with room beside the file for the copy: if so it begins.
+    fn compact_begin(&mut self, min_free: u64) -> anyhow::Result<bool> {
+        let pages = |p: &str| -> anyhow::Result<u64> { Ok(self.one_int(&format!("PRAGMA {p}"), &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0)) };
+        let page = pages("page_size")?;
+        let (size, free) = (pages("page_count")? * page, pages("freelist_count")? * page);
+        if free < min_free || free * 3 < size {
+            return Ok(false);
+        }
+        // Room for what the file holds, and some.
+        let need = (size - free) + (size - free) / 10 + (64 << 20);
+        if let Some(have) = self.path.parent().and_then(crate::os::disk_available)
+            && have < need
+        {
+            tracing::info!(file = %self.path.display(), need, have, "conversation store: no room beside it to make its file compact");
+            return Ok(false);
+        }
+        let part = beside(&self.path, ".compact.tmp");
+        for side in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(beside(&part, side));
+        }
+        let copy = Turso::open(&part)?;
+        // The copy counts for nothing until it is whole, on disk and in place: no waiting on the
+        // disk for each batch of it. It goes to disk whole before the swap.
+        copy.exec("PRAGMA synchronous = OFF")?;
+        // Its indexes take rows in no order of theirs (an event's session and number, its time):
+        // pages enough to keep them at hand, or each batch reads them again. Bounded, and gone
+        // with the copy.
+        copy.exec(&format!("PRAGMA cache_size = -{}", COMPACT_CACHE >> 10))?;
+        let copier = Copier::start(copy)?;
+        self.touched.borrow_mut().clear();
+        self.compaction = Some(Box::new(Compaction { copier, scans: COMPACT_SCANNED.iter().map(|t| (*t, Some(0))).collect(), through: self.rev, before: size, counted: Counted::No }));
+        tracing::info!(file = %self.path.display(), size, free, "conversation store: its file is being made compact, a step at a time");
+        Ok(true)
+    }
+
+    /// A step of compacting: a batch of a big table, or of what was written meanwhile, read and
+    /// given to the copier. True: nothing is left to copy but what the swap copies.
+    fn compact_step(&mut self, budget: usize) -> anyhow::Result<bool> {
+        let mut c = self.compaction.take().ok_or_else(|| anyhow::anyhow!("no compaction under way"))?;
+        let done = self.compact_batch(&mut c, budget);
+        self.compaction = Some(c);
+        done
+    }
+
+    fn compact_batch(&self, c: &mut Compaction, budget: usize) -> anyhow::Result<bool> {
+        c.copier.check()?;
+        // The copier a few batches behind at most: a step reads only once it has room.
+        if c.copier.busy() >= COMPACT_AHEAD {
+            return Ok(false);
+        }
+        if let Some((table, at)) = c.scans.iter_mut().find(|(_, at)| at.is_some()) {
+            let began = std::time::Instant::now();
+            let (rows, last) = self.rows_from(&format!("SELECT rowid, * FROM {table} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"), &[int(at.unwrap_or(0)), int(COMPACT_ROWS)], budget)?;
+            if rows.is_empty() {
+                *at = None;
+            } else {
+                tracing::debug!(table, rows = rows.len(), read_ms = ms(began.elapsed()), "conversation store: a step of compacting");
+                c.copier.give(CopyJob::Put(table, rows, true))?;
+                *at = Some(last);
+            }
+            return Ok(false);
+        }
+        self.compact_catch_up(c, budget, true)?;
+        if c.through < self.rev {
+            return Ok(false);
+        }
+        // Caught up once: the copy on disk and counted against the store, its count after all the
+        // copier was given. The copier counts while the writer goes on.
+        match std::mem::replace(&mut c.counted, Counted::Yes) {
+            Counted::No => {
+                if c.copier.busy() > 0 {
+                    c.counted = Counted::No;
+                    return Ok(false);
+                }
+                let tables: Vec<String> = COMPACT_SCANNED.iter().map(|t| (*t).to_owned()).collect();
+                let ours = self.counts(&tables)?;
+                c.counted = Counted::Asked(ours, c.copier.count(tables, true)?);
+                return Ok(false);
+            }
+            Counted::Asked(ours, theirs) => match theirs.try_recv() {
+                Ok(counted) => {
+                    let counted = counted?;
+                    anyhow::ensure!(counted == ours, "the copy holds {counted:?} rows of {COMPACT_SCANNED:?}, the store {ours:?}");
+                    return Ok(false);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    c.counted = Counted::Asked(ours, theirs);
+                    return Ok(false);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    c.copier.check()?;
+                    anyhow::bail!("the copier has ended");
+                }
+            },
+            Counted::Yes => {}
+        }
+        // Then the swap, once the copier has done all it was given.
+        Ok(c.copier.busy() == 0)
+    }
+
+    /// A batch of what was written while copying, in the order it was written, for the copier:
+    /// each big table's rows written after `through` (a page of each, or what comes to `budget`),
+    /// through where every page is whole.
+    fn compact_catch_up(&self, c: &mut Compaction, budget: usize, flush: bool) -> anyhow::Result<()> {
+        if c.through >= self.rev {
+            return Ok(());
+        }
+        let began = std::time::Instant::now();
+        let mut bound = self.rev;
+        let mut all: Vec<(u64, &'static str, Vec<Value>)> = Vec::new();
+        for table in COMPACT_SCANNED {
+            let mut stmt = self.prepare(&format!("SELECT rev, * FROM {table} WHERE rev > ?1 ORDER BY rev LIMIT ?2"))?;
+            let (mut n, mut bytes, mut last) = (0i64, 0usize, 0u64);
+            self.run_while(&mut stmt, &[seq(c.through), int(COMPACT_ROWS)], |r| {
+                last = u(r, 0);
+                let row: Vec<Value> = r.get_values().skip(1).cloned().collect();
+                bytes += row.iter().map(value_bytes).sum::<usize>();
+                all.push((last, table, row));
+                n += 1;
+                Ok(bytes < budget)
+            })?;
+            // A page cut short may have more after its last.
+            if n >= COMPACT_ROWS || bytes >= budget {
+                bound = bound.min(last);
+            }
+        }
+        all.retain(|(rev, ..)| *rev <= bound);
+        all.sort_by_key(|(rev, ..)| *rev);
+        tracing::debug!(rows = all.len(), through = bound, read_ms = ms(began.elapsed()), "conversation store: a step of compacting, what was written meanwhile");
+        if !all.is_empty() {
+            c.copier.give(CopyJob::Replay(all, flush))?;
+        }
+        c.through = bound;
+        Ok(())
+    }
+
+    /// What was written while copying, in the order it was written, into this (the copy): each
+    /// row as it is now, and what a drop took away taken away here too, before the rows written
+    /// after it.
+    fn replay(&mut self, rows: &[(u64, &'static str, Vec<Value>)]) -> anyhow::Result<()> {
+        self.transaction(|t| {
+            let mut puts: HashMap<&str, Statement> = HashMap::new();
+            for (_, table, row) in rows {
+                if *table == "drops" {
+                    // A file of a record, or events from a number on (all of them: none said).
+                    let s = |i: usize| row.get(i).and_then(Value::to_text).map(str::to_owned);
+                    match (s(1), s(2).as_deref()) {
+                        (Some(session), Some("record")) => {
+                            let mut reset = t.prepare(sql::RECORDS_RESET)?;
+                            t.run(&mut reset, &[txt(&session), text(s(3).as_deref())], |_| Ok(()))?;
+                        }
+                        (Some(session), _) => {
+                            let from = row.get(4).filter(|v| !matches!(v, Value::Null)).cloned().unwrap_or_else(|| int(0));
+                            let mut reset = t.prepare(sql::EVENTS_RESET)?;
+                            t.run(&mut reset, &[txt(&session), from], |_| Ok(()))?;
+                        }
+                        _ => {}
+                    }
+                }
+                let stmt = match puts.get_mut(table) {
+                    Some(stmt) => stmt,
+                    None => {
+                        let stmt = t.prepare(&format!("INSERT OR REPLACE INTO {table} VALUES ({})", vec!["?"; row.len()].join(", ")))?;
+                        puts.entry(table).or_insert(stmt)
+                    }
+                };
+                t.run(stmt, row, |_| Ok(()))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Everything in the log written into the file itself, and the log emptied. The copy does it
+    /// each batch: its log restarts no other way, and would grow to the size of everything copied
+    /// (and keep the disk and the memory of a capped server busy writing it back).
+    fn flush(&self) -> anyhow::Result<()> {
+        self.conn.checkpoint(CheckpointMode::Truncate { upper_bound_inclusive: None }).map_err(fail)?;
+        Ok(())
+    }
+
+    /// How many rows each of `tables` holds.
+    fn counts(&self, tables: &[String]) -> anyhow::Result<Vec<Option<i64>>> {
+        tables.iter().map(|t| self.one_int(&format!("SELECT count(*) FROM {t}"), &[])).collect()
+    }
+
+    /// With nothing else writing: the rest of what was written meanwhile, the sessions changed
+    /// without a number of their own, and the small tables whole, for the copier; then the copy,
+    /// on disk, counted against the store, and closed.
+    fn compact_seal(&self, c: &mut Compaction) -> anyhow::Result<()> {
+        let began = std::time::Instant::now();
+        while c.through < self.rev {
+            self.compact_catch_up(c, usize::MAX, false)?;
+        }
+        let touched: Vec<String> = self.touched.borrow_mut().drain().collect();
+        let mut again = Vec::new();
+        for session in touched {
+            again.extend(self.rows_from("SELECT rowid, * FROM sessions WHERE id = ?1", &[txt(&session)], usize::MAX)?.0);
+        }
+        if !again.is_empty() {
+            c.copier.give(CopyJob::Put("sessions", again, false))?;
+        }
+        let tables = self.tables()?;
+        for table in tables.iter().filter(|t| !COMPACT_SCANNED.contains(&t.as_str())) {
+            let (rows, _) = self.rows_from(&format!("SELECT rowid, * FROM {table}"), &[], usize::MAX)?;
+            c.copier.give(CopyJob::Replace(table.clone(), rows))?;
+        }
+        let read = began.elapsed();
+        let ours = self.counts(&tables)?;
+        let theirs = match c.copier.count(tables.clone(), true)?.recv() {
+            Ok(counted) => counted?,
+            Err(_) => {
+                c.copier.check()?;
+                anyhow::bail!("the copier has ended");
+            }
+        };
+        anyhow::ensure!(theirs == ours, "the copy holds {theirs:?} rows of {tables:?}, the store {ours:?}");
+        let counted = began.elapsed();
+        c.copier.finish()?;
+        tracing::debug!(read_ms = ms(read), count_ms = ms(counted - read), close_ms = ms(began.elapsed() - counted), "conversation store: the compact copy sealed");
+        Ok(())
+    }
+
+    /// The copy, sealed, takes the file's place: from its rename on, even after a crash
+    /// (`finish_compact`), and the store goes on in it.
+    fn compact_swap(mut self: Box<Self>) -> anyhow::Result<(Box<dyn Engine>, Compacting)> {
+        let Some(mut c) = self.compaction.take() else { return Ok((self, Compacting::Not)) };
+        let (before, held) = (c.before, std::time::Instant::now());
+        let sealed = self.compact_seal(&mut c);
+        // The copy closed before it moves (a copier stopped part-way finishes here).
+        drop(c);
+        let part = beside(&self.path, ".compact.tmp");
+        let sealed_at = held.elapsed();
+        let placed = sealed.and_then(|()| {
+            anyhow::ensure!(std::fs::metadata(beside(&part, "-wal")).map_or(0, |m| m.len()) == 0, "the compact copy's log isn't empty");
+            for side in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(beside(&part, side));
+            }
+            sync_file(&part)?;
+            std::fs::rename(&part, beside(&self.path, ".compact"))?;
+            Ok(())
+        });
+        let placed_at = held.elapsed();
+        if let Err(e) = placed {
+            tracing::warn!(file = %self.path.display(), error = %format!("{e:#}"), "conversation store: its compact copy couldn't take its place; it goes on as it is");
+            self.compact_drop();
+            return Ok((self, Compacting::Not));
+        }
+        let path = self.path.clone();
+        drop(self);
+        let opened = Self::open(&path)?;
+        let after = std::fs::metadata(&path).map_or(0, |m| m.len());
+        tracing::debug!(seal_ms = ms(sealed_at), sync_ms = ms(placed_at - sealed_at), open_ms = ms(held.elapsed() - placed_at), "conversation store: the swap");
+        // How long reads and writes waited for the swap.
+        tracing::info!(file = %path.display(), held_ms = ms(held.elapsed()), "conversation store: the compact copy took the file's place");
+        Ok((Box::new(opened), Compacting::Done { before, after }))
+    }
+
+    /// A compaction stopped: the copier ends (the copy closes), and the copy goes.
+    fn compact_drop(&mut self) {
+        self.compaction = None;
+        let part = beside(&self.path, ".compact.tmp");
+        for side in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(beside(&part, side));
+        }
+        self.touched.borrow_mut().clear();
     }
 }
 
@@ -758,8 +1248,10 @@ impl Engine for Turso {
     }
 
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool> {
-        if self.squeeze_below == 0 {
-            return Ok(false);
+        // Not while compacting: a line compressed in place keeps its number, so the copy wouldn't
+        // know of it.
+        if self.squeeze_below == 0 || self.compaction.is_some() {
+            return Ok(self.squeeze_below > 0);
         }
         let mut below = self.prepare(sql::RECORDS_BELOW)?;
         let mut rows: Vec<(String, String, u64, String, u64)> = Vec::new();
@@ -792,6 +1284,10 @@ impl Engine for Turso {
     }
 
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
+        // Not while compacting: lines let go have no number, so the copy wouldn't know of it.
+        if self.compaction.is_some() {
+            return Ok(0);
+        }
         let mut ended = self.prepare(sql::SESSIONS_ENDED_BEFORE)?;
         let mut ids: Vec<String> = Vec::new();
         self.run(&mut ended, &[int(before)], |r| {
@@ -821,38 +1317,25 @@ impl Engine for Turso {
         Ok(0)
     }
 
-    fn compact(self: Box<Self>, min_free: u64) -> anyhow::Result<(Box<dyn Engine>, Option<(u64, u64)>)> {
-        let pages = |q: &str| self.one_int(q, &[]).ok().flatten().and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
-        let page = pages("PRAGMA page_size");
-        let (before, free) = (pages("PRAGMA page_count") * page, pages("PRAGMA freelist_count") * page);
-        if free < min_free || free * 3 < before {
-            return Ok((self, None));
-        }
-        // The copy, whole once renamed: from then on it takes the store's place, even after a crash.
-        let path = self.path.clone();
-        let (part, whole) = (beside(&path, ".compact.tmp"), beside(&path, ".compact"));
-        let copied = (|| -> anyhow::Result<()> {
-            let _ = std::fs::remove_file(&part);
-            let name = part.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", part.display()))?;
-            self.conn.execute(format!("VACUUM INTO '{}'", name.replace('\'', "''"))).map_err(fail)?;
-            // Everything is in the copy itself: the log it was written with holds nothing.
-            anyhow::ensure!(std::fs::metadata(beside(&part, "-wal")).map_or(0, |m| m.len()) == 0, "the compact copy's log isn't empty");
-            for side in ["-wal", "-shm"] {
-                let _ = std::fs::remove_file(beside(&part, side));
+    fn compact_some(mut self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)> {
+        let ready = if self.compaction.is_some() {
+            self.compact_step(step_bytes)
+        } else {
+            match self.compact_begin(min_free) {
+                Ok(true) => return Ok((self, Compacting::Going)),
+                Ok(false) => return Ok((self, Compacting::Not)),
+                Err(e) => Err(e),
             }
-            std::fs::File::open(&part)?.sync_all()?;
-            std::fs::rename(&part, &whole)?;
-            Ok(())
-        })();
-        if let Err(e) = copied {
-            let _ = std::fs::remove_file(&part);
-            tracing::warn!(file = %path.display(), error = %format!("{e:#}"), "conversation store: no compact copy could be made; it goes on as it is");
-            return Ok((self, None));
+        };
+        match ready {
+            Ok(false) => Ok((self, Compacting::Going)),
+            Ok(true) => self.compact_swap(),
+            Err(e) => {
+                tracing::warn!(file = %self.path.display(), error = %format!("{e:#}"), "conversation store: making its file compact stopped; it goes on as it is");
+                self.compact_drop();
+                Ok((self, Compacting::Not))
+            }
         }
-        drop(self);
-        let opened = Self::open(&path)?;
-        let after = std::fs::metadata(&path).map_or(0, |m| m.len());
-        Ok((Box::new(opened), Some((before, after))))
     }
 
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
@@ -1081,37 +1564,121 @@ mod tests {
     }
 
     #[test]
-    fn a_store_made_compact_keeps_everything_and_goes_on() -> anyhow::Result<()> {
+    fn a_store_made_compact_a_step_at_a_time_keeps_everything_written_meanwhile_and_goes_on() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("c.db");
-        let mut t = Turso::open(&path)?;
-        let line = |s: &str, n: u64, text: String| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: text, kept: None }));
+        // The store compacted, and one given the same writes and left alone, to hold it up to.
+        let (mut t, mut same) = (Turso::open(&path)?, Turso::open(&dir.path().join("same.db"))?);
+        let line = |s: &str, src: &str, n: u64, text: String| Row::Record(Box::new(RecordRow { session: s.into(), source: src.into(), n, end: n + 1, line: text, kept: None }));
         let mut rows = vec![Row::Session { session: "gone".into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 }];
-        rows.extend((0..1_500u64).map(|n| line("gone", n, noise(2_000))));
+        rows.extend((0..1_500u64).map(|n| line("gone", "cc", n, noise(2_000))));
         rows.push(Row::Closed { session: "gone".into(), at: 10 });
-        let kept: Vec<(u64, String)> = (0..40u64).map(|n| (n, noise(500))).collect();
-        rows.extend(kept.iter().map(|(n, l)| line("kept", *n, l.clone())));
+        rows.extend((0..40u64).map(|n| line("kept", "cc", n, noise(500))));
         rows.extend(super::super::rows::of("kept", &said("m1", 1, "the clock was read twice"), 5));
-        t.apply(&rows)?;
-        while t.prune_some(1_000, 500)? > 0 {}
-        let (id, rev) = (t.id(), t.rev);
-        // Not worth it below the bar; then made compact, the same store going on.
-        let (t, none) = Box::new(t).compact(u64::MAX)?;
-        assert_eq!(none, None);
-        let (mut t, sizes) = t.compact(0)?;
-        let Some((before, after)) = sizes else { anyhow::bail!("nothing was made compact") };
+        for s in [&mut t, &mut same] {
+            s.apply(&rows)?;
+            while s.prune_some(1_000, 500)? > 0 {}
+        }
+        let id = t.id();
+        // What is written while it compacts, one more each step: rows of every kind, a drop of
+        // events and of a record's file, where a session runs (no number of its own), reopened.
+        let meanwhile: Vec<Vec<Row>> = vec![
+            super::super::rows::of("kept", &said("m2", 2, "written while copying"), 6),
+            vec![line("kept", "cc", 40, noise(300)), line("kept", "cx", 0, noise(300))],
+            vec![Row::Machine { session: "kept".into(), machine: "box-2".into() }],
+            vec![Row::Reset { session: "kept".into(), from: Some(2), at: 7 }],
+            super::super::rows::of("kept", &said("m3", 2, "after the reset"), 8),
+            vec![Row::RecordReset { session: "kept".into(), source: "cx".into(), at: 9 }, line("kept", "cx", 0, "{\"fresh\":true}".into())],
+            vec![Row::Session { session: "new".into(), info: Some("{\"n\":1}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 11 }],
+            vec![Row::Closed { session: "new".into(), at: 12 }, Row::Session { session: "new".into(), info: None, meta: None, state: None, changes: None, epoch: None, open: true, at: 13 }],
+        ];
+        // Not worth it below the bar.
+        let (engine, not) = Box::new(t).compact_some(u64::MAX, 64 << 10)?;
+        assert_eq!(not, Compacting::Not);
+        let mut engine = engine;
+        let (mut steps, mut writes) = (0, meanwhile.iter());
+        let (before, after) = loop {
+            let (e, step) = engine.compact_some(0, 64 << 10)?;
+            engine = e;
+            match step {
+                // The copier writes meanwhile; the writer comes back after a while.
+                Compacting::Going => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Compacting::Done { before, after } => break (before, after),
+                Compacting::Not => anyhow::bail!("compacting stopped after {steps} steps"),
+            }
+            steps += 1;
+            anyhow::ensure!(steps < 50_000, "compacting never ended");
+            if let Some(rows) = writes.next() {
+                engine.apply(rows)?;
+                same.apply(rows)?;
+            }
+        };
+        assert!(writes.next().is_none(), "every write landed while it compacted ({steps} steps)");
         assert!(after * 2 < before, "{before} -> {after}");
+        // The store goes on in the compact file, holding what the one left alone holds, under the
+        // same numbers.
+        engine.apply(&[line("kept", "cc", 41, "{\"after\":true}".into())])?;
+        same.apply(&[line("kept", "cc", 41, "{\"after\":true}".into())])?;
+        drop(engine);
+        let t = Turso::open(&path)?;
         assert_eq!(t.id(), id);
-        assert_eq!(t.record("kept", "cc", 0, 100)?, kept);
-        assert_eq!(t.kept("kept", 10)?.map(|k| k.events.len()), Some(1));
-        assert_eq!(t.changes(rev, 1 << 20, false)?.rows.len(), 0, "the numbers went on where they were");
-        t.apply(&[line("kept", 40, "{\"after\":true}".into())])?;
-        assert_eq!(t.record("kept", "cc", 40, 10)?, vec![(40, "{\"after\":true}".to_owned())]);
-        assert!(t.changes(rev, 1 << 20, false)?.rows.iter().all(|c| c.rev > rev));
+        assert_eq!(t.rev, same.rev);
+        assert_eq!(dump(&t)?, dump(&same)?);
         for left in [".compact", ".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
             assert!(!beside(&path, left).exists(), "{left} left beside the store");
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_compaction_stopped_part_way_leaves_the_store_as_it_was() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let mut t = Turso::open(&path)?;
+        let line = |n: u64, text: String| Row::Record(Box::new(RecordRow { session: "gone".into(), source: "cc".into(), n, end: n + 1, line: text, kept: None }));
+        t.apply(&[Row::Session { session: "gone".into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 }])?;
+        t.apply(&(0..1_000u64).map(|n| line(n, noise(2_000))).collect::<Vec<_>>())?;
+        t.apply(&[Row::RecordReset { session: "gone".into(), source: "cc".into(), at: 6 }, line(0, "{\"kept\":true}".into())])?;
+        let was = dump(&t)?;
+        let mut engine: Box<dyn Engine> = Box::new(t);
+        for _ in 0..3 {
+            let (e, step) = engine.compact_some(0, 16 << 10)?;
+            engine = e;
+            assert_eq!(step, Compacting::Going);
+        }
+        assert!(beside(&path, ".compact.tmp").exists());
+        // Stopped (kiln stops): the copy goes when the store opens again, which holds what it did.
+        drop(engine);
+        let t = Turso::open(&path)?;
+        assert!(!beside(&path, ".compact.tmp").exists());
+        assert_eq!(dump(&t)?, was);
+        // And compacting can begin again, and end.
+        let mut engine: Box<dyn Engine> = Box::new(t);
+        loop {
+            let (e, step) = engine.compact_some(0, 1 << 20)?;
+            engine = e;
+            match step {
+                Compacting::Going => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Compacting::Done { .. } => break,
+                Compacting::Not => anyhow::bail!("compacting stopped"),
+            }
+        }
+        drop(engine);
+        assert_eq!(dump(&Turso::open(&path)?)?, was);
+        Ok(())
+    }
+
+    /// Every table's rows (rowid aside), sorted, but the store's own id: what two stores holding
+    /// the same things have alike.
+    fn dump(t: &Turso) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+        let mut out = Vec::new();
+        for table in t.tables()? {
+            let (rows, _) = t.rows_from(&format!("SELECT rowid, * FROM {table}"), &[], usize::MAX)?;
+            let mut rows: Vec<String> = rows.iter().filter(|r| !(table == "meta" && r.first().and_then(Value::to_text) == Some("id"))).map(|r| format!("{r:?}")).collect();
+            rows.sort();
+            out.push((table, rows));
+        }
+        Ok(out)
     }
 
     /// A store whose file another process still holds (the runner before this one, on its way
@@ -1225,7 +1792,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("conversations.db");
         {
-            let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), None)?;
+            let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), super::super::store::Upkeep::default())?;
             store.send("a1", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
             for i in 1..=2_000u64 {
                 store.send("a1", &said(&format!("m{i}"), i, &format!("reply {i} about 100% of_the parser")));
@@ -1255,7 +1822,7 @@ mod tests {
             assert!(scoped.is_empty());
         }
         // Reopened: everything is still there, and the schema isn't made twice.
-        let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), None)?;
+        let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), super::super::store::Upkeep::default())?;
         let k = store.kept("a1", 5_000)?.ok_or_else(|| anyhow::anyhow!("nothing kept after reopening"))?;
         assert_eq!(k.events.len(), 2_000);
         assert!(k.events.iter().any(|e| e.id == "m7" && e.text == "reply seven, revised"));
