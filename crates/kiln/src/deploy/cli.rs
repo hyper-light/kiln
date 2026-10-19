@@ -171,14 +171,52 @@ enum AppCmd {
         #[arg(long, visible_alias = "to")]
         env: String,
     },
-    /// Delete an app registered nowhere.
-    Delete { app: String },
+    /// Change some of an app: owners, properties, contacts, template.
+    Set {
+        app: String,
+        /// Its owner teams, replacing them: the owner first, then a co-owner and an ops owner.
+        #[arg(long = "owner")]
+        owners: Vec<String>,
+        /// `name=value`; `name=` removes it.
+        #[arg(long = "property")]
+        properties: Vec<String>,
+        /// Who is on call.
+        #[arg(long)]
+        oncall: Option<String>,
+        /// Chat channels its release messages go to, replacing them.
+        #[arg(long = "channel")]
+        channels: Vec<String>,
+        /// `name=url`, added to its links.
+        #[arg(long = "link")]
+        links: Vec<String>,
+        #[arg(long)]
+        template: Option<String>,
+    },
+    /// The app as Backstage's catalog reads it (catalog-info.yaml).
+    Catalog { app: String },
+    /// Delete an app: one registered nowhere, or with `--everywhere` deregistered first.
+    Delete {
+        app: String,
+        #[arg(long)]
+        everywhere: bool,
+        /// With `--everywhere`: leave what it runs in place.
+        #[arg(long)]
+        keep: bool,
+    },
+    /// The templates apps are made from.
+    Templates,
+    /// Add (or replace) a template from a YAML or JSON file.
+    TemplateAdd { file: PathBuf },
+    TemplateRm { name: String },
 }
 
 /// `kiln app create`: an app and how it is deployed.
 #[derive(clap::Args)]
 struct NewApp {
     app: String,
+    /// The template it is made from: its package, namespace and checks, unless given here.
+    #[arg(long)]
+    template: Option<String>,
     #[arg(long, default_value = "default")]
     project: String,
     /// Owner teams: the owner first, then a co-owner and an ops owner.
@@ -504,7 +542,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             });
         }
         AppCmd::Create(new) => {
-            let NewApp { app, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace } = *new;
+            let NewApp { app, template, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace } = *new;
             let mut sets = BTreeMap::new();
             for kv in &set {
                 let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set name=value"))?;
@@ -519,9 +557,10 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                     let spec: Value = serde_yaml::from_str(&text).with_context(|| format!("{} doesn't read as YAML", file.display()))?;
                     json!({ "kind": "platform", "provider": provider, "spec": spec, "repo": files_repo, "path": path })
                 }
-                _ => bail!("how is it deployed? --helm-repo and --chart, --git-repo (and --path), or --platform and --spec"),
+                (None, None, None) if template.is_some() => Value::Null,
+                _ => bail!("how is it deployed? --helm-repo and --chart, --git-repo (and --path), --platform and --spec, or a --template that says"),
             };
-            let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace });
+            let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace, "template": template });
             let v = api.call(Method::Post, "/apps", Some(body)).await?;
             api.print(&v, |v| println!("app {} ready: register it in an environment (kiln app register {} --env <env>)", s(v, "name"), s(v, "name")));
         }
@@ -543,10 +582,74 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             let v = api.call(Method::Post, &format!("/apps/{}/environments/{}/resume", enc(&app), enc(&env)), None).await?;
             api.print(&v, |_| println!("{app} in {env}: automation resumed"));
         }
-        AppCmd::Delete { app } => {
-            api.call(Method::Delete, &format!("/apps/{}", enc(&app)), None).await?;
+        AppCmd::Delete { app, everywhere, keep } => {
+            api.call(Method::Delete, &format!("/apps/{}?everywhere={everywhere}&keep={keep}", enc(&app)), None).await?;
             if !api.json {
                 println!("{app} deleted");
+            }
+        }
+        AppCmd::Set { app, owners, properties, oncall, channels, links, template } => {
+            let mut patch = serde_json::Map::new();
+            if !owners.is_empty() {
+                patch.insert("owners".into(), json!(owners));
+            }
+            if !properties.is_empty() {
+                let mut props = serde_json::Map::new();
+                for kv in &properties {
+                    let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --property name=value"))?;
+                    props.insert(k.to_owned(), if v.is_empty() { Value::Null } else { json!(v) });
+                }
+                patch.insert("properties".into(), Value::Object(props));
+            }
+            if oncall.is_some() || !channels.is_empty() || !links.is_empty() {
+                let now = api.call(Method::Get, &format!("/apps/{}", enc(&app)), None).await?;
+                let mut contacts = now.pointer("/app/contacts").cloned().unwrap_or_else(|| json!({}));
+                if let Some(m) = contacts.as_object_mut() {
+                    if let Some(o) = oncall {
+                        m.insert("oncall".into(), json!(o));
+                    }
+                    if !channels.is_empty() {
+                        m.insert("channels".into(), json!(channels));
+                    }
+                    for kv in &links {
+                        let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --link name=url"))?;
+                        let entry = m.entry("links").or_insert_with(|| json!({}));
+                        if let Some(l) = entry.as_object_mut() {
+                            l.insert(k.to_owned(), json!(v));
+                        }
+                    }
+                }
+                patch.insert("contacts".into(), contacts);
+            }
+            if let Some(t) = template {
+                patch.insert("template".into(), json!(t));
+            }
+            let v = api.call(Method::Patch, &format!("/apps/{}", enc(&app)), Some(Value::Object(patch))).await?;
+            api.print(&v, |v| println!("{} updated", s(v, "name")));
+        }
+        AppCmd::Catalog { app } => {
+            let v = api.call(Method::Get, &format!("/apps/{}/catalog-info.yaml", enc(&app)), None).await?;
+            print!("{}", v.as_str().unwrap_or_default());
+        }
+        AppCmd::Templates => {
+            let v = api.call(Method::Get, "/templates", None).await?;
+            api.print(&v, |v| {
+                for t in v.get("templates").and_then(Value::as_array).into_iter().flatten() {
+                    println!("{:<20} {}", s(t, "name"), s(t, "description"));
+                }
+            });
+        }
+        AppCmd::TemplateAdd { file } => {
+            let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+            let t: Value = serde_yaml::from_str(&text).with_context(|| format!("{} doesn't read as YAML", file.display()))?;
+            let name = s(&t, "name").to_owned();
+            let v = api.call(Method::Put, &format!("/templates/{}", enc(&name)), Some(t)).await?;
+            api.print(&v, |v| println!("template {} ready", s(v, "name")));
+        }
+        AppCmd::TemplateRm { name } => {
+            api.call(Method::Delete, &format!("/templates/{}", enc(&name)), None).await?;
+            if !api.json {
+                println!("template {name} removed");
             }
         }
     }

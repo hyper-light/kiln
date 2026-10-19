@@ -15,7 +15,7 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::flow::{self, Ask, RollbackAsk, Who};
-use super::model::{App, Environment, State};
+use super::model::{App, Environment, State, Template};
 use super::{Deploy, api, store};
 use crate::ops::{Cx, Fail, Out};
 
@@ -116,6 +116,54 @@ pub fn ops() -> &'static [Op] {
                 run: |cx: Cx, v: Value| async move {
                     let e: Environment = serde_json::from_value(v.get("environment").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the environment doesn't read: {e}")))?;
                     answer(flow::put_environment(&*service()?, &Who::of(&cx.caller), e).await?)
+                }),
+            op!("deploy.templates.list", "The templates apps are made from (txst's app types): each one's package, namespace pattern, checks, properties and environments.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["templates"]), HashMap::new())),
+                run: |_cx: Cx, _v: Value| async move { answer(json!({ "templates": store::templates(&service()?.hub.store).await.map_err(internal)? })) }),
+            op!("deploy.templates.put", "Create or replace a template: the package its apps start with (`{app}` is the app's name), their namespace pattern (`apps-{app}`), the checks their releases pass, the properties they may have, the environments they may go to.", ro: false, destructive: false,
+                input: || schema(json!({"template": {"type": "object", "description": "The template, as deploy.templates.list shows one."}}), &["template"]),
+                route: |v| {
+                    let name = v.pointer("/template/name").and_then(Value::as_str).ok_or_else(|| bad("`template.name` is required"))?;
+                    Ok((Method::PUT, path(&["templates", name]), HashMap::new()))
+                },
+                run: |cx: Cx, v: Value| async move {
+                    let t: Template = serde_json::from_value(v.get("template").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the template doesn't read: {e}")))?;
+                    answer(flow::put_template(&*service()?, &cx.caller.name, t).await?)
+                }),
+            op!("deploy.apps.create", "Create an app: its name, owner teams, and how it is deployed, or a template that says how (its package, namespace and checks follow). Then register it in environments.", ro: false, destructive: false,
+                input: || schema(json!({"app": {"type": "object", "description": "{name, project?, owners?, template?, package?, namespace?, properties?, contacts?}"}}), &["app"]),
+                route: |_| Ok((Method::POST, path(&["apps"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let ask: flow::AppAsk = serde_json::from_value(v.get("app").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the app doesn't read: {e}")))?;
+                    answer(flow::create_app(&*service()?, &cx.caller.name, ask).await?)
+                }),
+            op!("deploy.apps.patch", "Change some of an app: owners, properties (null removes one), contacts (on call, channels, links), template, package, namespace, archived. A package's change reaches each environment with its next release.", ro: false, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "patch": {"type": "object"}}), &["app", "patch"]),
+                route: |v| Ok((Method::PATCH, path(&["apps", &text(v, "app")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let p: flow::AppPatch = serde_json::from_value(v.get("patch").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the patch doesn't read: {e}")))?;
+                    answer(flow::patch_app(&*service()?, &cx.caller.name, &text(&v, "app")?, p).await?)
+                }),
+            op!("deploy.apps.delete", "Delete an app. With `everywhere`, it is deregistered from every environment first, what it runs deleted (or kept, with `keep`); otherwise an app still registered somewhere is refused.", ro: false, destructive: true,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "everywhere": {"type": "boolean"}, "keep": {"type": "boolean"}}), &["app"]),
+                route: |v| {
+                    let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false).to_string();
+                    Ok((Method::DELETE, path(&["apps", &text(v, "app")?]), HashMap::from([("everywhere".to_owned(), flag("everywhere")), ("keep".to_owned(), flag("keep"))])))
+                },
+                run: |cx: Cx, v: Value| async move {
+                    let app = text(&v, "app")?;
+                    let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+                    flow::delete_app(&*service()?, &Who::of(&cx.caller), &app, flag("everywhere"), flag("keep")).await?;
+                    Ok(json!({ "deleted": app }))
+                }),
+            op!("deploy.apps.catalog_info", "An app as Backstage's catalog reads it: its catalog-info.yaml.", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}}), &["app"]),
+                route: |v| Ok((Method::GET, path(&["apps", &text(v, "app")?, "catalog-info.yaml"]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move {
+                    let name = text(&v, "app")?;
+                    let a = store::app(&service()?.hub.store, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {name}")))?;
+                    Ok(json!({ "catalog_info": flow::catalog_info(&a) }))
                 }),
             op!("deploy.apps.list", "Every app kiln releases: its project, owner teams and package.", ro: true, destructive: false,
                 input: || schema(json!({}), &[]),
@@ -322,6 +370,7 @@ mod tests {
             let v = match op.name {
                 "deploy.environments.put" => json!({ "environment": { "name": "staging" } }),
                 "deploy.apps.put" => json!({ "app": { "name": "web" } }),
+                "deploy.templates.put" => json!({ "template": { "name": "service" } }),
                 _ => input.clone(),
             };
             let (method, rest, _) = (op.route)(&v)?;

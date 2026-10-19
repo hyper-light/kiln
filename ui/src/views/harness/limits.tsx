@@ -197,20 +197,20 @@ export function topLimit(limits: Limit[] | undefined): Limit | null {
 }
 
 /** The most-used limit; it opens the rest (`controls`: the panel it opens, `open`: whether it is). */
-export function LimitBadge({ limits, onClick, open, controls }: { limits: Limit[] | undefined; onClick?: () => void; open?: boolean; controls?: string }) {
+export function LimitBadge({ limits, onClick, open, controls, className }: { limits: Limit[] | undefined; onClick?: () => void; open?: boolean; controls?: string; className?: string }) {
   const top = topLimit(limits);
   if (!top || top.used_percent === null) return null;
   return (
     <button
       type="button"
-      className="hx-limit-badge"
+      className={cn("hx-limit-badge", className)}
       data-tone={tone(top.used_percent)}
       onClick={onClick}
       aria-expanded={open}
       aria-controls={open ? controls : undefined}
       title={(limits ?? []).map((l) => `${l.label}: ${l.used_percent ?? "?"}%`).join(" · ")}
     >
-      {top.label} {Math.round(top.used_percent)}%
+      <span>{top.label} {Math.round(top.used_percent)}%</span>
     </button>
   );
 }

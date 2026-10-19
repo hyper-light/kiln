@@ -5,7 +5,9 @@
 //! | Route | |
 //! | --- | --- |
 //! | `GET`, `POST /environments`; `GET`, `PUT`, `DELETE /environments/{env}` | environments |
-//! | `GET`, `POST /apps`; `GET`, `PUT`, `DELETE /apps/{app}` | apps |
+//! | `GET`, `POST /templates`; `GET`, `PUT`, `DELETE /templates/{name}` | what apps are made from |
+//! | `GET`, `POST /apps`; `GET`, `PUT`, `PATCH`, `DELETE /apps/{app}` (`?everywhere&keep`) | apps |
+//! | `GET /apps/{app}/catalog-info.yaml`, `GET /app-names/{name}` | Backstage's view; whether a name is free |
 //! | `POST`, `GET`, `DELETE /apps/{app}/environments/{env}` | register, show, deregister (`?keep=true`) |
 //! | `POST /apps/{app}/environments/{env}/pause`, `…/resume` | the provider's automation |
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
@@ -24,7 +26,7 @@ use hyper::body::Incoming;
 use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
-use super::model::{App, Environment, State};
+use super::model::{App, Environment, State, Template};
 use super::{Deploy, argocd, kilncd, store};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
@@ -89,8 +91,29 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
 
+        (&Method::GET, ["templates"]) => ok(&json!({ "templates": store::templates(store).await.map_err(internal)? })),
+        (&Method::POST, ["templates"]) => created(&flow::put_template(&d, &actor, body::<Template>(req.into_body()).await?).await?),
+        (&Method::GET, ["templates", name]) => ok(&store::template(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no template {name}")))?),
+        (&Method::PUT, ["templates", name]) => {
+            let t: Template = body(req.into_body()).await?;
+            if t.name != *name {
+                return Err(bad(format!("the body is template {}, the path {name}", t.name)));
+            }
+            ok(&flow::put_template(&d, &actor, t).await?)
+        }
+        (&Method::DELETE, ["templates", name]) => {
+            flow::delete_template(&d, &actor, name).await?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::GET, ["app-names", name]) => ok(&flow::app_name_free(&d, name).await?),
+
         (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
-        (&Method::POST, ["apps"]) => created(&flow::put_app(&d, &actor, body::<App>(req.into_body()).await?).await?),
+        (&Method::POST, ["apps"]) => created(&flow::create_app(&d, &actor, body::<flow::AppAsk>(req.into_body()).await?).await?),
+        (&Method::PATCH, ["apps", name]) => ok(&flow::patch_app(&d, &actor, name, body::<flow::AppPatch>(req.into_body()).await?).await?),
+        (&Method::GET, ["apps", name, "catalog-info.yaml"]) => {
+            let a = store::app(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
+            Ok(srv::response(StatusCode::OK, "application/yaml", srv::full(flow::catalog_info(&a))))
+        }
         (&Method::GET, ["apps", name]) => ok(&app_json(&d, name).await?),
         (&Method::PUT, ["apps", name]) => {
             let a: App = body(req.into_body()).await?;
@@ -100,7 +123,8 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             ok(&flow::put_app(&d, &actor, a).await?)
         }
         (&Method::DELETE, ["apps", name]) => {
-            flow::delete_app(&d, &actor, name).await?;
+            let yes = |k: &str| q.get(k).is_some_and(|v| v == "true" || v == "1");
+            flow::delete_app(&d, &who, name, yes("everywhere"), yes("keep")).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
 

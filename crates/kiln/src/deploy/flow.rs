@@ -20,7 +20,7 @@ use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
 use super::gates::{self, Verdict};
-use super::model::{App, Approval, Artifact, Concurrency, Environment, KILN_HOST, KILNCD, Kind, Origin, Registration, Release, ReleaseFile, State};
+use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template};
 use super::{Deploy, repo, store};
 
 /// An error and the status that says what went wrong.
@@ -288,16 +288,39 @@ pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
     for (k, v) in a.package.set() {
         repo::check(v).map_err(|e| bad(format!("set {k}: {e}")))?;
     }
+    if let Some(name) = &a.template {
+        let t = template(d, name).await?;
+        if let Some(pattern) = &t.namespace {
+            let wanted = pattern.replace("{app}", &a.name);
+            if a.namespace.as_deref().is_some_and(|n| n != wanted) {
+                return Err(bad(format!("template {name} runs its apps in {pattern}: {} runs in {wanted}", a.name)));
+            }
+        }
+        for (k, v) in &a.properties {
+            match t.properties.get(k) {
+                None if !t.properties.is_empty() => return Err(bad(format!("template {name} has no property {k} ({})", t.properties.keys().cloned().collect::<Vec<_>>().join(", ")))),
+                Some(allowed) if !allowed.is_empty() && !allowed.contains(v) => return Err(bad(format!("{k} is one of {} (template {name})", allowed.join(", ")))),
+                _ => {}
+            }
+        }
+    }
     store::put_app(&d.hub.store, &a).await.map_err(internal)?;
     audit(d, actor, "deploy.app.put", a.name.clone()).await;
     Ok(a)
 }
 
-pub async fn delete_app(d: &Deploy, actor: &str, name: &str) -> Result<(), Fail> {
+/// Deletes an app. `everywhere`: deregistered from every environment first, what it runs there
+/// deleted, or kept with `keep`; otherwise an app still registered somewhere stays.
+pub async fn delete_app(d: &Deploy, who: &Who, name: &str, everywhere: bool, keep: bool) -> Result<(), Fail> {
+    let actor = who.name.as_str();
     let regs = store::registrations(&d.hub.store, Some(name), None).await.map_err(internal)?;
-    if !regs.is_empty() {
+    if everywhere {
+        for r in &regs {
+            deregister(d, who, name, &r.environment, keep).await?;
+        }
+    } else if !regs.is_empty() {
         let envs: Vec<&str> = regs.iter().map(|r| r.environment.as_str()).collect();
-        return Err(conflict(format!("{name} is registered in {}. Deregister it first", envs.join(", "))));
+        return Err(conflict(format!("{name} is registered in {}. Deregister it first, or delete it everywhere", envs.join(", "))));
     }
     if !store::delete_app(&d.hub.store, name).await.map_err(internal)? {
         return Err(missing(format!("no app {name}")));
@@ -308,6 +331,197 @@ pub async fn delete_app(d: &Deploy, actor: &str, name: &str) -> Result<(), Fail>
 
 async fn app(d: &Deploy, name: &str) -> Result<App, Fail> {
     store::app(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no app {name}")))
+}
+
+/// An app as asked for (`POST /apps`): its template may give its package and its namespace.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAsk {
+    pub name: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub owners: Vec<String>,
+    #[serde(default)]
+    pub package: Option<Package>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub contacts: Contacts,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// Creates (or replaces) an app from what was asked: what its template gives fills what wasn't.
+pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fail> {
+    let t = match &ask.template {
+        Some(name) => Some(template(d, name).await?),
+        None => None,
+    };
+    let from_template = || -> Result<Option<Package>, Fail> {
+        let Some(p) = t.as_ref().and_then(|t| t.package.clone()) else { return Ok(None) };
+        // `{app}` in the template's package is the app's name.
+        let v = fill_app(serde_json::to_value(&p).map_err(|e| internal(e.into()))?, &ask.name);
+        serde_json::from_value(v).map(Some).map_err(|e| internal(e.into()))
+    };
+    let package = match ask.package.clone() {
+        Some(p) => p,
+        None => from_template()?.ok_or_else(|| bad("how is it deployed? give a package, or a template that has one"))?,
+    };
+    let namespace = ask.namespace.clone().or_else(|| t.as_ref().and_then(|t| t.namespace.as_ref()).map(|p| p.replace("{app}", &ask.name)));
+    let a = App {
+        name: ask.name,
+        project: ask.project.unwrap_or_else(|| "default".to_owned()),
+        owners: ask.owners,
+        package,
+        namespace,
+        properties: ask.properties,
+        template: ask.template,
+        contacts: ask.contacts,
+        archived: ask.archived,
+    };
+    put_app(d, actor, a).await
+}
+
+/// `{app}` in every string of a value is `name`.
+fn fill_app(v: Value, name: &str) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.replace("{app}", name)),
+        Value::Array(a) => Value::Array(a.into_iter().map(|x| fill_app(x, name)).collect()),
+        Value::Object(m) => Value::Object(m.into_iter().map(|(k, x)| (k, fill_app(x, name))).collect()),
+        other => other,
+    }
+}
+
+/// What changes in an app (`PATCH /apps/{app}`): only what is given.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPatch {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub owners: Option<Vec<String>>,
+    #[serde(default)]
+    pub package: Option<Package>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Set (a value) or removed (`null`), each.
+    #[serde(default)]
+    pub properties: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub contacts: Option<Contacts>,
+    #[serde(default)]
+    pub archived: Option<bool>,
+}
+
+/// Changes what a patch gives of an app; the package's change reaches each environment with its
+/// next release.
+pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Result<App, Fail> {
+    let mut a = app(d, name).await?;
+    if let Some(x) = p.project {
+        a.project = x;
+    }
+    if let Some(x) = p.owners {
+        a.owners = x;
+    }
+    if let Some(x) = p.package {
+        a.package = x;
+    }
+    if let Some(x) = p.namespace {
+        a.namespace = Some(x).filter(|n| !n.is_empty());
+    }
+    for (k, v) in p.properties {
+        match v {
+            Some(v) => a.properties.insert(k, v),
+            None => a.properties.remove(&k),
+        };
+    }
+    if let Some(x) = p.template {
+        a.template = Some(x).filter(|t| !t.is_empty());
+    }
+    if let Some(x) = p.contacts {
+        a.contacts = x;
+    }
+    if let Some(x) = p.archived {
+        a.archived = x;
+    }
+    put_app(d, actor, a).await
+}
+
+/// Whether `name` is free for a new app, and why not.
+pub async fn app_name_free(d: &Deploy, name: &str) -> Result<Value, Fail> {
+    if let Err((_, why)) = dns_label("app", name) {
+        return Ok(json!({ "name": name, "available": false, "why": why }));
+    }
+    let taken = store::app(&d.hub.store, name).await.map_err(internal)?.is_some();
+    Ok(json!({ "name": name, "available": !taken, "why": if taken { Some(format!("{name} is an app already")) } else { None } }))
+}
+
+/// The app as Backstage's catalog reads it (`catalog-info.yaml`).
+pub fn catalog_info(a: &App) -> String {
+    let links: Vec<Value> = a.contacts.links.iter().map(|(title, url)| json!({ "title": title, "url": url })).collect();
+    let mut annotations = serde_json::Map::new();
+    annotations.insert("kiln.dev/app".into(), json!(a.name));
+    annotations.insert("kiln.dev/project".into(), json!(a.project));
+    if let Some(o) = &a.contacts.oncall {
+        annotations.insert("kiln.dev/oncall".into(), json!(o));
+    }
+    if !a.contacts.channels.is_empty() {
+        annotations.insert("kiln.dev/channels".into(), json!(a.contacts.channels.join(",")));
+    }
+    let doc = json!({
+        "apiVersion": "backstage.io/v1alpha1",
+        "kind": "Component",
+        "metadata": { "name": a.name, "annotations": annotations, "links": links, "tags": a.template.iter().collect::<Vec<_>>() },
+        "spec": {
+            "type": a.template.clone().unwrap_or_else(|| "service".to_owned()),
+            "lifecycle": if a.archived { "deprecated" } else { "production" },
+            "owner": a.owners.first().cloned().unwrap_or_else(|| "unknown".to_owned()),
+            "system": a.project,
+        },
+    });
+    serde_yaml::to_string(&doc).unwrap_or_default()
+}
+
+// ------------------------------------------------------------------ templates
+
+async fn template(d: &Deploy, name: &str) -> Result<Template, Fail> {
+    store::template(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no template {name}")))
+}
+
+pub async fn put_template(d: &Deploy, actor: &str, t: Template) -> Result<Template, Fail> {
+    dns_label("template", &t.name)?;
+    for c in &t.checks {
+        if !matches!(c.as_str(), "no-snapshots" | "owners-set") {
+            return Err(bad(format!("kiln has no check `{c}` (no-snapshots, owners-set)")));
+        }
+    }
+    if let Some(p) = &t.package {
+        for (k, v) in p.set() {
+            repo::check(v).map_err(|e| bad(format!("package.set {k}: {e}")))?;
+        }
+    }
+    store::put_template(&d.hub.store, &t).await.map_err(internal)?;
+    audit(d, actor, "deploy.template.put", t.name.clone()).await;
+    Ok(t)
+}
+
+pub async fn delete_template(d: &Deploy, actor: &str, name: &str) -> Result<(), Fail> {
+    let using: Vec<String> = store::apps(&d.hub.store).await.map_err(internal)?.into_iter().filter(|a| a.template.as_deref() == Some(name)).map(|a| a.name).collect();
+    if !using.is_empty() {
+        return Err(conflict(format!("apps are made from {name}: {}", using.join(", "))));
+    }
+    if !store::delete_template(&d.hub.store, name).await.map_err(internal)? {
+        return Err(missing(format!("no template {name}")));
+    }
+    audit(d, actor, "deploy.template.delete", name.to_owned()).await;
+    Ok(())
 }
 
 // ------------------------------------------------------------------ registrations
@@ -341,6 +555,12 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     }
     if store::registration(&d.hub.store, app_name, env_name).await.map_err(internal)?.is_some() {
         return Err(conflict(format!("{app_name} is registered in {env_name} already")));
+    }
+    if let Some(name) = &a.template {
+        let t = template(d, name).await?;
+        if !t.environments.is_empty() && !t.environments.iter().any(|e| e == env_name) {
+            return Err(conflict(format!("template {name} keeps its apps to {}", t.environments.join(", "))));
+        }
     }
     if let super::model::Package::Platform { provider, .. } = &a.package {
         if argo_of(&env).is_some() {
@@ -1274,6 +1494,33 @@ mod tests {
             concurrency: Default::default(),
             agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
         }
+    }
+
+    #[test]
+    fn a_template_s_package_becomes_the_app_s_and_backstage_reads_the_app() -> Result<(), String> {
+        let p = json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "{app}", "set": { "image.repository": "ghcr.io/acme/{app}" } });
+        let filled = fill_app(p, "web");
+        assert_eq!(filled.pointer("/chart"), Some(&json!("web")));
+        assert_eq!(filled.pointer("/set/image.repository"), Some(&json!("ghcr.io/acme/web")));
+        let package: Package = serde_json::from_value(filled).map_err(|e| e.to_string())?;
+        let a = App {
+            name: "web".into(),
+            project: "shop".into(),
+            owners: vec!["payments".into(), "platform".into()],
+            package,
+            namespace: Some("apps-web".into()),
+            properties: BTreeMap::new(),
+            template: Some("service".into()),
+            contacts: Contacts { oncall: Some("ada".into()), channels: vec!["#deploys".into()], links: BTreeMap::from([("dashboard".into(), "https://grafana.example/d/web".into())]) },
+            archived: false,
+        };
+        let doc: Value = serde_yaml::from_str(&catalog_info(&a)).map_err(|e| e.to_string())?;
+        assert_eq!(doc.pointer("/kind"), Some(&json!("Component")));
+        assert_eq!(doc.pointer("/spec/owner"), Some(&json!("payments")), "the owner team first");
+        assert_eq!(doc.pointer("/spec/type"), Some(&json!("service")));
+        assert_eq!(doc.pointer("/metadata/links/0/url"), Some(&json!("https://grafana.example/d/web")));
+        assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1oncall"), Some(&json!("ada")));
+        Ok(())
     }
 
     #[test]

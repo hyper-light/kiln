@@ -46,6 +46,19 @@ export function formatThought(seconds: number) {
   return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
 }
 
+/** Use the reported effort, never elapsed time or a typography change, to describe a think. */
+export function thinkingWords(effort?: string): string {
+  switch (effort?.toLowerCase()) {
+    case "minimal":
+    case "low": return "Thinking briefly";
+    case "high": return "Thinking deeply";
+    case "xhigh":
+    case "max":
+    case "ultra": return "Thinking very deeply";
+    default: return "Thinking";
+  }
+}
+
 /** The toggle above a thinking block: live it breathes ("Thinking"); settled it reads "Thought · 12s" with a chevron. */
 export function ThinkingHead({
   live,
@@ -53,21 +66,23 @@ export function ThinkingHead({
   open,
   onToggle,
   className,
+  effort,
 }: {
   live: boolean;
   seconds?: number;
   open: boolean;
   onToggle: () => void;
   className?: string;
+  effort?: string;
 }) {
   return (
-    <button type="button" className={cn("sg-think-head", className)} data-live={live ? "true" : "false"} aria-expanded={open} onClick={onToggle}>
+    <button type="button" className={cn("sg-think-head", "sg-thinking-line", className)} data-live={live ? "true" : "false"} aria-expanded={open} onClick={onToggle}>
       {/* The label already names the state; keep the glyph out of the button's accessible name. */}
       <span className="sg-think-glyph" aria-hidden="true">
         <Optic state={live ? "thinking" : "done"} />
       </span>
       {live ? (
-        <PrismLabel live>Thinking</PrismLabel>
+        <PrismLabel live>{thinkingWords(effort)}</PrismLabel>
       ) : (
         <>
           <PrismLabel>
