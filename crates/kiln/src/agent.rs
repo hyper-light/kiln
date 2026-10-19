@@ -986,6 +986,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             if let Some(sp) = retire_span.take() {
                 sp.record("result", "ok");
             }
+            // Its other engines' browsers don't outlive it (Chromium's go with their pipes).
+            crate::browser::driven::stop_all().await;
             return Ok(());
         }
         let ev = futures::select_biased! {
@@ -1014,6 +1016,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 for r in jobs.values() {
                     r.cancel.cancel();
                 }
+                crate::browser::driven::stop_all().await;
                 return Ok(());
             }
             Ev::ChaosDrop => {

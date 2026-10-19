@@ -142,6 +142,56 @@ page appears in the conversation, live.
 - **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
   that ended can be started again from the frame.
 
+### Engines
+
+A live page runs in Chromium unless asked otherwise. To test it in another engine, pick one (Engine
+in the Tools tab's Live pages; `engine` in `show_live`):
+
+- **Firefox**: the machine's own (on its `PATH`, in Applications on a Mac, in Program Files on
+  Windows; `KILN_FIREFOX` says where otherwise), headless, driven over its WebDriver BiDi. One
+  Firefox a profile (the conversation's, a person's own, or a clean one each time), each stream a
+  tab of its.
+- **WebKit**: Safari on a Mac, through `safaridriver` (turned on once with `safaridriver --enable`,
+  which asks for an administrator's password). Its automated window opens on that Mac's screen,
+  keeps nothing, and is one at a time. On Linux, WebKitGTK's `WebKitWebDriver` when it's installed
+  (`apt install webkit2gtk-driver`).
+
+Neither has a capture a page can be streamed from. So their page's picture is taken as it changes
+(Firefox's in about 5 ms: up to 30 a second while it changes or was just used, a few a second while
+it's still, none while nobody looks), and one that hasn't changed goes nowhere: still costs
+nothing on the wire. Each picture is encoded by kiln's capture extension as a tab's frames are
+(H.264, a sharp key frame when still), so viewers, recordings and the agent's `use_live` work the
+same. What viewers do goes to them as WebDriver actions (the pointer, touch, keys, text, the wheel).
+They stream without sound. The Tools tab offers the engines the agent's machine has (`engines` in
+`GET .../preview`); runners announce `CAP_ENGINES`.
+
+A Firefox a runner started stops with it, and one a runner left running (a crash) is stopped when
+the next one starts (its profile says whose it is).
+
+### Devices
+
+By default a live page lays out as its viewer's frame (its size, the screen's density, touch from
+a phone). A device holds it to the device's instead (Device in Live pages; `device` in
+`show_live`): iPhone 15, iPhone SE, Pixel 8, iPad Air, Laptop, Desktop. Its window, density and
+touch are the device's, and so is its user agent (Chromium and Firefox say it; Safari's window is
+sized to it). A viewer's own size then changes nothing: the page is drawn whole in the frame,
+letterboxed, and taps and clicks land where the page has them. The devices are in
+`crate::browser::devices` (and `devices` in `GET .../preview`).
+
+### Simulators
+
+On a Mac with Xcode, a page in WebKit laid out as an iPhone or iPad (iPhone 15, iPhone SE, iPad
+Air) runs in an iOS Simulator, in the real Mobile Safari (`crate::browser::simulators`). kiln keeps
+a simulator of its own for each model (`kiln iPhone 15`, the model Xcode has, else the newest of
+its kind) on the newest iOS runtime there, boots it with no Simulator window, turns on its Safari's
+remote automation, and drives it through `safaridriver` as it does Safari (its picture as it
+changes, touch for every pointer, the device's own window). It stays booted for the next stream.
+
+What a Mac needs once: Xcode, an iOS simulator runtime (`xcodebuild -downloadPlatform iOS`, several
+GB), and `safaridriver --enable` (it asks for an administrator's password). Until then the Tools
+tab says what's missing (`ios` in the preview's `engines`), and a stream asking for one says the
+same.
+
 ### Recordings
 
 Record (in a live page's own controls) keeps what it shows and what's done in it, on the agent's
@@ -238,7 +288,7 @@ Connections run on the runner link's own lane (`LANE_PORTS`, runners with `CAP_P
 ### API
 
 - `POST /api/harness/sessions/:id/streams` with `{url, width, height, scale, mobile, codec,
-  bitrate, profile}`: a stream of a page, on the session's machine. `profile` is `conversation`
+  bitrate, profile, engine, device}`: a stream of a page, on the session's machine. `profile` is `conversation`
   (the default), `clean` or `personal`; width and height are a phone's (390 by 640) until a
   viewer says its own. With `{"start": true}` instead of a url, the project's app starts first
   (its `.kiln/preview.yaml`) and its page opens.

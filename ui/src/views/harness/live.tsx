@@ -18,7 +18,7 @@ import { formatBytes } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { duration } from "./derive";
 import { Beam, PrismLabel } from "./signals";
-import { chunkOf, fieldAt, liveOf, modifiers, secret, shapeOf, type FieldPlace, type LiveStream, type PageField } from "./live-of";
+import { chunkOf, fieldAt, liveOf, modifiers, pagePoint, secret, shapeOf, type FieldPlace, type LiveStream, type PageField } from "./live-of";
 import "./page.css";
 import "./live.css";
 
@@ -256,8 +256,11 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const boxEl = React.useRef<HTMLDivElement | null>(null);
   const viewing = React.useRef<Viewing | null>(null);
   const size = React.useRef({ width: 0, height: 0 });
-  const live = React.useRef({ stream, sound, macPage });
-  live.current = { stream, sound, macPage };
+  /** Its engine, and the device it's held to (its window the device's: drawn whole in this frame). */
+  const [engine, setEngine] = React.useState("chromium");
+  const [held, setHeld] = React.useState<{ name: string; width: number; height: number } | null>(null);
+  const live = React.useRef({ stream, sound, macPage, held });
+  live.current = { stream, sound, macPage, held };
   const moved = React.useRef<Record<string, unknown> | null>(null);
 
   const send = React.useCallback((m: unknown) => viewing.current?.send(m), []);
@@ -285,8 +288,12 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
       },
       fps: setFps,
       event: (e) => {
-        const opened = e.opened as { platform?: string } | undefined;
-        if (opened) setMacPage(opened.platform === "macos");
+        const opened = e.opened as { platform?: string; engine?: string; device?: { name: string; width: number; height: number } | null } | undefined;
+        if (opened) {
+          setMacPage(opened.platform === "macos");
+          setEngine(opened.engine ?? "chromium");
+          setHeld(opened.device ? { name: opened.device.name, width: opened.device.width, height: opened.device.height } : null);
+        }
         const nav = e.navigated as { url?: string } | undefined;
         if (nav?.url) setAddress(nav.url);
         const loaded = e.loaded as { title?: string } | undefined;
@@ -387,9 +394,13 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     [connect, disconnect, resize],
   );
 
+  // Where in the page: the frame's own point, or (held to a device, drawn whole in it) the page's.
   const at = (e: React.PointerEvent | React.WheelEvent) => {
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+    const c = e.currentTarget as HTMLCanvasElement;
+    const r = c.getBoundingClientRect();
+    const p = { x: e.clientX - r.left, y: e.clientY - r.top };
+    const h = live.current.held;
+    return h ? pagePoint(p, r, { width: c.width, height: c.height }, h) : { x: Math.round(p.x), y: Math.round(p.y) };
   };
   const mods = (e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; key?: string }) => modifiers(e, macViewer, live.current.macPage);
   const pointer = (k: "down" | "move" | "up" | "cancel") => (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -493,7 +504,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     setEditing(null);
   };
   const startAgain = async () => {
-    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile }) });
+    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile, engine: stream.engine, device: stream.device }) });
     if (!r.ok) {
       setWhy((await r.text()) || "It couldn't start again.");
       return;
@@ -510,7 +521,9 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   // The viewer's own field shows while it's typed in, or (on a phone; anywhere, for what a password
   // manager fills) while the page's field has the focus.
   const shown = typing || (field !== null && (touchViewer || secret(field)));
-  const word = status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended";
+  // Its engine and device, when they're not Chromium as this screen is.
+  const what = [engine !== "chromium" ? engine : "", held?.name ?? ""].filter(Boolean).join(" · ");
+  const word = (what ? `${what} · ` : "") + (status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended");
   return (
     <div className="pg lv" data-ev={ev} data-ev-live={stream.id} data-status={status}>
       <div className="pg-head">

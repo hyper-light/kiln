@@ -10,7 +10,10 @@
 pub mod apps;
 pub mod ports;
 pub mod record;
+pub mod simulators;
 pub mod cdp;
+pub mod devices;
+pub mod driven;
 pub mod install;
 pub mod page;
 pub mod preview;
@@ -438,7 +441,7 @@ fn clear_leftovers(profiles: &Path) {
 }
 
 /// Whether process `pid` is running (one that can't be asked counts as running).
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         i32::try_from(pid).is_ok_and(|p| !matches!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None), Err(nix::errno::Errno::ESRCH)))

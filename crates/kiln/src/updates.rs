@@ -2241,6 +2241,7 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_STREAM
     | crate::proto::CAP_PREVIEW
     | crate::proto::CAP_PORTS
+    | crate::proto::CAP_ENGINES
     | crate::proto::CAP_POOLS
     | crate::proto::CAP_RECEIVED;
 

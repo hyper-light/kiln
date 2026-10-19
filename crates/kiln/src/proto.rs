@@ -256,14 +256,18 @@ pub const CAP_PREVIEW: u32 = 1 << 24;
 /// [`AgentMsg::Build`] capability: the runner connects the server to ports its machine's processes
 /// listen on ([`ServerMsg::PortOpen`], on [`LANE_PORTS`], `crate::browser::ports`).
 pub const CAP_PORTS: u32 = 1 << 25;
+/// [`AgentMsg::Build`] capability: the runner streams pages in other engines (Firefox, WebKit) and
+/// laid out as devices (`crate::browser::driven`, `crate::browser::devices`): a stream's spec's
+/// `engine` and `device`.
+pub const CAP_ENGINES: u32 = 1 << 26;
 /// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
 /// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`,
-/// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`).
-pub const CAP_POOLS: u32 = 1 << 26;
+/// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`, 1 << 26 `CAP_ENGINES`).
+pub const CAP_POOLS: u32 = 1 << 27;
 /// [`AgentMsg::Build`] capability: the runner keeps a job's result and its events (each with its
 /// `seq`) until the server says it has the result ([`ServerMsg::Received`]), and sends them again
 /// after a reconnect, so what was in flight as the connection dropped isn't lost.
-pub const CAP_RECEIVED: u32 = 1 << 27;
+pub const CAP_RECEIVED: u32 = 1 << 28;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -725,6 +729,7 @@ mod tests {
             assert_eq!(decode::<AgentMsg>(&b)?, m);
         }
         assert!(CAP_PORTS.is_power_of_two() && CAP_PORTS > CAP_PREVIEW);
+        assert!(CAP_ENGINES.is_power_of_two() && CAP_ENGINES > CAP_PORTS);
         assert!(LANE_PORTS == LANE_STREAM + 1 && LANE_PORTS < crate::net::limits(true).lanes_per_peer, "a lane of its own, within what a peer allows");
         Ok(())
     }
@@ -777,7 +782,7 @@ mod tests {
         let b = encode(&said)?;
         assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Executor comes right after PortClose");
         assert_eq!(decode::<AgentMsg>(&b)?, said);
-        let others = CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
+        let others = CAP_ENGINES | CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
         assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
         Ok(())
     }

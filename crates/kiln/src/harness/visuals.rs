@@ -52,6 +52,10 @@ pub struct Visual {
     /// on the agent's machine; a frame takes its size from these before the page loads.
     #[serde(default)]
     pub heights: Vec<(u32, u32)>,
+    /// The same in the machine's other engines (`firefox`): a viewer's frame takes its own
+    /// engine's.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub engines: std::collections::BTreeMap<String, Vec<(u32, u32)>>,
     /// Unix ms.
     pub at: i64,
 }
@@ -508,11 +512,16 @@ impl Visuals {
     }
 
     /// The heights the agent's machine measured, for its own session's page.
-    pub fn measured(&self, id: &str, session: &str, heights: Vec<(u32, u32)>) -> anyhow::Result<Visual> {
+    pub fn measured(&self, id: &str, session: &str, heights: Vec<(u32, u32)>, engines: std::collections::BTreeMap<String, Vec<(u32, u32)>>) -> anyhow::Result<Visual> {
         let mut v = self.get(id).ok_or_else(|| anyhow::anyhow!("no such page"))?;
         anyhow::ensure!(v.session == session, "that page is another conversation's");
-        v.heights = heights.into_iter().filter(|(w, h)| *w > 0 && *w <= 10_000 && *h > 0 && *h <= 100_000).take(24).collect();
-        v.heights.sort_unstable();
+        let sane = |hs: Vec<(u32, u32)>| {
+            let mut hs: Vec<(u32, u32)> = hs.into_iter().filter(|(w, h)| *w > 0 && *w <= 10_000 && *h > 0 && *h <= 100_000).take(24).collect();
+            hs.sort_unstable();
+            hs
+        };
+        v.heights = sane(heights);
+        v.engines = engines.into_iter().filter(|(e, _)| matches!(e.as_str(), "firefox" | "webkit")).map(|(e, hs)| (e, sane(hs))).filter(|(_, hs)| !hs.is_empty()).collect();
         self.save(&v)?;
         Ok(v)
     }
@@ -555,8 +564,9 @@ pub async fn ask(hub: &Arc<Hub>, session: &str, q: &Value) -> anyhow::Result<Val
         }
         Some("measured") => {
             let heights: Vec<(u32, u32)> = serde_json::from_value(q.get("heights").cloned().unwrap_or_default()).unwrap_or_default();
+            let engines: std::collections::BTreeMap<String, Vec<(u32, u32)>> = serde_json::from_value(q.get("engines").cloned().unwrap_or_default()).unwrap_or_default();
             let (h, id, session) = (hub.clone(), s("id").unwrap_or("").to_owned(), session.to_owned());
-            crate::rt::blocking(move || h.harness.visuals.measured(&id, &session, heights)).await??
+            crate::rt::blocking(move || h.harness.visuals.measured(&id, &session, heights, engines)).await??
         }
         other => anyhow::bail!("pages don't do {other:?}"),
     };
@@ -568,6 +578,7 @@ pub async fn ask(hub: &Arc<Hub>, session: &str, q: &Value) -> anyhow::Result<Val
         "url": format!("{}{path}", hub.cfg.server.pages_url.as_deref().unwrap_or(&hub.cfg.server.public_url).trim_end_matches('/')),
         "files": v.files.len().saturating_sub(1),
         "heights": v.heights,
+        "engines": v.engines,
     }))
 }
 
@@ -695,7 +706,7 @@ pub async fn publish(hub: &Arc<Hub>, session: &str, title: &str, entry: &str, ht
     }
     let (page, _) = to_copy(html, Text::Html, &page_base);
     let page = with_bridge(&page);
-    let v = Visual { id, session: session.to_owned(), title: title.trim().chars().take(200).collect::<String>(), entry: served_at(&entry_target), files, heights: Vec::new(), at: crate::util::now_ms() };
+    let v = Visual { id, session: session.to_owned(), title: title.trim().chars().take(200).collect::<String>(), entry: served_at(&entry_target), files, heights: Vec::new(), engines: std::collections::BTreeMap::new(), at: crate::util::now_ms() };
     let h = hub.clone();
     let entry_from = entry.to_owned();
     crate::rt::blocking(move || -> anyhow::Result<Visual> {

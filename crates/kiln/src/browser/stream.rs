@@ -66,6 +66,13 @@ pub struct Spec {
     /// The agent session it streams for (the server's message says it).
     #[serde(default)]
     pub session: Option<String>,
+    /// The engine it runs in: `chromium` (the default), `firefox` or `webkit` (`super::driven`).
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// A device it's laid out as (`super::devices`): its window is then the device's, whatever
+    /// its viewers' are.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 fn two() -> f64 {
@@ -143,8 +150,15 @@ pub struct Stream {
     pub id: String,
     /// The agent session it streams for.
     pub session: String,
+    /// The browser that encodes it: its page's own (a Chromium tab's), or one that encodes the
+    /// pictures of another engine's page.
     streamer: Arc<Streamer>,
-    page: Page,
+    page: Surface,
+    /// The device it's laid out as, if it's held to one.
+    device: Option<super::devices::Device>,
+    /// When its viewers last did something (unix ms): another engine's page is looked at more
+    /// often just after.
+    touched: std::sync::atomic::AtomicI64,
     touches: Mutex<HashMap<i64, (f64, f64)>>,
     inputs: async_channel::Sender<Vec<Input>>,
     /// Laid out as a phone's (touch, a phone's viewport): what its viewer is.
@@ -161,6 +175,75 @@ pub struct Stream {
     /// doesn't while it records: what an agent does with nobody looking is recorded too).
     recording: Mutex<Option<Arc<super::record::Recording>>>,
     paused: std::sync::atomic::AtomicBool,
+}
+
+/// What a stream's page is: a Chromium tab (captured as its compositor draws it), or a page of
+/// another engine's (`super::driven`: its picture taken as it changes).
+pub(crate) enum Surface {
+    Tab(Page),
+    Driven(super::driven::Driven),
+}
+
+impl Surface {
+    async fn eval(&self, js: &str) -> anyhow::Result<Value> {
+        match self {
+            Self::Tab(p) => p.eval(js).await,
+            Self::Driven(d) => d.eval(js).await,
+        }
+    }
+
+    async fn navigate(&self, url: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Tab(p) => p.call("Page.navigate", json!({"url": url})).await.map(|_| ()),
+            Self::Driven(d) => d.navigate(url).await,
+        }
+    }
+
+    async fn reload(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Tab(p) => p.call("Page.reload", json!({})).await.map(|_| ()),
+            Self::Driven(d) => d.reload().await,
+        }
+    }
+
+    /// Back (`-1`) or forward (`1`).
+    async fn history(&self, delta: i64) -> anyhow::Result<()> {
+        match self {
+            Self::Tab(p) => {
+                let h = p.call("Page.getNavigationHistory", json!({})).await?;
+                let at = h.get("currentIndex").and_then(Value::as_i64).unwrap_or(0) + delta;
+                if let Some(entry) = h.get("entries").and_then(Value::as_array).and_then(|e| usize::try_from(at).ok().and_then(|i| e.get(i))) {
+                    p.call("Page.navigateToHistoryEntry", json!({"entryId": entry.get("id")})).await?;
+                }
+                Ok(())
+            }
+            Self::Driven(d) => d.history(delta).await,
+        }
+    }
+
+    async fn viewport(&self, width: u32, height: u32, scale: f64, mobile: bool) -> anyhow::Result<()> {
+        match self {
+            Self::Tab(p) => p.viewport(width, height, scale, mobile).await,
+            Self::Driven(d) => d.viewport(width, height, scale).await,
+        }
+    }
+
+    async fn settle(&self) {
+        match self {
+            Self::Tab(p) => {
+                let _ = p.settle().await;
+            }
+            Self::Driven(_) => crate::rt::sleep(Duration::from_millis(150)).await,
+        }
+    }
+
+    /// A picture of it (PNG).
+    async fn picture(&self) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Tab(p) => p.picture(false).await,
+            Self::Driven(d) => Ok(d.shot(true).await?.0),
+        }
+    }
 }
 
 /// This machine's streams, by id.
@@ -199,13 +282,25 @@ impl Streams {
 
     /// Open a stream of `spec` as `id`; its chunks and events go to `out`.
     pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
+        let engine = super::driven::Engine::parse(spec.engine.as_deref().unwrap_or(""))?;
+        let device = match spec.device.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            Some(n) => Some(super::devices::device(n).ok_or_else(|| anyhow::anyhow!("kiln knows no device {n:?}: {}", super::devices::DEVICES.iter().map(|d| d.name).collect::<Vec<_>>().join(", ")))?),
+            None => None,
+        };
+        // Its window: a device's, else its viewer's.
+        let (width, height, scale, mobile) = device.map_or((spec.width, spec.height, spec.scale.clamp(1.0, 3.0), spec.mobile), |d| (d.width, d.height, d.scale, d.mobile));
+        if engine != super::driven::Engine::Chromium {
+            return self.open_driven(dir, id, spec, engine, device, (width, height, scale, mobile), out).await;
+        }
         // A clean profile is new each time: a browser of the stream's own.
         let profile = if spec.profile == "clean" { format!("clean:{id}") } else { spec.profile.clone() };
         let s = self.streamer(dir, &profile).await?;
         let mark = hex::encode(rand::random::<[u8; 8]>());
         let page = s.browser.tab(&format!("about:blank#kiln-{mark}")).await?;
-        let scale = spec.scale.clamp(1.0, 3.0);
-        page.viewport(spec.width, spec.height, scale, spec.mobile).await?;
+        page.viewport(width, height, scale, mobile).await?;
+        if let Some(agent) = device.map(|d| d.agent).filter(|a| !a.is_empty()) {
+            page.call("Emulation.setUserAgentOverride", json!({"userAgent": agent})).await?;
+        }
         page.call("Page.enable", json!({})).await?;
         // The tab, as the extension knows it.
         let mut tab = Value::Null;
@@ -223,7 +318,7 @@ impl Streams {
         anyhow::ensure!(tab.is_number(), "the capture extension doesn't see the stream's tab");
         s.outs.lock().insert(id.to_owned(), out.clone());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let (pw, ph) = ((f64::from(spec.width) * scale).round() as u32, (f64::from(spec.height) * scale).round() as u32);
+        let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
         let opts = json!({"width": pw, "height": ph, "framerate": 60, "bitrate": spec.bitrate.unwrap_or(4_000_000), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
         let started = super::evaluate(&s.browser.cdp, &s.worker, &format!("kiln.capture({tab}, {}, {opts})", json!(id))).await?;
         if started.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -238,24 +333,46 @@ impl Streams {
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), personal: spec.profile.starts_with("personal:"), out: out.clone(), dir: dir.to_path_buf(), viewport: Mutex::new(json!({"width": spec.width, "height": spec.height, "scale": scale, "mobile": spec.mobile})), recording: Mutex::default(), paused: std::sync::atomic::AtomicBool::new(false) });
+        let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(page), device, inputs, out.clone(), dir, (width, height, scale, mobile)));
         crate::rt::spawn(watch(stream.clone(), out.clone()));
-        // What viewers do, applied in the order they did it.
-        let applying = Arc::downgrade(&stream);
-        crate::rt::spawn(async move {
-            while let Ok(events) = queued.recv().await {
-                let Some(s) = applying.upgrade() else { return };
-                for e in &events {
-                    s.log(json!({"by": "person", "input": e}));
-                }
-                if let Err(e) = s.input(events).await {
-                    tracing::debug!(stream = %s.id, error = %format!("{e:#}"), "a viewer's input didn't reach the page");
-                }
-            }
-        });
-        stream.page.call("Page.navigate", json!({"url": spec.url})).await?;
+        crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
+        stream.page.navigate(&spec.url).await?;
         self.open.lock().insert(id.to_owned(), stream);
-        Ok(json!({"opened": {"width": spec.width, "height": spec.height, "scale": scale, "audio": started.get("audio"), "platform": std::env::consts::OS}}))
+        Ok(json!({"opened": {"width": width, "height": height, "scale": scale, "audio": started.get("audio"), "platform": std::env::consts::OS, "engine": "chromium", "device": device}}))
+    }
+
+    /// A stream of another engine's page (`super::driven`): its pictures, taken as it changes,
+    /// encoded by a Chromium of kiln's own (`kiln.pushed`).
+    #[allow(clippy::too_many_arguments)]
+    async fn open_driven(&self, dir: &Path, id: &str, spec: &Spec, engine: super::driven::Engine, device: Option<super::devices::Device>, window: (u32, u32, f64, bool), out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
+        let (width, height, scale, mobile) = window;
+        let enc = self.streamer(dir, "encode").await?;
+        let page = super::driven::Driven::open(dir, engine, &spec.profile, width, height, scale, device.as_ref()).await?;
+        if let Some(agent) = device.map(|d| d.agent).filter(|a| !a.is_empty()) {
+            page.agent(agent).await;
+        }
+        enc.outs.lock().insert(id.to_owned(), out.clone());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
+        let opts = json!({"width": pw, "height": ph, "framerate": 30, "bitrate": spec.bitrate.unwrap_or(4_000_000), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
+        let started = match super::evaluate(&enc.browser.cdp, &enc.worker, &format!("kiln.pushed({}, {opts})", json!(id))).await {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => v,
+            other => {
+                enc.outs.lock().remove(id);
+                page.close().await;
+                anyhow::bail!("its pictures couldn't be encoded: {}", other.map(|v| v.to_string()).unwrap_or_else(|e| format!("{e:#}")));
+            }
+        };
+        drop(started);
+        self.listen(&enc).await?;
+        let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
+        let stream = Arc::new(Stream::new(id, spec, enc, Surface::Driven(page), device, inputs, out.clone(), dir, window));
+        crate::rt::spawn(said(stream.clone(), out));
+        crate::rt::spawn(pump(Arc::downgrade(&stream)));
+        crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
+        stream.page.navigate(&spec.url).await?;
+        self.open.lock().insert(id.to_owned(), stream);
+        Ok(json!({"opened": {"width": width, "height": height, "scale": scale, "mobile": mobile, "audio": false, "platform": std::env::consts::OS, "engine": engine.name(), "device": device}}))
     }
 
     /// The offscreen document's binding attached (once a browser's first capture made it), its
@@ -317,7 +434,12 @@ impl Streams {
         let _ = super::evaluate(&cdp, &off, &format!("kiln.stop({})", json!(id))).await;
         s.streamer.outs.lock().remove(id);
         // Its tab, whoever else still holds the stream (its watcher ends as the tab does).
-        let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": s.page.target()})).await;
+        match &s.page {
+            Surface::Tab(p) => {
+                let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": p.target()})).await;
+            }
+            Surface::Driven(d) => d.close().await,
+        }
         let streamer = s.streamer.clone();
         drop(s);
         if streamer.alone {
@@ -474,11 +596,11 @@ pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
     let _ = s.out.send(Out::Event { stream: s.id.clone(), json: json!({"agent": {"did": did}}).to_string() }).await;
     // A moment for the page to answer what was done.
     crate::rt::sleep(Duration::from_millis(300)).await;
-    let _ = s.page.settle().await;
+    s.page.settle().await;
     let url = s.page.eval("location.href").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
     let title = s.page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
     let picture = if a.picture {
-        let png = s.page.picture(false).await?;
+        let png = s.page.picture().await?;
         let pictures = dir.join("browser").join("pictures");
         std::fs::create_dir_all(&pictures)?;
         let f = pictures.join(format!("live-{}-{}.png", crate::util::now_ms(), std::process::id()));
@@ -564,6 +686,9 @@ fn chunk(stream: &str, kind: u8, flags: u8, ts: i64, bytes: &[u8]) -> Option<Vec
 /// like it: its keyboard comes up for it, its password manager fills it), where the page's fields
 /// are (so a tap on one brings the keyboard up at once, in the tap's own gesture), and whether
 /// text is selected (to copy). Each said only when it changed.
+/// The same, for an engine of another kind's (`super::driven`): its binding is theirs to make.
+pub(crate) const FOCUS_SOURCE: &str = FOCUS;
+
 const FOCUS: &str = r"(() => {
   if (window.__kilnFocus) return;
   window.__kilnFocus = true;
@@ -603,10 +728,83 @@ const FOCUS: &str = r"(() => {
 /// document's.
 const SELECTED: &str = r"(() => { const e = document.activeElement; if (e && typeof e.selectionStart === 'number' && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA')) return e.type === 'password' ? '' : e.value.slice(e.selectionStart, e.selectionEnd); return String(getSelection() || ''); })()";
 
+/// What viewers do, applied in the order they did it (and logged, when it's recording).
+async fn apply(s: std::sync::Weak<Stream>, queued: async_channel::Receiver<Vec<Input>>) {
+    while let Ok(events) = queued.recv().await {
+        let Some(s) = s.upgrade() else { return };
+        for e in &events {
+            s.log(json!({"by": "person", "input": e}));
+        }
+        if let Err(e) = s.input(events).await {
+            tracing::debug!(stream = %s.id, error = %format!("{e:#}"), "a viewer's input didn't reach the page");
+        }
+    }
+}
+
+/// What another engine's page does (`super::driven::Driven::said`), to its viewers.
+async fn said(s: Arc<Stream>, out: async_channel::Sender<Out>) {
+    let Surface::Driven(d) = &s.page else { return };
+    while let Ok(ev) = d.said.recv().await {
+        if let Some(u) = ev.pointer("/navigated/url").and_then(Value::as_str) {
+            s.log(json!({"navigated": u}));
+        }
+        let closed = ev.get("closed").is_some();
+        if out.send(Out::Event { stream: s.id.clone(), json: ev.to_string() }).await.is_err() || closed {
+            return;
+        }
+    }
+}
+
+/// Another engine's page's picture, taken as it changes and handed to its encoder (`kiln.push`):
+/// often while it changes or was just used, seldom while it's still (a picture that hasn't changed
+/// goes nowhere), not at all while nobody looks and nothing records.
+async fn pump(s: std::sync::Weak<Stream>) {
+    use base64::Engine as _;
+    let mut last: Vec<u8> = Vec::new();
+    let mut changed = std::time::Instant::now();
+    loop {
+        let (looked, gap) = {
+            let Some(st) = s.upgrade() else { return };
+            let Surface::Driven(d) = &st.page else { return };
+            let looked = !st.paused.load(std::sync::atomic::Ordering::Relaxed) || st.recording.lock().is_some();
+            let used = crate::util::now_ms() - st.touched.load(std::sync::atomic::Ordering::Relaxed) < 2000;
+            let busy = changed.elapsed() < Duration::from_secs(2) || used;
+            let quick = if d.engine == super::driven::Engine::Firefox { Duration::from_millis(33) } else { Duration::from_millis(150) };
+            (looked, if !looked { Duration::from_millis(500) } else if busy { quick } else { Duration::from_millis(300) })
+        };
+        crate::rt::sleep(gap).await;
+        if !looked {
+            continue;
+        }
+        let Some(st) = s.upgrade() else { return };
+        let Surface::Driven(d) = &st.page else { return };
+        match d.shot(false).await {
+            Ok((bytes, mime)) if bytes != last => {
+                let off = st.streamer.offscreen.lock().await.clone().unwrap_or_default();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                if let Err(e) = super::evaluate(&st.streamer.browser.cdp, &off, &format!("kiln.push({}, \"{b64}\", \"{mime}\")", json!(st.id))).await {
+                    tracing::debug!(stream = %st.id, error = %format!("{e:#}"), "a picture didn't reach its encoder");
+                }
+                last = bytes;
+                changed = std::time::Instant::now();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(stream = %st.id, error = %format!("{e:#}"), "no picture of the page");
+                if d.said.is_closed() {
+                    return;
+                }
+                crate::rt::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
 /// What the tab does that its viewer's side shows: where it is (its address and title), a field
 /// taking text or not, a dialog (dismissed), its end.
 async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
-    let events = s.page.listen();
+    let Surface::Tab(page) = &s.page else { return };
+    let events = page.listen();
     while let Ok(e) = events.recv().await {
         let ev = match e.method.as_str() {
             "Page.frameNavigated" if e.params.get("frame").and_then(|f| f.get("parentId")).is_none() => {
@@ -615,7 +813,7 @@ async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
                 Some(json!({"navigated": {"url": url}}))
             }
             "Page.loadEventFired" => {
-                let title = s.page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+                let title = page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
                 Some(json!({"loaded": {"title": title}}))
             }
             // `{"focus": ...}`, `{"fields": [...]}` or `{"selected": bool}`, as the page said it.
@@ -624,7 +822,7 @@ async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
                 .filter(|v| v.as_object().is_some_and(|o| o.len() == 1 && ["focus", "fields", "selected"].iter().any(|k| o.contains_key(*k)))),
             // A page's alert, confirm or prompt would hold it still: answered, and said.
             "Page.javascriptDialogOpening" => {
-                let _ = s.page.call("Page.handleJavaScriptDialog", json!({"accept": true})).await;
+                let _ = page.call("Page.handleJavaScriptDialog", json!({"accept": true})).await;
                 Some(json!({"dialog": {"type": e.params.get("type"), "message": e.params.get("message")}}))
             }
             "Inspector.detached" | "Target.detachedFromTarget" => {
@@ -807,6 +1005,28 @@ fn punctuation(c: char) -> Option<i64> {
 }
 
 impl Stream {
+    #[allow(clippy::too_many_arguments)]
+    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, inputs: async_channel::Sender<Vec<Input>>, out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
+        let (width, height, scale, mobile) = window;
+        Self {
+            id: id.to_owned(),
+            session: spec.session.clone().unwrap_or_default(),
+            streamer,
+            page,
+            device,
+            touched: std::sync::atomic::AtomicI64::new(0),
+            touches: Mutex::default(),
+            inputs,
+            mobile: std::sync::atomic::AtomicBool::new(mobile),
+            personal: spec.profile.starts_with("personal:"),
+            out,
+            dir: dir.to_path_buf(),
+            viewport: Mutex::new(json!({"width": width, "height": height, "scale": scale, "mobile": mobile})),
+            recording: Mutex::default(),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
     /// Into its recording's log, when it's recording.
     fn log(&self, what: Value) {
         if let Some(r) = self.recording.lock().as_ref() {
@@ -868,7 +1088,7 @@ impl Stream {
             }
         }
         if let Some(u) = url {
-            self.page.call("Page.navigate", json!({"url": u})).await?;
+            self.page.navigate(&u).await?;
             crate::rt::sleep(Duration::from_millis(500)).await;
         }
         let n = steps.len();
@@ -885,6 +1105,11 @@ impl Stream {
 
     /// What a viewer did, to the tab.
     pub async fn input(&self, events: Vec<Input>) -> anyhow::Result<()> {
+        self.touched.store(crate::util::now_ms(), std::sync::atomic::Ordering::Relaxed);
+        let page = match &self.page {
+            Surface::Tab(p) => p,
+            Surface::Driven(d) => return d.input(&events).await,
+        };
         for e in events {
             match e {
                 // A touch on a page laid out for a mouse (a phone's viewer before its size came)
@@ -913,7 +1138,7 @@ impl Stream {
                     };
                     let points: Vec<Value> = self.touches.lock().iter().map(|(i, (x, y))| json!({"x": x, "y": y, "id": i})).collect();
                     let _ = (button, buttons, clicks);
-                    self.page.call("Input.dispatchTouchEvent", json!({"type": kind, "touchPoints": points, "modifiers": mods})).await?;
+                    page.call("Input.dispatchTouchEvent", json!({"type": kind, "touchPoints": points, "modifiers": mods})).await?;
                 }
                 Input::Pointer { k, x, y, button, buttons, mods, clicks, .. } => {
                     let kind = match k.as_str() {
@@ -927,10 +1152,10 @@ impl Stream {
                         (_, 2) => "right",
                         _ => "left",
                     };
-                    self.page.call("Input.dispatchMouseEvent", json!({"type": kind, "x": x, "y": y, "button": which, "buttons": buttons, "clickCount": clicks.max(if kind == "mouseMoved" { 0 } else { 1 }), "modifiers": mods})).await?;
+                    page.call("Input.dispatchMouseEvent", json!({"type": kind, "x": x, "y": y, "button": which, "buttons": buttons, "clickCount": clicks.max(if kind == "mouseMoved" { 0 } else { 1 }), "modifiers": mods})).await?;
                 }
                 Input::Wheel { x, y, dx, dy, mods } => {
-                    self.page.call("Input.dispatchMouseEvent", json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy, "modifiers": mods})).await?;
+                    page.call("Input.dispatchMouseEvent", json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy, "modifiers": mods})).await?;
                 }
                 Input::Key { k, key, code, text, mods, rep, loc } => {
                     let down = k == "down";
@@ -950,13 +1175,13 @@ impl Stream {
                         o.insert("text".into(), json!(text));
                         o.insert("unmodifiedText".into(), json!(text));
                     }
-                    self.page.call("Input.dispatchKeyEvent", p).await?;
+                    page.call("Input.dispatchKeyEvent", p).await?;
                 }
                 Input::Text { text } => {
-                    self.page.call("Input.insertText", json!({"text": text})).await?;
+                    page.call("Input.insertText", json!({"text": text})).await?;
                 }
                 Input::Compose { text, start, end } => {
-                    self.page.call("Input.imeSetComposition", json!({"text": text, "selectionStart": start, "selectionEnd": end})).await?;
+                    page.call("Input.imeSetComposition", json!({"text": text, "selectionStart": start, "selectionEnd": end})).await?;
                 }
             }
         }
@@ -970,7 +1195,8 @@ impl Stream {
         let off = self.streamer.offscreen.lock().await.clone().unwrap_or_default();
         let cdp = &self.streamer.browser.cdp;
         let id = json!(self.id);
-        if let Some(r) = c.get("resize") {
+        // Held to a device, its window is the device's, whatever its viewers' is.
+        if let Some(r) = c.get("resize").filter(|_| self.device.is_none()) {
             let w = r.get("width").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).unwrap_or(390).clamp(200, 3840);
             let h = r.get("height").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).unwrap_or(844).clamp(200, 3840);
             let scale = r.get("scale").and_then(Value::as_f64).unwrap_or(2.0).clamp(1.0, 3.0);
@@ -984,7 +1210,10 @@ impl Stream {
             let _ = self.page.eval("document.activeElement && document.activeElement !== document.body && document.activeElement.scrollIntoView({ block: 'nearest' })").await;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let (pw, ph) = ((f64::from(w) * scale).round() as u32, (f64::from(h) * scale).round() as u32);
-            super::evaluate(cdp, &off, &format!("kiln.resize({id}, {pw}, {ph})")).await?;
+            // A tab's capture takes its new size; another engine's pictures come at it.
+            if matches!(self.page, Surface::Tab(_)) {
+                super::evaluate(cdp, &off, &format!("kiln.resize({id}, {pw}, {ph})")).await?;
+            }
         }
         if let Some(p) = c.get("pause").and_then(Value::as_bool) {
             self.paused.store(p, std::sync::atomic::Ordering::Relaxed);
@@ -1011,18 +1240,14 @@ impl Stream {
             let _ = self.out.send(Out::Event { stream: self.id.clone(), json: json!({"copied": {"text": text}}).to_string() }).await;
         }
         if let Some(url) = c.get("go").and_then(Value::as_str) {
-            self.page.call("Page.navigate", json!({"url": url})).await?;
+            self.page.navigate(url).await?;
         }
         if c.get("reload").and_then(Value::as_bool) == Some(true) {
-            self.page.call("Page.reload", json!({})).await?;
+            self.page.reload().await?;
         }
         for (k, delta) in [("back", -1), ("forward", 1)] {
             if c.get(k).and_then(Value::as_bool) == Some(true) {
-                let h = self.page.call("Page.getNavigationHistory", json!({})).await?;
-                let at = h.get("currentIndex").and_then(Value::as_i64).unwrap_or(0) + delta;
-                if let Some(entry) = h.get("entries").and_then(Value::as_array).and_then(|e| usize::try_from(at).ok().and_then(|i| e.get(i))) {
-                    self.page.call("Page.navigateToHistoryEntry", json!({"entryId": entry.get("id")})).await?;
-                }
+                self.page.history(delta).await?;
             }
         }
         Ok(())
@@ -1091,6 +1316,137 @@ mod tests {
             streams().close("test-stream").await;
             assert!(configs >= 1 && keys >= 1 && frames > 30, "configs {configs}, key frames {keys}, frames {frames}");
             assert_eq!(title, json!("clicked"));
+            Ok(())
+        })
+    }
+
+    /// Another engine: this machine's Firefox, its page's pictures taken as it changes and encoded
+    /// as a tab's are (a device's window, its user agent); a click reaching it; where it went.
+    #[test]
+    #[ignore = "needs Firefox installed, and downloads and starts the real browser (about 200 MB)"]
+    fn firefox_streams_a_page_as_a_device() -> anyhow::Result<()> {
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        crate::rt::block_on(async move {
+            let page = "data:text/html,<title>fox</title><body style='margin:0;background:%23123'><div id=b style='width:40px;height:40px;background:%23bab0e3;position:absolute'></div><script>let t=0;addEventListener('pointerdown',()=>document.title='clicked');setInterval(()=>{t++;b.style.left=(t*7%25200)+'px'},50)</script></body>";
+            // A conversation's profile (kept), as the Tools tab opens one.
+            let spec: Spec = serde_json::from_value(json!({"url": page, "profile": std::env::var("KILN_TEST_PROFILE").unwrap_or_else(|_| "clean".into()), "engine": "firefox", "device": "iPhone SE"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            let opened = streams().open(&dir, "test-firefox", &spec, tx).await?;
+            assert_eq!(opened.pointer("/opened/engine"), Some(&json!("firefox")), "{opened}");
+            assert_eq!(opened.pointer("/opened/device/name"), Some(&json!("iPhone SE")), "{opened}");
+            let s = streams().get("test-firefox").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let (mut configs, mut keys, mut frames, mut size, mut said) = (0, 0, 0, json!(null), Vec::new());
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < end {
+                match crate::rt::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Ok(Out::Frame { data, .. })) => match (data.first(), data.get(1)) {
+                        (Some(b'c'), _) => {
+                            configs += 1;
+                            size = data.get(12..).and_then(|b| serde_json::from_slice::<Value>(b).ok()).unwrap_or_default();
+                        }
+                        (Some(b'v'), Some(b'k')) => keys += 1,
+                        (Some(b'v'), _) => frames += 1,
+                        _ => {}
+                    },
+                    Ok(Ok(Out::Event { json, .. })) => said.push(json),
+                    _ => {}
+                }
+            }
+            // A resize from a viewer leaves a device's window be.
+            s.control(&json!({"resize": {"width": 800, "height": 600, "scale": 1, "mobile": false}})).await?;
+            let window = s.page.eval("[innerWidth, innerHeight, devicePixelRatio, navigator.userAgent]").await?;
+            s.input(vec![Input::Pointer { k: "down".into(), x: 100.0, y: 100.0, button: 0, buttons: 1, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }, Input::Pointer { k: "up".into(), x: 100.0, y: 100.0, button: 0, buttons: 0, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }]).await?;
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            let title = s.page.eval("document.title").await?;
+            streams().close("test-firefox").await;
+            super::super::driven::stop_all().await;
+            assert!(configs >= 1 && keys >= 1 && frames > 20, "configs {configs}, key frames {keys}, frames {frames}");
+            assert_eq!((size.get("codedWidth"), size.get("codedHeight")), (Some(&json!(750)), Some(&json!(1334))), "the device's window at its density: {size}");
+            assert_eq!(window.as_array().and_then(|w| w.get(..3)), Some(&[json!(375), json!(667), json!(2)][..]), "{window}");
+            assert!(window.get(3).and_then(Value::as_str).is_some_and(|ua| ua.contains("iPhone")), "{window}");
+            assert_eq!(title, json!("clicked"));
+            assert!(said.iter().any(|e| e.contains("\"loaded\"") && e.contains("fox")), "{said:?}");
+            Ok(())
+        })
+    }
+
+    /// A viewer that joins once another engine's page has gone still is sent its picture at once
+    /// (a key frame of the last one, asked for as it joins).
+    #[test]
+    #[ignore = "needs Firefox installed, and downloads and starts the real browser (about 200 MB)"]
+    fn firefox_answers_a_late_viewer() -> anyhow::Result<()> {
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        crate::rt::block_on(async move {
+            let page = "data:text/html,<title>still</title><body style='margin:0;background:%23246'><p style='color:white'>still</p></body>";
+            let spec: Spec = serde_json::from_value(json!({"url": page, "profile": "clean", "engine": "firefox", "device": "iPhone SE"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            streams().open(&dir, "test-late", &spec, tx).await?;
+            let s = streams().get("test-late").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            // Nobody looks for a while: the page goes still.
+            crate::rt::sleep(Duration::from_secs(3)).await;
+            while rx.try_recv().is_ok() {}
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let (mut configs, mut keys) = (0, 0);
+            let end = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < end {
+                if let Ok(Ok(Out::Frame { data, .. })) = crate::rt::timeout(Duration::from_millis(100), rx.recv()).await {
+                    match (data.first(), data.get(1)) {
+                        (Some(b'c'), _) => configs += 1,
+                        (Some(b'v'), Some(b'k')) => keys += 1,
+                        _ => {}
+                    }
+                }
+            }
+            streams().close("test-late").await;
+            super::super::driven::stop_all().await;
+            assert!(configs >= 1 && keys >= 1, "configs {configs}, key frames {keys}");
+            Ok(())
+        })
+    }
+
+    /// WebKit's way in, WebDriver over HTTP (Safari's, WebKitGTK's), tried with whichever
+    /// WebDriver `KILN_WEBDRIVER` names (and `KILN_WEBDRIVER_CAPS` its capabilities: chromedriver
+    /// does here): its pictures (PNG) as it changes, a click reaching it, where it went, said.
+    #[test]
+    #[ignore = "needs KILN_WEBDRIVER (a WebDriver), and downloads and starts the real browser (about 200 MB)"]
+    fn webdriver_streams_a_page() -> anyhow::Result<()> {
+        if std::env::var_os("KILN_WEBDRIVER").is_none() {
+            return Ok(());
+        }
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        crate::rt::block_on(async move {
+            let page = "data:text/html,<title>driven</title><body style='margin:0;background:%23123'><div id=b style='width:40px;height:40px;background:%23bab0e3;position:absolute'></div><script>let t=0;addEventListener('pointerdown',e=>document.title='clicked '+e.clientX+','+e.clientY);setInterval(()=>{t++;b.style.left=(t*7%25200)+'px'},80)</script></body>";
+            let spec: Spec = serde_json::from_value(json!({"url": page, "width": 400, "height": 300, "scale": 1, "profile": "clean", "engine": "webkit"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            let opened = streams().open(&dir, "test-webdriver", &spec, tx).await?;
+            assert_eq!(opened.pointer("/opened/engine"), Some(&json!("webkit")), "{opened}");
+            let s = streams().get("test-webdriver").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let (mut keys, mut frames, mut said) = (0, 0, Vec::new());
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < end {
+                match crate::rt::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Ok(Out::Frame { data, .. })) => match (data.first(), data.get(1)) {
+                        (Some(b'v'), Some(b'k')) => keys += 1,
+                        (Some(b'v'), _) => frames += 1,
+                        _ => {}
+                    },
+                    Ok(Ok(Out::Event { json, .. })) => said.push(json),
+                    _ => {}
+                }
+            }
+            let window = s.page.eval("[innerWidth, innerHeight]").await?;
+            s.input(vec![Input::Pointer { k: "down".into(), x: 120.0, y: 90.0, button: 0, buttons: 1, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }, Input::Pointer { k: "up".into(), x: 120.0, y: 90.0, button: 0, buttons: 0, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }]).await?;
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            let title = s.page.eval("document.title").await?;
+            streams().close("test-webdriver").await;
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            super::super::driven::stop_all().await;
+            assert!(keys >= 1 && frames >= 5, "key frames {keys}, frames {frames}");
+            assert_eq!(window, json!([400, 300]), "its window, as asked");
+            assert_eq!(title, json!("clicked 120,90"));
+            assert!(said.iter().any(|e| e.contains("\"navigated\"")) && said.iter().any(|e| e.contains("\"loaded\"") && e.contains("driven")), "{said:?}");
             Ok(())
         })
     }
