@@ -506,6 +506,39 @@ export interface ScrapeTest {
   took_ms?: number;
 }
 
+/** How a machine's DogStatsD listener goes. */
+export interface StatsdState {
+  listening: string[];
+  rcvbuf: number;
+  datagrams: number;
+  metrics: number;
+  events: number;
+  checks: number;
+  invalid: number;
+  refused: number;
+  conflicts: number;
+  contexts: number;
+  points: number;
+  dropped: number;
+  held: number;
+  last_ms: number | null;
+  error: string | null;
+}
+
+export type HistogramAggregate = "max" | "median" | "avg" | "count" | "min" | "sum";
+
+/** A DogStatsD listener as it is given: where it listens (`udp://127.0.0.1:8125`, `unix:///…`), who listens. */
+export interface StatsdIn {
+  listen: string[];
+  tags?: string[];
+  histogram_aggregates?: HistogramAggregate[];
+  histogram_percentiles?: number[];
+  on?: string;
+}
+
+/** A DogStatsD listener as the API shows it, and how each machine that opens it goes. */
+export type Statsd = StatsdIn & { name: string; on: string; machines: { machine: string; state: StatsdState }[] };
+
 export type LogSourceKind = "file" | "kubernetes" | "docker" | "journald" | "syslog" | "unified_log" | "windows_event";
 export type LogRuleKind = "exclude_at_match" | "include_at_match" | "mask_sequences" | "multi_line";
 
@@ -853,6 +886,9 @@ export const observeApi = {
   testSynthetic: (name: string, t: SyntheticIn) => request<SyntheticOutcome>("POST", `${BASE}/synthetics/${enc(name)}/test`, t),
   runSynthetic: (name: string) => request<{ run: boolean }>("POST", `${BASE}/synthetics/${enc(name)}/run`),
   deleteScrape: (name: string) => request<void>("DELETE", `${BASE}/scrapes/${enc(name)}`),
+  statsd: (signal?: AbortSignal) => request<{ statsd: Statsd[] }>("GET", `${BASE}/statsd`, undefined, { signal }).then((r) => r.statsd),
+  putStatsd: (name: string, l: StatsdIn) => request<void>("PUT", `${BASE}/statsd/${enc(name)}`, l),
+  deleteStatsd: (name: string) => request<void>("DELETE", `${BASE}/statsd/${enc(name)}`),
   testScrape: (name: string, t: ScrapeIn) => request<ScrapeTest>("POST", `${BASE}/scrapes/${enc(name)}/test`, t),
   pipelines: (signal?: AbortSignal) => request<{ pipelines: Pipeline[] }>("GET", `${BASE}/pipelines`, undefined, { signal }).then((r) => r.pipelines),
   pipeline: (id: string, signal?: AbortSignal) => request<Pipeline>("GET", `${BASE}/pipelines/${enc(id)}`, undefined, { signal }),

@@ -754,6 +754,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::scrape::start(&name, &name, http.clone(), shutdown.clone());
         // The synthetic tests the server says this machine runs (it is their location by name).
         crate::observe::synthetics::start(&name, shutdown.clone());
+        // The DogStatsD listeners the server says this machine opens.
+        crate::observe::statsd::start(&name, &name, shutdown.clone());
         // The logs the server says this machine collects (its files, its journal).
         crate::observe::collect::start(&name, &name, &o.state_dir.join("observe"), shutdown.clone());
         // This machine's own figures, as the server's are.

@@ -482,6 +482,38 @@ fn schemas() -> Map<String, Value> {
             &["name", "series", "kinds", "tags", "samples"],
         ),
     );
+    // DogStatsD listeners (docs/observe.md §8.4).
+    let statsd_fields = vec![
+        ("listen", describe(array(string()), "udp://127.0.0.1:8125, unix:///var/run/kiln/dsd.socket (4 at the most)")),
+        ("tags", describe(array(string()), "key:value, on every metric, event and check (a message's own win on its key)")),
+        ("histogram_aggregates", describe(array(one_of(&["max", "median", "avg", "count", "min", "sum"])), "max, median, avg and count unless said")),
+        ("histogram_percentiles", describe(array(number()), "0.01 to 0.99 in hundredths; 0.95 unless said")),
+        ("on", describe(string(), "`server`, a runner's name, or `*`: every machine, each its own")),
+    ];
+    put("StatsdIn", object(&statsd_fields, &["listen"]));
+    let statsd_state = object(
+        &[
+            ("listening", array(string())),
+            ("rcvbuf", describe(integer(), "the least receive buffer the system granted its sockets, bytes")),
+            ("datagrams", integer()),
+            ("metrics", integer()),
+            ("events", integer()),
+            ("checks", integer()),
+            ("invalid", describe(integer(), "messages that did not read, values that are not numbers")),
+            ("refused", describe(integer(), "samples of contexts past the bound, or that no series can be")),
+            ("conflicts", describe(integer(), "tags whose key came twice with another value (the first kept)")),
+            ("contexts", integer()),
+            ("points", integer()),
+            ("dropped", describe(integer(), "points and records dropped after waiting a minute for room")),
+            ("held", describe(integer(), "points and records waiting for room")),
+            ("last_ms", nullable(integer())),
+            ("error", nullable(string())),
+        ],
+        &["listening", "datagrams", "points"],
+    );
+    let mut statsd_listed = statsd_fields.clone();
+    statsd_listed.extend([("name", string()), ("machines", array(object(&[("machine", string()), ("state", statsd_state)], &["machine", "state"])))]);
+    put("Statsd", object(&statsd_listed, &["name", "listen", "on", "machines"]));
     // Synthetic tests (docs/observe.md §10.4).
     let assertion = object(
         &[
@@ -1128,6 +1160,9 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: vec![name()], ..op("delete", "/integrations/{name}", "Removes an integration", "observe.manage", None, vec![no_content()]) },
         Op { params: vec![name()], ..op("post", "/integrations/{name}/test", "Sends an integration a test notice", "observe.manage", None, vec![accepted(object(&[("sent", boolean())], &["sent"]))]) },
         op("get", "/scrapes", "Lists Prometheus scrape targets, each machine's state of them", "observe.read", None, vec![("200", answer_of("the targets", object(&[("scrapes", array(schema("Scrape")))], &["scrapes"])))]),
+        op("get", "/statsd", "Lists DogStatsD listeners, each machine's state of them", "observe.read", None, vec![("200", answer_of("the listeners", object(&[("statsd", array(schema("Statsd")))], &["statsd"])))]),
+        Op { params: vec![name()], ..op("put", "/statsd/{name}", "Makes or changes a DogStatsD listener", "observe.manage", Some(body("StatsdIn")), vec![no_content()]) },
+        Op { params: vec![name()], ..op("delete", "/statsd/{name}", "Removes a DogStatsD listener: its machines close it", "observe.manage", None, vec![no_content()]) },
         op("get", "/synthetics", "Lists synthetic tests, each location's state of them", "observe.read", None, vec![("200", answer_of("the tests", object(&[("synthetics", array(schema("Synthetic")))], &["synthetics"])))]),
         Op { params: vec![name()], ..op("put", "/synthetics/{name}", "Makes or changes a synthetic test (and the monitor it owns, when it alerts)", "observe.manage", Some(body("SyntheticIn")), vec![no_content()]) },
         Op { params: vec![name()], ..op("delete", "/synthetics/{name}", "Removes a synthetic test and the monitor it owns", "observe.manage", None, vec![no_content()]) },

@@ -21,6 +21,7 @@ import { invalidate } from "@/lib/resource";
 import { Clouds } from "./clouds";
 import { LogSources } from "./logsources";
 import { Scrapes } from "./scrapes";
+import { StatsdListeners } from "./statsd";
 import { ObserveNav, integrationsRes } from "./parts";
 
 const KINDS: { value: IntegrationKind; label: string; url: string }[] = [
@@ -77,6 +78,7 @@ export default function Integrations() {
       <Clouds />
       <Scrapes />
       <LogSources />
+      <StatsdListeners />
     </div>
   );
 }

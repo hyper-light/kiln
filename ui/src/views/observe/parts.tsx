@@ -17,6 +17,7 @@ import {
   type ObserveStatus,
   type QueryAnswer,
   type Scrape,
+  type Statsd,
   type Synthetic,
   type HeatmapAnswer,
   type Slo,
@@ -430,6 +431,7 @@ export const sloRes = (id: string): Res<Slo> => ({ key: `observe/slo/${id}`, fet
 export const integrationsRes: Res<Integration[]> = { key: "observe/integrations", fetch: (s) => observeApi.integrations(s) };
 export const cloudsRes: Res<Cloud[]> = { key: "observe/clouds", fetch: (s) => observeApi.clouds(s), opts: { pollMs: 10_000 } };
 export const scrapesRes: Res<Scrape[]> = { key: "observe/scrapes", fetch: (s) => observeApi.scrapes(s), opts: { pollMs: 10_000 } };
+export const statsdRes: Res<Statsd[]> = { key: "observe/statsd", fetch: (s) => observeApi.statsd(s), opts: { pollMs: 10_000 } };
 export const syntheticsRes: Res<Synthetic[]> = { key: "observe/synthetics", fetch: (s) => observeApi.synthetics(s), opts: { pollMs: 10_000 } };
 export const logSourcesRes: Res<LogSource[]> = { key: "observe/log_sources", fetch: (s) => observeApi.logSources(s), opts: { pollMs: 10_000 } };
 export const pipelinesRes: Res<Pipeline[]> = { key: "observe/pipelines", fetch: (s) => observeApi.pipelines(s) };

@@ -31,6 +31,7 @@ pub mod prom;
 pub mod query;
 pub mod rollup;
 pub mod slo;
+pub mod statsd;
 pub mod store;
 pub mod symbols;
 pub mod testkit;

@@ -103,6 +103,28 @@ fn apply_synthetics(t: &super::synthetics::Tests) {
     }
 }
 
+/// The server's DogStatsD listeners, once it started.
+static STATSD: OnceLock<std::sync::Arc<super::statsd::Listeners>> = OnceLock::new();
+
+pub fn set_statsd(l: std::sync::Arc<super::statsd::Listeners>) {
+    let _ = STATSD.set(l);
+}
+
+fn statsd() -> Result<&'static std::sync::Arc<super::statsd::Listeners>, Fail> {
+    STATSD.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "DogStatsD listeners are kept by the server"))
+}
+
+/// The listeners now, applied: the server's own open from now, each runner told its own.
+fn apply_statsd(l: &super::statsd::Listeners) {
+    let all = l.list();
+    if let Some(s) = super::statsd::get() {
+        s.set(&all);
+    }
+    if let Some(o) = get() {
+        o.set_statsd(all);
+    }
+}
+
 /// The server's log sources, once it started.
 static LOG_SOURCES: OnceLock<std::sync::Arc<super::collect::Sources>> = OnceLock::new();
 
@@ -753,6 +775,52 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 Err(e) => json!({ "ok": false, "error": format!("{e:#}"), "took_ms": t0.elapsed().as_millis() as u64 }),
             };
             Ok(srv::json(StatusCode::OK, &answer))
+        }
+        (&Method::GET, ["statsd"]) => {
+            // Each listener, and how each machine that opens it goes: the server's own here, a
+            // runner's from its last status.
+            let mut by_name: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+            for (name, st) in super::statsd::get().map(|s| s.states()).unwrap_or_default() {
+                by_name.entry(name).or_default().push(json!({ "machine": super::statsd::SERVER, "state": st }));
+            }
+            if let Some(o) = get() {
+                for m in o.view().machines {
+                    for (name, st) in m.status.map(|s| s.statsd).unwrap_or_default() {
+                        by_name.entry(name).or_default().push(json!({ "machine": m.machine, "state": st }));
+                    }
+                }
+            }
+            let list: Vec<Value> = statsd()?
+                .list()
+                .into_iter()
+                .map(|(name, l)| {
+                    let mut v = serde_json::to_value(&l).unwrap_or(Value::Null);
+                    if let Value::Object(o) = &mut v {
+                        o.insert("name".into(), Value::from(name.clone()));
+                        o.insert("machines".into(), Value::from(by_name.remove(&name).unwrap_or_default()));
+                    }
+                    v
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "statsd": list })))
+        }
+        (&Method::PUT, ["statsd", name]) => {
+            let name = (*name).to_owned();
+            let l: super::statsd::Listener = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = statsd()?;
+            store.put(&name, l).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_statsd(store);
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::DELETE, ["statsd", name]) => {
+            let store = statsd()?;
+            match store.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+                true => {
+                    apply_statsd(store);
+                    Ok(srv::status(StatusCode::NO_CONTENT))
+                }
+                false => Err(fail(StatusCode::NOT_FOUND, "no such DogStatsD listener")),
+            }
         }
         (&Method::GET, ["synthetics"]) => {
             // Each test, and how each location goes: the server's own here, a runner's from its

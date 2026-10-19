@@ -455,6 +455,46 @@ const scenarios = {
     await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
     await until("the target gone", async () => !(await api("GET", "/api/observe/v1/scrapes")).body.scrapes.some((t) => t.name === name));
   },
+  /** A DogStatsD listener added from the form, sent datagrams as an application sends them, its counts read back, and removed. */
+  async "a DogStatsD listener is added, takes what is sent it, and is removed"() {
+    const name = `e2e-d-${run}`;
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    await page.goto(`${BASE}/observe/integrations`);
+    await page.getByRole("button", { name: "Add listener", exact: true }).click();
+    const dialog = page.getByRole("dialog");
+    await fillIn(dialog.getByLabel("Name"), name);
+    await fillIn(dialog.getByLabel("Listen on"), `udp://127.0.0.1:${port}`);
+    await fillIn(dialog.getByLabel("Tags"), "env:e2e");
+    await fillIn(dialog.getByLabel("Histogram percentiles"), "0.5, 0.99");
+    await dialog.getByRole("button", { name: "Add", exact: true }).click();
+    const kept = async () => (await api("GET", "/api/observe/v1/statsd")).body.statsd.find((l) => l.name === name);
+    await until("the listener open on the server", async () => (await kept())?.machines?.some((m) => m.machine === "server" && m.state.listening.length === 1), 30_000);
+    const listener = await kept();
+    expect(JSON.stringify(listener.histogram_percentiles) === "[0.5,0.99]" && listener.histogram_aggregates === undefined, `what the form sent: ${JSON.stringify(listener)}`);
+    // An application's counts, a timer, and a gauge, over UDP.
+    const metric = `e2e.dsd.${run}`;
+    const sock = dgram.createSocket("udp4");
+    const send = (text) => new Promise((ok, fail) => sock.send(text, port, "127.0.0.1", (e) => (e ? fail(e) : ok())));
+    const from = Date.now() - 1000;
+    for (let i = 0; i < 30; i++) await send(`${metric}:1|c|#route:/x`);
+    await send(`${metric}.lat:5:10:15|ms\n${metric}.q:7|g`);
+    sock.close();
+    const row = page.locator("tr", { hasText: name });
+    await until("the row says it listens and counts what came", async () => /Listening/.test((await row.textContent()) ?? "") && /(^|\D)32 metrics/.test((await row.textContent()) ?? ""), 30_000);
+    const sum = async () => {
+      const r = await api("POST", "/api/observe/v1/query", { query: `sum:${metric}{env:e2e}.as_count()`, from, to: Date.now() + 60_000, step: 10_000 });
+      return (r.body.series ?? []).flatMap((s) => s.values).reduce((a, v) => a + (v ?? 0), 0);
+    };
+    await until("its counts stored, once its bucket is over", async () => (await sum()) === 30, 40_000);
+    const median = await api("POST", "/api/observe/v1/query", { query: `max:${metric}.lat.50percentile{*}`, from, to: Date.now() + 60_000, step: 10_000 });
+    expect(
+      (median.body.series?.[0]?.values ?? []).some((v) => v === 10),
+      `the timer's 50th percentile: ${JSON.stringify(median.body.series)}`,
+    );
+    await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+    await until("the listener gone", async () => !(await kept()));
+  },
   /** A search's patterns: the seed's message shapes grouped, and a pattern a click from its records. */
   async "a search's records group into patterns, and a pattern narrows the search to its own"() {
     // Records of its own, of three shapes.

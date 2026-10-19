@@ -209,6 +209,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             o.set_synthetics(all);
         }
         crate::observe::api::set_synthetics(tests);
+        // DogStatsD listeners: kept here, the server's own opened here, each runner told its own.
+        let listeners = std::sync::Arc::new(crate::observe::statsd::Listeners::open(&cfg.data("observe")));
+        let all = listeners.list();
+        crate::observe::statsd::start(crate::observe::statsd::SERVER, &crate::os::hostname(), shutdown.clone()).set(&all);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_statsd(all);
+        }
+        crate::observe::api::set_statsd(listeners);
         // Log pipelines: kept here, applied here and by every runner.
         let pipelines = std::sync::Arc::new(crate::observe::pipeline::kept::Pipelines::open(&cfg.data("observe")));
         crate::observe::pipeline::kept::activate(&pipelines.defs());

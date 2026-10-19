@@ -24,6 +24,7 @@ pub mod scrape;
 pub mod slos;
 pub mod smtp;
 pub mod spans;
+pub mod statsd;
 pub mod synthetics;
 pub mod wire;
 

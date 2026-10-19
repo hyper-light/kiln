@@ -17,7 +17,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7), described in OpenAPI 3.1 and held to what its routes answer; Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
-| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
+| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events; DogStatsD on every machine (§8.4: Datadog's protocol over UDP and Unix sockets, aggregated as its Agent aggregates, checked live with Datadog's own client; 5 M messages a second a listener, §12.20) | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
@@ -548,6 +548,7 @@ its schema (§13). Built:
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET synthetics`, `PUT/DELETE synthetics/{name}`, `POST synthetics/{name}/test`, `POST synthetics/{name}/run` | Synthetic tests (§10.4), each with how each location goes (passed, its last run's time, status, certificate's minutes, tries, failures; a runner's as of its last status) and the monitor it owns; a token left out of a `PUT` (or `"…"`) is the one kept, never shown; `test` runs one once from the server, nothing written; `run` runs it now at every location |
+| `GET statsd`, `PUT/DELETE statsd/{name}` | DogStatsD listeners (§8.4), each with how each machine that opens it goes (where it listens and the buffer it was granted, datagrams, metrics, events, checks, what did not read, contexts, points written, what waits and what was dropped; a runner's as of its last status) |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
 | `GET/POST pipelines`, `GET/PUT/DELETE pipelines/{id}`, `PUT pipeline_order`, `POST pipeline_test` | log pipelines (§8.2), in the order they apply, kiln's own first (read-only but for whether they are on: one is turned off, not removed); a pipeline made or changed is checked (it compiles) and applied from the next record on every machine; `pipeline_test` runs a pipeline given (or every one, in order) on records given and keeps nothing |
 | `GET/POST log_metrics`, `GET/PUT/DELETE log_metrics/{name}`, `POST log_metric_test` | metrics from logs (§8.3): Datadog's definitions, in kiln's shape or their API's envelope; each with what its latest window with records held, and how counting goes (the settle learned, windows counted again, windows too late); a name whose series another writes is refused (409); what a metric computes stays (400); `log_metric_test` counts a definition over the last fifteen minutes (an hour at the most) and writes nothing |
@@ -831,6 +832,53 @@ custom metrics' (`kiln.*`, `system.*` and `datadog.*` refused: kiln writes them)
 series something else writes already is refused (409), as is one another metric from logs writes:
 a metric has one writer. What a metric computes, and of what, stays; its filter, groups and
 percentiles change, counted so from the next window on.
+
+### 8.4 DogStatsD
+
+What an application sends Datadog's DogStatsD (`kiln_obs::statsd`, `crate::observe::statsd`), taken
+by the server and every runner: listeners the server keeps (`<observe>/statsd.json`) and tells each
+machine its own, as it tells scrape targets, so an application instrumented for Datadog points its
+client at kiln on its own host and nothing else changes.
+
+- **Where.** A listener listens over UDP (`udp://127.0.0.1:8125`, the Agent's `dogstatsd_port`;
+  `0.0.0.0` takes other machines' too) and, on Unix, over a datagram socket (the Agent's
+  `dogstatsd_socket`; anyone on the machine may send to it, only kiln reads), four addresses at the
+  most, a thread a socket. It asks for a 4 MiB receive buffer: Linux charges a datagram some 768
+  bytes beyond what it holds, so that is some 5,000 datagrams, 50 ms of 100,000 a second, through a
+  reading thread's scheduling delay on a loaded machine (the Agent leaves the system's 208 KiB); the
+  system grants what its bound allows (`net.core.rmem_max`), and the listener says what it got.
+- **What.** Protocol 1.3 (Datadog's "Datagram Format"): a metric, several values a message, a
+  sample rate, tags, a container and a timestamp; events and service checks. A message's context is
+  its name, how it aggregates, its host (a `host:` tag's, else the machine's) and its tags in any
+  order, a key once (its first value: a series has one value a key, so `#team:a,team:b` keeps
+  `team:a`, counted); the listener's own tags go where the message has not the key.
+- **Aggregated as the Agent aggregates** (its time sampler: buckets of ten seconds of when samples
+  came, a bucket's points at its start once it is over): a count sums its values each over its
+  sample rate, a count a bucket (`.as_rate()` reads it a second, as Datadog shows a DogStatsD count),
+  and writes zero for five minutes after its last sample, so a graph of it falls to zero
+  (`dogstatsd_expiry_seconds`); a gauge its last value; a set its distinct values; a histogram or a
+  timer the aggregates its listener asks (`histogram_aggregates`: max, median, avg, count unless
+  said; min, sum) and its percentiles (`histogram_percentiles`, 0.95 unless said), each its own
+  series (`<name>.max`, `.95percentile`, ...), the median and percentiles the Agent's nearest rank
+  over the samples' weights; a distribution kiln's distribution (§4.4), merged across hosts and time.
+  A gauge or count with a timestamp is written at it as it came.
+- **Events** are kiln's events (`source:kiln.event`, as `POST events` makes them); **service
+  checks** are records, `source:service_check` with `@check` and `@check_status` (OK an info, WARNING
+  a warning, CRITICAL an error), for log monitors to watch.
+- **Bounds.** 131,072 contexts a listener (a bucket of that many histograms, five series each, is a
+  fifth of what a node takes waiting); past it a new context's samples are refused and counted.
+  Histogram samples are held exactly, 1 Mi of them across contexts and 64 Ki a context; past
+  either, a context's samples that bucket go into buckets of §4.4's scale, its percentiles then
+  within 1.09%. A set counts 64 Ki distinct values a bucket; a distribution keeps 4,096 buckets (the
+  Agent's own sketches' limit), a value past them counted in the nearest. A datagram has no sender
+  to tell to wait: what observe has no room for is held and offered again (six buckets of points,
+  10,000 records), the oldest past that dropped and counted. A listener reconfigured starts again;
+  stopping, it writes the bucket under way.
+
+Steady state allocates nothing a message: a context is found by a hash of its name, host and tags,
+each tag hashed alone (so their order does not matter) and a key given twice found by its bytes; its
+series' keys are made once, when it is first seen, and a bucket is written as an OTLP request's
+samples are, each series' key once and its samples flat (§12.20).
 
 ## 9. Monitors
 
@@ -2092,6 +2140,41 @@ matters where cores are contended: with idle cores the 15 helpers' tail was alik
 once (the bench: 23 MiB to 42, the C library's arenas of the threads that read), then hold it (no
 page faults a query after the first); every soak run held its level.
 
+### 12.20 DogStatsD
+
+`cargo bench -p kiln-obs --bench statsd`: datagrams as Datadog's clients pack them (1,432 bytes over
+UDP, 8 KiB over a Unix socket); a service's traffic (by route, method and status: four in ten a
+count, four a timer, a gauge, a set or a distribution; six tags each, Datadog's unified service
+tagging's and the route's), and many contexts. Once its contexts exist, a message (fedora,
+2026-10-19):
+
+| traffic | contexts | ns a message | allocations a message | page faults | a bucket's flush |
+| --- | --- | --- | --- | --- | --- |
+| a service, 200 routes, UDP | 1,817 | 238 (550 before) | 0 | 0 | 854 ns a context, 0 allocations (1,663 and 1,200) |
+| a service, 200 routes, Unix | 1,817 | 246 | 0 | 0 | 904 ns |
+| a service, 5,000 routes, UDP | 43,594 | 394 (840) | 0 | 0 | 109 ns (311 and 28,295) |
+| 100,000 contexts (counts) | 100,000 | 171 (398) | 0 | 0 | 19 ns |
+
+What moved it (perf, then the bench again): a datagram's UTF-8 checked once rather than a line at a
+time, its lines split by `memchr` rather than a byte at a time; a tag hashed once (its key and value
+had been hashed apart and mixed); a histogram's samples sorted once a flush (each quantile had
+sorted them) and its values worked out in a buffer kept from flush to flush. What is left is spread
+thin: hashing a sixth, splitting a sixth, parsing a tenth, and at 100,000 contexts the context's
+lookup, cache misses mostly.
+
+Live (`observe_statsd.rs`, a release build, fedora): four senders flood a listener's UDP socket for
+20 s, 13 counts a datagram over 10,000 contexts. Every datagram the listener read was stored exactly
+(its counts summed in kiln equal what it read):
+
+| messages a second | datagrams | read | the server, cores while it came |
+| --- | --- | --- | --- |
+| 500,000 | 768,909 | all | 0.20 |
+| 2,000,000 | 3,075,770 | all | 0.48 |
+| 5,000,000 | 7,687,608 | all (in another run, 98%: the system dropped 2% before they were read) | 0.53 |
+
+Five million a second is one socket's thread's edge on this machine, past what a host's DogStatsD
+sees; a listener with more addresses reads each on a thread of its own.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -2320,6 +2403,22 @@ each said once, and the monitor the test owns alerts a webhook (its message the 
 back, it recovers, told, and each location's recovery is said. Removed, its monitor goes with it
 (404). In the OpenAPI document and its conformance test; the routes a maintainer's. 2026-10-19:
 passes (181 s).
+
+**DogStatsD** (`crates/kiln/tests/observe_statsd.rs`): a kiln server and a runner, each opening the
+listener the server keeps for it: the server's over UDP and a Unix socket with a tag of its own, the
+runner's over UDP with histograms of max, min, count and the 99th percentile. Datagrams as the
+protocol spells them: 110 counts over sample rates come out of `sum:…as_count()` as 110, a `host:`
+tag's as that host, the listener's tag on every one; a gauge's last value, a set's two distinct
+values; a timer's 22 samples as the Agent writes them (its median the nearest rank's 11, its 95th
+100, its average and count); a distribution's count, sum and percentiles (within 1.09%); a gauge
+with a timestamp two minutes back written there; the Unix socket's and the runner's (of host `r1`,
+only the aggregates its listener asked); an event in the event stream, a service check a record
+(`status:error`, `@check_status:critical`); a count that stopped falling to zero; two lines that do
+not read counted, nothing else lost. Then Datadog's own client (datadog-py 0.55: increments,
+decrements, gauges, sets, 100 timings, distributions, `gauge_with_timestamp`, an event and a service
+check, over UDP and the Unix socket): every one as sent. What the API refuses (a TCP address, the
+99.9th percentile, an unknown aggregate) is refused; removed, a listener closes where it was opened,
+its socket file with it. 2026-10-19: passes (141 s). The flood beside it is §12.20's.
 
 **Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
 KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and

@@ -66,6 +66,10 @@ name = "beside"
 harness = false
 
 [[bench]]
+name = "statsd"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 

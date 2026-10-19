@@ -75,6 +75,9 @@ pub enum Msg {
     /// targets; and one of them to run now.
     Synthetics { tests: Vec<(String, super::synthetics::Test)> },
     RunSynthetic { name: String },
+    /// Server → runner: the DogStatsD listeners this machine opens (`super::statsd`), as scrape
+    /// targets.
+    Statsd { listeners: Vec<(String, super::statsd::Listener)> },
 }
 
 /// What a write came to, as its sender needs it.
@@ -141,6 +144,8 @@ pub struct Status {
     pub collect: Vec<(String, super::collect::State)>,
     /// How each synthetic test it runs goes.
     pub synthetics: Vec<(String, super::synthetics::State)>,
+    /// How each DogStatsD listener it opens goes.
+    pub statsd: Vec<(String, super::statsd::State)>,
 }
 
 pub fn encode(msg: &Msg) -> String {
