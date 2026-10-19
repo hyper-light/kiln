@@ -367,6 +367,20 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
         At::Run(i) => repo_of(one("SELECT p.name FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.id = ?1", seg(i)).await),
         At::Job(i) => repo_of(one("SELECT p.name FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1", seg(i)).await),
         At::Runner(i) => Scope::Runner { runner: seg(i) },
+        At::Diff(i) => {
+            let key = seg(i);
+            let (kind, number) = crate::ci::diffs::key_of(&key);
+            let name = hub
+                .store
+                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))", rusqlite::params![key, number, kind], |r| r.get::<_, String>(0)).optional()?))
+                .await
+                .ok()
+                .flatten();
+            repo_of(name)
+        }
+        At::Stack(i) => repo_of(one("SELECT p.name FROM stacks s JOIN repos p ON p.id = s.repo_id WHERE s.id = ?1", seg(i)).await),
+        At::Comment(i) => repo_of(one("SELECT p.name FROM review_comments c JOIN review_threads t ON t.id = c.thread_id JOIN diffs d ON d.id = t.diff_id JOIN repos p ON p.id = d.repo_id WHERE c.id = ?1", seg(i)).await),
+        At::Entry(i) => repo_of(one("SELECT p.name FROM land_queue q JOIN repos p ON p.id = q.repo_id WHERE q.id = ?1", seg(i)).await),
         At::ScopeQuery => match q.get("scope").map(|s| Scope::parse(s)) {
             Some(Ok(s)) => match s.repo().map(str::to_owned) {
                 Some(r) => {

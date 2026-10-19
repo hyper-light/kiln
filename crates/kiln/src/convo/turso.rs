@@ -3,7 +3,7 @@
 //! to its end on that thread (`PlatformIO` does its I/O inline, so `step` waits on nothing).
 
 use std::num::NonZero;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, Row as TRow, SqliteDialect, Statement, StepResult, Value};
@@ -20,12 +20,16 @@ const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Rows of each kind a feed reads at once.
 const FEED_PAGE: usize = 512;
+/// How long opening waits for whoever else holds the file to let go of it: this process's last
+/// writer still closing, or the runner process before this one on its way out after an upgrade.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// A Turso database file.
 pub struct Turso {
     io: Arc<dyn IO>,
     _db: Arc<Database>,
     conn: Arc<Connection>,
+    path: PathBuf,
     /// Who the store is to its peers.
     id: String,
     /// The last number given to a write.
@@ -55,6 +59,42 @@ fn seq(v: u64) -> Value {
     Value::from_i64(i64::try_from(v).unwrap_or(i64::MAX))
 }
 
+/// A file beside the store's: its name with `suffix` added.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// What a compaction left behind it ([`Engine::compact`]): a compact copy written whole takes the
+/// store's place (the compaction stopped between the copy and the swap); one written in part goes.
+fn finish_compact(path: &Path) -> anyhow::Result<()> {
+    for part in [".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
+        let _ = std::fs::remove_file(beside(path, part));
+    }
+    let whole = beside(path, ".compact");
+    if !whole.exists() {
+        return Ok(());
+    }
+    // The old file's log would be read into the copy: it goes first.
+    for side in ["-wal", "-shm"] {
+        if let Err(e) = std::fs::remove_file(beside(path, side))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(anyhow::Error::from(e).context(format!("remove the old {side} of {}", path.display())));
+        }
+    }
+    std::fs::rename(&whole, path).map_err(|e| anyhow::Error::from(e).context(format!("put the compact copy in place of {}", path.display())))?;
+    // The rename itself on disk (not on Windows, which opens no folder).
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    tracing::info!(file = %path.display(), "conversation store: the compact copy took the store's place");
+    Ok(())
+}
+
 impl Turso {
     /// The database at `path`, made and migrated as needed.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -66,11 +106,18 @@ impl Turso {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        finish_compact(path)?;
         let name = path.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", path.display()))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
-        let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
+        let until = std::time::Instant::now() + LOCK_WAIT;
+        let db = loop {
+            match Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())) {
+                Err(turso_core::LimboError::LockingError(_)) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(100)),
+                opened => break opened.map_err(fail)?,
+            }
+        };
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn, id: String::new(), rev: 0, squeeze_below: 0 };
+        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0 };
         t.migrate(schema)?;
         if schema < 2 {
             return Ok(t);
@@ -633,6 +680,70 @@ impl Engine for Turso {
         Ok(next > 0)
     }
 
+    fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
+        let mut ended = self.prepare(sql::SESSIONS_ENDED_BEFORE)?;
+        let mut ids: Vec<String> = Vec::new();
+        self.run(&mut ended, &[int(before)], |r| {
+            if let Ok(id) = r.get::<String>(0) {
+                ids.push(id);
+            }
+            Ok(())
+        })?;
+        // The first lines of the first file of the first of them with a record still kept.
+        let (mut first, mut lines, mut gone) = (self.prepare(sql::RECORD_FIRST_SOURCE)?, self.prepare(sql::RECORD_FIRST_LINES)?, self.prepare(sql::RECORDS_PRUNE)?);
+        for id in ids {
+            let mut source = None;
+            self.run(&mut first, &[txt(&id)], |r| {
+                source = r.get::<String>(0).ok();
+                Ok(())
+            })?;
+            let Some(source) = source else { continue };
+            let mut ns: Vec<u64> = Vec::new();
+            self.run(&mut lines, &[txt(&id), txt(&source), int(i64::try_from(limit).unwrap_or(500))], |r| {
+                ns.push(u(r, 0));
+                Ok(())
+            })?;
+            let Some(last) = ns.last().copied() else { continue };
+            self.run(&mut gone, &[txt(&id), txt(&source), seq(last)], |_| Ok(()))?;
+            return Ok(ns.len());
+        }
+        Ok(0)
+    }
+
+    fn compact(self: Box<Self>, min_free: u64) -> anyhow::Result<(Box<dyn Engine>, Option<(u64, u64)>)> {
+        let pages = |q: &str| self.one_int(q, &[]).ok().flatten().and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+        let page = pages("PRAGMA page_size");
+        let (before, free) = (pages("PRAGMA page_count") * page, pages("PRAGMA freelist_count") * page);
+        if free < min_free || free * 3 < before {
+            return Ok((self, None));
+        }
+        // The copy, whole once renamed: from then on it takes the store's place, even after a crash.
+        let path = self.path.clone();
+        let (part, whole) = (beside(&path, ".compact.tmp"), beside(&path, ".compact"));
+        let copied = (|| -> anyhow::Result<()> {
+            let _ = std::fs::remove_file(&part);
+            let name = part.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", part.display()))?;
+            self.conn.execute(format!("VACUUM INTO '{}'", name.replace('\'', "''"))).map_err(fail)?;
+            // Everything is in the copy itself: the log it was written with holds nothing.
+            anyhow::ensure!(std::fs::metadata(beside(&part, "-wal")).map_or(0, |m| m.len()) == 0, "the compact copy's log isn't empty");
+            for side in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(beside(&part, side));
+            }
+            std::fs::File::open(&part)?.sync_all()?;
+            std::fs::rename(&part, &whole)?;
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&part);
+            tracing::warn!(file = %path.display(), error = %format!("{e:#}"), "conversation store: no compact copy could be made; it goes on as it is");
+            return Ok((self, None));
+        }
+        drop(self);
+        let opened = Self::open(&path)?;
+        let after = std::fs::metadata(&path).map_or(0, |m| m.len());
+        Ok((Box::new(opened), Some((before, after))))
+    }
+
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
         let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
         let mut out = Vec::new();
@@ -767,6 +878,133 @@ mod tests {
     }
 
     #[test]
+    fn the_records_of_sessions_that_ended_long_ago_go_and_their_events_stay() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("c.db"))?;
+        let mut rows = Vec::new();
+        for s in ["old", "recent", "open"] {
+            rows.push(Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 });
+            rows.extend(super::super::rows::of(s, &said("m1", 1, "the clock was read twice"), 5));
+            for source in ["cc-a", "cc-b"] {
+                for n in 0..5u64 {
+                    rows.push(Row::Record(Box::new(RecordRow { session: s.into(), source: source.into(), n, end: (n + 1) * 100, line: format!("{{\"n\":{n}}}") })));
+                }
+            }
+        }
+        rows.push(Row::Closed { session: "old".into(), at: 1_000 });
+        rows.push(Row::Closed { session: "recent".into(), at: 9_000 });
+        t.apply(&rows)?;
+        // Ended before 5,000: "old" alone, its two files, four lines at a time.
+        let mut gone = Vec::new();
+        loop {
+            match t.prune_some(5_000, 4)? {
+                0 => break,
+                n => gone.push(n),
+            }
+        }
+        assert_eq!(gone, vec![4, 1, 4, 1]);
+        assert!(t.marks("old")?.is_empty());
+        assert_eq!(t.kept("old", 10)?.map(|k| k.events.len()), Some(1), "its events stay");
+        for s in ["recent", "open"] {
+            assert_eq!(t.marks(s)?.len(), 2, "{s}");
+            assert_eq!(t.record(s, "cc-b", 0, 10)?.len(), 5, "{s}");
+        }
+        Ok(())
+    }
+
+    /// A line that compresses little: random ids, about `bytes` of them.
+    fn noise(bytes: usize) -> String {
+        let mut s = String::with_capacity(bytes + 32);
+        while s.len() < bytes {
+            s.push_str(&crate::util::new_id());
+        }
+        format!("{{\"text\":\"{s}\"}}")
+    }
+
+    #[test]
+    fn a_store_made_compact_keeps_everything_and_goes_on() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let mut t = Turso::open(&path)?;
+        let line = |s: &str, n: u64, text: String| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: text }));
+        let mut rows = vec![Row::Session { session: "gone".into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 }];
+        rows.extend((0..1_500u64).map(|n| line("gone", n, noise(2_000))));
+        rows.push(Row::Closed { session: "gone".into(), at: 10 });
+        let kept: Vec<(u64, String)> = (0..40u64).map(|n| (n, noise(500))).collect();
+        rows.extend(kept.iter().map(|(n, l)| line("kept", *n, l.clone())));
+        rows.extend(super::super::rows::of("kept", &said("m1", 1, "the clock was read twice"), 5));
+        t.apply(&rows)?;
+        while t.prune_some(1_000, 500)? > 0 {}
+        let (id, rev) = (t.id(), t.rev);
+        // Not worth it below the bar; then made compact, the same store going on.
+        let (t, none) = Box::new(t).compact(u64::MAX)?;
+        assert_eq!(none, None);
+        let (mut t, sizes) = t.compact(0)?;
+        let Some((before, after)) = sizes else { anyhow::bail!("nothing was made compact") };
+        assert!(after * 2 < before, "{before} -> {after}");
+        assert_eq!(t.id(), id);
+        assert_eq!(t.record("kept", "cc", 0, 100)?, kept);
+        assert_eq!(t.kept("kept", 10)?.map(|k| k.events.len()), Some(1));
+        assert_eq!(t.changes(rev, 1 << 20)?.rows.len(), 0, "the numbers went on where they were");
+        t.apply(&[line("kept", 40, "{\"after\":true}".into())])?;
+        assert_eq!(t.record("kept", "cc", 40, 10)?, vec![(40, "{\"after\":true}".to_owned())]);
+        assert!(t.changes(rev, 1 << 20)?.rows.iter().all(|c| c.rev > rev));
+        for left in [".compact", ".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
+            assert!(!beside(&path, left).exists(), "{left} left beside the store");
+        }
+        Ok(())
+    }
+
+    /// A store whose file another process still holds (the runner before this one, on its way
+    /// out after an upgrade) is opened once that process lets go, not given up on.
+    #[cfg(unix)]
+    #[test]
+    fn opening_waits_for_another_process_to_let_go_of_the_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let id = Turso::open(&path)?.id();
+        // Held as Turso holds it (an fcntl lock), by another process, for a second.
+        let holder = std::process::Command::new("python3")
+            .args(["-c", "import fcntl, sys, time; f = open(sys.argv[1], 'r+'); fcntl.lockf(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(1)", &path.to_string_lossy()])
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut holder) = holder else {
+            eprintln!("skipped: no python3");
+            return Ok(());
+        };
+        let mut line = String::new();
+        let out = holder.stdout.take().ok_or_else(|| anyhow::anyhow!("the holder has no stdout"))?;
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)?;
+        anyhow::ensure!(line.trim() == "held", "the holder said {line:?}");
+        let started = std::time::Instant::now();
+        let t = Turso::open(&path)?;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300), "opened while another process held the file");
+        assert_eq!(t.id(), id);
+        let _ = holder.wait();
+        Ok(())
+    }
+
+    #[test]
+    fn a_compaction_stopped_before_the_swap_is_finished_when_the_store_opens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let id = {
+            let mut t = Turso::open(&path)?;
+            t.apply(&[Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n: 0, end: 1, line: "{\"in\":\"the copy\"}".into() }))])?;
+            t.conn.execute(format!("VACUUM INTO '{}'", beside(&path, ".compact").display())).map_err(fail)?;
+            t.id()
+        };
+        // The old file's log, which mustn't be read into the copy, and a copy written in part.
+        std::fs::write(beside(&path, "-wal"), b"not a log of the copy")?;
+        std::fs::write(beside(&path, ".compact.tmp"), b"half a copy")?;
+        let mut t = Turso::open(&path)?;
+        assert_eq!(t.id(), id);
+        assert_eq!(t.record("s1", "cc", 0, 10)?, vec![(0, "{\"in\":\"the copy\"}".to_owned())]);
+        assert!(!beside(&path, ".compact").exists() && !beside(&path, ".compact.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
     fn transcript_lines_are_kept_compressed_and_read_back_whole() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut t = Turso::open(&dir.path().join("c.db"))?;
@@ -828,7 +1066,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("conversations.db");
         {
-            let store = super::super::store::Store::start(Box::new(Turso::open(&path)?))?;
+            let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), None)?;
             store.send("a1", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
             for i in 1..=2_000u64 {
                 store.send("a1", &said(&format!("m{i}"), i, &format!("reply {i} about 100% of_the parser")));
@@ -858,7 +1096,7 @@ mod tests {
             assert!(scoped.is_empty());
         }
         // Reopened: everything is still there, and the schema isn't made twice.
-        let store = super::super::store::Store::start(Box::new(Turso::open(&path)?))?;
+        let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), None)?;
         let k = store.kept("a1", 5_000)?.ok_or_else(|| anyhow::anyhow!("nothing kept after reopening"))?;
         assert_eq!(k.events.len(), 2_000);
         assert!(k.events.iter().any(|e| e.id == "m7" && e.text == "reply seven, revised"));

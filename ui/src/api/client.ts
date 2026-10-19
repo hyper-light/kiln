@@ -1,4 +1,4 @@
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -233,7 +233,12 @@ export const api = {
   updates: (signal?: AbortSignal) => get<UpdatesOverview>("/api/updates", signal),
   /** Ask GitHub (and, in Kubernetes, the image on the node) again; an `updates` event follows. */
   checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),
-  upgradeRunner: (name: string) => post<UpdateJob>(`/api/updates/runners/${enc(name)}`),
+  /** Upgrade that runner now (a retry too): that way, or whichever kiln can. */
+  upgradeRunner: (name: string, way?: UpgradeWay) => post<UpdateJob>(`/api/updates/runners/${enc(name)}`, way ? { way } : undefined),
+  /** How long kiln waits on runners' upgrades from now on (those under way too). */
+  setUpgradeWaits: (waits: UpgradeWaits) => request<void>("PUT", "/api/updates/waits", waits),
+  /** Back to what kiln.toml says. */
+  resetUpgradeWaits: () => del<void>("/api/updates/waits"),
   /** What that runner does with a newer kiln. */
   setRunnerPolicy: (name: string, policy: UpdatePolicy) => request<void>("PUT", `/api/updates/runners/${enc(name)}`, { policy }),
   /** The same update policy for these runners, or every one. */

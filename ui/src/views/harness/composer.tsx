@@ -339,14 +339,18 @@ export function Composer({
 
   // Grow with the text (measured as each change is shown) up to the stylesheet's most lines, ten,
   // or four on a phone; past that it scrolls inside, so a long message never pushes the
-  // conversation off the screen.
+  // conversation off the screen. Words added can only make it taller, which its scroll height says
+  // as it is; only words taken away let it shrink, so only then is it set back to measure: typing
+  // never makes the whole page lay itself out again.
+  const lengthWas = React.useRef(0);
   const grow = React.useCallback(
     (el: HTMLTextAreaElement | null) => {
       ta.current = el;
       if (!el) return;
-      void text;
-      el.style.height = "auto";
-      el.style.height = `${el.scrollHeight}px`;
+      if (text.length < lengthWas.current || !text) el.style.height = "auto";
+      lengthWas.current = text.length;
+      const h = `${el.scrollHeight}px`;
+      if (el.style.height !== h) el.style.height = h;
       if (mirror.current) mirror.current.scrollTop = el.scrollTop;
     },
     [text],

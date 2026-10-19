@@ -1014,6 +1014,7 @@ impl Hub {
                     if let Some(k) = f.kiln.clone() {
                         crate::fleet::remember(self, &k.build, &k.target, &k.commit);
                         self.instances.lock().set_kiln(peer, k);
+                        self.updates.late_by_commit(self, &agent);
                         self.updates.fleet.wake();
                     }
                     // A probe's whole report (a runner that only said its kiln has no CPU count):

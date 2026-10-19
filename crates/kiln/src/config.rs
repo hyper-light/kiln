@@ -93,6 +93,15 @@ pub struct RepoConfig {
     pub clone_url: Option<String>,
     pub branches: Vec<String>,
     pub poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (docs/ci.md W14-R01), made empty or from `import`; `upstream`
+    /// (the default): kiln follows `clone_url`.
+    pub mode: Option<String>,
+    /// A native repository's history, copied once from this URL.
+    pub import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    pub default_branch: Option<String>,
+    /// A native repository's upstream: its trunk is pushed there after each land.
+    pub mirror: Option<String>,
 }
 
 
@@ -157,6 +166,16 @@ pub struct Conversations {
     pub mirrors: usize,
     /// Runners to pick first, by name (each still has to keep a store of its own).
     pub mirror_on: Vec<String>,
+    /// Days the server's store keeps an ended agent's transcript (its events stay). 0: for good.
+    /// Runners and mirrors keep them the default 30.
+    pub keep_closed_days: u32,
+}
+
+impl Conversations {
+    /// How long ended agents' transcripts are kept (None: for good).
+    pub fn keep_closed(&self) -> Option<std::time::Duration> {
+        (self.keep_closed_days > 0).then(|| std::time::Duration::from_secs(u64::from(self.keep_closed_days) * 86_400))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,7 +407,7 @@ impl Default for Terminal {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new() }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30 }
     }
 }
 
@@ -474,10 +493,28 @@ pub struct Updates {
     /// one, whatever the server's policy for it (`kiln config set updates.accept false`); the
     /// server shows it so.
     pub accept: bool,
+    /// Minutes a runner has to switch to its new build and report in, counted once it has no
+    /// jobs running. Settings → Updates can change it, and the two below.
+    pub upgrade_minutes: u64,
+    /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running (it
+    /// switches only once they are done).
+    pub wait_for_jobs_minutes: u64,
+    /// Minutes a machine has to build kiln itself, install included.
+    pub build_minutes: u64,
 }
 
 impl Default for Updates {
     fn default() -> Self {
-        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned(), in_step: true, follow: true, accept: true }
+        Self {
+            release_repo: "hyper-light/kiln".to_owned(),
+            release_pipeline: "release".to_owned(),
+            release_branch: "main".to_owned(),
+            in_step: true,
+            follow: true,
+            accept: true,
+            upgrade_minutes: 15,
+            wait_for_jobs_minutes: 6 * 60,
+            build_minutes: 60,
+        }
     }
 }

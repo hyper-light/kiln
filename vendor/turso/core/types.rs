@@ -823,6 +823,7 @@ impl Value {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(unpredictable_function_pointer_comparisons)] // kiln: as upstream compares them
 pub struct ExternalAggState {
     pub context: usize,
     pub state: *mut AggCtx,

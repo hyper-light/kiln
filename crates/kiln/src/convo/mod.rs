@@ -26,18 +26,19 @@ pub const MIRROR_FILE: &str = "mirror.db";
 
 /// This machine's conversation store in `dir`, its writer started: None when it is turned off
 /// (`KILN_CONVERSATIONS=off`) or can't be opened, and the machine runs as it did without one.
-pub fn open(dir: &std::path::Path) -> Option<store::Store> {
-    open_file(dir, FILE)
+/// `keep_closed`: how long the records of sessions that ended are kept (None: for good).
+pub fn open(dir: &std::path::Path, keep_closed: Option<std::time::Duration>) -> Option<store::Store> {
+    open_file(dir, FILE, keep_closed)
 }
 
 /// The store kept in file `file` of `dir` (see [`open`]).
-pub fn open_file(dir: &std::path::Path, file: &str) -> Option<store::Store> {
+pub fn open_file(dir: &std::path::Path, file: &str, keep_closed: Option<std::time::Duration>) -> Option<store::Store> {
     if std::env::var("KILN_CONVERSATIONS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")) {
         tracing::info!("the conversation store is off (KILN_CONVERSATIONS)");
         return None;
     }
     let path = dir.join(file);
-    let opened = turso::Turso::open(&path).and_then(|engine| store::Store::start(Box::new(engine)));
+    let opened = turso::Turso::open(&path).and_then(|engine| store::Store::start(Box::new(engine), keep_closed));
     match opened {
         Ok(s) => {
             tracing::info!(file = %path.display(), "conversations are kept in the store");

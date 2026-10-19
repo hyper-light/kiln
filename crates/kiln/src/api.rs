@@ -319,6 +319,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        // W14: diffs and stacks.
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+            let segs: Vec<&str> = s.iter().skip(1).copied().collect();
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
@@ -326,9 +332,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "check"]) => Ok(updates_overview(&hub, true).await),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
         (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
-        (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
+        (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name, req).await,
         (&Method::PUT, ["api", "updates", "runners", name]) => set_runner_policy(&hub, name, req).await,
         (&Method::PUT, ["api", "updates", "policy"]) => set_policies(&hub, req).await,
+        (&Method::PUT, ["api", "updates", "waits"]) => set_waits(&hub, req).await,
+        (&Method::DELETE, ["api", "updates", "waits"]) => reset_waits(&hub).await,
         (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
         (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
@@ -1341,6 +1349,14 @@ struct NewRepo {
     #[serde(default)]
     branches: Vec<String>,
     poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (W14-R01); `upstream` (the default): kiln follows `clone_url`.
+    mode: Option<String>,
+    /// A native repository's history, copied from this URL (`kiln repo import`).
+    import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    default_branch: Option<String>,
+    /// A native repository's upstream, its trunk pushed there after each land (W14-R01).
+    mirror: Option<String>,
 }
 
 async fn add_repo(hub: &Hub, req: Request) -> R {
@@ -1349,11 +1365,33 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
     if name.split('/').count() != 2 || name.contains(char::is_whitespace) {
         return Err(err(StatusCode::BAD_REQUEST, "name must be owner/repo"));
     }
+    let native = match r.mode.as_deref() {
+        None => r.import.is_some(),
+        Some("native") => true,
+        Some("upstream") => false,
+        Some(m) => return Err(err(StatusCode::BAD_REQUEST, format!("mode `{m}`: `native` or `upstream`"))),
+    };
+    let default_branch = r.default_branch.clone().filter(|_| native).or_else(|| native.then(|| "main".to_owned()));
+    if let Some(m) = r.mirror.as_deref() {
+        if !native {
+            return Err(err(StatusCode::BAD_REQUEST, "a mirror is a native repository's upstream"));
+        }
+        crate::ci::hosting::importable(m).map_err(|e| err(StatusCode::BAD_REQUEST, e.replace("an import copies", "a mirror is")))?;
+    }
+    let clone_url = if native {
+        if let Some(url) = &r.import {
+            crate::ci::hosting::importable(url).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        }
+        let path = crate::ci::hosting::create(hub, &name, default_branch.as_deref().unwrap_or("main"), r.import.as_deref()).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        crate::ci::hosting::clone_url(&path)
+    } else {
+        r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git"))
+    };
     let repo = hub
         .store
         .upsert_repo(Repo {
             id: crate::util::new_id(),
-            clone_url: r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git")),
+            clone_url,
             name: name.clone(),
             branches: r.branches,
             poll_seconds: r.poll_seconds.unwrap_or(hub.cfg.gitops.poll_seconds),
@@ -1361,6 +1399,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
             created_at: crate::util::now_unix(),
             last_polled_at: None,
             last_error: None,
+            mode: if native { "native" } else { "upstream" }.into(),
+            default_branch,
+            mirror: r.mirror.clone(),
         })
         .await?;
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
@@ -2192,6 +2233,11 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
             "build": release_build(hub).await,
             "newest": hub.updates.fleet.target(),
             "follow": hub.cfg.updates.follow,
+            "waits": {
+                "now": crate::updates::waits(hub).await,
+                "config": crate::updates::Waits::of(&hub.cfg.updates),
+                "changed": crate::updates::waits_changed(hub).await,
+            },
         }),
     )
 }
@@ -2239,8 +2285,23 @@ async fn build_every_platform(hub: &Hub) -> R {
 }
 
 /// `POST /api/updates/runners/{name}`: upgrade that machine's runner (nothing it runs stops).
-async fn upgrade_runner(hub: &Arc<Hub>, name: &str) -> R {
-    match crate::updates::upgrade_runner(hub, name).await {
+#[derive(Deserialize, Default)]
+struct RunnerUpgrade {
+    /// "download" or "build"; by default whichever kiln can.
+    #[serde(default)]
+    way: Option<crate::updates::Way>,
+}
+
+/// `POST /api/updates/runners/{name}`, optionally `{"way": "download" | "build"}`: upgrade that
+/// machine's runner to the newest kiln now, that way (a retry too).
+async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
+    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let b: RunnerUpgrade = if bytes.iter().all(u8::is_ascii_whitespace) {
+        RunnerUpgrade::default()
+    } else {
+        serde_json::from_slice(&bytes).map_err(|e| err(StatusCode::BAD_REQUEST, format!("the body isn't an upgrade: {e}")))?
+    };
+    match crate::updates::upgrade_runner(hub, name, b.way).await {
         Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
         Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
     }
@@ -2287,6 +2348,27 @@ async fn apply_policy(hub: &Arc<Hub>, names: &[String], policy: crate::updates::
     hub.emit(&json!({ "type": "updates" }));
     // Its gauges at once, and an automatic one brought up to date.
     hub.updates.fleet.wake();
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `PUT /api/updates/waits` `{"upgrade_minutes": 15, "wait_for_jobs_minutes": 360, "build_minutes": 60}`:
+/// how long kiln waits on runners' upgrades from now on, those under way too (kiln.toml's
+/// `[updates]` says until then).
+async fn set_waits(hub: &Arc<Hub>, req: Request) -> R {
+    let w: crate::updates::Waits = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    w.check().map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::updates::set_waits(hub, Some(w)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let said = format!("upgrades {}, waiting for jobs {}, builds {}", w.upgrade_minutes, w.wait_for_jobs_minutes, w.build_minutes);
+    hub.store.audit("admin".into(), "upgrade.waits".into(), format!("{said} (minutes)")).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `DELETE /api/updates/waits`: back to what kiln.toml says.
+async fn reset_waits(hub: &Arc<Hub>) -> R {
+    crate::updates::set_waits(hub, None).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.waits".into(), "as kiln.toml says".to_owned()).await;
+    hub.emit(&json!({ "type": "updates" }));
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -2965,43 +3047,83 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
 /// After a snapshot on an agent session's socket: what was resent is complete.
 const SYNCED: &str = r#"{"t":"synced"}"#;
 
+/// What a viewer of an agent session takes, as its socket's query says.
+#[derive(Debug, Clone, Copy, Default)]
+struct Takes {
+    /// `z=gzip`: each snapshot packed. What a long conversation sends on attach is most of what it
+    /// ever sends, and on a slow link a tenth of it arrives ten times sooner.
+    packed: bool,
+    /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's.
+    patches: bool,
+}
+
+impl Takes {
+    fn of(query: Option<&str>) -> Self {
+        let has = |p: &str| query.is_some_and(|q| q.split('&').any(|x| x == p));
+        Self { packed: has("z=gzip"), patches: has("patch=state") }
+    }
+}
+
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
+    let takes = Takes::of(req.uri().query());
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = harness_attach(hub, id, socket).await {
+        if let Err(e) = harness_attach(hub, id, socket, takes).await {
             tracing::debug!(error = %format!("{e:#}"), "agent session websocket ended");
         }
     });
     Ok(resp)
 }
 
+/// A snapshot's frames and the `synced` after them, gzip'd as one message: a frame a line (frames
+/// are JSON, whose strings escape their line breaks).
+fn pack_snapshot(frames: &[String]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    for f in frames {
+        gz.write_all(f.as_bytes())?;
+        gz.write_all(b"\n")?;
+    }
+    gz.write_all(SYNCED.as_bytes())?;
+    gz.finish()
+}
+
+/// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
+/// one gzip'd binary message.
+async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -> anyhow::Result<()> {
+    if packed {
+        let bytes = crate::rt::blocking(move || pack_snapshot(&frames)).await??;
+        tx.send(ws::binary(bytes)).await?;
+        return Ok(());
+    }
+    for f in frames {
+        tx.send(ws::text(f)).await?;
+    }
+    tx.send(ws::text(SYNCED)).await?;
+    Ok(())
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
 /// so a viewer can swap it in at once instead of clearing what it shows.
-async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> anyhow::Result<()> {
+async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
     let Some(att) = hub.harness.attach(&id) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
-    for f in att.frames {
-        tx.send(ws::text(f)).await?;
-    }
-    tx.send(ws::text(SYNCED)).await?;
+    send_snapshot(&mut tx, att.frames, takes.packed).await?;
     let mut live = att.live;
     loop {
         futures::select_biased! {
             f = live.recv().fuse() => match f {
-                Ok(frame) => tx.send(ws::text(frame.as_ref())).await?,
+                Ok(frame) => tx.send(ws::text(frame.for_viewer(takes.patches))).await?,
                 Err(async_broadcast::RecvError::Overflowed(_)) => {
                     // Fell behind: start over from the current state (it begins with "open").
-                    for f in hub.harness.frames(&id).unwrap_or_default() {
-                        tx.send(ws::text(f)).await?;
-                    }
-                    tx.send(ws::text(SYNCED)).await?;
+                    send_snapshot(&mut tx, hub.harness.frames(&id).unwrap_or_default(), takes.packed).await?;
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },
@@ -3074,6 +3196,34 @@ async fn readyz(hub: &Hub) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_viewer_takes_what_its_query_asks_for() {
+        let t = Takes::of(Some("z=gzip&patch=state"));
+        assert!(t.packed && t.patches);
+        let t = Takes::of(Some("patch=state"));
+        assert!(!t.packed && t.patches);
+        let t = Takes::of(None);
+        assert!(!t.packed && !t.patches);
+        assert!(!Takes::of(Some("z=gzipped&patch=states")).packed);
+    }
+
+    #[test]
+    fn a_packed_snapshot_unpacks_to_its_frames_then_synced() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let long = format!(r#"{{"t":"events","events":[{{"id":"e1","text":"{}\nsecond line"}}]}}"#, "word ".repeat(4000));
+        let frames = vec![r#"{"t":"open","info":{}}"#.to_owned(), long.clone(), r#"{"t":"state","state":{}}"#.to_owned()];
+        let packed = pack_snapshot(&frames)?;
+        // A long conversation packs small.
+        assert!(packed.len() * 10 < long.len(), "{} bytes packed from {}", packed.len(), long.len());
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut text)?;
+        let lines: Vec<&str> = text.split('\n').collect();
+        let mut want: Vec<&str> = frames.iter().map(String::as_str).collect();
+        want.push(SYNCED);
+        assert_eq!(lines, want);
+        Ok(())
+    }
 
     #[test]
     fn release_downloads() {
