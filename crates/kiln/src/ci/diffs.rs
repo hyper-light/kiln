@@ -898,7 +898,20 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
-        (&Method::GET, ["review", "inbox"]) => ok(super::review::inbox(hub, caller).await?),
+        (&Method::GET, ["review", "inbox"]) => {
+            let mut v = super::review::inbox(hub, caller).await?;
+            // Changes on other hosts asking for the caller's review (docs/ci.md W23-R06), read in a
+            // task of its own: a host's calls nest deep.
+            if let Some(user) = caller.user.clone() {
+                let h = Arc::clone(hub);
+                let found = crate::rt::spawn(async move { crate::githost::pulls::asked_of(&h, &user).await }).await.unwrap_or_default();
+                let elsewhere: Vec<Value> = found.into_iter().filter(|p| caller.can("diffs.read", &crate::authz::Scope::Repo { repo: p.get("repo").and_then(Value::as_str).unwrap_or_default().to_owned() })).collect();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("elsewhere".into(), json!(elsewhere));
+                }
+            }
+            ok(v)
+        }
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         (_, ["diffs" | "change-requests", key, rest @ ..]) => {

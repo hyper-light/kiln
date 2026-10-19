@@ -4971,12 +4971,18 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
   acted on as the person when they signed in with that host (R08's last part), else with kiln's
   credentials there.
   - Checked against fakes of all three (`w23_r06_pulls`).
+- *Done.* Kiln's inbox (`GET /api/review/inbox`) has the hosts' changes asking for the person's
+  review (`elsewhere`), through the accounts they linked by signing in; reviews, comments, merges
+  and approvals they make from kiln are made with their own token on that host. Checked with a
+  person signed in with the fake GitHub (`w23_r08_as_the_person`).
+- *Done.* R07's CLI: `kiln repo provider <repo>` says what its CI runs on and what it may;
+  `kiln repo provider <repo> <provider…>` chooses (checked in `w23_ac01_contract`).
 - *Who builds what.* The review pages (W14-R06, AC06; R06 here) are the agentic work's, under
   W21's rules, against W14's APIs and R06's.
 - *Left.* The review pages showing other hosts' pull requests (the agentic work's, against R06's
-  API) and kiln's inbox with them; GitHub's review threads' resolved state (GraphQL only); AC02
-  and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their credentials
-  (user-assisted).
+  API); the repository settings page's choice of provider (R07's page, with the Settings work);
+  GitHub's review threads' resolved state (GraphQL only); AC02 and AC03, which need test
+  repositories on GitHub, GitLab and Bitbucket and their credentials (user-assisted).
 
 ## 4. API, events, CLI and MCP reference
 

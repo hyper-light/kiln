@@ -31,8 +31,8 @@ struct Req {
 /// What a fake answers: a status, a body (JSON, or text as a JSON string), and where it redirects.
 type Answer = (u16, Value, Option<String>);
 
-/// What a fake was asked: (method, path, body).
-type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
+/// What a fake was asked: (method, path, body, authorization).
+type Calls = Arc<Mutex<Vec<(String, String, Value, String)>>>;
 
 /// A fake API on a port of its own, answering with `answer(request, its port)`.
 fn fake(answer: impl Fn(&Req, u16) -> Answer + Send + 'static) -> anyhow::Result<(u16, Calls)> {
@@ -72,7 +72,7 @@ fn fake(answer: impl Fn(&Req, u16) -> Answer + Send + 'static) -> anyhow::Result
             let req = Req { method, path, auth, body: serde_json::from_slice(&body).unwrap_or(Value::Null) };
             let (status, reply, location) = answer(&req, port);
             if let Ok(mut c) = seen.lock() {
-                c.push((req.method.clone(), req.path.clone(), req.body.clone()));
+                c.push((req.method.clone(), req.path.clone(), req.body.clone(), req.auth.clone()));
             }
             let text = match &reply {
                 Value::String(t) => t.clone(),
@@ -88,20 +88,28 @@ fn fake(answer: impl Fn(&Req, u16) -> Answer + Send + 'static) -> anyhow::Result
 }
 
 fn asked(calls: &Calls, method: &str, path: &str) -> Option<Value> {
-    calls.lock().ok()?.iter().rev().find(|(m, p, _)| m == method && p.split('?').next() == Some(path)).map(|(_, _, b)| b.clone())
+    calls.lock().ok()?.iter().rev().find(|(m, p, ..)| m == method && p.split('?').next() == Some(path)).map(|(_, _, b, _)| b.clone())
+}
+
+/// Who the last such call was made as (its `Authorization`).
+fn asked_as(calls: &Calls, method: &str, path: &str) -> Option<String> {
+    calls.lock().ok()?.iter().rev().find(|(m, p, ..)| m == method && p.split('?').next() == Some(path)).map(|(.., a)| a.clone())
 }
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn gh_pull(port: u16) -> Value {
     json!({ "number": 5, "title": "Faster builds", "body": "It's faster.", "user": { "login": "ada" }, "state": "open", "draft": false, "merged_at": null,
-            "head": { "ref": "feat", "sha": SHA }, "base": { "ref": "main", "sha": "b".repeat(40) }, "html_url": format!("http://127.0.0.1:{port}/acme/gh/pull/5"), "updated_at": "2026-10-18T12:00:00Z", "mergeable": true })
+            "head": { "ref": "feat", "sha": SHA }, "base": { "ref": "main", "sha": "b".repeat(40) }, "html_url": format!("http://127.0.0.1:{port}/acme/gh/pull/5"), "updated_at": "2026-10-18T12:00:00Z", "mergeable": true,
+            "requested_reviewers": [{ "login": "bob" }] })
 }
 
 /// GitHub: the App's installation and token, and Actions.
 fn github(req: &Req, port: u16) -> Answer {
     let app = req.auth.starts_with("Bearer ey");
     let token = req.auth == "Bearer ghs_t";
+    // bob, signed in with GitHub (W23-R08): his own token.
+    let bob = req.auth == "Bearer gho_bob";
     let run = json!({ "id": 700, "name": "ci", "path": ".github/workflows/ci.yml", "display_title": "on GitHub", "event": "push", "head_branch": "main", "head_sha": SHA,
                       "status": "completed", "conclusion": "failure", "run_number": 3, "run_attempt": 1, "html_url": format!("http://127.0.0.1:{port}/acme/gh/actions/runs/700"),
                       "created_at": "2026-10-18T12:00:00Z", "run_started_at": "2026-10-18T12:00:05Z", "updated_at": "2026-10-18T12:03:00Z", "actor": { "login": "ada" } });
@@ -109,6 +117,12 @@ fn github(req: &Req, port: u16) -> Answer {
     match (req.method.as_str(), path) {
         ("GET", "/repos/acme/gh/installation") if app => (200, json!({ "id": 7 }), None),
         ("POST", "/app/installations/7/access_tokens") if app => (201, json!({ "token": "ghs_t", "expires_at": "2099-01-01T00:00:00Z" }), None),
+        ("POST", "/login/oauth/access_token") => (200, json!({ "access_token": "gho_bob", "token_type": "bearer" }), None),
+        ("GET", "/user") if bob => (200, json!({ "id": 7, "login": "bob" }), None),
+        ("GET", "/user/emails") if bob => (200, json!([{ "email": "bob@example.com", "primary": true, "verified": true }]), None),
+        ("GET", "/user/orgs") if bob => (200, json!([{ "login": "acme" }]), None),
+        ("GET", "/user/teams") if bob => (200, json!([]), None),
+        ("POST", "/repos/acme/gh/issues/5/comments") if bob => (201, json!({ "id": 12 }), None),
         ("GET", "/repos/acme/gh/actions/runs") if token => (200, json!({ "total_count": 1, "workflow_runs": [run] }), None),
         ("GET", "/repos/acme/gh/actions/runs/700") if token => (200, run, None),
         ("GET", "/repos/acme/gh/actions/runs/700/jobs") if token => (
@@ -354,6 +368,22 @@ clone_url = "http://127.0.0.1:{bb}/acme/bb.git"
     }
     let (st, v) = call("PUT", "/api/ci/repos/acme%2Fgl/providers", Some(&json!({ "providers": ["bitbucket-pipelines"] })))?;
     assert_eq!(st, 422, "a provider the repository can't have: {v}");
+    // The same from the CLI (W23-R07): `kiln repo provider` says, and chooses.
+    let cli = |args: &[&str]| -> anyhow::Result<String> {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_kiln"))
+            .args(args)
+            .env("HOME", dir.path())
+            .env("KILN_URL", format!("http://127.0.0.1:{port}"))
+            .env("KILN_ADMIN_TOKEN", admin)
+            .env_remove("KILN_CONFIG")
+            .output()?;
+        anyhow::ensure!(o.status.success(), "kiln {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let shown = cli(&["repo", "provider", "acme/gh"])?;
+    assert!(shown.contains("acme/gh: github-actions") && shown.contains("may have: kiln, github-actions"), "{shown}");
+    assert!(cli(&["repo", "provider", "acme/gh", "kiln", "github-actions"])?.contains("acme/gh: kiln, github-actions"));
+    assert!(cli(&["repo", "provider", "acme/gh", "github-actions"])?.contains("acme/gh: github-actions"));
 
     // GitHub and GitLab: looked at now; Bitbucket: its signed webhook says a build status changed.
     for repo in ["acme/gh", "acme/gl"] {
@@ -523,5 +553,64 @@ fn w23_r06_pulls() -> anyhow::Result<()> {
     assert_eq!(s(&asked(&gh_calls, "PUT", "/repos/acme/gh/pulls/5/merge").unwrap_or_default(), "/merge_method"), "squash");
     assert_eq!(asked(&gl_calls, "PUT", "/api/v4/projects/acme%2Fgl/merge_requests/3/merge").unwrap_or_default().get("squash"), Some(&json!(true)));
     assert_eq!(s(&asked(&bb_calls, "POST", "/2.0/repositories/acme/bb/pullrequests/9/merge").unwrap_or_default(), "/merge_strategy"), "fast_forward");
+    Ok(())
+}
+
+/// A request as a browser makes it, with a session cookie: its status, headers and body.
+fn browse(port: u16, method: &str, path: &str, cookie: Option<&str>, body: Option<&Value>) -> anyhow::Result<(u16, String, String)> {
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let (cookie, payload) = (cookie.map(|k| format!("Cookie: {k}\r\n")).unwrap_or_default(), body.map(Value::to_string).unwrap_or_default());
+    write!(c, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{cookie}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())?;
+    let mut raw = String::new();
+    c.read_to_string(&mut raw)?;
+    let (head, rest) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let status = head.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    Ok((status, head.to_owned(), rest.to_owned()))
+}
+
+fn header_of<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
+}
+
+/// Acting on the host as the person (docs/ci.md W23-R08's last part, R06's inbox): bob signs in with
+/// GitHub; the pull request asking him for a review is in kiln's inbox; his comment from kiln is made
+/// with his own GitHub token, not the App's.
+#[test]
+fn w23_r08_as_the_person() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().display().to_string();
+    let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow::anyhow!("keygen"))?;
+    let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow::anyhow!("der"))?;
+    std::fs::write(dir.path().join("app.pem"), format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref())))?;
+    std::fs::write(dir.path().join("gh-secret"), "s3cret\n")?;
+    let (gh, gh_calls) = fake(github)?;
+    let ci = format!("github = {{ app_id = 99, private_key_file = \"{d}/app.pem\", api_url = \"http://127.0.0.1:{gh}\", web_url = \"http://127.0.0.1:{gh}\" }}");
+    let extra = format!(
+        "[sso.github]\nclient_id = \"cid\"\nclient_secret_file = \"{d}/gh-secret\"\nweb_url = \"http://127.0.0.1:{gh}\"\napi_url = \"http://127.0.0.1:{gh}\"\ncreate_users = true\n\
+         grants = {{ \"acme\" = [\"developer@org:acme\"] }}\n\n[[repos]]\nname = \"acme/gh\"\nclone_url = \"http://127.0.0.1:{gh}/acme/gh.git\"\n"
+    );
+    let srv = start(dir.path(), &Options { ci: &ci, extra: &extra, ..Options::default() })?;
+    let port = srv.port;
+
+    // bob signs in with GitHub.
+    let (st, head, _) = browse(port, "GET", "/api/auth/github/start?return=/", None, None)?;
+    assert_eq!(st, 303, "{head}");
+    let state = header_of(&head, "location").unwrap_or_default().split(['?', '&']).find_map(|kv| kv.strip_prefix("state=")).unwrap_or_default().to_owned();
+    let (st, head, body) = browse(port, "GET", &format!("/api/auth/github/callback?code=bob&state={state}"), None, None)?;
+    assert_eq!(st, 303, "{head}\n{body}\n{}", srv.log());
+    let cookie = header_of(&head, "set-cookie").and_then(|c| c.split(';').next()).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no session"))?;
+
+    // The pull request asking him for a review, in his inbox.
+    let (st, _, body) = browse(port, "GET", "/api/review/inbox", Some(&cookie), None)?;
+    let inbox: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    assert!(st == 200 && inbox.pointer("/elsewhere/0/number") == Some(&json!(5)) && s(&inbox, "/elsewhere/0/repo") == "acme/gh", "{st} {body}\n{}", srv.log());
+
+    // His comment is his on GitHub.
+    let (st, _, body) = browse(port, "POST", "/api/ci/repos/acme%2Fgh/pulls/5/comments", Some(&cookie), Some(&json!({ "body": "from bob" })))?;
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    assert!(st == 201 && s(&v, "/as") == "person", "{st} {body}");
+    assert_eq!(asked_as(&gh_calls, "POST", "/repos/acme/gh/issues/5/comments").as_deref(), Some("Bearer gho_bob"));
+    assert_eq!(s(&asked(&gh_calls, "POST", "/repos/acme/gh/issues/5/comments").unwrap_or_default(), "/body"), "from bob");
     Ok(())
 }

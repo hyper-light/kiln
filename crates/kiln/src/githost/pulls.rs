@@ -10,7 +10,8 @@
 //! Every provider's checks of the head commit come from kiln's own tables
 //! (`crate::ci::providers::checks`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
 use serde_json::{Value, json};
@@ -110,6 +111,11 @@ async fn gh_token(app: &github::App, name: &str, write: bool) -> anyhow::Result<
     app.token(name, &p).await
 }
 
+/// The logins in a list of people (`/login`, `/username`, `/nickname`).
+fn logins(list: Option<&Value>, key: &str) -> Vec<String> {
+    list.and_then(Value::as_array).into_iter().flatten().filter_map(|u| u.pointer(key).and_then(Value::as_str)).map(str::to_owned).collect()
+}
+
 /// A GitHub pull request in kiln's shape.
 fn gh_pull(p: &Value) -> Value {
     let state = if p.get("merged_at").is_some_and(|m| !m.is_null()) { "merged" } else { p.get("state").and_then(Value::as_str).unwrap_or("open") };
@@ -117,6 +123,7 @@ fn gh_pull(p: &Value) -> Value {
         "host": "github", "number": p.get("number"), "title": st(p, "/title"), "body": st(p, "/body"), "author": st(p, "/user/login"), "state": state,
         "draft": p.get("draft").and_then(Value::as_bool).unwrap_or(false), "head": st(p, "/head/ref"), "sha": st(p, "/head/sha"), "base": st(p, "/base/ref"), "base_sha": st(p, "/base/sha"),
         "url": st(p, "/html_url"), "updated_at": at(p, "/updated_at"), "mergeable": p.get("mergeable"),
+        "reviewers": logins(p.get("requested_reviewers"), "/login"),
     })
 }
 
@@ -131,6 +138,7 @@ fn gl_pull(m: &Value) -> Value {
         "draft": m.get("draft").or_else(|| m.get("work_in_progress")).and_then(Value::as_bool).unwrap_or(false), "head": st(m, "/source_branch"), "sha": st(m, "/sha"), "base": st(m, "/target_branch"),
         "base_sha": st(m, "/diff_refs/base_sha"), "url": st(m, "/web_url"), "updated_at": at(m, "/updated_at"),
         "mergeable": m.get("detailed_merge_status").and_then(Value::as_str).map(|s| s == "mergeable"),
+        "reviewers": logins(m.get("reviewers"), "/username"),
     })
 }
 
@@ -145,6 +153,7 @@ fn bb_pull(p: &Value) -> Value {
         "host": "bitbucket", "number": p.get("id"), "title": st(p, "/title"), "body": st(p, "/description"), "author": p.pointer("/author/nickname").or_else(|| p.pointer("/author/display_name")).and_then(Value::as_str).unwrap_or_default(),
         "state": state, "draft": p.get("draft").and_then(Value::as_bool).unwrap_or(false), "head": st(p, "/source/branch/name"), "sha": st(p, "/source/commit/hash"), "base": st(p, "/destination/branch/name"),
         "base_sha": st(p, "/destination/commit/hash"), "url": st(p, "/links/html/href"), "updated_at": at(p, "/updated_on"), "mergeable": Value::Null,
+        "reviewers": logins(p.get("reviewers"), "/nickname"),
     })
 }
 
@@ -161,11 +170,57 @@ pub async fn list(hub: &Hub, repo: &Repo) -> anyhow::Result<Vec<Value>> {
             v.as_array().into_iter().flatten().map(gl_pull).collect()
         }
         On::Bitbucket(b, name) => {
-            let (code, v) = b.call(Method::Get, &format!("/repositories/{name}/pullrequests?state=OPEN&pagelen=50"), None).await?;
+            let (code, v) = b.call(Method::Get, &format!("/repositories/{name}/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.reviewers"), None).await?;
             anyhow::ensure!(code == 200, "Bitbucket's pull requests ({code}): {}", bitbucket::said(&v));
             v.get("values").and_then(Value::as_array).into_iter().flatten().map(bb_pull).collect()
         }
     })
+}
+
+/// [`list`], read from the host at most once a minute (the inbox asks often).
+async fn list_cached(hub: &Hub, repo: &Repo) -> Vec<Value> {
+    static C: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, (Instant, Vec<Value>)>>> = std::sync::OnceLock::new();
+    let cache = C.get_or_init(Default::default);
+    if let Some((at, l)) = cache.lock().get(&repo.id)
+        && at.elapsed() < Duration::from_secs(60)
+    {
+        return l.clone();
+    }
+    let l = list(hub, repo).await.unwrap_or_else(|e| {
+        tracing::debug!(repo = %repo.name, error = %format!("{e:#}"), "a host's pull requests can't be read");
+        Vec::new()
+    });
+    cache.lock().insert(repo.id.clone(), (Instant::now(), l.clone()));
+    l
+}
+
+/// The open changes on hosts that ask `user` (a kiln user) for a review, through the accounts they
+/// linked by signing in with those hosts (W23-R06: kiln's inbox has them too).
+pub async fn asked_of(hub: &Hub, user: &str) -> Vec<Value> {
+    let u = user.to_owned();
+    let linked: Vec<(String, String)> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT provider, login FROM user_identities WHERE user_id = ?1")?;
+            let rows = q.query_map([&u], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .unwrap_or_default();
+    if linked.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for repo in hub.store.repos().await.unwrap_or_default() {
+        let Some((provider, _)) = identity_of(hub, &repo).await else { continue };
+        let Some((_, login)) = linked.iter().find(|(p, _)| p == provider) else { continue };
+        for p in list_cached(hub, &repo).await {
+            if p.get("reviewers").and_then(Value::as_array).is_some_and(|r| r.iter().any(|x| x.as_str().is_some_and(|x| x.eq_ignore_ascii_case(login)))) {
+                out.push(json!({ "repo": repo.name, "host": p.get("host"), "number": p.get("number"), "title": p.get("title"), "author": p.get("author"), "url": p.get("url"), "updated_at": p.get("updated_at") }));
+            }
+        }
+    }
+    out
 }
 
 /// Threads from comments with a place and a parent: `[{ id, path, line, side, resolved, comments }]`.
