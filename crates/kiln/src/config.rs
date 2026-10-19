@@ -32,6 +32,8 @@ pub struct Config {
     pub ci: ci::Ci,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
     pub conversations: Conversations,
+    /// Notifications to people's devices (docs/notifications.md).
+    pub push: crate::push::Push,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
     /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
     pub agent: crate::runner::probe::Declared,
