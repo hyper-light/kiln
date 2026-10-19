@@ -26,6 +26,7 @@ import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { handlePush, pushHeard } from "./push.ts";
+import { handleReview } from "./review.ts";
 import { handleDoctor } from "./doctor.ts";
 import {
   AUTOJOIN,
@@ -1583,6 +1584,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handleReview(req, res, url, { json, err, body, emit: (ev) => emit(ev as never) })) return;
     if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
     if (await handleDoctor(req, res, url, { json, err, body, runners: () => [...agents.values()].map((a) => ({ name: a.name, connected: a.connected, os: a.os })) })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
