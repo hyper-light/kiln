@@ -83,24 +83,27 @@ export function NotificationsPanel() {
     });
 
   return (
-    <Panel eyebrow="Agents" title="Notifications" description={DESCRIPTION}>
+    <Panel
+      eyebrow="Agents"
+      title="Notifications"
+      description={DESCRIPTION}
+      actions={
+        devices.length > 0 && state.available ? (
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => void test()}>
+            Send a test
+          </Button>
+        ) : undefined
+      }
+    >
       <div className="space-y-4">
         {blocked ? (
           <p className="text-[13px] leading-relaxed text-[#c9c3b6]">{blocked}</p>
         ) : (
           <div className="space-y-3">
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-              <label className="inline-flex min-h-8 cursor-pointer items-center gap-3 text-[13.5px] text-[#ededee]">
-                <input type="checkbox" className="check" checked={Boolean(mine)} disabled={busy} onChange={(e) => void toggle(e.target.checked)} />
-                Notify this device
-              </label>
-              {mine && <span className="text-[12.5px] text-[#8b8f99]">{mine.device}</span>}
-              {devices.length > 0 && (
-                <Button size="xs" variant="secondary" className="ml-auto" disabled={busy} onClick={() => void test()}>
-                  Send a test
-                </Button>
-              )}
-            </div>
+            <label className="inline-flex min-h-8 cursor-pointer items-center gap-3 text-[13.5px] text-[#ededee]">
+              <input type="checkbox" className="check" checked={Boolean(mine)} disabled={busy} onChange={(e) => void toggle(e.target.checked)} />
+              Notify this device
+            </label>
             {mine && (
               <fieldset className="flex flex-wrap items-center gap-x-5 gap-y-2" disabled={busy}>
                 <legend className="sr-only">What this device hears</legend>
@@ -166,19 +169,21 @@ function DeviceRow({ d, state, here }: { d: PushDevice; state: PushState; here: 
   };
   const failed = d.last_error && (!d.last_ok_at || (d.last_error_at ?? 0) >= d.last_ok_at);
   return (
-    <li className="flex flex-wrap items-center gap-x-4 gap-y-1 py-3">
-      <span className="min-w-0 text-[13.5px] text-[#eceef2]">
-        {d.device}
-        {here && <span className="ml-2 text-[12px] text-[#8b8f99]">this device</span>}
-      </span>
-      <span className="text-[12px] text-[#8b8f99]">{hearsWords(d.hears, state)}</span>
-      <Button size="xs" variant="ghost-danger" className="ml-auto" disabled={busy} onClick={() => void remove()} aria-label={`Remove ${d.device}`}>
+    <li className="flex items-start gap-3 py-3">
+      <div className="min-w-0 flex-1 space-y-1">
+        <p className="text-[13.5px] text-[#eceef2]">
+          {d.device}
+          {here && <span className="ml-2 text-[12px] text-[#8b8f99]">this device</span>}
+        </p>
+        <p className="text-[12px] text-[#8b8f99]">Hears: {hearsWords(d.hears, state).toLowerCase()}</p>
+        <p className={failed ? "text-[12px] text-[#d1aaad]" : "text-[12px] text-[#8b8f99]"}>
+          {failed ? `Last delivery failed ${relativeTime(d.last_error_at)}: ${d.last_error}` : d.last_ok_at ? `Last delivered ${relativeTime(d.last_ok_at)}` : "Nothing sent yet"}
+        </p>
+        {problem && <p className="text-[12px] text-[#d8c8b0]">{problem}</p>}
+      </div>
+      <Button size="xs" variant="ghost-danger" disabled={busy} onClick={() => void remove()} aria-label={`Remove ${d.device}`}>
         <Trash2 /> Remove
       </Button>
-      <span className={failed ? "basis-full text-[12px] text-[#d1aaad]" : "basis-full text-[12px] text-[#8b8f99]"}>
-        {failed ? `Last delivery failed ${relativeTime(d.last_error_at)}: ${d.last_error}` : d.last_ok_at ? `Last delivered ${relativeTime(d.last_ok_at)}` : "Nothing sent yet"}
-      </span>
-      {problem && <span className="basis-full text-[12px] text-[#d8c8b0]">{problem}</span>}
     </li>
   );
 }

@@ -137,7 +137,9 @@ export async function turnOn(publicKey: string, hears?: PushKind[]): Promise<Pus
     await sub.unsubscribe();
     sub = null;
   }
-  sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }).catch((e: unknown) => {
+    throw new Error(`This browser couldn't subscribe to its push service (${e instanceof Error ? e.message : String(e)}).`);
+  });
   return pushApi.subscribe({ subscription: sub.toJSON(), device: deviceName(), hears });
 }
 

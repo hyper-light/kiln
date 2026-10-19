@@ -435,6 +435,48 @@ html.fills-window body {
   line-height: 1.8;
   color: #a1a4ad;
 }
+/* A page that asks for it (`compact`): on a phone its head is one line, the title, how things
+   stand (cut to the room there is), then its actions. */
+@media (max-width: 640px) {
+  .page-intro[data-compact] {
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 14px;
+  }
+  .page-intro[data-compact] > div:first-child {
+    display: flex;
+    flex: 1 1 auto;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+  .page-intro[data-compact] .eyebrow {
+    display: none;
+  }
+  .page-intro[data-compact] h1 {
+    flex: none;
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.2;
+    letter-spacing: -0.03em;
+    white-space: nowrap;
+  }
+  .page-intro[data-compact] p.lead {
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    font-size: 12.5px;
+    line-height: 1.4;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .page-intro[data-compact] > div:last-child {
+    flex: none;
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+}
 /* Crumbs (misc.tsx): a detail page's eyebrow, its parts linking back up. */
 .crumbs {
   flex-wrap: wrap;
