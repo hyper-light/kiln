@@ -85,7 +85,7 @@ impl Caller {
     /// Someone from a peered cluster, with `role` on this whole server (`crate::peers::caller`).
     pub fn peer(name: &str, role: &str) -> Caller {
         let rights = Rights { grants: vec![Grant { what: role.to_owned(), scope: Scope::Server, deny: false }], custom: HashMap::new() };
-        Caller { kind: Kind::Peer, name: name.to_owned(), user: None, token: None, rights: Some(rights), limit: None }
+        Caller { kind: Kind::Peer, name: name.to_owned(), user: None, token: None, agent: None, rights: Some(rights), limit: None }
     }
 
     /// The highest built-in role it holds on the whole server (the owner: admin), which is the
