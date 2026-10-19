@@ -45,6 +45,18 @@ pub struct Ci {
     /// idle_timeout = "10m"
     /// ```
     pub pools: Vec<kiln_ci::sched::pools::PoolSpec>,
+    /// Runners kept for matching legs in windows (docs/ci.md W05-R12); a pool's own go in its
+    /// `reserve`:
+    ///
+    /// ```toml
+    /// [[ci.reservations]]
+    /// name = "nightly-bench"
+    /// runners = "custom.rack == bench"
+    /// for = "workflow == 'bench'"
+    /// cron = "0 2 * * *"
+    /// duration = "2h"
+    /// ```
+    pub reservations: Vec<kiln_ci::sched::reserve::ReservationSpec>,
     pub cache: Cache,
     pub artifacts: Artifacts,
     pub oidc: Oidc,

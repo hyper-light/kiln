@@ -176,7 +176,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
-| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations left |
+| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); tiers, BuildKit, speed left |
@@ -1739,14 +1739,21 @@ W20.
     decides them, so the server's choices win. `POST /api/ci/routing/explain` (with
     `kiln routing where <labels> [--repo]`) shows where a leg so routed would go and which
     rules applied; `kiln routing rules [--scope] [--set FILE | --clear]`.
-- *Left.*
-  - Reservations (R12).
+- *Done.* R12, reservations: `[[ci.reservations]]` keeps the runners a constraint names (or a
+  pool's `reserve`, its executors) for the legs `for` matches (a condition over `job`,
+  `workflow`, `repo` and `event`, as a routing rule's `match.job`). Windows start at `cron`
+  (GitHub's syntax; `timezone` reads it in local time, with DST handled) and last `duration`. In a
+  window nothing else is assigned there: a leg that could only go there waits with reason
+  `reservation` (which one, and until when). Legs already running finish. The scheduler looks at
+  the windows when one opens or closes (a timer), not on every decision (`w05_r12_*`).
+- *Done.* R13's `scaling` reason for a pool's legs: how many executors it's starting, and since
+  when. A pool at its `max` makes the leg wait for `capacity`, its executors counted.
 - *Done.* R27 (with W13-R09): the scheduler keeps each pool's executors (starting, idle, busy) and
   asks for more when the legs waiting for a pool outnumber its idle and starting executors (or
   `min_idle`), within `max` and `per_host_max`, the host with the fewest of the pool's first. It
   stops executors idle past `idle_timeout`, down to `min_idle`. A host that fails to start one is
   left alone, 2 s at first, doubling to 5 minutes. A pool's leg runs only in an idle executor of
-  its pool, and its wait reason is `pool` (executors, busy, starting, max). On the simulator, a
+  its pool; it waits for `scaling` while executors start for it. On the simulator, a
   burst of 200 legs scales a pool to its `max` of 32 and back to `min_idle` within
   `idle_timeout` (`w13_ac04_pool_burst_on_the_simulator`).
   - AC07 (cancel timing on the host executor), AC09 at 10,000 legs, AC11 live.

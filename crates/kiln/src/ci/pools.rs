@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use http::StatusCode;
 use kiln_ci::sched::pools::{Pool, PoolSpec};
+use kiln_ci::sched::reserve::Reservation;
 use rusqlite::params;
 use serde_json::{Value, json};
 
@@ -25,9 +26,34 @@ fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
-/// The pools in order: the configuration's, then the stored ones. One that doesn't check out is
-/// left out, with a warning.
-pub async fn sources(hub: &Hub) -> Vec<Pool> {
+/// The pools in order (the configuration's, then the stored ones), and the reservations
+/// (`[[ci.reservations]]`, then the pools' own). One that doesn't check out is left out, with a
+/// warning.
+pub async fn sources(hub: &Hub) -> (Vec<Pool>, Vec<Reservation>) {
+    let specs = specs(hub).await;
+    let mut reservations: Vec<Reservation> = Vec::new();
+    for r in hub.cfg.ci.reservations.iter().map(|s| (s.name.clone(), s.reservation())).chain(specs.iter().filter_map(|p| p.reservation().map(|r| (p.name.clone(), r)))) {
+        match r {
+            (_, Ok(r)) => reservations.push(r),
+            (n, Err(e)) => tracing::warn!(reservation = %n, error = %e, "a reservation is left out"),
+        }
+    }
+    let pools = specs
+        .iter()
+        .filter_map(|s| match s.pool() {
+            // Its hosts' runners start executors when asked.
+            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), ..p }),
+            Err(e) => {
+                tracing::warn!(pool = %s.name, error = %e, "a pool is left out");
+                None
+            }
+        })
+        .collect();
+    (pools, reservations)
+}
+
+/// The pools' settings: the configuration's, then the stored ones.
+async fn specs(hub: &Hub) -> Vec<PoolSpec> {
     let mut specs: Vec<PoolSpec> = hub.cfg.ci.pools.clone();
     let stored: Vec<String> = hub.store.call(|c| {
         let mut s = c.prepare("SELECT spec FROM ci_pools ORDER BY created_at, name")?;
@@ -44,16 +70,6 @@ pub async fn sources(hub: &Hub) -> Vec<Pool> {
         }
     }
     specs
-        .iter()
-        .filter_map(|s| match s.pool() {
-            // Its hosts' runners start executors when asked.
-            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), ..p }),
-            Err(e) => {
-                tracing::warn!(pool = %s.name, error = %e, "a pool is left out");
-                None
-            }
-        })
-        .collect()
 }
 
 /// `GET /api/ci/pools[/:name]`.

@@ -1,7 +1,8 @@
 //! Scheduler tests (docs/ci.md W05-AC01 to AC06, AC10, W05-S01 to S04), on the simulator.
 
 use super::groups::GroupConfig;
-use super::pools::{ExecState, PoolSpec};
+use super::pools::PoolSpec;
+use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
@@ -415,12 +416,78 @@ fn w13_r09_failing_host_backs_off() -> Result<(), String> {
     sim.run(20_000);
     let tries = sim.executors_started.iter().filter(|(_, _, h)| h == "bad").count();
     assert!((2..=6).contains(&tries), "backing off: {tries} tries in 20 s");
-    assert!(matches!(sim.last_wait("w1"), Some(WaitReason::Pool { .. })), "{:?}", sim.last_wait("w1"));
+    assert!(sim.waits.iter().any(|(_, l, r)| l == "w1" && matches!(r, WaitReason::Scaling { pool, starting: 1, .. } if pool == "burst")), "{:?}", sim.waits);
     let view = sim.sched.pools();
     assert!(view.first().and_then(|p| p.last_error.clone()).is_some_and(|(h, _)| h == "bad"));
     sim.runner(20_000, docker_host("good"));
     sim.run(40_000);
     assert_eq!(sim.assigned.iter().find(|a| a.leg == "w1").map(|a| a.runner.as_str()), Some("good"));
-    let _ = ExecState::Idle;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ reservations (W05-R12)
+
+const H: i64 = 60 * MIN;
+
+fn wf_leg(id: &str, workflow: &str) -> LegIn {
+    let mut l = leg(id, "acme/x", 50);
+    l.route.workflow = workflow.into();
+    l
+}
+
+/// W05-R12: a runner kept for `bench` legs from 02:00 for two hours takes only those in the
+/// window; another waits with reason `reservation` until it ends; one already running finishes.
+#[test]
+fn w05_r12_reservation_keeps_a_runner() -> Result<(), String> {
+    let res = ReservationSpec { name: "nightly".into(), runners: Some("custom.rack == bench".into()), matches: "workflow == 'bench'".into(), cron: "0 2 * * *".into(), duration: "2h".into(), ..ReservationSpec::default() }.reservation()?;
+    let mut sim = Sim::new(Config { reservations: vec![res], ..Config::default() });
+    let mut bench = linux("bench", 1);
+    bench.view.facts.custom.insert("rack".into(), "bench".into());
+    sim.runner(0, bench);
+    sim.leg(H + 50 * MIN, wf_leg("early", "build"), 20 * MIN);
+    sim.leg(2 * H + 30 * MIN, wf_leg("late", "build"), MIN);
+    sim.leg(2 * H + 35 * MIN, wf_leg("kept", "bench"), MIN);
+    sim.run(5 * H);
+    assert_eq!(sim.started("early"), Some(H + 50 * MIN), "before the window, anything");
+    assert!(sim.settled.iter().any(|(t, l, o)| l == "early" && *o == Outcome::Success && *t == 2 * H + 10 * MIN), "running into the window, it finishes: {:?}", sim.settled);
+    assert_eq!(sim.started("kept"), Some(2 * H + 35 * MIN), "the leg it's kept for");
+    assert!(sim.waits.iter().any(|(_, l, r)| l == "late" && matches!(r, WaitReason::Reservation { reservation, until } if reservation == "nightly" && *until == 4 * H)), "{:?}", sim.waits);
+    assert_eq!(sim.started("late"), Some(4 * H), "once the window ends");
+    // A runner it doesn't keep takes anything.
+    let res = ReservationSpec { runners: Some("custom.rack == bench".into()), matches: "workflow == 'bench'".into(), cron: "0 2 * * *".into(), duration: "2h".into(), ..ReservationSpec::default() }.reservation()?;
+    let mut sim = Sim::new(Config { reservations: vec![res], ..Config::default() });
+    sim.runner(0, linux("other", 1));
+    sim.leg(2 * H + 30 * MIN, wf_leg("late", "build"), MIN);
+    sim.run(3 * H);
+    assert_eq!(sim.started("late"), Some(2 * H + 30 * MIN));
+    Ok(())
+}
+
+/// A pool's `reserve`: its executors take only the legs it's kept for in the window.
+#[test]
+fn w05_r12_reserved_pool() -> Result<(), String> {
+    let mut spec = PoolSpec {
+        name: "burst".into(),
+        executor: "docker".into(),
+        image: Some("kiln/runner-ubuntu-24.04".into()),
+        labels: vec!["burst".into()],
+        min_idle: 1,
+        max: Some(2),
+        ..PoolSpec::default()
+    };
+    spec.reserve = Some(ReservationSpec { matches: "workflow == 'bench'".into(), cron: "0 2 * * *".into(), duration: "1h".into(), ..ReservationSpec::default() });
+    let res = spec.reservation().ok_or("no reservation")??;
+    assert_eq!((res.name.as_str(), res.pool.as_deref()), ("pool burst", Some("burst")));
+    let mut sim = Sim::new(Config { pools: vec![spec.pool()?], reservations: vec![res], ..Config::default() });
+    sim.runner(0, docker_host("d1"));
+    let mut other = pool_leg("other");
+    other.route.workflow = "build".into();
+    let mut kept = pool_leg("kept");
+    kept.route.workflow = "bench".into();
+    sim.leg(2 * H + 10 * MIN, other, MIN);
+    sim.leg(2 * H + 20 * MIN, kept, MIN);
+    sim.run(4 * H);
+    assert_eq!(sim.started("kept"), Some(2 * H + 20 * MIN));
+    assert_eq!(sim.started("other"), Some(3 * H), "after the window");
     Ok(())
 }

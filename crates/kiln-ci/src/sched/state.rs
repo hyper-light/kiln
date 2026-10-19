@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use super::groups::{GroupAction, GroupConfig, Groups};
 use super::pools::{self, ExecState, Executor, Pool, PoolView};
+use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
 
@@ -46,6 +47,8 @@ pub struct Config {
     pub quotas: HashMap<String, usize>,
     /// Pools, in order: a leg goes to the first that serves its labels (W13-R09).
     pub pools: Vec<Pool>,
+    /// Runners and pools kept for matching legs in windows (W05-R12).
+    pub reservations: Vec<Reservation>,
 }
 
 impl Default for Config {
@@ -61,6 +64,7 @@ impl Default for Config {
             rules: vec![routing::native_rule()],
             quotas: HashMap::new(),
             pools: Vec::new(),
+            reservations: Vec::new(),
         }
     }
 }
@@ -134,7 +138,8 @@ pub enum Input {
     ExecutorReady { executor: String },
     /// Its host couldn't start it, or it's gone.
     ExecutorFailed { executor: String, error: String },
-    PoolsChanged(Vec<Pool>),
+    /// Pools and reservations, read again (the Pools page, W13-R09, W05-R12).
+    PoolsChanged { pools: Vec<Pool>, reservations: Vec<Reservation> },
     /// The time a [`Command::Timer`] asked for.
     Tick,
 }
@@ -151,8 +156,10 @@ pub enum WaitReason {
     Quota { limit: usize },
     Exclusive,
     Retry { at: i64 },
-    /// Its pool's executors are all busy or starting (W13-R09).
-    Pool { pool: String, executors: usize, busy: usize, starting: usize, max: usize },
+    /// Its pool is starting executors for it (W13-R09): how many, since when (unix ms).
+    Scaling { pool: String, starting: usize, since: i64 },
+    /// The runners or pool that could take it are kept for other legs until `until` (W05-R12).
+    Reservation { reservation: String, until: i64 },
 }
 
 /// What to do.
@@ -245,6 +252,9 @@ pub struct Scheduler {
     backoff: HashMap<(String, String), (i64, i64)>,
     /// Each pool's last failure to start an executor: (runner, error).
     pool_errors: HashMap<String, (String, String)>,
+    /// The reservations' windows open now (index, end), and when they're next looked at (W05-R12).
+    windows: Vec<(usize, i64)>,
+    windows_at: Option<i64>,
 }
 
 impl Scheduler {
@@ -259,6 +269,10 @@ impl Scheduler {
     /// Handles one input at `now` (unix milliseconds).
     pub fn handle(&mut self, input: Input, now: i64) -> Vec<Command> {
         let mut out = Vec::new();
+        // Reservations' windows that opened or closed since: what may run where changes.
+        if !self.cfg.reservations.is_empty() && self.windows_at.is_none_or(|at| now >= at) {
+            self.refresh_windows(now, &mut out);
+        }
         match input {
             Input::RunQueued { run, group, supersede } => self.run_queued(run, group, supersede, now, &mut out),
             Input::RunFinished { run } => {
@@ -295,8 +309,11 @@ impl Scheduler {
             Input::RulesChanged(rules) => self.rules_changed(rules, now, &mut out),
             Input::ExecutorReady { executor } => self.executor_ready(&executor, now, &mut out),
             Input::ExecutorFailed { executor, error } => self.executor_failed(&executor, error, now, &mut out),
-            Input::PoolsChanged(pools) => {
+            Input::PoolsChanged { pools, reservations } => {
                 self.cfg.pools = pools;
+                self.cfg.reservations = reservations;
+                self.windows_at = None;
+                self.refresh_windows(now, &mut out);
                 // A pool gone: its idle and starting executors stop; busy ones end with their legs.
                 let gone: Vec<Executor> = self.executors.values().filter(|e| !matches!(e.state, ExecState::Busy { .. }) && !self.cfg.pools.iter().any(|p| p.name == e.pool)).cloned().collect();
                 for e in gone {
@@ -549,6 +566,9 @@ impl Scheduler {
 
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
         if !r.connected || r.draining || r.exclusive {
+            return false;
+        }
+        if self.reserved_against(r, l).is_some() {
             return false;
         }
         if l.avoid.as_deref() == Some(r.input.id.as_str()) || l.pin.as_deref().is_some_and(|p| p != r.input.id) {
@@ -833,6 +853,40 @@ impl Scheduler {
         self.scale_all(now, out);
     }
 
+    // ------------------------------------------------------------------ reservations (W05-R12)
+
+    /// Which reservation keeps `r` (or the leg's pool) from `l` now, and until when.
+    fn reserved_against(&self, r: &Runner, l: &Leg) -> Option<(String, i64)> {
+        self.windows.iter().find_map(|(i, end)| {
+            let res = self.cfg.reservations.get(*i)?;
+            let keeps = match &res.pool {
+                Some(p) => l.req.pool.as_deref() == Some(p.as_str()),
+                None => res.holds(&r.input.view),
+            };
+            (keeps && !res.admits(&l.input.route)).then(|| (res.name.clone(), *end))
+        })
+    }
+
+    /// The windows open at `now`, and a timer for the next that opens or closes; then every
+    /// runner looks again at what waits, as what may run where changed.
+    fn refresh_windows(&mut self, now: i64, out: &mut Vec<Command>) {
+        let before = self.windows.clone();
+        self.windows = self.cfg.reservations.iter().enumerate().filter_map(|(i, r)| r.window_end(now).map(|end| (i, end))).collect();
+        let next = self.windows.iter().map(|(_, end)| *end).chain(self.cfg.reservations.iter().filter_map(|r| r.next_start(now))).filter(|t| *t > now).min();
+        // Looked at again within a week at the latest.
+        let at = next.unwrap_or(now + 7 * 86_400_000);
+        self.windows_at = Some(at);
+        self.timers.entry(at).or_default();
+        out.push(Command::Timer { at });
+        if self.windows != before {
+            let runners: Vec<String> = self.runners.keys().cloned().collect();
+            for r in runners {
+                self.try_runner(&r, now, out);
+            }
+            self.refresh_reasons(out);
+        }
+    }
+
     // ------------------------------------------------------------------ pools (W13-R09)
 
     fn pool(&self, name: &str) -> Option<&Pool> {
@@ -1035,15 +1089,21 @@ impl Scheduler {
             return WaitReason::Quota { limit: *q };
         }
         let eligible: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        // Every runner that could take it is kept for other legs: until the first window ends.
+        if !eligible.is_empty()
+            && let Some((name, until)) = eligible.iter().map(|r| self.reserved_against(r, l)).collect::<Option<Vec<_>>>().and_then(|all| all.into_iter().min_by_key(|(_, u)| *u))
+        {
+            return WaitReason::Reservation { reservation: name, until };
+        }
         if let (Some(pool), false) = (&l.req.pool, eligible.is_empty()) {
             let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == *pool).collect();
-            return WaitReason::Pool {
-                pool: pool.clone(),
-                executors: mine.len(),
-                busy: mine.iter().filter(|e| matches!(e.state, ExecState::Busy { .. })).count(),
-                starting: mine.iter().filter(|e| e.state == ExecState::Starting).count(),
-                max: self.pool(pool).map_or(0, |p| p.max),
-            };
+            let starting: Vec<&&Executor> = mine.iter().filter(|e| e.state == ExecState::Starting).collect();
+            if let Some(since) = starting.iter().map(|e| e.since).min() {
+                return WaitReason::Scaling { pool: pool.clone(), starting: starting.len(), since };
+            }
+            // At its `max` (or no host has room): its executors are the capacity.
+            let busy = mine.iter().filter(|e| matches!(e.state, ExecState::Busy { .. })).count();
+            return WaitReason::Capacity { eligible: mine.len(), busy, draining: 0 };
         }
         if !eligible.is_empty() {
             if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {

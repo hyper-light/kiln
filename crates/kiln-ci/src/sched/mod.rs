@@ -6,9 +6,11 @@
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
 //! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
+//! - [`reserve`]: runners and pools kept for some legs in windows (W05-R12).
 
 pub mod groups;
 pub mod pools;
+pub mod reserve;
 pub mod retry;
 pub mod routing;
 pub mod sim;

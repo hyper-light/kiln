@@ -464,7 +464,7 @@ pub fn spawn(hub: Arc<Hub>) {
         let sources = super::routing::sources(&hub).await;
         let rules = sources.effective();
         let mut cfg = sched_config(&hub, rules);
-        cfg.pools = super::pools::sources(&hub).await;
+        (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
         let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
@@ -556,8 +556,8 @@ impl Dispatch {
                 Ok(())
             }
             Msg::PoolsChanged => {
-                let pools = super::pools::sources(&self.hub).await;
-                let cmds = self.sched.handle(Input::PoolsChanged(pools), now_ms());
+                let (pools, reservations) = super::pools::sources(&self.hub).await;
+                let cmds = self.sched.handle(Input::PoolsChanged { pools, reservations }, now_ms());
                 self.commands(cmds).await;
                 Ok(())
             }

@@ -54,6 +54,8 @@ pub struct PoolSpec {
     pub per_host_max: Option<usize>,
     pub idle_timeout: Option<String>,
     pub resources: Option<ResourceSpec>,
+    /// Kept for matching legs in windows (W05-R12): `{ for, cron, duration, timezone }`.
+    pub reserve: Option<super::reserve::ReservationSpec>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
@@ -69,6 +71,13 @@ pub struct ResourceSpec {
 pub const KINDS: &[&str] = &["docker", "firecracker", "shards", "k8s"];
 
 impl PoolSpec {
+    /// Its reservation, if it has one: the pool's executors, for the legs it names.
+    pub fn reservation(&self) -> Option<Result<super::reserve::Reservation, String>> {
+        let r = self.reserve.as_ref()?;
+        let name = if r.name.trim().is_empty() { format!("pool {}", self.name) } else { r.name.clone() };
+        Some(super::reserve::ReservationSpec { name, pool: Some(self.name.clone()), runners: None, ..r.clone() }.reservation())
+    }
+
     /// The pool, or what's wrong with it.
     pub fn pool(&self) -> Result<Pool, String> {
         let name = self.name.trim();
