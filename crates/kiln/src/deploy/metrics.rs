@@ -130,6 +130,7 @@ mod tests {
             created_at: created,
             committed_at: None,
             ended_at: ended,
+            secrets: None,
         }
     }
 

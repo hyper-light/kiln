@@ -409,6 +409,7 @@ mod tests {
             requested_by: "ada".into(),
             at: String::new(),
             rollback_of: None,
+            secrets: String::new(),
         }
     }
 

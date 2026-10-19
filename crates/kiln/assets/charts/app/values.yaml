@@ -20,7 +20,9 @@ args: []
 # Environment variables: NAME: value (templated), or NAME: {secretKeyRef: …}.
 env: {}
 envFrom: []
-# The app's secrets from kiln, as env (docs/deploy-api.md §3.5, when built).
+# The app's secrets from kiln, as env (docs/deploy-api.md §3.5): the Secret `<app>-kiln` each
+# release delivers on KilnCD (kiln app secret set <app> NAME --env <env>). Its pods roll when a
+# release delivers new versions.
 kilnSecrets: false
 
 resources:

@@ -72,7 +72,20 @@ kiln deploy approve 42 --note "checked the dashboards"
 
 By hand instead: `kiln deploy web --to production --from staging`.
 
-## 4. Look, change, roll back
+## 4. Secrets
+
+```sh
+kiln app secret set web DB_PASSWORD --env staging       # asked for, unechoed (or piped in, or --from-file)
+kiln app secret import web .env.staging --env staging    # each NAME=value, released together
+kiln app secret list web --env staging                   # names and versions: values are never shown
+```
+
+Each release delivers them, at their versions as it commits, as the Secret `web-kiln` in the
+app's namespace (on KilnCD; Argo CD can't take them yet), and kiln-base reads it as env with
+`kilnSecrets: true`. A change is a release of its own, through the environment's gates; its pods
+roll with it. `kiln app secret uses web --env staging` says each time a delivery read them.
+
+## 5. Look, change, roll back
 
 ```sh
 kiln deploy status web --env production      # what runs, what's on its way, what the provider says
@@ -87,7 +100,7 @@ kiln deploy fleet --env staging --template service --set replicaCount=2   # many
 A release that fails (its provider refuses it, or it doesn't land in time) has its commit
 reverted: what ran before runs again.
 
-## 5. People and agents
+## 6. People and agents
 
 - **Messages**: an app's chat channels (`slack:#deploys`, on its page or `kiln app set web
   --channel slack:#deploys`) hear when its releases wait for approval, land, fail or are

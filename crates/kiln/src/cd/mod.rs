@@ -112,6 +112,8 @@ pub struct Resolved {
     pub artifacts: Vec<ArtifactRef>,
     /// Pull secrets its artifacts ask for.
     pub pull_secrets: Vec<PullSecret>,
+    /// Its secrets, at the versions its definition pins (docs/deploy-api.md §3.5).
+    pub secrets: Option<AppSecrets>,
 }
 
 impl Resolved {
@@ -131,6 +133,25 @@ impl Resolved {
         self.artifacts = artifacts;
         self.pull_secrets = pull_secrets;
     }
+
+    /// Makes an app's secrets part of what this resolution stands for, by their versions (never
+    /// their values): a new version renders (and syncs) again, the same ones don't.
+    pub fn add_secrets(&mut self, secrets: Option<AppSecrets>) {
+        if let Some(s) = &secrets {
+            let h = blake(&[b"app-secrets", s.name.as_bytes(), s.bundle.versions().as_bytes()]);
+            self.key ^= h.rotate_left(29);
+            self.content ^= h.rotate_left(29);
+        }
+        self.secrets = secrets;
+    }
+}
+
+/// An app's secrets as a render delivers them: the Secret's name, and the values of the versions
+/// its definition pins, which are never printed.
+#[derive(Clone, Debug)]
+pub struct AppSecrets {
+    pub name: String,
+    pub bundle: Arc<crate::secrets::Bundle>,
 }
 
 /// A Secret of registry credentials an artifact asks for (`pull-secret`): its name and the
@@ -177,6 +198,9 @@ pub struct Cd {
     plans: plans::Renders,
     /// Images resolved lately, by registry and reference, so apps sharing one ask once a minute.
     artifacts: Mutex<HashMap<String, (crate::ci::integrations::oci::Resolved, Instant)>>,
+    /// Each secrets scope's values, at the versions read last: read again (and the read
+    /// recorded) only when a definition pins others, or a lease runs out.
+    secret_values: Mutex<HashMap<String, (String, Arc<crate::secrets::Bundle>)>>,
     /// Why a repository's deploy file doesn't read, by repository.
     pub deploy_errors: Mutex<BTreeMap<String, String>>,
     /// Each repository's environments (`.kiln/environments.yaml` at trunk), by its URL.
@@ -463,9 +487,13 @@ impl Cd {
                 Ok((mut head, mut held)) => async {
                     let (a, p) = self.resolve_artifacts(&def_for_artifacts, &head.revision).await?;
                     head.add_artifacts(a, p);
+                    // Its secrets are the ones its definition pins, whichever commits it holds.
+                    let secrets = self.app_secrets(&def_for_artifacts).await?;
+                    head.add_secrets(secrets.clone());
                     if let Some(h) = held.as_mut() {
                         let (a, p) = self.held_artifacts(&def_for_artifacts, &id, h).await?;
                         h.add_artifacts(a, p);
+                        h.add_secrets(secrets);
                     }
                     Ok::<_, anyhow::Error>((head, held))
                 }
@@ -685,6 +713,36 @@ impl Cd {
         Ok((refs, self.pull_secrets_of(def, revision).await?))
     }
 
+    /// The secrets `def` pins (docs/deploy-api.md §3.5), with their values from kiln's secrets
+    /// service: read once for each set of versions (the read recorded there), and kept in memory.
+    pub(crate) async fn app_secrets(&self, def: &AppDef) -> Result<Option<AppSecrets>> {
+        let Some(want) = &def.secrets else { return Ok(None) };
+        let versions = want.versions_text();
+        let fresh = |b: &crate::secrets::Bundle| b.expires_at.is_none_or(|t| t - crate::util::now_unix() > 600);
+        let kept = self.secret_values.lock().get(&want.scope).filter(|(v, b)| *v == versions && fresh(b)).map(|(_, b)| Arc::clone(b));
+        let bundle = match kept {
+            Some(b) => b,
+            None => {
+                let scope = crate::secrets::Scope::from_key(&want.scope).with_context(|| format!("`{}` isn't a secrets scope", want.scope))?;
+                let pinned: Vec<(String, u32)> = want.versions.iter().map(|(n, v)| (n.clone(), *v)).collect();
+                let why = crate::secrets::Use { by: "kilncd".into(), purpose: format!("render {}", def.id()) };
+                let b = Arc::new(crate::secrets::of(&self.hub).resolve(&scope, &pinned, &why).await.context("the app's secrets")?);
+                self.secret_values.lock().insert(want.scope.clone(), (versions, Arc::clone(&b)));
+                b
+            }
+        };
+        Ok(Some(AppSecrets { name: want.name.clone(), bundle }))
+    }
+
+    /// An app's secrets for a plan, from memory alone: those it was last rendered with.
+    pub(crate) fn planned_secrets(&self, def: &AppDef) -> Option<AppSecrets> {
+        let want = def.secrets.as_ref()?;
+        if let Some((_, b)) = self.secret_values.lock().get(&want.scope).filter(|(v, _)| *v == want.versions_text()) {
+            return Some(AppSecrets { name: want.name.clone(), bundle: Arc::clone(b) });
+        }
+        self.apps.read().get(&def.id()).and_then(|e| e.resolved.back().and_then(|r| r.secrets.clone()))
+    }
+
     /// The pull secrets an app's artifacts ask for, with their registries' credentials now.
     async fn pull_secrets_of(&self, def: &AppDef, revision: &str) -> Result<Vec<PullSecret>> {
         let mut out = Vec::new();
@@ -799,11 +857,13 @@ impl Cd {
             Some(c) => (c.version.read().clone(), c.discovery.read().api_versions.clone()),
             None => (None, Vec::new()),
         };
+        let secrets = self.app_secrets(&def).await?;
         let cd = Arc::clone(self);
         crate::rt::blocking(move || {
             let mut r = cd.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
             let (artifacts, pull_secrets) = cd.planned_artifacts(&def, &r.revision);
             r.add_artifacts(artifacts, pull_secrets);
+            r.add_secrets(secrets);
             cd.render_app(&def, &r, r.key, kube_version.as_deref(), &api_versions).map(|(objects, _children)| objects)
         })
         .await
@@ -866,6 +926,12 @@ impl Cd {
         }
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
+        }
+        // Its secrets: one Secret, and the pods that read it marked with their versions.
+        if let Some(s) = &inputs.secrets {
+            let versions = s.bundle.versions();
+            objects.push(apps::app_secret(&s.name, &def.destination.namespace, &versions, s.bundle.items.iter().map(|(n, _, v)| (n.as_str(), v.bytes()))));
+            apps::stamp_secrets(&mut objects, &s.name, &def.destination.namespace, &versions);
         }
         apps::stamp_rollout(def, &mut objects);
         let _ = std::fs::remove_dir_all(&views);
@@ -1419,6 +1485,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         live: live::Live::default(),
         plans: plans::Renders::default(),
         artifacts: Mutex::new(HashMap::new()),
+        secret_values: Mutex::new(HashMap::new()),
         deploy_errors: Mutex::new(BTreeMap::new()),
         environments: RwLock::new(BTreeMap::new()),
         started: Mutex::new(HashMap::new()),

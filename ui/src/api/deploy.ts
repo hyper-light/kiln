@@ -54,6 +54,8 @@ export interface Release {
   created_at: number;
   committed_at?: number;
   ended_at?: number;
+  /** Secrets' changes it delivers (docs/deploy-api.md §3.5): a secrets release's reason (`DB_PASSWORD v4`), or ones it took on while it waited. */
+  secrets?: string | null;
 }
 
 export interface Registration {
@@ -213,6 +215,39 @@ export interface Metrics {
   by_day: { day: string; landed: number; failed: number }[];
 }
 
+/** One of an app's secrets in an environment, as listed: never its value (docs/deploy-api.md §3.5). */
+export interface SecretMeta {
+  name: string;
+  version: number;
+  size: number;
+  set_by: string;
+  set_at: number;
+}
+
+export interface SecretVersion {
+  version: number;
+  set_by: string;
+  set_at: number;
+  /** A deletion: the secret was gone from this version on. */
+  deleted: boolean;
+  /** Its value is no longer kept (older than the last ten), or it never had one. */
+  destroyed: boolean;
+}
+
+/** A secret's change on its way to what runs: the release that delivers it (made, or a waiting one it joined), and what happens next. */
+export interface SecretReleased {
+  release: Release | null;
+  next: string;
+}
+
+/** A read of an app's secrets for a delivery: who, for what, which versions (`DB_PASSWORD@3,API_KEY@1`). */
+export interface SecretRead {
+  by: string;
+  purpose: string;
+  versions: string;
+  at: number;
+}
+
 /** What a release asks for: exactly one of a version, values, enabled, or a promotion. */
 export interface ReleaseAsk {
   app: string;
@@ -280,6 +315,13 @@ export const deployApi = {
   },
   pause: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/pause`, {}),
   resume: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/resume`, {}),
+  secrets: (app: string, env: string, signal?: AbortSignal) => request<{ backend: string; secrets: SecretMeta[] }>("GET", `${reg(app, env)}/secrets`, undefined, { signal }),
+  /** A secret's next version. Its value is never read back. */
+  setSecret: (app: string, env: string, name: string, value: string) => request<SecretMeta & SecretReleased>("PUT", `${reg(app, env)}/secrets/${enc(name)}`, { value }),
+  deleteSecret: (app: string, env: string, name: string) => request<SecretReleased>("DELETE", `${reg(app, env)}/secrets/${enc(name)}`),
+  secretVersions: (app: string, env: string, name: string, signal?: AbortSignal) =>
+    request<{ versions: SecretVersion[] }>("GET", `${reg(app, env)}/secrets/${enc(name)}/versions`, undefined, { signal }).then((r) => r.versions),
+  secretUses: (app: string, env: string, signal?: AbortSignal) => request<{ reads: SecretRead[] }>("GET", `${reg(app, env)}/secret-uses?limit=20`, undefined, { signal }).then((r) => r.reads),
 };
 
 export const boardHref = "/deployments/releases";
@@ -325,7 +367,7 @@ export function describe(r: Release): string {
     case "rollback":
       return `rollback to ${r.version ?? ""}${r.rollback_of ? ` (release ${r.rollback_of})` : ""}`;
     case "config":
-      return "config";
+      return r.secrets && !r.values ? `secrets: ${r.secrets}` : r.secrets ? `config (and secrets: ${r.secrets})` : "config";
     default:
       return r.kind;
   }

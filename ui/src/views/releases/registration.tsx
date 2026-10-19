@@ -2,25 +2,29 @@
  * An app in one environment, as its provider sees it (docs/deploy-api.md §8.1): its objects with
  * their sync and health, the manifests it renders, what a sync would change, and its workloads'
  * logs, from KilnCD or Argo CD alike; and another version previewed: what it would render, and
- * what deploying it would change.
+ * what deploying it would change. Its secrets there (§3.5): set, never shown again.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
 
 import { appHref } from "@/api/cd";
-import { boardHref, deployApi, describe, releaseAppHref, releaseHref, type RunningObject } from "@/api/deploy";
+import { boardHref, deployApi, describe, releaseAppHref, releaseHref, type RunningObject, type SecretMeta } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { useSuspenseResource } from "@/lib/resource";
+import { toast } from "@/components/ui/toast";
+import { relativeTime } from "@/lib/format";
+import { errorMessage } from "@/lib/hooks";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { HealthPair, KindBadge, objectKey, objectLabel, SyncPair } from "@/views/deployments/parts";
 import { FileDiffView } from "@/views/harness/diff";
 import { DEPLOY_EVENTS } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
-type Tab = "resources" | "manifests" | "diff" | "logs";
+type Tab = "resources" | "manifests" | "diff" | "logs" | "secrets";
 
 /** The kinds whose pods have logs. */
 const RUNS_PODS = new Set(["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "Pod"]);
@@ -136,6 +140,189 @@ function Logs({ app, env }: { app: string; env: string }) {
   );
 }
 
+/** What the server says happens next (`release 12 delivers it`), as a sentence. */
+const sentence = (s: string) => `${s.charAt(0).toUpperCase()}${s.slice(1)}.`;
+
+/** A secret's versions, newest first: who set each and when, and which keep their value. */
+function SecretVersions({ app, env, name }: { app: string; env: string; name: string }) {
+  const versions = useSuspenseResource(`deploy/secrets/${app}/${env}/${name}/versions`, (s) => deployApi.secretVersions(app, env, name, s)).data;
+  return (
+    <ul className="rel-secret-versions">
+      {versions.map((v) => (
+        <li key={v.version}>
+          <span className="rel-what">v{v.version}</span> {v.deleted ? "deleted" : "set"} by {v.set_by} {relativeTime(v.set_at)}
+          {!v.deleted && v.destroyed && <span className="rel-quiet"> · its value no longer kept</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** The reads of the secrets for deliveries, newest first. */
+function SecretUses({ app, env }: { app: string; env: string }) {
+  const reads = useSuspenseResource(`deploy/secrets/${app}/${env}/uses`, (s) => deployApi.secretUses(app, env, s), { on: DEPLOY_EVENTS }).data;
+  if (!reads.length) return <p className="rel-quiet">No delivery has read them yet.</p>;
+  return (
+    <ul className="rel-secret-versions">
+      {reads.map((r, i) => (
+        <li key={i}>
+          {relativeTime(r.at)} · {r.by} for {r.purpose}: <span className="rel-what">{r.versions || "none"}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** One secret: its version and who set it, a new value for it, its versions, its deletion. */
+function SecretRow({ app, env, m, onDelete }: { app: string; env: string; m: SecretMeta; onDelete: () => void }) {
+  const [value, setValue] = React.useState("");
+  const [setting, setSetting] = React.useState(false);
+  const [history, setHistory] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const save = async () => {
+    setBusy(true);
+    try {
+      const next = await deployApi.setSecret(app, env, m.name, value);
+      toast({ title: `${m.name} is version ${next.version}`, description: sentence(next.next), tone: "succeeded" });
+      setValue("");
+      setSetting(false);
+      invalidate(`deploy/secrets/${app}/${env}`);
+    } catch (err) {
+      toast({ title: "Not set", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <li>
+      <span className="rel-object">
+        <span className="rel-what">{m.name}</span>
+        <span className="rel-quiet">
+          v{m.version} · {m.size} B · set by {m.set_by} {relativeTime(m.set_at)}
+        </span>
+      </span>
+      <span className="rel-secret-acts">
+        <Button size="sm" variant="ghost" onClick={() => setSetting(!setting)}>
+          New value
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => setHistory(!history)}>
+          Versions
+        </Button>
+        <Button size="sm" variant="ghost-danger" onClick={onDelete}>
+          Delete
+        </Button>
+      </span>
+      {setting && (
+        <form
+          className="rel-register rel-secret-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          <TextField label={`${m.name}'s new value`} type="password" autoComplete="off" value={value} onChange={(e) => setValue(e.target.value)} />
+          <Button size="sm" type="submit" disabled={busy || !value}>
+            Set
+          </Button>
+        </form>
+      )}
+      {history && (
+        <Loadable label="its versions">
+          <SecretVersions app={app} env={env} name={m.name} />
+        </Loadable>
+      )}
+    </li>
+  );
+}
+
+/**
+ * The app's secrets here: names, versions, who set each and when. A value is set (a password
+ * field, or `kiln app secret set` for one of several lines) and never shown again; on KilnCD, what
+ * runs gets them as the Secret `<app>-kiln`.
+ */
+function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }) {
+  const { secrets } = useSuspenseResource(`deploy/secrets/${app}/${env}`, (s) => deployApi.secrets(app, env, s), { on: DEPLOY_EVENTS }).data;
+  const [name, setName] = React.useState("");
+  const [value, setValue] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [deleting, setDeleting] = React.useState<string | null>(null);
+  const add = async () => {
+    setBusy(true);
+    try {
+      const m = await deployApi.setSecret(app, env, name, value);
+      toast({ title: `${m.name} is version ${m.version}`, description: sentence(m.next), tone: "succeeded" });
+      setName("");
+      setValue("");
+      invalidate(`deploy/secrets/${app}/${env}`);
+    } catch (err) {
+      toast({ title: "Not set", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async () => {
+    if (!deleting) return;
+    try {
+      const gone = await deployApi.deleteSecret(app, env, deleting);
+      toast({ title: `${deleting} is deleted`, description: `${sentence(gone.next)} The record of its versions stays.`, tone: "succeeded" });
+      invalidate(`deploy/secrets/${app}/${env}`);
+    } catch (err) {
+      toast({ title: "Not deleted", description: errorMessage(err), tone: "failed" });
+    }
+  };
+  return (
+    <>
+      <p className="rel-msg">
+        {argo
+          ? "Argo CD renders from git alone, so these don't reach it yet: they're kept for when they can."
+          : `Each release delivers them, at their versions then, as the Secret ${app}-kiln (kiln-base reads it with kilnSecrets: true); a change is released. Values are never shown again.`}
+      </p>
+      {secrets.length ? (
+        <ul className="rel-objects">
+          {secrets.map((m) => (
+            <SecretRow key={m.name} app={app} env={env} m={m} onDelete={() => setDeleting(m.name)} />
+          ))}
+        </ul>
+      ) : (
+        <p className="rel-quiet">No secrets yet.</p>
+      )}
+      <form
+        className="rel-register"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void add();
+        }}
+      >
+        <TextField label="Name" placeholder="DB_PASSWORD" value={name} spellCheck={false} autoComplete="off" onChange={(e) => setName(e.target.value.toUpperCase())} />
+        <TextField
+          label="Value"
+          type="password"
+          autoComplete="off"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          hint="One line; one of several (a key, a certificate) with kiln app secret set --from-file."
+        />
+        <Button size="sm" type="submit" disabled={busy || !name.trim() || !value}>
+          Add
+        </Button>
+      </form>
+      <h3 className="rel-sub">Read for deliveries</h3>
+      <Loadable label="its reads">
+        <SecretUses app={app} env={env} />
+      </Loadable>
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(o) => !o && setDeleting(null)}
+        title={`Delete ${deleting ?? ""}?`}
+        description="A release takes it from what runs. The record of its versions stays."
+        confirmLabel="Delete the secret"
+        danger
+        onConfirm={remove}
+      />
+    </>
+  );
+}
+
 function RegistrationView({ app, env }: { app: string; env: string }) {
   const d = useSuspenseResource(`deploy/reg/${app}/${env}`, (s) => deployApi.registration(app, env, s), { on: DEPLOY_EVENTS }).data;
   const [tab, setTab] = React.useState<Tab>("resources");
@@ -172,6 +359,7 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
           { value: "manifests", label: "Manifests" },
           { value: "diff", label: "Diff" },
           { value: "logs", label: "Logs" },
+          { value: "secrets", label: "Secrets" },
         ]}
       />
       {d.running && (tab === "manifests" || tab === "diff") && (
@@ -200,6 +388,7 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
           {tab === "manifests" && <Manifests app={app} env={env} version={preview} />}
           {tab === "diff" && <Diffs app={app} env={env} version={preview} />}
           {tab === "logs" && <Logs app={app} env={env} />}
+          {tab === "secrets" && <Secrets app={app} env={env} argo={argo} />}
         </Loadable>
       </div>
     </>

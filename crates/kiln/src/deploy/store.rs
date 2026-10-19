@@ -283,6 +283,23 @@ pub async fn releases(store: &Store, q: ReleaseQuery) -> anyhow::Result<Vec<Rele
 }
 
 /// A registration's release in flight, if any.
+/// The newest release in flight for a registration: the one a secret's change joins while it
+/// waits (§3.5).
+pub async fn newest_in_flight(store: &Store, app: &str, env: &str) -> anyhow::Result<Option<Release>> {
+    let (app, env) = (app.to_owned(), env.to_owned());
+    let spec: Option<String> = store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT spec FROM deploy_releases WHERE app = ?1 AND environment = ?2 AND state IN ('waiting', 'waiting_approval', 'committing', 'delivering') ORDER BY id DESC LIMIT 1",
+                params![app, env],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await?;
+    spec.as_deref().map(from_json).transpose()
+}
+
 pub async fn in_flight(store: &Store, app: &str, env: &str) -> anyhow::Result<Option<Release>> {
     let (app, env) = (app.to_owned(), env.to_owned());
     let spec: Option<String> = store

@@ -54,7 +54,7 @@ fn dns_label(what: &str, s: &str) -> Result<(), Fail> {
 
 /// Tells every client, and whoever waits on it, that a release moved; one waiting for approval
 /// says so, and who may give it (`needs`, `approvers`).
-fn emit_release(d: &Deploy, r: &Release) {
+pub(super) fn emit_release(d: &Deploy, r: &Release) {
     let mut e = json!({
         "type": "deploy",
         "id": r.id,
@@ -273,6 +273,11 @@ pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(
         return Err(missing(format!("no environment {name}")));
     }
     audit(d, actor, "deploy.environment.delete", name.to_owned()).await;
+    // Its apps' secrets there go with it (§3.5).
+    let secrets = crate::secrets::of(&d.hub);
+    for a in store::apps(&d.hub.store).await.map_err(internal)? {
+        secrets.forget(&crate::secrets::Scope::of(&a.name, name), actor).await.map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -358,6 +363,11 @@ pub async fn delete_app(d: &Deploy, who: &Who, name: &str, everywhere: bool, kee
         return Err(missing(format!("no app {name}")));
     }
     audit(d, actor, "deploy.app.delete", name.to_owned()).await;
+    // Its secrets go with it (§3.5): an app made later with its name doesn't get them.
+    let secrets = crate::secrets::of(&d.hub);
+    for e in store::environments(&d.hub.store).await.map_err(internal)? {
+        secrets.forget(&crate::secrets::Scope::of(name, &e.name), actor).await.map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -754,6 +764,10 @@ pub struct Ask {
     /// Asked for again with the same key, it is the same release (a retry after a timeout).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// A secrets release (§3.5): the app's secrets at their versions now, its version and values
+    /// kept. What changed, in a few words (`DB_PASSWORD v4`).
+    #[serde(default)]
+    pub secrets: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -921,9 +935,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     if a.archived {
         return Err(conflict(format!("{} is archived: no new releases", a.name)));
     }
-    let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some()].iter().filter(|b| **b).count();
+    let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some(), ask.secrets.is_some()].iter().filter(|b| **b).count();
     if asked != 1 {
-        return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, or promote_from"));
+        return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, promote_from, or secrets"));
     }
     let now = crate::util::now_unix();
     let mut r = Release {
@@ -950,6 +964,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         created_at: now,
         committed_at: None,
         ended_at: None,
+        secrets: None,
     };
     // Asked for before with this key: that release, whatever it has become.
     if let Some(k) = &r.idempotency_key
@@ -991,6 +1006,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         r.rollback_of = Some(to.id);
     } else if let Some(enabled) = ask.enabled {
         r.kind = if enabled { Kind::Enable } else { Kind::Disable };
+    } else if let Some(what) = ask.secrets {
+        r.kind = Kind::Config;
+        r.secrets = Some(Some(what.trim()).filter(|w| !w.is_empty()).unwrap_or("as they are").to_owned());
     } else if let Some(from) = ask.promote_from {
         if from == env.name {
             return Err(bad("a promotion comes from another environment"));
@@ -1209,8 +1227,12 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             }
         },
         State::Committing => match commit_release(d, &r).await {
-            Ok(sha) => {
+            Ok((sha, secrets)) => {
                 r.commit = Some(sha);
+                // What it changes of the app's secrets, as it pinned them (§3.5).
+                if let Some(changed) = secrets.filter(|c| !c.is_empty()) {
+                    r.secrets = Some(changed);
+                }
                 r.committed_at = Some(now);
                 r.state = State::Delivering;
                 r.message = None;
@@ -1316,9 +1338,10 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Commits a release to its environment's release repository; the commit's id. A commit made
-/// before a crash is found by its trailer, not made again.
-async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
+/// Commits a release to its environment's release repository: the commit's id, and what it
+/// changes of the app's secrets (§3.5). A commit made before a crash is found by its trailer, not
+/// made again.
+async fn commit_release(d: &Deploy, r: &Release) -> Result<(String, Option<String>), String> {
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let rr = env.release_repo.clone();
@@ -1328,7 +1351,7 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
         crate::rt::blocking(move || hosted.find_trailer(&rr.repo, &rr.branch, repo::RELEASE_TRAILER, &id.to_string())).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?
     };
     if let Some(sha) = found {
-        return Ok(sha);
+        return Ok((sha, None));
     }
     let (hosted, release_path, values_path) = (d.hosted.clone(), repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name));
     let prior = {
@@ -1346,7 +1369,12 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
         Kind::Config => prior.as_ref().is_some_and(|p| p.enabled),
         Kind::Deploy | Kind::Rollback | Kind::Enable => true,
     };
-    let file = repo::release_json(&a, &env.name, r, prior.as_ref(), enabled);
+    let mut file = repo::release_json(&a, &env.name, r, prior.as_ref(), enabled);
+    // The app's secrets, at their versions now (§3.5): what runs gets these until a release pins
+    // others, a rollback included.
+    let pinned = crate::secrets::of(&d.hub).current(&crate::secrets::Scope::of(&a.name, &env.name)).await.map_err(|e| format!("the app's secrets: {e:#}"))?;
+    file.secrets = crate::secrets::versions_text(pinned.iter().map(|(n, v)| (n.as_str(), *v)));
+    let changed = secrets_changed(prior.as_ref().map_or("", |p| p.secrets.as_str()), &file.secrets);
     let mut changes = vec![
         Change { path: repo::app_file(&rr, &a), content: Some(repo::app_yaml(&a).map_err(|e| format!("{e:#}"))?) },
         Change { path: release_path, content: Some(repo::encode(&file).map_err(|e| format!("{e:#}"))?) },
@@ -1354,7 +1382,18 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
     if let Some(v) = &r.values {
         changes.push(Change { path: values_path, content: Some(v.clone().into_bytes()) });
     }
-    commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await
+    let sha = commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await?;
+    Ok((sha, Some(changed)))
+}
+
+/// What a release changes of the app's secrets, from the versions the one before pinned to its
+/// own: each set (`API_KEY v1`) or deleted (`DB_PASSWORD deleted`).
+fn secrets_changed(before: &str, after: &str) -> String {
+    let read = |t: &str| crate::secrets::parse_versions(t).unwrap_or_default().into_iter().collect::<BTreeMap<String, u32>>();
+    let (before, after) = (read(before), read(after));
+    let mut out: Vec<String> = after.iter().filter(|(n, v)| before.get(*n) != Some(*v)).map(|(n, v)| format!("{n} v{v}")).collect();
+    out.extend(before.keys().filter(|n| !after.contains_key(*n)).map(|n| format!("{n} deleted")));
+    out.join(", ")
 }
 
 /// What a release's commit holds for its registration.
@@ -1385,7 +1424,8 @@ pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, versi
         return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
-    let then = kilncd::definition(a, env, &reg, &file, &commit, &url).map_err(bad)?;
+    let chart = kilncd::git_chart(&cd, &a.package, version).await;
+    let then = kilncd::definition(a, env, &reg, &file, &commit, &url, chart).map_err(bad)?;
     futures::try_join!(cd.render_definition(now), cd.render_definition(then)).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))
 }
 
@@ -1440,7 +1480,8 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
         return Ok(());
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(|e| format!("{e:#}"))?;
-    let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url).map_err(Undelivered::Refused)?;
+    let chart = kilncd::git_chart(&cd, &a.package, file.version.as_deref().unwrap_or_default()).await;
+    let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url, chart).map_err(Undelivered::Refused)?;
     kilncd::deliver(&d.hub, &cd, &actor, &def).await
 }
 
@@ -1733,6 +1774,7 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     created_at: now,
                     committed_at: Some(now),
                     ended_at: None,
+                    secrets: None,
                 };
                 let (r, _) = store::insert_release(st, &r).await?;
                 if let Err(e) = deliver(d, &r).await {
@@ -1827,6 +1869,14 @@ mod tests {
         assert_eq!(onward(&envs, &registered, "staging"), ["production"], "eu promotes by hand; canary doesn't run the app");
         assert!(onward(&envs, &registered, "production").is_empty(), "nothing comes after production");
         assert_eq!(serde_json::to_value(super::super::model::Gates::default()).ok(), Some(json!({})), "`manual`, the default, isn't written");
+    }
+
+    #[test]
+    fn a_release_says_what_it_changes_of_the_secrets() {
+        assert_eq!(secrets_changed("", "API_KEY@1,DB_PASSWORD@2"), "API_KEY v1, DB_PASSWORD v2");
+        assert_eq!(secrets_changed("API_KEY@1,DB_PASSWORD@2", "API_KEY@1,DB_PASSWORD@3,TOKEN@1"), "DB_PASSWORD v3, TOKEN v1");
+        assert_eq!(secrets_changed("API_KEY@1,DB_PASSWORD@2", "API_KEY@1"), "DB_PASSWORD deleted");
+        assert_eq!(secrets_changed("API_KEY@1", "API_KEY@1"), "", "nothing changed");
     }
 
     #[test]

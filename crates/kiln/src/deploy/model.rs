@@ -607,6 +607,10 @@ pub struct Release {
     pub committed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
+    /// Secrets changed since what runs, that it delivers (§3.5): a secrets release's reason
+    /// (`DB_PASSWORD v4`), or changes a waiting release took on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<String>,
 }
 
 /// `release.json`: what an environment runs, as kiln commits it (docs/deploy-api.md §6). Argo CD's
@@ -631,6 +635,10 @@ pub struct ReleaseFile {
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_of: Option<i64>,
+    /// The version of each of the app's secrets it delivers (`API_KEY@1,DB_PASSWORD@4`, never a
+    /// value): those set as it was committed (§3.5).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub secrets: String,
 }
 
 /// `release.json`'s schema, and the start of every release repository path kiln owns.

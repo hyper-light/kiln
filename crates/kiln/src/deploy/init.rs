@@ -106,7 +106,7 @@ mod tests {
         assert!(get("charts/web/charts/kiln-base/templates/_all.tpl").is_some_and(|t| t.contains("define \"kiln-base.all\"")));
         assert!(get("deploy/production.yaml").is_some_and(|t| t.contains("replicaCount: 3") && t.contains("enabled: true")));
         assert!(get("deploy/staging.yaml").is_some_and(|t| t.contains("replicaCount: 1")));
-        assert_eq!(base_version(), "0.1.0");
+        assert_eq!(base_version(), "0.1.1");
     }
 
     #[test]
@@ -128,6 +128,11 @@ mod tests {
             let out = std::process::Command::new("helm").arg("template").arg("web").arg(tmp.path().join("charts/web")).output()?;
             let text = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success() && text.contains("kind: Deployment") && text.contains("image: ghcr.io/acme/web:0.1.0"), "{text}");
+            assert!(!text.contains("web-kiln"), "no secrets unless asked for");
+            // The app's secrets from kiln: the Secret KilnCD delivers, as env, there or not.
+            let out = std::process::Command::new("helm").args(["template", "web", "--set", "kilnSecrets=true"]).arg(tmp.path().join("charts/web")).output()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && text.contains("name: web-kiln") && text.contains("optional: true"), "{text}");
         }
         Ok(())
     }

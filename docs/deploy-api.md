@@ -198,40 +198,72 @@ is needed) and `deploy/<env>.yaml` for each environment into a repository, keepi
 there unless `--force`; `--base` writes only kiln-base, to move an app to the version this kiln
 ships.
 
-### 3.5 Secrets per app (proposed, not built: for the user to decide)
+### 3.5 Secrets per app
 
-An app's secrets for an environment (a database password, an API key) come from kiln's secret
-store and reach what runs without ever passing through git.
+An app's secrets for an environment (a database password, an API key) come from kiln's secrets
+service and reach what runs without ever passing through git. Agreed 2026-10-19, as the first
+piece of a larger one: a just-in-time secrets service (AWS Secrets Manager's scale, Vault's
+controls) that will take over the storage and issuing. The code is cut so that cutover swaps one
+backend: the API, `kiln`, the UI, delivery and audit stay as they are.
 
-- **Where they live.** kiln's secret store (ci.md W09: sealed with AES-256-GCM, each value bound
-  to its scope and name, rotated with the store): a new scope, `app:<app>:<environment>`. Like an
-  integration's own credential, it is never resolved for a CI leg. Its values are never read
-  back through the API: only their names, who set them and when.
-- **Who.** Set and removed by people with `secrets.manage` on the app (or a new
-  `apps.secrets` capability); agents may list names, never set or read values.
-- **API.** `PUT /api/deploy/apps/{app}/environments/{env}/secrets/{name}` (the value in the body,
-  write-only), `GET …/secrets` (names, set by, set at), `DELETE …/secrets/{name}`;
-  `kiln app secret set web DB_PASSWORD --env production` (the value from stdin);
-  `deploy.secrets.list` for agents.
-- **On KilnCD.** At render, KilnCD adds a Kubernetes Secret `<app>-kiln` in the app's namespace
-  with the app's secrets for the environment, as it adds image pull secrets now: tracked as the
-  app's own, applied by a sync, shown masked in manifests, diffs and plans. The values' digest
-  (never the values) is part of the render key, so a changed secret renders and syncs again.
-  The app's chart reads it by name (`envFrom: [{secretRef: {name: <app>-kiln}}]`); the base
-  chart (§3.4) does so by default.
-- **On Argo CD.** Argo CD renders from git alone, so the Secret can't be added at render. Two
-  ways, chosen per environment: Sealed Secrets (kiln seals each value with the cluster's public
-  key and commits the SealedSecret to the release repository: git holds only ciphertext), or the
+- **The service** (`crate::secrets`): a scope (today an app in an environment), its secrets by
+  name, their versions, who set each and when, and every read of their values. Names are
+  environment variables' (`DB_PASSWORD`), values at most 64 KiB, a scope at most 200 secrets
+  and 960 KiB in all (they're delivered as one Kubernetes Secret, which holds at most 1 MiB).
+  The policy is the service's, the same for every backend: who may set, list and read, and that
+  agents never set values or read them.
+- **Backends** (`secrets::Backend`): `list`, `versions`, `put` (a new version), `delete` (a
+  tombstone version: history stays), `resolve` (the current values for a delivery, each with
+  its version, and until when they hold: a lease, from a backend that issues them), `rotate`.
+  - **kiln's own** (`secrets::kiln`, today): versions kept in kiln's store (the last ten with
+    their values, older ones' values destroyed, their record kept), each sealed with
+    AES-256-GCM under a data key of its own, the data keys wrapped by the server's master key
+    (the secret store's, W09), each ciphertext bound to its scope, name and version; `rotate`
+    re-seals every value under a new data key. Each read for a delivery is recorded (who, why,
+    which versions).
+  - **The JIT secrets service** (later): the same calls over its API; leases come back with
+    `resolve`, and delivery renews them before they expire.
+- **Who.** People with `secrets.manage` set and delete; anyone who reads deployments lists names
+  and versions; values are never read back through the API. Agents list names and versions,
+  and never set or delete (the service's one policy check, `Secrets::may`, where Vault-like
+  policies will go).
+- **API.** `GET /api/deploy/apps/{app}/environments/{env}/secrets` (names, versions, sizes, who,
+  when), `PUT …/secrets/{name}` (`{value}`, or `{base64}` for bytes; write-only: a new version),
+  `DELETE …/secrets/{name}`, `GET …/secrets/{name}/versions`, `GET …/secret-uses` (each read for
+  a delivery). A change answers with the release that delivers it and what happens next;
+  `?release=false` keeps it for a later release. `kiln app secret set|import|list|rm|versions|uses`
+  (a value from stdin, asked for unechoed at a terminal, or `--from-file`: never an argument;
+  `--no-release`); `kiln deploy <app> --to <env> --secrets`; `deploy.secrets.list` for agents; a
+  Secrets tab on each registration's page.
+- **Pinned by releases.** Each release pins the secrets' versions as it commits (`release.json`'s
+  `secrets: "API_KEY@1,DB_PASSWORD@4"`, never a value), so what runs changes only through a
+  release and its gates, and the release repository's history says which versions ran when.
+- **On KilnCD.** The definition KilnCD deploys a release from names the pinned versions; at
+  render KilnCD adds a Secret `<app>-kiln` in the app's namespace with their values, as it adds
+  image pull secrets: tracked as the app's own, applied by a sync, shown masked in manifests,
+  diffs and plans, never written to disk. Values are read once for each set of versions (the read
+  recorded: `kilncd`, `render shop/web-staging`, the versions) and kept in memory; the versions
+  (never the values) are part of the render key. Each pod template that reads the Secret (env, a
+  key of it, a volume) is marked with the versions (`kiln.dev/secrets`), so its pods roll when a
+  release delivers new ones. kiln-base's `kilnSecrets: true` reads it as env (optional: an app
+  without secrets has none).
+- **On Argo CD.** Argo CD renders from git alone, so the Secret can't be added at render: the
   External Secrets Operator with kiln as its webhook provider (the chart carries an
   ExternalSecret; the operator fetches values from kiln with a token scoped to that app and
-  environment).
-- **A change is a release.** Setting or removing a secret makes a config release ("secrets:
-  DB_PASSWORD changed"), so the environment's gates, history and audit apply. History records
-  which names changed, by whom, never values; a rollback restores a release's configuration, not
-  older secret values.
+  environment), or Sealed Secrets (kiln seals each value with the cluster's key and commits the
+  SealedSecret: git holds only ciphertext). Not built yet.
+- **A change is a release.** Setting or deleting a secret asks for a secrets release (a config
+  release that keeps the version and values: "secrets: DB_PASSWORD v4") where something runs on
+  KilnCD, so the environment's gates, history and audit apply. A release still waiting takes the
+  change on instead, and says so for whoever approves it; one already committing doesn't, and an
+  environment that takes one release at a time refuses another (the change is kept, and the
+  answer says how to release it). Where nothing runs yet, the first release delivers them. A
+  rollback pins the versions current then: it restores a release's configuration, never older
+  secret values.
+- **Gone with what they belong to.** Deleting an app, or an environment, deletes its secrets
+  there and destroys their values; the record of their versions and reads stays.
 - **Platforms.** Lambda, ECS, Workers and Vercel take them their own way (their secret stores or
   environment variables), through KilnCD's providers, later.
-- **Each delivery is recorded**, as a delivery to a leg is (W09-R04).
 
 ## 4. Environments
 
@@ -769,7 +801,8 @@ deployments, and aren't carried over.
 | P5: an app's source repository (§3.1, step 4): one linked (`source`), or one its template makes (`repository`: a name pattern, a starter repository at a branch or tag, the default branch) as one of kiln's own repositories, its first commit the starter's files with `{{kiln.app}}` and the rest filled in, in files and in names (links and modes kept, nothing of the starter run), its first build started as a push of it would; a template that makes repositories put only by someone who may add them; `kiln app create --source`, `kiln app set --source`; the source in `catalog-info.yaml` and on the app's page | built. On the test server: a starter served over git:// became `acme/shop-web` with every placeholder filled and Helm's own `{{ }}` left alone, a script still executable and a link still a link, and its `.kiln/ci.yaml` queued a run; podinfo 6.11.0 from GitHub became `demo/pod-src` (336 files, one commit, in a second); a taken name, a missing starter and a `file://` starter were each refused with nothing left behind; with a token of someone who may make apps but not add repositories, a template without a repository was put and one with a repository (or a new starter) refused, and an app made from the admin's template got its repository |
 | P5: fleet changes (§3.3) as releases: one version, or values set, across the apps of an environment a fleet selects, each through its gates, followed together; by API, `kiln deploy fleet` and `deploy.fleets.*` | built. On the test server: `--template svc-src --set ui.message=… --set replicaCount=2` made a config release for each of its two apps, both landed with the values merged into their own; a version across both, asked twice with one key, was the same two releases (they then timed out on a rollout the cluster couldn't finish) |
 | P5: kiln's base chart and `kiln app init` (§3.4) | built. `helm lint` passes on what `kiln app init` writes; with every part turned on (an Ingress with TLS, autoscaling on CPU and memory, a digest-pinned image, config files and env, a Secret's key as env, a cron job, a migration hook, a volume, a network policy) all twelve objects render as meant; run again it keeps every file, and `--base` rewrites only kiln-base |
-| P5, the rest: owners as groups (kiln has none yet), kiln-base published to a registry (it's vendored for now), source repositories on GitHub, GitLab or Bitbucket (with P3), registries, secrets per app (§3.5, for the user to decide), fleet changes as pull requests, chat | not yet |
+| P5: secrets per app (§3.5): kiln's secrets service over its own backend (versions sealed with AES-256-GCM under data keys of its own, wrapped by the master key and bound to scope, name and version; the last ten kept; every read for a delivery recorded; rotation; forgotten with their app or environment; 960 KiB a scope), behind `secrets::Backend` for the JIT secrets service to take over; the API, `kiln app secret set\|import\|list\|rm\|versions\|uses`, `kiln deploy --secrets`, `deploy.secrets.list`, a Secrets tab per registration; each release pins the versions (`release.json`'s `secrets`) and KilnCD renders their values as `<app>-kiln`, rolling the pods that read it; a change is a secrets release, or joins one still waiting; `cd.apps.create` refuses a definition naming secrets; a git package that is a chart renders with Helm as the app, with the environment's values | built. On the test server and the kilncd-e2e cluster: a secret set before the first release was kept, then delivered by it (the Secret, the pod template marked `DB_PASSWORD@1`, the running pod's env); a new value made release 3, which rolled the pod onto it; a dotenv import of two made one release; a deletion made release 5, after which the Secret and the pod held only the other two; the release repository pinned each release's versions; a definition naming another app's secrets was refused (400) and never created; each read for a delivery was recorded |
+| P5, the rest: owners as groups (kiln has none yet), kiln-base published to a registry (it's vendored for now), source repositories on GitHub, GitLab or Bitbucket (with P3), registries, secrets on Argo CD and platforms (§3.5), fleet changes as pull requests, chat | not yet |
 | Reads per registration, from either provider in KilnCD's shapes (txst's resources, render, diff and logs): resources with sync and health, the manifests it renders (Secrets masked, Helm's test hooks left out on Argo CD), what a sync would change (live, predicted, unified hunks), a workload's pods' logs; on Argo CD, a preview of another version (what it renders, and how that differs from what the deployed version renders). `GET …/resources`, `…/manifests`, `…/diff`, `…/logs`; `kiln deploy resources|manifests|diff|logs`; `deploy.registrations.*` | built. On the test servers each read answered on both providers; previewing podinfo 6.11.0 on Argo CD showed its labels and image change and nothing else. On KilnCD a version is previewed as what runs at that version (its values and artifacts as they are), rendered as KilnCD renders it and compared with what runs renders, Helm's test hooks left out: previewing 6.11.0 where 6.11.2 ran showed the same labels and image change, the running version nothing, and a version that isn't there said so with the newest ones, as a release of it is told |
 | P8, first part: the Releases pages under Deployments (`/deployments/releases`): the environments board (apps down, environments across, what runs and what is on its way in each, its provider), what waits for approval with its answer at hand, an app's environments side by side with the release dialog (a version and its image, values, a promotion, a rollback picked from its candidates), pause, resume, enable and disable, its history, and a release's page (its facts, each gate's result and evidence, answers, cancel, what its provider said); live from the `deploy` event, at phone width too; `GET /api/deploy/board` | built. Against the test server in a browser: the board, an app and a release rendered; a reviewer signed in on the board approved a release waiting there and it landed; a refusal (a non-reviewer's) said why |
 | P8: a new app from one page (`/deployments/releases/new`, and New app on the board): its name checked as it's left, a template (its package, namespace, checks, allowed environments and the repository it makes, shown filled in for the app) or a package, its source repository (the template's, one kiln has, or none), the environments it's registered in; registering an app from its page | built. In a browser against the test server: an app made from a template got `acme/ui-web` from its starter (its first build queued) and its registration in `e2e`, landed on its page, and its first release, asked for there, landed through KilnCD (Synced, Healthy); at phone width the page fits |

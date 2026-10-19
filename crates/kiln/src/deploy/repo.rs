@@ -74,6 +74,7 @@ pub fn release_json(app: &App, env: &str, r: &Release, prior: Option<&ReleaseFil
         requested_by: r.requested_by.clone(),
         at: rfc3339(r.created_at),
         rollback_of: r.rollback_of,
+        secrets: String::new(),
     }
 }
 
@@ -92,6 +93,7 @@ pub fn registered_json(app: &App, env: &str) -> ReleaseFile {
         requested_by: String::new(),
         at: rfc3339(crate::util::now_unix()),
         rollback_of: None,
+        secrets: String::new(),
     }
 }
 
@@ -109,7 +111,10 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<ReleaseFile> {
 pub fn message(app: &App, env: &str, r: &Release) -> String {
     let what = match r.kind {
         Kind::Deploy => format!("deploy {} {} to {env}", app.name, r.version.as_deref().unwrap_or("?")),
-        Kind::Config => format!("change {}'s values in {env}", app.name),
+        Kind::Config => match &r.secrets {
+            Some(what) if r.values.is_none() => format!("deliver {}'s secrets in {env}: {what}", app.name),
+            _ => format!("change {}'s values in {env}", app.name),
+        },
         Kind::Rollback => format!(
             "roll {} in {env} back to {}{}",
             app.name,
@@ -306,6 +311,7 @@ mod tests {
             created_at: 1_792_356_000,
             committed_at: None,
             ended_at: None,
+            secrets: None,
         }
     }
 
