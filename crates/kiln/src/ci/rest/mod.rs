@@ -184,6 +184,14 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
             run_object(hub, &origin, owner, repo, &repo_id, run).await
         }
+        (&Method::GET, ["repos", owner, repo, "actions", "runs"]) => {
+            let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            run_list(hub, &origin, owner, repo, &repo_id, None, &q).await
+        }
+        (&Method::GET, ["repos", owner, repo, "actions", "workflows", which, "runs"]) => {
+            let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            run_list(hub, &origin, owner, repo, &repo_id, Some(which), &q).await
+        }
         (&Method::GET, ["repos", owner, repo, "actions", "workflows", which]) => {
             let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
             workflow_object(hub, &origin, owner, repo, &repo_id, which).await
@@ -283,25 +291,18 @@ fn workflow_number(path: &str) -> u64 {
     u64::from(u32::from_be_bytes([d.first().copied().unwrap_or(0), d.get(1).copied().unwrap_or(0), d.get(2).copied().unwrap_or(0), d.get(3).copied().unwrap_or(0)] ) & 0x7fff_ffff)
 }
 
-/// `GET /repos/{o}/{r}/actions/runs/{run_id}`: the run, as GitHub shows one.
-async fn run_object(hub: &Hub, origin: &str, owner: &str, repo: &str, repo_id: &str, run: &str) -> Result<Response, Fail> {
-    let Ok(rowid) = run.parse::<i64>() else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
-    type Row = (i64, i64, String, String, String, String, String, String, Option<String>, i64, i64, Option<i64>, Option<i64>, Option<String>);
-    let rid = repo_id.to_owned();
-    let row: Option<Row> = hub
-        .store
-        .call(move |c| {
-            Ok(c.query_row(
-                "SELECT rowid, number, COALESCE(workflow_id, ''), pipeline, event, branch, sha, status, conclusion, COALESCE(attempt, 1), created_at, started_at, finished_at, run_name
-                 FROM runs WHERE rowid = ?1 AND repo_id = ?2",
-                params![rowid, rid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?)),
-            )
-            .optional()?)
-        })
-        .await
-        .map_err(internal)?;
-    let Some((id, number, path, name, event, branch, sha, status, conclusion, attempt, created, started, finished, run_name)) = row else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+/// A run's row, as the facade reads it.
+type RunRow = (i64, i64, String, String, String, String, String, String, Option<String>, i64, i64, Option<i64>, Option<i64>, Option<String>);
+
+const RUN_COLUMNS: &str = "rowid, number, COALESCE(workflow_id, ''), pipeline, event, branch, sha, status, conclusion, COALESCE(attempt, 1), created_at, started_at, finished_at, run_name";
+
+fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?))
+}
+
+/// A run as GitHub shows one.
+fn run_json(origin: &str, owner: &str, repo: &str, row: RunRow) -> Value {
+    let (id, number, path, name, event, branch, sha, status, conclusion, attempt, created, started, finished, run_name) = row;
     let api = format!("{}/api/v3/repos/{owner}/{repo}", origin.trim_end_matches('/'));
     let wf = workflow_number(&path);
     let gh_status = match status.as_str() {
@@ -310,17 +311,59 @@ async fn run_object(hub: &Hub, origin: &str, owner: &str, repo: &str, repo_id: &
         _ if finished.is_some() => "completed",
         _ => "in_progress",
     };
-    Ok(srv::json(
-        StatusCode::OK,
-        &json!({
-            "id": id, "name": name, "display_title": run_name.unwrap_or_else(|| name.clone()), "run_number": number, "run_attempt": attempt, "event": event,
-            "status": gh_status, "conclusion": conclusion, "head_branch": branch, "head_sha": sha, "path": path, "workflow_id": wf,
-            "workflow_url": format!("{api}/actions/workflows/{wf}"), "url": format!("{api}/actions/runs/{id}"),
-            "html_url": format!("{}/{owner}/{repo}/actions/runs/{id}", origin.trim_end_matches('/')),
-            "created_at": rfc3339(created), "updated_at": rfc3339(finished.or(started).unwrap_or(created)), "run_started_at": rfc3339(started.unwrap_or(created)),
-            "pull_requests": [],
-        }),
-    ))
+    json!({
+        "id": id, "name": name, "display_title": run_name.unwrap_or_else(|| name.clone()), "run_number": number, "run_attempt": attempt, "event": event,
+        "status": gh_status, "conclusion": conclusion, "head_branch": branch, "head_sha": sha, "path": path, "workflow_id": wf,
+        "workflow_url": format!("{api}/actions/workflows/{wf}"), "url": format!("{api}/actions/runs/{id}"),
+        "html_url": format!("{}/{owner}/{repo}/actions/runs/{id}", origin.trim_end_matches('/')),
+        "jobs_url": format!("{api}/actions/runs/{id}/jobs"), "artifacts_url": format!("{api}/actions/runs/{id}/artifacts"),
+        "created_at": rfc3339(created), "updated_at": rfc3339(finished.or(started).unwrap_or(created)), "run_started_at": rfc3339(started.unwrap_or(created)),
+        "pull_requests": [],
+    })
+}
+
+/// `GET /repos/{o}/{r}/actions/runs/{run_id}`: the run, as GitHub shows one.
+async fn run_object(hub: &Hub, origin: &str, owner: &str, repo: &str, repo_id: &str, run: &str) -> Result<Response, Fail> {
+    let Ok(rowid) = run.parse::<i64>() else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    let rid = repo_id.to_owned();
+    let row: Option<RunRow> = hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {RUN_COLUMNS} FROM runs WHERE rowid = ?1 AND repo_id = ?2"), params![rowid, rid], run_row).optional()?)).await.map_err(internal)?;
+    match row {
+        Some(row) => Ok(srv::json(StatusCode::OK, &run_json(origin, owner, repo, row))),
+        None => Ok(message(StatusCode::NOT_FOUND, "Not Found")),
+    }
+}
+
+/// `GET /repos/{o}/{r}/actions/runs` (and a workflow's, `/actions/workflows/{id}/runs`): newest
+/// first, filtered as GitHub filters (`branch`, `event`, `status`, `head_sha`), `per_page` (100
+/// at most) and `page`.
+async fn run_list(hub: &Hub, origin: &str, owner: &str, repo: &str, repo_id: &str, workflow: Option<&str>, q: &std::collections::HashMap<String, String>) -> Result<Response, Fail> {
+    let f = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
+    let per = f("per_page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(30).clamp(1, 100);
+    let page = f("page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).max(1);
+    let (rid, branch, event, sha, status) = (repo_id.to_owned(), f("branch"), f("event"), f("head_sha"), f("status"));
+    let rows: Vec<RunRow> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE repo_id = ?1 AND workflow_id IS NOT NULL AND (?2 IS NULL OR branch = ?2) AND (?3 IS NULL OR event = ?3) AND (?4 IS NULL OR sha = ?4)
+                 ORDER BY created_at DESC, rowid DESC LIMIT 2000"
+            ))?;
+            let rows = st.query_map(params![rid, branch, event, sha], run_row)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    let wanted = |r: &RunRow| {
+        let wf_ok = workflow.is_none_or(|w| workflow_number(&r.2).to_string() == w || r.2.rsplit('/').next() == Some(w) || r.2 == w);
+        let json = run_json(origin, owner, repo, r.clone());
+        let st_ok = status.as_deref().is_none_or(|s| json.get("status").and_then(Value::as_str) == Some(s) || json.get("conclusion").and_then(Value::as_str) == Some(s));
+        (wf_ok && st_ok).then_some(json)
+    };
+    let all: Vec<Value> = rows.iter().filter_map(wanted).collect();
+    let total = all.len();
+    let start = usize::try_from((page - 1) * per).unwrap_or(usize::MAX);
+    let runs: Vec<Value> = all.into_iter().skip(start).take(usize::try_from(per).unwrap_or(30)).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "total_count": total, "workflow_runs": runs })))
 }
 
 /// `GET /repos/{o}/{r}/actions/workflows/{id}` (its number, or its file's name).

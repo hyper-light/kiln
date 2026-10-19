@@ -1060,3 +1060,93 @@ fn w14_generated_files_and_blobs() -> anyhow::Result<()> {
     assert_eq!(status("path=logo.png&side=both")?, 400);
     Ok(())
 }
+
+/// The facade's runs and code scanning (docs/ci.md W14-R11): a job reads its own run, the
+/// repository's runs and its workflow as GitHub serves them, and code scanning takes SARIF (gzipped
+/// and in base64), reads it into alerts, says it's complete, and marks an alert fixed when a
+/// later analysis no longer finds it.
+#[test]
+fn w14_r11_runs_and_code_scanning() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    // The first trunk: the poller's first look takes it as it is.
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/app") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(
+        work.join(".github/workflows/scan.yml"),
+        r#"on: push
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+jobs:
+  scan:
+    runs-on: local
+    steps:
+      - env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          api() { curl -sf -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$@"; }
+          R="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          run=$(api "$R/actions/runs/$GITHUB_RUN_ID")
+          echo "$run" | grep -q '"path":".github/workflows/scan.yml"'
+          wf=$(echo "$run" | sed -n 's/.*"workflow_url":"\([^"]*\)".*/\1/p')
+          api "$wf" | grep -q '"state":"active"'
+          api "$R/actions/runs?event=push" | grep -q '"total_count":1'
+          api "$GITHUB_API_URL/meta" > /dev/null
+          sarif() { printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Lint","rules":[{"id":"no-eval","defaultConfiguration":{"level":"error"}}]}},"results":[%s]}]}' "$1" | gzip -c | base64 -w0; }
+          found='{"ruleId":"no-eval","message":{"text":"eval is evil"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/a.js"},"region":{"startLine":3}}}]}'
+          up() { api -X POST "$R/code-scanning/sarifs" -d "{\"commit_sha\":\"$GITHUB_SHA\",\"ref\":\"$GITHUB_REF\",\"sarif\":\"$(sarif "$1")\",\"tool_name\":\"Lint\"}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'; }
+          id=$(up "$found")
+          api "$R/code-scanning/sarifs/$id" | grep -q '"processing_status":"complete"'
+          api "$R/code-scanning/alerts?state=open" | grep -q '"id":"no-eval"'
+          api "$R/code-scanning/analyses" | grep -q '"results_count":1'
+          up "" > /dev/null
+          api "$R/code-scanning/alerts?state=fixed" | grep -q '"number":1'
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -X POST "$R/code-scanning/sarifs" -d '{"commit_sha":"nope","ref":"refs/heads/main","sarif":"x"}')
+          test "$code" = 422
+          echo scanned
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "scan"]), "commit")?;
+    // The owner moves the trunk (a developer may only open diffs to it).
+    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"]), "the workflow")?;
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        let run = v.get("runs").and_then(Value::as_array).and_then(|r| r.first()).cloned();
+        if let Some(r) = run.filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let id = text(&r, "id").to_owned();
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let mut log = String::new();
+            for step in 0..3 {
+                let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+                log.push_str(&text);
+            }
+            assert_eq!(text(&r, "conclusion"), "success", "{r}\n{log}\n{}", s.log());
+            assert!(log.contains("scanned"), "{log}");
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
