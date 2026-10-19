@@ -141,17 +141,35 @@
 
 /* ------------------------------------------------------------ thinking */
 
-.sg-think-head {
+.sg-thinking-line {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin-left: -5px;
-  padding: 2px 5px;
+  min-height: 24px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sg-thinking-line .sg-label {
+  font-size: 11px;
+  line-height: 1.8;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+.sg-think-head {
+  position: relative;
+  margin: 0;
+  padding: 0;
   border: 0;
   border-radius: 6px;
   background: none;
   color: var(--color-muted, #97999f);
   cursor: pointer;
+}
+.sg-think-head::before {
+  position: absolute;
+  inset: -8px -5px;
+  content: "";
 }
 .sg-think-head:hover {
   background: rgb(255 255 255 / 4%);
