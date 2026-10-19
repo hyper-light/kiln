@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::flow::{self, Ask, RollbackAsk, Who};
 use super::model::{App, Environment, State, Template};
-use super::{Deploy, api, store};
+use super::{Deploy, api, reads, store};
 use crate::ops::{Cx, Fail, Out};
 
 type Fut = Pin<Box<dyn Future<Output = Out> + Send>>;
@@ -210,6 +210,38 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
                 route: |v| Ok((Method::POST, registration_path(v, &["resume"])?, HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(flow::pause(&*service()?, &cx.caller.name, &text(&v, "app")?, &text(&v, "environment")?, false).await?) }),
+            op!("deploy.registrations.resources", "What an app runs in an environment, as its provider (KilnCD or Argo CD) sees it: each object with its sync, health and why.", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["resources"])?, HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { registration_read(&v, |_| Ok(reads::Read::Resources)).await }),
+            op!("deploy.registrations.manifests", "The manifests an app renders in an environment (Secrets masked); on Argo CD, those another `version` would render.", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "version": {"type": "string"}}), &["app", "environment"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["manifests"])?, HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { registration_read(&v, |v| Ok(reads::Read::Manifests { version: opt_text(v, "version") })).await }),
+            op!("deploy.registrations.diff", "What a sync would change for an app in an environment, per object (live, predicted, unified hunks); on Argo CD, what deploying another `version` would change.", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "version": {"type": "string"}}), &["app", "environment"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["diff"])?, HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { registration_read(&v, |v| Ok(reads::Read::Diff { version: opt_text(v, "version") })).await }),
+            op!("deploy.registrations.logs", "The last lines of a pod's log, or of a workload's pods (`kind`, `name`), for an app in an environment.", ro: true, destructive: false,
+                input: || schema(json!({
+                    "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV},
+                    "kind": {"type": "string", "description": "Deployment, StatefulSet, Pod, …"}, "name": {"type": "string"}, "group": {"type": "string"},
+                    "namespace": {"type": "string"}, "container": {"type": "string"}, "tail": {"type": "integer", "minimum": 1, "maximum": 10000}
+                }), &["app", "environment", "kind", "name"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["logs"])?, HashMap::new())),
+                run: |_cx: Cx, v: Value| async move {
+                    registration_read(&v, |v| {
+                        Ok(reads::Read::Logs {
+                            group: opt_text(v, "group"),
+                            kind: text(v, "kind")?,
+                            name: text(v, "name")?,
+                            namespace: opt_text(v, "namespace"),
+                            container: opt_text(v, "container"),
+                            tail: v.get("tail").and_then(Value::as_u64).and_then(|t| u32::try_from(t).ok()).unwrap_or(200).clamp(1, 10_000),
+                        })
+                    })
+                    .await
+                }),
             op!("deploy.registrations.candidates", "The releases a rollback can go to: the last ten that succeeded, the one running and any rolled back from left out.", ro: true, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
                 route: |v| Ok((Method::GET, registration_path(v, &["candidates"])?, HashMap::new())),
@@ -297,6 +329,20 @@ pub fn ops() -> &'static [Op] {
                 run: |_cx: Cx, v: Value| async move { wait(&*service()?, id(&v)?, v.get("until").and_then(Value::as_str) != Some("any"), v.get("timeout_s").and_then(Value::as_u64).unwrap_or(WAIT_MAX_SECS)).await }),
         ]
     })
+}
+
+/// A registration's read from its provider: what `what` makes of the input.
+async fn registration_read(v: &Value, what: impl FnOnce(&Value) -> Result<reads::Read, Fail>) -> Out {
+    let d = service()?;
+    let (app, env) = (text(v, "app")?, text(v, "environment")?);
+    let a = store::app(&d.hub.store, &app).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let e = store::environment(&d.hub.store, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&d.hub.store, &app, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let mut read = what(v)?;
+    if let reads::Read::Logs { namespace: ns @ None, .. } = &mut read {
+        *ns = Some(a.namespace().to_owned());
+    }
+    reads::read(&d, &a, &e, read).await
 }
 
 /// Waits on a release: until it is done (or, `done` false, until it moves at all), or the time is

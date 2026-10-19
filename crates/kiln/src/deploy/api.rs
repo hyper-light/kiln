@@ -11,6 +11,7 @@
 //! | `POST`, `GET`, `DELETE /apps/{app}/environments/{env}` | register, show, deregister (`?keep=true`) |
 //! | `POST /apps/{app}/environments/{env}/pause`, `…/resume` | the provider's automation |
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
+//! | `GET /apps/{app}/environments/{env}/resources`, `/manifests`, `/diff` (`?version` on Argo CD), `/logs?kind&name` | what runs, as the provider sees it |
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
 //! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
@@ -27,7 +28,7 @@ use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
 use super::model::{App, Environment, State, Template};
-use super::{Deploy, argocd, kilncd, store};
+use super::{Deploy, argocd, kilncd, reads, store};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 
@@ -136,6 +137,26 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
         }
         (&Method::POST, ["apps", app, "environments", env, "pause"]) => ok(&flow::pause(&d, &actor, app, env, true).await?),
         (&Method::POST, ["apps", app, "environments", env, "resume"]) => ok(&flow::pause(&d, &actor, app, env, false).await?),
+        (&Method::GET, ["apps", app, "environments", env, what @ ("resources" | "manifests" | "diff" | "logs")]) => {
+            let a = store::app(store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+            let environment = store::environment(store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+            store::registration(store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+            let version = q.get("version").filter(|v| !v.is_empty()).cloned();
+            let read = match *what {
+                "resources" => reads::Read::Resources,
+                "manifests" => reads::Read::Manifests { version },
+                "diff" => reads::Read::Diff { version },
+                _ => reads::Read::Logs {
+                    group: q.get("group").cloned(),
+                    kind: q.get("kind").cloned().ok_or_else(|| bad("logs of what? ?kind=Deployment&name=web"))?,
+                    name: q.get("name").cloned().ok_or_else(|| bad("logs of what? ?kind=Deployment&name=web"))?,
+                    namespace: q.get("namespace").cloned().or_else(|| Some(a.namespace().to_owned())),
+                    container: q.get("container").cloned(),
+                    tail: q.get("tail").and_then(|t| t.parse().ok()).unwrap_or(200).clamp(1, 10_000),
+                },
+            };
+            ok(&reads::read(&d, &a, &environment, read).await?)
+        }
         (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": flow::candidates(&d, app, env).await? })),
 
         (&Method::GET, ["releases"]) => {

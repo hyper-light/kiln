@@ -25,6 +25,7 @@ pub mod kilncd;
 pub mod model;
 pub mod ops;
 pub mod provider;
+pub mod reads;
 pub mod repo;
 pub mod store;
 
