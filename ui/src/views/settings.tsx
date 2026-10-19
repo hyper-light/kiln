@@ -1,122 +1,170 @@
+/**
+ * Settings: sections that open and close (this device, updates, deployments, integrations,
+ * sign-in), each in groups of rows, and a search that narrows the page to what matches. A link to a
+ * section or a group (`/settings#updates`, `/settings#updates.waits`) opens it.
+ */
 import * as React from "react";
 import { LogOut } from "lucide-react";
-import { ApiError } from "@/api/client";
-import { api } from "@/api/client";
+import { ApiError, api } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, Facts, PageIntro, Panel, TextField } from "@/components/ui/misc";
-import { MotionToggle } from "@/components/shell/motion";
-import { Link } from "@/lib/router";
+import { Confirm, Facts, PageIntro, TextField } from "@/components/ui/misc";
+import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSections, openHash } from "@/components/ui/settings";
+import { useMotionPreference } from "@/components/shell/motion";
+import { Link, useLocation } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { useAuth } from "@/lib/auth";
 import { usePref } from "@/lib/prefs";
 import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
-import { UpdatesHold, UpdatesPanel } from "@/views/settings-updates";
+import { UpdatesHold, UpdatesPanel, UpdatesStatus } from "@/views/settings-updates";
 import { DeploySettings } from "@/views/settings-deploy";
 
-const methodsRes: Res<{ password: boolean; token: boolean }> = { key: "auth/methods", fetch: (sig) => api.authMethods(sig) };
+const methodsRes: Res<{ password: boolean; token: boolean }> = {
+  key: "auth/methods",
+  fetch: (sig) => api.authMethods(sig),
+};
 
 export default function Settings() {
   warm(updatesRes, methodsRes);
+  const [query, setQuery] = React.useState("");
+  // At /settings#<section or group>, arriving or following a link here: that one opens.
+  const { hash } = useLocation();
+  const arrived = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el && hash) openHash(hash);
+    },
+    [hash],
+  );
   return (
-    <div className="container-console page max-w-[880px]">
+    <div ref={arrived} className="container-console page st max-w-[880px]">
       <title>Settings · kiln</title>
-      <PageIntro index={10} label="Settings" title="Settings" lead="Preferences here are stored in this browser only." />
-      {/* The page arrives whole: nothing below a loading panel moves when it lands. */}
-      <Loadable label="the settings" fallback={<SettingsPanels updates={<UpdatesHold />} password={<PasswordHold />} />}>
-        <SettingsPanels updates={<UpdatesPanel />} password={<PasswordPanel />} />
-      </Loadable>
+      <PageIntro index={10} label="Settings" title="Settings" />
+      <SettingsSearch value={query} onChange={setQuery} />
+      <SettingsSections query={query}>
+        <SettingsSection id="device" index={1} title="This device" about="How kiln behaves in this browser" words="browser phone">
+          <MotionGroup />
+        </SettingsSection>
+        <SettingsSection
+          id="updates"
+          index={2}
+          title="Updates"
+          about="Upgrade kiln and its runners; a runner keeps what it runs while it's upgraded"
+          words="upgrade version"
+          status={<UpdatesStatus />}
+        >
+          <Loadable label="the updates" fallback={<UpdatesHold />}>
+            <UpdatesPanel />
+          </Loadable>
+        </SettingsSection>
+        <SettingsSection id="deployments" index={3} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
+          <DeploySettings />
+        </SettingsSection>
+        <SettingsSection id="integrations" index={4} title="Integrations" about="Peered kiln clusters, and a Grafana link" words="peering">
+          <ClustersGroup />
+          <GrafanaGroup />
+        </SettingsSection>
+        <SettingsSection id="signin" index={5} title="Sign-in" about="The password other devices sign in with, and this session" words="login account" status={<PasswordStatus />}>
+          <Loadable label="sign-in" fallback={<PasswordHold />}>
+            <PasswordGroup />
+          </Loadable>
+          <SessionGroup />
+        </SettingsSection>
+      </SettingsSections>
     </div>
   );
 }
 
-function SettingsPanels({ updates, password }: { updates: React.ReactNode; password: React.ReactNode }) {
+/* ---------------------------- this device ---------------------------- */
+
+function MotionGroup() {
+  const { paused, reduced, toggle } = useMotionPreference();
+  return (
+    <SettingsGroup id="device.motion" title="Motion" words="motion animation prism pulse reduced pause">
+      <SettingRow
+        inline
+        htmlFor="st-motion"
+        label="Pause motion"
+        help={reduced ? "Your device asks for reduced motion, so kiln keeps still." : "The ambient prism and status pulses keep still. Your device's reduced-motion setting always wins."}
+      >
+        <input id="st-motion" type="checkbox" className="check" checked={paused || reduced} disabled={reduced} onChange={toggle} />
+      </SettingRow>
+    </SettingsGroup>
+  );
+}
+
+/* ---------------------------- integrations ---------------------------- */
+
+function ClustersGroup() {
+  return (
+    <SettingsGroup
+      id="integrations.clusters"
+      title="Peered clusters"
+      about="Other kiln clusters, opened through this one from the picker in the header."
+      words="clusters peering peer kiln picker"
+      actions={
+        <Button asChild size="xs" variant="secondary">
+          <Link to="/clusters">Manage</Link>
+        </Button>
+      }
+    />
+  );
+}
+
+function GrafanaGroup() {
   const [grafana, setGrafana] = usePref("kiln.grafanaUrl", "");
   const [draft, setDraft] = React.useState(grafana);
-  const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
   const valid = draft === "" || /^https?:\/\/\S+$/.test(draft.trim());
   return (
-    <div className="space-y-4">
-      {updates}
-      <DeploySettings />
-      <Panel
-        eyebrow="Peering"
-        title="Clusters"
-        description="Other kiln clusters, opened through this one from the picker in the header."
-        actions={
-          <Button asChild size="sm" variant="secondary">
-            <Link to="/clusters">Manage</Link>
-          </Button>
-        }
-      />
-      <Panel eyebrow="Integrations" title="Grafana" description="Linked from the Metrics page. kiln ships dashboards as ConfigMaps under deploy/.">
-        <form
-          className="flex flex-wrap items-end gap-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!valid) return;
-            setGrafana(draft.trim());
-            toast({ title: draft.trim() ? "Grafana link saved" : "Grafana link removed", tone: "info" });
-          }}
+    <SettingsGroup id="integrations.grafana" title="Grafana" words="grafana dashboard metrics url link">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!valid) return;
+          setGrafana(draft.trim());
+          toast({
+            title: draft.trim() ? "Grafana link saved" : "Grafana link removed",
+            tone: "info",
+          });
+        }}
+      >
+        <SettingRow
+          label="Dashboard link"
+          htmlFor="st-grafana"
+          help={valid ? "Opened from the Metrics page; kiln ships its dashboards as ConfigMaps under deploy/. Kept in this browser." : "It must start with http:// or https://"}
         >
-          <TextField
-            className="min-w-0 flex-1"
-            label="Dashboard URL"
-            placeholder="https://grafana.example.com/d/kiln"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            hint={valid ? undefined : "Must start with http:// or https://"}
-          />
-          <Button type="submit" variant="secondary" disabled={!valid || draft.trim() === grafana}>
+          <div className="field st-wide">
+            <input id="st-grafana" type="url" inputMode="url" placeholder="https://grafana.example.com/d/kiln" value={draft} onChange={(e) => setDraft(e.target.value)} />
+          </div>
+          <Button type="submit" size="xs" variant="secondary" disabled={!valid || draft.trim() === grafana}>
             Save
           </Button>
-        </form>
-      </Panel>
-      <Panel eyebrow="Accessibility" title="Motion" description="Ambient prism animation and status pulses. Your operating system's reduced-motion setting always wins.">
-        <MotionToggle />
-      </Panel>
-      {password}
-      <Panel
-        eyebrow="Session"
-        title="Signed in"
-        actions={
-          <Button variant="ghost" size="sm" onClick={() => void api.logout()}>
-            <LogOut /> Sign out
-          </Button>
-        }
-      >
-        <Facts
-          items={[
-            { label: "Server", value: me?.hostname ?? "—" },
-            { label: "Version", value: me?.version ?? "—" },
-            { label: "Origin", value: location.host },
-          ]}
-        />
-      </Panel>
-    </div>
+        </SettingRow>
+      </form>
+    </SettingsGroup>
   );
+}
+
+/* ---------------------------- sign-in ---------------------------- */
+
+const PASSWORD_WORDS = "password sign in login token phone set change remove";
+
+function PasswordStatus() {
+  const on = useRes(methodsRes).data.password;
+  return <span data-tone={on ? "succeeded" : undefined}>{on ? "Password on" : "Password off"}</span>;
 }
 
 function PasswordHold() {
   return (
-    <PasswordFrame description={"\u00a0"}>
+    <SettingsGroup id="signin.password" title="Password" words={PASSWORD_WORDS}>
       <Hold height={66} />
-    </PasswordFrame>
-  );
-}
-
-function PasswordFrame({ description, actions, children }: { description: React.ReactNode; actions?: React.ReactNode; children: React.ReactNode }) {
-  return (
-    <Panel eyebrow="Sign-in" title="Password" description={description} actions={actions}>
-      {children}
-    </Panel>
+    </SettingsGroup>
   );
 }
 
 /** The sign-in password: set it once here, then sign in from any device with it. */
-function PasswordPanel() {
+function PasswordGroup() {
   const methods = useRes(methodsRes).data;
   const [pw, setPw] = React.useState("");
   const [again, setAgain] = React.useState("");
@@ -136,7 +184,11 @@ function PasswordPanel() {
       await api.setPassword(pw);
       setPw("");
       setAgain("");
-      toast({ title: isSet ? "Password changed" : "Password set", description: "Sign in from any device with it.", tone: "info" });
+      toast({
+        title: isSet ? "Password changed" : "Password set",
+        description: "Sign in from any device with it.",
+        tone: "info",
+      });
       invalidate("auth/methods");
     } catch (err) {
       setProblem(err instanceof ApiError ? err.message : String(err));
@@ -160,15 +212,16 @@ function PasswordPanel() {
   };
 
   return (
-    <PasswordFrame
-      description={
-        isSet
-          ? "On. Any device that can reach this server can sign in with it; the admin token keeps working too."
-          : "Off. Choose a password so your phone or another computer can sign in without the admin token."
+    <SettingsGroup
+      id="signin.password"
+      title="Password"
+      about={
+        isSet ? "On: any device that can reach this server signs in with it, and the admin token keeps working." : "Off: set one so your phone or another computer can sign in without the admin token."
       }
+      words={PASSWORD_WORDS}
       actions={
         isSet ? (
-          <Button variant="ghost" size="sm" disabled={busy} aria-expanded={removing} onClick={() => setRemoving(!removing)}>
+          <Button variant="ghost" size="xs" disabled={busy} aria-expanded={removing} onClick={() => setRemoving(!removing)}>
             Remove
           </Button>
         ) : undefined
@@ -176,7 +229,7 @@ function PasswordPanel() {
     >
       {removing && isSet && (
         <Confirm
-          className="mb-4"
+          className="mb-3"
           label="Remove the sign-in password"
           tone="danger"
           actions={
@@ -193,7 +246,7 @@ function PasswordPanel() {
           <p>Remove the sign-in password? Devices will need the admin token or a `kiln login` link to sign in.</p>
         </Confirm>
       )}
-      <form className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end" onSubmit={save} autoComplete="on">
+      <form className="st-password" onSubmit={save} autoComplete="on">
         <input type="text" name="username" autoComplete="username" value="admin" readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
         <TextField
           label={isSet ? "New password" : "Password"}
@@ -213,11 +266,39 @@ function PasswordPanel() {
           onChange={(e) => setAgain(e.target.value)}
           hint={mismatch ? "The two passwords differ" : undefined}
         />
-        <Button type="submit" variant="secondary" disabled={busy || pw.length < 8 || pw !== again}>
+        <Button type="submit" size="xs" variant="secondary" className="st-password-go" disabled={busy || pw.length < 8 || pw !== again}>
           {isSet ? "Change password" : "Set password"}
         </Button>
       </form>
-      {problem && <p className="mt-3 text-[12.5px] text-[#d8c8b0]">{problem}</p>}
-    </PasswordFrame>
+      {problem && (
+        <p className="st-note" data-tone="error">
+          {problem}
+        </p>
+      )}
+    </SettingsGroup>
+  );
+}
+
+function SessionGroup() {
+  const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
+  return (
+    <SettingsGroup
+      id="signin.session"
+      title="This session"
+      words="session sign out logout server version origin"
+      actions={
+        <Button variant="ghost" size="xs" onClick={() => void api.logout()}>
+          <LogOut /> Sign out
+        </Button>
+      }
+    >
+      <Facts
+        items={[
+          { label: "Server", value: me?.hostname ?? "—" },
+          { label: "Version", value: me?.version ?? "—" },
+          { label: "Origin", value: location.host },
+        ]}
+      />
+    </SettingsGroup>
   );
 }
