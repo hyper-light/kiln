@@ -4,9 +4,15 @@
 //!
 //! - **Keys** ([`vapid`]): the server makes its key pair once and keeps it with its data.
 //! - **Encryption** ([`ece`]): one record per message, for one device's keys.
+//! - **Devices** ([`store`]): each one a person turned notifications on for, what it hears, how its
+//!   last delivery went; the agents each person muted; what was said of each agent.
+//! - **When** ([`watch`]): a change of where an agent stands, settled so a state that comes and
+//!   goes says nothing, and never the same thing twice.
 
 pub mod ece;
+pub mod store;
 pub mod vapid;
+pub mod watch;
 
 use serde::{Deserialize, Serialize};
 
