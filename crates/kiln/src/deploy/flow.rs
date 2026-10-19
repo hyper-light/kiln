@@ -1539,9 +1539,51 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
     }
     audit(d, &format!("deploy for {}", r.requested_by), "deploy.release.end", format!("release {} {}{}", r.id, state.as_str(), r.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())).await;
     emit_release(d, &r);
+    if state == State::Succeeded && r.kind == Kind::Deploy {
+        promote_onward(d, &r).await;
+    }
     // A release waiting behind this one may go now.
     d.wake.notify();
     Ok(())
+}
+
+/// The environments a version that landed in `from` moves on to by itself: those that promote
+/// automatically with `from` among their `after`, where the app is registered.
+fn onward(envs: &[Environment], registered: &[String], from: &str) -> Vec<String> {
+    envs.iter()
+        .filter(|e| e.gates.promote == super::model::Promote::Auto && e.gates.after.iter().any(|a| a == from) && registered.contains(&e.name))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// A version that landed, released on by itself (docs/deploy-api.md §9.2): exactly what landed,
+/// to each environment that promotes automatically after this one, through its other gates
+/// (soak, approvals, windows, freezes). Asked for in the name of who asked for the landed one, so
+/// they don't approve their own change on its way; once per landing and environment however often
+/// this runs. One refused (a release already in flight there, an `after` it doesn't run in yet)
+/// goes when the next of its `after` lands, or by hand.
+async fn promote_onward(d: &Deploy, landed: &Release) {
+    let st = &d.hub.store;
+    let next = async {
+        let envs = store::environments(st).await?;
+        let registered: Vec<String> = store::registrations(st, Some(&landed.app), None).await?.into_iter().map(|r| r.environment).collect();
+        anyhow::Ok(onward(&envs, &registered, &landed.environment))
+    };
+    let next = match next.await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(app = %landed.app, error = %format!("{e:#}"), "deploy: the environments a version promotes to by itself didn't read");
+            return;
+        }
+    };
+    let who = Who { name: landed.requested_by.clone(), agent: false };
+    for env in next {
+        let ask = Ask { app: landed.app.clone(), environment: env.clone(), promote_from: Some(landed.environment.clone()), idempotency_key: Some(format!("promote:{}:{env}", landed.id)), ..Ask::default() };
+        match Box::pin(release(d, &who, ask)).await {
+            Ok(r) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, release = r.id, "deploy: a version promoted by itself"),
+            Err((_, why)) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, %why, "deploy: a version didn't promote by itself"),
+        }
+    }
 }
 
 /// The trailer of a commit that reverts a release's: the release.
@@ -1769,6 +1811,22 @@ mod tests {
         assert!(merge_values("image: web\n", &BTreeMap::from([("image.tag".to_owned(), "1".to_owned())])).is_err_and(|e| e.contains("image isn't a map")));
         assert!(merge_values("", &BTreeMap::from([("a..b".to_owned(), "1".to_owned())])).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_version_moves_on_by_itself_only_where_an_environment_says() {
+        let after = |name: &str, upstream: &[&str], auto: bool| {
+            let mut e = env(false);
+            e.name = name.into();
+            e.gates.after = upstream.iter().map(|u| (*u).to_owned()).collect();
+            e.gates.promote = if auto { super::super::model::Promote::Auto } else { super::super::model::Promote::Manual };
+            e
+        };
+        let envs = vec![after("staging", &[], false), after("production", &["staging"], true), after("eu", &["staging"], false), after("canary", &["staging"], true)];
+        let registered = vec!["staging".to_owned(), "production".to_owned(), "eu".to_owned()];
+        assert_eq!(onward(&envs, &registered, "staging"), ["production"], "eu promotes by hand; canary doesn't run the app");
+        assert!(onward(&envs, &registered, "production").is_empty(), "nothing comes after production");
+        assert_eq!(serde_json::to_value(super::super::model::Gates::default()).ok(), Some(json!({})), "`manual`, the default, isn't written");
     }
 
     #[test]
