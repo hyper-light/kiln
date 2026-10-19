@@ -347,6 +347,18 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
         return Ok(format!("agent:{m}"));
     }
     let mut want = crate::reach::directory::Want::parse(&on).map_err(|e| bad(format!("`on`: {e:#}")))?;
+    // A machine named, and nothing else asked of it: that one (it says itself if it can't start
+    // the harness), whatever its list of harnesses says yet.
+    if let Some(name) = want.name.clone().filter(|_| want == crate::reach::directory::Want { name: want.name.clone(), ..Default::default() }) {
+        if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && !hub.agents.lock().contains_key(&name)) {
+            return Ok("local".to_owned());
+        }
+        return match hub.agents.lock().get(&name) {
+            Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
+            Some(_) => Err((StatusCode::CONFLICT, format!("{name} isn't connected (or doesn't run agents): pick another machine"))),
+            None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
+        };
+    }
     want.harness = Some(kind.to_owned());
     let (best, passed) = candidates(hub, &want);
     match best.into_iter().next() {
