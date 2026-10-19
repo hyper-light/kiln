@@ -1,3 +1,6 @@
+// kiln: its shared-WAL locks are unused in kiln's build, which would warn on Windows.
+#![allow(dead_code)]
+
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 use std::collections::HashMap;

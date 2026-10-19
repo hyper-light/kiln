@@ -6,15 +6,15 @@
  * other platforms come from kiln's own release pipeline (Build every platform) or an upload.
  */
 import * as React from "react";
-import { Link } from "@/lib/router";
+import { Link, useNavigate } from "@/lib/router";
 import { create } from "zustand";
-import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Bot, ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview } from "@/api/types";
+import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay, UpgradeWayOpen } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
-import { Confirm, Facts, Panel, SelectField } from "@/components/ui/misc";
+import { Confirm, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
@@ -22,6 +22,7 @@ import { formatBytes, formatDuration, relativeTime, shortSha } from "@/lib/forma
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { SpawnDialog } from "@/views/harness/spawn";
 
 /** A server upgrade in flight: the page reconnects to the new server and says what changed. */
 const PENDING_KEY = "kiln.serverUpgrade";
@@ -139,6 +140,9 @@ export function UpdatesPanel() {
       return next;
     });
   const [checking, setChecking] = React.useState(false);
+  // The runner an agent is being started for, to find out why its upgrade failed.
+  const [diagnosing, setDiagnosing] = React.useState<{ r: RunnerUpdate; job: UpdateJob | undefined } | null>(null);
+  const navigate = useNavigate();
   const pending = usePending((s) => s.pending);
   const fileRef = React.useRef<HTMLInputElement>(null);
   const uploadTarget = React.useRef<string>("");
@@ -168,10 +172,10 @@ export function UpdatesPanel() {
     }
   };
 
-  const startRunner = async (r: RunnerUpdate) => {
+  const startRunner = async (r: RunnerUpdate, way?: UpgradeWay) => {
     try {
-      started(await api.upgradeRunner(r.name));
-      toast({ title: `Upgrading ${r.name}`, description: "Its terminals, agents and jobs keep running.", tone: "running" });
+      started(await api.upgradeRunner(r.name, way));
+      toast({ title: way === "build" ? `Building kiln on ${r.name}` : `Upgrading ${r.name}`, description: "Its terminals, agents and jobs keep running.", tone: "running" });
     } catch (e) {
       toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
     }
@@ -341,34 +345,54 @@ export function UpdatesPanel() {
             </div>
           )}
           <ul className="upd-runners">
-            {data.runners.map((r) => (
-              <RunnerRow
-                key={r.name}
-                r={r}
-                newest={newest}
-                job={latest("runner", r.name)}
-                uploading={uploading}
-                onUpload={() => r.target && pickUpload(r.target)}
-                selected={selected.has(r.name)}
-                onSelect={(on) => select(r.name, on)}
-                onPolicy={(p) => void setPolicy([r.name], p)}
-                plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
-                onUpgrade={() =>
-                  setConfirm({
-                    scope: `runner:${r.name}`,
-                    title: r.how === "build" ? `Build the newest kiln on ${r.name}?` : `Upgrade ${r.name}?`,
-                    lead: "What will happen:",
-                    plan: <RunnerPlan r={r} newest={newest} />,
-                    confirmLabel: r.how === "build" ? "Build and upgrade" : "Upgrade",
-                    run: () => startRunner(r),
-                  })
-                }
-              />
-            ))}
+            {data.runners.map((r) => {
+              const job = latest("runner", r.name);
+              const again = job?.state === "failed";
+              return (
+                <RunnerRow
+                  key={r.name}
+                  r={r}
+                  newest={newest}
+                  job={job}
+                  uploading={uploading}
+                  onUpload={() => r.target && pickUpload(r.target)}
+                  selected={selected.has(r.name)}
+                  onSelect={(on) => select(r.name, on)}
+                  onPolicy={(p) => void setPolicy([r.name], p)}
+                  plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
+                  onUpgrade={(way) => {
+                    const build = way ? way === "build" : r.how === "build";
+                    setConfirm({
+                      scope: `runner:${r.name}`,
+                      title: again ? (build ? `Try building kiln on ${r.name} again?` : `Try upgrading ${r.name} again?`) : build ? `Build the newest kiln on ${r.name}?` : `Upgrade ${r.name}?`,
+                      lead: "What will happen:",
+                      plan: <RunnerPlan r={r} newest={newest} build={build} />,
+                      confirmLabel: again ? "Try again" : build ? "Build and upgrade" : "Upgrade",
+                      run: () => startRunner(r, way),
+                    });
+                  }}
+                  onDiagnose={() => setDiagnosing({ r, job })}
+                />
+              );
+            })}
           </ul>
         </section>
+        {data.waits && <WaitsSection waits={data.waits} />}
         <Binaries data={data} uploading={uploading} onUpload={pickUpload} onRemoved={() => invalidate("updates")} onBuilt={readAgainSoon} />
       </div>
+      {diagnosing && (
+        <SpawnDialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setDiagnosing(null);
+          }}
+          defaults={{ target: `agent:${diagnosing.r.name}`, cwd: diagnosing.r.checkout ?? undefined, prompt: diagnosisPrompt(diagnosing.r, diagnosing.job, newest) }}
+          onStarted={(agents) => {
+            setDiagnosing(null);
+            navigate(agents.length === 1 && agents[0] ? `/agents/${agents[0].id}` : "/agents");
+          }}
+        />
+      )}
     </UpdatesFrame>
   );
 }
@@ -525,6 +549,8 @@ function runnerState(r: RunnerUpdate, job: UpdateJob | undefined): { tone: strin
   if (job?.state === "running") return { tone: "running", text: job.method === "build" ? "building itself" : "upgrading" };
   if (!r.connected) return { tone: "cancelled", text: "offline" };
   if (r.up_to_date) return { tone: "succeeded", text: "up to date" };
+  // Its last upgrade failed, and it hasn't got there since: what it reads until it does, or is tried again.
+  if (job?.state === "failed") return { tone: "failed", text: job.method === "build" ? "build failed" : "upgrade failed" };
   if (r.how === "left") return { tone: "timed_out", text: r.standing === "local" ? "local build" : "branch build" };
   if (r.how === "off") return { tone: "timed_out", text: "updates off" };
   if (r.how === "wait") return { tone: "queued", text: "waiting" };
@@ -535,6 +561,26 @@ function runnerState(r: RunnerUpdate, job: UpdateJob | undefined): { tone: strin
 /** "builds 94f0847a1b2c itself" → "Builds 94f0847a1b2c itself". */
 function sentence(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** The way an upgrade went: a build on the machine, or a binary downloaded. */
+function wayOf(j: UpdateJob): UpgradeWay {
+  return j.method === "build" ? "build" : "download";
+}
+
+/** The ways a runner can be upgraded now. An older server doesn't say: the way it would take, when it would. */
+function upgradeWays(r: RunnerUpdate): UpgradeWayOpen[] {
+  if (r.ways) return r.ways;
+  if (!r.how || r.how === "wait" || r.how === "upgrading" || r.how === "left" || r.how === "off") return [];
+  const build = r.how === "build";
+  return [{ way: build ? "build" : "download", ok: (r.method === "native" && !build) || r.terminal, why: "" }];
+}
+
+/** A way's button: the first is the upgrade itself, the one that failed is tried again, any other is the alternative. */
+function wayLabel(way: UpgradeWay, first: boolean, failedBefore: boolean) {
+  if (failedBefore) return way === "build" ? "Retry build" : "Retry";
+  if (first) return way === "build" ? "Build and upgrade" : "Upgrade";
+  return way === "build" ? "Build it instead" : "Download instead";
 }
 
 /** "Waits for the release build of 31c0bba: run #232, its build step, on adacachy, 11m 04s in",
@@ -561,6 +607,7 @@ function RunnerRow({
   selected,
   onSelect,
   onPolicy,
+  onDiagnose,
 }: {
   r: RunnerUpdate;
   /** The newest kiln, when kiln knows it. */
@@ -569,14 +616,27 @@ function RunnerRow({
   uploading: string | null;
   /** Its upgrade, being confirmed. */
   plan: React.ReactNode;
-  onUpgrade: () => void;
+  /** Upgrade it that way (none: the way kiln picks). */
+  onUpgrade: (way?: UpgradeWay) => void;
   onUpload: () => void;
   selected: boolean;
   onSelect: (on: boolean) => void;
   onPolicy: (p: UpdatePolicy) => void;
+  /** Start an agent on it to find out why it isn't upgrading. */
+  onDiagnose: () => void;
 }) {
   const st = runnerState(r, job);
   const missing = Boolean(r.connected && !r.up_to_date && !r.target_build && r.target);
+  const failed = job?.state === "failed" ? job : undefined;
+  const behind = r.connected && !r.up_to_date && r.how !== "left" && r.policy !== "off" && !r.locked;
+  const actionable = behind && job?.state !== "running" && r.how !== "upgrading" && !plan;
+  const ways = upgradeWays(r);
+  const open = ways.filter((w) => w.ok);
+  // The way that failed comes first (to try it again), else the way kiln would take.
+  const first = failed ? wayOf(failed) : r.how === "build" ? "build" : "download";
+  open.sort((a, b) => Number(b.way === first) - Number(a.way === first));
+  // Stuck: behind, and no way to upgrade it now.
+  const stuck = behind && open.length === 0 && ways.length > 0;
   return (
     <li className="upd-runner">
       <div className="upd-runner-top">
@@ -629,13 +689,28 @@ function RunnerRow({
               <Upload /> {uploading === r.target ? "Uploading…" : `Upload ${r.target}`}
             </Button>
           )}
-          {r.connected && !r.up_to_date && !plan && r.how !== "wait" && r.how !== "upgrading" && r.policy !== "off" && !r.locked && (
-            <Button size="xs" variant="secondary" disabled={job?.state === "running" || ((r.method === "terminal" || r.how === "build") && !r.terminal)} onClick={onUpgrade}>
-              {r.how === "build" ? "Build and upgrade" : "Upgrade"}
+          {actionable &&
+            open.map((w, i) => (
+              <Button key={w.way} size="xs" variant={i === 0 ? "secondary" : "ghost"} title={sentence(w.why)} onClick={() => onUpgrade(w.way)}>
+                {wayLabel(w.way, i === 0, failed !== undefined && wayOf(failed) === w.way)}
+              </Button>
+            ))}
+          {r.connected && (failed || stuck) && !plan && (
+            <Button size="xs" variant="ghost" onClick={onDiagnose}>
+              <Bot /> Diagnose
             </Button>
           )}
         </div>
       </div>
+      {actionable && open.length === 0 && ways.length > 0 && (
+        <p className="upd-sub upd-ways">
+          {ways.map((w) => (
+            <span key={w.way}>
+              {w.way === "build" ? "Can't build it there now" : "Can't download a build now"}: {w.why}
+            </span>
+          ))}
+        </p>
+      )}
       {plan}
       {r.instances.length > 1 && (
         <ul className="upd-procs">
@@ -657,18 +732,27 @@ function RunnerRow({
   );
 }
 
-function RunnerPlan({ r, newest: target }: { r: RunnerUpdate; newest: FleetTarget | null }) {
+function RunnerPlan({ r, newest: target, build }: { r: RunnerUpdate; newest: FleetTarget | null; build: boolean }) {
   const newest = r.instances.find((i) => i.newest);
   const inPlace = r.method === "native" && newest !== undefined && newest.id !== "main" && !newest.legacy;
   const of = target ? ` (${shortSha(target.commit)})` : "";
   const to = r.target_build ? `build ${r.target_build}${of}` : `the ${r.target ?? ""} build (this version's GitHub release, if one is published)`;
   return (
     <ul className="upd-plan">
-      {r.how === "build" ? (
+      {build ? (
         <>
           <li>
-            No binary of {target ? shortSha(target.commit) : "the newest kiln"} exists for {r.target ?? "its platform"} yet, so {r.name} builds it: kiln opens a terminal on it (it won&rsquo;t appear
-            among your terminals) that fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and runs <code>kiln install --agent --upgrade</code>.
+            {r.how === "build" ? (
+              <>
+                No binary of {target ? shortSha(target.commit) : "the newest kiln"} exists for {r.target ?? "its platform"} yet, so {r.name} builds it
+              </>
+            ) : (
+              <>
+                {r.name} builds {target ? shortSha(target.commit) : "the newest kiln"} itself rather than downloading it
+              </>
+            )}
+            : kiln opens a terminal on it (it won&rsquo;t appear among your terminals) that fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code>{" "}
+            and runs <code>kiln install --agent --upgrade</code>.
           </li>
           <li>
             {r.checkout ? (
@@ -769,7 +853,175 @@ function JobLog({ job }: { job: UpdateJob }) {
         </pre>
       )}
       {!open && job.error && <p className="upd-err">{job.error}</p>}
+      {job.state === "failed" && job.timed_out && (
+        <p className="upd-sub upd-job-note">
+          kiln stopped waiting; the runner may still get there, and the upgrade then reads as done.{" "}
+          <button type="button" className="upd-link" onClick={() => toWaits(job.timed_out)}>
+            Change how long kiln waits
+          </button>
+        </p>
+      )}
     </div>
+  );
+}
+
+/** Bring the waits into view, the one that ran out focused. */
+function toWaits(which: UpdateJob["timed_out"]) {
+  const field = document.getElementById(`upd-wait-${which ?? "upgrade"}`);
+  field?.scrollIntoView({ behavior: "smooth", block: "center" });
+  field?.focus({ preventScroll: true });
+}
+
+/* ---------------------------- diagnosing with an agent ---------------------------- */
+
+/** The first message of an agent started on a runner to find out why it isn't upgrading, and fix that. */
+function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, newest: FleetTarget | null): string {
+  const failed = job?.state === "failed" ? job : undefined;
+  const at = (t: number) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+  const tail = failed ? failed.log.slice(-40) : [];
+  const stuck = (r.ways ?? []).filter((w) => !w.ok);
+  const lines = [
+    failed
+      ? `kiln couldn't upgrade its runner on ${r.name} (${r.hostname}, ${r.os}/${r.arch}). Find out why, and fix what's wrong on the machine so the next upgrade goes through.`
+      : `kiln can't upgrade its runner on ${r.name} (${r.hostname}, ${r.os}/${r.arch}). Find out what's in the way, and fix it if it's on the machine.`,
+    "",
+    "What kiln knows:",
+    `- ${r.name} runs kiln ${r.version}${r.commit ? `, commit ${r.commit}` : ""}${r.build ? `, build ${r.build}` : ""}.`,
+    newest ? `- The newest kiln is commit ${newest.commit}.` : "",
+    failed
+      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on the machine` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
+      : "",
+    ...stuck.map((w) => `- ${w.way === "build" ? "It can't build kiln itself now" : "It can't download a build now"}: ${w.why}.`),
+    r.next ? `- What kiln does next: it ${r.next}.` : "",
+    tail.length ? `- Its last lines, as kiln kept them:\n\n${tail.map((l) => `    ${l}`).join("\n")}` : "",
+    "",
+    "Where to look:",
+    `- You should be on ${r.name}. If you aren't, run commands there with kiln reach (on: "${r.name}").`,
+    r.os === "linux"
+      ? `- The runner's log: journalctl --user -u 'kiln-agent*'${failed ? ` --since '${at(failed.started_at).replace("T", " ").replace("Z", "")} UTC'` : ""} (without --user for a system install).`
+      : r.os === "macos"
+        ? "- The runner's log: kiln.log in its state directory, usually ~/.local/share/kiln/agent/kiln.log."
+        : "- The runner's log, in its state directory.",
+    failed?.method === "build" ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log (the build works in ~/.cache/kiln/self-build).` : "",
+    "- Free disk and memory, and for a build the Rust toolchain (rustup show, cargo --version) and npm.",
+    "",
+    "Rules:",
+    "- Don't stop, restart or reinstall the kiln runner: everything on this machine runs through it, you included.",
+    "- Don't upgrade kiln yourself. Fix the cause, then say what was wrong and what you changed; the upgrade is then tried again from Settings → Updates.",
+    "- Ask before anything you can't undo, like deleting files you didn't make or changing system settings.",
+  ];
+  return lines
+    .filter((l, i, all) => l !== "" || (i > 0 && all[i - 1] !== ""))
+    .join("\n")
+    .trim();
+}
+
+/* ---------------------------- how long kiln waits ---------------------------- */
+
+const WAITS: { key: keyof UpgradeWaits; which: NonNullable<UpdateJob["timed_out"]>; label: string; hint: string; min: number; max: number }[] = [
+  { key: "upgrade_minutes", which: "upgrade", label: "Upgrade", hint: "for a runner to switch to its new build and report in, once it has no jobs running", min: 1, max: 24 * 60 },
+  { key: "wait_for_jobs_minutes", which: "jobs", label: "Running jobs", hint: "while a runner finishes the jobs it is running; it switches once they end", min: 1, max: 7 * 24 * 60 },
+  { key: "build_minutes", which: "build", label: "Build", hint: "for a machine to build kiln itself, install included", min: 5, max: 24 * 60 },
+];
+
+/** "an hour", "6 hours", "90 minutes". */
+function minutesSaid(m: number) {
+  if (m === 1) return "a minute";
+  if (m === 60) return "an hour";
+  return m >= 120 && m % 60 === 0 ? `${m / 60} hours` : `${m} minutes`;
+}
+
+type WaitsDraft = Record<keyof UpgradeWaits, string>;
+
+const draftOf = (w: UpgradeWaits): WaitsDraft => ({ upgrade_minutes: String(w.upgrade_minutes), wait_for_jobs_minutes: String(w.wait_for_jobs_minutes), build_minutes: String(w.build_minutes) });
+
+/** The waits a draft says, or what's wrong with it. */
+function readDraft(d: WaitsDraft): UpgradeWaits | string {
+  const out: UpgradeWaits = { upgrade_minutes: 0, wait_for_jobs_minutes: 0, build_minutes: 0 };
+  for (const f of WAITS) {
+    const v = Number(d[f.key]);
+    if (!Number.isInteger(v) || v < f.min || v > f.max) return `${f.label}: a whole number of minutes from ${f.min} to ${f.max}`;
+    out[f.key] = v;
+  }
+  return out;
+}
+
+function WaitsSection({ waits }: { waits: NonNullable<UpdatesOverview["waits"]> }) {
+  const [draft, setDraft] = React.useState<WaitsDraft | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const shown = draft ?? draftOf(waits.now);
+  const read = readDraft(shown);
+  const changed = typeof read !== "string" && WAITS.some((f) => read[f.key] !== waits.now[f.key]);
+  const act = async (what: () => Promise<void>, done: string) => {
+    setBusy(true);
+    try {
+      await what();
+      setDraft(null);
+      toast.success(done);
+      invalidate("updates");
+    } catch (e) {
+      toast.error("Couldn't change how long kiln waits", errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const config = WAITS.map((f) => `${f.label.toLowerCase()} ${minutesSaid(waits.config[f.key])}`).join(", ");
+  return (
+    <section className="upd-section" aria-labelledby="upd-waits">
+      <div className="upd-section-head">
+        <div className="min-w-0">
+          <h4 id="upd-waits" className="upd-h">
+            How long kiln waits
+          </h4>
+          <p className="upd-sub">
+            An upgrade that takes longer reads as failed, and as done if the runner gets there later. A change applies to upgrades under way too.{" "}
+            {waits.changed ? `Changed here; kiln.toml says ${config}.` : "As kiln.toml's [updates] says."}
+          </p>
+        </div>
+      </div>
+      <form
+        className="upd-waits"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (typeof read !== "string" && changed) void act(() => api.setUpgradeWaits(read), "kiln waits that long from now on");
+        }}
+      >
+        {WAITS.map((f) => {
+          const n = Number(shown[f.key]);
+          return (
+            <TextField
+              key={f.key}
+              id={`upd-wait-${f.which}`}
+              label={`${f.label}, in minutes`}
+              type="number"
+              inputMode="numeric"
+              min={f.min}
+              max={f.max}
+              step={1}
+              value={shown[f.key]}
+              onChange={(e) => setDraft({ ...shown, [f.key]: e.target.value })}
+              hint={`${Number.isInteger(n) && n >= f.min ? `${sentence(minutesSaid(n))} ` : ""}${f.hint}`}
+            />
+          );
+        })}
+        <div className="upd-actions upd-waits-actions">
+          <Button type="submit" size="sm" variant="secondary" disabled={busy || !changed}>
+            Save
+          </Button>
+          {draft && (
+            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setDraft(null)}>
+              Cancel
+            </Button>
+          )}
+          {waits.changed && !draft && (
+            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void act(() => api.resetUpgradeWaits(), "kiln waits as kiln.toml says")}>
+              Use kiln.toml&rsquo;s
+            </Button>
+          )}
+          {draft && typeof read === "string" && <span className="upd-err-inline">{read}</span>}
+        </div>
+      </form>
+    </section>
   );
 }
 

@@ -472,14 +472,24 @@ export function CiLegExtras({
   attempt: number | undefined;
   legId: string;
   status: string;
-  reused: boolean;
+  /** The leg whose result it took over, and that leg's run. */
+  reused: { leg: string; run: string | null; number: number | null } | null;
   keptUntil?: number | null;
 }) {
   const annotations = useSuspenseResource(`ci-run/${runId}/annotations/${attempt ?? ""}`, (s) => ci.annotations(runId, attempt, s)).data.annotations.filter((a) => a.leg === legId);
   return (
     <div className="border-t border-[#28313d]">
       <LegDebug runId={runId} legId={legId} running={status === "running"} keptUntil={keptUntil ?? null} />
-      {reused && <p className="px-5 py-3 font-mono text-[11px] text-[#a6b2c6]">Kept from the last attempt: this rerun didn't run it again.</p>}
+      {reused && (reused.run === null || reused.run === runId) && <p className="px-5 py-3 font-mono text-[11px] text-[#a6b2c6]">Kept from the last attempt: this rerun didn't run it again.</p>}
+      {reused && reused.run !== null && reused.run !== runId && (
+        <p className="px-5 py-3 font-mono text-[11px] text-[#a6b2c6]">
+          Reused from{" "}
+          <Link to={`/runs/${encodeURIComponent(reused.run)}/jobs/${encodeURIComponent(reused.leg)}`} className="text-link font-mono text-[11px]">
+            run #{reused.number ?? "?"}
+          </Link>
+          : its inputs were the same, so it didn't run again.
+        </p>
+      )}
       {(status === "failed" || status === "timed_out") && (
         <p className="px-5 py-3">
           <Link to={`/runs/${encodeURIComponent(runId)}/compare?leg=${encodeURIComponent(legId)}`} className="text-link font-mono text-[11px]">

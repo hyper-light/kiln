@@ -838,7 +838,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        convo = crate::convo::open(&own_dir);
+        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().keep_closed());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
         h.restore_from(convo.as_ref());
@@ -1974,7 +1974,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // The server's store, of which this runner keeps a copy (a mirror), beside
                         // its own store; opened the first time the server sends it.
                         if mirror.is_none() && convo.is_some() {
-                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
+                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().keep_closed()).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
                                 Ok((intake, out)) => {
                                     let up = uplink.0.clone();
                                     crate::rt::spawn(async move {
