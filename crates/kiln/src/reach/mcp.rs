@@ -598,7 +598,7 @@ impl Server {
         };
         let id = page.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
         let page = if heights.is_array() {
-            match self.ask(json!({"op": "page", "do": "measured", "id": id, "heights": heights})) {
+            match self.ask(json!({"op": "page", "do": "measured", "id": id, "heights": heights, "engines": seen.get("engines").cloned().unwrap_or(Value::Null)})) {
                 Ok(a) => a.get("ok").cloned().unwrap_or(page),
                 Err(_) => page,
             }

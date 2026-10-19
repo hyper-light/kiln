@@ -178,6 +178,20 @@ sized to it). A viewer's own size then changes nothing: the page is drawn whole 
 letterboxed, and taps and clicks land where the page has them. The devices are in
 `crate::browser::devices` (and `devices` in `GET .../preview`).
 
+### Simulators
+
+On a Mac with Xcode, a page in WebKit laid out as an iPhone or iPad (iPhone 15, iPhone SE, iPad
+Air) runs in an iOS Simulator, in the real Mobile Safari (`crate::browser::simulators`). kiln keeps
+a simulator of its own for each model (`kiln iPhone 15`, the model Xcode has, else the newest of
+its kind) on the newest iOS runtime there, boots it with no Simulator window, turns on its Safari's
+remote automation, and drives it through `safaridriver` as it does Safari (its picture as it
+changes, touch for every pointer, the device's own window). It stays booted for the next stream.
+
+What a Mac needs once: Xcode, an iOS simulator runtime (`xcodebuild -downloadPlatform iOS`, several
+GB), and `safaridriver --enable` (it asks for an administrator's password). Until then the Tools
+tab says what's missing (`ios` in the preview's `engines`), and a stream asking for one says the
+same.
+
 ### Recordings
 
 Record (in a live page's own controls) keeps what it shows and what's done in it, on the agent's

@@ -347,7 +347,7 @@ impl Streams {
     async fn open_driven(&self, dir: &Path, id: &str, spec: &Spec, engine: super::driven::Engine, device: Option<super::devices::Device>, window: (u32, u32, f64, bool), out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
         let (width, height, scale, mobile) = window;
         let enc = self.streamer(dir, "encode").await?;
-        let page = super::driven::Driven::open(dir, engine, &spec.profile, width, height, scale).await?;
+        let page = super::driven::Driven::open(dir, engine, &spec.profile, width, height, scale, device.as_ref()).await?;
         if let Some(agent) = device.map(|d| d.agent).filter(|a| !a.is_empty()) {
             page.agent(agent).await;
         }
@@ -1328,7 +1328,8 @@ mod tests {
         let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
         crate::rt::block_on(async move {
             let page = "data:text/html,<title>fox</title><body style='margin:0;background:%23123'><div id=b style='width:40px;height:40px;background:%23bab0e3;position:absolute'></div><script>let t=0;addEventListener('pointerdown',()=>document.title='clicked');setInterval(()=>{t++;b.style.left=(t*7%25200)+'px'},50)</script></body>";
-            let spec: Spec = serde_json::from_value(json!({"url": page, "profile": "clean", "engine": "firefox", "device": "iPhone SE"}))?;
+            // A conversation's profile (kept), as the Tools tab opens one.
+            let spec: Spec = serde_json::from_value(json!({"url": page, "profile": std::env::var("KILN_TEST_PROFILE").unwrap_or_else(|_| "clean".into()), "engine": "firefox", "device": "iPhone SE"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
             let opened = streams().open(&dir, "test-firefox", &spec, tx).await?;
             assert_eq!(opened.pointer("/opened/engine"), Some(&json!("firefox")), "{opened}");
@@ -1366,6 +1367,40 @@ mod tests {
             assert!(window.get(3).and_then(Value::as_str).is_some_and(|ua| ua.contains("iPhone")), "{window}");
             assert_eq!(title, json!("clicked"));
             assert!(said.iter().any(|e| e.contains("\"loaded\"") && e.contains("fox")), "{said:?}");
+            Ok(())
+        })
+    }
+
+    /// A viewer that joins once another engine's page has gone still is sent its picture at once
+    /// (a key frame of the last one, asked for as it joins).
+    #[test]
+    #[ignore = "needs Firefox installed, and downloads and starts the real browser (about 200 MB)"]
+    fn firefox_answers_a_late_viewer() -> anyhow::Result<()> {
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        crate::rt::block_on(async move {
+            let page = "data:text/html,<title>still</title><body style='margin:0;background:%23246'><p style='color:white'>still</p></body>";
+            let spec: Spec = serde_json::from_value(json!({"url": page, "profile": "clean", "engine": "firefox", "device": "iPhone SE"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            streams().open(&dir, "test-late", &spec, tx).await?;
+            let s = streams().get("test-late").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            // Nobody looks for a while: the page goes still.
+            crate::rt::sleep(Duration::from_secs(3)).await;
+            while rx.try_recv().is_ok() {}
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let (mut configs, mut keys) = (0, 0);
+            let end = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < end {
+                if let Ok(Ok(Out::Frame { data, .. })) = crate::rt::timeout(Duration::from_millis(100), rx.recv()).await {
+                    match (data.first(), data.get(1)) {
+                        (Some(b'c'), _) => configs += 1,
+                        (Some(b'v'), Some(b'k')) => keys += 1,
+                        _ => {}
+                    }
+                }
+            }
+            streams().close("test-late").await;
+            super::super::driven::stop_all().await;
+            assert!(configs >= 1 && keys >= 1, "configs {configs}, key frames {keys}");
             Ok(())
         })
     }

@@ -821,8 +821,10 @@ export interface Device {
 export interface PreviewLook {
   ports: Listening[];
   app: { configured: boolean; start?: string; port?: number; path?: string; running?: string | null; error?: string };
-  engines?: { chromium?: boolean; firefox?: boolean; webkit?: boolean };
+  engines?: { chromium?: boolean; firefox?: boolean; webkit?: boolean; ios?: boolean };
   devices?: Device[];
+  /** The machine's system (`macos`, `linux`, `windows`). */
+  platform?: string;
 }
 
 /** A live page of a session, as the server relays it (`crate::harness::streams::Live::view`). */

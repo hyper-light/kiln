@@ -10,6 +10,7 @@
 pub mod apps;
 pub mod ports;
 pub mod record;
+pub mod simulators;
 pub mod cdp;
 pub mod devices;
 pub mod driven;

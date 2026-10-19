@@ -262,15 +262,16 @@ fn reap(dir: &Path, only: Option<&Path>) {
 }
 
 /// The engine's browser for `profile`, started when it isn't running.
-async fn remote(dir: &Path, engine: Engine, profile: &str) -> anyhow::Result<Arc<Remote>> {
+async fn remote(dir: &Path, engine: Engine, profile: &str, sim: Option<&super::simulators::Sim>) -> anyhow::Result<Arc<Remote>> {
     static REAPED: OnceLock<()> = OnceLock::new();
     if REAPED.set(()).is_ok() {
         let d = dir.to_path_buf();
         let _ = crate::rt::blocking(move || reap(&d, None)).await;
     }
     // Safari keeps nothing, and takes one automated window: one for every profile.
-    let key = match engine {
-        Engine::Webkit => "webkit".to_owned(),
+    let key = match (engine, sim) {
+        (Engine::Webkit, Some(s)) => format!("webkit:sim:{}", s.udid),
+        (Engine::Webkit, None) => "webkit".to_owned(),
         _ if profile == "clean" => format!("{}:clean:{}", engine.name(), hex::encode(rand::random::<[u8; 6]>())),
         _ => format!("{}:{profile}", engine.name()),
     };
@@ -282,7 +283,7 @@ async fn remote(dir: &Path, engine: Engine, profile: &str) -> anyhow::Result<Arc
     }
     let r = Arc::new(match engine {
         Engine::Firefox => start_firefox(dir, profile).await?,
-        Engine::Webkit => start_webdriver().await?,
+        Engine::Webkit => start_webdriver(sim).await?,
         Engine::Chromium => anyhow::bail!("Chromium's pages are the capture extension's"),
     });
     g.insert(key, r.clone());
@@ -378,7 +379,30 @@ async fn start_firefox(dir: &Path, profile: &str) -> anyhow::Result<Remote> {
 /// The engines this machine has, besides Chromium: whether it has Firefox, and a WebDriver for
 /// WebKit.
 pub fn available() -> Value {
-    json!({"chromium": true, "firefox": firefox().is_some(), "webkit": webdriver().is_some()})
+    json!({"chromium": true, "firefox": firefox().is_some(), "webkit": webdriver().is_some(), "ios": ios()})
+}
+
+/// Whether this Mac can run iOS simulators (Xcode, an iOS runtime): asked of `simctl` at most once
+/// a minute.
+fn ios() -> bool {
+    static SEEN: OnceLock<Mutex<Option<(std::time::Instant, bool)>>> = OnceLock::new();
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let seen = SEEN.get_or_init(Mutex::default);
+    if let Some((at, ok)) = *seen.lock()
+        && at.elapsed() < Duration::from_secs(60)
+    {
+        return ok;
+    }
+    let ok = std::process::Command::new("xcrun")
+        .args(["simctl", "list", "-j", "runtimes"])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .is_some_and(|v| super::simulators::has_runtime(&v));
+    *seen.lock() = Some((std::time::Instant::now(), ok));
+    ok
 }
 
 /// Safari's WebDriver on a Mac, WebKitGTK's elsewhere (`KILN_WEBDRIVER` says another's: one that
@@ -398,7 +422,7 @@ fn webdriver() -> Option<(PathBuf, bool)> {
     candidates.into_iter().find(|p| p.is_file()).map(|p| (p, false))
 }
 
-async fn start_webdriver() -> anyhow::Result<Remote> {
+async fn start_webdriver(sim: Option<&super::simulators::Sim>) -> anyhow::Result<Remote> {
     let Some((bin, safari)) = webdriver() else {
         anyhow::bail!(
             "{}",
@@ -430,10 +454,12 @@ async fn start_webdriver() -> anyhow::Result<Remote> {
     }
     anyhow::ensure!(up, "{} didn't answer", bin.display());
     let asked = std::env::var("KILN_WEBDRIVER_CAPS").ok().and_then(|c| serde_json::from_str::<Value>(&c).ok());
-    let caps = match asked {
-        Some(c) => json!({"capabilities": {"alwaysMatch": c}}),
-        None if safari => json!({"capabilities": {"alwaysMatch": {"browserName": "safari"}}}),
-        None => json!({"capabilities": {"alwaysMatch": {}}}),
+    let caps = match (asked, sim) {
+        (Some(c), _) => json!({"capabilities": {"alwaysMatch": c}}),
+        // An iPhone's or iPad's Mobile Safari, in kiln's simulator of it.
+        (None, Some(s)) => json!({"capabilities": {"alwaysMatch": {"platformName": "iOS", "browserName": "Safari", "safari:useSimulator": true, "safari:deviceUDID": s.udid}}}),
+        (None, None) if safari => json!({"capabilities": {"alwaysMatch": {"browserName": "safari"}}}),
+        (None, None) => json!({"capabilities": {"alwaysMatch": {}}}),
     };
     let made = http(&format!("{root}/session"), Some(caps)).await.map_err(|e| {
         if safari && format!("{e:#}").to_ascii_lowercase().contains("remote automation") {
@@ -474,6 +500,8 @@ pub struct Driven {
     /// What the page did (`{"navigated"}`, `{"loaded"}`, `{"focus"}`, `{"dialog"}`, `{"closed"}`).
     pub said: async_channel::Receiver<Value>,
     said_tx: async_channel::Sender<Value>,
+    /// An iOS simulator's: touched, never moused, its window its device's.
+    pub simulated: bool,
 }
 
 /// Tells kiln what a field taking text is, where its fields are, whether text is selected
@@ -485,8 +513,13 @@ fn focus_script() -> String {
 
 impl Driven {
     /// A page of `engine`'s, in `profile`, at `width` by `height` (CSS pixels, `scale` density).
-    pub async fn open(dir: &Path, engine: Engine, profile: &str, width: u32, height: u32, scale: f64) -> anyhow::Result<Self> {
-        let remote = remote(dir, engine, profile).await?;
+    pub async fn open(dir: &Path, engine: Engine, profile: &str, width: u32, height: u32, scale: f64, device: Option<&super::devices::Device>) -> anyhow::Result<Self> {
+        // An iPhone or iPad in WebKit, on a Mac: its simulator's own Mobile Safari.
+        let sim = match device.filter(|d| engine == Engine::Webkit && cfg!(target_os = "macos") && super::simulators::is_ios(d)) {
+            Some(d) => Some(super::simulators::ensure(d).await?),
+            None => None,
+        };
+        let remote = remote(dir, engine, profile, sim.as_ref()).await?;
         let (said_tx, said) = async_channel::bounded(256);
         let context = match &remote.conn {
             Conn::Bidi(b) => {
@@ -505,8 +538,11 @@ impl Driven {
             }
         };
         remote.pages.fetch_add(1, Ordering::Relaxed);
-        let d = Self { engine, remote, context, said, said_tx };
-        d.viewport(width, height, scale).await?;
+        let d = Self { engine, remote, context, said, said_tx, simulated: sim.is_some() };
+        // A simulator's window is its device's own.
+        if !d.simulated {
+            d.viewport(width, height, scale).await?;
+        }
         Ok(d)
     }
 
@@ -599,6 +635,17 @@ impl Driven {
     /// What a viewer (or the agent) did, as WebDriver actions: each run of one kind of input in a
     /// call of its own, in order.
     pub async fn input(&self, events: &[Input]) -> anyhow::Result<()> {
+        // A phone has no mouse: what a pointer does there, a finger does.
+        let touched: Vec<Input>;
+        let events = if self.simulated {
+            touched = events.iter().cloned().map(|e| match e {
+                Input::Pointer { k, x, y, button, buttons, pt: _, id, mods, clicks } => Input::Pointer { k, x, y, button, buttons, pt: "touch".to_owned(), id, mods, clicks },
+                other => other,
+            }).collect();
+            &touched[..]
+        } else {
+            events
+        };
         for (source, actions) in action_runs(events) {
             if source == "wheel" && self.bidi().is_none() {
                 // Not every WebDriver has the wheel: the page scrolls itself where it was turned.
@@ -660,6 +707,89 @@ impl Driven {
     /// Whether its browser is still there.
     pub fn alive(&self) -> bool {
         self.remote.process.lock().as_mut().is_some_and(|p| matches!(p.try_wait(), Ok(None)))
+    }
+}
+
+/// What answers a measured page's requests: a URL's status, headers and body.
+pub type Answer = Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, (u16, Vec<(String, String)>, Vec<u8>)> + Send + Sync>;
+
+/// A tab of this machine's Firefox that a page is measured in (`super::preview`): its requests to
+/// kiln's own origin answered by kiln, its window as narrow or wide as asked.
+pub struct Measuring {
+    remote: Arc<Remote>,
+    bidi: Arc<Bidi>,
+    context: String,
+    events: async_channel::Receiver<(String, Value)>,
+}
+
+impl Measuring {
+    /// A tab of a Firefox kept for measuring; none when this machine has no Firefox.
+    pub async fn open(dir: &Path) -> anyhow::Result<Option<Self>> {
+        if firefox().is_none() {
+            return Ok(None);
+        }
+        let remote = remote(dir, Engine::Firefox, "measure", None).await?;
+        let Conn::Bidi(b) = &remote.conn else { anyhow::bail!("Firefox without its BiDi") };
+        let bidi = b.clone();
+        let ctx = bidi.call("browsingContext.create", json!({"type": "tab"})).await?.get("context").and_then(Value::as_str).unwrap_or("").to_owned();
+        let (tx, events) = async_channel::bounded::<(String, Value)>(1024);
+        bidi.pages.lock().insert(ctx.clone(), tx);
+        remote.pages.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(Self { remote, bidi, context: ctx, events }))
+    }
+
+    /// Load `url`, every request to `local` answered by `answer`; done when it's loaded.
+    pub async fn load(&self, url: &str, local: &str, answer: Answer) -> anyhow::Result<()> {
+        let host = local.trim_start_matches("https://").trim_end_matches('/');
+        // The Firefox kept for measuring hears every request of its own (its tabs are only these).
+        self.bidi.call("session.subscribe", json!({"events": ["network.beforeRequestSent"]})).await?;
+        self.bidi.call("network.addIntercept", json!({"phases": ["beforeRequestSent"], "urlPatterns": [{"type": "pattern", "protocol": "https", "hostname": host}], "contexts": [self.context]})).await?;
+        let (bidi, events) = (self.bidi.clone(), self.events.clone());
+        crate::rt::spawn(async move {
+            while let Ok((method, p)) = events.recv().await {
+                if method != "network.beforeRequestSent" || p.get("isBlocked").and_then(Value::as_bool) != Some(true) {
+                    continue;
+                }
+                let (Some(request), Some(u)) = (p.pointer("/request/request").and_then(Value::as_str), p.pointer("/request/url").and_then(Value::as_str)) else { continue };
+                let (request, answer, bidi) = (request.to_owned(), answer.clone(), bidi.clone());
+                let u = u.to_owned();
+                // Each answered on its own: a big file holds up nothing else.
+                crate::rt::spawn(async move {
+                    use base64::Engine as _;
+                    let (status, headers, body) = answer(u).await;
+                    let headers: Vec<Value> = headers.into_iter().map(|(k, v)| json!({"name": k, "value": {"type": "string", "value": v}})).collect();
+                    let body = json!({"type": "base64", "value": base64::engine::general_purpose::STANDARD.encode(&body)});
+                    let _ = bidi.call("network.provideResponse", json!({"request": request, "statusCode": status, "reasonPhrase": if status == 200 { "OK" } else { "Not Found" }, "headers": headers, "body": body})).await;
+                });
+            }
+        });
+        self.bidi.call("browsingContext.navigate", json!({"context": self.context, "url": url, "wait": "complete"})).await?;
+        Ok(())
+    }
+
+    /// Its height (`js` says it) in a window `width` wide.
+    pub async fn height_at(&self, width: u32, js: &str) -> anyhow::Result<u32> {
+        self.bidi.call("browsingContext.setViewport", json!({"context": self.context, "viewport": {"width": width, "height": 8}, "devicePixelRatio": 1})).await?;
+        let eval = |e: &str| self.bidi.call("script.evaluate", json!({"expression": e, "target": {"context": self.context}, "awaitPromise": true, "resultOwnership": "none"}));
+        eval("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))").await?;
+        let r = eval(js).await?;
+        Ok(r.get("result").map(plain).and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).unwrap_or(0))
+    }
+
+    /// Done: its tab closes (the Firefox stays a while for the next).
+    pub async fn close(self) {
+        self.bidi.pages.lock().remove(&self.context);
+        let _ = self.bidi.call("browsingContext.close", json!({"context": self.context})).await;
+        if self.remote.pages.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return;
+        }
+        let r = self.remote.clone();
+        crate::rt::spawn(async move {
+            crate::rt::sleep(IDLE).await;
+            if r.pages.load(Ordering::Relaxed) == 0 {
+                retire(&r).await;
+            }
+        });
     }
 }
 

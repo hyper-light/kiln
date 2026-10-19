@@ -101,6 +101,10 @@ pub struct Seen {
     pub content_height: u32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub heights: Vec<(u32, u32)>,
+    /// The same, measured in this machine's other engines (Firefox's, when it has one): a viewer's
+    /// frame takes its own engine's.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub engines: std::collections::BTreeMap<String, Vec<(u32, u32)>>,
     pub said: Vec<Said>,
     /// Cumulative layout shift while it loaded and was watched (0 is none: nothing moved).
     pub layout_shift: f64,
@@ -177,19 +181,54 @@ async fn run(page: &mut Page, dir: &Path, ask: Ask) -> anyhow::Result<Seen> {
     page.viewport(w, h, scale, mobile).await?;
     page.appearance(ask.dark, ask.reduced_motion).await?;
     page.before_load(WATCH).await?;
-    let (url, server) = match local {
+    let (url, server, served) = match local {
         Some((entry, html)) => {
             let html = if ask.as_shown { crate::harness::visuals::with_bridge(&html) } else { html };
-            let s = Server::start(page, &entry, html).await?;
-            (local_url(&entry), Some(s))
+            let s = Server::start(page, &entry, html.clone()).await?;
+            (local_url(&entry), Some(s), Some((entry, html)))
         }
-        None => (ask.url.clone().unwrap_or_default(), None),
+        None => (ask.url.clone().unwrap_or_default(), None, None),
     };
     let r = look(page, dir, &ask, &url, (w, h, scale, mobile)).await;
     let loaded = server.map(Server::stop);
     let mut seen = r?;
     seen.loaded = loaded;
+    // Measured in Firefox too, when this machine has it: answered from the same files.
+    if ask.measure
+        && let Some(heights) = firefox_heights(dir, &url, served.as_ref()).await
+    {
+        seen.engines.insert("firefox".to_owned(), heights);
+    }
     Ok(seen)
+}
+
+/// A page's height at each of [`WIDTHS`] in this machine's Firefox (`super::driven`), its requests
+/// to [`LOCAL`] answered as Chromium's are: none when there's no Firefox, or it couldn't.
+async fn firefox_heights(dir: &Path, url: &str, served: Option<&(String, String)>) -> Option<Vec<(u32, u32)>> {
+    let m = match super::driven::Measuring::open(dir).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "Firefox couldn't measure a page");
+            return None;
+        }
+    };
+    let (entry, html) = served.cloned().unwrap_or_default();
+    let answer = move |u: String| {
+        let (entry, html) = (entry.clone(), html.clone());
+        Box::pin(async move { respond(&u, &entry, &html, None).await }) as futures::future::BoxFuture<'static, (u16, Vec<(String, String)>, Vec<u8>)>
+    };
+    let r = async {
+        m.load(url, LOCAL, Arc::new(answer)).await?;
+        let mut heights = Vec::new();
+        for width in WIDTHS {
+            heights.push((width, m.height_at(width, CONTENT_HEIGHT).await?));
+        }
+        anyhow::Ok(heights)
+    }
+    .await;
+    m.close().await;
+    r.map_err(|e| tracing::debug!(error = %format!("{e:#}"), "Firefox couldn't measure a page")).ok()
 }
 
 async fn look(page: &mut Page, dir: &Path, ask: &Ask, url: &str, (w, h, scale, mobile): (u32, u32, f64, bool)) -> anyhow::Result<Seen> {
@@ -227,6 +266,7 @@ async fn look(page: &mut Page, dir: &Path, ask: &Ask, url: &str, (w, h, scale, m
         height: h,
         content_height,
         heights,
+        engines: std::collections::BTreeMap::new(),
         said: page.said().await,
         layout_shift: (num("cls") * 10_000.0).round() / 10_000.0,
         long_tasks,
@@ -300,6 +340,15 @@ async fn serve(cdp: Arc<Cdp>, session: String, events: async_channel::Receiver<E
 async fn answer(cdp: Arc<Cdp>, session: String, params: Value, entry: String, html: Arc<String>, loaded: Arc<Mutex<Loaded>>) {
     let id = params.get("requestId").and_then(Value::as_str).unwrap_or("").to_owned();
     let url = params.get("request").and_then(|r| r.get("url")).and_then(Value::as_str).unwrap_or("");
+    let (status, headers, body) = respond(url, &entry, &html, Some(&loaded)).await;
+    let headers: Vec<Value> = headers.into_iter().map(|(k, v)| json!({"name": k, "value": v})).collect();
+    let body = base64::engine::general_purpose::STANDARD.encode(&body);
+    let _ = cdp.call(Some(&session), "Fetch.fulfillRequest", json!({"requestId": id, "responseCode": status, "responseHeaders": headers, "body": body})).await;
+}
+
+/// What kiln answers a request to [`LOCAL`] with (whichever engine asks): its status, headers
+/// and body.
+pub(crate) async fn respond(url: &str, entry: &str, html: &str, loaded: Option<&Arc<Mutex<Loaded>>>) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let path = local_path(url).unwrap_or_default();
     let (status, mime, body) = if path == entry {
         (200, "text/html; charset=utf-8".to_owned(), html.as_bytes().to_vec())
@@ -312,7 +361,9 @@ async fn answer(cdp: Arc<Cdp>, session: String, params: Value, entry: String, ht
         let p = path.clone();
         match crate::rt::blocking(move || crate::harness::files::read_whole(&p, MOST_FILE)).await {
             Ok(Ok((meta, data))) => {
-                loaded.lock().local.push(path.clone());
+                if let Some(l) = loaded {
+                    l.lock().local.push(path.clone());
+                }
                 (200, crate::harness::visuals::served_type(&path, &meta.mime), data)
             }
             Ok(Err(e)) => (404, "text/plain; charset=utf-8".to_owned(), e.into_bytes()),
@@ -320,17 +371,16 @@ async fn answer(cdp: Arc<Cdp>, session: String, params: Value, entry: String, ht
         }
     };
     let mut headers = vec![
-        json!({"name": "Content-Type", "value": mime}),
+        ("Content-Type".to_owned(), mime),
         // Its own origin is opaque (sandboxed, as where it's shown): modules, fonts and fetches
         // of its files are cross-origin.
-        json!({"name": "Access-Control-Allow-Origin", "value": "*"}),
-        json!({"name": "Cache-Control", "value": "no-store"}),
+        ("Access-Control-Allow-Origin".to_owned(), "*".to_owned()),
+        ("Cache-Control".to_owned(), "no-store".to_owned()),
     ];
     if path == entry {
-        headers.push(json!({"name": "Content-Security-Policy", "value": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock"}));
+        headers.push(("Content-Security-Policy".to_owned(), "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock".to_owned()));
     }
-    let body = base64::engine::general_purpose::STANDARD.encode(&body);
-    let _ = cdp.call(Some(&session), "Fetch.fulfillRequest", json!({"requestId": id, "responseCode": status, "responseHeaders": headers, "body": body})).await;
+    (status, headers, body)
 }
 
 /// A path's address on [`LOCAL`] (each segment encoded; a Windows path's drive first).
@@ -417,6 +467,37 @@ mod tests {
         assert!(seen.said.iter().any(|s| s.text == "n is 7"), "{:?}", seen.said);
         assert!(seen.loaded.as_ref().is_some_and(|l| l.local.iter().any(|p| p.ends_with("lib.js"))), "{:?}", seen.loaded);
         assert!(seen.picture_path.as_deref().is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1000)));
+        Ok(())
+    }
+
+    /// Measured in Firefox too, when this machine has it: answered from the same files, its own
+    /// heights (text wraps as Firefox wraps it).
+    #[test]
+    #[ignore = "needs Firefox installed, and downloads and starts the real browser (about 200 MB)"]
+    fn a_page_is_measured_in_firefox_too() -> anyhow::Result<()> {
+        if super::super::driven::available().get("firefox") != Some(&json!(true)) {
+            return Ok(());
+        }
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        let work = dir.join("work-ff");
+        std::fs::create_dir_all(&work)?;
+        std::fs::write(work.join("p.css"), "body{margin:0;font:16px/1.4 serif} p{margin:0}\n")?;
+        let html = format!("<!doctype html><head><link rel=stylesheet href='./p.css'></head><body><p>{}</p></body>", "a few words that wrap ".repeat(40));
+        let ask: Ask = serde_json::from_value(json!({"html": html, "entry": work.join("page.html").to_string_lossy(), "measure": true, "as_shown": true, "picture": "none"}))?;
+        let d = dir.clone();
+        let seen = crate::rt::block_on(async move {
+            let seen = preview(&d, ask).await;
+            super::super::driven::stop_all().await;
+            seen
+        })?;
+        let ff = seen.engines.get("firefox").cloned().unwrap_or_default();
+        assert_eq!(ff.len(), WIDTHS.len(), "{:?}", seen.engines);
+        // Narrower, taller; and each engine's own (their fonts wrap the words apart), within reason
+        // of the other's.
+        assert!(ff.windows(2).all(|w| w.first().map(|x| x.1) >= w.get(1).map(|x| x.1)), "{ff:?}");
+        for ((w, c), (_, f)) in seen.heights.iter().zip(&ff) {
+            assert!(*f <= 2 * c && *c <= 2 * f, "at {w}: chromium {c}, firefox {f}");
+        }
         Ok(())
     }
 

@@ -139,6 +139,20 @@ function Pages({ session }: { session: string }) {
   ];
   const devices = [{ value: "", label: "This screen" }, ...(look.data.look.devices ?? []).map((d) => ({ value: d.name, label: `${d.name} · ${d.width}×${d.height}` }))];
   const runIn = engines.some((e) => e.value === engine) ? engine : "chromium";
+  // What WebKit is there: an iPhone or iPad a Mac's iOS Simulator (the real Mobile Safari), else
+  // Safari's own window on that Mac, or WebKitGTK elsewhere.
+  const mac = look.data.look.platform === "macos";
+  const ios = (look.data.look.devices ?? []).some((d) => d.name === layout && d.mobile && /iPhone|iPad/.test(d.agent ?? ""));
+  const webkitSays =
+    runIn !== "webkit"
+      ? ""
+      : mac && ios
+        ? has.ios
+          ? "It runs in that Mac's iOS Simulator: the real Mobile Safari, with no window on its screen."
+          : "An iPhone or iPad runs in that Mac's iOS Simulator, which needs a runtime first: install one there with xcodebuild -downloadPlatform iOS."
+        : mac
+          ? "WebKit is Safari on that Mac: its window opens on its screen, and keeps nothing."
+          : "WebKit is WebKitGTK on that machine.";
   // What opens on the person's own device: a port of its machine (the app's once it runs).
   const device = port ? { port: port.port, path: chosen === `port:${appPort}` ? (app.path ?? "/") : "/" } : chosen === "address" ? localOf(address) : undefined;
   // Yours: the ones opened here, then any you opened elsewhere (the agent's are in the conversation).
@@ -281,8 +295,7 @@ function Pages({ session }: { session: string }) {
         </Button>
       </form>
       <p className="field-hint lp-says">
-        {PROFILE_SAYS[profile]}
-        {runIn === "webkit" ? " WebKit is Safari on the agent's machine: its window opens on that Mac's screen, and keeps nothing." : ""}
+        {PROFILE_SAYS[profile]} {webkitSays}
         {runIn !== "chromium" ? " It streams without sound." : ""}
       </p>
       <div className="lp-device">

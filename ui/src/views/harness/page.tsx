@@ -13,7 +13,7 @@ import * as React from "react";
 import { ExternalLink, RotateCw } from "lucide-react";
 import type { ToolCall } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
-import { heightAt, pageOf, type ShownPage } from "./page-of";
+import { heightAt, heightsFor, pageOf, type ShownPage } from "./page-of";
 import { FilesContext } from "./files";
 import { Beam, PrismLabel } from "./signals";
 import { useDrafts } from "./state";
@@ -81,7 +81,8 @@ function Frame({ page, ev }: { page: ShownPage; ev: string }) {
   const live = React.useRef({ page, agent, width });
   live.current = { page, agent, width };
 
-  const measured = heightAt(page.heights, width);
+  // Measured in this browser's own engine, when its machine had it.
+  const measured = heightAt(heightsFor(page, typeof navigator === "undefined" ? "" : navigator.userAgent), width);
   const height = Math.min(MOST, reported ?? (measured != null && measured >= FILL_UNDER ? measured : fillHeight(width || 390)));
 
   const tell = React.useCallback((method: string, params: unknown) => {
