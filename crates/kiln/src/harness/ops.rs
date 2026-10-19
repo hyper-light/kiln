@@ -178,6 +178,7 @@ async fn result(cx: Cx, v: Value) -> Out {
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
+    let record = crate::workspace::change::of(&cx.hub, &id).await;
     let files: Vec<Value> = changes
         .as_array()
         .into_iter()
@@ -192,12 +193,31 @@ async fn result(cx: Cx, v: Value) -> Out {
         "cwd": info.cwd,
         "machine": wait::machine(&info.target),
         "cost_usd": info.cost_usd,
-        // Filled in once agents work in workspaces of their own and open change requests
-        // (docs/agentic.md, W and C).
+        // Filled in once agents work in workspaces of their own (docs/agentic.md, W).
         "workspace": Value::Null,
-        "branch": Value::Null,
-        "change_request": Value::Null,
+        "branch": record.as_ref().map(|r| json!(r.branch)),
+        "change_request": record.as_ref().map(crate::workspace::change::shown),
     }))
+}
+
+async fn change(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    may_steer(&cx, &info.id)?;
+    let want: crate::workspace::change::Want = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let r = crate::workspace::change::open(&cx.hub, &cx.caller.name, &info, want).await?;
+    Ok(json!({"change_request": crate::workspace::change::shown(&r)}))
+}
+
+async fn changes(cx: Cx, v: Value) -> Out {
+    let one = v.get("agent").and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty());
+    let list: Vec<Value> = match one {
+        Some(a) => {
+            let id = known(&cx, a).map_or_else(|_| a.to_owned(), |i| i.id);
+            crate::workspace::change::of(&cx.hub, &id).await.iter().map(crate::workspace::change::shown).collect()
+        }
+        None => crate::workspace::change::all(&cx.hub).await.iter().map(crate::workspace::change::shown).collect(),
+    };
+    Ok(json!({"changes": list}))
 }
 
 async fn interrupt(cx: Cx, v: Value) -> Out {
@@ -345,7 +365,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.result",
-            summary: "What an agent concluded: its last reply, how its last turn ended, what it changed (files, lines added and removed), its folder and machine, and its cost. (Its workspace, branch and change request come once agents have them.)",
+            summary: "What an agent concluded: its last reply, how its last turn ended, what it changed (files, lines added and removed), its folder and machine, its cost, and its change request and branch (agents.change) once it has one.",
             read_only: true,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
@@ -369,6 +389,36 @@ pub fn list_ops() -> Vec<Op> {
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "interrupt"]))),
             run: |cx, v| Box::pin(interrupt(cx, v)),
+        },
+        Op {
+            name: "agents.change",
+            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default).",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "title": {"type": "string"},
+                        "body": {"type": "string", "description": "What it changes and why, for reviewers."},
+                        "draft": {"type": "boolean", "description": "Not ready for review yet (kiln's own review)."},
+                        "trunk": {"type": "string", "description": "The branch it goes into."},
+                        "fix_checks": {"type": "boolean", "description": "Failing checks go to the agent to fix (the default)."}
+                    }),
+                    &["agent"],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "change"]))),
+            run: |cx, v| Box::pin(change(cx, v)),
+        },
+        Op {
+            name: "agents.changes",
+            summary: "Agents' change requests: whose, where (repository, branch, the change and its page), its versions, review and checks, and whether it landed. `agent` for one.",
+            read_only: true,
+            destructive: false,
+            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &[]),
+            route: |_| Ok((Method::GET, path(&["api", "harness", "changes"]))),
+            run: |cx, v| Box::pin(changes(cx, v)),
         },
         Op {
             name: "agents.stop",

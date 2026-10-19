@@ -65,7 +65,7 @@ pub struct By {
 }
 
 /// The open change request of `branch` for `trunk`, if there is one: its id and number.
-async fn open_of(hub: &Hub, repo: &str, trunk: &str, branch: &str) -> anyhow::Result<Option<(String, u32)>> {
+pub(crate) async fn open_of(hub: &Hub, repo: &str, trunk: &str, branch: &str) -> anyhow::Result<Option<(String, u32)>> {
     let (repo, trunk, branch) = (repo.to_owned(), trunk.to_owned(), branch.to_owned());
     hub.store
         .call(move |c| {

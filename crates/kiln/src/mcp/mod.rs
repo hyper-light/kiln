@@ -292,7 +292,8 @@ workflows (validate and plan before proposing), reruns, approvals, and failed le
 a command in one, `ci.legs.rerun_step` reruns a step there). Deployments (GitOps CD) are under `kiln.cd`: apps, their \
 sync and health, resources and why they differ, diffs, history, syncs, clusters. Agents are under `kiln.agents`: start \
 agents for parts of the work on any machine (`agents_start`), wait for them (`agents_wait`) and read what they concluded \
-(`agents_result`); what they ask a person stays a person's to answer. Plans and goal stacks are under `kiln.plans` and \
+(`agents_result`), and put an agent's work up for review (`agents_change`); what they ask a person stays a person's to answer. \
+Plans and goal stacks are under `kiln.plans` and \
 `kiln.goals`. Prefer code_run: one program can list, filter and act on a whole fleet and return only what matters. \
 code_search shows the operations and their inputs. The skills (kiln-agents, kiln-ci-diagnose, kiln-deploy, kiln-diagnose, \
 kiln-apps, kiln-argocd-migration) say how to use them.";

@@ -589,7 +589,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "agents", "wait"]) => own_op(&hub, &caller, "agents.wait", query_value(&q)).await,
         (&Method::GET, ["api", "harness", "agents", id]) => own_op(&hub, &caller, "agents.get", json!({ "agent": id })).await,
         (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => own_op(&hub, &caller, &format!("agents.{what}"), json!({ "agent": id })).await,
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop")]) => {
+        (&Method::GET, ["api", "harness", "changes"]) => own_op(&hub, &caller, "agents.changes", query_value(&q)).await,
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             let mut body = body_value(req).await?;
             if let Some(o) = body.as_object_mut() {

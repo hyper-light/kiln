@@ -260,14 +260,17 @@ pub const CAP_PORTS: u32 = 1 << 25;
 /// laid out as devices (`crate::browser::driven`, `crate::browser::devices`): a stream's spec's
 /// `engine` and `device`.
 pub const CAP_ENGINES: u32 = 1 << 26;
+/// [`AgentMsg::Build`] capability: the runner answers questions about its agents' folders and
+/// pushes their work for review ([`ServerMsg::Workspace`], `crate::workspace`).
+pub const CAP_WORKSPACE: u32 = 1 << 27;
 /// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
 /// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`,
-/// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`, 1 << 26 `CAP_ENGINES`).
-pub const CAP_POOLS: u32 = 1 << 27;
+/// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`, 1 << 26 `CAP_ENGINES`, 1 << 27 `CAP_WORKSPACE`).
+pub const CAP_POOLS: u32 = 1 << 28;
 /// [`AgentMsg::Build`] capability: the runner keeps a job's result and its events (each with its
 /// `seq`) until the server says it has the result ([`ServerMsg::Received`]), and sends them again
 /// after a reconnect, so what was in flight as the connection dropped isn't lost.
-pub const CAP_RECEIVED: u32 = 1 << 28;
+pub const CAP_RECEIVED: u32 = 1 << 29;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -471,6 +474,11 @@ pub enum ServerMsg {
     PortAck { conn: u64, session: String, bytes: u64 },
     /// Connection `conn` is done with.
     PortClose { conn: u64, session: String },
+    /// A question about agent session `session`'s folder (`json` a [`crate::workspace::Ask`]: its
+    /// repository, or a commit of the agent's work pushed for review), answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_WORKSPACE`]. Appended last: postcard
+    /// encodes variants by index.
+    Workspace { req: u64, session: String, json: String },
     /// CI: start or stop one of a pool's executors (JSON `crate::runner::pool::Ask`, docs/ci.md
     /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
     /// variants by index.
@@ -735,6 +743,17 @@ mod tests {
     }
 
     #[test]
+    fn workspaces_are_appended_after_ports() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::PortClose { conn: 1, session: "s".into() })?;
+        let m = ServerMsg::Workspace { req: 4, session: "s".into(), json: r#"{"op":"git"}"#.into() };
+        let b = encode(&m)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "it comes right after the ones before it");
+        assert_eq!(decode::<ServerMsg>(&b)?, m);
+        assert!(CAP_WORKSPACE.is_power_of_two() && CAP_WORKSPACE > CAP_ENGINES && CAP_ENGINES > CAP_PORTS);
+        Ok(())
+    }
+
+    #[test]
     fn previews_are_appended_after_streams() -> anyhow::Result<()> {
         let last = encode(&ServerMsg::StreamClose { stream: "v".into(), session: "s".into() })?;
         let m = ServerMsg::Preview { req: 3, session: "s".into(), json: "{\"op\":\"look\"}".into() };
@@ -772,17 +791,17 @@ mod tests {
 
     #[test]
     fn pool_executors_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        let last_server = encode(&ServerMsg::PortClose { conn: 1, session: "s".into() })?;
+        let last_server = encode(&ServerMsg::Workspace { req: 1, session: "s".into(), json: "{}".into() })?;
         let start = ServerMsg::Executor { json: "{}".into() };
         let b = encode(&start)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after PortClose");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after Workspace");
         assert_eq!(decode::<ServerMsg>(&b)?, start);
         let last_agent = encode(&AgentMsg::PortClose { conn: 1, error: None })?;
         let said = AgentMsg::Executor { json: "{}".into() };
         let b = encode(&said)?;
         assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Executor comes right after PortClose");
         assert_eq!(decode::<AgentMsg>(&b)?, said);
-        let others = CAP_ENGINES | CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
+        let others = CAP_WORKSPACE | CAP_ENGINES | CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
         assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
         Ok(())
     }

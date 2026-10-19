@@ -33,6 +33,7 @@ import { AgentFamilies } from "./family";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { PushOffer } from "./push-offer";
+import { RowChange, RowReview } from "./change-bar";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
@@ -173,6 +174,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: A
             </span>
           )}
           {(a.left_behind ?? 0) > 0 && <span className="ms-left">{a.left_behind} left running</span>}
+          {(a.files_changed ?? 0) > 0 && <RowChange agentId={a.id} />}
         </span>
       </span>
       <span className="ms-actions">
@@ -189,6 +191,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: A
               Restart
             </Button>
           )}
+          {(stand === "finished" || stand === "ready" || stand === "ended") && (a.files_changed ?? 0) > 0 && <RowReview agentId={a.id} />}
         </span>
         <span className="ms-tail">
           {actions.menu()}
