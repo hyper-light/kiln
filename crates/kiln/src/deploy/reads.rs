@@ -95,7 +95,7 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
                     change(key_of(i), live.as_ref(), predicted.as_ref())
                 })
                 .collect();
-            Ok(json!({ "changes": changes }))
+            Ok(json!({ "diffs": changes }))
         }
         Read::Diff { version: Some(v) } => {
             // What `v` renders, against what the deployed version renders: the chart's own change,
@@ -115,7 +115,7 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
                     changes.push(change(key.clone(), Some(before), None));
                 }
             }
-            Ok(json!({ "version": v, "changes": changes }))
+            Ok(json!({ "version": v, "diffs": changes }))
         }
         Read::Logs { group, kind, name: object, namespace, container, tail } => {
             let group = group.unwrap_or_else(|| group_of(&kind).to_owned());

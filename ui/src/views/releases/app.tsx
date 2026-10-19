@@ -7,7 +7,7 @@ import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { Pause, Play, Plus, Rocket } from "lucide-react";
 
-import { boardHref, deployApi, describe, packageWords, providerName, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type ReleaseAsk } from "@/api/deploy";
+import { boardHref, deployApi, describe, packageWords, providerName, registrationHref, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type ReleaseAsk } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
@@ -168,9 +168,14 @@ function EnvCard({ app, env, others }: { app: string; env: string; others: strin
       eyebrow={providerName(d.provider.kind === "argocd" ? `argocd/${d.provider.integration ?? ""}` : "kilncd")}
       title={env}
       actions={
-        <Button size="xs" onClick={() => setOpen(true)} disabled={!!d.in_flight}>
-          <Rocket /> Release
-        </Button>
+        <>
+          <Button asChild size="xs" variant="ghost">
+            <Link to={registrationHref(app, env)}>What runs</Link>
+          </Button>
+          <Button size="xs" onClick={() => setOpen(true)} disabled={!!d.in_flight}>
+            <Rocket /> Release
+          </Button>
+        </>
       }
       className="rel-env"
     >

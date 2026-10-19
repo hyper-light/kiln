@@ -577,13 +577,17 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             let q = version.map(|v| format!("?version={}", enc(&v))).unwrap_or_default();
             let v = api.call(Method::Get, &format!("/apps/{}/environments/{}/diff{q}", enc(&app), enc(&env)), None).await?;
             api.print(&v, |v| {
-                let changes = v.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
+                // `changes` from a server before both providers answered `diffs`.
+                let all = v.get("diffs").or_else(|| v.get("changes")).and_then(Value::as_array).cloned().unwrap_or_default();
+                let flag = |c: &Value, f: &str| c.get(f).and_then(Value::as_bool).unwrap_or(false);
+                let changes: Vec<Value> = all.into_iter().filter(|c| c.get("hunks").and_then(Value::as_array).is_some_and(|h| !h.is_empty()) || flag(c, "missing") || flag(c, "requires_pruning")).collect();
                 if changes.is_empty() {
                     println!("nothing would change");
                 }
                 for c in changes {
                     let k = |f: &str| c.pointer(&format!("/key/{f}")).and_then(Value::as_str).unwrap_or("").to_owned();
-                    println!("--- {} {}/{}", k("kind"), k("namespace"), k("name"));
+                    let note = if flag(&c, "missing") { " (not there yet: a sync makes it)" } else if flag(&c, "requires_pruning") { " (no longer in git: a sync that prunes deletes it)" } else { "" };
+                    println!("--- {} {}/{}{note}", k("kind"), k("namespace"), k("name"));
                     for h in c.get("hunks").and_then(Value::as_array).into_iter().flatten() {
                         let n = |f: &str| h.get(f).and_then(Value::as_u64).unwrap_or(0);
                         println!("@@ -{},{} +{},{} @@", n("old_start"), n("old_lines"), n("new_start"), n("new_lines"));
