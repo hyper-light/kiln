@@ -6,3 +6,6 @@ node_modules/
 *.part
 /dist
 __pycache__/
+
+# The review UI check's server (ci/ui/review_setup.py).
+ci/ui/run/

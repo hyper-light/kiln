@@ -185,7 +185,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); microVM and k8s executors and pool kinds, the Pools page, UI-made image definitions left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); review UI and REST rest left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); the rest of the REST left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -3478,8 +3478,22 @@ adapts [review.md](review.md), which it replaces.
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
 **Progress.** In progress: native hosting, stacked diffs, change requests, review, policy, the
-land queue and the GitHub App are built; the review UI and the rest of the facade's REST half are
-left.
+land queue, the GitHub App and the review UI (AC06) are built; the rest of the facade's REST half
+is left.
+
+- *Done.* AC06, against a real server: `ci/ui/review_setup.py` makes a diff with a 10,000-line
+  change, a moved block, a one-word edit, a generated file and an image, and a reviewer's thread
+  waiting for the author. `ci/ui/review_ac06.mjs` checks the review pages (W21-R09) in Chromium and
+  WebKit (Playwright 1.64.1), on a desktop and a phone, with the UI server rendering them:
+  - the inbox shows the thread waiting for your reply, and `n` brings it into view;
+  - a file ticked viewed stays ticked across a reload;
+  - word diffs mark only the changed word, and the moved block links to where it went;
+  - the generated file is folded, and both sides of the image show;
+  - on phones the diff is unified, and nothing is wider than the screen;
+  - no script errors, no failed requests.
+
+  The 10,000-line diff scrolls at a median 16.7 ms a frame in Chromium (p95 16.8 ms). WebKit's
+  median is 17.0 ms, but its p95 is 82 ms in the container, where it renders without a GPU.
 
 - *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
   - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
