@@ -41,6 +41,10 @@ pub(crate) fn git(hub: &Hub) -> Command {
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{t}"));
         c.arg("-c").arg(format!("http.https://github.com/.extraheader=Authorization: Basic {basic}"));
     }
+    // GitLab's and Bitbucket's credentials, for what they cover (docs/ci.md W23-R04, R05).
+    for (url, header) in crate::githost::git_headers(hub) {
+        c.arg("-c").arg(format!("http.{url}.extraheader={header}"));
+    }
     c
 }
 

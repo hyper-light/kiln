@@ -101,6 +101,12 @@ fn azure_headers(mut r: Response) -> Response {
 
 /// The byte range a read asks for (`Range` or `x-ms-range`), as `[start, end)` within `size`.
 /// `None` for the whole object. A range past the end is refused with `Err`.
+/// The byte range a request asks for of `size` bytes, `[start, end)`: `None` for all of it, `Err` when
+/// it can't be met.
+pub(crate) fn byte_range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    range(req, size)
+}
+
 fn range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
     let v = req.headers().get("x-ms-range").or_else(|| req.headers().get(header::RANGE)).and_then(|v| v.to_str().ok());
     parse_range(v, size)

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -784,7 +784,7 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
     let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
         let u = core.take_out();
-        (u, core.take_writes(), std::mem::take(&mut core.previews), std::mem::take(&mut core.change_jobs))
+        (u, core.take_writes(), std::mem::take(&mut core.previews), core.take_change_jobs())
     };
     if let Some(stdin) = stdin {
         for w in writes {
@@ -813,7 +813,7 @@ async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u
 }
 
 enum Ev {
-    Change(Option<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>),
+    Change((String, (Option<super::model::FileChange>, Option<super::core::Baseline>))),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -1604,7 +1604,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut kind = kind;
     s.core.lock().harness = Some(kind.name.to_owned());
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
-    let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
+    let mut changes = futures::stream::FuturesUnordered::new();
     let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
@@ -1785,19 +1785,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        let tx = ch_tx.clone();
-                        crate::rt::spawn(async move {
+                        s.core.lock().start_change(&job.abs);
+                        changes.push(async move {
                             let abs = job.abs.clone();
                             let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.unwrap_or((None, None));
-                            let _ = tx.send((abs, change)).await;
+                            (abs, change)
                         });
                     }
                     let ev = futures::select_biased! {
                         c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
+                        c = changes.select_next_some() => Ev::Change(c),
                         o = pipe(&p.stdout, out_open).fuse() => Ev::Out(o),
                         e = pipe(&p.stderr, err_open).fuse() => Ev::Err(e),
                         d = pv_rx.recv().fuse() => Ev::Preview(d.ok()),
-                        c = ch_rx.recv().fuse() => Ev::Change(c.ok()),
                         f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
                         _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
@@ -2036,9 +2036,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 core.touch_state();
                             }
                         }
-                        Ev::Preview(None) | Ev::Change(None) => {}
-                        Ev::Change(Some((abs, (change, resolved)))) => {
+                        Ev::Preview(None) => {}
+                        Ev::Change((abs, (change, resolved))) => {
                             s.core.lock().set_change(&abs, change, resolved);
+                            while let Some(Some((abs, (change, resolved)))) = changes.next().now_or_never() {
+                                s.core.lock().set_change(&abs, change, resolved);
+                            }
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
                         Ev::Fx(None) => {}

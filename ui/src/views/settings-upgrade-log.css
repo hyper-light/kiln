@@ -1,0 +1,203 @@
+.upgrade-log {
+  min-width: 0;
+  margin-top: 12px;
+  overflow: hidden;
+  border: 1px solid #2b2e39;
+  border-radius: 8px;
+  background: #101217;
+}
+.upgrade-log-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 8px;
+  background: #12151b;
+}
+.upgrade-log-toggle {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  text-align: left;
+}
+.upgrade-log-toggle:hover .upgrade-log-title { color: #f2f2f3; }
+.upgrade-log-toggle:focus-visible,
+.upgrade-log-actions button:focus-visible,
+.upgrade-log-viewport:focus-visible {
+  outline-offset: -3px;
+}
+.upgrade-log-icon { color: #7f8a9d; }
+.upgrade-log-heading {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 14px;
+  min-width: 0;
+}
+.upgrade-log-title {
+  color: #d7dce5;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+.upgrade-log-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: #8b93a2;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.upgrade-log-state { display: inline-flex; align-items: center; gap: 5px; }
+.upgrade-log-state i { width: 5px; height: 5px; border-radius: 50%; background: #bab0e3; }
+.upgrade-log[data-state="done"] .upgrade-log-state i { background: #a5c8b3; }
+.upgrade-log[data-state="failed"] .upgrade-log-state i { background: #d1aaad; }
+.upgrade-log-duration { font-variant-numeric: tabular-nums; }
+.upgrade-log-target {
+  max-width: 140px;
+  overflow: hidden;
+  color: #7f899a;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upgrade-log-chevron { color: #757e8c; transition: transform 150ms ease; }
+.upgrade-log-chevron[data-open] { transform: rotate(180deg); }
+.upgrade-log-actions { display: flex; flex: none; align-items: center; gap: 2px; }
+.upgrade-log-actions button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #98a3b5;
+}
+.upgrade-log-actions button:hover:not(:disabled),
+.upgrade-log-actions button[aria-pressed="true"] {
+  border-color: #303745;
+  background: #1a1f29;
+  color: #e0e5ed;
+}
+.upgrade-log-actions button:disabled { opacity: 0.35; }
+.upgrade-log-viewport {
+  min-height: 82px;
+  max-height: 240px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  border-top: 1px solid #252a35;
+  background: #0c0e12;
+  scrollbar-gutter: stable;
+}
+.upgrade-log[data-expanded] .upgrade-log-viewport { height: min(560px, 65dvh); max-height: none; }
+.upgrade-log-output {
+  margin: 0;
+  padding: 14px;
+  color: #b9c3d3;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.8;
+  tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.upgrade-log-output[data-empty] { color: #798393; }
+.upgrade-log-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px 12px;
+  min-height: 34px;
+  padding: 5px 12px;
+  border-top: 1px solid #222732;
+  color: #7f8b9f;
+  font-size: 10px;
+}
+.upgrade-log-foot button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0;
+  color: #c4b8e5;
+  font-size: 10.5px;
+}
+.upgrade-log-foot button:hover { color: #e1d6fa; }
+.upgrade-log-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px 12px;
+  padding: 9px 12px;
+  border-top: 1px solid #30303b;
+  background: #1b1922;
+  color: #c4b8df;
+  font-size: 11px;
+}
+.upgrade-log-notice button { color: #e0d5f4; font-size: 10.5px; }
+.upgrade-log-notice button:disabled { opacity: 0.45; }
+.upgrade-log-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  border-top: 1px solid #3b2c32;
+  background: #21171c;
+  color: #dfb7bf;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.upgrade-log-error svg { margin-top: 3px; }
+.upgrade-log-timeout {
+  margin: 0;
+  padding: 10px 12px;
+  border-top: 1px solid #282932;
+  color: #9aa3b2;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.upgrade-log-timeout button {
+  margin-left: 5px;
+  color: #c4b8e5;
+  text-decoration: underline;
+  text-decoration-color: #62596e;
+  text-underline-offset: 3px;
+}
+@media (max-width: 600px) {
+  .upgrade-log-heading { display: block; }
+  .upgrade-log-meta { margin-top: 3px; }
+  .upgrade-log-target { display: none; }
+  .upgrade-log-toggle { gap: 8px; padding: 10px; }
+  .upgrade-log-icon { display: none; }
+  .upgrade-log-actions button { width: 32px; height: 34px; }
+  .upgrade-log-output { padding: 12px; }
+}
+@media (max-width: 480px) {
+  .upgrade-log-head { flex-wrap: wrap; gap: 0; padding-right: 0; }
+  .upgrade-log-toggle { flex-basis: 100%; }
+  .upgrade-log-actions {
+    justify-content: flex-end;
+    width: 100%;
+    padding: 4px 8px;
+    border-top: 1px solid #252a35;
+  }
+}
+@media (pointer: coarse) {
+  .upgrade-log-actions button { width: 44px; height: 44px; }
+  .upgrade-log-foot button,
+  .upgrade-log-notice button,
+  .upgrade-log-timeout button { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .upgrade-log-chevron { transition: none; }
+}

@@ -274,6 +274,14 @@ async fn job(hub: &Hub, t: &str) -> Option<Caller> {
     if j.may("environments", Level::Write) {
         give(&["environments.deploy"], &here);
     }
+    // kiln's registry (docs/ci.md W12-R01): its names under the job's repository, by GitHub's
+    // `packages` or kiln's `registry: push`.
+    if j.may("packages", Level::Read) || j.may("registry", Level::Read) {
+        give(&["artifacts.read"], &here);
+    }
+    if j.may("packages", Level::Write) || j.may("registry", Level::Write) {
+        give(&["artifacts.write"], &here);
+    }
     if j.may("binaries", Level::Write) {
         give(&["binaries.publish"], &Scope::Server);
     }

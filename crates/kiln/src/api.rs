@@ -189,6 +189,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         };
     }
 
+    // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
+    // of its own (an upload streams for as long as it takes).
+    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
+        let h = Arc::clone(&hub);
+        return crate::rt::spawn(async move { crate::ci::registry::proxy::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
+    }
+    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
+        let h = Arc::clone(&hub);
+        return crate::rt::spawn(async move { crate::ci::registry::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
+    }
+
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
         (&Method::POST, ["api", "mcp"]) => {
@@ -213,6 +224,26 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             };
         }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
+        // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
+        (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &crate::authz::sso::providers(&hub).await)),
+        (&Method::GET, ["api", "auth", provider, "start"]) => {
+            let q = srv::query(&req);
+            return match crate::authz::sso::start(&hub, provider, q.get("return").map(String::as_str)).await {
+                Ok(to) => Ok(srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &to)),
+                Err((c, m)) => Err(err(c, m)),
+            };
+        }
+        (&Method::GET, ["api", "auth", provider, "callback"]) => {
+            let q = srv::query(&req);
+            let (code, state) = (q.get("code").cloned().unwrap_or_default(), q.get("state").cloned().unwrap_or_default());
+            return match crate::authz::sso::callback(&hub, provider, &code, &state).await {
+                Ok((session, _, back)) => {
+                    let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &back);
+                    Ok(srv::with_header(r, header::SET_COOKIE, &cookie_for(&session, is_secure(&hub, &req))))
+                }
+                Err((c, m)) => Err(err(c, m)),
+            };
+        }
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
         (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,
@@ -233,6 +264,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return put_artifacts(&hub, &id, req).await;
         }
         (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        // The GitHub App's events and GitHub's return from making it (W14-R10): open, they carry
+        // their own proof (a signature; a state kiln handed out).
+        (&Method::POST, ["api", "hooks", "github", "app"]) => return crate::githost::web::webhook(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        // GitLab's and Bitbucket's webhooks, checked with their secrets (docs/ci.md W23-R04, R05).
+        (&Method::POST, ["api", "hooks", "gitlab"]) => return crate::githost::hooks::gitlab(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "hooks", "bitbucket"]) => return crate::githost::hooks::bitbucket(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ci", "github", "app", "callback"]) => return crate::githost::web::callback(&hub, &req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "shared", "plans", token]) => return shared_plan(&hub, token).await,
         (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();
@@ -654,6 +692,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => harness_kept_file(&hub, id, sha, &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => harness_file(&hub, id, q.get("path").cloned(), &req).await,
+        // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
+        (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
+        (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => recording_file(&hub, id, rid, what, &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -949,9 +990,31 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
 /// read on its machine now: one that isn't kept (too big, past a budget, from before kiln kept
 /// files), in pieces as the viewer takes it.
 async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
-    use crate::harness::kept::piece;
     let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
     let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    serve_from(hub, id, location, path, req).await
+}
+
+/// `GET /api/harness/sessions/:id/recordings/:recording/:what` (`video`, `inputs`, `test`): a
+/// recording of one of its streams, from its machine (`crate::browser::record`); its log and its
+/// test as text to keep.
+async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &Request) -> R {
+    let rec = hub.harness.streams.recordings(id, person(req).as_deref()).into_iter().find(|r| r.id == rid).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such recording"))?;
+    let path = rec.file(what).ok_or_else(|| err(StatusCode::NOT_FOUND, "a recording's files are its video, inputs and test"))?.to_owned();
+    let mut r = serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?;
+    if what != "video" {
+        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().replace('"', "")).unwrap_or_default();
+        r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/plain; charset=utf-8"));
+        if let Ok(v) = header::HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+            r.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    Ok(r)
+}
+
+/// A file of session `id`'s machine (`location`), in ranges, as it reads it.
+async fn serve_from(hub: &Arc<Hub>, id: &str, location: crate::harness::registry::Location, path: String, req: &Request) -> R {
+    use crate::harness::kept::piece;
     // What it is, and how big, before the part asked for.
     let (answer, _) = piece(hub, &location, id, &path, 0, 0)
         .await

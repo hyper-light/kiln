@@ -241,10 +241,10 @@ fn base_tools() -> Value {
         },
         {
             "name": "use_live",
-            "description": "Use a page you showed with show_live, as the person can: click or tap at a point (CSS pixels of its window), type text, press a key by name (Enter, Tab, Escape, ArrowDown, a), scroll, go to an address, back, forward, reload, wait. Its actions run in order; then you get a picture of it, its address and title. The person sees what you did as you do it, live, in the same page.",
+            "description": "Use a page you showed with show_live, as the person can: click or tap at a point (CSS pixels of its window), type text, press a key by name (Enter, Tab, Escape, ArrowDown, a), scroll, go to an address, back, forward, reload, wait. Its actions run in order; then you get a picture of it, its address and title. The person sees what you did as you do it, live, in the same page. Record it too: {\"record\": true} starts a recording (video, and a log of what's done in it by you or the person), {\"record\": false} stops it and answers with its files: the video (MP4), the log (.inputs.jsonl) and a Playwright test of what was done (.spec.ts) to turn into a real one. {\"replay\": \"<.inputs.jsonl path>\"} does a recording's log again in the page.",
             "inputSchema": {"type": "object", "properties": {
                 "stream": {"type": "string", "description": "The stream's id, from show_live's answer."},
-                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"wait_ms\": 500}.", "items": {"type": "object"}},
+                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"wait_ms\": 500}, {\"record\": true}, {\"record\": false}, {\"replay\": \"/path/live-….inputs.jsonl\"}.", "items": {"type": "object"}},
                 "picture": {"type": "boolean", "description": "A picture of it after (true by default)."}
             }, "required": ["stream"]},
             "annotations": {"readOnlyHint": false, "openWorldHint": true},

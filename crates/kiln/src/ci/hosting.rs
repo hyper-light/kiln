@@ -106,6 +106,22 @@ pub fn mirror_trunk(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str) {
     });
 }
 
+/// Makes `name`'s bare repository a copy of the bare repository at `from` (a template kiln
+/// hosts, docs/deploy-api.md §3.1).
+pub async fn create_from(hub: &Hub, name: &str, from: &Path) -> anyhow::Result<PathBuf> {
+    let path = path_of(hub, name).ok_or_else(|| anyhow::anyhow!("`{name}`: a repository is `owner/name`"))?;
+    anyhow::ensure!(!path.join("HEAD").is_file(), "{name} is there already");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (f, p) = (from.to_string_lossy().into_owned(), path.to_string_lossy().into_owned());
+    crate::gitops::run_git(hub, &["clone", "--quiet", "--bare", "--no-local", "--", &f, &p], std::time::Duration::from_secs(1800)).await?;
+    for (k, v) in [("receive.denyNonFastForwards", "false"), ("gc.auto", "0"), ("uploadpack.allowAnySHA1InWant", "true"), ("receive.advertisePushOptions", "true")] {
+        crate::gitops::run_git(hub, &["-C", &p, "config", k, v], crate::gitops::LS_REMOTE_TIMEOUT).await?;
+    }
+    Ok(path)
+}
+
 /// A ref update a push asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
@@ -442,7 +458,8 @@ async fn clear_for_refs(hub: &Hub, path: &str) {
 pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req: Request) -> Result<Response, Fail> {
     let Some(who) = pusher(hub, req.headers()).await else { return Ok(unauthorized()) };
     let read = match &who {
-        Pusher::Caller(c) => c.is_owner() || c.can("diffs.read", &Scope::Repo { repo: repo.name.clone() }),
+        // `git.read`: a reader's token (Argo CD's, docs/deploy-api.md §7), git and nothing else.
+        Pusher::Caller(c) => c.is_owner() || c.can("diffs.read", &Scope::Repo { repo: repo.name.clone() }) || c.can("git.read", &Scope::Repo { repo: repo.name.clone() }),
         Pusher::Job(j) => j.repo == repo.id && j.may("contents", kiln_ci::plan::perms::Level::Read),
     };
     if !read {

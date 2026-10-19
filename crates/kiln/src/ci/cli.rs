@@ -1044,6 +1044,14 @@ enum RepoCmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// What a repository's CI runs on (docs/ci.md W23-R07): `kiln repo provider acme/app` says, and
+    /// what it may; `kiln repo provider acme/app github-actions` chooses (several may run).
+    Provider {
+        /// `owner/name`.
+        name: String,
+        /// `kiln`, `github-actions`, `gitlab-ci`, `bitbucket-pipelines`.
+        providers: Vec<String>,
+    },
 }
 
 /// `owner/name` of a clone URL: `https://host/acme/app.git`, `git@host:acme/app.git`.
@@ -1075,6 +1083,16 @@ pub async fn repo(args: RepoArgs, cfg: &Config) -> Result<()> {
             let name = name.or_else(|| repo_name_of(&url)).ok_or_else(|| anyhow::anyhow!("`{url}`: name it with --name owner/name"))?;
             let v = api.call_for(Method::Post, "/api/repos", Some(json!({ "name": name, "mode": "native", "import": url })), Duration::from_secs(1800)).await?;
             created(&v);
+        }
+        RepoCmd::Provider { name, providers } => {
+            let path = format!("/api/ci/repos/{}/providers", enc(&name));
+            let shown = providers.is_empty();
+            let v = if shown { api.call_api(Method::Get, &path, None).await? } else { api.call_api(Method::Put, &path, Some(json!({ "providers": providers }))).await? };
+            let list = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            println!("{name}: {}", list("providers"));
+            if shown {
+                println!("may have: {}", list("available"));
+            }
         }
     }
     Ok(())

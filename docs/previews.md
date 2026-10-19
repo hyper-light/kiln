@@ -142,6 +142,29 @@ page appears in the conversation, live.
 - **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
   that ended can be started again from the frame.
 
+### Recordings
+
+Record (in a live page's own controls) keeps what it shows and what's done in it, on the agent's
+machine, until its conversation closes. The agent records with `use_live` too: `{"record": true}`,
+then `{"record": false}` answers with the files.
+
+- **Never encoded again.** Its video is what the stream already sent, put into a fragmented MP4 as
+  it comes: the H.264 pictures (as `avc3`, so a new window size mid-way is just its new key frame)
+  and the Opus sound. A fragment ends at a key frame, so a recording cut short plays to there.
+  While it records, the stream goes on whether anyone looks or not; a page that doesn't change
+  costs nothing, and its last picture lasts until it changes.
+- **What was done, beside it** (`.inputs.jsonl`): the page and window it began with, then each of
+  the person's inputs and the agent's actions, where the page went and when its window changed,
+  each at its time.
+- **As a test** (`.spec.ts`): that log as a Playwright test, its window and touch as they were,
+  presses as clicks, taps or drags, keys and text, the wheel, a wait where someone paused, and
+  where it ended as an assertion, to add what the page should show.
+- **Played again**: `use_live`'s `{"replay": "<.inputs.jsonl>"}` does a recording's log again in
+  a live page, in its recorded window, each step after its pause (at most two seconds).
+
+Each recording shows below its live page: Watch plays it there; Test and Log are its test and
+log to keep. A recording of a stream in a person's own profile is theirs alone, as the stream is.
+
 ### Opening a page
 
 A person opens one too, from the agent's Tools tab (Live pages): pick what to open and a profile,
@@ -228,12 +251,16 @@ Connections run on the runner link's own lane (`LANE_PORTS`, runners with `CAP_P
   minutes). `GET` lists the person's openings of the session (without their links), and
   `DELETE /api/harness/sessions/:id/opened/:opened` ends one.
 - `GET /api/harness/sessions/:id/streams`: the session's streams (not another person's own).
+- `GET /api/harness/sessions/:id/recordings`: the recordings of its streams, and
+  `GET /api/harness/sessions/:id/recordings/:recording/:what` (`video`, `inputs`, `test`) a
+  recording's file, from its machine (the video in ranges).
 - `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer's socket. It's sent binary chunks
   (`crate::browser::stream::frame`: kind `v`, `a` or `c`, flags, timestamp in µs, part, parts, the
   bytes) and JSON events (`opened`, `navigated`, `loaded`, `focus`, `fields`, `selected`,
   `copied`, `dialog`, `agent`, `closed`, `error`). It sends `{"input": [...]}` (what the person
   does) and `{"control": {...}}` (`resize`, `pause`, `keyframe`, `go`, `back`, `forward`,
-  `reload`, `copy`).
+  `reload`, `copy`, `record`). Its events include `recording` and `recorded` (a recording's
+  files, length and size, and its `id` here).
 - `DELETE /api/harness/sessions/:id/streams/:stream`: close it (its tab goes).
 
 An agent's MCP server opens one through its runner, for its own session only (`{"op": "stream",

@@ -204,3 +204,38 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Recording (live.tsx): its time in the head, and below the frame each recording, to watch or keep. */
+.lv-recording {
+  color: #e3a7a0;
+}
+.lv-recs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.lv-rec {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+.lv-rec-what {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lv-rec-video {
+  display: block;
+  width: 100%;
+  max-height: 60dvh;
+  margin-top: 6px;
+  border: 1px solid #1d1f23;
+  border-radius: 8px;
+  background: #0c0d10;
+}

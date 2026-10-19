@@ -164,6 +164,12 @@ pub fn apply(i: &Integration, dir: &Path, session: &str, seen: &dyn Fn(&Path) ->
                 set("KILN_REGISTRY_PASSWORD", t);
             }
         }
+        // A package registry's credentials (docs/ci.md W12-R04): where its tools read them.
+        "package" => {
+            for (k, v) in package_env(i, dir, seen)? {
+                set(&k, &v);
+            }
+        }
         "slack" => {
             if let Some(t) = i.token.as_deref() {
                 if t.starts_with("xoxb-") || t.starts_with("xoxp-") {
@@ -197,6 +203,78 @@ pub fn apply(i: &Integration, dir: &Path, session: &str, seen: &dyn Fn(&Path) ->
     }
     a.env = env.into_iter().collect();
     Ok(a)
+}
+
+/// A package registry's token where its ecosystem's tools read one: npm's userconfig (and
+/// `NODE_AUTH_TOKEN`), twine's and uv's publishing variables and pip's extra index, Cargo's
+/// registry token, Go's netrc and `GOPRIVATE`, Maven's settings, NuGet's source credentials,
+/// RubyGems' and Bundler's, Composer's `COMPOSER_AUTH`.
+fn package_env(i: &Integration, dir: &Path, seen: &dyn Fn(&Path) -> String) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(t) = i.token.as_deref() else { return Ok(Vec::new()) };
+    let eco = cfg(i, "ecosystem").ok_or_else(|| anyhow::anyhow!("`{}` has no ecosystem", i.name))?;
+    let registry = cfg(i, "registry");
+    let user = cfg(i, "username").unwrap_or("kiln");
+    let upper = safe(&i.name).to_ascii_uppercase().replace('-', "_");
+    let mut env = Vec::new();
+    let host_of = |u: &str| u.split_once("://").map_or(u, |(_, r)| r).split('/').next().unwrap_or(u).to_owned();
+    match eco {
+        "npm" => {
+            let reg = registry.unwrap_or("https://registry.npmjs.org").trim_end_matches('/');
+            let rest = reg.split_once("://").map_or(reg, |(_, r)| r);
+            let rc = dir.join(format!("{}.npmrc", safe(&i.name)));
+            let scope_line = registry.map(|_| format!("registry={reg}/\n")).unwrap_or_default();
+            write_private(&rc, format!("{scope_line}//{rest}/:_authToken={t}\n").as_bytes())?;
+            env.push(("NPM_CONFIG_USERCONFIG".to_owned(), seen(&rc)));
+            env.push(("NODE_AUTH_TOKEN".to_owned(), t.to_owned()));
+        }
+        "pypi" => {
+            env.push(("TWINE_USERNAME".to_owned(), if registry.is_some() { user.to_owned() } else { "__token__".to_owned() }));
+            env.push(("TWINE_PASSWORD".to_owned(), t.to_owned()));
+            env.push(("UV_PUBLISH_TOKEN".to_owned(), t.to_owned()));
+            if let Some(r) = registry {
+                env.push(("TWINE_REPOSITORY_URL".to_owned(), r.to_owned()));
+                let (scheme, rest) = r.split_once("://").unwrap_or(("https", r));
+                env.push(("PIP_EXTRA_INDEX_URL".to_owned(), format!("{scheme}://{user}:{t}@{rest}")));
+            }
+        }
+        "crates" => match registry {
+            Some(r) => {
+                env.push((format!("CARGO_REGISTRIES_{upper}_INDEX"), if r.starts_with("sparse+") { r.to_owned() } else { format!("sparse+{}/", r.trim_end_matches('/')) }));
+                env.push((format!("CARGO_REGISTRIES_{upper}_TOKEN"), t.to_owned()));
+            }
+            None => env.push(("CARGO_REGISTRY_TOKEN".to_owned(), t.to_owned())),
+        },
+        "go" => {
+            let host = host_of(registry.ok_or_else(|| anyhow::anyhow!("`{}`: a Go registry needs its URL (`registry`)", i.name))?);
+            let rc = dir.join(format!("{}.netrc", safe(&i.name)));
+            write_private(&rc, format!("machine {} login {user} password {t}\n", host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h)).as_bytes())?;
+            env.push(("NETRC".to_owned(), seen(&rc)));
+            env.push(("GOPRIVATE".to_owned(), host.clone()));
+            env.push(("GONOSUMDB".to_owned(), host));
+        }
+        "maven" => {
+            let f = dir.join(format!("{}-settings.xml", safe(&i.name)));
+            write_private(&f, format!("<settings><servers><server><id>{}</id><username>{user}</username><password>{t}</password></server></servers></settings>\n", i.name).as_bytes())?;
+            env.push(("MAVEN_ARGS".to_owned(), format!("-s {}", seen(&f))));
+        }
+        "nuget" => {
+            // NuGet's credentials for a source named as the integration is.
+            env.push((format!("NuGetPackageSourceCredentials_{}", i.name), format!("Username={user};Password={t}")));
+            env.push(("NUGET_API_KEY".to_owned(), t.to_owned()));
+        }
+        "rubygems" => {
+            env.push(("GEM_HOST_API_KEY".to_owned(), t.to_owned()));
+            if let Some(r) = registry {
+                env.push((format!("BUNDLE_{}", host_of(r).to_ascii_uppercase().replace(['.', '-'], "__").replace(':', "___")), format!("{user}:{t}")));
+            }
+        }
+        "composer" => {
+            let host = host_of(registry.unwrap_or("https://repo.packagist.com"));
+            env.push(("COMPOSER_AUTH".to_owned(), json!({ "http-basic": { host: { "username": user, "password": t } } }).to_string()));
+        }
+        other => anyhow::bail!("`{}`: ecosystem `{other}`: npm, pypi, crates, go, maven, nuget, rubygems or composer", i.name),
+    }
+    Ok(env)
 }
 
 /// Writes `bytes` to `path` where only this user reads it, whole or not at all.
@@ -296,6 +374,16 @@ pub fn place_binary(work: &Path) -> Option<PathBuf> {
             std::fs::copy(&exe, &tmp).ok()?;
         }
         std::fs::rename(&tmp, &dst).ok()?;
+    }
+    // Docker's credential helper is the same binary by another name (W12-R03).
+    let helper = dir.join(if cfg!(windows) { "docker-credential-kiln.exe" } else { "docker-credential-kiln" });
+    let same = matches!((std::fs::metadata(&dst), std::fs::metadata(&helper)), (Ok(x), Ok(y)) if x.len() == y.len() && x.modified().ok() <= y.modified().ok());
+    if !same {
+        let tmp = dir.join(format!(".helper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::hard_link(&dst, &tmp).is_ok() || std::fs::copy(&dst, &tmp).is_ok() {
+            let _ = std::fs::rename(&tmp, &helper);
+        }
     }
     Some(dir)
 }
@@ -423,6 +511,30 @@ mod tests {
 
     fn integration(kind: &str, config: Value, token: Option<&str>) -> Integration {
         Integration { name: "prod one".into(), kind: kind.into(), mode: if token.is_some() { "token".into() } else { "oidc".into() }, config, token: token.map(str::to_owned), job: true }
+    }
+
+    #[test]
+    fn w12_r04_package_credentials() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plain = |p: &Path| p.to_string_lossy().into_owned();
+        let pkg = |eco: &str, registry: Option<&str>| Integration { name: "corp".into(), kind: "package".into(), mode: "token".into(), config: json!({ "ecosystem": eco, "registry": registry }), token: Some("s3cret".into()), job: true };
+        let npm = apply(&pkg("npm", Some("https://npm.corp/repo")), dir.path(), "s", &plain)?;
+        let rc = std::fs::read_to_string(npm.env.get("NPM_CONFIG_USERCONFIG").map(String::as_str).unwrap_or_default())?;
+        assert_eq!(rc, "registry=https://npm.corp/repo/\n//npm.corp/repo/:_authToken=s3cret\n");
+        assert_eq!(npm.env.get("NODE_AUTH_TOKEN").map(String::as_str), Some("s3cret"));
+        let py = apply(&pkg("pypi", Some("https://py.corp/simple/")), dir.path(), "s", &plain)?;
+        assert_eq!(py.env.get("PIP_EXTRA_INDEX_URL").map(String::as_str), Some("https://kiln:s3cret@py.corp/simple/"));
+        assert_eq!(apply(&pkg("crates", None), dir.path(), "s", &plain)?.env.get("CARGO_REGISTRY_TOKEN").map(String::as_str), Some("s3cret"));
+        let own = apply(&pkg("crates", Some("https://crates.corp/index")), dir.path(), "s", &plain)?;
+        assert_eq!(own.env.get("CARGO_REGISTRIES_CORP_INDEX").map(String::as_str), Some("sparse+https://crates.corp/index/"));
+        let go = apply(&pkg("go", Some("https://go.corp")), dir.path(), "s", &plain)?;
+        assert_eq!((go.env.get("GOPRIVATE").map(String::as_str), std::fs::read_to_string(go.env.get("NETRC").map(String::as_str).unwrap_or_default())?.as_str()), (Some("go.corp"), "machine go.corp login kiln password s3cret\n"));
+        assert_eq!(apply(&pkg("nuget", None), dir.path(), "s", &plain)?.env.get("NuGetPackageSourceCredentials_corp").map(String::as_str), Some("Username=kiln;Password=s3cret"));
+        assert_eq!(apply(&pkg("rubygems", Some("https://gems.corp")), dir.path(), "s", &plain)?.env.get("BUNDLE_GEMS__CORP").map(String::as_str), Some("kiln:s3cret"));
+        assert!(apply(&pkg("composer", None), dir.path(), "s", &plain)?.env.get("COMPOSER_AUTH").is_some_and(|a| a.contains("repo.packagist.com")));
+        assert!(apply(&pkg("conan", None), dir.path(), "s", &plain).is_err());
+        assert_eq!(npm.masks, vec!["s3cret".to_owned()]);
+        Ok(())
     }
 
     #[test]

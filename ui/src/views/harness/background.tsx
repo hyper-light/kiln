@@ -33,6 +33,14 @@ interface Tail {
 const NO_TAIL: Tail = { text: "", note: null };
 /** Each task's output read so far (opened again, it's there at once and goes on from where it was). */
 const tails = new Map<string, Tail>();
+const readers = new Map<string, number>();
+
+function pruneTails() {
+  let idle = 0;
+  for (const key of [...tails.keys()].reverse()) {
+    if (!readers.has(key) && ++idle > 32) tails.delete(key);
+  }
+}
 
 /** A task's output: read while shown, every moment while it runs (subscribed to as a store is). */
 function useTail(agent: string, task: string, live: boolean): Tail {
@@ -41,7 +49,12 @@ function useTail(agent: string, task: string, live: boolean): Tail {
     (changed: () => void) => {
       let stop = false;
       let timer = 0;
+      readers.set(key, (readers.get(key) ?? 0) + 1);
       const poll = async () => {
+        if (live && document.hidden) {
+          timer = window.setTimeout(poll, 1500);
+          return;
+        }
         const was = tails.get(key) ?? NO_TAIL;
         try {
           const r = await harnessApi.taskOutput(agent, task, was.offset);
@@ -58,13 +71,18 @@ function useTail(agent: string, task: string, live: boolean): Tail {
           if (stop) return;
           tails.set(key, { ...(tails.get(key) ?? NO_TAIL), note: e instanceof Error ? e.message : String(e) });
           changed();
+        } finally {
+          if (!stop && live) timer = window.setTimeout(poll, 1500);
         }
-        if (!stop && live) timer = window.setTimeout(poll, 1500);
       };
       void poll();
       return () => {
         stop = true;
         window.clearTimeout(timer);
+        const count = (readers.get(key) ?? 1) - 1;
+        if (count) readers.set(key, count);
+        else readers.delete(key);
+        pruneTails();
       };
     },
     [key, agent, task, live],

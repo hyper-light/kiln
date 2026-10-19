@@ -2132,7 +2132,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
                         let rt = &mut a.runtime;
-                        for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url] {
+                        for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url, &mut rt.registry_url] {
+                            if u.starts_with('/') {
+                                *u = format!("{base}{u}");
+                            }
+                        }
+                        for (_, u) in &mut rt.proxies {
                             if u.starts_with('/') {
                                 *u = format!("{base}{u}");
                             }

@@ -153,6 +153,14 @@ pub struct Stream {
     personal: bool,
     /// Where what it says goes (its viewers, through the server).
     out: async_channel::Sender<Out>,
+    /// kiln's state here (its recordings go under it).
+    dir: PathBuf,
+    /// Its window, as last laid out (what a recording starts with).
+    viewport: Mutex<Value>,
+    /// A recording under way (`super::record`), and whether its viewers had let it pause (it
+    /// doesn't while it records: what an agent does with nobody looking is recorded too).
+    recording: Mutex<Option<Arc<super::record::Recording>>>,
+    paused: std::sync::atomic::AtomicBool,
 }
 
 /// This machine's streams, by id.
@@ -201,10 +209,13 @@ impl Streams {
         page.call("Page.enable", json!({})).await?;
         // The tab, as the extension knows it.
         let mut tab = Value::Null;
-        // A moment for the extension to see it (longer on a busy machine).
+        // A moment for the extension to see it (longer on a busy machine, and for a browser just
+        // started, whose extension's worker may not have run its script yet).
         for _ in 0..100 {
-            tab = super::evaluate(&s.browser.cdp, &s.worker, &format!("kiln.tab({})", json!(mark))).await?;
-            if tab.is_number() {
+            if let Ok(t) = super::evaluate(&s.browser.cdp, &s.worker, &format!("kiln.tab({})", json!(mark))).await
+                && t.is_number()
+            {
+                tab = t;
                 break;
             }
             crate::rt::sleep(Duration::from_millis(50)).await;
@@ -227,13 +238,16 @@ impl Streams {
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), personal: spec.profile.starts_with("personal:"), out: out.clone() });
+        let stream = Arc::new(Stream { id: id.to_owned(), session: spec.session.clone().unwrap_or_default(), streamer: s.clone(), page, touches: Mutex::default(), inputs, mobile: std::sync::atomic::AtomicBool::new(spec.mobile), personal: spec.profile.starts_with("personal:"), out: out.clone(), dir: dir.to_path_buf(), viewport: Mutex::new(json!({"width": spec.width, "height": spec.height, "scale": scale, "mobile": spec.mobile})), recording: Mutex::default(), paused: std::sync::atomic::AtomicBool::new(false) });
         crate::rt::spawn(watch(stream.clone(), out.clone()));
         // What viewers do, applied in the order they did it.
         let applying = Arc::downgrade(&stream);
         crate::rt::spawn(async move {
             while let Ok(events) = queued.recv().await {
                 let Some(s) = applying.upgrade() else { return };
+                for e in &events {
+                    s.log(json!({"by": "person", "input": e}));
+                }
                 if let Err(e) = s.input(events).await {
                     tracing::debug!(stream = %s.id, error = %format!("{e:#}"), "a viewer's input didn't reach the page");
                 }
@@ -264,7 +278,13 @@ impl Streams {
                     continue;
                 }
                 let payload = e.params.get("payload").and_then(Value::as_str).unwrap_or("");
-                let Some((stream, msgs)) = chunk(payload) else { continue };
+                let Some((stream, kind, flags, ts, bytes)) = parse(payload) else { continue };
+                // A recording of it takes what it sends as it's sent (`super::record`).
+                let recording = streams().open.lock().get(&stream).and_then(|s| s.recording.lock().clone());
+                if let Some(r) = recording {
+                    r.chunk(kind, flags, ts, &bytes);
+                }
+                let Some(msgs) = chunk(&stream, kind, flags, ts, &bytes) else { continue };
                 let tx = outs.lock().get(&stream).cloned();
                 if let Some(tx) = tx {
                     for m in msgs {
@@ -286,6 +306,12 @@ impl Streams {
     /// while later (unless one opens meanwhile); a clean profile's stops now, and its profile goes.
     pub async fn close(&self, id: &str) {
         let Some(s) = self.open.lock().remove(id) else { return };
+        // A recording of it is finished first (and its viewers told where it is).
+        if s.recording.lock().is_some()
+            && let Err(e) = s.record_stop().await
+        {
+            tracing::warn!(stream = %id, error = %format!("{e:#}"), "a recording didn't finish as its stream closed");
+        }
         let cdp = s.streamer.browser.cdp.clone();
         let off = s.streamer.offscreen.lock().await.clone().unwrap_or_default();
         let _ = super::evaluate(&cdp, &off, &format!("kiln.stop({})", json!(id))).await;
@@ -316,8 +342,8 @@ impl Streams {
         }
     }
 
-    /// A session's streams on this machine close (it closed), and its conversation's profile goes
-    /// with them: its browser stops, its cookies and storage are removed.
+    /// A session's streams on this machine close (it closed), and its conversation's profile and
+    /// recordings go with them: its browser stops, its cookies, storage and recordings are removed.
     pub async fn close_session(&self, dir: &Path, session: &str) {
         let ids: Vec<String> = self.open.lock().values().filter(|s| s.session == session).map(|s| s.id.clone()).collect();
         for id in ids {
@@ -331,6 +357,12 @@ impl Streams {
         let kept = dir.join("browser").join("streams").join(profile_key(&profile));
         if kept.exists() {
             let _ = crate::rt::blocking(move || std::fs::remove_dir_all(kept)).await;
+        }
+        // Its recordings were kept with it.
+        let key: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
+        let recordings = dir.join("browser").join("recordings").join(key);
+        if !session.is_empty() && recordings.exists() {
+            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(recordings)).await;
         }
     }
 }
@@ -412,47 +444,30 @@ pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
     let s = streams().get(&a.stream).filter(|s| s.session == a.session).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
     anyhow::ensure!(!s.personal, "that page is open in its person's own profile (their sign-ins): it's theirs to use, not yours. Show it yourself with show_live to use it");
     let mut did = Vec::new();
-    let point = |v: &Value| -> Option<(f64, f64)> {
-        let p = v.as_array()?;
-        Some((p.first()?.as_f64()?, p.get(1)?.as_f64()?))
-    };
+    let mut recorded = None;
     for act in a.actions.iter().take(50) {
         let Some((verb, arg)) = act.as_object().and_then(|o| o.iter().next()) else { continue };
         match verb.as_str() {
-            "click" | "tap" => {
-                let (x, y) = point(arg).ok_or_else(|| anyhow::anyhow!("{verb} takes [x, y]"))?;
-                let pt = if verb == "tap" { "touch" } else { "mouse" };
-                let p = |k: &str, buttons: i64| Input::Pointer { k: k.to_owned(), x, y, button: 0, buttons, pt: pt.to_owned(), id: 1, mods: 0, clicks: 1 };
-                s.input(vec![p("down", 1), p("up", 0)]).await?;
-                did.push(json!({verb: [x, y]}));
+            // Its recording: begun, or ended (its files in the answer).
+            "record" if arg.as_bool() == Some(false) => {
+                recorded = Some(s.record_stop().await?);
+                did.push(json!({"record": false}));
             }
-            "type" => {
-                let text = arg.as_str().unwrap_or("").to_owned();
-                s.input(vec![Input::Text { text: text.clone() }]).await?;
-                did.push(json!({"type": text}));
+            "record" => {
+                s.record_start().await?;
+                did.push(json!({"record": true}));
             }
-            "key" => {
-                let key = arg.as_str().unwrap_or("").to_owned();
-                let code = if key.chars().count() == 1 { key.chars().next().map(|c| if c.is_ascii_alphabetic() { format!("Key{}", c.to_ascii_uppercase()) } else if c.is_ascii_digit() { format!("Digit{c}") } else { String::new() }).unwrap_or_default() } else { key.clone() };
-                let text = if key.chars().count() == 1 { key.clone() } else if key == "Enter" { "\r".to_owned() } else { String::new() };
-                let k = |k: &str| Input::Key { k: k.to_owned(), key: key.clone(), code: code.clone(), text: if k == "down" { text.clone() } else { String::new() }, mods: 0, rep: false, loc: 0 };
-                s.input(vec![k("down"), k("up")]).await?;
-                did.push(json!({"key": key}));
+            "replay" => {
+                let path = arg.as_str().ok_or_else(|| anyhow::anyhow!("replay takes a recording's .inputs.jsonl path"))?;
+                let n = s.replay(path).await?;
+                did.push(json!({"replay": path, "steps": n}));
             }
-            "scroll" => {
-                let (dx, dy) = point(arg).ok_or_else(|| anyhow::anyhow!("scroll takes [dx, dy]"))?;
-                let size = s.page.eval("[innerWidth / 2, innerHeight / 2]").await.unwrap_or_default();
-                let (x, y) = point(&size).unwrap_or((100.0, 100.0));
-                s.input(vec![Input::Wheel { x, y, dx, dy, mods: 0 }]).await?;
-                did.push(json!({"scroll": [dx, dy]}));
+            _ => {
+                if let Some(d) = act_one(&s, verb, arg).await? {
+                    s.log(json!({"by": "agent", "act": d}));
+                    did.push(d);
+                }
             }
-            "go" | "back" | "forward" | "reload" => {
-                s.control(&json!({verb: arg})).await?;
-                did.push(json!({verb: arg}));
-                crate::rt::sleep(Duration::from_millis(400)).await;
-            }
-            "wait_ms" => crate::rt::sleep(Duration::from_millis(arg.as_u64().unwrap_or(0).min(10_000))).await,
-            other => anyhow::bail!("use_live doesn't do {other:?}"),
         }
     }
     // Its viewers see who's at it.
@@ -472,25 +487,77 @@ pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
     } else {
         None
     };
-    Ok(json!({"stream": s.id, "url": url, "title": title, "did": did, "picture_path": picture}))
+    let mut answer = json!({"stream": s.id, "url": url, "title": title, "did": did, "picture_path": picture});
+    if let (Some(o), Some(r)) = (answer.as_object_mut(), recorded) {
+        o.insert("recorded".into(), r);
+    }
+    Ok(answer)
 }
 
-/// A chunk from the extension (`<stream> <kind> <flags> <timestamp> <base64>`), as messages to the
-/// server: in parts when it's bigger than one may be.
-fn chunk(payload: &str) -> Option<(String, Vec<Out>)> {
+/// One of the agent's actions in stream `s`: what it did, to say (none for a wait).
+async fn act_one(s: &Stream, verb: &str, arg: &Value) -> anyhow::Result<Option<Value>> {
+    let point = |v: &Value| -> Option<(f64, f64)> {
+        let p = v.as_array()?;
+        Some((p.first()?.as_f64()?, p.get(1)?.as_f64()?))
+    };
+    Ok(match verb {
+        "click" | "tap" => {
+            let (x, y) = point(arg).ok_or_else(|| anyhow::anyhow!("{verb} takes [x, y]"))?;
+            let pt = if verb == "tap" { "touch" } else { "mouse" };
+            let p = |k: &str, buttons: i64| Input::Pointer { k: k.to_owned(), x, y, button: 0, buttons, pt: pt.to_owned(), id: 1, mods: 0, clicks: 1 };
+            s.input(vec![p("down", 1), p("up", 0)]).await?;
+            Some(json!({verb: [x, y]}))
+        }
+        "type" => {
+            let text = arg.as_str().unwrap_or("").to_owned();
+            s.input(vec![Input::Text { text: text.clone() }]).await?;
+            Some(json!({"type": text}))
+        }
+        "key" => {
+            let key = arg.as_str().unwrap_or("").to_owned();
+            let code = if key.chars().count() == 1 { key.chars().next().map(|c| if c.is_ascii_alphabetic() { format!("Key{}", c.to_ascii_uppercase()) } else if c.is_ascii_digit() { format!("Digit{c}") } else { String::new() }).unwrap_or_default() } else { key.clone() };
+            let text = if key.chars().count() == 1 { key.clone() } else if key == "Enter" { "\r".to_owned() } else { String::new() };
+            let k = |k: &str| Input::Key { k: k.to_owned(), key: key.clone(), code: code.clone(), text: if k == "down" { text.clone() } else { String::new() }, mods: 0, rep: false, loc: 0 };
+            s.input(vec![k("down"), k("up")]).await?;
+            Some(json!({"key": key}))
+        }
+        "scroll" => {
+            let (dx, dy) = point(arg).ok_or_else(|| anyhow::anyhow!("scroll takes [dx, dy]"))?;
+            let size = s.page.eval("[innerWidth / 2, innerHeight / 2]").await.unwrap_or_default();
+            let (x, y) = point(&size).unwrap_or((100.0, 100.0));
+            s.input(vec![Input::Wheel { x, y, dx, dy, mods: 0 }]).await?;
+            Some(json!({"scroll": [dx, dy]}))
+        }
+        "go" | "back" | "forward" | "reload" => {
+            s.control(&json!({verb: arg})).await?;
+            crate::rt::sleep(Duration::from_millis(400)).await;
+            Some(json!({verb: arg}))
+        }
+        "wait_ms" => {
+            crate::rt::sleep(Duration::from_millis(arg.as_u64().unwrap_or(0).min(10_000))).await;
+            None
+        }
+        other => anyhow::bail!("use_live doesn't do {other:?}"),
+    })
+}
+
+/// A chunk from the extension (`<stream> <kind> <flags> <timestamp> <base64>`): its stream, kind,
+/// flags, time and bytes.
+fn parse(payload: &str) -> Option<(String, u8, u8, i64, Vec<u8>)> {
     let mut it = payload.splitn(5, ' ');
     let (stream, kind, flags, ts, data) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next().unwrap_or(""));
     let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
-    let ts: i64 = ts.parse().unwrap_or(0);
-    let kind = *kind.as_bytes().first()?;
-    let flags = *flags.as_bytes().first().unwrap_or(&b'-');
+    Some((stream.to_owned(), *kind.as_bytes().first()?, *flags.as_bytes().first().unwrap_or(&b'-'), ts.parse().unwrap_or(0), bytes))
+}
+
+/// A chunk as messages to the server: in parts when it's bigger than one may be.
+fn chunk(stream: &str, kind: u8, flags: u8, ts: i64, bytes: &[u8]) -> Option<Vec<Out>> {
     if kind == b'e' {
-        return Some((stream.to_owned(), vec![Out::Event { stream: stream.to_owned(), json: String::from_utf8_lossy(&bytes).into_owned() }]));
+        return Some(vec![Out::Event { stream: stream.to_owned(), json: String::from_utf8_lossy(bytes).into_owned() }]);
     }
     let parts: Vec<&[u8]> = if bytes.is_empty() { vec![&[][..]] } else { bytes.chunks(PART).collect() };
     let n = u8::try_from(parts.len()).ok()?;
-    let out = parts.iter().enumerate().filter_map(|(i, p)| Some(Out::Frame { stream: stream.to_owned(), data: frame(kind, flags, ts, u8::try_from(i).ok()?, n, p) })).collect();
-    Some((stream.to_owned(), out))
+    Some(parts.iter().enumerate().filter_map(|(i, p)| Some(Out::Frame { stream: stream.to_owned(), data: frame(kind, flags, ts, u8::try_from(i).ok()?, n, p) })).collect())
 }
 
 /// Tells kiln what the page's focused field is when one takes text (so the viewer's own field is
@@ -544,6 +611,7 @@ async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
         let ev = match e.method.as_str() {
             "Page.frameNavigated" if e.params.get("frame").and_then(|f| f.get("parentId")).is_none() => {
                 let url = e.params.get("frame").and_then(|f| f.get("url")).and_then(Value::as_str).unwrap_or("");
+                s.log(json!({"navigated": url}));
                 Some(json!({"navigated": {"url": url}}))
             }
             "Page.loadEventFired" => {
@@ -574,7 +642,7 @@ async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
 }
 
 /// What a viewer does, as the server sends it (`ServerMsg::StreamInput`): each event, in order.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Input {
     /// A pointer: `k` down, move, up or cancel; at `x`, `y` (CSS pixels in the page); its
@@ -739,6 +807,82 @@ fn punctuation(c: char) -> Option<i64> {
 }
 
 impl Stream {
+    /// Into its recording's log, when it's recording.
+    fn log(&self, what: Value) {
+        if let Some(r) = self.recording.lock().as_ref() {
+            r.log(what);
+        }
+    }
+
+    /// Record it from now (`super::record`): the stream goes on while it does, from a key frame.
+    pub async fn record_start(&self) -> anyhow::Result<Value> {
+        anyhow::ensure!(self.recording.lock().is_none(), "it's recording already");
+        let url = self.page.eval("location.href").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+        let session: String = self.session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
+        let dir = self.dir.join("browser").join("recordings").join(if session.is_empty() { "streams".to_owned() } else { session });
+        let name = format!("live-{}-{}", crate::util::now_ms(), self.id.chars().take(6).collect::<String>());
+        let viewport = self.viewport.lock().clone();
+        let r = crate::rt::blocking(move || super::record::Recording::start(&dir, &name, &url, viewport)).await??;
+        let files = r.files.clone();
+        *self.recording.lock() = Some(Arc::new(r));
+        let cdp = &self.streamer.browser.cdp;
+        let off = self.streamer.offscreen.lock().await.clone().unwrap_or_default();
+        let id = json!(self.id);
+        super::evaluate(cdp, &off, &format!("kiln.pause({id}, false)")).await?;
+        super::evaluate(cdp, &off, &format!("kiln.keyframe({id})")).await?;
+        let ev = json!({"recording": {"on": true, "at": crate::util::now_ms(), "video": files.video}});
+        let _ = self.out.send(Out::Event { stream: self.id.clone(), json: ev.to_string() }).await;
+        Ok(ev)
+    }
+
+    /// Stop recording it: its files, finished (and its viewers told where they are).
+    pub async fn record_stop(&self) -> anyhow::Result<Value> {
+        let r = self.recording.lock().take().ok_or_else(|| anyhow::anyhow!("it isn't recording"))?;
+        let title = self.page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+        let done = crate::rt::blocking(move || r.stop(&title)).await??;
+        // Nobody looking: it pauses again.
+        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            let off = self.streamer.offscreen.lock().await.clone().unwrap_or_default();
+            let _ = super::evaluate(&self.streamer.browser.cdp, &off, &format!("kiln.pause({}, true)", json!(self.id))).await;
+        }
+        let recorded = json!({"recorded": {"session": self.session, "at": crate::util::now_ms(), "video": done.files.video, "inputs": done.files.inputs, "test": done.files.test, "seconds": done.seconds, "bytes": done.bytes, "pictures": done.pictures}});
+        for ev in [json!({"recording": {"on": false}}), recorded.clone()] {
+            let _ = self.out.send(Out::Event { stream: self.id.clone(), json: ev.to_string() }).await;
+        }
+        Ok(recorded.get("recorded").cloned().unwrap_or_default())
+    }
+
+    /// Do again what a recording's log (`path`) did, as it was done: its page, its window, then
+    /// each input and action after its pause (`super::record::replay_steps`).
+    async fn replay(&self, path: &str) -> anyhow::Result<usize> {
+        let p = PathBuf::from(path);
+        let log = crate::rt::blocking(move || super::record::read_log(&p)).await??;
+        let (url, viewport, steps) = super::record::replay_steps(&log);
+        if let Some(v) = viewport {
+            let n = |k: &str| v.get(k).and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok());
+            if let (Some(w), Some(h)) = (n("width"), n("height")) {
+                let scale = v.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+                let mobile = v.get("mobile").and_then(Value::as_bool).unwrap_or(false);
+                self.page.viewport(w, h, scale, mobile).await?;
+                self.mobile.store(mobile, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(u) = url {
+            self.page.call("Page.navigate", json!({"url": u})).await?;
+            crate::rt::sleep(Duration::from_millis(500)).await;
+        }
+        let n = steps.len();
+        for (pause, step) in steps {
+            crate::rt::sleep(pause).await;
+            if let Some(i) = step.get("input").cloned().and_then(|i| serde_json::from_value::<Input>(i).ok()) {
+                self.input(vec![i]).await?;
+            } else if let Some((verb, arg)) = step.get("act").and_then(Value::as_object).and_then(|o| o.iter().next()) {
+                act_one(self, verb, arg).await?;
+            }
+        }
+        Ok(n)
+    }
+
     /// What a viewer did, to the tab.
     pub async fn input(&self, events: Vec<Input>) -> anyhow::Result<()> {
         for e in events {
@@ -833,6 +977,9 @@ impl Stream {
             let mobile = r.get("mobile").and_then(Value::as_bool).unwrap_or(false);
             self.page.viewport(w, h, scale, mobile).await?;
             self.mobile.store(mobile, std::sync::atomic::Ordering::Relaxed);
+            let vp = json!({"width": w, "height": h, "scale": scale, "mobile": mobile});
+            *self.viewport.lock() = vp.clone();
+            self.log(json!({"viewport": vp}));
             // A field being typed in stays in sight as the window shrinks (a phone's keyboard came up).
             let _ = self.page.eval("document.activeElement && document.activeElement !== document.body && document.activeElement.scrollIntoView({ block: 'nearest' })").await;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -840,7 +987,20 @@ impl Stream {
             super::evaluate(cdp, &off, &format!("kiln.resize({id}, {pw}, {ph})")).await?;
         }
         if let Some(p) = c.get("pause").and_then(Value::as_bool) {
-            super::evaluate(cdp, &off, &format!("kiln.pause({id}, {p})")).await?;
+            self.paused.store(p, std::sync::atomic::Ordering::Relaxed);
+            // While it records it goes on, looked at or not.
+            if !p || self.recording.lock().is_none() {
+                super::evaluate(cdp, &off, &format!("kiln.pause({id}, {p})")).await?;
+            }
+        }
+        match c.get("record").and_then(Value::as_bool) {
+            Some(true) => {
+                self.record_start().await?;
+            }
+            Some(false) => {
+                self.record_stop().await?;
+            }
+            None => {}
         }
         if c.get("keyframe").and_then(Value::as_bool) == Some(true) {
             super::evaluate(cdp, &off, &format!("kiln.keyframe({id})")).await?;
@@ -886,8 +1046,9 @@ mod tests {
     #[test]
     fn a_chunk_bigger_than_a_message_goes_in_parts() -> anyhow::Result<()> {
         let big = base64::engine::general_purpose::STANDARD.encode(vec![7u8; PART * 2 + 10]);
-        let (stream, out) = chunk(&format!("s1 v k 1234 {big}")).unwrap_or_default();
-        assert_eq!(stream, "s1");
+        let (stream, kind, flags, ts, bytes) = parse(&format!("s1 v k 1234 {big}")).ok_or_else(|| anyhow::anyhow!("not a chunk"))?;
+        assert_eq!((stream.as_str(), kind, flags, ts, bytes.len()), ("s1", b'v', b'k', 1234, PART * 2 + 10));
+        let out = chunk(&stream, kind, flags, ts, &bytes).unwrap_or_default();
         assert_eq!(out.len(), 3);
         let last = match out.get(2) {
             Some(Out::Frame { data, .. }) => data.clone(),

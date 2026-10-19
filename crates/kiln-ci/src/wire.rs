@@ -177,6 +177,13 @@ pub struct Runtime {
     pub github_token: String,
     /// `ACTIONS_CACHE_MODE`: `read`, `write`, `write-only` or `none` (W08-R14).
     pub cache_mode: Option<String>,
+    /// kiln's own registry (W12-R01): the server's origin, as the runner reaches it.
+    pub registry_url: String,
+    /// kiln's package proxies the leg's tools are pointed at (W12-R04): `(ecosystem, url)`.
+    pub proxies: Vec<(String, String)>,
+    /// The registries kiln mirrors (W12-R02): `(upstream, prefix)`; the runner pulls their images
+    /// through kiln.
+    pub mirrors: Vec<(String, String)>,
 }
 
 /// A remote action, resolved (W07-R02).
@@ -363,6 +370,16 @@ pub enum JobEventV2 {
         provenance: bool,
         #[serde(default)]
         sbom: bool,
+    },
+    /// W13-R11: an image a `kiln/build-image@v1` step built and pushed to kiln's registry.
+    ImageBuilt {
+        idx: u32,
+        name: String,
+        /// Where it is (`<registry>/<repository>:<tag>`), and its digest.
+        reference: String,
+        digest: String,
+        #[serde(default)]
+        platforms: Vec<String>,
     },
 }
 
