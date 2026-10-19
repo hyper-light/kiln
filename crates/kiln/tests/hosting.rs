@@ -1715,3 +1715,89 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     assert!(theirs.1.contains("another owner's repository"), "{}", theirs.1);
     Ok(())
 }
+
+/// W07-R10's `kiln/upload@v1` and `kiln/download@v1`: one job's files zipped and uploaded by the
+/// runner itself (their common directory the zip's root, hidden files left out), the next job's
+/// download of them, and the artifact in the run with its digest.
+#[test]
+fn w07_r10_kiln_upload_and_download() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/art", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "art\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/art.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/art.yaml"),
+        r#"on: push
+jobs:
+  make:
+    runs-on: local
+    checkout: false
+    steps:
+      - run: mkdir -p dist/lib && echo one > dist/app.js && echo two > dist/lib/x.js && echo hidden > dist/.secret
+      - id: up
+        uses: kiln/upload@v1
+        with:
+          name: dist
+          path: dist
+      - run: echo "uploaded ${{ steps.up.outputs.artifact-id }} ${{ steps.up.outputs.artifact-digest }}"
+  take:
+    needs: make
+    runs-on: local
+    checkout: false
+    steps:
+      - uses: kiln/download@v1
+        with:
+          name: dist
+          path: got
+      - run: |
+          cat got/app.js got/lib/x.js
+          test ! -e got/.secret && echo "no hidden file"
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "artifacts"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let (run, legs) = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/art&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        if let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null()) && text(r, "workflow").ends_with("art.yaml")) {
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
+            break (r.clone(), serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let log_of = |key: &str| -> anyhow::Result<String> {
+        let id = legs.iter().find(|l| text(l, "key") == key).map(|l| text(l, "id").to_owned()).unwrap_or_default();
+        let mut all = String::new();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{id}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    assert_eq!(text(&run, "conclusion"), "success", "{}\n{}\n{}", log_of("make")?, log_of("take")?, s.log());
+    let take = log_of("take")?;
+    assert!(take.contains("one") && take.contains("two") && take.contains("no hidden file"), "{take}");
+    let (_, listed) = http(s.port, "GET", &format!("/api/ci/runs/{}/artifacts", text(&run, "id")), &s.admin, None)?;
+    let made = log_of("make")?;
+    let digest = made.split("uploaded ").nth(1).and_then(|r| r.split_whitespace().nth(1)).unwrap_or_default().to_owned();
+    assert!(digest.len() == 64 && listed.contains(&digest) && listed.contains("\"dist\""), "{listed}\n{made}");
+    Ok(())
+}

@@ -229,16 +229,17 @@ def push(api, dest, repo, refspec):
     git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", refspec, env=env)
 
 
-def settle(api, repo, event, sha, since, timeout):
-    """`repo`'s runs of `event` (at `sha`, or since `since` for a pull request, whose commit is
-    the diff's), by workflow file, once every one has settled; and those blocked."""
+def settle(api, repo, event, sha, timeout):
+    """`repo`'s runs of `event` at `sha` (a pull request's commit is the diff's, the one pushed),
+    by workflow file, once every one has settled; and those blocked. Runs an earlier invocation
+    started count: a second one goes on where the first stopped."""
     runs, quiet_since, blocked = {}, time.time(), set()
     deadline = time.time() + timeout
     while time.time() < deadline:
         listing = api.call("GET", "/api/ci/runs?" + urllib.parse.urlencode({"repo": repo, "limit": 200}))["runs"]
         before = len(runs)
         for r in listing:
-            if r.get("event") == event and (r.get("sha") == sha if event == "push" else (r.get("created_at") or 0) >= since):
+            if r.get("event") == event and r.get("sha") == sha:
                 runs[os.path.basename(r.get("workflow", ""))] = r
         if len(runs) != before:
             quiet_since = time.time()
@@ -296,10 +297,9 @@ def run_repo(api, args, repo, commit):
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
     out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}
     for event in EVENTS:
-        since = int(time.time()) - 5
         push(api, dest, repo, f"{top}:refs/{'for' if event == 'pull_request' else 'heads'}/{branch}")
         print(f"{repo}: {event} of {top[:8]} on {branch}; waiting for its runs", flush=True)
-        runs, blocked = settle(api, repo, event, top, since, args.timeout)
+        runs, blocked = settle(api, repo, event, top, args.timeout)
         out["events"][event] = results(api, repo, event, corpus, runs, blocked)
     return out
 

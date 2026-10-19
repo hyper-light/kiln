@@ -3051,6 +3051,41 @@ impl Leg {
                 outputs = self.build_image(st, idx, &with, wd).await?;
                 true
             }
+            "upload" | "download" => {
+                let svc = super::artifacts::Service { http: &self.http, base: super::artifacts::Service::origin_of(&self.a.runtime.results_url), token: &self.a.runtime.runtime_token, run: &self.a.run_id, job: &self.a.job_id };
+                let ws = st.layout.workspace.clone();
+                let flag = |k: &str| get(k).is_some_and(|v| v == "true");
+                if b.name == "upload" {
+                    let u = super::artifacts::Upload {
+                        name: get("name").unwrap_or_else(|| "artifact".into()),
+                        paths: get("path").unwrap_or_default().lines().map(str::to_owned).collect(),
+                        if_none: get("if-no-files-found").unwrap_or_else(|| "warn".into()),
+                        retention_days: get("retention-days").and_then(|d| d.parse().ok()),
+                        level: get("compression-level").and_then(|l| l.parse().ok()).unwrap_or(6),
+                        overwrite: flag("overwrite"),
+                        hidden: flag("include-hidden-files"),
+                    };
+                    match super::artifacts::upload(&svc, &ws, &st.layout.temp, &u).await? {
+                        Some(up) => {
+                            self.note(idx, &format!("Uploaded {}: {} files, {} bytes, sha256:{}", u.name, up.files, up.size, up.digest)).await;
+                            let repo = self.a.contexts.github.get("repository").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                            outputs.insert("artifact-url".to_owned(), format!("{}/{repo}/actions/runs/{}/artifacts/{}", self.a.runtime.facade_url.trim_end_matches('/'), self.a.run_id, up.id));
+                            outputs.insert("artifact-id".to_owned(), up.id);
+                            outputs.insert("artifact-digest".to_owned(), up.digest);
+                        }
+                        None if u.if_none == "warn" => self.annotate(idx, "warning", &format!("No files were found with the provided path: {}. No artifacts will be uploaded.", u.paths.join(", "))).await,
+                        None => {}
+                    }
+                } else {
+                    let path = get("path").map_or_else(|| ws.clone(), |p| if Path::new(&p).is_absolute() { PathBuf::from(p) } else { ws.join(p) });
+                    let d = super::artifacts::Download { name: get("name"), pattern: get("pattern"), path: path.clone(), merge: flag("merge-multiple") };
+                    for (name, at) in super::artifacts::download(&svc, &st.layout.temp, &d).await? {
+                        self.note(idx, &format!("Downloaded {name} to {}", st.seen(&at))).await;
+                    }
+                    outputs.insert("download-path".to_owned(), st.seen(&path));
+                }
+                true
+            }
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
         };
         Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })

@@ -498,7 +498,7 @@ pub async fn workflow_run(hub: &Hub, repo: &Repo, action: &str, run: &context::R
     let pipeline = Event { name: "pipeline".into(), ..e.clone() };
     for l in listening {
         let Some(w) = l.workflow.as_ref() else { continue };
-        for ev in [Some(&e).filter(|_| takes(w, "workflow_run")), Some(&pipeline).filter(|_| completed && takes(w, "pipeline"))].into_iter().flatten() {
+        for ev in [takes(w, "workflow_run").then_some(&e), (completed && takes(w, "pipeline")).then_some(&pipeline)].into_iter().flatten() {
             if let Err(err) = start(hub, repo, ev, l, &message, &run.actor, serde_json::Value::Null).await {
                 tracing::warn!(repo = %repo.name, workflow = %l.path, event = %ev.name, error = %format!("{err:#}"), "workflow_run");
             }

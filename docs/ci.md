@@ -2283,6 +2283,12 @@ Gives step execution for `uses:`.
   main and post steps, and each main step's reaches its post step. They run in GitHub's order:
   the pre steps first, in step order (`Pre js kind`, `Pre docker kind`); then the job's steps;
   then the post steps, in reverse.
+- *Done.* R10's `kiln/upload@v1` and `kiln/download@v1` (`w07_r10_kiln_upload_and_download`),
+  run by the runner itself, no Node: a zip each, through the results service and its blob URLs as
+  `actions/upload-artifact@v4` keeps them, so either reads the other's. The files' root is the
+  deepest directory every path is under; hidden files stay out unless asked for; big ones go in
+  8 MiB blocks; the server checks each upload's SHA-256 as it's finalized, and the download checks
+  it again as it arrives; entries that would land outside the destination are refused.
 - *Done.* R01's `kiln://owner/repo[/path]@ref` (`w07_r01_kiln_actions`): an action in one of
   kiln's own repositories, pinned at run start from kiln's own git, mirrored and served apart
   from GitHub's of the same name (`/_kiln/actions/kiln/…`), run as GitHub's are. It's its owner's
@@ -2291,8 +2297,8 @@ Gives step execution for `uses:`.
 - *Left.*
   - The pins on the run page and its "rerun with fresh actions" (the API and CLI have it), and
     storing tarballs in W08's store (today they are files under `<data>/actions/tar`).
-  - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
-    `kiln/deploy`, `kiln/attest`, `kiln/upload` and `kiln/download`, each with its workstream.
+  - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache` (with W08's
+    tiers) and `kiln/deploy` (with W15).
   - musl Node for Alpine job containers, with W13.
   - AC01 (with W22-AC02).
 

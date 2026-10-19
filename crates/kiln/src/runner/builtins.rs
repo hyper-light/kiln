@@ -28,6 +28,35 @@ const fn input(name: &'static str, description: &'static str, default: Option<&'
 /// The built-ins this runner has.
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
+        name: "upload",
+        description: "Upload an artifact (W08): the files zipped as `actions/upload-artifact@v4` keeps them, so `actions/download-artifact` reads it too, uploaded by the runner itself (no Node), its SHA-256 checked by the server. The files' root is the deepest directory every path is under.",
+        inputs: &[
+            input("name", "The artifact's name.", Some("artifact")),
+            Input { name: "path", description: "Files, directories or patterns, one a line, from the workspace; `!` excludes.", default: None, required: true },
+            input("if-no-files-found", "`warn`, `error` or `ignore`.", Some("warn")),
+            input("retention-days", "Days to keep it (0: the server's default).", Some("0")),
+            input("compression-level", "0 (stored) to 9.", Some("6")),
+            input("overwrite", "Replace one of the same name in this run.", Some("false")),
+            input("include-hidden-files", "Include files and directories whose names start with `.`.", Some("false")),
+        ],
+        outputs: &[
+            ("artifact-id", "The artifact's id."),
+            ("artifact-url", "Where it's downloaded from."),
+            ("artifact-digest", "Its zip's SHA-256."),
+        ],
+    },
+    Builtin {
+        name: "download",
+        description: "Download a run's artifacts (W08), its own jobs' or `actions/upload-artifact`'s, by the runner itself (no Node), each checked against the SHA-256 it was uploaded with.",
+        inputs: &[
+            input("name", "One artifact, by name; all of the run's when left out.", None),
+            input("pattern", "Without `name`: those whose names match (`*`, `?`).", None),
+            input("path", "Where to put them, from the workspace (several: each in a directory of its name).", None),
+            input("merge-multiple", "Several into `path` itself.", Some("false")),
+        ],
+        outputs: &[("download-path", "Where they went.")],
+    },
+    Builtin {
         name: "checkout",
         description: "Check out the run's commit (or another ref) from the server's mirror: shallow by default, sparse and partial when asked.",
         inputs: &[
