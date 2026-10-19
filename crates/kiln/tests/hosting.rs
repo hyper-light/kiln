@@ -1154,3 +1154,101 @@ jobs:
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+/// Pull requests a job opens and labels (docs/ci.md W14-R11), as `create-pull-request` and
+/// `actions/labeler` do: a branch pushed with the job's token, `POST /pulls` (one open per
+/// branch), labels added, set and removed, `PATCH` for its title, description and state.
+#[test]
+fn w14_r11_pull_requests_jobs_open_and_label() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/app") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(
+        work.join(".github/workflows/pr.yml"),
+        r#"on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+jobs:
+  open:
+    runs-on: local
+    steps:
+      - uses: kiln/checkout@v1
+      - env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          api() { curl -sf -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$@"; }
+          code() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$@"; }
+          R="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          # A branch, pushed with the job's own token, as create-pull-request pushes one.
+          git checkout -q -b feature
+          echo change > change.txt
+          git add change.txt
+          git -c user.name=bot -c user.email=bot@example.com commit -qm "a change"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" push -q "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" HEAD:refs/heads/feature
+          pr=$(api -X POST "$R/pulls" -d '{"title":"A change","head":"acme:feature","base":"main","body":"Made by a job."}')
+          n=$(echo "$pr" | sed -n 's/.*"number":\([0-9]*\).*/\1/p' | head -1)
+          echo "$pr" | grep -q '"state":"open"'
+          echo "$pr" | grep -q '"body":"Made by a job."'
+          test "$(code -X POST "$R/pulls" -d '{"title":"again","head":"feature","base":"main"}')" = 422
+          api "$R/pulls?state=open&head=acme:feature" | grep -q '"title":"A change"'
+          # Labels: added, set, removed.
+          api -X POST "$R/issues/$n/labels" -d '{"labels":["bug","ci"]}' | grep -q '"name":"ci"'
+          api "$R/pulls/$n" | grep -q '"name":"bug"'
+          test "$(api -X PUT "$R/issues/$n/labels" -d '["docs"]' | grep -o '"name"' | wc -l)" = 1
+          api -X DELETE "$R/issues/$n/labels/docs" | grep -q '^\[\]$'
+          test "$(code -X DELETE "$R/issues/$n/labels/docs")" = 404
+          # Its title, description and state.
+          api -X PATCH "$R/pulls/$n" -d '{"title":"Renamed","body":"Said again."}' | grep -q '"title":"Renamed"'
+          api "$R/issues/$n" | grep -q '"body":"Said again."'
+          api -X PATCH "$R/pulls/$n" -d '{"state":"closed"}' | grep -q '"state":"closed"'
+          echo "opened and labeled $n"
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "pr"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"]), "the workflow")?;
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        let run = v.get("runs").and_then(Value::as_array).and_then(|r| r.iter().find(|r| text(r, "workflow").ends_with("pr.yml"))).cloned();
+        if let Some(r) = run.filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let id = text(&r, "id").to_owned();
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let mut log = String::new();
+            for step in 0..3 {
+                let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+                log.push_str(&text);
+            }
+            assert_eq!(text(&r, "conclusion"), "success", "{r}\n{log}\n{}", s.log());
+            assert!(log.contains("opened and labeled"), "{log}");
+            // The change request is kiln's own, with the job's description and labels gone.
+            let (_, crs) = http(s.port, "GET", "/api/repos/acme%2Fapp/change-requests", &s.admin, None)?;
+            assert!(crs.contains("Renamed") && crs.contains("abandoned"), "{crs}");
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}

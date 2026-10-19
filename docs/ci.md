@@ -3740,6 +3740,13 @@ is left.
     and deletes of jobs' own comments). A job writes as `github-actions[bot]`, an agent: its
     approval counts only where `agents-can-approve`; a comment on the whole pull request doesn't
     hold a land up. Checked with a real run (`w14_r11_pulls`);
+  - pull requests jobs open, as `create-pull-request` does: `POST /pulls` makes a change request
+    for a branch the job pushed with its token (one open per branch and trunk, a second refused
+    with 422), and `PATCH /pulls/{n}` changes its title or description, or closes it (abandoned)
+    and opens it again. Labels, as `actions/labeler` sets them: `GET`, `POST` (add), `PUT` (set)
+    and `DELETE` on `/issues/{n}/labels`, and `DELETE /issues/{n}/labels/{name}` (404 when it
+    hadn't it); a pull request's JSON lists them. Checked with a real run
+    (`w14_r11_pull_requests_jobs_open_and_label`);
   - workflow runs as GitHub shapes them, from kiln's: `/actions/runs` (with GitHub's filters),
     `/actions/runs/{id}`, `/actions/workflows/{id}` and `/actions/workflows/{id}/runs` (by file
     name or number);

@@ -80,6 +80,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
         (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
         (&Method::GET, ["repos", _, _, "pulls", ..]) => Some(("pull-requests", Level::Read)),
+        (&Method::POST, ["repos", _, _, "pulls"]) | (&Method::PATCH, ["repos", _, _, "pulls", _]) => Some(("pull-requests", Level::Write)),
         (&Method::POST, ["repos", _, _, "attestations"]) => Some(("attestations", Level::Write)),
         (&Method::POST | &Method::PUT, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Write)),
         (&Method::GET, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Read)),
@@ -136,6 +137,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
                 pulls::comment(&s, id, &claims, &method, b.as_ref(), true).await
             }
             (&Method::GET, ["pulls", n]) => pulls::get(&s, n).await,
+            (&Method::POST, ["pulls"]) => pulls::create(hub, &s, &claims, &body(req).await?).await,
+            (&Method::PATCH, ["pulls", n]) => pulls::update(&s, n, &claims, &body(req).await?).await,
             (&Method::GET, ["pulls", n, "files"]) => pulls::files(&s, n).await,
             (&Method::GET, ["pulls", n, "commits"]) => pulls::commits(&s, n).await,
             (&Method::GET, ["pulls", n, "comments"]) => pulls::review_comments(&s, n, &claims, None).await,
@@ -147,6 +150,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
                 pulls::comment(&s, id, &claims, &method, b.as_ref(), false).await
             }
             (&Method::GET, ["issues", n]) => pulls::issue(&s, n).await,
+            (&Method::GET | &Method::DELETE, ["issues", n, "labels"]) => pulls::labels(&s, n, &claims, &method, None).await,
+            (&Method::POST | &Method::PUT, ["issues", n, "labels"]) => pulls::labels(&s, n, &claims, &method, Some(&body(req).await?)).await,
+            (&Method::DELETE, ["issues", n, "labels", name]) => pulls::unlabel(&s, n, name, &claims).await,
             (&Method::GET, ["issues", n, "comments"]) => pulls::issue_comments(&s, n, &claims, None).await,
             (&Method::POST, ["issues", n, "comments"]) => pulls::issue_comments(&s, n, &claims, Some(&body(req).await?)).await,
             // Code scanning: SARIF uploads (codeql-action's and the public API's), alerts, analyses.

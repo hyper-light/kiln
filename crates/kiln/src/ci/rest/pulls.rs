@@ -7,7 +7,11 @@
 //!   `GET`/`PATCH`/`DELETE /pulls/comments/{id}`;
 //! - `GET`/`POST /pulls/{n}/reviews` (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`, or pending);
 //! - `GET /issues/{n}`, `GET`/`POST /issues/{n}/comments`, `GET`/`PATCH`/`DELETE
-//!   /issues/comments/{id}` (comments on the diff as a whole).
+//!   /issues/comments/{id}` (comments on the diff as a whole);
+//! - `POST /pulls` (a change request for a branch a job pushed), `PATCH /pulls/{n}` (title,
+//!   description, closed or open again);
+//! - labels: `GET`/`POST`/`PUT`/`DELETE /issues/{n}/labels`, `DELETE /issues/{n}/labels/{name}`
+//!   (what `actions/labeler` and `create-pull-request` set).
 //!
 //! A job writes as `github-actions[bot]`; its reviews are an agent's (they count only where
 //! `agents-can-approve`). Comments' ids are numbers, as GitHub's are.
@@ -147,7 +151,7 @@ async fn pr_json(s: &Site<'_>, d: &Diff, vs: &[Version]) -> Value {
         "html_url": format!("{}/diffs/{}", s.origin, d.name), "diff_url": format!("{}/diffs/{}.diff", s.origin, d.name), "patch_url": format!("{}/diffs/{}.patch", s.origin, d.name),
         "issue_url": format!("{}/issues/{n}", s.api), "commits_url": format!("{url}/commits"), "review_comments_url": format!("{url}/comments"), "comments_url": format!("{}/issues/{n}/comments", s.api), "statuses_url": format!("{}/statuses/{head}", s.api),
         "state": if closed { "closed" } else { "open" }, "locked": false, "title": d.title, "body": d.summary, "user": user(&d.author),
-        "labels": [], "milestone": null, "assignee": null, "assignees": [], "requested_reviewers": reviewers, "requested_teams": [],
+        "labels": labels_of(s, d).await, "milestone": null, "assignee": null, "assignees": [], "requested_reviewers": reviewers, "requested_teams": [],
     });
     let more = json!({
         "draft": d.state == "draft", "created_at": rfc3339(d.created_at), "updated_at": rfc3339(d.updated_at),
@@ -412,13 +416,14 @@ pub async fn comment(s: &Site<'_>, id: &str, job: &Job, method: &Method, body: O
 pub async fn issue(s: &Site<'_>, n: &str) -> Result<Response, Fail> {
     let Some(d) = find(s, n).await? else { return Ok(not_found()) };
     let (comments, _) = counts(s, &d).await;
+    let labels = labels_of(s, &d).await;
     let closed = matches!(d.state.as_str(), "landed" | "abandoned");
     let num = d.number;
     Ok(srv::json(
         StatusCode::OK,
         &json!({
             "id": num, "node_id": format!("kiln-issue-{}", d.id), "number": num, "url": format!("{}/issues/{num}", s.api), "html_url": format!("{}/diffs/{}", s.origin, d.name),
-            "state": if closed { "closed" } else { "open" }, "title": d.title, "body": d.summary, "user": user(&d.author), "labels": [], "assignees": [], "comments": comments,
+            "state": if closed { "closed" } else { "open" }, "title": d.title, "body": d.summary, "user": user(&d.author), "labels": labels, "assignees": [], "comments": comments,
             "created_at": rfc3339(d.created_at), "updated_at": rfc3339(d.updated_at), "closed_at": if closed { Value::String(rfc3339(d.updated_at)) } else { Value::Null },
             "pull_request": { "url": format!("{}/pulls/{num}", s.api), "html_url": format!("{}/diffs/{}", s.origin, d.name) }, "author_association": "MEMBER",
         }),
@@ -495,4 +500,170 @@ pub async fn reviews(s: &Site<'_>, n: &str, job: &Job, body: Option<&Value>) -> 
         })
         .collect();
     Ok(srv::json(StatusCode::OK, &out))
+}
+
+/// A label as GitHub shows one. Labels have no rows of their own here, so the id comes from the
+/// name.
+fn label_json(s: &Site<'_>, name: &str) -> Value {
+    let id = name.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))) & 0x1f_ffff_ffff_ffff;
+    let path: String = name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
+    json!({ "id": id, "node_id": format!("kiln-label-{id}"), "url": format!("{}/labels/{path}", s.api), "name": name, "color": "ededed", "default": false, "description": null })
+}
+
+/// A pull request's labels, by name.
+async fn labels_of(s: &Site<'_>, d: &Diff) -> Vec<Value> {
+    let id = d.id.clone();
+    let names: Vec<String> = s
+        .hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT name FROM diff_labels WHERE diff_id = ?1 ORDER BY name")?;
+            let rows = st.query_map([&id], |r| r.get::<_, String>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+        .unwrap_or_default();
+    names.iter().map(|n| label_json(s, n)).collect()
+}
+
+/// `GET`/`POST`/`PUT`/`DELETE /issues/{n}/labels`: a pull request's labels. `POST` adds them,
+/// `PUT` sets them, `DELETE` clears them; GitHub takes `{"labels": [...]}` or the bare list, of
+/// names or `{"name": ...}`.
+pub async fn labels(s: &Site<'_>, n: &str, job: &Job, method: &Method, body: Option<&Value>) -> Result<Response, Fail> {
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    if *method != Method::GET {
+        if !job.may("issues", Level::Write) && !job.may("pull-requests", Level::Write) {
+            return Ok(forbidden("issues"));
+        }
+        let list = body.and_then(|b| b.get("labels").or(Some(b))).and_then(Value::as_array).cloned().unwrap_or_default();
+        let names: Vec<String> = list.iter().filter_map(|l| l.as_str().or_else(|| l.get("name").and_then(Value::as_str))).map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+        if names.iter().any(|n| n.chars().count() > 50) {
+            return Ok(invalid("a label's name is at most 50 characters"));
+        }
+        let (id, by, set, clear) = (d.id.clone(), format!("job:{}", job.leg), *method == Method::PUT, *method == Method::DELETE);
+        s.hub
+            .store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                if set || clear {
+                    tx.execute("DELETE FROM diff_labels WHERE diff_id = ?1", [&id])?;
+                }
+                if !clear {
+                    let now = crate::util::now_unix();
+                    for n in &names {
+                        tx.execute("INSERT OR IGNORE INTO diff_labels (diff_id, name, added_by, added_at) VALUES (?1, ?2, ?3, ?4)", params![id, n, by, now])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+        if clear {
+            return Ok(srv::status(StatusCode::NO_CONTENT));
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &labels_of(s, &d).await))
+}
+
+/// `DELETE /issues/{n}/labels/{name}`: the labels left; 404 when it hadn't that one, as GitHub
+/// answers.
+pub async fn unlabel(s: &Site<'_>, n: &str, name: &str, job: &Job) -> Result<Response, Fail> {
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    if !job.may("issues", Level::Write) && !job.may("pull-requests", Level::Write) {
+        return Ok(forbidden("issues"));
+    }
+    let (id, name) = (d.id.clone(), srv::decode(name));
+    let removed = s.hub.store.call(move |c| Ok(c.execute("DELETE FROM diff_labels WHERE diff_id = ?1 AND name = ?2", params![id, name])?)).await.map_err(internal)?;
+    if removed == 0 {
+        return Ok(srv::json(StatusCode::NOT_FOUND, &json!({ "message": "Label does not exist" })));
+    }
+    Ok(srv::json(StatusCode::OK, &labels_of(s, &d).await))
+}
+
+/// `POST /pulls` `{title, head, base, body, draft}`: a change request for the branch `head` (one a
+/// job pushed) into the trunk `base`, as opening a pull request on GitHub. One branch has one open
+/// pull request into a trunk: another is refused, as GitHub refuses it.
+pub async fn create(hub: &std::sync::Arc<crate::hub::Hub>, s: &Site<'_>, job: &Job, body: &Value) -> Result<Response, Fail> {
+    if !job.may("pull-requests", Level::Write) {
+        return Ok(forbidden("pull-requests"));
+    }
+    let (Some(head), Some(base)) = (body.get("head").and_then(Value::as_str), body.get("base").and_then(Value::as_str)) else {
+        return Ok(invalid("a pull request has a `head` and a `base`"));
+    };
+    // `owner:branch`, as GitHub names a fork's branch: here, this repository's.
+    let branch = head.rsplit(':').next().unwrap_or(head).trim_start_matches("refs/heads/").to_owned();
+    let base = base.trim_start_matches("refs/heads/").to_owned();
+    let Some(path) = crate::ci::hosting::native_path(s.hub, &s.repo) else { return Ok(invalid("pull requests are opened on repositories kiln hosts")) };
+    let p = path.to_string_lossy().into_owned();
+    if let Err(e) = crate::ci::cr::branch_ok(&branch, std::slice::from_ref(&base)) {
+        return Ok(invalid(&e));
+    }
+    let (repo, b, t) = (s.repo.id.clone(), branch.clone(), base.clone());
+    let open: Option<u32> = s
+        .hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT number FROM diffs WHERE repo_id = ?1 AND trunk = ?2 AND branch = ?3 AND kind = 'change_request' AND state NOT IN ('landed', 'abandoned')", params![repo, t, b], |r| r.get(0)).optional()?))
+        .await
+        .map_err(internal)?;
+    if open.is_some() {
+        return Ok(invalid(&format!("A pull request already exists for {}:{branch}.", s.owner())));
+    }
+    let rev = |spec: String| {
+        let p = p.clone();
+        async move { crate::gitops::run_git(s.hub, &["-C", &p, "rev-parse", "--verify", "--quiet", &spec], crate::gitops::LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|x| !x.is_empty()) }
+    };
+    if rev(format!("refs/heads/{base}^{{commit}}")).await.is_none() {
+        return Ok(invalid(&format!("base: no branch {base}")));
+    }
+    let Some(head_sha) = rev(format!("refs/heads/{branch}^{{commit}}")).await else { return Ok(invalid(&format!("head: no branch {branch}: push it first"))) };
+    let by = crate::ci::cr::By { pushed_by: format!("job:{}", job.leg), author: (format!("job:{}", job.leg), "agent") };
+    let options = kiln_ci::review::Options { draft: body.get("draft").and_then(Value::as_bool).unwrap_or(false), title: body.get("title").and_then(Value::as_str).map(str::to_owned), ..kiln_ci::review::Options::default() };
+    let made = match crate::ci::cr::submit(hub, &s.repo, &p, &base, &branch, &head_sha, &by, &options).await {
+        Ok(o) => o,
+        Err(e) => return Ok(invalid(&e)),
+    };
+    // Its description is the body given, as a pull request's is.
+    if let Some(text) = body.get("body").and_then(Value::as_str).map(str::to_owned) {
+        let (repo, number) = (s.repo.id.clone(), made.number);
+        s.hub.store.call(move |c| Ok(c.execute("UPDATE diffs SET summary = ?3 WHERE repo_id = ?1 AND number = ?2", params![repo, number, text]).map(|_| ())?)).await.map_err(internal)?;
+    }
+    let Some(d) = find(s, &made.number.to_string()).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::CREATED, &pr_json(s, &d, &vs).await))
+}
+
+/// `PATCH /pulls/{n}` `{title, body, state}`: its title and description; `state: closed` abandons
+/// it, `open` takes an abandoned one back. Any job that may write pull requests may, as on GitHub.
+pub async fn update(s: &Site<'_>, n: &str, job: &Job, body: &Value) -> Result<Response, Fail> {
+    if !job.may("pull-requests", Level::Write) {
+        return Ok(forbidden("pull-requests"));
+    }
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let to = match body.get("state").and_then(Value::as_str) {
+        None => None,
+        Some("closed") if d.state == "landing" => return Ok(invalid("it's landing")),
+        Some("closed") if !matches!(d.state.as_str(), "landed" | "abandoned") => Some("abandoned"),
+        Some("open") if d.state == "abandoned" => Some("needs-review"),
+        Some("closed" | "open") => None,
+        Some(other) => return Ok(invalid(&format!("state `{other}`: `open` or `closed`"))),
+    };
+    let title = body.get("title").and_then(Value::as_str).map(str::to_owned);
+    let text = body.get("body").and_then(Value::as_str).map(str::to_owned);
+    let id = d.id.clone();
+    s.hub
+        .store
+        .call(move |c| {
+            c.execute(
+                "UPDATE diffs SET title = COALESCE(?2, title), summary = COALESCE(?3, summary), state = COALESCE(?4, state), updated_at = ?5 WHERE id = ?1",
+                params![id, title, text, to, crate::util::now_unix()],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    s.hub.store.audit(format!("job:{}", job.leg), "diffs.update".into(), format!("{} {}{}", d.repo, d.name, to.map(|t| format!(" {t}")).unwrap_or_default())).await;
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))
 }
