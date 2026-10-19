@@ -418,12 +418,17 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/front-doors", "runners.read", At::Server),
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
+    r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
+    r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),
     r("POST", "/api/updates/binaries", "binaries.publish", At::Server),
+    // A runner upgraded now, or its policy (`crate::doctor`'s `updates.retry` and `updates.policy`).
+    r("POST", "/api/updates/runners/*", "runners.manage", At::Runner(3)),
+    r("PUT", "/api/updates/runners/*", "runners.manage", At::Runner(3)),
     // Agents: the harness, AI sessions, plans, places, voice, model accounts.
     any("/api/harness/**", "agents.run", At::Server),
     any("/api/ai-sessions", "agents.run", At::Server),

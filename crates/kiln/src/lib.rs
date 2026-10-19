@@ -18,6 +18,7 @@ pub mod config;
 pub mod config_cli;
 pub mod convo;
 pub mod dirs;
+pub mod doctor;
 pub mod discovery;
 pub mod dns;
 pub mod exec;
