@@ -213,6 +213,12 @@ pub fn author_of(caller_name: &str, kind: Option<crate::authz::gate::Kind>) -> (
     }
 }
 
+/// Whom a principal acts for: the person after an agent's `for` (`agent:review for user:ada` is
+/// `user:ada`'s); `None` for people themselves.
+pub fn acting_for(caller_name: &str) -> Option<String> {
+    caller_name.split_once(" for ").map(|(_, p)| p.trim().to_owned()).filter(|p| !p.is_empty())
+}
+
 /// A submission: the pushed commit for a trunk, by whom, with the push's options.
 pub struct Submission<'a> {
     pub repo: &'a Repo,
@@ -367,9 +373,9 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                         let id = crate::util::new_id();
                         let state = if opts.draft { State::Draft } else { State::NeedsReview };
                         tx.execute(
-                            "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, stack_id, parent_diff, topic, created_at, updated_at)
-                             VALUES (?1, ?2, ?3, 'diff', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
-                            params![id, repo_id, number, p.change_id, p.title, p.summary, author, author_kind, state.as_str(), trunk, stack, below, opts.topic, now],
+                            "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, stack_id, parent_diff, topic, created_at, updated_at, author_for)
+                             VALUES (?1, ?2, ?3, 'diff', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
+                            params![id, repo_id, number, p.change_id, p.title, p.summary, author, author_kind, state.as_str(), trunk, stack, below, opts.topic, now, acting_for(&pushed_by)],
                         )?;
                         (id, number, 1u32, "new", false)
                     }
@@ -589,6 +595,8 @@ pub struct Diff {
     pub updated_at: i64,
     /// A change request's branch.
     pub branch: Option<String>,
+    /// Whom the author acts for: an agent's person.
+    pub author_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -606,7 +614,7 @@ pub struct Version {
     pub git_ref: String,
 }
 
-const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch";
+const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for";
 const DIFF_FROM: &str = "diffs d JOIN repos p ON p.id = d.repo_id LEFT JOIN diffs pd ON pd.id = d.parent_diff";
 
 fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
@@ -632,6 +640,7 @@ fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
         created_at: r.get(14)?,
         updated_at: r.get(15)?,
         branch: r.get(16)?,
+        author_for: r.get(17)?,
     })
 }
 
@@ -862,10 +871,13 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
         "reclaim" => return Err((StatusCode::CONFLICT, format!("{} isn't abandoned", d.name))),
         other => return Err((StatusCode::NOT_FOUND, format!("no action `{other}`"))),
     };
-    let (id, to_s, author_c) = (d.id.clone(), to.as_str(), author.clone());
+    let (id, to_s, author_c, for_c) = (d.id.clone(), to.as_str(), author.clone(), acting_for(&caller.name));
     hub.store
         .call(move |c| {
-            c.execute("UPDATE diffs SET state = ?2, author = COALESCE(?3, author), updated_at = ?4 WHERE id = ?1", params![id, to_s, author_c, crate::util::now_unix()])?;
+            c.execute(
+                "UPDATE diffs SET state = ?2, author = COALESCE(?3, author), author_for = CASE WHEN ?3 IS NULL THEN author_for ELSE ?5 END, updated_at = ?4 WHERE id = ?1",
+                params![id, to_s, author_c, crate::util::now_unix(), for_c],
+            )?;
             Ok(())
         })
         .await

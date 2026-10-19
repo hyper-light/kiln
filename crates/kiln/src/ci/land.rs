@@ -135,12 +135,25 @@ async fn set_diff_state(hub: &Hub, ids: &[String], state: State) -> anyhow::Resu
         .await
 }
 
+/// Says where an entry is (`queue`: `queued`, `testing`, `landed`, `ejected`, `cancelled`), with
+/// its diffs and whose they are, for whoever follows them.
+async fn tell(hub: &Hub, e: &Entry, state: &str, reason: Option<&str>) {
+    let mut list = Vec::new();
+    for id in &e.diffs {
+        if let Ok(Some(d)) = diffs::find(hub, id).await {
+            list.push(json!({ "diff": d.name, "repo": d.repo, "author": d.author, "author_for": d.author_for }));
+        }
+    }
+    hub.emit(&json!({ "type": "queue", "entry": e.id, "state": state, "reason": reason, "strategy": e.strategy.as_str(), "diffs": list, "enqueued_by": e.enqueued_by }));
+}
+
 /// Takes an entry out of the queue, saying why; its diffs go back to their review state.
 async fn eject(hub: &Hub, e: &Entry, reason: &str) -> anyhow::Result<()> {
     let (id, why) = (e.id.clone(), reason.to_owned());
     hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()]).map(|_| ())?)).await?;
     set_diff_state(hub, &e.diffs, State::Accepted).await?;
     hub.store.audit("kiln".into(), "queue.eject".into(), format!("{}: {reason}", e.id)).await;
+    tell(hub, e, "ejected", Some(reason)).await;
     tracing::info!(entry = %e.id, %reason, "ejected from the land queue");
     Ok(())
 }
@@ -706,6 +719,9 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
             .await?;
     }
     tracing::info!(repo = %repo.name, %trunk, candidate = %tip, diffs = %names.join(" "), checks = started.len(), "a land candidate is under test");
+    for (e, _) in &built {
+        tell(hub, e, "testing", None).await;
+    }
     // Nothing to wait for: the next step lands it.
     if started.is_empty() {
         kick();
@@ -745,6 +761,7 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
             .await?;
         all.extend(e.diffs.iter().cloned());
         hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk} at {tip}: entry {} by {}", repo.name, e.id, e.enqueued_by)).await;
+        tell(hub, e, "landed", None).await;
     }
     tracing::info!(repo = %repo.name, %trunk, %tip, diffs = all.len(), "landed");
     // For whoever follows lands (deploy's releases of origin `git`, docs/deploy-api.md).

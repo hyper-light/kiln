@@ -142,7 +142,7 @@ pub async fn comment(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resu
     if file.is_some() != start.is_some() {
         return Err(bad("a comment on code names its `file` and `start_line`"));
     }
-    let (diff_id, me2) = (d.id.clone(), me.clone());
+    let (diff_id, me2, said, file_c, side_c) = (d.id.clone(), me.clone(), text.clone(), file.clone(), side.clone());
     let (tid, cid) = hub
         .store
         .call(move |c| {
@@ -172,6 +172,11 @@ pub async fn comment(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resu
         .map_err(|e| bad(format!("{e:#}")))?;
     if publish {
         hub.store.audit(caller.name.clone(), "diffs.comment".into(), format!("{} {} thread {tid}", d.repo, d.name)).await;
+        // For whoever follows a diff's conversation (an agent's queue, the inbox).
+        hub.emit(&json!({
+            "type": "comment", "repo": d.repo, "diff": d.name, "version": version, "thread": tid, "comment": cid, "author": me, "body": said,
+            "file": file_c, "side": side_c, "start_line": start, "end_line": end.or(start), "diff_author": d.author, "diff_author_for": d.author_for,
+        }));
     }
     Ok(json!({ "id": cid, "thread": tid, "draft": !publish }))
 }
@@ -367,6 +372,7 @@ pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resul
     }
     let shown = if matches!(state, State::NeedsReview | State::ChangesRequested | State::Accepted) { now } else { state };
     hub.store.audit(caller.name.clone(), format!("diffs.review.{}", action.as_str()), format!("{} {} v{latest}", d.repo, d.name)).await;
+    hub.emit(&json!({ "type": "review", "repo": d.repo, "diff": d.name, "version": latest, "reviewer": me, "action": action.as_str(), "body": text, "published": published, "state": shown.as_str(), "diff_author": d.author, "diff_author_for": d.author_for }));
     Ok(json!({ "diff": d.name, "action": action.as_str(), "version": latest, "published": published, "state": shown.as_str() }))
 }
 
@@ -565,4 +571,65 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
         .map_err(fail)?;
     hub.store.audit(caller.name.clone(), "diffs.suggestion.apply".into(), format!("{} {} v{n}", d.repo, d.name)).await;
     Ok(json!({ "diff": d.name, "version": n, "thread": thread, "state": "resolved" }))
+}
+
+/// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,
+/// how it ended, its failed legs (with where their failure excerpts are), and whose it is, for
+/// whoever follows the diff (an agent that wrote it, its person). For as long as the server runs.
+pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let mut rx = hub.events.subscribe();
+    loop {
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            m = rx.recv().fuse() => match m {
+                Ok(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    let finished = v.get("type").and_then(Value::as_str) == Some("run")
+                        && v.pointer("/run/status").and_then(Value::as_str).is_some_and(|s| matches!(s, "succeeded" | "failed" | "cancelled" | "timed_out" | "skipped"));
+                    if finished
+                        && let Some(id) = v.pointer("/run/id").and_then(Value::as_str)
+                        && let Err(e) = diff_run(&hub, id).await
+                    {
+                        tracing::debug!(run = %id, error = %format!("{e:#}"), "a diff's run event");
+                    }
+                }
+                Err(async_broadcast::RecvError::Overflowed(_)) => {}
+                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            },
+        }
+    }
+}
+
+async fn diff_run(hub: &Hub, run: &str) -> anyhow::Result<()> {
+    let key = run.to_owned();
+    #[allow(clippy::type_complexity)]
+    let found: Option<(String, String, u32, String, Option<String>, String, String, Option<String>, String)> = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT d.id, CASE d.kind WHEN 'diff' THEN 'D' ELSE 'CR' END || d.number, v.n, d.author, d.author_for, p.name, r.status, r.conclusion, COALESCE(r.run_name, r.pipeline)
+                 FROM runs r JOIN repos p ON p.id = r.repo_id JOIN diff_versions v ON v.commit_sha = r.sha JOIN diffs d ON d.id = v.diff_id AND d.repo_id = r.repo_id
+                 WHERE r.id = ?1 ORDER BY v.n DESC LIMIT 1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            )
+            .optional()?)
+        })
+        .await?;
+    let Some((_, name, version, author, author_for, repo, status, conclusion, workflow)) = found else { return Ok(()) };
+    let key = run.to_owned();
+    let failed: Vec<Value> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id, COALESCE(job_id, key), status FROM jobs WHERE run_id = ?1 AND status IN ('failed', 'timed_out')")?;
+            let rows = st.query_map([&key], |r| {
+                let id: String = r.get(0)?;
+                Ok(json!({ "leg": id, "name": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?, "failure": format!("/api/ci/legs/{id}/logs/failure") }))
+            })?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await?;
+    hub.emit(&json!({ "type": "diff_run", "repo": repo, "diff": name, "version": version, "run": run, "workflow": workflow, "status": status, "conclusion": conclusion, "failed": failed, "diff_author": author, "diff_author_for": author_for }));
+    Ok(())
 }

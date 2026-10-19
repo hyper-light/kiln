@@ -46,6 +46,15 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
                 let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" })).await;
             }
         }
+        // GitHub Actions' runs, for repositories whose CI provider it is (W23-R03).
+        ("workflow_run" | "workflow_job", _) => {
+            let (hub2, event2) = (Arc::clone(hub), event.clone());
+            crate::rt::spawn(async move {
+                if let Err(e) = crate::ci::providers::github_actions::on_event(&hub2, &event2, &v).await {
+                    tracing::debug!(event = %event2, error = %format!("{e:#}"), "a GitHub Actions run didn't sync");
+                }
+            });
+        }
         ("installation" | "installation_repositories", _) => {
             let account = v.pointer("/installation/account/login").and_then(Value::as_str).unwrap_or_default();
             hub.store.audit("github".into(), format!("github.{event}"), format!("{action} for {account}")).await;

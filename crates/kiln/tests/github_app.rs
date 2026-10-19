@@ -74,8 +74,29 @@ fn fake_github(public_key: Vec<u8>) -> anyhow::Result<(u16, Calls)> {
                 key.verify(format!("{h}.{b}").as_bytes(), &B64URL.decode(s).unwrap_or_default()).is_ok() && claims.get("iss") == Some(&json!(99))
             });
             let token_ok = auth.starts_with("Bearer ghs_fake_");
+            let run555 = json!({ "id": 555, "name": "ci", "path": ".github/workflows/ci.yml", "display_title": "a failing run", "event": "push", "head_branch": "main", "head_sha": "a".repeat(40),
+                                 "status": "completed", "conclusion": "failure", "run_number": 7, "run_attempt": 1, "html_url": "https://github.example/acme/gha/actions/runs/555",
+                                 "created_at": "2026-10-18T12:00:00Z", "run_started_at": "2026-10-18T12:00:05Z", "updated_at": "2026-10-18T12:03:00Z", "actor": { "login": "ada" } });
+            let run556 = json!({ "id": 556, "name": "ci", "path": ".github/workflows/ci.yml", "display_title": "a running one", "event": "push", "head_branch": "main", "head_sha": "b".repeat(40),
+                                 "status": "in_progress", "conclusion": null, "run_number": 8, "run_attempt": 1, "html_url": "https://github.example/acme/gha/actions/runs/556",
+                                 "created_at": "2026-10-18T13:00:00Z", "run_started_at": "2026-10-18T13:00:05Z", "updated_at": "2026-10-18T13:00:06Z", "actor": { "login": "ada" } });
+            let mut location: Option<String> = None;
             let (status, reply) = match (method.as_str(), path.split('?').next().unwrap_or_default()) {
-                ("GET", "/repos/acme/app/installation") if jwt_ok => (200, json!({ "id": 7 })),
+                ("GET", "/repos/acme/app/installation" | "/repos/acme/gha/installation") if jwt_ok => (200, json!({ "id": 7 })),
+                ("GET", "/repos/acme/gha/actions/runs") if token_ok => (200, json!({ "total_count": 1, "workflow_runs": [run555] })),
+                ("GET", "/repos/acme/gha/actions/runs/556") if token_ok => (200, run556),
+                ("GET", "/repos/acme/gha/actions/runs/555/jobs") if token_ok => (200, json!({ "jobs": [{ "id": 9001, "name": "build", "status": "completed", "conclusion": "failure", "runner_name": "gh-1", "labels": ["ubuntu-latest"],
+                    "started_at": "2026-10-18T12:00:06Z", "completed_at": "2026-10-18T12:02:00Z", "html_url": "https://github.example/acme/gha/actions/runs/555/job/9001",
+                    "steps": [{ "name": "Set up job", "status": "completed", "conclusion": "success", "number": 1 }, { "name": "test", "status": "completed", "conclusion": "failure", "number": 2 }] }] })),
+                ("GET", "/repos/acme/gha/actions/runs/556/jobs") if token_ok => (200, json!({ "jobs": [{ "id": 9002, "name": "test", "status": "in_progress", "conclusion": null, "steps": [] }] })),
+                ("GET", "/repos/acme/gha/actions/jobs/9001/logs") if token_ok => {
+                    location = Some(format!("http://127.0.0.1:{port}/blob/logs/9001"));
+                    (302, json!({}))
+                }
+                ("GET", "/blob/logs/9001") if auth.is_empty() => (200, json!("build failed: boom")),
+                ("POST", "/repos/acme/gha/actions/runs/555/rerun-failed-jobs") if token_ok => (201, json!({})),
+                ("POST", "/repos/acme/gha/actions/runs/555/cancel") if token_ok => (202, json!({})),
+                ("POST", "/repos/acme/gha/actions/workflows/ci.yml/dispatches") if token_ok => (204, json!(null)),
                 ("POST", "/app/installations/7/access_tokens") if jwt_ok => {
                     next_token += 1;
                     (201, json!({ "token": format!("ghs_fake_{next_token}"), "expires_at": "2099-01-01T00:00:00Z" }))
@@ -92,9 +113,14 @@ fn fake_github(public_key: Vec<u8>) -> anyhow::Result<(u16, Calls)> {
             if let Ok(mut c) = seen.lock() {
                 c.push((method.clone(), path.clone(), auth.clone(), body));
             }
-            let text = reply.to_string();
+            let text = match &reply {
+                Value::String(t) => t.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let extra = location.map(|l| format!("Location: {l}\r\n")).unwrap_or_default();
             let mut s = reader.into_inner();
-            let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
         }
     });
     Ok((port, calls))
@@ -142,6 +168,7 @@ fn w14_r10_github_app() -> anyhow::Result<()> {
     let gh = dir.path().join("gh");
     std::fs::create_dir_all(gh.join("acme"))?;
     git(&gh, &["init", "-q", "--bare", "acme/app.git"])?;
+    git(&gh, &["init", "-q", "--bare", "acme/gha.git"])?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::create_dir_all(work.join(".kiln"))?;
@@ -179,7 +206,7 @@ jobs:
         key.display(),
         secret.display()
     );
-    let extra = format!("[[repos]]\nname = \"acme/app\"\nclone_url = \"git://127.0.0.1:{port}/acme/app.git\"\n");
+    let extra = format!("[[repos]]\nname = \"acme/app\"\nclone_url = \"git://127.0.0.1:{port}/acme/app.git\"\n\n[[repos]]\nname = \"acme/gha\"\nclone_url = \"git://127.0.0.1:{port}/acme/gha.git\"\n");
     let s = start(dir.path(), &Options { agent: true, ci: &ci, extra: &extra })?;
     let (st, app) = http(s.port, "GET", "/api/ci/github/app", &s.admin, None)?;
     assert!(st == 200 && app.contains("\"configured\":true") && app.contains("\"source\":\"config\""), "{st} {app}");
@@ -238,6 +265,53 @@ jobs:
     until(240, "the second attempt's check run", || {
         let posts = checks(&calls).iter().filter(|(m, _, _)| m == "POST").count();
         Ok((posts <= posts_before).then(|| format!("{:?}", checks(&calls))))
+    })?;
+
+    // W23-R03: acme/gha's CI is GitHub Actions'. Its runs come into kiln, logs, reruns, cancels
+    // and dispatches go to GitHub.
+    let (st, body) = http(s.port, "PUT", "/api/ci/repos/acme%2Fgha/providers", &s.admin, Some(&json!({ "providers": ["github-actions"] })))?;
+    assert!(st == 200 && body.contains("github-actions"), "{st} {body}");
+    let (st, body) = http(s.port, "PUT", "/api/ci/repos/acme%2Fgha/providers", &s.admin, Some(&json!({ "providers": ["gitlab-ci"] })))?;
+    assert_eq!(st, 422, "only what the repository may have: {body}");
+    let mut run_id = String::new();
+    until(60, "GitHub Actions' run in kiln", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme%2Fgha", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let runs = v.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        let r = runs.iter().find(|r| r.get("external_number") == Some(&json!(7))).cloned();
+        if let Some(r) = &r {
+            assert_eq!((r.get("provider"), r.get("status"), r.get("conclusion")), (Some(&json!("github-actions")), Some(&json!("failed")), Some(&json!("failure"))), "{r}");
+            run_id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        }
+        Ok(r.is_none().then_some(body))
+    })?;
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run_id}"), &s.admin, None)?;
+    let d: Value = serde_json::from_str(&detail).unwrap_or(Value::Null);
+    let leg = d.get("legs").and_then(Value::as_array).and_then(|l| l.first()).cloned().unwrap_or_default();
+    assert_eq!((leg.get("name").or_else(|| leg.get("key")), leg.get("status")), (Some(&json!("build")), Some(&json!("failed"))), "{detail}");
+    let leg_id = leg.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (st, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg_id}/logs"), &s.admin, None)?;
+    assert!(st == 200 && log.contains("build failed: boom"), "{st} {log}");
+    let saw = |what: &str| calls.lock().map(|c| c.iter().any(|(m, p, _, _)| m == "POST" && p.ends_with(what))).unwrap_or(false);
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run_id}/rerun"), &s.admin, Some(&json!({ "mode": "failed" })))?;
+    assert!(st == 201 && saw("/actions/runs/555/rerun-failed-jobs"), "{st} {body}");
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run_id}/cancel"), &s.admin, Some(&json!({})))?;
+    assert!(st == 202 && saw("/actions/runs/555/cancel"), "{st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/ci/repos/acme%2Fgha/workflows/.github/workflows/ci.yml/dispatches", &s.admin, Some(&json!({ "ref": "main", "inputs": { "x": "1" } })))?;
+    assert!(st == 204 && saw("/actions/workflows/ci.yml/dispatches"), "{st} {body}");
+    let sent = calls.lock().map(|c| c.iter().find(|(_, p, _, _)| p.ends_with("/dispatches")).map(|(_, _, _, b)| b.clone()).unwrap_or_default()).unwrap_or_default();
+    assert_eq!((sent.get("ref"), sent.pointer("/inputs/x")), (Some(&json!("main")), Some(&json!("1"))), "{sent}");
+    // A job's event brings its run at once.
+    let body = json!({ "action": "in_progress", "workflow_job": { "id": 9002, "run_id": 556 }, "repository": { "full_name": "acme/gha" } }).to_string();
+    let sig = format!("sha256={}", kiln::util::hmac_hex(b"s3cret", body.as_bytes()));
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", s.port))?;
+    write!(conn, "POST /api/hooks/github/app HTTP/1.1\r\nHost: x\r\nX-GitHub-Event: workflow_job\r\nX-Hub-Signature-256: {sig}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    let mut answer = String::new();
+    conn.read_to_string(&mut answer)?;
+    assert!(answer.starts_with("HTTP/1.1 202"), "{answer}");
+    until(15, "run 556 from its job's event", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme%2Fgha", &s.admin, None)?;
+        Ok((!(body.contains("\"external_number\":8") && body.contains("\"running\""))).then_some(body))
     })?;
     Ok(())
 }

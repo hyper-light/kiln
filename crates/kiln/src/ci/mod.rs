@@ -26,6 +26,7 @@ pub mod notify;
 pub mod oidc;
 pub mod ops;
 pub mod preview;
+pub mod providers;
 pub mod repo_config;
 pub mod results;
 pub mod rest;

@@ -120,9 +120,9 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
                     let id = crate::util::new_id();
                     let state = if draft { State::Draft } else { State::NeedsReview };
                     tx.execute(
-                        "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, branch, topic, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, 'change_request', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
-                        params![id, repo_id, number, title_c, summary_c, author.0, author.1, state.as_str(), trunk_s, branch_s, topic, now],
+                        "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, branch, topic, created_at, updated_at, author_for)
+                         VALUES (?1, ?2, ?3, 'change_request', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
+                        params![id, repo_id, number, title_c, summary_c, author.0, author.1, state.as_str(), trunk_s, branch_s, topic, now, diffs::acting_for(&pushed_by)],
                     )?;
                     (id, number, 1, "new", false)
                 }

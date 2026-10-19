@@ -146,6 +146,13 @@ struct DispatchAsk {
 pub async fn dispatch(hub: &Hub, repo: &str, path: &str, body: Incoming) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: DispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    // A repository whose CI is GitHub Actions' (W23-R03): GitHub starts it.
+    let providers = super::providers::chosen(hub, &repo).await;
+    if !providers.iter().any(|p| p == super::providers::KILN) && providers.iter().any(|p| p == super::providers::GITHUB_ACTIONS) {
+        let inputs = serde_json::Value::Object(ask.inputs.clone());
+        super::providers::github_actions::dispatch(hub, &repo, path, &ask.git_ref, &inputs).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        return Ok(srv::status(StatusCode::NO_CONTENT));
+    }
     super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln").await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }

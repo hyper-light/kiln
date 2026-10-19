@@ -21,6 +21,10 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     if !hub.ci.enabled() {
         return Ok(false);
     }
+    // A repository whose CI runs elsewhere (W23-R07): KilnCI stands aside.
+    if !super::providers::kiln_runs(hub, repo).await {
+        return Ok(true);
+    }
     let commit = load::load(hub, repo, &t.sha).await?;
     // A manual run of one pipeline runs that one only.
     let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
