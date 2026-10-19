@@ -387,7 +387,8 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: 
     if i.kind == "webhook" {
         req = req.header("x-kiln-event", event).header("x-kiln-delivery", &crate::util::new_id());
     }
-    let resp = req.send().await.map_err(|e| format!("{e:#}"))?;
+    // On the heap: the request's future (the reach check, TLS) is deep.
+    let resp = Box::pin(req.send()).await.map_err(|e| format!("{e:#}"))?;
     let status = resp.status();
     let answer = resp.bytes(64 << 10).await.unwrap_or_default();
     if !(200..300).contains(&status) {
