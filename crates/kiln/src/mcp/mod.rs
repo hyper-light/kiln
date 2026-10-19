@@ -228,7 +228,7 @@ fn write_plugin(dir: &std::path::Path) -> anyhow::Result<()> {
     std::fs::write(
         dir.join(".claude-plugin").join("plugin.json"),
         serde_json::to_vec_pretty(&json!({"name": "kiln", "version": env!("CARGO_PKG_VERSION"),
-            "description": "kiln's skills: deploying, diagnosing deployments, defining apps, moving from Argo CD."}))?,
+            "description": "kiln's skills: running agents, deploying, diagnosing deployments and CI, defining apps, moving from Argo CD."}))?,
     )?;
     skills::install(&dir.join("skills"))?;
     Ok(())
