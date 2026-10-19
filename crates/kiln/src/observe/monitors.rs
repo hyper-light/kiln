@@ -180,6 +180,10 @@ pub struct GroupState {
     pub since: i64,
     pub last_data: i64,
     pub notified: i64,
+    /// A downtime that held it ended with it in trouble, asking that its first recovery after say
+    /// nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet_recovery: bool,
 }
 
 /// What a monitor's messages say of its thresholds (a composite has none: NaN, null in a notice).
@@ -187,6 +191,14 @@ pub struct GroupState {
 struct Said {
     threshold: f64,
     warning: Option<f64>,
+}
+
+/// What a monitor's messages say of its thresholds, as its definition has them.
+fn said_of(m: &Monitor) -> Said {
+    match m.compiled() {
+        Ok(Compiled::Query(q, t)) => Said { threshold: q.threshold, warning: t.warning },
+        _ => Said { threshold: f64::NAN, warning: None },
+    }
 }
 
 /// Why a monitor was not deleted.
@@ -210,6 +222,8 @@ pub struct Monitors {
     notifier: Notifier,
     link_base: String,
     due: Mutex<Due>,
+    /// Downtimes (`super::downtimes`): when what monitors say is held.
+    pub downtimes: super::downtimes::Downtimes,
 }
 
 fn group_key(g: &[(String, String)]) -> String {
@@ -221,7 +235,16 @@ impl Monitors {
         let load = |name: &str| std::fs::read(dir.join(name)).ok();
         let defs = load("monitors.json").and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let states = load("monitor-states.json").and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Arc::new(Self { dir: dir.to_owned(), defs: Mutex::new(defs), states: Mutex::new(states), integrations: Integrations::open(dir), notifier: Notifier::start(http), link_base: link_base.trim_end_matches('/').to_owned(), due: Mutex::new(Due::default()) })
+        Arc::new(Self {
+            dir: dir.to_owned(),
+            defs: Mutex::new(defs),
+            states: Mutex::new(states),
+            integrations: Integrations::open(dir),
+            notifier: Notifier::start(http),
+            link_base: link_base.trim_end_matches('/').to_owned(),
+            due: Mutex::new(Due::default()),
+            downtimes: super::downtimes::Downtimes::open(dir),
+        })
     }
 
     fn save(&self) -> anyhow::Result<()> {
@@ -360,9 +383,53 @@ impl Monitors {
                 changed |= self.evaluate_composite(&c, &x, now);
             }
         }
+        changed |= self.tell_ends(now);
         if changed {
             self.save_states();
         }
+    }
+
+    /// Downtimes' windows that ended since last looked at: each group one held that is in one of
+    /// its end states told once (as a renotification), and asked, if the downtime says so, to keep
+    /// its first recovery quiet. Whether any state changed.
+    fn tell_ends(&self, now: i64) -> bool {
+        let ended = self.downtimes.ended(now);
+        if ended.is_empty() {
+            return false;
+        }
+        let defs: Vec<Monitor> = lock(&self.defs).values().cloned().collect();
+        let mut changed = false;
+        for e in ended {
+            let d = &e.downtime;
+            let Ok(scope) = kiln_obs::monitor::downtime::Scope::parse(&d.scope) else { continue };
+            let tell = d.notify_end_types.iter().any(|t| t == e.how);
+            for m in defs.iter().filter(|m| d.names(&m.id, &m.tags)) {
+                let groups: Vec<GroupState> = lock(&self.states).get(&m.id).map(|gs| gs.values().filter(|g| scope.holds(&g.group)).cloned().collect()).unwrap_or_default();
+                for g in groups {
+                    let state = State::parse(&g.state).unwrap_or(State::Ok);
+                    if state == State::Ok {
+                        continue;
+                    }
+                    if d.mute_first_recovery_notification
+                        && let Some(gs) = lock(&self.states).get_mut(&m.id).and_then(|gs| gs.get_mut(&group_key(&g.group)))
+                    {
+                        gs.quiet_recovery = true;
+                        changed = true;
+                    }
+                    let named = match state {
+                        State::Alert => "alert",
+                        State::Warn => "warn",
+                        State::NoData => "no data",
+                        State::Ok => "ok",
+                    };
+                    if tell && d.notify_end_states.iter().any(|s| s == named) {
+                        tracing::debug!(monitor = %m.name, downtime = %d.id, how = e.how, group = %group_key(&g.group), "a downtime ended with a group in trouble: told");
+                        self.say(m, said_of(m), &g, state, state, now);
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// One monitor's evaluation: each group's next state, events and notifications for changes.
@@ -419,7 +486,7 @@ impl Monitors {
                     continue;
                 }
                 seen.insert(key.clone());
-                let g = groups.entry(key).or_insert_with(|| GroupState { group, state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0 });
+                let g = groups.entry(key).or_insert_with(|| GroupState { group, state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0, quiet_recovery: false });
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
                 let to = next(prev, value, made);
                 g.value = value;
@@ -470,7 +537,14 @@ impl Monitors {
         let tr = Transition { from, to };
         let vars = Vars { monitor: &m.name, value: g.value, threshold: said.threshold, warn_threshold: said.warning, group: &g.group, link: &link };
         let message = monitor::render(&m.message, tr, &vars);
-        let muted = m.muted(now);
+        let downtime = self.downtimes.holding(&m.id, &m.tags, &g.group, now);
+        // A recovery a downtime that ended asked to keep quiet: this one, once.
+        let quiet = to == State::Ok && from != State::Ok && {
+            let mut all = lock(&self.states);
+            let gs = all.get_mut(&m.id).and_then(|gs| gs.get_mut(&group_key(&g.group)));
+            gs.is_some_and(|gs| std::mem::take(&mut gs.quiet_recovery))
+        };
+        let muted = m.muted(now) || downtime.is_some() || quiet;
         if let Some(o) = super::api::get() {
             let mut attrs: Vec<(String, String)> = vec![
                 ("event.type".into(), format!("monitor.{}", to.as_str().to_ascii_lowercase().replace(' ', "_"))),
@@ -480,6 +554,9 @@ impl Monitors {
                 ("previous".into(), from.as_str().into()),
                 ("muted".into(), muted.to_string()),
             ];
+            if let Some(id) = &downtime {
+                attrs.push(("downtime_id".into(), id.clone()));
+            }
             if let Some(v) = g.value {
                 attrs.push(("value".into(), v.to_string()));
             }

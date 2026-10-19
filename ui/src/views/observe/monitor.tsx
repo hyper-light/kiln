@@ -104,6 +104,7 @@ function MonitorView({ id }: { id: string }) {
           <p className="lead flex flex-wrap items-center gap-3">
             <StateBadge state={m.state} muted={isMuted} />
             <code className="font-mono text-[12px] break-all text-[#a7aab3]">{m.composite?.named ?? m.query}</code>
+            <HeldBy m={m} />
           </p>
         </div>
         {!editing && (
@@ -580,5 +581,18 @@ function Mentions() {
       Mention where it goes: {all.map((i) => `@${i.kind}-${i.name}`).join(", ")}. Template variables: {"{{value}}"}, {"{{threshold}}"}, {"{{monitor.name}}"}, {"{{host.name}}"} (any tag of the
       group&apos;s), {"{{link}}"}.
     </p>
+  );
+}
+
+/** A downtime that holds the monitor now, or the next that will: a link to the downtimes. */
+function HeldBy({ m }: { m: Monitor }) {
+  const d = m.downtimes?.find((x) => x.status === "active") ?? m.downtimes?.find((x) => x.status === "scheduled");
+  if (!d?.window) return null;
+  const at = (ms: number) => new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const text = d.status === "active" ? `Held by a downtime${d.window.end ? ` until ${at(d.window.end)}` : ""}` : `A downtime from ${at(d.window.start)}`;
+  return (
+    <Link to="/observe/downtimes" className="text-[12.5px] text-[#a7aab3] hover:text-white">
+      {text}
+    </Link>
   );
 }

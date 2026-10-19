@@ -329,6 +329,7 @@ fn schemas() -> Map<String, Value> {
         ("state", one_of(&["OK", "WARN", "ALERT", "NO DATA"])),
         ("groups", array(schema("GroupState"))),
         ("composite", describe(object(&[("monitors", array(any())), ("expression", string()), ("named", string())], &[]), "a composite's monitors by letter")),
+        ("downtimes", describe(array(schema("Downtime")), "the downtimes that hold it now, or will")),
     ]);
     put("Monitor", object(&shown, &["id", "name", "query", "state", "groups"]));
     put(
@@ -341,6 +342,7 @@ fn schemas() -> Map<String, Value> {
                 ("since", ms()),
                 ("last_data", ms()),
                 ("notified", ms()),
+                ("quiet_recovery", describe(boolean(), "a downtime that ended with it in trouble asked its first recovery to say nothing")),
             ],
             &["group", "state", "since"],
         ),
@@ -547,6 +549,40 @@ fn schemas() -> Map<String, Value> {
             &["records"],
         ),
     );
+    // Downtimes (§9.3): Datadog's v2 downtime.
+    let time_in = describe(any(), "ms since the epoch, or RFC 3339");
+    let downtime_fields = [
+        ("message", string()),
+        ("monitor_identifier", describe(object(&[("monitor_id", string()), ("monitor_tags", array(string()))], &[]), "the monitors held: one, or those that carry every tag")),
+        ("scope", describe(string(), "the groups held: env:prod host:(web-1 OR web-2) -region:eu; * every one")),
+        (
+            "schedule",
+            describe(
+                object(
+                    &[
+                        ("start", time_in.clone()),
+                        ("end", time_in),
+                        ("recurrences", array(object(&[("rrule", describe(string(), "RFC 5545: FREQ=WEEKLY;BYDAY=SA,SU")), ("start", describe(string(), "a wall-clock time in the timezone: 2026-10-24T02:00")), ("duration", describe(string(), "4h, 1h30m, 2d"))], &["rrule", "start", "duration"]))),
+                        ("timezone", describe(string(), "an IANA name; UTC unless said")),
+                    ],
+                    &[],
+                ),
+                "once (from start, now when none, to end, until canceled when none), or recurring",
+            ),
+        ),
+        ("mute_first_recovery_notification", boolean()),
+        ("notify_end_states", array(one_of(&["alert", "no data", "warn"]))),
+        ("notify_end_types", array(one_of(&["canceled", "expired"]))),
+    ];
+    put("DowntimeIn", object(&downtime_fields, &["monitor_identifier", "schedule"]));
+    let mut kept: Vec<(&str, Value)> = downtime_fields.to_vec();
+    kept.push(("id", string()));
+    kept.push(("canceled", describe(integer(), "ms it was canceled at")));
+    kept.push(("created", integer()));
+    kept.push(("modified", integer()));
+    kept.push(("status", one_of(&["active", "scheduled", "ended", "canceled"])));
+    kept.push(("window", nullable(object(&[("start", integer()), ("end", nullable(integer()))], &["start"]))));
+    put("Downtime", object(&kept, &["id", "monitor_identifier", "schedule", "status"]));
     // Metrics from logs (§8.3): Datadog's definition, kiln's shape or theirs.
     let log_metric_fields = [
         ("name", describe(string(), "the metric's name: a letter, then letters, digits, _ and . (kiln.*, system.* and datadog.* are kiln's)")),
@@ -938,6 +974,11 @@ fn ops() -> Vec<Op<'static>> {
         op("post", "/distribution_points", "Writes a distribution's values (Datadog's v1 distribution points)", "observe.write", Some(body("DistributionIntake")), vec![accepted(object(&[("values", integer())], &["values"]))]),
         op("post", "/logs", "Writes log records (Datadog's log intake)", "observe.write", Some(body("LogIntake")), vec![accepted(object(&[("records", integer())], &["records"]))]),
         op("get", "/openapi.json", "This document", "observe.read", None, vec![("200", answer_of("OpenAPI 3.1", any()))]),
+        op("get", "/downtimes", "Lists downtimes, newest first, each its status and its window now or next", "observe.read", None, vec![("200", answer_of("the downtimes", object(&[("downtimes", array(schema("Downtime")))], &["downtimes"])))]),
+        op("post", "/downtimes", "Makes a downtime: the monitors and groups it holds, once or recurring", "observe.write", Some(body("DowntimeIn")), vec![("201", answer("made", Some("Downtime")))]),
+        Op { params: vec![id()], ..op("get", "/downtimes/{id}", "A downtime", "observe.read", None, vec![ok("Downtime")]) },
+        Op { params: vec![id()], ..op("put", "/downtimes/{id}", "Changes a downtime", "observe.write", Some(body("DowntimeIn")), vec![ok("Downtime")]) },
+        Op { params: vec![id()], ..op("delete", "/downtimes/{id}", "Cancels a downtime (kept, its status canceled)", "observe.write", None, vec![no_content()]) },
         op(
             "get",
             "/log_metrics",

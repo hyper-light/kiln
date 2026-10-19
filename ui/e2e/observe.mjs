@@ -866,6 +866,60 @@ const scenarios = {
     }
   },
 
+  /** A downtime made from the form for a monitor's group, shown on the monitor's page while it
+   * holds, then canceled from its row; a recurring one made with the weekly builder, said in words. */
+  async "a downtime holds a monitor's group, shows on the monitor, and is canceled"() {
+    const name = `E2E dt ${run}`;
+    const made = await api("POST", "/api/observe/v1/monitors", { name, query: `last(last_1m):max:e2e.dt.${run}{*} by {host} > 100`, message: "never", options: { every: 60 } });
+    expect(made.status === 201, `the monitor: ${JSON.stringify(made.body)}`);
+    const id = made.body.id;
+    const ids = [];
+    try {
+      await page.goto(`${BASE}/observe/downtimes`);
+      await page.getByRole("button", { name: "New downtime", exact: true }).click();
+      let d = page.getByRole("dialog");
+      await d.getByLabel("Monitor", { exact: true }).selectOption(id);
+      await fillIn(d.getByLabel("Scope (optional)", { exact: true }), "host:a");
+      const end = new Date(Date.now() + 3_600_000 - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+      await fillIn(d.getByLabel("To", { exact: true }), end);
+      await d.getByRole("button", { name: "Make it", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      const row = page.getByRole("row").filter({ hasText: name });
+      await row.getByText("Holding", { exact: true }).waitFor();
+      const listed = (await api("GET", "/api/observe/v1/downtimes")).body.downtimes.filter((x) => x.monitor_identifier.monitor_id === id);
+      expect(listed.length === 1 && listed[0].scope === "host:a" && listed[0].status === "active", `kept as made: ${JSON.stringify(listed)}`);
+      ids.push(listed[0].id);
+      // On the monitor's page: held, until when.
+      await page.goto(`${BASE}/observe/monitors/${id}`);
+      await page.getByRole("link", { name: /^Held by a downtime until/ }).waitFor();
+      // Canceled from its row: kept, canceled.
+      await page.goto(`${BASE}/observe/downtimes`);
+      await row.getByRole("button", { name: "Cancel", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Cancel it", exact: true }).click();
+      await row.getByText("Canceled", { exact: true }).waitFor();
+      // Recurring: weekly on Saturdays and Sundays, four hours, said in words.
+      await page.getByRole("button", { name: "New downtime", exact: true }).click();
+      d = page.getByRole("dialog");
+      await d.getByLabel("Monitor", { exact: true }).selectOption(id);
+      await d.getByRole("group", { name: "When", exact: true }).getByRole("button", { name: "Recurring", exact: true }).click();
+      await fillIn(d.getByLabel("For", { exact: true }), "4h");
+      await fillIn(d.getByLabel("Timezone", { exact: true }), "Europe/Paris");
+      await d.getByRole("button", { name: "Make it", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      await page
+        .getByText(/Weekly on Sat, Sun at 02:00 for 4h \(Europe\/Paris\)/)
+        .filter({ visible: true })
+        .first()
+        .waitFor();
+      const rec = (await api("GET", "/api/observe/v1/downtimes")).body.downtimes.find((x) => x.monitor_identifier.monitor_id === id && x.schedule.recurrences);
+      expect(rec && rec.schedule.recurrences[0].rrule === "FREQ=WEEKLY;BYDAY=SA,SU" && rec.schedule.timezone === "Europe/Paris", `the rule: ${JSON.stringify(rec)}`);
+      ids.push(rec.id);
+    } finally {
+      for (const x of ids) await api("DELETE", `/api/observe/v1/downtimes/${x}`);
+      await api("DELETE", `/api/observe/v1/monitors/${id}`);
+    }
+  },
+
   /** A ratio SLO made from the form over counts whose share failing is known: its standing as the
    * page and the API say it; its two burn-rate alerts added, then evaluated to the burn rate; its
    * deletion refused while they read it; its target changed; then deleted. */

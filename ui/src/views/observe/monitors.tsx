@@ -28,11 +28,16 @@ export default function Monitors() {
         title="Monitors"
         lead="Each one a query kiln evaluates as data arrives: a metric, how it changed, or a count of logs, against thresholds. A change of state is an event, and a message to the integrations it mentions."
         actions={
-          <Button asChild>
-            <Link to="/observe/monitors/new">
-              <Plus /> New monitor
-            </Link>
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" asChild>
+              <Link to="/observe/downtimes">Downtimes</Link>
+            </Button>
+            <Button asChild>
+              <Link to="/observe/monitors/new">
+                <Plus /> New monitor
+              </Link>
+            </Button>
+          </div>
         }
       />
       <ObserveNav />

@@ -28,6 +28,7 @@ import { Route as AppDeploymentsIndexRouteImport } from './routes/_app.deploymen
 import { Route as AppDeploymentsNewRouteImport } from './routes/_app.deployments.new'
 import { Route as AppDeploymentsPlansRouteImport } from './routes/_app.deployments.plans'
 import { Route as AppObserveIndexRouteImport } from './routes/_app.observe.index'
+import { Route as AppObserveDowntimesRouteImport } from './routes/_app.observe.downtimes'
 import { Route as AppObserveEventsRouteImport } from './routes/_app.observe.events'
 import { Route as AppObserveIntegrationsRouteImport } from './routes/_app.observe.integrations'
 import { Route as AppObserveLiveRouteImport } from './routes/_app.observe.live'
@@ -145,6 +146,11 @@ const AppDeploymentsPlansRoute = AppDeploymentsPlansRouteImport.update({
 const AppObserveIndexRoute = AppObserveIndexRouteImport.update({
   id: '/observe/',
   path: '/observe/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppObserveDowntimesRoute = AppObserveDowntimesRouteImport.update({
+  id: '/observe/downtimes',
+  path: '/observe/downtimes',
   getParentRoute: () => AppRoute,
 } as any)
 const AppObserveEventsRoute = AppObserveEventsRouteImport.update({
@@ -287,6 +293,7 @@ export interface FileRoutesByFullPath {
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
+  '/observe/downtimes': typeof AppObserveDowntimesRoute
   '/observe/events': typeof AppObserveEventsRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
   '/observe/live': typeof AppObserveLiveRoute
@@ -331,6 +338,7 @@ export interface FileRoutesByTo {
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
+  '/observe/downtimes': typeof AppObserveDowntimesRoute
   '/observe/events': typeof AppObserveEventsRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
   '/observe/live': typeof AppObserveLiveRoute
@@ -377,6 +385,7 @@ export interface FileRoutesById {
   '/_app/agents/sessions': typeof AppAgentsSessionsRoute
   '/_app/deployments/new': typeof AppDeploymentsNewRoute
   '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
+  '/_app/observe/downtimes': typeof AppObserveDowntimesRoute
   '/_app/observe/events': typeof AppObserveEventsRoute
   '/_app/observe/integrations': typeof AppObserveIntegrationsRoute
   '/_app/observe/live': typeof AppObserveLiveRoute
@@ -423,6 +432,7 @@ export interface FileRouteTypes {
     | '/agents/sessions'
     | '/deployments/new'
     | '/deployments/plans'
+    | '/observe/downtimes'
     | '/observe/events'
     | '/observe/integrations'
     | '/observe/live'
@@ -467,6 +477,7 @@ export interface FileRouteTypes {
     | '/agents/sessions'
     | '/deployments/new'
     | '/deployments/plans'
+    | '/observe/downtimes'
     | '/observe/events'
     | '/observe/integrations'
     | '/observe/live'
@@ -512,6 +523,7 @@ export interface FileRouteTypes {
     | '/_app/agents/sessions'
     | '/_app/deployments/new'
     | '/_app/deployments/plans'
+    | '/_app/observe/downtimes'
     | '/_app/observe/events'
     | '/_app/observe/integrations'
     | '/_app/observe/live'
@@ -679,6 +691,13 @@ declare module '@tanstack/react-router' {
       path: '/observe'
       fullPath: '/observe/'
       preLoaderRoute: typeof AppObserveIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/observe/downtimes': {
+      id: '/_app/observe/downtimes'
+      path: '/observe/downtimes'
+      fullPath: '/observe/downtimes'
+      preLoaderRoute: typeof AppObserveDowntimesRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/observe/events': {
@@ -868,6 +887,7 @@ interface AppRouteChildren {
   AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
   AppDeploymentsNewRoute: typeof AppDeploymentsNewRoute
   AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
+  AppObserveDowntimesRoute: typeof AppObserveDowntimesRoute
   AppObserveEventsRoute: typeof AppObserveEventsRoute
   AppObserveIntegrationsRoute: typeof AppObserveIntegrationsRoute
   AppObserveLiveRoute: typeof AppObserveLiveRoute
@@ -912,6 +932,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppAgentsSessionsRoute: AppAgentsSessionsRoute,
   AppDeploymentsNewRoute: AppDeploymentsNewRoute,
   AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,
+  AppObserveDowntimesRoute: AppObserveDowntimesRoute,
   AppObserveEventsRoute: AppObserveEventsRoute,
   AppObserveIntegrationsRoute: AppObserveIntegrationsRoute,
   AppObserveLiveRoute: AppObserveLiveRoute,

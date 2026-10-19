@@ -176,7 +176,32 @@ export interface Monitor {
   state: MonitorState;
   groups: MonitorGroup[];
   composite?: CompositeOf;
+  /** The downtimes that hold it now, or will. */
+  downtimes?: Downtime[];
 }
+
+/** One recurrence of a downtime: an RFC 5545 rule, its first wall-clock start in the schedule's timezone, how long each lasts. */
+export interface DowntimeRecurrence {
+  rrule: string;
+  start: string;
+  duration: string;
+}
+
+/** A downtime as it is sent (Datadog's v2): the monitors it holds (one, or every one with these tags), the groups (a scope), when. */
+export interface DowntimeIn {
+  message?: string;
+  monitor_identifier: { monitor_id?: string; monitor_tags?: string[] };
+  scope?: string;
+  schedule: { start?: number; end?: number } | { recurrences: DowntimeRecurrence[]; timezone?: string };
+  mute_first_recovery_notification?: boolean;
+  notify_end_states?: ("alert" | "no data" | "warn")[];
+  notify_end_types?: ("canceled" | "expired")[];
+}
+
+export type DowntimeStatus = "active" | "scheduled" | "ended" | "canceled";
+
+/** A downtime as the API shows it: its status, and its window now or next. */
+export type Downtime = DowntimeIn & { id: string; canceled?: number; created: number; modified: number; status: DowntimeStatus; window: { start: number; end: number | null } | null };
 
 /** A monitor's query checked: its condition, and what it watches (to draw), or why it is not one. */
 export interface MonitorCheck {
@@ -660,6 +685,10 @@ export const observeApi = {
   monitors: (signal?: AbortSignal) => request<{ monitors: Monitor[] }>("GET", `${BASE}/monitors`, undefined, { signal }).then((r) => r.monitors),
   monitor: (id: string, signal?: AbortSignal) => request<Monitor>("GET", `${BASE}/monitors/${enc(id)}`, undefined, { signal }),
   createMonitor: (m: MonitorIn) => request<Monitor>("POST", `${BASE}/monitors`, m),
+  downtimes: (signal?: AbortSignal) => request<{ downtimes: Downtime[] }>("GET", `${BASE}/downtimes`, undefined, { signal }).then((r) => r.downtimes),
+  createDowntime: (d: DowntimeIn) => request<Downtime>("POST", `${BASE}/downtimes`, d),
+  updateDowntime: (id: string, d: DowntimeIn) => request<Downtime>("PUT", `${BASE}/downtimes/${enc(id)}`, d),
+  cancelDowntime: (id: string) => request<void>("DELETE", `${BASE}/downtimes/${enc(id)}`),
   updateMonitor: (id: string, m: MonitorIn) => request<Monitor>("PUT", `${BASE}/monitors/${enc(id)}`, m),
   deleteMonitor: (id: string) => request<void>("DELETE", `${BASE}/monitors/${enc(id)}`),
   validateMonitor: (query: string, signal?: AbortSignal, type?: string) => request<MonitorCheck>("POST", `${BASE}/monitors/validate`, { query, type }, { signal }),

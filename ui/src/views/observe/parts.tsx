@@ -22,6 +22,7 @@ import {
   type LogSource,
   type Pipeline,
   type LogMetric,
+  type Downtime,
   type LogMetricCounting,
 } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
@@ -419,6 +420,7 @@ export function Histogram({ h, range, height = 120 }: { h: LogHistogram; range: 
 
 export const statusRes: Res<ObserveStatus> = { key: "observe/status", fetch: (s) => observeApi.status(s), opts: { pollMs: 15_000 } };
 export const monitorsRes: Res<Monitor[]> = { key: "observe/monitors", fetch: (s) => observeApi.monitors(s), opts: { pollMs: 30_000 } };
+export const downtimesRes: Res<Downtime[]> = { key: "observe/downtimes", fetch: (s) => observeApi.downtimes(s), opts: { pollMs: 30_000 } };
 // One item's key is not under its list's: a list refreshed after a delete must not refresh the item deleted.
 export const monitorRes = (id: string): Res<Monitor> => ({ key: `observe/monitor/${id}`, fetch: (s) => observeApi.monitor(id, s), opts: { pollMs: 30_000 } });
 export const slosRes: Res<Slo[]> = { key: "observe/slos", fetch: (s) => observeApi.slos(s), opts: { pollMs: 60_000 } };

@@ -25,6 +25,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations); the Event Log on a Windows machine | in progress |
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
+| O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
@@ -539,6 +540,7 @@ its schema (§13). Built:
 | `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, read-only) and yours, kept in `<observe>/dashboards.json` |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
+| `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
@@ -987,6 +989,31 @@ six, 10% in three days), so another timeframe's rates are scaled to its hours: 3
 days, 43.2 and 18 for 90; the SLO's page adds the two that page so. An SLO a monitor reads is not
 deleted until the monitor is.
 
+### 9.3 Downtimes
+
+Datadog's downtimes (`crate::observe::downtimes`, `kiln_obs::monitor::downtime`): monitors'
+notifications held for a while, for the monitors a downtime names (one by its id, or every one that
+carries all of some tags) and the groups its scope holds (`env:prod host:(web-1 OR web-2) -region:eu`,
+a value a glob; `*` every group; a monitor of one group only by `*`). Its schedule is once (from a
+time, now when none, to a time, until canceled when none) or recurring: up to five recurrences, each
+an RFC 5545 rule, the wall-clock time its first occurrence begins at, and how long each lasts, in a
+timezone. The rules taken are the ones downtimes use: `FREQ` of `DAILY`, `WEEKLY`, `MONTHLY` or
+`YEARLY` (none oftener: an hourly downtime is a schedule's job, not a calendar's), `INTERVAL`,
+`BYDAY` (with an ordinal in a month or a year: `2TU` Patch Tuesday, `-1FR` the last Friday),
+`BYMONTHDAY` (from the end when negative), `BYMONTH`, `COUNT`, `UNTIL` and `WKST`; an occurrence
+begins at the start's time of day on each day the rule names, a time a change of offset skips taken
+after the change and one it makes twice the earlier, as RFC 5545 has it (a test holds rules to the
+days they name across offsets: the second Tuesday of three months at 22:00 New York, EDT then EST).
+
+A group a downtime holds still changes state (an event, `@downtime_id` its downtime's, `muted:true`)
+and says nothing. As a downtime's window ends (it expires, or is canceled while it holds, as its
+`notify_end_types` say: expiring alone unless said), each group it held that is in one of its
+`notify_end_states` (alert, warn, no data: all three unless said) is told once, as a renotification;
+and, if it asks (`mute_first_recovery_notification`), that group's first recovery after says
+nothing. A window's end is told once whatever the server does meanwhile: the windows that hold are
+looked at each second, an end found when the one that held is gone. Canceling keeps a downtime (its
+status `canceled`); one canceled or ended is forgotten after 30 days. `<observe>/downtimes.json`.
+
 ## 10. Integrations
 
 Notifications (`crate::observe::notify`), each in its service's format: Slack (incoming webhook,
@@ -1141,6 +1168,11 @@ time range and the search in the address (a page is a link).
   range with its thresholds, what it said (its events), mute and unmute; made and edited in a form
   that checks its query. A composite (the form's other kind) is its monitors chosen by letter and a
   condition over the letters; its page lists what it reads, each one's state a link away.
+- **Downtimes** (a link from the monitors): each one's status (holding, scheduled, ended, canceled),
+  the monitors and groups it holds, when (once, or its rule in words: "Weekly on Sat, Sun at 02:00 for
+  4h (Europe/Paris)"), its window now or next; made and edited in a form (a monitor or monitors
+  tagged, a scope, once or recurring with a weekly builder or a rule of one's own, what to tell as it
+  ends), canceled from its row. A monitor's page says the downtime that holds it, until when.
 - **SLOs**: their states, in trouble first; each one's target and timeframe, SLI, budget left (a
   meter) and the hour's burn rate. An SLO's page: its standing and its four burn rates; each day's
   SLI against the target and the budget left through it, as lines (an SLI's days differ in their
@@ -2167,6 +2199,17 @@ late batch held every window back five minutes (the settle was the most any batc
 99th percentile; the entries a server applies again as it opens looked minutes late (the settle 30
 s after a restart), now told apart as the live tail tells them; and the log intake kept a nested
 attribute as one JSON text where Datadog's reads `@http.status_code`, now flattened as theirs.
+
+**Downtimes** (`observe_live.rs`): a server and a webhook; a monitor of two hosts, and a downtime of
+the monitor's tag scoped to host `a` for 40 s, asking to be told of alerts as it expires and to keep
+the first recovery after quiet. Both hosts alert: `b` is told, `a` is not (its alert an event marked
+with the downtime, `muted:true`); the monitor shows the downtime. As it expires, `a`, still alerting,
+is told once (no more twelve seconds on); both recover: `b`'s recovery is told, `a`'s is not. A daily
+downtime begun a minute before, an hour long, holds at once; canceled, it tells nothing (it asked of
+expiring only); both are listed after, the first ended, the second canceled. Passes (100 s). In a
+browser: a downtime made in the form for a monitor's group (a time to end), holding at once, shown on
+the monitor's page, canceled from its row; a weekly one made with the builder, said in words, its
+rule `FREQ=WEEKLY;BYDAY=SA,SU` in Europe/Paris; in Chromium and WebKit as a phone.
 
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a

@@ -276,6 +276,21 @@ fn monitor_json(ms: &super::monitors::Monitors, m: &super::monitors::Monitor) ->
         if let Ok(super::monitors::Compiled::Composite(c)) = m.compiled() {
             o.insert("composite".into(), composite_json(ms, &c));
         }
+        // The downtimes that hold it now, or will.
+        let now = crate::util::now_ms();
+        let dts: Vec<Value> = ms.downtimes.of_monitor(&m.id, &m.tags, now).iter().map(|d| downtime_json(d, now)).collect();
+        o.insert("downtimes".into(), Value::Array(dts));
+    }
+    v
+}
+
+/// A downtime as the API shows it: as kept, with its status and its window now (or its next).
+fn downtime_json(d: &super::downtimes::Downtime, now: i64) -> Value {
+    let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
+    if let Value::Object(o) = &mut v {
+        o.insert("status".into(), Value::from(d.status(now)));
+        let w = d.window(now).map(|(s, e)| json!({ "start": s, "end": (e != i64::MAX).then_some(e) }));
+        o.insert("window".into(), w.unwrap_or(Value::Null));
     }
     v
 }
@@ -421,6 +436,37 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             observe()?.verify();
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "verifying": true })))
         }
+        (&Method::GET, ["downtimes"]) => {
+            let now = crate::util::now_ms();
+            let list: Vec<Value> = monitors()?.downtimes.list().iter().map(|d| downtime_json(d, now)).collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "downtimes": list })))
+        }
+        (&Method::POST, ["downtimes"]) => {
+            let mut d: super::downtimes::Downtime = read_json(req.into_body(), QUERY_BODY).await?;
+            d.id.clear();
+            let d = monitors()?.downtimes.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::CREATED, &downtime_json(&d, crate::util::now_ms())))
+        }
+        (&Method::GET, ["downtimes", id]) => {
+            let d = monitors()?.downtimes.get(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such downtime"))?;
+            Ok(srv::json(StatusCode::OK, &downtime_json(&d, crate::util::now_ms())))
+        }
+        (&Method::PUT, ["downtimes", id]) => {
+            let ms = monitors()?;
+            let id = (*id).to_owned();
+            if ms.downtimes.get(&id).is_none() {
+                return Err(fail(StatusCode::NOT_FOUND, "no such downtime"));
+            }
+            let mut d: super::downtimes::Downtime = read_json(req.into_body(), QUERY_BODY).await?;
+            d.id = id;
+            let d = ms.downtimes.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::OK, &downtime_json(&d, crate::util::now_ms())))
+        }
+        // Canceled, as Datadog's are: kept, its status `canceled`.
+        (&Method::DELETE, ["downtimes", id]) => match monitors()?.downtimes.cancel(id).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
+            true => Ok(srv::status(StatusCode::NO_CONTENT)),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such downtime")),
+        },
         (&Method::GET, ["monitors"]) => {
             let ms = monitors()?;
             Ok(srv::json(StatusCode::OK, &json!({ "monitors": ms.list().iter().map(|m| monitor_json(ms, m)).collect::<Vec<_>>() })))

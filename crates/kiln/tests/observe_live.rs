@@ -420,6 +420,96 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
     Ok(())
 }
 
+/// A downtime holds a monitor's groups in its scope while it is active: those say nothing (their
+/// events marked with it) while the others do; as it expires, a group still alerting is told once,
+/// and its first recovery after says nothing, as the downtime asked. A recurring one shows on the
+/// monitor while it holds, and canceled, tells nothing (it asked to be told of expiring only).
+#[test]
+#[ignore = "starts real processes"]
+fn a_downtime_holds_its_groups_and_tells_what_is_still_wrong_as_it_ends() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, b) = f.request("PUT", "/api/observe/v1/integrations/ops", Some(&json!({ "kind": "webhook", "url": mock.url("/hook") })))?;
+    anyhow::ensure!(code == 204, "integration: {code} {}", String::from_utf8_lossy(&b));
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({ "name": "e2e dt", "query": "last(last_1m):max:e2e.dt{*} by {host} > 100", "message": "{{host.name}} at {{value}} @webhook-ops", "options": { "every": 10, "thresholds": { "critical": 100 } }, "tags": ["team:dt"] })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    // Held: host a's groups, by the monitor's tag, for 40 s from now.
+    let now = crate_now();
+    let d = f.call(
+        "POST",
+        "/api/observe/v1/downtimes",
+        Some(&json!({ "monitor_identifier": { "monitor_tags": ["team:dt"] }, "scope": "host:a", "schedule": { "start": now - 1_000, "end": now + 40_000 }, "notify_end_states": ["alert"], "mute_first_recovery_notification": true, "message": "patching a" })),
+    )?;
+    let dt = at(&d, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(at(&d, &["status"]) == "active" && at(&d, &["window", "end"]).as_i64() == Some(now + 40_000), "{d:#}");
+    let heard = |host: &str, state: &str| -> usize { mock.at("/hook").iter().filter(|g| at(&g.json(), &["notice", "state"]) == state && at(&g.json(), &["notice", "group"]).to_string().contains(&format!("\"{host}\""))).count() };
+    let write = |host: &str, v: f64| f.write("e2e.dt", &[host], crate_now() - 50_000, 6, |_, _| v);
+    write("a", 150.0)?;
+    write("b", 150.0)?;
+    let start = Instant::now();
+    while heard("b", "ALERT") == 0 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(40), "b never alerted\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+    anyhow::ensure!(at(&m, &["state"]) == "ALERT" && at(&m, &["downtimes"]).as_array().is_some_and(|d| d.iter().any(|x| at(x, &["id"]) == dt.as_str())), "{m:#}");
+    anyhow::ensure!(heard("a", "ALERT") == 0, "a group held said something");
+    // a's alert: an event (written as the group's thread gets to it), marked held.
+    let start = Instant::now();
+    loop {
+        let events = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:kiln.event @monitor_id:{id} @event.type:monitor.alert @downtime_id:{dt}"), "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 10 })))?;
+        if at(&events, &["records"]).as_array().is_some_and(|r| r.len() == 1 && r.first().is_some_and(|e| at(e, &["attributes", "muted"]) == "true")) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(15), "a's alert, an event marked held: {events}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Expired, a still alerting: told once.
+    let start = Instant::now();
+    while heard("a", "ALERT") == 0 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(70), "a was never told as the downtime ended\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let d = f.call("GET", &format!("/api/observe/v1/downtimes/{dt}"), None)?;
+    anyhow::ensure!(at(&d, &["status"]) == "ended", "{d:#}");
+    std::thread::sleep(Duration::from_secs(12));
+    anyhow::ensure!(heard("a", "ALERT") == 1, "told {} times", heard("a", "ALERT"));
+    // Both recover: b's is told, a's first one is not (the downtime asked so).
+    write("a", 50.0)?;
+    write("b", 50.0)?;
+    let start = Instant::now();
+    while heard("b", "OK") == 0 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(40), "b never recovered\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    f.until(Duration::from_secs(40), "a recovered", |_| f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).is_ok_and(|m| at(&m, &["state"]) == "OK"))?;
+    std::thread::sleep(Duration::from_secs(3));
+    anyhow::ensure!(heard("a", "OK") == 0, "a's first recovery after the downtime was told");
+    // Recurring: a daily window begun a minute ago, in UTC, an hour long; then canceled, which
+    // tells nothing.
+    let t = time::OffsetDateTime::from_unix_timestamp(crate_now() / 1000 - 60).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let start_local = format!("{:04}-{:02}-{:02}T{:02}:{:02}:00", t.year(), u8::from(t.month()), t.day(), t.hour(), t.minute());
+    let r = f.call("POST", "/api/observe/v1/downtimes", Some(&json!({ "monitor_identifier": { "monitor_id": id }, "schedule": { "recurrences": [{ "rrule": "FREQ=DAILY", "start": start_local, "duration": "1h" }], "timezone": "UTC" } })))?;
+    let rid = at(&r, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(at(&r, &["status"]) == "active", "{r:#}");
+    write("a", 150.0)?;
+    f.until(Duration::from_secs(40), "a alerting again", |_| f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).is_ok_and(|m| at(&m, &["state"]) == "ALERT"))?;
+    let before = mock.at("/hook").len();
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/downtimes/{rid}"), None)?;
+    anyhow::ensure!(code == 204, "cancel: {code}");
+    anyhow::ensure!(at(&f.call("GET", &format!("/api/observe/v1/downtimes/{rid}"), None)?, &["status"]) == "canceled");
+    std::thread::sleep(Duration::from_secs(12));
+    anyhow::ensure!(mock.at("/hook").len() == before, "a canceled downtime told: {}", mock.at("/hook").len() - before);
+    let listed = f.call("GET", "/api/observe/v1/downtimes", None)?;
+    anyhow::ensure!(at(&listed, &["downtimes"]).as_array().is_some_and(|d| d.len() == 2), "{listed:#}");
+    Ok(())
+}
+
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     use hmac::{KeyInit as _, Mac as _};
     match hmac::Hmac::<sha2::Sha256>::new_from_slice(key) {
@@ -1455,6 +1545,19 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     for i in [&i1, &i2] {
         check("DELETE", &format!("{base}/pipelines/{i}"), &ppath, None, 204)?;
     }
+    // Downtimes: once and recurring; one that names no monitor refused; canceled, kept.
+    let dpath = format!("{base}/downtimes/{{id}}");
+    let once = check("POST", &format!("{base}/downtimes"), &format!("{base}/downtimes"), Some(json!({ "monitor_identifier": { "monitor_tags": ["team:e2e"] }, "scope": "host:a", "schedule": { "end": "2099-01-01T00:00:00Z" }, "message": "m" })), 201)?;
+    let rec = check("POST", &format!("{base}/downtimes"), &format!("{base}/downtimes"), Some(json!({ "monitor_identifier": { "monitor_id": "m0" }, "schedule": { "recurrences": [{ "rrule": "FREQ=WEEKLY;BYDAY=SA,SU", "start": "2026-10-24T02:00", "duration": "4h" }], "timezone": "America/New_York" } })), 201)?;
+    check("POST", &format!("{base}/downtimes"), &format!("{base}/downtimes"), Some(json!({ "monitor_identifier": {}, "schedule": {} })), 400)?;
+    let (d1, d2) = (at(&once, &["id"]).as_str().unwrap_or("").to_owned(), at(&rec, &["id"]).as_str().unwrap_or("").to_owned());
+    check("GET", &format!("{base}/downtimes"), &format!("{base}/downtimes"), None, 200)?;
+    check("GET", &format!("{base}/downtimes/{d2}"), &dpath, None, 200)?;
+    check("PUT", &format!("{base}/downtimes/{d1}"), &dpath, Some(json!({ "monitor_identifier": { "monitor_tags": ["team:e2e"] }, "schedule": {}, "notify_end_types": ["canceled", "expired"] })), 200)?;
+    for d in [&d1, &d2] {
+        check("DELETE", &format!("{base}/downtimes/{d}"), &dpath, None, 204)?;
+    }
+    check("DELETE", &format!("{base}/downtimes/dtnone"), &dpath, None, 404)?;
     // Metrics from logs: kiln's shape and Datadog's; a name of kiln's refused, as is a second
     // writer of one's series; what one computes stays.
     let lm = json!({ "name": "api.errors", "compute": { "aggregation_type": "count" }, "filter": { "query": "status:error" }, "group_by": [{ "path": "service" }] });

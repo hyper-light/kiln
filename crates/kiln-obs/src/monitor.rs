@@ -23,6 +23,7 @@
 //! with no data keeps its state, or goes to NO DATA when the monitor asks to be told.
 
 pub mod composite;
+pub mod downtime;
 
 use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
