@@ -43,6 +43,13 @@ pub fn describe(server: &str, tool: &str, input: &serde_json::Value) -> Option<(
         "runners" => (ToolKind::Search, s("want").map_or_else(|| "Runners".to_owned(), |w| format!("Runners for {w}")), None),
         "output" => (ToolKind::Shell, format!("output of {}", s("id").unwrap_or_default()), None),
         "stop" => (ToolKind::Shell, format!("stop {}", s("id").unwrap_or_default()), None),
+        "show_page" => (ToolKind::Mcp, s("title").unwrap_or_else(|| "A page".to_owned()), None),
+        "preview_page" => {
+            let what = s("url").or_else(|| s("path")).unwrap_or_else(|| "a page".to_owned());
+            let w = input.get("width").and_then(serde_json::Value::as_u64).unwrap_or(390);
+            let h = input.get("height").and_then(serde_json::Value::as_u64).unwrap_or(844);
+            (ToolKind::Web, format!("Preview {what}"), Some(format!("{w}×{h}")))
+        }
         _ => return None,
     })
 }
@@ -63,6 +70,22 @@ pub struct Shown {
 
 pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
     let tool = tool_name.strip_prefix("mcp__kiln__").or_else(|| tool_name.strip_prefix("mcp__kiln-reach__")).or_else(|| tool_name.strip_prefix("mcp__kiln_reach__"))?;
+    // A page shown or previewed: what it said, on one line (its picture is for the agent; the
+    // conversation shows the page itself).
+    if matches!(tool, "show_page" | "preview_page") {
+        let text = match result {
+            serde_json::Value::String(s) => s.lines().find(|l| l.starts_with('{')).map(str::to_owned),
+            serde_json::Value::Object(o) => o
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|c| c.iter().find_map(|b| b.get("text").and_then(serde_json::Value::as_str)))
+                .map(str::to_owned)
+                .or_else(|| o.get("structuredContent").map(serde_json::Value::to_string)),
+            _ => None,
+        }?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        return Some(Shown { output: v.to_string(), exit_code: None, runner: None });
+    }
     if !matches!(tool, "run" | "output" | "stop") {
         return None;
     }

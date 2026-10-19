@@ -141,7 +141,7 @@ impl Keeper {
 
     /// Content no list names goes (and copies left half-made); returns what's left. Past the
     /// server's budget, the lists of conversations that changed least recently go first.
-    fn sweep(&self) -> u64 {
+    fn sweep(&self, also: &HashSet<String>) -> u64 {
         let Ok(entries) = std::fs::read_dir(&self.dir) else { return 0 };
         let mut lists: Vec<(std::time::SystemTime, PathBuf, Vec<Kept>)> = entries
             .flatten()
@@ -167,7 +167,9 @@ impl Keeper {
             }
             sizes.insert(name, md.map_or(0, |m| m.len()));
         }
-        let named = |lists: &[(std::time::SystemTime, PathBuf, Vec<Kept>)]| -> HashSet<String> { lists.iter().flat_map(|(_, _, l)| l.iter().filter_map(|k| k.sha.clone())).collect() };
+        // What lists name, and what pages use (`super::visuals`: theirs stays while their
+        // conversation does).
+        let named = |lists: &[(std::time::SystemTime, PathBuf, Vec<Kept>)]| -> HashSet<String> { lists.iter().flat_map(|(_, _, l)| l.iter().filter_map(|k| k.sha.clone())).chain(also.iter().cloned()).collect() };
         let mut keep = named(&lists);
         let mut used: u64 = sizes.iter().filter(|(s, _)| keep.contains(*s)).map(|(_, n)| n).sum();
         // Over budget: the oldest conversations' copies go (their lists stay, read live).
@@ -201,7 +203,7 @@ impl Keeper {
         loop {
             if Instant::now() >= next_sweep {
                 let h = hub.clone();
-                let used = crate::rt::blocking(move || h.harness.keeper.sweep()).await.unwrap_or(0);
+                let used = crate::rt::blocking(move || h.harness.keeper.sweep(&h.harness.visuals.shas())).await.unwrap_or(0);
                 hub.harness.keeper.used.store(used, Ordering::Relaxed);
                 next_sweep = Instant::now() + SWEEP_EVERY;
             }
@@ -238,6 +240,18 @@ pub async fn piece(hub: &Hub, location: &Location, session: &str, path: &str, of
             Ok(Some((serde_json::from_str(&json)?, data)))
         }
     }
+}
+
+/// A file of a session's machine into the store (a page's picture, style or script,
+/// `super::visuals`), up to `most` bytes: its content's SHA-256, and what it is.
+pub async fn store_file(hub: &Arc<Hub>, location: &Location, session: &str, path: &str, most: u64) -> anyhow::Result<(String, Meta)> {
+    let Some((answer, first)) = piece(hub, location, session, path, 0, PIECE).await? else {
+        anyhow::bail!("its machine's runner doesn't read files yet: upgrade it")
+    };
+    let meta = answer.meta.ok_or_else(|| anyhow::anyhow!(answer.error.unwrap_or_else(|| "it couldn't be read".to_owned())))?;
+    anyhow::ensure!(meta.size <= most, "it's {} MB; a page's file may be up to {} MB", meta.size >> 20, most >> 20);
+    let sha = copy(hub, location, session, "page", path, &meta, first).await?;
+    Ok((sha, meta))
 }
 
 async fn keep(hub: &Arc<Hub>, job: Job) {
@@ -293,7 +307,7 @@ async fn keep_one(hub: &Arc<Hub>, job: &Job, path: &str, list: &[Kept]) -> Optio
     if !fits {
         return Some(entry(Some(meta), None, None));
     }
-    match copy(hub, job, path, &meta, first).await {
+    match copy(hub, &job.location, &job.session, &job.seq.to_string(), path, &meta, first).await {
         Ok(sha) => Some(entry(Some(meta), Some(sha), None)),
         Err(e) => {
             tracing::debug!(session = %job.session, path, error = %format!("{e:#}"), "a file a message mentions couldn't be kept; it's read when someone looks");
@@ -304,9 +318,9 @@ async fn keep_one(hub: &Arc<Hub>, job: &Job, path: &str, list: &[Kept]) -> Optio
 
 /// The whole file into the store, a piece at a time (never all of it in memory), checking it
 /// doesn't change on the way; its SHA-256.
-async fn copy(hub: &Arc<Hub>, job: &Job, path: &str, meta: &Meta, first: Vec<u8>) -> anyhow::Result<String> {
+async fn copy(hub: &Arc<Hub>, location: &Location, session: &str, tag: &str, path: &str, meta: &Meta, first: Vec<u8>) -> anyhow::Result<String> {
     let blobs = hub.harness.keeper.dir.join("blobs");
-    let tmp = blobs.join(format!("{}-{}-{}.part", file_name(&job.session), job.seq, crate::util::now_ms()));
+    let tmp = blobs.join(format!("{}-{tag}-{}.part", file_name(session), crate::util::now_ms()));
     let (b, t) = (blobs.clone(), tmp.clone());
     let file = crate::rt::blocking(move || -> anyhow::Result<std::fs::File> {
         std::fs::create_dir_all(&b)?;
@@ -328,7 +342,7 @@ async fn copy(hub: &Arc<Hub>, job: &Job, path: &str, meta: &Meta, first: Vec<u8>
             if offset >= meta.size {
                 return Ok((file, hasher));
             }
-            let Some((a, d)) = piece(hub, &job.location, &job.session, path, offset, PIECE).await? else { anyhow::bail!("its runner stopped reading files") };
+            let Some((a, d)) = piece(hub, location, session, path, offset, PIECE).await? else { anyhow::bail!("its runner stopped reading files") };
             let m = a.meta.ok_or_else(|| anyhow::anyhow!(a.error.unwrap_or_else(|| "it couldn't be read".to_owned())))?;
             anyhow::ensure!(m.size == meta.size && m.mtime == meta.mtime, "{path} changed while kiln copied it");
             data = d;
@@ -410,8 +424,10 @@ mod tests {
         std::fs::write(blobs.join(&named), b"0123456789")?;
         std::fs::write(blobs.join(&unnamed), b"01234")?;
         k.save("s2", &[Kept { path: "/tmp/b.png".into(), seq: 1, meta: None, sha: Some(named.clone()), error: None }])?;
-        assert_eq!(k.sweep(), 10);
-        assert!(blobs.join(&named).exists() && !blobs.join(&unnamed).exists());
+        let page = "d".repeat(64);
+        std::fs::write(blobs.join(&page), b"0123")?;
+        assert_eq!(k.sweep(&HashSet::from([page.clone()])), 14);
+        assert!(blobs.join(&named).exists() && blobs.join(&page).exists() && !blobs.join(&unnamed).exists());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
