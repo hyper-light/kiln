@@ -575,6 +575,19 @@ button.rv-num:focus-visible {
 .rv-inbox-row:hover .rv-inbox-what {
   color: #ffffff;
 }
+.rv-inbox-read {
+  margin-left: auto;
+}
+/* A notification not read yet: a mark at its start. */
+.rv-inbox-list > li[data-unread] .rv-inbox-what::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 8px 2px 0;
+  border-radius: 50%;
+  background: rgb(var(--rv-pick));
+}
 .rv-inbox-what {
   margin: 0;
   color: var(--rv-text);

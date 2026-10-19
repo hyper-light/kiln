@@ -42,6 +42,11 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("leg.flaky", "a run had flaky tests: a retry passed them, or an attempt failed them and another passed them"),
     ("land.ejected", "diffs were taken out of the land queue, and why"),
     ("runner.offline", "a runner went away and hasn't come back for two minutes"),
+    ("review.requested", "a diff or change request asks someone for a review"),
+    ("comment.reply", "a comment published in a thread, or on someone's diff"),
+    ("mention", "a comment or review names someone (@ada)"),
+    ("quota.near", "a repository's cache is past 90 % of its quota"),
+    ("secret.unused", "a secret no run has read in 90 days"),
     ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),
     // An agent's notes (docs/agentic.md N2, `crate::push`), as people's devices get them.
     ("agent.needs_you", "an agent waits on a person: an approval, a question or a plan"),

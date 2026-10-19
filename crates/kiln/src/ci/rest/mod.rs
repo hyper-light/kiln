@@ -36,7 +36,7 @@ pub mod repos;
 pub mod scanning;
 
 /// The token's repository when `owner/repo` names it: a job's token reads its own only.
-async fn site<'a>(hub: &'a Hub, claims: &Job, owner: &str, repo: &str, origin: &str) -> Result<Option<repos::Site<'a>>, Fail> {
+async fn site<'a>(hub: &'a Arc<Hub>, claims: &Job, owner: &str, repo: &str, origin: &str) -> Result<Option<repos::Site<'a>>, Fail> {
     let full = format!("{owner}/{repo}");
     let all = hub.store.repos().await.map_err(internal)?;
     let Some(r) = all.into_iter().find(|r| r.id == claims.repo && r.name.eq_ignore_ascii_case(&full)) else { return Ok(None) };

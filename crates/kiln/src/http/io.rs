@@ -308,12 +308,19 @@ pub fn public(ip: IpAddr) -> bool {
 /// proxy when it has one (the name was checked here first), else to an address checked.
 pub(crate) async fn connect_reaching(host: &str, port: u16, https: bool, reach: &Reach) -> anyhow::Result<TcpStream> {
     use anyhow::Context as _;
-    let mut addrs = reach.addresses(host, port).await?;
     if let Some(proxy) = super::proxy::settings().choose(https, host, port) {
+        // Where it goes is checked all the same.
+        reach.addresses(host, port).await?;
         let tcp = connect(&proxy.host, proxy.port).await.with_context(|| format!("the proxy {}:{} (for {host}:{port})", proxy.host, proxy.port))?;
         super::proxy::tunnel(&tcp, proxy, host, port).await?;
         return Ok(tcp);
     }
+    connect_direct_reaching(host, port, reach).await
+}
+
+/// [`connect_reaching`] never through a proxy, for what an HTTP proxy doesn't carry (SMTP).
+pub(crate) async fn connect_direct_reaching(host: &str, port: u16, reach: &Reach) -> anyhow::Result<TcpStream> {
+    let mut addrs = reach.addresses(host, port).await?;
     addrs.sort_by_key(|a| !a.is_ipv4());
     let mut last = None;
     for addr in addrs {

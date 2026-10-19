@@ -93,7 +93,7 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     let reviewers = options.reviewers.clone();
     let (head_s, base_s, patch_s) = (s.head.clone(), s.base.clone(), s.patch_id.clone());
     let (title_c, summary_c) = (title.clone(), summary.clone());
-    let made: (String, u32, u32, &'static str, bool) = hub
+    let made: (String, u32, u32, &'static str, bool, Vec<String>) = hub
         .store
         .call(move |c| {
             let tx = c.transaction()?;
@@ -105,7 +105,7 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
                         && *commit == head_s
                     {
                         tx.commit()?;
-                        return Ok((id, number, *n, "unchanged", false));
+                        return Ok((id, number, *n, "unchanged", false, Vec::new()));
                     }
                     let rebase_only = last.as_ref().is_some_and(|(_, _, base, patch)| !patch.is_empty() && *patch == patch_s && *base != base_s);
                     let n = last.map_or(1, |(n, ..)| n + 1);
@@ -131,15 +131,22 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
                 "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![id, n, head_s, base_s, patch_s, summary_c, note, rebase_only, pushed_by, now],
             )?;
+            // Reviewers asked for the first time: they hear of it (W19-R06).
+            let mut asked = Vec::new();
             for r in &reviewers {
-                tx.execute("INSERT OR IGNORE INTO diff_reviewers (diff_id, reviewer, state, added_at) VALUES (?1, ?2, 'not-looked', ?3)", params![id, r, now])?;
+                if tx.execute("INSERT OR IGNORE INTO diff_reviewers (diff_id, reviewer, state, added_at) VALUES (?1, ?2, 'not-looked', ?3)", params![id, r, now])? > 0 {
+                    asked.push(r.clone());
+                }
             }
             tx.commit()?;
-            Ok((id, number, n, kind, rebase_only))
+            Ok((id, number, n, kind, rebase_only, asked))
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
-    let (id, number, n, kind, rebase_only) = made;
+    let (id, number, n, kind, rebase_only, asked) = made;
+    if !asked.is_empty() {
+        crate::rt::spawn(super::notify::diff_event(Arc::clone(hub), repo.name.clone(), "review.requested", format!("CR{number}"), title.clone(), trunk.to_owned(), by.author.0.clone(), String::new(), asked));
+    }
     if kind != "unchanged" {
         let _ = gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/CR{number}/v{n}"), &s.head], LS_REMOTE_TIMEOUT).await;
         let fresh = diffs::Fresh { number, n, sha: s.head.clone(), parent: s.base.clone(), title: title.clone(), summary: summary.clone(), message: summary.clone(), draft, rebase_only, branch: Some(branch.to_owned()), labels: diffs::labels(hub, &id).await };

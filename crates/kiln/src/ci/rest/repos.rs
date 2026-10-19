@@ -8,6 +8,8 @@
 //! - `/tarball/{ref}` and `/zipball/{ref}`;
 //! - `/compare/{base}...{head}`.
 
+use std::sync::Arc;
+
 use base64::Engine as _;
 use http::StatusCode;
 use serde_json::{Value, json};
@@ -20,7 +22,7 @@ use crate::store::Repo;
 
 /// The run's repository, as the facade describes it.
 pub struct Site<'a> {
-    pub hub: &'a Hub,
+    pub hub: &'a Arc<Hub>,
     pub repo: Repo,
     /// `<origin>/api/v3/repos/<owner>/<repo>`.
     pub api: String,
@@ -32,7 +34,7 @@ pub struct Site<'a> {
 }
 
 impl Site<'_> {
-    pub async fn new<'a>(hub: &'a Hub, repo: Repo, origin: &str) -> Site<'a> {
+    pub async fn new<'a>(hub: &'a Arc<Hub>, repo: Repo, origin: &str) -> Site<'a> {
         let f = crate::ci::events::facts(hub, &repo).await;
         Site { api: format!("{origin}/api/v3/repos/{}", repo.name), html: format!("{origin}/{}", repo.name), origin: origin.to_owned(), mirror: f.mirror, default_branch: f.default_branch, hub, repo }
     }

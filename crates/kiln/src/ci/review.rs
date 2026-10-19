@@ -117,7 +117,7 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
 
 /// A new comment: on a thread (`thread`), or a new thread on a version's `file`, `side` and
 /// lines (or on the diff as a whole). A draft until a review publishes it, unless `publish`.
-pub async fn comment(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let (me, _) = who(caller);
     let text = body.get("body").and_then(Value::as_str).unwrap_or_default().trim().to_owned();
     let suggestion = body.get("suggestion").and_then(Value::as_str).map(str::to_owned);
@@ -177,8 +177,37 @@ pub async fn comment(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resu
             "type": "comment", "repo": d.repo, "diff": d.name, "version": version, "thread": tid, "comment": cid, "author": me, "body": said,
             "file": file_c, "side": side_c, "start_line": start, "end_line": end.or(start), "diff_author": d.author, "diff_author_for": d.author_for,
         }));
+        tell(hub, d, &me, vec![(tid.clone(), said)]);
     }
     Ok(json!({ "id": cid, "thread": tid, "draft": !publish }))
+}
+
+/// Who a published comment is news to (W19-R06), for each `(thread, body)`: the people in its
+/// thread and the diff's author (`comment.reply`), and whom it mentions (`mention`), but whoever
+/// wrote it.
+fn tell(hub: &std::sync::Arc<Hub>, d: &Diff, me: &str, said: Vec<(String, String)>) {
+    if said.is_empty() {
+        return;
+    }
+    let (hub, d, me) = (std::sync::Arc::clone(hub), d.clone(), me.to_owned());
+    crate::rt::spawn(async move {
+        for (thread, body) in said {
+            let t = thread.clone();
+            let mut people: Vec<String> = hub
+                .store
+                .call(move |c| {
+                    let mut st = c.prepare("SELECT DISTINCT author FROM review_comments WHERE thread_id = ?1 AND published = 1")?;
+                    let rows = st.query_map([&t], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .await
+                .unwrap_or_default();
+            people.push(d.author.clone());
+            super::notify::diff_event(std::sync::Arc::clone(&hub), d.repo.clone(), "comment.reply", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), body.clone(), people).await;
+            let named = kiln_ci::trigger::context::mentions(&body);
+            super::notify::diff_event(std::sync::Arc::clone(&hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), body, named).await;
+        }
+    });
 }
 
 /// `PATCH /api/comments/:id`: a comment's author edits it (`body`, `suggestion`); anyone who may
@@ -316,7 +345,7 @@ pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
 
 /// `POST /api/diffs/:id/review`: `{ action: accept | request_changes | comment | resign, body }`.
 /// Publishes the reviewer's drafts on the diff with it, and moves the diff's review state.
-pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let (me, agent) = who(caller);
     let action = body.get("action").and_then(Value::as_str).and_then(Action::parse).ok_or_else(|| bad("`action`: accept, request_changes, comment or resign"))?;
     let text = body.get("body").and_then(Value::as_str).unwrap_or_default().trim().to_owned();
@@ -330,11 +359,16 @@ pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resul
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().map_or(1, |v| v.n);
     let (id, me2, text2) = (d.id.clone(), me.clone(), text.clone());
-    let published = hub
+    let (published, drafts) = hub
         .store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = crate::util::now_unix();
+            // What the review publishes, for whom it's news (W19-R06).
+            let drafts: Vec<(String, String)> = {
+                let mut st = tx.prepare("SELECT c.thread_id, c.body FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.author = ?2 AND c.published = 0 ORDER BY c.created_at")?;
+                st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?
+            };
             let published = tx.execute("UPDATE review_comments SET published = 1, updated_at = ?3 WHERE author = ?2 AND published = 0 AND thread_id IN (SELECT id FROM review_threads WHERE diff_id = ?1)", params![id, me2, now])?;
             tx.execute(
                 "INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -357,10 +391,15 @@ pub async fn review(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Resul
                 }
             }
             tx.commit()?;
-            Ok(published)
+            Ok((published, drafts))
         })
         .await
         .map_err(fail)?;
+    tell(hub, d, &me, drafts);
+    if !text.is_empty() {
+        let named = kiln_ci::trigger::context::mentions(&text);
+        crate::rt::spawn(super::notify::diff_event(std::sync::Arc::clone(hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), text.clone(), named));
+    }
     // The review state the reviews give it now (a draft stays a draft, landing stays landing).
     let (_, path) = super::diffs::home(hub, d).await?;
     let (policy, _) = policy(hub, &path, &d.trunk).await;

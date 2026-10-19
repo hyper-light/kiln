@@ -9,10 +9,15 @@
 //!   which only the server's rules take (an agent is no repository's), `where` reading `agent`;
 //!   and a release's (docs/deploy-api.md §12.3): `release.waiting_approval`, `release.succeeded`,
 //!   `release.failed`, `release.cancelled`, which the server's rules take (`where` reading
-//!   `release`) and which go to the app's own channels too (its `contacts.channels`).
+//!   `release`) and which go to the app's own channels too (its `contacts.channels`); for people,
+//!   about a diff or change request: `review.requested`, `comment.reply`, `mention`; and
+//!   `quota.near` (a repository's cache past 90 % of its quota) and `secret.unused` (no run read
+//!   it in 90 days).
 //! - **Channels** are `kind:target`: an integration of that kind (one named `target`, or the
-//!   first, with `target` as its channel or chat): `slack:#ci`, `discord:team-hook`,
-//!   `teams:ops`, `telegram:-1001234`, `pagerduty:oncall`, `opsgenie:ops`, `webhook:audit`.
+//!   first, with `target` as its channel, chat or address): `slack:#ci`, `discord:team-hook`,
+//!   `teams:ops`, `telegram:-1001234`, `pagerduty:oncall`, `opsgenie:ops`, `webhook:audit`,
+//!   `email:ada@example.com`; and kiln's own `inbox` (the people an event is about: a run's actor,
+//!   the reviewers asked, a thread's people, whom a comment mentions) or `inbox:ada`.
 //! - **Deliveries** retry with backoff, webhooks are signed (`X-Kiln-Signature-256`, HMAC-SHA256
 //!   of the body with the integration's secret), and each is recorded (`notify_deliveries`).
 //! - `kiln/notify@v1` sends a message from a step (`POST /_kiln/notify`, the leg's token).
@@ -51,6 +56,11 @@ pub const EVENTS: &[&str] = &[
     "release.succeeded",
     "release.failed",
     "release.cancelled",
+    "review.requested",
+    "comment.reply",
+    "mention",
+    "quota.near",
+    "secret.unused",
 ];
 /// The events about an agent (`crate::push`): the server's rules take them, a repository's can't.
 pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
@@ -64,7 +74,12 @@ const OFFLINE_AFTER: Duration = Duration::from_secs(120);
 /// How long a release's event, once sent through a channel, isn't sent through it again.
 const RELEASE_ONCE: i64 = 90 * 86_400;
 /// The integration kinds that are channels.
-pub const CHANNELS: &[&str] = &["slack", "discord", "teams", "telegram", "pagerduty", "opsgenie", "webhook"];
+pub const CHANNELS: &[&str] = &["slack", "discord", "teams", "telegram", "pagerduty", "opsgenie", "webhook", "email"];
+/// How long a secret goes unread before `secret.unused` is said of it, and said again.
+const UNUSED_AFTER: i64 = 90 * 86_400;
+/// A repository's cache this full is `quota.near` (in hundredths); under the second, it may be said
+/// again.
+const NEAR: (u64, u64) = (90, 80);
 
 fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
@@ -179,6 +194,8 @@ pub struct Subject {
     pub github: Value,
     /// For approvals: which environments.
     pub environments: Vec<String>,
+    /// Whom it's about, for the `inbox` (a run's actor when none).
+    pub people: Vec<String>,
 }
 
 impl Subject {
@@ -204,6 +221,19 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     if event == "message" {
         let line = if s.run.is_empty() { s.url.clone() } else { format!("{} · {} · {}", s.repo, s.branch, s.url) };
         return (s.name.clone(), line);
+    }
+    // A diff's or change request's, for people (`name` is it and its title, `message` what was
+    // said), the cache's and a secret's.
+    // People by name: `user:ada` is ada.
+    let shown = |p: &str| p.strip_prefix("user:").unwrap_or(p).to_owned();
+    let (actor, people) = (shown(&s.actor), s.people.iter().map(|p| shown(p)).collect::<Vec<_>>().join(", "));
+    match event {
+        "review.requested" => return (format!("👀 {actor} asks for a review of {}", s.name), format!("{} · for {people} · {}", s.repo, s.url)),
+        "comment.reply" => return (format!("💬 {actor} replied on {}", s.name), format!("{} · {} · {}", s.repo, s.message.lines().next().unwrap_or_default(), s.url)),
+        "mention" => return (format!("@ {actor} mentioned {people} on {}", s.name), format!("{} · {} · {}", s.repo, s.message.lines().next().unwrap_or_default(), s.url)),
+        "quota.near" => return (format!("⚠ {}'s cache is near its quota", s.repo), format!("{} · {}", s.message, s.url)),
+        "secret.unused" => return (format!("⚠ secret {} hasn't been used in {} days", s.name, UNUSED_AFTER / 86_400), format!("{} · {} · {}", s.repo, s.message, s.url)),
+        _ => {}
     }
     // A land queue's entry: its diffs, why, and where they are.
     if event == "land.ejected" {
@@ -240,6 +270,8 @@ struct Msg {
     resolve: bool,
     /// A webhook channel's body.
     webhook: Value,
+    /// Whom it's about: whose inboxes `inbox` puts it in.
+    people: Vec<String>,
 }
 
 impl Msg {
@@ -248,8 +280,15 @@ impl Msg {
         let webhook = json!({ "event": event, "title": title, "text": line, "run": s.run_value(), "environments": s.environments });
         // A deployment's incident is the environment's; a run's, its workflow's on its branch.
         let dedup = if event.starts_with("deploy.") { format!("kiln:{}:deploy:{}", s.repo, s.environments.join(",")) } else { format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch) };
-        let what = if event == "land.ejected" { "the diff" } else { "the run" };
-        Msg { title, line, url: s.url.clone(), what, dedup, resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"), webhook }
+        let what = match event {
+            "land.ejected" | "review.requested" | "comment.reply" | "mention" => "the diff",
+            "quota.near" => "the cache",
+            "secret.unused" => "the secrets",
+            _ => "the run",
+        };
+        let people = if s.people.is_empty() { vec![s.actor.clone()] } else { s.people.clone() };
+        let people = people.into_iter().filter(|p| !p.is_empty()).collect();
+        Msg { title, line, url: s.url.clone(), what, dedup, resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"), webhook, people }
     }
 
     /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`.
@@ -265,7 +304,7 @@ impl Msg {
         };
         let line = format!("{text} · {machine} · {url}");
         let webhook = json!({ "event": event, "title": title, "text": line, "agent": ev.get("agent").cloned().unwrap_or(Value::Null), "url": url });
-        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook }
+        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new() }
     }
 }
 
@@ -302,7 +341,9 @@ impl Msg {
         parts.push(url.to_owned());
         let line = parts.join(" · ");
         let webhook = json!({ "event": event, "title": title, "text": line, "release": r, "url": url });
-        Msg { title, line, url: url.to_owned(), what: "the release", dedup: format!("kiln:release:{app}:{env}"), resolve: event == "release.succeeded", webhook }
+        // Its approvers while it waits for them; else whoever asked for it.
+        let people = if event == "release.waiting_approval" { approvers.iter().map(|a| (*a).to_owned()).collect() } else { vec![by.clone()] };
+        Msg { title, line, url: url.to_owned(), what: "the release", dedup: format!("kiln:release:{app}:{env}"), resolve: event == "release.succeeded", webhook, people }
     }
 }
 
@@ -327,8 +368,8 @@ async fn throttled(hub: &Hub, key: &str, throttle: Option<i64>) -> bool {
 /// are), and the target in it (a Slack channel, a chat).
 async fn channel(hub: &Hub, repo: Option<&Repo>, spec: &str) -> Result<(Integration, Option<String>), String> {
     let (kind, target) = spec.split_once(':').map_or((spec, ""), |(k, t)| (k, t));
-    if kind == "inbox" || kind == "email" {
-        return Err(format!("`{kind}` channels aren't built yet"));
+    if kind == "inbox" {
+        return Err("the inbox is kiln's own, not an integration".into());
     }
     if !CHANNELS.contains(&kind) {
         return Err(format!("`{kind}` isn't a channel: {} (each an integration)", CHANNELS.join(", ")));
@@ -350,8 +391,11 @@ fn usable_by(i: &Integration, repo: &Repo) -> bool {
 
 /// Sends one message through `i`.
 async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: &Msg) -> Result<(), String> {
-    let client = crate::http::client::Client::public().map_err(|e| format!("{e:#}"))?;
     let secret = integrations::token(hub, i).await.map_err(|e| format!("{e:#}"))?;
+    if i.kind == "email" {
+        return send_email(hub, i, target, secret, m).await;
+    }
+    let client = crate::http::client::Client::public().map_err(|e| format!("{e:#}"))?;
     let (title, line) = (m.title.clone(), m.line.clone());
     let text = format!("{title}\n{line}");
     let cfg = |k: &str| i.config.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.is_empty());
@@ -426,11 +470,41 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: 
     Ok(())
 }
 
+/// An email (W11-R06): through the integration's SMTP server, to `target` (addresses,
+/// comma-separated) or its `to`.
+async fn send_email(hub: &Hub, i: &Integration, target: Option<&str>, password: Option<String>, m: &Msg) -> Result<(), String> {
+    let cfg = |k: &str| i.config.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.is_empty());
+    let tls = super::smtp::Tls::parse(&cfg("tls").unwrap_or_default())?;
+    let host = cfg("host").ok_or_else(|| format!("{} has no `host`", i.name))?;
+    let port = match cfg("port") {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("`port: {p}` isn't a port"))?,
+        None => tls.default_port(),
+    };
+    let from = cfg("from").ok_or_else(|| format!("{} has no `from`", i.name))?;
+    let to: Vec<String> = target.map(str::to_owned).or_else(|| cfg("to")).ok_or("email needs an address: `email:ada@example.com`, or the integration's `to`")?.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).collect();
+    let server = super::smtp::Server { host, port, tls, user: cfg("user"), password, reach: Some(hub.cfg.ci.reach()) };
+    let message = super::smtp::Message { from, to, subject: m.title.clone(), body: format!("{}\n\n{}\n", m.line, m.url) };
+    super::smtp::send(&server, &message).await.map_err(|e| format!("{e:#}"))
+}
+
 /// Delivers through `spec`, retrying (now, after 2 s, after 15 s), and records how it went (with
-/// what it's about: a run's id, or `agent:<id>`).
+/// what it's about: a run's id, or `agent:<id>`). The inbox takes it at once.
 async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about: &str, m: &Msg, spec: &str) {
     let mut attempts = 0;
+    let inbox = spec == "inbox" || spec.starts_with("inbox:");
     let result = match channel(hub, repo, spec).await {
+        Err(_) if inbox => {
+            attempts = 1;
+            let people: Vec<String> = match spec.strip_prefix("inbox:") {
+                Some(named) => named.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+                None => m.people.clone(),
+            };
+            match super::inbox::put(hub, &people, event, &m.title, &m.line, &m.url, repo.map(|r| r.name.as_str())).await {
+                Ok(0) => Err("it's about nobody with an inbox".to_owned()),
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
         Err(e) => Err(e),
         Ok((i, target)) => {
             let mut last = Err(String::new());
@@ -582,7 +656,7 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
     let Some(repo) = hub.store.repos().await?.into_iter().find(|x| x.id == repo_id) else { return Ok(None) };
     let github = input.and_then(|i| serde_json::from_str::<Value>(&i).ok()).and_then(|v| v.get("github").cloned()).unwrap_or(Value::Null);
     let url = format!("{}/runs/{run}", hub.cfg.server.public_url.trim_end_matches('/'));
-    Ok(Some((repo.clone(), Subject { repo: repo.name, run: run.to_owned(), number, workflow, name, branch, sha, message, actor, conclusion: conclusion.unwrap_or_default(), url, github, environments: Vec::new() })))
+    Ok(Some((repo.clone(), Subject { repo: repo.name, run: run.to_owned(), number, workflow, name, branch, sha, message, actor, conclusion: conclusion.unwrap_or_default(), url, github, environments: Vec::new(), people: Vec::new() })))
 }
 
 /// A run ended (W19-R06): `run.failed`, `run.cancelled`, or `run.succeeded` and, after failures
@@ -684,13 +758,18 @@ pub fn runners_gone(hub: &Arc<Hub>) {
 /// rules that take it (`where` reads `runner`: its `name`, `labels` and `gone_for` seconds), and
 /// to the server's webhook subscribers.
 pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
-    let labels = hub.agents.lock().get(&name).map(|a| a.labels.clone()).unwrap_or_default();
+    let live = hub.agents.lock().get(&name).map(|a| a.labels.clone());
+    let labels = match live {
+        Some(l) => l,
+        // Gone from the live runners: the labels it has on record.
+        None => hub.store.agents().await.unwrap_or_default().into_iter().find(|a| a.name == name).map(|a| a.labels).unwrap_or_default(),
+    };
     let runner = json!({ "name": name, "labels": labels, "gone_for": gone_for });
     hub.emit(&json!({ "type": "runner.offline", "runner": runner }));
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
     let title = format!("⚠ runner {name} is offline");
     let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
-    let m = Msg { title: title.clone(), line: line.clone(), url, what: "the runner", dedup: format!("kiln:runner:{name}"), resolve: false, webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }) };
+    let m = Msg { title: title.clone(), line: line.clone(), url, what: "the runner", dedup: format!("kiln:runner:{name}"), resolve: false, webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }), people: Vec::new() };
     for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
         if rule.check(true).is_err() || !takes_ctx(rule, "runner.offline", "runner", &runner) {
             continue;
@@ -704,6 +783,136 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
             deliver(&hub, None, &rule_name, "runner.offline", &format!("runner:{name}"), &m, spec).await;
         }
     }
+}
+
+/// A person-facing event about a diff or change request (W19-R06): `review.requested` (`people`:
+/// the reviewers asked), `comment.reply` (the people in the thread) or `mention` (whom it
+/// mentions), done by `actor`. The repository's rules see `run` as the diff: `name` it and its
+/// title, `workflow` its name, `branch` its trunk, `actor`, `message` (what was said), `url`.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff_event(hub: Arc<Hub>, repo: String, event: &'static str, diff: String, title: String, trunk: String, actor: String, text: String, people: Vec<String>) {
+    let mut people: Vec<String> = people.into_iter().filter(|p| !p.eq_ignore_ascii_case(&actor) && super::inbox::person(p) != super::inbox::person(&actor)).collect();
+    people.sort();
+    people.dedup();
+    if people.is_empty() {
+        return;
+    }
+    let Some(r) = hub.store.repos().await.ok().and_then(|all| all.into_iter().find(|x| x.name == repo)) else { return };
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let s = Subject {
+        repo: repo.clone(),
+        run: format!("diff:{diff}"),
+        workflow: diff.clone(),
+        name: format!("{diff} {title}"),
+        branch: trunk.clone(),
+        message: text,
+        actor: actor.clone(),
+        url: format!("{base}/diffs/{diff}"),
+        github: json!({ "repository": repo, "ref": format!("refs/heads/{trunk}"), "ref_name": trunk, "actor": actor, "event_name": event }),
+        people,
+        ..Subject::default()
+    };
+    emit(&hub, &r, event, &s).await;
+}
+
+/// Repositories told their cache is near its quota, until it's well under it again.
+static NEAR_QUOTA: parking_lot::Mutex<Option<std::collections::HashSet<String>>> = parking_lot::Mutex::new(None);
+
+/// A repository's cache uses `used` of `quota` bytes (after eviction): past 90 %, `quota.near`,
+/// once until it's under 80 % again.
+pub async fn cache_use(hub: &Hub, repo_id: String, used: u64, quota: u64) {
+    if quota == 0 {
+        return;
+    }
+    let pct = used.saturating_mul(100) / quota;
+    {
+        let mut told = NEAR_QUOTA.lock();
+        let told = told.get_or_insert_with(std::collections::HashSet::new);
+        if pct < NEAR.1 {
+            told.remove(&repo_id);
+            return;
+        }
+        if pct < NEAR.0 || !told.insert(repo_id.clone()) {
+            return;
+        }
+    }
+    let Some(repo) = hub.store.repos().await.ok().and_then(|all| all.into_iter().find(|r| r.id == repo_id)) else { return };
+    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let s = Subject {
+        repo: repo.name.clone(),
+        name: "the cache".into(),
+        message: format!("{:.1} GiB of {:.1} GiB ({pct} %); the least recently used entries go first", gib(used), gib(quota)),
+        url: format!("{base}/ci/caches?repo={}", repo.name),
+        github: json!({ "repository": repo.name }),
+        ..Subject::default()
+    };
+    emit(hub, &repo, "quota.near", &s).await;
+}
+
+/// When unused secrets were last looked for.
+static UNUSED_LOOKED: parking_lot::Mutex<i64> = parking_lot::Mutex::new(0);
+
+/// Secrets no run read in 90 days (W19-R06): `secret.unused` for each, again 90 days after it was
+/// said. A repository's and its environments' go through its rules; the server's, through the
+/// server's (`where` reads `secret`: its `name`, `scope` and `last_used_at`). Looked for hourly,
+/// as the scheduler sweeps.
+pub fn secrets_unused(hub: &Arc<Hub>) {
+    let now = crate::util::now_unix();
+    {
+        let mut at = UNUSED_LOOKED.lock();
+        if now - *at < 3600 {
+            return;
+        }
+        *at = now;
+    }
+    let hub = Arc::clone(hub);
+    crate::rt::spawn(async move {
+        let before = now - UNUSED_AFTER;
+        let rows: Vec<(String, String, String, String, Option<i64>)> = hub
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT id, name, scope_kind, scope_id, last_used_at FROM ci_secrets WHERE scope_kind != 'integration' AND COALESCE(last_used_at, created_at) < ?1 ORDER BY name")?;
+                let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap_or_default();
+        let repos = hub.store.repos().await.unwrap_or_default();
+        let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+        for (id, name, kind, scope, last) in rows {
+            if throttled(&hub, &format!("secret.unused\u{0}{id}"), Some(UNUSED_AFTER)).await {
+                continue;
+            }
+            let when = last.map_or_else(|| "never read".to_owned(), |t| format!("last read {} days ago", (now - t) / 86_400));
+            // A repository's own, or one of its workflows' or environments' (`<repo id>:<name>`).
+            let repo = repos.iter().find(|r| matches!(kind.as_str(), "repository" | "workflow" | "environment") && (scope == r.id || scope.starts_with(&format!("{}:", r.id))));
+            let s = Subject {
+                repo: repo.map(|r| r.name.clone()).unwrap_or_else(|| "the server".to_owned()),
+                run: format!("secret:{name}"),
+                name: name.clone(),
+                message: format!("{kind} {}, {when}", repo.map_or_else(|| scope.clone(), |r| scope.strip_prefix(&format!("{}:", r.id)).map_or_else(|| r.name.clone(), |rest| format!("{} {rest}", r.name)))),
+                url: format!("{base}/settings/secrets"),
+                github: json!({ "repository": repo.map(|r| r.name.clone()) }),
+                ..Subject::default()
+            };
+            match repo {
+                Some(r) => emit(&hub, r, "secret.unused", &s).await,
+                None => {
+                    let secret = json!({ "name": name, "scope": kind, "last_used_at": last });
+                    let m = Msg::of_run("secret.unused", &s);
+                    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+                        if rule.check(true).is_err() || !takes_ctx(rule, "secret.unused", "secret", &secret) {
+                            continue;
+                        }
+                        for spec in &rule.to {
+                            deliver(&hub, None, &format!("server#{}", n + 1), "secret.unused", &s.run, &m, spec).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// A run waits for a reviewer to deploy to `environments` (W15-R03).
@@ -769,7 +978,7 @@ mod tests {
     use super::*;
 
     fn subject() -> Subject {
-        Subject { repo: "acme/app".into(), run: "r1".into(), number: 7, workflow: ".github/workflows/ci.yml".into(), name: "CI".into(), branch: "main".into(), sha: "0123456789abcdef".into(), message: "fix the parser\n\nlong".into(), actor: "ada".into(), conclusion: "failure".into(), url: "https://kiln.example/runs/r1".into(), github: json!({ "ref_name": "main", "event_name": "push" }), environments: Vec::new() }
+        Subject { repo: "acme/app".into(), run: "r1".into(), number: 7, workflow: ".github/workflows/ci.yml".into(), name: "CI".into(), branch: "main".into(), sha: "0123456789abcdef".into(), message: "fix the parser\n\nlong".into(), actor: "ada".into(), conclusion: "failure".into(), url: "https://kiln.example/runs/r1".into(), github: json!({ "ref_name": "main", "event_name": "push" }), environments: Vec::new(), people: Vec::new() }
     }
 
     /// W19-AC05's rules, without the network: events and `where` pick rules; bad rules are refused.
@@ -793,6 +1002,24 @@ mod tests {
         assert_eq!(title, "✗ CI #7 failed on main");
         assert_eq!(line, "acme/app · 01234567 fix the parser · ada · https://kiln.example/runs/r1");
         assert_eq!(message("run.fixed", &s).0, "✓ CI #7 is fixed on main");
+    }
+
+    /// W19-R06's events for people, the cache and secrets: their messages, whom they're about, and
+    /// the rules that take them.
+    #[test]
+    fn w19_r06_people_cache_and_secret_messages() {
+        let s = Subject { repo: "acme/app".into(), name: "D3 Parse dates".into(), workflow: "D3".into(), branch: "main".into(), actor: "user:dev".into(), message: "Is this right, @rev?\nmore".into(), url: "https://kiln.example/diffs/D3".into(), people: vec!["user:rev".into()], ..Subject::default() };
+        assert_eq!(message("review.requested", &s), ("👀 dev asks for a review of D3 Parse dates".to_owned(), "acme/app · for rev · https://kiln.example/diffs/D3".to_owned()));
+        assert_eq!(message("comment.reply", &s).1, "acme/app · Is this right, @rev? · https://kiln.example/diffs/D3");
+        assert_eq!(message("mention", &s).0, "@ dev mentioned rev on D3 Parse dates");
+        let m = Msg::of_run("mention", &s);
+        assert_eq!((m.people.clone(), m.what), (vec!["user:rev".to_owned()], "the diff"));
+        // A run's is its actor's.
+        assert_eq!(Msg::of_run("run.failed", &subject()).people, vec!["ada".to_owned()]);
+        let q = Subject { repo: "acme/app".into(), message: "9.2 GiB of 10.0 GiB (92 %)".into(), url: "https://kiln.example/ci/caches?repo=acme/app".into(), ..Subject::default() };
+        assert_eq!(message("quota.near", &q).0, "⚠ acme/app's cache is near its quota");
+        let rules = parse_rules("- on: [review.requested, comment.reply, mention, quota.near, secret.unused]\n  to: [inbox, email:ada@example.com]\n").unwrap_or_default();
+        assert!(rules.first().is_some_and(|r| takes(r, "mention", &s) && takes(r, "quota.near", &q)));
     }
 
     /// docs/agentic.md N2: an agent's notes through the server's rules, `where` reading `agent`.

@@ -398,11 +398,13 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     let (repo_id, trunk, opts) = (s.repo.id.clone(), s.trunk.to_owned(), s.options.clone());
     let (pushed_by, author, author_kind) = (s.pushed_by.to_owned(), s.author.0.clone(), s.author.1);
     let rows: Vec<(Planned, Option<(String, Option<String>)>)> = planned.into_iter().map(|p| { let f = found.get(&p.change_id).map(|(id, stack, _)| (id.clone(), stack.clone())); (p, f) }).collect();
-    let (outcomes, fresh) = hub
+    let (outcomes, fresh, asked) = hub
         .store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = crate::util::now_unix();
+            // Reviewers asked for the first time, by diff: they hear of it (W19-R06).
+            let mut asked: Vec<(u32, String, String)> = Vec::new();
             // The stack: the bottom diff's, or a new one.
             let stack = match rows.first().and_then(|(_, f)| f.as_ref()).and_then(|(_, s)| s.clone()) {
                 Some(s) => s,
@@ -464,13 +466,15 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                 }
                 // `-o reviewer=` asks for review of what the push changed.
                 for r in opts.reviewers.iter().filter(|_| kind != "unchanged") {
-                    tx.execute("INSERT OR IGNORE INTO diff_reviewers (diff_id, reviewer, state, added_at) VALUES (?1, ?2, 'not-looked', ?3)", params![diff_id, r, now])?;
+                    if tx.execute("INSERT OR IGNORE INTO diff_reviewers (diff_id, reviewer, state, added_at) VALUES (?1, ?2, 'not-looked', ?3)", params![diff_id, r, now])? > 0 {
+                        asked.push((number, p.title.clone(), r.clone()));
+                    }
                 }
                 outcomes.push((number, n, kind, p.title.clone()));
                 below = Some(diff_id);
             }
             tx.commit()?;
-            Ok((outcomes, fresh))
+            Ok((outcomes, fresh, asked))
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -485,6 +489,13 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     let base_url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let out: Vec<Outcome> = outcomes.into_iter().map(|(number, version, kind, title)| Outcome { name: format!("D{number}"), number, version, kind, title, url: format!("{base_url}/diffs/D{number}") }).collect();
     hub.store.audit(s.pushed_by.to_owned(), "diffs.submit".into(), format!("{} {}: {}", s.repo.name, s.trunk, out.iter().map(|o| format!("D{} v{} {}", o.number, o.version, o.kind)).collect::<Vec<_>>().join(", "))).await;
+    let mut by_diff: BTreeMap<u32, (String, Vec<String>)> = BTreeMap::new();
+    for (number, title, reviewer) in asked {
+        by_diff.entry(number).or_insert_with(|| (title, Vec::new())).1.push(reviewer);
+    }
+    for (number, (title, reviewers)) in by_diff {
+        crate::rt::spawn(super::notify::diff_event(Arc::clone(hub), s.repo.name.clone(), "review.requested", format!("D{number}"), title, s.trunk.to_owned(), s.author.0.clone(), String::new(), reviewers));
+    }
     // Their checks, unless a job's token pushed them (it starts no run, as on GitHub).
     if by_job(s.pushed_by) {
         return Ok(out);
@@ -1280,8 +1291,15 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     o.insert("elsewhere".into(), json!(elsewhere));
                 }
             }
+            // What notification rules put in the caller's inbox (W19-R06).
+            let told = super::inbox::list(hub, caller, q).await?;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("notifications".into(), told.get("items").cloned().unwrap_or_else(|| json!([])));
+                o.insert("unread".into(), told.get("unread").cloned().unwrap_or_else(|| json!(0)));
+            }
             ok(v)
         }
+        (&Method::POST, ["review", "inbox", "read"]) => ok(super::inbox::read(hub, caller, body).await?),
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         (_, ["diffs" | "change-requests", key, rest @ ..]) => {

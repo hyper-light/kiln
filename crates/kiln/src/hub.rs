@@ -1726,6 +1726,7 @@ impl Hub {
                 self.check_timeouts().await?;
                 self.check_lost_agents().await;
                 crate::ci::notify::runners_gone(&self);
+                crate::ci::notify::secrets_unused(&self);
             }
         }
     }

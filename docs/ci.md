@@ -190,7 +190,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check for CD (R04's kiln half), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, R04's CD half, AC04, microVM containment (W13) left |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, issue-tracker channels and a person's own subscriptions left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; `kiln-ci-diagnose`; users' tokens over MCP; generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
@@ -3120,6 +3120,9 @@ auth`, W11-R03, R04). Done on this side: R03, R04.
   - an AWS integration: its role, region and session name, and a token file (0600) whose token
     has `aud: sts.amazonaws.com`;
   - a federating integration without `id-token: write`, and an unknown one, refused by name.
+- *Done.* R06's channels are W19-R06's (see its notes): Slack, Discord, Teams, Telegram,
+  PagerDuty, Opsgenie, signed webhooks and email (`email`, by SMTP). AC04 with local fakes is
+  W19-AC05's test (`w19_ac05_notifications`).
 
 ### W12 Registries
 
@@ -4912,9 +4915,43 @@ channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
   (`w19_r06_deploy_land_and_runner_events`), and end to end
   (`w19_r06_deploy_failed_and_leg_flaky_reach_a_channel`): a repository's rule sent a failed
   deployment and a report's retried test to a local webhook.
-- *Left*: R02's OpenTelemetry export; email (SMTP), the inbox and issue trackers as channels; the
-  events for people (`review.requested`, `comment.reply`, `mention`, with the inbox),
-  `quota.near` and `secret.unused`; AC05.
+- *Done.* R06's people, email and inbox (`crates/kiln/src/ci/notify.rs`, `smtp.rs`, `inbox.rs`):
+  - Events for people, about a diff or change request, done by someone (`actor`) and never to
+    them: `review.requested` (the reviewers a push or a change request asks for the first
+    time), `comment.reply` (a published comment: the people in its thread and the diff's
+    author) and `mention` (whom a comment or a review names, `@ada`). Rules see `run` as the
+    diff: `name` it and its title, `workflow` its name, `branch` its trunk, `message` what was
+    said, `url`.
+  - `quota.near`: a repository's cache past 90 % of its quota after eviction, once until it's
+    under 80 % again. `secret.unused`: a secret no run read in 90 days (or never, 90 days after
+    it was set), said again 90 days later; a repository's, a workflow's and an environment's
+    go through its rules, the server's and an organization's through the server's (`where`
+    reading `secret`: `name`, `scope`, `last_used_at`).
+  - `email` (W11-R06): an integration of its own (`host`, `from`, `port`, `tls`, `user`, `to`,
+    the password as its secret), sent by a small SMTP client on kiln's own stack: STARTTLS on
+    587 by default (refused when the server doesn't offer it), TLS from the start on 465, or in
+    the clear to a relay that takes mail that way (`tls: none`, never with a password); AUTH
+    PLAIN, or LOGIN where that's all a server offers. `email:ada@example.com` sends to that
+    address (several, comma-separated), `email` alone to the integration's `to`. A message is
+    plain text in base64 lines, its headers one line each (a subject that isn't ASCII is RFC
+    2047's encoded word), marked `Auto-Submitted: auto-generated`. It goes where the server may
+    reach (W22-AC07), never through an HTTP proxy.
+  - `inbox`: kiln's own, each person's, on the review inbox page (its Notifications, newest
+    first, the unread marked, "Mark all read"). A rule's `inbox` puts an item there for the
+    people an event is about (a run's actor; a release's approvers while it waits, else whoever
+    asked for it; the reviewers asked; a thread's people; whom a comment mentions), `inbox:ada`
+    for whom it names. `GET /api/review/inbox` has them (`notifications`, `unread`), of
+    repositories the caller may read; `POST /api/review/inbox/read` (`ids`, or `all`) marks
+    theirs read. A person keeps their last 500.
+  - AC05 end to end (`tests/notifications.rs`, `w19_ac05_notifications`), against local fakes:
+    `run.failed` reached Slack and a signed webhook; a failure again within the throttle sent
+    nothing; the fix sent `run.fixed` to Discord; a diff pushed with `-o reviewer=rev` put
+    `review.requested` in rev's inbox; rev's comment naming @dev put `comment.reply` and
+    `mention` in dev's, and dev's answer in the thread put `comment.reply` in rev's (nobody
+    heard of what they did themselves); rev read them all; each of the four reached an SMTP
+    server, from kiln to the rule's address; every delivery was recorded as sent.
+- *Left*: R02's OpenTelemetry export (with W11-R09); issue trackers as channels (W11-R07); a
+  person's own subscriptions.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 

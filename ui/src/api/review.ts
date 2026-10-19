@@ -156,8 +156,23 @@ export interface InboxThread {
   last: string;
 }
 
+/** What a notification rule put in your inbox (W19-R06). */
+export interface InboxNote {
+  id: string;
+  event: string;
+  title: string;
+  line: string;
+  url: string;
+  repo: string | null;
+  at: number;
+  read: boolean;
+}
+
 export interface Inbox {
   you: string;
+  /** What notification rules put here, newest first. */
+  notifications: InboxNote[];
+  unread: number;
   /** Threads whose last word isn't yours. */
   waiting_for_you: InboxThread[];
   /** Threads whose last word is yours. */
@@ -196,6 +211,7 @@ const enc = encodeURIComponent;
 
 export const reviewApi = {
   inbox: (signal?: AbortSignal) => request<Inbox>("GET", "/api/review/inbox", undefined, { signal }),
+  readAll: () => request<{ read: number }>("POST", "/api/review/inbox/read", { all: true }),
   diff: (key: string, signal?: AbortSignal) => request<DiffDetail>("GET", `/api/diffs/${enc(key)}`, undefined, { signal }),
   files: (key: string, version: number, signal?: AbortSignal) => request<VersionFiles>("GET", `/api/diffs/${enc(key)}/versions/${version}/files`, undefined, { signal }),
   interdiff: (key: string, from: number, to: number, signal?: AbortSignal) => request<Interdiff>("GET", `/api/diffs/${enc(key)}/interdiff?from=${from}&to=${to}`, undefined, { signal }),
@@ -221,7 +237,7 @@ export const reviewApi = {
 };
 
 /** Events that change what review pages show. */
-const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run"];
+const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run", "inbox"];
 
 export const inboxRes: Res<Inbox> = { key: "review/inbox", fetch: (s) => reviewApi.inbox(s), opts: { on: REVIEW_EVENTS } };
 export const diffRes = (key: string): Res<DiffDetail> => ({ key: `review/diff/${key}`, fetch: (s) => reviewApi.diff(key, s), opts: { on: REVIEW_EVENTS } });
