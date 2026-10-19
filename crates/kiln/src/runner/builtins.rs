@@ -28,6 +28,41 @@ const fn input(name: &'static str, description: &'static str, default: Option<&'
 /// The built-ins this runner has.
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
+        name: "deploy",
+        description: "Release an app in the job's environment through kiln's deploy service (W15-R05: CI drives CD), and follow the release to its end: its gates (approvals, windows, soak), its delivery, synced and healthy. The job must be bound to the environment (`environment:`), whose protection passed before it started.",
+        inputs: &[
+            Input { name: "app", description: "The app.", default: None, required: true },
+            Input { name: "environment", description: "Where: the job's environment.", default: None, required: true },
+            input("revision", "The version: a chart's version, or a git package's commit, branch or tag (the run's commit when left out).", None),
+            input("artifacts", "What it deploys that the run built, as JSON: `{\"web\": {\"repository\": …, \"tag\": …, \"digest\": …}}`.", None),
+            input("wait", "`synced` or `healthy`: kiln's releases end synced, healthy and settled either way.", Some("healthy")),
+            input("timeout", "How long to follow it (`30m`, `1h`); past it the step fails, the release goes on.", Some("30m")),
+        ],
+        outputs: &[
+            ("release-id", "The release."),
+            ("state", "Where it ended: `succeeded`, `failed`, `cancelled`, or where it was when the time ran out."),
+        ],
+    },
+    Builtin {
+        name: "cache",
+        description: "Restore a cache, and save it after the job when the job succeeds and the key wasn't hit (W08-R09): the paths kept as content-defined chunks in kiln's store, so a cache that changed by 1 % moves about 1 % of its bytes. With `local`, the runner keeps the chunks it has seen: a restore downloads only those it lacks, a save uploads only those the repository's caches lack. Keys and restore keys work as `actions/cache`'s.",
+        inputs: &[
+            Input { name: "key", description: "The key it's saved under, and restored by first.", default: None, required: true },
+            Input { name: "path", description: "Files and directories, one a line (`~` is the home directory, others the workspace's).", default: None, required: true },
+            input("restore-keys", "On a miss, keys to restore from, one a line, in order: the newest entry whose key starts with one.", None),
+            input("scope", "`ref` (GitHub's: this ref's entries, then the default branch's) or `repo` (shared by the repository's refs, written by its trusted runs).", Some("ref")),
+            input("policy", "`pull-push`, `pull` (restore only) or `push` (save only).", Some("pull-push")),
+            input("local", "Keep the chunks on this runner, in `<work>/_cache` (`KILN_CACHE_MAX`, 10G by default).", Some("false")),
+            input("fail-on-cache-miss", "Fail the step when nothing is restored.", Some("false")),
+            input("lookup-only", "Only say whether an entry is there, restoring nothing.", Some("false")),
+        ],
+        outputs: &[
+            ("cache-hit", "Whether the key itself was restored."),
+            ("cache-primary-key", "The key."),
+            ("cache-matched-key", "The key of what was restored."),
+        ],
+    },
+    Builtin {
         name: "upload",
         description: "Upload an artifact (W08): the files zipped as `actions/upload-artifact@v4` keeps them, so `actions/download-artifact` reads it too, uploaded by the runner itself (no Node), its SHA-256 checked by the server. The files' root is the deepest directory every path is under.",
         inputs: &[

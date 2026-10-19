@@ -175,6 +175,38 @@ pub fn evict(entries: &[Entry], now: i64, max_idle_secs: i64, quota: u64) -> Vec
     gone
 }
 
+/// The kiln dialect's `cache:` on a job (W08-R09): each entry `{ key, restore-keys, paths, scope,
+/// policy, local }` a `kiln/cache@v1` step the job starts with. Lists of directories (v1's kept
+/// directories) aren't caches of this kind, and give none.
+pub fn job_steps(entries: &[crate::wf::ir::YVal]) -> Vec<crate::wf::ir::Step> {
+    use crate::wf::ir::{Step, Tpl, YVal};
+    let text = |v: &YVal| -> Option<YVal> {
+        match v {
+            YVal::Seq(items) => {
+                let lines: Vec<String> = items.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect();
+                Some(YVal::Str(Tpl::new(lines.join("\n"), Default::default())))
+            }
+            YVal::Null => None,
+            other => Some(other.clone()),
+        }
+    };
+    entries
+        .iter()
+        .filter(|e| matches!(e, YVal::Map(_)))
+        .map(|e| {
+            let mut with = Vec::new();
+            for (from, to) in [("key", "key"), ("restore-keys", "restore-keys"), ("paths", "path"), ("path", "path"), ("scope", "scope"), ("policy", "policy"), ("local", "local")] {
+                if let Some(v) = e.get(from).and_then(text)
+                    && !with.iter().any(|(k, _): &(String, YVal)| k == to)
+                {
+                    with.push((to.to_owned(), v));
+                }
+            }
+            Step { name: Some(Tpl::new("Cache".to_owned(), Default::default())), uses: Some("kiln/cache@v1".into()), with, ..Step::default() }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +310,22 @@ mod tests {
         for m in [Mode::Read, Mode::Write, Mode::WriteOnly, Mode::None] {
             assert_eq!(Mode::parse(m.as_str()), Some(m));
         }
+    }
+
+    #[test]
+    fn w08_r09_job_caches_are_steps() {
+        let (w, d) = crate::wf::parse_workflow(".kiln/x.yaml", "on: push\njobs:\n  a:\n    runs-on: x\n    cache:\n      - key: cargo-${{ hashFiles('Cargo.lock') }}\n        restore-keys: [cargo-]\n        paths: [target, ~/.cargo/registry]\n        local: true\n    steps:\n      - run: echo\n", crate::expr::Dialect::Kiln);
+        assert!(!d.iter().any(|x| x.is_error()), "{d:?}");
+        let job = w.as_ref().and_then(|w| w.jobs.first()).cloned().unwrap_or_default();
+        let steps = job_steps(&job.kiln.cache);
+        assert_eq!(steps.len(), 1);
+        let s = steps.first().cloned().unwrap_or_default();
+        assert_eq!(s.uses.as_deref(), Some("kiln/cache@v1"));
+        let with: std::collections::BTreeMap<String, String> = s.with.iter().map(|(k, v)| (k.clone(), match v { crate::wf::ir::YVal::Str(t) => t.src.clone(), other => format!("{other:?}") })).collect();
+        assert_eq!(with.get("path").map(String::as_str), Some("target\n~/.cargo/registry"));
+        assert_eq!(with.get("restore-keys").map(String::as_str), Some("cargo-"));
+        assert!(with.get("key").is_some_and(|k| k.contains("hashFiles")));
+        // v1's kept directories aren't caches of this kind.
+        assert!(job_steps(&[crate::wf::ir::YVal::Str(crate::wf::ir::Tpl::new("target", Default::default()))]).is_empty());
     }
 }

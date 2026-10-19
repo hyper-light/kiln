@@ -1801,3 +1801,264 @@ jobs:
     assert!(digest.len() == 64 && listed.contains(&digest) && listed.contains("\"dist\""), "{listed}\n{made}");
     Ok(())
 }
+
+/// W08-R09's `kiln/cache@v1` with its local tier: a first run misses and saves every chunk; a
+/// second restores the first's entry by a restore key with nothing downloaded (the runner kept
+/// the chunks), changes a little of it, and saves only the chunks that changed.
+#[test]
+fn w08_r09_kiln_cache_moves_only_new_chunks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/cached", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "cached\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/cached.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    // 8 MiB of the same noise each run (a few chunks), and on the second run a line more.
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/cache.yaml"),
+        r#"on: push
+jobs:
+  build:
+    runs-on: local
+    checkout: false
+    steps:
+      - id: c
+        uses: kiln/cache@v1
+        with:
+          key: big-${{ github.sha }}
+          restore-keys: big-
+          path: big
+          local: true
+      - run: |
+          mkdir -p big
+          if [ ! -f big/noise.bin ]; then
+            python3 -c "import random; r = random.Random(7); open('big/noise.bin','wb').write(bytes(r.getrandbits(8) for _ in range(8 << 20)))"
+          fi
+          echo "run ${{ github.run_number }} hit=${{ steps.c.outputs.cache-hit }} matched=${{ steps.c.outputs.cache-matched-key }}" >> big/runs.txt
+"#,
+    )?;
+    let runs = |n: usize| -> anyhow::Result<Vec<Value>> {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/cached&limit=10", &s.admin, None)?;
+            let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+            let done: Vec<Value> = list.into_iter().filter(|r| text(r, "workflow").ends_with("cache.yaml") && r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+            if done.len() >= n {
+                return Ok(done);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{n} runs didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..6 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "cache"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let first = runs(1)?;
+    let one = first.first().cloned().unwrap_or_default();
+    let said = log_of(&one)?;
+    assert_eq!(text(&one, "conclusion"), "success", "{said}\n{}", s.log());
+    assert!(said.contains("Cache not found for input keys"), "{said}");
+    let sent = |log: &str| -> Option<(u64, u64)> {
+        let at = log.split("bytes sent").next()?.rsplit(';').next()?;
+        let mut w = at.split_whitespace();
+        let a = w.next()?.parse().ok()?;
+        let _of = w.next()?;
+        let b = w.next()?.parse().ok()?;
+        Some((a, b))
+    };
+    let (up1, size1) = sent(&said).ok_or_else(|| anyhow::anyhow!("no save in: {said}"))?;
+    assert_eq!(up1, size1, "the first save sends everything: {said}");
+    // The second run: restored from the first's chunks on this runner, then a little more saved.
+    std::fs::write(work.join("README.md"), "cached, again\n")?;
+    must(git(&home, &work, &["commit", "-qam", "again"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let both = runs(2)?;
+    let two = both.first().cloned().unwrap_or_default();
+    let said = log_of(&two)?;
+    assert_eq!(text(&two, "conclusion"), "success", "{said}\n{}", s.log());
+    assert!(said.contains("Cache restored from key: big-") && said.contains("(0 bytes downloaded,"), "restored from the runner's own chunks: {said}");
+    let (up2, size2) = sent(&said).ok_or_else(|| anyhow::anyhow!("no save in: {said}"))?;
+    // (The archive's size may not change: tar pads the longer runs.txt to the same block.)
+    assert!(size2 >= size1 && up2 * 4 < size2, "only what changed went: {up2} of {size2} bytes\n{said}");
+    Ok(())
+}
+
+/// W15-R05's `kiln/deploy@v1`: a job bound to an environment releases an app there through the
+/// deploy service and follows the release; one that isn't bound is refused, saying why. (No CD
+/// provider runs here, so the release ends where the service leaves it, or the step's time runs
+/// out: what's checked is that CI asks as the job, and follows.)
+#[test]
+fn w15_r05_kiln_deploy_releases_from_the_job() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "[cd]\nenabled = true\n" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    for (path, body) in [
+        ("/api/deploy/environments", json!({ "name": "staging" })),
+        ("/api/deploy/apps", json!({ "name": "web", "package": { "kind": "helm", "repo": "oci://registry.invalid/charts", "chart": "web" } })),
+    ] {
+        let (st, out) = http(s.port, "POST", path, &s.admin, Some(&body))?;
+        anyhow::ensure!((200..300).contains(&st), "{path}: {st} {out}");
+    }
+    let (st, out) = http(s.port, "POST", "/api/deploy/apps/web/environments/staging", &s.admin, Some(&json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "register: {st} {out}");
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/ship", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "ship\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/ship.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/ship.yaml"),
+        r#"on: push
+jobs:
+  ship:
+    runs-on: local
+    checkout: false
+    environment: staging
+    steps:
+      - id: d
+        uses: kiln/deploy@v1
+        with:
+          app: web
+          environment: staging
+          revision: 1.2.3
+          timeout: 8s
+      - if: always()
+        run: echo "release ${{ steps.d.outputs.release-id }} ended ${{ steps.d.outputs.state }}"
+  stray:
+    runs-on: local
+    checkout: false
+    steps:
+      - uses: kiln/deploy@v1
+        with:
+          app: web
+          environment: staging
+          revision: 1.2.3
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "ship"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let legs = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/ship&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        if let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null()) && text(r, "workflow").ends_with("ship.yaml")) {
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
+            break serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let said = |key: &str| -> anyhow::Result<(String, String)> {
+        let l = legs.iter().find(|l| text(l, "key") == key).cloned().unwrap_or_default();
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/legs/{}", text(&l, "id")), &s.admin, None)?;
+        let detail: Value = serde_json::from_str(&detail)?;
+        let notes: Vec<String> = detail.get("annotations").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
+        let mut log = notes.join("\n");
+        for step in 0..3 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{}/logs?step={step}", text(&l, "id")), &s.admin, None)?;
+            log.push_str(&t);
+        }
+        Ok((text(&l, "id").to_owned(), log))
+    };
+    let (stray_id, stray) = said("stray")?;
+    assert!(stray.contains("kiln/deploy releases to the job's own environment"), "{stray}");
+    let (ship_id, ship) = said("ship")?;
+    assert!(ship.contains("of web to staging:"), "the release was followed: {ship}\n{}", s.log());
+    let (_, releases) = http(s.port, "GET", "/api/deploy/releases?app=web", &s.admin, None)?;
+    assert!(releases.contains(&format!("job:{ship_id}")) && !releases.contains(&format!("job:{stray_id}")), "asked as the bound job alone: {releases}");
+    Ok(())
+}
+
+/// W03-AC05: a push both delivered by GitHub's webhook and seen by the poller runs once; a
+/// redelivery of the webhook (the same `X-GitHub-Delivery`) does nothing, and neither does a new
+/// delivery of the same push.
+#[test]
+fn w03_ac05_a_webhook_and_a_poll_of_one_push_run_once() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let repo = dir.path().join("hooked");
+    std::fs::create_dir_all(&repo)?;
+    must(git(&home, &repo, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(repo.join("README.md"), "hooked\n")?;
+    must(git(&home, &repo, &["add", "."]), "add")?;
+    must(git(&home, &repo, &["commit", "-qm", "first"]), "commit")?;
+    let extra = format!("[[repos]]\nname = \"acme/hooked\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/hooked") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    let before = must(git(&home, &repo, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    std::fs::create_dir_all(repo.join(".kiln"))?;
+    std::fs::write(repo.join(".kiln/hooked.yaml"), "on: push\njobs:\n  j:\n    runs-on: local\n    checkout: false\n    steps:\n      - run: echo hooked\n")?;
+    must(git(&home, &repo, &["add", "."]), "add")?;
+    must(git(&home, &repo, &["commit", "-qm", "hooked"]), "commit")?;
+    let after = must(git(&home, &repo, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let payload = json!({
+        "ref": "refs/heads/main", "before": before, "after": after, "created": false, "deleted": false, "forced": false,
+        "repository": { "full_name": "acme/hooked", "name": "hooked", "owner": { "login": "acme" }, "default_branch": "main" },
+        "head_commit": { "id": after, "message": "hooked", "timestamp": "2026-10-19T00:00:00Z", "author": { "name": "T", "email": "t@example.com" } },
+        "pusher": { "name": "t" }, "sender": { "login": "t" },
+    })
+    .to_string();
+    let deliver = |id: &str| -> anyhow::Result<String> {
+        let out = Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "Content-Type: application/json", "-H", "X-GitHub-Event: push", "-H", &format!("X-GitHub-Delivery: {id}"), "--data-binary", &payload, &format!("http://127.0.0.1:{}/api/hooks/github", s.port)])
+            .output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    // The webhook, at once (the poll looks within a second too): whichever comes first runs it.
+    assert_eq!(deliver("d-1")?, "202");
+    let runs_of = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/hooked&limit=20", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| text(r, "sha") == after).collect())
+    };
+    until(120, "the push's run", || {
+        let n = runs_of()?.len();
+        Ok((n == 0).then(|| "no run yet".to_owned()))
+    })?;
+    // The same delivery again, and a new delivery of the same push.
+    assert_eq!(deliver("d-1")?, "202");
+    assert_eq!(deliver("d-2")?, "202");
+    // Polls go on meanwhile; nothing more runs.
+    std::thread::sleep(Duration::from_secs(6));
+    let runs = runs_of()?;
+    assert_eq!(runs.len(), 1, "one run for the push: {runs:?}\n{}", s.log());
+    Ok(())
+}

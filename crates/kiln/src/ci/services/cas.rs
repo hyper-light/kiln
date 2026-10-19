@@ -122,6 +122,25 @@ pub fn put_file_blocking(root: &Path, path: &Path) -> std::io::Result<(Object, u
 pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
     let (r, p) = (root(hub), path.to_path_buf());
     let (obj, fresh) = crate::rt::blocking(move || put_file_blocking(&r, &p)).await??;
+    record(hub, &obj).await?;
+    tracing::debug!(object = %obj.digest, size = obj.size, chunks = obj.chunks.len(), new_bytes = fresh, "stored");
+    Ok(obj)
+}
+
+/// A chunk, stored unless it is (its digest checked first): the bytes newly written.
+pub fn put_chunk(hub: &Hub, digest: &str, data: &[u8]) -> anyhow::Result<u64> {
+    anyhow::ensure!(hex(&Sha256::digest(data)) == digest, "the chunk doesn't hash to {digest}");
+    Ok(keep_chunk(&root(hub), digest, data)?)
+}
+
+/// Where a stored chunk is, when it is.
+pub fn chunk_file(hub: &Hub, digest: &str) -> Option<PathBuf> {
+    let ok = digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then(|| chunk_path(&root(hub), digest)).filter(|p| p.is_file())
+}
+
+/// Records an object whose chunks are stored (the chunks' digests and sizes, its own digest).
+pub async fn record(hub: &Hub, obj: &Object) -> anyhow::Result<()> {
     let o = obj.clone();
     hub.store
         .call(move |c| {
@@ -139,9 +158,7 @@ pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
             tx.commit()?;
             Ok(())
         })
-        .await?;
-    tracing::debug!(object = %obj.digest, size = obj.size, chunks = obj.chunks.len(), new_bytes = fresh, "stored");
-    Ok(obj)
+        .await
 }
 
 /// An object's chunk list, and a touch of its last use.

@@ -12,6 +12,7 @@
 pub mod blob;
 pub mod cache_v1;
 pub mod cas;
+pub mod chunks;
 pub mod twirp;
 
 use std::sync::Arc;

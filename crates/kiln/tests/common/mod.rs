@@ -125,9 +125,7 @@ browse = false
 join_requests = false
 tailscale = false
 
-[cd]
-enabled = false
-
+{cd}
 [ci]
 enabled = true
 {ci}
@@ -140,6 +138,8 @@ enabled = true
         agent = o.agent,
         ci = o.ci,
         extra = o.extra,
+        // CD stays off unless a test turns it on with a `[cd]` of its own.
+        cd = if o.extra.contains("[cd]") { "" } else { "[cd]\nenabled = false\n" },
     );
     let cfg = dir.join("kiln.toml");
     std::fs::write(&cfg, config)?;

@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod attest;
 pub mod auth;
 pub mod builtins;
+pub mod cache;
 pub mod chaos;
 pub mod credential;
 pub mod docker;

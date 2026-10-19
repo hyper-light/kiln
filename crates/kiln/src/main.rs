@@ -168,6 +168,9 @@ enum Cmd {
     Submit(kiln::ci::review_cli::SubmitArgs),
     /// Fetch the trunk and rebase the stack onto it; landed diffs drop out.
     Sync(kiln::ci::review_cli::SyncArgs),
+    /// Amend each edit of the working copy into the commit of the stack that last touched its lines
+    /// (`-n` says where each would go); what can't be placed stays.
+    Absorb(kiln::ci::review_cli::AbsorbArgs),
     /// A repository's diffs.
     Diffs(kiln::ci::review_cli::DiffsArgs),
     /// Check out a diff's version: `kiln checkout D12` (its latest) or `D12@v2`.
@@ -769,6 +772,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Clone(a) => kiln::ci::review_cli::clone(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Submit(a) => kiln::ci::review_cli::submit(a),
         Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
+        Cmd::Absorb(a) => kiln::ci::review_cli::absorb(a),
         Cmd::Diffs(a) => kiln::ci::review_cli::diffs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Checkout(a) => kiln::ci::review_cli::checkout(a),
         Cmd::Cr(a) => kiln::ci::review_cli::cr(a),

@@ -171,6 +171,8 @@ struct Post {
 enum PostRun {
     Node { node: PathBuf, script: PathBuf },
     Container { image: String, entrypoint: String },
+    /// A built-in's own post step (`kiln/cache@v1`'s save), with its inputs.
+    Builtin { name: &'static str, with: BTreeMap<String, String> },
 }
 
 /// Where an action is, once fetched.
@@ -3051,6 +3053,8 @@ impl Leg {
                 outputs = self.build_image(st, idx, &with, wd).await?;
                 true
             }
+            "cache" => self.cache_step(st, idx, &with, &mut outputs).await?,
+            "deploy" => self.deploy_step(idx, &with, &mut outputs).await?,
             "upload" | "download" => {
                 let svc = super::artifacts::Service { http: &self.http, base: super::artifacts::Service::origin_of(&self.a.runtime.results_url), token: &self.a.runtime.runtime_token, run: &self.a.run_id, job: &self.a.job_id };
                 let ws = st.layout.workspace.clone();
@@ -3089,6 +3093,187 @@ impl Leg {
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
         };
         Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })
+    }
+
+    /// `kiln/deploy@v1` (W15-R05): the release asked for (`/_kiln/deploy`), then followed, each
+    /// move said, until it ends or the time runs out.
+    async fn deploy_step(&self, idx: u32, with: &BTreeMap<String, String>, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let wait = get("wait").unwrap_or_else(|| "healthy".into());
+        anyhow::ensure!(matches!(wait.as_str(), "synced" | "healthy"), "`wait` is `synced` or `healthy`, not `{wait}`");
+        let timeout = get("timeout").map_or(Some(1800), |t| kiln_ci::trigger::cron::seconds(&t)).map(Duration::from_secs);
+        let timeout = timeout.ok_or_else(|| anyhow::anyhow!("`timeout` is a duration (`30m`, `1h`)"))?;
+        let artifacts: serde_json::Value = match get("artifacts") {
+            Some(a) => serde_json::from_str(&a).map_err(|e| anyhow::anyhow!("`artifacts` isn't JSON: {e}"))?,
+            None => serde_json::json!({}),
+        };
+        let version = get("revision").or_else(|| self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).map(str::to_owned));
+        let base = super::artifacts::Service::origin_of(&self.a.runtime.results_url);
+        let token = &self.a.runtime.runtime_token;
+        let ask = serde_json::json!({ "app": get("app"), "environment": get("environment"), "version": version, "artifacts": artifacts, "attempt": self.a.attempt });
+        let resp = self.http.post(&format!("{base}/_kiln/deploy/releases")).bearer(token).header("content-type", "application/json").body(serde_json::to_vec(&ask)?).timeout(Duration::from_secs(120)).send().await?;
+        let status = resp.status();
+        let made: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+        anyhow::ensure!((200..300).contains(&status), "{}", made.get("message").and_then(serde_json::Value::as_str).unwrap_or("the release was refused"));
+        let id = made.get("id").and_then(serde_json::Value::as_i64).unwrap_or_default();
+        outputs.insert("release-id".to_owned(), id.to_string());
+        let said = |r: &serde_json::Value| {
+            let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            format!("release {id} of {} to {}: {}{}", s("app"), s("environment"), s("state"), r.get("message").and_then(serde_json::Value::as_str).map(|m| format!(" ({m})")).unwrap_or_default())
+        };
+        self.note(idx, &said(&made)).await;
+        let (mut last, deadline) = (said(&made), Instant::now() + timeout);
+        let mut state = made.get("state").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        while !matches!(state.as_str(), "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded") {
+            if Instant::now() >= deadline {
+                outputs.insert("state".to_owned(), state.clone());
+                self.annotate(idx, "error", &format!("release {id} is still {state} after {} s: it goes on without this step", timeout.as_secs())).await;
+                return Ok(false);
+            }
+            if self.cancel.is_cancelled() {
+                anyhow::bail!("cancelled while release {id} was {state}: it goes on");
+            }
+            crate::rt::sleep(Duration::from_secs(3)).await;
+            let resp = self.http.get(&format!("{base}/_kiln/deploy/releases/{id}")).bearer(token).timeout(Duration::from_secs(60)).send().await?;
+            if !resp.is_success() {
+                continue;
+            }
+            let r: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+            state = r.get("state").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            let now = said(&r);
+            if now != last {
+                self.note(idx, &now).await;
+                last = now;
+            }
+        }
+        outputs.insert("state".to_owned(), state.clone());
+        Ok(state == "succeeded")
+    }
+
+    /// kiln's chunked cache, as this leg reaches it.
+    fn cache_service(&self) -> super::cache::Service<'_> {
+        super::cache::Service { http: &self.http, base: super::artifacts::Service::origin_of(&self.a.runtime.results_url), token: &self.a.runtime.runtime_token }
+    }
+
+    /// `kiln/cache@v1`'s paths on this runner: a job container's as the host has them (its home,
+    /// the workspace, its other mounts); the ones the runner can't reach.
+    fn cache_paths(&self, st: &State, given: &[String]) -> (super::cache::Paths, Vec<String>) {
+        let ws = st.layout.workspace.clone();
+        match st.containers.as_ref().and_then(|c| c.job.as_ref()) {
+            Some(j) => {
+                let mut unreachable = Vec::new();
+                let resolved = given
+                    .iter()
+                    .map(|p| {
+                        let inside = if let Some(rest) = p.strip_prefix("~/") {
+                            format!("{}/{rest}", j.home)
+                        } else if p == "~" {
+                            j.home.clone()
+                        } else if Path::new(p).is_absolute() {
+                            p.clone()
+                        } else {
+                            return ws.join(p);
+                        };
+                        j.map.to_host(&inside).unwrap_or_else(|| {
+                            unreachable.push(p.clone());
+                            st.layout.temp.join("_kiln_cache_unreachable").join(crate::util::new_id())
+                        })
+                    })
+                    .collect();
+                (super::cache::Paths { given: given.to_vec(), resolved }, unreachable)
+            }
+            None => {
+                let home = st.env.get("HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+                (super::cache::Paths::new(given, &ws, home.as_deref()), Vec::new())
+            }
+        }
+    }
+
+    /// `kiln/cache@v1`'s step: a restore (unless `policy: push`), and the save after the job
+    /// (unless `policy: pull`, or the key itself was restored).
+    async fn cache_step(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let lines = |k: &str| get(k).map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+        let flag = |k: &str| get(k).is_some_and(|v| v == "true");
+        let key = get("key").unwrap_or_default();
+        let scope = get("scope").unwrap_or_else(|| "ref".into());
+        anyhow::ensure!(matches!(scope.as_str(), "ref" | "repo"), "`scope` is `ref` or `repo`, not `{scope}`");
+        let policy = get("policy").unwrap_or_else(|| "pull-push".into());
+        anyhow::ensure!(matches!(policy.as_str(), "pull-push" | "pull" | "push"), "`policy` is `pull-push`, `pull` or `push`, not `{policy}`");
+        let (paths, unreachable) = self.cache_paths(st, &lines("path"));
+        for p in &unreachable {
+            self.annotate(idx, "warning", &format!("`{p}` isn't in a directory the runner shares with the job container: kiln/cache can't keep it")).await;
+        }
+        let local = flag("local").then(|| super::cache::Local::new(&self.work_dir));
+        outputs.insert("cache-primary-key".to_owned(), key.clone());
+        outputs.insert("cache-hit".to_owned(), "false".to_owned());
+        let mut exact = false;
+        if policy != "push" {
+            let mut keys = vec![key.clone()];
+            keys.extend(lines("restore-keys"));
+            let archive = st.layout.temp.join(format!("kiln-cache-{}.tar", crate::util::new_id()));
+            let look_only = flag("lookup-only");
+            match super::cache::restore(&self.cache_service(), &keys, &paths.version(), &scope, local.as_ref(), &archive, look_only).await {
+                Ok(Some(found)) => {
+                    exact = found.key.eq_ignore_ascii_case(&key);
+                    if !look_only {
+                        let (a, p, staging) = (archive.clone(), paths.clone(), st.layout.temp.join(format!("kiln-cache-{}", crate::util::new_id())));
+                        crate::rt::blocking(move || super::cache::unpack(&a, &p, &staging)).await??;
+                        self.note(idx, &format!("Cache restored from key: {} ({} bytes downloaded, {} from this runner's chunks)", found.key, found.downloaded, found.local_bytes)).await;
+                    } else {
+                        self.note(idx, &format!("Cache found for key: {} (lookup only)", found.key)).await;
+                    }
+                    outputs.insert("cache-hit".to_owned(), exact.to_string());
+                    outputs.insert("cache-matched-key".to_owned(), found.key);
+                }
+                Ok(None) => {
+                    self.note(idx, &format!("Cache not found for input keys: {}", keys.join(", "))).await;
+                    if flag("fail-on-cache-miss") {
+                        let _ = std::fs::remove_file(&archive);
+                        self.annotate(idx, "error", &format!("Failed to restore cache entry. Exiting as fail-on-cache-miss is set. Input key: {key}")).await;
+                        return Ok(false);
+                    }
+                }
+                // As actions/cache: a cache that can't be restored is a warning, not a failure.
+                Err(e) => self.annotate(idx, "warning", &format!("Failed to restore: {e:#}")).await,
+            }
+            let _ = std::fs::remove_file(&archive);
+        }
+        if policy != "pull" && !exact {
+            st.posts.push(Post { name: format!("Post kiln/cache ({key})"), run: PostRun::Builtin { name: "cache", with: with.clone() }, env: BTreeMap::new(), cond: Some(Tpl::new("success()".to_owned(), Default::default())), wd: st.layout.workspace.clone(), uses: "kiln/cache@v1".to_owned() });
+        }
+        if let Some(l) = local {
+            let _ = crate::rt::blocking(move || l.trim()).await;
+        }
+        Ok(true)
+    }
+
+    /// A built-in's post step: `kiln/cache@v1`'s save.
+    async fn builtin_post(&self, st: &mut State, idx: u32, name: &str, with: &BTreeMap<String, String>) -> anyhow::Result<Ran> {
+        anyhow::ensure!(name == "cache", "kiln/{name}@v1 has no post step");
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let key = get("key").unwrap_or_default();
+        let scope = get("scope").unwrap_or_else(|| "ref".into());
+        let given: Vec<String> = get("path").map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
+        let (paths, _) = self.cache_paths(st, &given);
+        let local = get("local").is_some_and(|v| v == "true").then(|| super::cache::Local::new(&self.work_dir));
+        let archive = st.layout.temp.join(format!("kiln-cache-{}.tar", crate::util::new_id()));
+        let (a, p) = (archive.clone(), paths.clone());
+        let kept = crate::rt::blocking(move || super::cache::archive(&p, &a)).await??;
+        if kept == 0 {
+            self.annotate(idx, "warning", "Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.").await;
+        } else {
+            match super::cache::save(&self.cache_service(), &key, &paths.version(), &scope, local.as_ref(), &archive).await {
+                Ok(Some(s)) => self.note(idx, &format!("Cache saved with key: {key} ({} chunks; {} of {} bytes sent)", s.chunks, s.uploaded, s.size)).await,
+                Ok(None) => self.note(idx, &format!("Another job saved key {key} first: nothing more to save")).await,
+                Err(e) => self.annotate(idx, "warning", &format!("Failed to save: {e:#}")).await,
+            }
+        }
+        let _ = std::fs::remove_file(&archive);
+        if let Some(l) = local {
+            let _ = crate::rt::blocking(move || l.trim()).await;
+        }
+        Ok(Ran { end: End::Exit(Some(0)), outputs: BTreeMap::new(), state: Vec::new() })
     }
 
     /// `kiln/attest@v1` (W18-R01, R02): the subjects' digests are reported over the runner's own
@@ -3518,6 +3703,7 @@ impl Leg {
                     Ok(cli) => self.exec(st, idx, Run::Container { cli, image, entrypoint: Some(entrypoint), args: Vec::new() }, &p.wd, p.env, deadline).await,
                     Err(e) => Err(e),
                 },
+                PostRun::Builtin { name, with } => self.builtin_post(st, idx, name, &with).await,
             };
             let ok = matches!(r, Ok(Ran { end: End::Exit(Some(0)), .. }));
             if let Err(e) = &r {

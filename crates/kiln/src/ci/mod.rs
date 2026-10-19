@@ -11,6 +11,7 @@ pub mod broker;
 pub mod cli;
 pub mod compare;
 pub mod cr;
+pub mod deploy_step;
 pub mod diffs;
 pub mod dispatch;
 pub mod environments;

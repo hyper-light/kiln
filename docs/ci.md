@@ -1227,10 +1227,13 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
     raises it in the repository whose `.kiln/deploy.yaml` defines it.
   - R13: `kiln: { chain-depth }` lets a workflow take part in `workflow_run` and `pipeline`
     chains up to ten deep (GitHub's three otherwise).
+- *Done.* AC05 as an integration test (`w03_ac05_a_webhook_and_a_poll_of_one_push_run_once`): a
+  push that GitHub's webhook delivers and the poller also sees, a second later, runs once. A
+  redelivery (the same `X-GitHub-Delivery`) does nothing, and a new delivery of the same push
+  does nothing either.
 - *Left.*
   - The App's events (with W14-R10).
-  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05 as an integration
-    test, AC07 to AC09.
+  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC07 to AC09.
 
 ### W04 Planner: graph, matrices, reusable workflows, outputs
 
@@ -2518,8 +2521,31 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   - a table of edits changes the hash, one input at a time;
   - E2E on a local server: a README-only push reused the build, a change under its `paths` ran
     it, and "run anyway" ran it.
+- *Done.* R09's `kiln/cache@v1` and the kiln dialect's `cache:` key, on the chunked protocol
+  (`crates/kiln/src/ci/services/chunks.rs`, `crates/kiln/src/runner/cache.rs`):
+  - `/_kiln/cache` answers for a leg's token:
+    - `lookup` returns an entry with its chunk list;
+    - `missing` reports which chunks the repository's store lacks (only the repository's own
+      chunks count, so no leg can probe another repository's content);
+    - `chunks/<sha>` stores a chunk, checked against its digest;
+    - `entries` commits an entry once every chunk is there and the sizes and the whole
+      digest match.
+  - Lookups and saves follow the leg's scopes and cache mode (R06, R14). `scope: repo` adds a
+    scope every ref of the repository reads.
+  - The runner archives the paths (a tar whose entries name their path), chunks them
+    content-defined (`kiln_ci::store::cdc`), and sends only what's missing. A restore unpacks
+    into a staging directory before anything is replaced. The step sets `actions/cache`'s
+    outputs, and its save runs after the job, unless an exact key hit, under `policy: pull |
+    push | pull-push`.
+  - `local: true` keeps chunks in `<work>/_cache`, least recently used first out past
+    `KILN_CACHE_MAX` (10G by default), so a restore downloads only what the runner lacks.
+  - A job's `cache: [{ key, restore-keys, paths, scope, policy, local }]` is a `kiln/cache@v1`
+    step before its own (`kiln_ci::store::cache::job_steps`).
+  - Checked end to end (`w08_r09_kiln_cache_moves_only_new_chunks`). The first run saved 8 MiB,
+    sending all of it. The second restored by a restore key with 0 bytes downloaded, changed a
+    file, and sent 0.5 MiB of the entry's 4 chunks.
 - *Left.*
-  - R02 (S3), R09 (tiers), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - R02 (S3), R09's `global` scope, R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
   - A diff that only rebases reusing what it didn't touch (W14).
   - R14's cap for called workflows.
   - v1's `artifacts:` as an artifact.
@@ -3693,6 +3719,14 @@ is left.
     - `kiln clone` (kiln's git credential helper, and the commit-msg hook that adds Change-Ids);
     - `kiln submit` (adds the Change-Ids commits lack, then pushes);
     - `kiln sync`, `kiln diffs`, `kiln checkout D12[@v2]`, `kiln hook install`;
+    - `kiln absorb [-n]`: each edit of the working copy (to files HEAD has, staged or not) is
+      amended into the stack's commit that last touched its lines (blame within the stack), and
+      an insertion goes into the commit both its neighbours come from. Edits stay in the working
+      copy when they touch the trunk's lines or two commits' lines, or when a commit above moves
+      or changes their lines. The commits from the lowest target up are rewritten in place with
+      git's plumbing (no rebase to stop half-way): trees with the edits, then authors, dates and
+      messages as they were. HEAD moves only once the new top matches the working copy's files.
+      Unit-tested on a stack of two commits (`w14_r03_absorb`);
   - tables `diffs`, `diff_versions`, `stacks`, `diff_reviewers`.
   - Checked end to end with real git: W14-AC01 (`w14_ac01_stacks`: three commits as a stack,
     D2 amended, the stack rebased and reordered, an interdiff, the refusals, the options, the
@@ -3859,7 +3893,6 @@ is left.
       the first upload opens an alert, the second fixes it, and a bad commit gets a 422
       (`w14_r11_runs_and_code_scanning`).
 - *Left.* Everything else:
-  - R03's `kiln absorb`;
   - the rest of R11's REST subset and GraphQL;
   - replies by email or chat (R05, with W11-R06);
   - R06's diffs UI and the review pages (with W21);
@@ -3970,10 +4003,22 @@ previews and the board).
     - a rejection failed the job with the reviewer's comment, and a cancel ended a held one;
     - a held job stayed held across a server restart, then deployed when approved;
     - the run page's review in Chromium and WebKit, on desktop and phone.
+- *Done.* R05's `kiln/deploy@v1` (`crates/kiln/src/ci/deploy_step.rs`, the runner's
+  `deploy_step`). A leg whose job is bound to the environment (`environment:` on the job, its
+  protection passed before it started) asks the deploy service for a release of the app there
+  (`POST /_kiln/deploy/releases`, with the leg's token). It asks as `job:<leg>`, once per attempt
+  (an idempotency key), so the service's own gates apply too. The step then follows the release,
+  logging each change of state, and succeeds when the release does. A job that isn't bound to
+  the environment is refused, saying so. Checked end to end
+  (`w15_r05_kiln_deploy_releases_from_the_job`): the bound job's release was made as the job and
+  followed, and the unbound job was refused, with no release made.
+- *Done.* R06: KilnCD's app statuses raise kiln's `deploy` event in the app's repository (see
+  W03's notes).
 - *Left.*
   - Custom gates, windows, `after:` and `soak:` (R03, with CD), concurrency limits per
     environment, teams as reviewers, the environment pages (R08) and the board (R09).
-  - R02, R05 to R07 and AC02 to AC05, which are CD's or shared with it.
+  - R05's `wait: synced`, the sync's progress in the log, and the `deploy:` shorthand.
+  - R02, R07 and AC02 to AC05, which are CD's or shared with it.
 
 ### W16 Test results, flaky tests and benchmarks
 

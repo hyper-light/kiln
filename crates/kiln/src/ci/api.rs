@@ -33,6 +33,10 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W08: blobs, the cache (as GHES serves it) and the results service (artifacts).
         ["_kiln", "blob", id] => Some(super::services::blob::serve(hub, id, req).await),
         ["_apis", "artifactcache", rest @ ..] => Some(super::services::cache_v1::route(hub, rest, req).await),
+        // W15-R05: `kiln/deploy@v1`'s releases.
+        ["_kiln", "deploy", rest @ ..] => Some(super::deploy_step::route(hub, rest, req).await),
+        // W08-R09: kiln's chunked cache, for `kiln/cache@v1`.
+        ["_kiln", "cache", rest @ ..] => Some(super::services::chunks::route(hub, rest, req).await),
         ["twirp", service, method] => Some(super::services::twirp::route(hub, service, method, req).await),
         // W14: GitHub's REST API (as GHES serves it, at /api/v3) and GraphQL, for a leg's token.
         ["api", "v3", rest @ ..] => Some(super::rest::route(hub, rest, req).await),
