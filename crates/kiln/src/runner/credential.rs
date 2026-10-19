@@ -8,6 +8,9 @@
 //!   as `oauth2accesstoken`;
 //! - **ACR** (`"azure"`): Entra's token for the client, exchanged at the registry for its refresh
 //!   token;
+//! - **Quay** (`"quay"`): a robot's federated token; **JFrog** (`"jfrog"`): an Artifactory access
+//!   token for its OIDC provider; **Cloudsmith** (`"cloudsmith"`): a service's token;
+//!   **Chainguard** (`"chainguard"`): an assumable identity's token;
 //! - **the rest** (Docker Hub, GHCR, GitLab, Harbor robots, …): the integration's stored token;
 //! - **kiln's own registry**: the job's token, which ends with the leg.
 //!
@@ -102,7 +105,51 @@ pub async fn credentials_for(host: &str, list: &[Integration]) -> anyhow::Result
             let refresh = v.get("refresh_token").and_then(Value::as_str).ok_or_else(|| anyhow!("ACR's answer has no refresh token"))?;
             Ok(Some(("00000000-0000-0000-0000-000000000000".to_owned(), refresh.to_owned())))
         }
-        Some(other) => Err(anyhow!("`{}`: federation `{other}`: aws, gcp or azure (or none, for its token)", i.name)),
+        Some("quay") => {
+            // Quay's robot federation: the robot's name, the ID token as its password.
+            let robot = cfg(i, "robot").ok_or_else(|| anyhow!("`{}` has no robot (`org+name`)", i.name))?;
+            let jwt = token_for(cfg(i, "audience").unwrap_or(host).to_owned()).await?;
+            let basic = base64::engine::general_purpose::STANDARD.encode(format!("{robot}:{jwt}"));
+            let r = http.get(&format!("https://{host}/oauth2/federation/robot/token")).header("Authorization", &format!("Basic {basic}")).send().await.context("Quay's robot federation")?;
+            anyhow::ensure!(r.is_success(), "Quay refused the robot's federation ({})", r.status());
+            let v: Value = r.json(1 << 20).await?;
+            let token = v.get("token").and_then(Value::as_str).ok_or_else(|| anyhow!("Quay's answer has no token"))?;
+            Ok(Some((robot.to_owned(), token.to_owned())))
+        }
+        Some("jfrog") => {
+            // Artifactory's OIDC integration: a token exchange at its access service.
+            let provider = cfg(i, "provider").ok_or_else(|| anyhow!("`{}` has no provider (the OIDC integration's name in JFrog)", i.name))?;
+            let jwt = token_for(cfg(i, "audience").unwrap_or("jfrog-github").to_owned()).await?;
+            let body = json!({ "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange", "subject_token_type": "urn:ietf:params:oauth:token-type:id_token", "subject_token": jwt, "provider_name": provider });
+            let base = cfg(i, "url").map_or_else(|| format!("https://{host}"), |u| u.trim_end_matches('/').to_owned());
+            let r = http.post(&format!("{base}/access/api/v1/oidc/token")).json(&body).send().await.context("JFrog's token exchange")?;
+            anyhow::ensure!(r.is_success(), "JFrog refused the exchange ({})", r.status());
+            let v: Value = r.json(1 << 20).await?;
+            let token = v.get("access_token").and_then(Value::as_str).ok_or_else(|| anyhow!("JFrog's answer has no access token"))?;
+            let user = v.get("username").and_then(Value::as_str).or_else(|| cfg(i, "username")).unwrap_or("kiln");
+            Ok(Some((user.to_owned(), token.to_owned())))
+        }
+        Some("cloudsmith") => {
+            let (org, service) = (cfg(i, "org").ok_or_else(|| anyhow!("`{}` has no org", i.name))?, cfg(i, "service").ok_or_else(|| anyhow!("`{}` has no service (its slug)", i.name))?);
+            // The audience is the one the Cloudsmith OIDC provider was set up with.
+            let jwt = token_for(cfg(i, "audience").ok_or_else(|| anyhow!("`{}` has no audience (the one its Cloudsmith OIDC provider expects)", i.name))?.to_owned()).await?;
+            let r = http.post(&format!("https://api.cloudsmith.io/openid/{org}/")).json(&json!({ "oidc_token": jwt, "service_slug": service })).send().await.context("Cloudsmith's OIDC exchange")?;
+            anyhow::ensure!(r.is_success(), "Cloudsmith refused the exchange ({})", r.status());
+            let v: Value = r.json(1 << 20).await?;
+            let token = v.get("token").and_then(Value::as_str).ok_or_else(|| anyhow!("Cloudsmith's answer has no token"))?;
+            Ok(Some((service.to_owned(), token.to_owned())))
+        }
+        Some("chainguard") => {
+            let identity = cfg(i, "identity").ok_or_else(|| anyhow!("`{}` has no identity (the assumable identity's id)", i.name))?;
+            let jwt = token_for(cfg(i, "audience").unwrap_or("https://issuer.enforce.dev").to_owned()).await?;
+            let url = format!("https://issuer.enforce.dev/sts/exchange?aud={}&identity={}", crate::ci::cli::enc(host), crate::ci::cli::enc(identity));
+            let r = http.post(&url).bearer(&jwt).send().await.context("Chainguard's token exchange")?;
+            anyhow::ensure!(r.is_success(), "Chainguard refused the exchange ({})", r.status());
+            let v: Value = r.json(1 << 20).await?;
+            let token = v.get("token").and_then(Value::as_str).ok_or_else(|| anyhow!("Chainguard's answer has no token"))?;
+            Ok(Some(("_token".to_owned(), token.to_owned())))
+        }
+        Some(other) => Err(anyhow!("`{}`: federation `{other}`: aws, gcp, azure, quay, jfrog, cloudsmith or chainguard (or none, for its token)", i.name)),
         None => {
             let t = i.token.clone().ok_or_else(|| anyhow!("`{}` has no token, and no federation", i.name))?;
             Ok(Some((cfg(i, "username").unwrap_or("kiln").to_owned(), t)))
@@ -170,9 +217,89 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from)
 }
 
+/// What a leg's tools need to go through kiln's package proxies (W12-R04): their variables, and
+/// the files some read their settings from (written in `dir`; `seen` is how a step sees a path),
+/// with the job's `token`.
+pub fn proxy_env(proxies: &[(String, String)], token: &str, dir: &std::path::Path, seen: &dyn Fn(&std::path::Path) -> String) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut env = std::collections::BTreeMap::new();
+    std::fs::create_dir_all(dir)?;
+    let (mut npmrc, mut netrc) = (String::new(), String::new());
+    for (eco, url) in proxies {
+        let url = url.trim_end_matches('/');
+        let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+        let host = rest.split('/').next().unwrap_or(rest);
+        let bare = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        let with_creds = format!("{scheme}://kiln:{token}@{rest}");
+        match crate::ci::registry::proxy::Ecosystem::parse(eco) {
+            Some(crate::ci::registry::proxy::Ecosystem::Npm) => npmrc.push_str(&format!("registry={url}/\n//{rest}/:_authToken={token}\n")),
+            Some(crate::ci::registry::proxy::Ecosystem::Jsr) => npmrc.push_str(&format!("@jsr:registry={url}/\n//{rest}/:_authToken={token}\n")),
+            Some(crate::ci::registry::proxy::Ecosystem::Pypi) => {
+                let index = format!("{with_creds}/simple/");
+                env.insert("PIP_INDEX_URL".to_owned(), index.clone());
+                env.insert("UV_DEFAULT_INDEX".to_owned(), index.clone());
+                env.insert("UV_INDEX_URL".to_owned(), index);
+                if scheme == "http" {
+                    env.insert("PIP_TRUSTED_HOST".to_owned(), bare.to_owned());
+                    env.insert("UV_INSECURE_HOST".to_owned(), host.to_owned());
+                }
+            }
+            Some(crate::ci::registry::proxy::Ecosystem::Go) => {
+                env.insert("GOPROXY".to_owned(), url.to_owned());
+                // Go signs in to a proxy from its netrc, by the host's name.
+                netrc.push_str(&format!("machine {bare} login kiln password {token}\n"));
+            }
+            Some(crate::ci::registry::proxy::Ecosystem::Maven) => {
+                let f = dir.join("maven-settings.xml");
+                super::auth::write_private(&f, format!("<settings><mirrors><mirror><id>kiln</id><mirrorOf>*</mirrorOf><url>{url}</url></mirror></mirrors><servers><server><id>kiln</id><username>kiln</username><password>{token}</password></server></servers></settings>\n").as_bytes())?;
+                env.insert("MAVEN_ARGS".to_owned(), format!("-s {}", seen(&f)));
+            }
+            Some(crate::ci::registry::proxy::Ecosystem::Rubygems) => {
+                let f = dir.join("gemrc");
+                super::auth::write_private(&f, format!("---\n:sources:\n- {with_creds}/\n").as_bytes())?;
+                env.insert("GEMRC".to_owned(), seen(&f));
+                env.insert("BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/".to_owned(), format!("{with_creds}/"));
+            }
+            Some(crate::ci::registry::proxy::Ecosystem::Conda) => {
+                env.insert("CONDA_CHANNEL_ALIAS".to_owned(), url.to_owned());
+            }
+            // Cargo's source replacement, NuGet's and the others' settings live in files a project
+            // names itself (docs/ci.md W12-R04).
+            _ => {}
+        }
+    }
+    if !npmrc.is_empty() {
+        let f = dir.join("npmrc");
+        super::auth::write_private(&f, npmrc.as_bytes())?;
+        env.insert("NPM_CONFIG_USERCONFIG".to_owned(), seen(&f));
+    }
+    if !netrc.is_empty() {
+        let f = dir.join("netrc");
+        super::auth::write_private(&f, netrc.as_bytes())?;
+        env.insert("NETRC".to_owned(), seen(&f));
+    }
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w12_r04_proxy_settings() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proxies = [("npm", "http://k:7/_kiln/proxy/npm"), ("pypi", "http://k:7/_kiln/proxy/pypi"), ("go", "http://k:7/_kiln/proxy/go"), ("maven", "http://k:7/_kiln/proxy/maven"), ("rubygems", "http://k:7/_kiln/proxy/rubygems")]
+            .map(|(e, u)| (e.to_owned(), u.to_owned()));
+        let env = proxy_env(&proxies, "T0K", dir.path(), &|p| p.to_string_lossy().into_owned())?;
+        let read = |k: &str| env.get(k).map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
+        assert_eq!(read("NPM_CONFIG_USERCONFIG"), "registry=http://k:7/_kiln/proxy/npm/\n//k:7/_kiln/proxy/npm/:_authToken=T0K\n");
+        assert_eq!(env.get("PIP_INDEX_URL").map(String::as_str), Some("http://kiln:T0K@k:7/_kiln/proxy/pypi/simple/"));
+        assert_eq!((env.get("PIP_TRUSTED_HOST").map(String::as_str), env.get("UV_INSECURE_HOST").map(String::as_str)), (Some("k"), Some("k:7")));
+        assert_eq!(read("NETRC"), "machine k login kiln password T0K\n");
+        assert_eq!(env.get("GOPROXY").map(String::as_str), Some("http://k:7/_kiln/proxy/go"));
+        assert!(env.get("MAVEN_ARGS").is_some_and(|a| a.starts_with("-s ")));
+        assert!(read("GEMRC").contains("- http://kiln:T0K@k:7/_kiln/proxy/rubygems/"));
+        Ok(())
+    }
 
     #[test]
     fn w12_r03_hosts_and_configs() {

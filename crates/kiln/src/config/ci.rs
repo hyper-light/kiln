@@ -191,6 +191,9 @@ pub struct Registry {
     pub anonymous_pull: Vec<String>,
     /// The biggest blob, in bytes (20 GiB by default).
     pub max_blob: Option<u64>,
+    /// The names images use for kiln's registry besides the public URL's host
+    /// (`registry.example.com`): an attestation about such an image is attached to it (W18).
+    pub hosts: Vec<String>,
     /// `[[ci.registry.mirrors]]`: pull-through caches of other registries (docs/ci.md W12-R02).
     ///
     /// ```toml
@@ -236,6 +239,9 @@ pub struct Proxy {
     pub password_file: Option<std::path::PathBuf>,
     /// Seconds an index is trusted (300).
     pub ttl: Option<u64>,
+    /// Every job's tools use it by themselves: npm's, pip's and uv's, Go's, Maven's, RubyGems'
+    /// and Bundler's, conda's settings point at it, with the job's token.
+    pub jobs: bool,
 }
 
 /// A registry kiln pulls through.

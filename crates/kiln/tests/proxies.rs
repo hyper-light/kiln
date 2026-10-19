@@ -346,3 +346,202 @@ fn w12_ac03_installs_through_proxies() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
+        .output()?;
+    anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    Ok(())
+}
+
+/// Jobs through the proxies by themselves (W12-R04's first part): a proxy with `jobs = true` is
+/// in every leg's settings, npm's, pip's and Go's, signed in with the job's token.
+#[test]
+fn w12_r04_jobs_use_proxies() -> anyhow::Result<()> {
+    let down = Arc::new(AtomicBool::new(false));
+    let (up, _) = upstream(down)?;
+    let u = format!("http://127.0.0.1:{up}");
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".kiln"))?;
+    std::fs::write(repo.join("README.md"), "proxies\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!(
+        "[[ci.registry.proxies]]\necosystem = \"npm\"\nupstream = \"{u}/npm\"\njobs = true\n\n[[ci.registry.proxies]]\necosystem = \"pypi\"\nupstream = \"{u}/pypi\"\nfiles = \"{u}/pypi-files\"\njobs = true\n\n\
+         [[ci.registry.proxies]]\necosystem = \"go\"\nupstream = \"{u}/go\"\njobs = true\n\n[[repos]]\nname = \"acme/px\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n",
+        repo.display()
+    );
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let port = s.port;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
+        if body.contains("acme/px") && !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(
+        repo.join(".kiln/ci.yaml"),
+        r#"name: px
+on: { push: {} }
+jobs:
+  px:
+    runs-on: [self-hosted, local]
+    steps:
+      - run: |
+          set -e
+          grep -q "registry=" "$NPM_CONFIG_USERCONFIG" && grep -q "_authToken=" "$NPM_CONFIG_USERCONFIG"
+          echo npm-ok
+          curl -sf "${PIP_INDEX_URL}six/" | grep -q six-1.16.0
+          echo pip-ok
+          curl -sf --netrc-file "$NETRC" "$GOPROXY/github.com/pkg/errors/@v/list" | grep -q v0.9.1
+          echo go-ok
+"#,
+    )?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "px"])?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let run = loop {
+        let (_, body) = common::http(port, "GET", "/api/ci/runs?repo=acme/px&limit=5", &s.admin, None)?;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if let Some(r) = v.get("runs").and_then(serde_json::Value::as_array).and_then(|r| r.first()).filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).cloned() {
+            break r;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let id = run.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let (_, detail) = common::http(port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    let leg = serde_json::from_str::<serde_json::Value>(&detail)?.pointer("/legs/0/id").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..4 {
+        let (_, text) = common::http(port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    assert_eq!(run.get("conclusion").and_then(serde_json::Value::as_str), Some("success"), "{run}\n{log}");
+    for said in ["npm-ok", "pip-ok", "go-ok"] {
+        assert!(log.contains(said), "{said}: {log}");
+    }
+    Ok(())
+}
+
+/// A fake npm registry that takes a publish (`PUT /<name>`) with its token: what it was sent.
+fn npm_registry() -> anyhow::Result<(u16, Arc<Mutex<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let got: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = got.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => continue,
+            });
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let (method, path) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
+            let (mut len, mut auth) = (0usize, String::new());
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                    break;
+                }
+                let (k, v) = h.split_once(':').unwrap_or((&h, ""));
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "content-length" => len = v.trim().parse().unwrap_or(0),
+                    "authorization" => auth = v.trim().to_owned(),
+                    _ => {}
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = reader.read_exact(&mut body);
+            let mut s = reader.into_inner();
+            let (status, reply) = if method == "PUT" && path == "/kiln-test-pkg" && auth == "Bearer npm_fake_token" {
+                if let Ok(mut g) = seen.lock() {
+                    g.push(String::from_utf8_lossy(&body).into_owned());
+                }
+                (200, r#"{"ok":true}"#)
+            } else if method == "PUT" {
+                (401, r#"{"error":"bad token"}"#)
+            } else {
+                (404, r#"{"error":"not found"}"#)
+            };
+            let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+        }
+    });
+    Ok((port, got))
+}
+
+/// `kiln/publish@v1` (W12-R04's third part): a package published to its registry with a
+/// `package` integration's token, which never shows in the log.
+#[test]
+fn w12_r04_publish() -> anyhow::Result<()> {
+    if !std::process::Command::new("npm").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("no npm here");
+        return Ok(());
+    }
+    let (reg, got) = npm_registry()?;
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".kiln"))?;
+    std::fs::write(repo.join("README.md"), "publish\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!("[[repos]]\nname = \"acme/pub\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let port = s.port;
+    let body = serde_json::json!({ "kind": "package", "name": "npmreg", "config": { "ecosystem": "npm", "registry": format!("http://127.0.0.1:{reg}") }, "secret": "npm_fake_token", "scope": "server" });
+    let (st, b) = common::http(port, "POST", "/api/ci/integrations", &s.admin, Some(&body))?;
+    anyhow::ensure!((200..300).contains(&st), "the integration: {st} {b}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
+        if body.contains("acme/pub") && !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(
+        repo.join(".kiln/ci.yaml"),
+        "name: pub\non: { push: {} }\njobs:\n  pub:\n    runs-on: [self-hosted, local]\n    integrations: [npmreg]\n    steps:\n      - run: mkdir -p pkg && printf '{\"name\":\"kiln-test-pkg\",\"version\":\"1.0.0\"}' > pkg/package.json\n      - uses: kiln/publish@v1\n        with: { ecosystem: npm, integration: npmreg, path: pkg }\n",
+    )?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "pub"])?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let run = loop {
+        let (_, body) = common::http(port, "GET", "/api/ci/runs?repo=acme/pub&limit=5", &s.admin, None)?;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if let Some(r) = v.get("runs").and_then(serde_json::Value::as_array).and_then(|r| r.first()).filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).cloned() {
+            break r;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let id = run.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let (_, detail) = common::http(port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    let leg = serde_json::from_str::<serde_json::Value>(&detail)?.pointer("/legs/0/id").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..4 {
+        let (_, text) = common::http(port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    assert_eq!(run.get("conclusion").and_then(serde_json::Value::as_str), Some("success"), "{run}\n{log}");
+    let sent = got.lock().map(|g| g.join("\n")).unwrap_or_default();
+    assert!(sent.contains("\"name\":\"kiln-test-pkg\"") && sent.contains("_attachments"), "the registry got: {sent}");
+    assert!(!log.contains("npm_fake_token"), "the token is masked: {log}");
+    Ok(())
+}

@@ -2980,10 +2980,30 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   had after the leg. A leg on the host keeps the runner's own Docker logins; a job container never
   sees them. Checked in a leg (`w12_r03_job_credentials`); the federated exchanges need the
   clouds (AC04, user-assisted).
-- *Left.* R02's runners pulling through the mirrors by themselves (Docker's `registry-mirrors`,
-  containerd's `hosts.toml`, shards' settings, Firecracker's root file systems); R04's first part
-  (each ecosystem's configuration files and variables written for jobs) and third
-  (`kiln/publish@v1`); R05's publish targets; AC04 (user-assisted).
+- *Done.* R04's first part: a `package` integration (an ecosystem, a registry's URL, a token) puts
+  the credentials where the ecosystem's tools read them in a leg that names it: npm's userconfig
+  and `NODE_AUTH_TOKEN`, twine's and uv's publishing variables and pip's extra index, Cargo's
+  registry token (or a named registry's index and token), Go's netrc with `GOPRIVATE`, Maven's
+  settings, NuGet's source credentials, RubyGems' and Bundler's, Composer's `COMPOSER_AUTH`. And
+  a proxy with `jobs = true` is in every leg's settings (npm's, pip's and uv's, Go's, Maven's,
+  RubyGems' and Bundler's, conda's), signed in with the job's token (`w12_r04_jobs_use_proxies`).
+- *Done.* R04's third part, `kiln/publish@v1`: `npm publish`, `uv publish` (else twine),
+  `cargo publish`, `dotnet nuget push`, `gem push`, `mvn deploy`, with a `package` integration's
+  token handed over as each tool reads one, never on its command line; R05's private registries
+  as publish targets (the integration's `registry`). Checked with npm against a fake registry
+  that wants the token (`w12_r04_publish`).
+- *Done.* More of Appendix D behind the proxies: JSR, conda channels, the Gradle Plugin Portal,
+  Clojars, pub.dev, Hex, CRAN, CPAN, Hackage, LuaRocks, Julia's package server, opam, CocoaPods'
+  CDN, and Zig's packages through the HTTP proxy.
+- *Done.* R02's runners: images from the registries kiln mirrors (`container:`, `services:`,
+  `docker://` actions) are pulled through kiln, signed in with the job's token, and tagged as
+  asked; from their registry when kiln's mirror can't.
+- *Done.* More of D.2's federations through `docker-credential-kiln`: Quay's robot federation,
+  JFrog's OIDC integration, Cloudsmith's OIDC, Chainguard's assumable identities.
+- *Left.* R02's runners beyond Docker pulls (containerd's `hosts.toml` for the cluster, shards'
+  settings, Firecracker's root file systems, with W13); D.1's Composer, the Swift Package
+  Registry, Conan, vcpkg's binary cache and Nimble; D.2's Alibaba ACR and Oracle OCIR
+  federations; AC04 (user-assisted, against test tenants).
 
 ### W13 Runners and executors
 
@@ -4097,9 +4117,16 @@ Untrusted code (R05–R08):
 
   The microVM half waits for W13's executors (shards' network grants, Firecracker's tap device).
 
+Done since:
+- attaching to images through the OCI referrers API (W12): kiln's signed provenance and SBOMs
+  about an image in kiln's registry (by its public host, or `[ci.registry] hosts`) are referrers
+  of it, Sigstore bundles as OCI artifacts (`application/vnd.dev.sigstore.bundle.v0.3+json`), as
+  cosign's new bundle format keeps them; cosign verifies the bundle the referrers API returns
+  with kiln's key (`w18_attestation_on_image`).
+
 Left:
 - keyless signing (Fulcio, Rekor), cosign key files and KMS;
-- attaching to images through the OCI referrers API (W12);
+- attaching to images in other registries;
 - the SBOM differences in review;
 - R04 (with CD) and AC04;
 - microVM and `k8s` containment (W13), and the host's network namespace (opt-in).

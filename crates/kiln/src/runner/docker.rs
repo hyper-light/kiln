@@ -189,11 +189,58 @@ static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
 pub struct Cli {
     pub bin: String,
     config: PathBuf,
+    /// kiln's registry (its host) and the registries it mirrors, `(upstream, prefix)`: images from
+    /// those are pulled through kiln first (W12-R02).
+    through: Option<(String, Vec<(String, String)>)>,
 }
 
 impl Cli {
     pub fn new(bin: &str, config: PathBuf) -> Cli {
-        Cli { bin: bin.to_owned(), config }
+        Cli { bin: bin.to_owned(), config, through: None }
+    }
+
+    /// Pulls go through kiln's mirrors at `host` for the registries it mirrors.
+    #[must_use]
+    pub fn through(mut self, host: &str, mirrors: Vec<(String, String)>) -> Cli {
+        if !mirrors.is_empty() {
+            self.through = Some((host.to_owned(), mirrors));
+        }
+        self
+    }
+
+    /// The reference to pull `image` by through kiln, if kiln mirrors its registry.
+    pub fn through_ref(&self, image: &str) -> Option<String> {
+        let (host, mirrors) = self.through.as_ref()?;
+        let r = crate::ci::integrations::oci::parse_reference(image).ok()?;
+        let (_, prefix) = mirrors.iter().find(|(up, _)| *up == r.registry)?;
+        let mut out = format!("{host}/{prefix}/{}", r.repository);
+        if let Some(t) = &r.tag {
+            out.push(':');
+            out.push_str(t);
+        }
+        if let Some(d) = &r.digest {
+            out.push('@');
+            out.push_str(d);
+        }
+        Some(out)
+    }
+
+    /// Pulls `image`: through kiln's mirror when kiln mirrors its registry (tagged as `image`
+    /// after), else, or when that fails, from its registry.
+    pub async fn pull(&self, image: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
+        let none = BTreeMap::new();
+        if let Some(via) = self.through_ref(image) {
+            say(format!("{} pull {via} (kiln's mirror of {image})", self.bin));
+            match self.run(&[s("pull"), s("--quiet"), via.clone()], &none, SLOW).await {
+                Ok(_) => {
+                    self.run(&[s("tag"), via, image.to_owned()], &none, QUICK).await?;
+                    return Ok(());
+                }
+                Err(e) => say(format!("kiln's mirror didn't have it ({e:#}); pulling from its registry")),
+            }
+        }
+        say(format!("{} pull {image}", self.bin));
+        self.run(&[s("pull"), s("--quiet"), image.to_owned()], &none, SLOW).await.map(|_| ())
     }
 
     fn command(&self, args: &[String], env: &BTreeMap<String, String>) -> Command {
@@ -636,8 +683,7 @@ impl Containers {
             }
             return r.map(|_| tag);
         }
-        say(format!("{} pull {image}", self.cli.bin));
-        self.cli.run(&[s("pull"), s("--quiet"), image.to_owned()], &BTreeMap::new(), SLOW).await?;
+        self.cli.pull(image, say).await?;
         Ok(image.to_owned())
     }
 
@@ -765,8 +811,7 @@ pub fn parse_ports(out: &str) -> BTreeMap<String, String> {
 /// and kept; or pulled for `docker://…`.
 pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<String> {
     if let Some(i) = image.strip_prefix("docker://") {
-        say(format!("{} pull {i}", cli.bin));
-        cli.run(&[s("pull"), s("--quiet"), i.to_owned()], &BTreeMap::new(), SLOW).await?;
+        cli.pull(i, say).await?;
         return Ok(i.to_owned());
     }
     let none = BTreeMap::new();
@@ -810,6 +855,16 @@ pub fn action_run_args(name: &str, label: &str, network: Option<&str>, mounts: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w12_r02_pulls_through_kiln() {
+        let cli = Cli::new("docker", PathBuf::from("/tmp/x")).through("kiln.example:7070", vec![("docker.io".into(), "docker.io".into()), ("ghcr.io".into(), "gh".into())]);
+        assert_eq!(cli.through_ref("alpine:3.20").as_deref(), Some("kiln.example:7070/docker.io/library/alpine:3.20"));
+        let d = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(cli.through_ref(&format!("ghcr.io/acme/app@{d}")), Some(format!("kiln.example:7070/gh/acme/app@{d}")));
+        assert_eq!(cli.through_ref("quay.io/acme/app:1"), None, "a registry kiln doesn't mirror");
+        assert_eq!(Cli::new("docker", PathBuf::from("/tmp/x")).through("kiln.example", vec![]).through_ref("alpine"), None);
+    }
 
     #[test]
     fn runner_images_have_a_dockerfile() {

@@ -12,9 +12,11 @@
 //! - **Who**: anyone signed in to kiln (a PAT, an agent's or a job's token, as Bearer, as Basic's
 //!   password, or bare, as Cargo sends it); anyone at all with `anonymous`.
 //!
-//! The ecosystems: npm, PyPI (the simple API, PEP 503 and 691), crates.io's sparse index, Go's
-//! module proxy (and its checksum database), Maven repositories, NuGet v3, RubyGems' compact
-//! index, and plain HTTP for the rest (only the hosts named).
+//! The ecosystems (docs/ci.md Appendix D): npm and JSR, PyPI (the simple API, PEP 503 and 691)
+//! and conda channels, crates.io's sparse index, Go's module proxy (and its checksum database),
+//! Maven repositories (Maven Central, the Gradle Plugin Portal, Clojars), NuGet v3, RubyGems'
+//! compact index, pub.dev, Hex, CRAN, CPAN, Hackage, LuaRocks, Julia's package server, opam,
+//! CocoaPods' CDN, and plain HTTP for the rest (only the hosts named; Zig's packages, by hash).
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -38,12 +40,25 @@ const MAX_INDEX: usize = 64 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {
     Npm,
+    Jsr,
     Pypi,
+    Conda,
     Crates,
     Go,
     Maven,
+    GradlePlugins,
+    Clojars,
     Nuget,
     Rubygems,
+    Pub,
+    Hex,
+    Cran,
+    Cpan,
+    Hackage,
+    Luarocks,
+    Julia,
+    Opam,
+    Cocoapods,
     Http,
 }
 
@@ -51,13 +66,26 @@ impl Ecosystem {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "npm" => Self::Npm,
+            "jsr" => Self::Jsr,
             "pypi" | "python" | "pip" => Self::Pypi,
+            "conda" | "conda-forge" | "anaconda" => Self::Conda,
             "crates" | "cargo" | "crates.io" => Self::Crates,
             "go" | "golang" => Self::Go,
             "maven" | "gradle" => Self::Maven,
+            "gradle-plugins" | "gradle-plugin-portal" => Self::GradlePlugins,
+            "clojars" | "clojure" => Self::Clojars,
             "nuget" | "dotnet" => Self::Nuget,
             "rubygems" | "gems" | "ruby" => Self::Rubygems,
-            "http" => Self::Http,
+            "pub" | "dart" | "flutter" => Self::Pub,
+            "hex" | "elixir" | "erlang" | "gleam" => Self::Hex,
+            "cran" | "r" => Self::Cran,
+            "cpan" | "perl" => Self::Cpan,
+            "hackage" | "haskell" => Self::Hackage,
+            "luarocks" | "lua" => Self::Luarocks,
+            "julia" => Self::Julia,
+            "opam" | "ocaml" => Self::Opam,
+            "cocoapods" | "pods" => Self::Cocoapods,
+            "http" | "zig" => Self::Http,
             _ => return None,
         })
     }
@@ -66,12 +94,25 @@ impl Ecosystem {
     fn upstream(self) -> &'static str {
         match self {
             Self::Npm => "https://registry.npmjs.org",
+            Self::Jsr => "https://npm.jsr.io",
             Self::Pypi => "https://pypi.org",
+            Self::Conda => "https://conda.anaconda.org",
             Self::Crates => "https://index.crates.io",
             Self::Go => "https://proxy.golang.org",
             Self::Maven => "https://repo1.maven.org/maven2",
+            Self::GradlePlugins => "https://plugins.gradle.org/m2",
+            Self::Clojars => "https://repo.clojars.org",
             Self::Nuget => "https://api.nuget.org",
             Self::Rubygems => "https://rubygems.org",
+            Self::Pub => "https://pub.dev",
+            Self::Hex => "https://repo.hex.pm",
+            Self::Cran => "https://cloud.r-project.org",
+            Self::Cpan => "https://cpan.metacpan.org",
+            Self::Hackage => "https://hackage.haskell.org",
+            Self::Luarocks => "https://luarocks.org",
+            Self::Julia => "https://pkg.julialang.org",
+            Self::Opam => "https://opam.ocaml.org",
+            Self::Cocoapods => "https://cdn.cocoapods.org",
             Self::Http => "",
         }
     }
@@ -80,16 +121,27 @@ impl Ecosystem {
     fn immutable(self, path: &str) -> bool {
         let file = path.rsplit('/').next().unwrap_or(path);
         match self {
-            Self::Npm => path.contains("/-/") && file.ends_with(".tgz"),
+            Self::Npm | Self::Jsr => path.contains("/-/") && file.ends_with(".tgz"),
             Self::Pypi => path.starts_with("files/"),
+            Self::Conda => file.ends_with(".conda") || file.ends_with(".tar.bz2"),
             Self::Crates => path.starts_with("dl/"),
             Self::Go => {
                 (path.contains("/@v/") && (file.ends_with(".zip") || file.ends_with(".mod") || file.ends_with(".info")))
                     || (path.starts_with("sumdb/") && path.contains("/tile/") && !path.contains(".p/"))
             }
-            Self::Maven => !file.starts_with("maven-metadata.xml") && !path.contains("-SNAPSHOT/"),
+            Self::Maven | Self::GradlePlugins | Self::Clojars => !file.starts_with("maven-metadata.xml") && !path.contains("-SNAPSHOT/"),
             Self::Nuget => file.ends_with(".nupkg") || file.ends_with(".nuspec"),
             Self::Rubygems => path.starts_with("gems/") || path.starts_with("quick/"),
+            Self::Pub => path.contains("/archives/") || file.ends_with(".tar.gz"),
+            Self::Hex => path.starts_with("tarballs/"),
+            Self::Cran => (path.contains("src/contrib/") || path.starts_with("bin/")) && !file.starts_with("PACKAGES") && (file.ends_with(".tar.gz") || file.ends_with(".tgz") || file.ends_with(".zip")),
+            Self::Cpan => path.starts_with("authors/id/"),
+            Self::Hackage => path.starts_with("package/") && file.ends_with(".tar.gz"),
+            Self::Luarocks => file.ends_with(".rock") || file.ends_with(".rockspec"),
+            // Everything but the list of registries is addressed by its hash.
+            Self::Julia => path.starts_with("registry/") || path.starts_with("package/") || path.starts_with("artifact/"),
+            Self::Opam => path.starts_with("cache/"),
+            Self::Cocoapods => path.starts_with("Specs/") && file.ends_with(".podspec.json"),
             Self::Http => false,
         }
     }
@@ -175,7 +227,7 @@ impl Upstream<'_> {
         let here = format!("{origin}/_kiln/proxy/{}", name_of(self.cfg));
         let text = std::str::from_utf8(body).ok()?;
         let out = match self.eco {
-            Ecosystem::Npm if !self.eco.immutable(path) => text.replace(&format!("{}/", self.base), &format!("{here}/")),
+            Ecosystem::Npm | Ecosystem::Jsr | Ecosystem::Pub if !self.eco.immutable(path) => text.replace(&format!("{}/", self.base), &format!("{here}/")),
             Ecosystem::Pypi if path.starts_with("simple") => text.replace(&format!("{}/", self.files()), &format!("{here}/files/")).replace(&format!("{}/simple/", self.base), &format!("{here}/simple/")),
             // NuGet's service index: every resource through kiln, but its repository signatures,
             // which NuGet takes only over HTTPS, stay the upstream's when kiln speaks plain HTTP.
@@ -378,7 +430,7 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
         return srv::with_header(srv::status(StatusCode::NOT_MODIFIED), header::ETAG, &etag);
     }
     let Ok(Some(obj)) = crate::ci::services::cas::object(hub, &k.digest).await else { return fail(StatusCode::BAD_GATEWAY, "kiln's copy is gone") };
-    let mut r = if matches!(up.eco, Ecosystem::Npm | Ecosystem::Pypi | Ecosystem::Nuget) && !immutable && k.size <= MAX_INDEX as u64 {
+    let mut r = if matches!(up.eco, Ecosystem::Npm | Ecosystem::Jsr | Ecosystem::Pypi | Ecosystem::Nuget | Ecosystem::Pub) && !immutable && k.size <= MAX_INDEX as u64 {
         // An index, its links written over for this origin.
         let mut buf = Vec::with_capacity(usize::try_from(k.size).unwrap_or(0));
         let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
@@ -421,6 +473,18 @@ mod tests {
         assert!(Ecosystem::Nuget.immutable("v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg") && !Ecosystem::Nuget.immutable("v3/index.json"));
         assert!(Ecosystem::Rubygems.immutable("gems/rake-13.0.6.gem") && !Ecosystem::Rubygems.immutable("info/rake") && !Ecosystem::Rubygems.immutable("versions"));
         assert_eq!(Ecosystem::parse("cargo"), Some(Ecosystem::Crates));
+        assert!(Ecosystem::Jsr.immutable("@std/path/-/path-1.0.0.tgz") && Ecosystem::Clojars.immutable("ring/ring/1.0/ring-1.0.jar"));
+        assert!(Ecosystem::Conda.immutable("conda-forge/linux-64/numpy-2.0.0-py312.conda") && !Ecosystem::Conda.immutable("conda-forge/linux-64/repodata.json"));
+        assert!(Ecosystem::Cran.immutable("src/contrib/Rcpp_1.0.12.tar.gz") && !Ecosystem::Cran.immutable("src/contrib/PACKAGES.gz"));
+        assert!(Ecosystem::Hex.immutable("tarballs/jason-1.4.1.tar") && !Ecosystem::Hex.immutable("packages/jason"));
+        assert!(Ecosystem::Julia.immutable("package/682c06a0-de6a-54ab-a142-c8b1cf79cde6/0f4e") && !Ecosystem::Julia.immutable("registries"));
+        assert!(Ecosystem::Cpan.immutable("authors/id/E/ET/ETHER/Moose-2.2207.tar.gz") && !Ecosystem::Cpan.immutable("modules/02packages.details.txt.gz"));
+        assert!(Ecosystem::Hackage.immutable("package/text-2.1/text-2.1.tar.gz") && !Ecosystem::Hackage.immutable("01-index.tar.gz"));
+        assert!(Ecosystem::Opam.immutable("cache/sha256/ab/abcd") && !Ecosystem::Opam.immutable("index.tar.gz"));
+        assert!(Ecosystem::Luarocks.immutable("manifests/x/lpeg-1.1.0-1.rockspec") && !Ecosystem::Luarocks.immutable("manifest-5.4"));
+        assert!(Ecosystem::Pub.immutable("api/archives/http-1.2.0.tar.gz") && !Ecosystem::Pub.immutable("api/packages/http"));
+        assert!(Ecosystem::Cocoapods.immutable("Specs/0/0/0/Alamofire/5.9.1/Alamofire.podspec.json") && !Ecosystem::Cocoapods.immutable("all_pods_versions_0_0_0.txt"));
+        assert_eq!((Ecosystem::parse("zig"), Ecosystem::parse("gleam")), (Some(Ecosystem::Http), Some(Ecosystem::Hex)));
     }
 
     #[test]

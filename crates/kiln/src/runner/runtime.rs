@@ -107,6 +107,12 @@ fn secret_feeds(a: &AssignmentV2, dialect: Dialect) -> std::collections::BTreeSe
 }
 
 /// Whether a program is on `PATH`.
+/// The files a pattern names below `wd`, as a shell would expand it.
+fn glob_files(wd: &Path, pattern: &str) -> Vec<String> {
+    let full = wd.join(pattern).to_string_lossy().into_owned();
+    glob::glob(&full).map(|paths| paths.flatten().filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()).unwrap_or_default()
+}
+
 fn which(prog: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
 }
@@ -714,14 +720,28 @@ impl Leg {
         }
         // Docker asks kiln for registries' credentials when it needs them (W12-R03): the leg's
         // `oci` integrations', and kiln's own registry's (the job's token, which ends with the leg).
-        let own = crate::githost::host_of(&a.runtime.facade_url);
+        let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
         let docker = dir.join("docker");
-        // The runner's own logins stay for a leg on the host; a job container never sees them.
+        // The runner's own logins stay for a leg on the host; a job container never sees them, and
+        // gets kiln's helper only when the leg names a registry (the helper is the runner's binary).
         let base = if map.is_none() { super::credential::runner_config() } else { None };
         let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
-        if std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+        let wanted = map.is_none() || a.integrations.iter().any(|i| i.kind == "oci");
+        if wanted && std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
             st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
             st.env.insert("KILN_REGISTRY_HOST".into(), own);
+        }
+        // Package tools through kiln's proxies (W12-R04), with the job's token.
+        if !a.runtime.proxies.is_empty() {
+            let pdir = dir.join("proxies");
+            match super::credential::proxy_env(&a.runtime.proxies, &a.runtime.github_token, &pdir, &seen) {
+                Ok(env) => {
+                    for (k, v) in env {
+                        st.env.entry(k).or_insert(v);
+                    }
+                }
+                Err(e) => self.note(0, &format!("kiln's package proxies: {e:#}")).await,
+            }
         }
         true
     }
@@ -970,7 +990,8 @@ impl Leg {
             }
         }
         self.report_facts(&st).await;
-        if !a.integrations.is_empty() && !self.integrations(&mut st).await {
+        // Every leg: its integrations, kiln's registry and package proxies (W11, W12).
+        if !self.integrations(&mut st).await {
             if let Some(c) = &st.containers {
                 c.stop().await;
             }
@@ -1673,7 +1694,16 @@ impl Leg {
         let said = parking_lot::Mutex::new(Vec::<String>::new());
         let say = |m: String| said.lock().push(m);
         let keys: Vec<String> = services.iter().map(|(k, _)| k.clone()).collect();
-        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, egress.as_ref().map(|(e, _)| e), &say).await;
+        // Images from the registries kiln mirrors come through it, signed in with the job's token
+        // (W12-R02).
+        let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
+        let cli = super::docker::Cli::new(&bin, config).through(&own, a.runtime.mirrors.clone());
+        if !a.runtime.mirrors.is_empty()
+            && let Err(e) = cli.login(&format!("{own}/kiln"), "kiln", &a.runtime.github_token)
+        {
+            say(format!("kiln's mirror: {e:#}"));
+        }
+        let started = super::docker::Containers::start(cli, &a.job_id, map, &workdir, job, services, egress.as_ref().map(|(e, _)| e), &say).await;
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{}\r\n", st.masker.mask(&line)).into_bytes()).await;
@@ -2488,6 +2518,105 @@ impl Leg {
     }
 
     /// A built-in kiln action (W07-R10), run here.
+    /// `kiln/publish@v1` (W12-R04): the ecosystem's own publishing tool, with the integration's
+    /// token handed to it as it reads one (a file of this leg's, or a variable), never in its
+    /// arguments.
+    async fn publish(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, wd: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let eco = get("ecosystem").unwrap_or_default();
+        let integration = match get("integration") {
+            Some(n) => Some(self.a.integrations.iter().find(|i| i.name == n).ok_or_else(|| anyhow::anyhow!("no integration `{n}` for this leg"))?),
+            None => None,
+        };
+        let token = integration.and_then(|i| i.token.clone()).unwrap_or_default();
+        if !token.is_empty() {
+            self.mask(st, &token).await;
+        }
+        let configured = integration.and_then(|i| i.config.get("registry").and_then(serde_json::Value::as_str).map(str::to_owned));
+        let path = get("path").unwrap_or_else(|| ".".into());
+        let dir = st.layout.temp.join(format!("_kiln_publish_{idx}"));
+        std::fs::create_dir_all(&dir)?;
+        let mut env: BTreeMap<String, String> = st.env.clone();
+        let public = |p: &str| p.to_owned();
+        let (registry, prog, args): (String, String, Vec<String>) = match eco.as_str() {
+            "npm" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://registry.npmjs.org"));
+                let rest = reg.split_once("://").map_or(reg.as_str(), |(_, r)| r).trim_end_matches('/').to_owned();
+                let rc = dir.join("npmrc");
+                super::auth::write_private(&rc, format!("registry={}/\n//{rest}/:_authToken={token}\n", reg.trim_end_matches('/')).as_bytes())?;
+                env.insert("NPM_CONFIG_USERCONFIG".into(), rc.to_string_lossy().into_owned());
+                // A folder, as npm reads one (a bare name is a package's).
+                let folder = if path.starts_with('/') || path.starts_with('.') { path.clone() } else { format!("./{path}") };
+                (reg.clone(), "npm".into(), vec!["publish".into(), folder, "--registry".into(), format!("{}/", reg.trim_end_matches('/'))])
+            }
+            "pypi" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://upload.pypi.org/legacy/"));
+                let files = glob_files(wd, if path == "." { "dist/*" } else { &path });
+                anyhow::ensure!(!files.is_empty(), "nothing to publish at `{path}`");
+                if which("uv") {
+                    env.insert("UV_PUBLISH_TOKEN".into(), token.clone());
+                    let mut a = vec!["publish".into(), "--publish-url".into(), reg.clone()];
+                    a.extend(files);
+                    (reg, "uv".into(), a)
+                } else {
+                    env.insert("TWINE_USERNAME".into(), "__token__".into());
+                    env.insert("TWINE_PASSWORD".into(), token.clone());
+                    let mut a = vec!["-m".into(), "twine".into(), "upload".into(), "--non-interactive".into(), "--repository-url".into(), reg.clone()];
+                    a.extend(files);
+                    (reg, "python3".into(), a)
+                }
+            }
+            "crates" => {
+                let manifest = Path::new(&path).join("Cargo.toml").to_string_lossy().into_owned();
+                match get("registry").or(configured) {
+                    Some(reg) => {
+                        env.insert("CARGO_REGISTRIES_KILN_PUBLISH_INDEX".into(), if reg.starts_with("sparse+") { reg.clone() } else { format!("sparse+{}/", reg.trim_end_matches('/')) });
+                        env.insert("CARGO_REGISTRIES_KILN_PUBLISH_TOKEN".into(), token.clone());
+                        (reg, "cargo".into(), vec!["publish".into(), "--manifest-path".into(), manifest, "--registry".into(), "kiln-publish".into()])
+                    }
+                    None => {
+                        env.insert("CARGO_REGISTRY_TOKEN".into(), token.clone());
+                        ("https://crates.io".into(), "cargo".into(), vec!["publish".into(), "--manifest-path".into(), manifest])
+                    }
+                }
+            }
+            "nuget" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://api.nuget.org/v3/index.json"));
+                let files = glob_files(wd, if path == "." { "*.nupkg" } else { &path });
+                anyhow::ensure!(files.len() == 1, "`{path}`: one package to push, not {}", files.len());
+                env.insert("NUGET_KILN_KEY".into(), token.clone());
+                let file = files.into_iter().next().unwrap_or_default();
+                // dotnet takes its key as an argument; a shell reads it from the variable, so it
+                // stays out of the command line the runner logs.
+                (reg.clone(), "sh".into(), vec!["-c".into(), "exec dotnet nuget push \"$1\" --api-key \"$NUGET_KILN_KEY\" --source \"$2\"".into(), "publish".into(), file, reg])
+            }
+            "rubygems" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://rubygems.org"));
+                let files = glob_files(wd, if path == "." { "*.gem" } else { &path });
+                anyhow::ensure!(files.len() == 1, "`{path}`: one gem to push, not {}", files.len());
+                env.insert("GEM_HOST_API_KEY".into(), token.clone());
+                (reg.clone(), "gem".into(), vec!["push".into(), files.into_iter().next().unwrap_or_default(), "--host".into(), reg])
+            }
+            "maven" => {
+                let reg = get("registry").or(configured).ok_or_else(|| anyhow::anyhow!("maven: the repository's URL (`registry`, or the integration's)"))?;
+                let user = integration.and_then(|i| i.config.get("username").and_then(serde_json::Value::as_str)).unwrap_or("kiln").to_owned();
+                let settings = dir.join("settings.xml");
+                super::auth::write_private(&settings, format!("<settings><servers><server><id>kiln-publish</id><username>{user}</username><password>{token}</password></server></servers></settings>\n").as_bytes())?;
+                (reg.clone(), "mvn".into(), vec!["-B".into(), "-s".into(), settings.to_string_lossy().into_owned(), "-f".into(), Path::new(&path).join("pom.xml").to_string_lossy().into_owned(), "deploy".into(), format!("-DaltDeploymentRepository=kiln-publish::{reg}")])
+            }
+            other => anyhow::bail!("kiln/publish@v1 publishes npm, pypi, crates, nuget, rubygems or maven, not `{other}`"),
+        };
+        self.note(idx, &format!("{prog} {} → {registry}", args.iter().filter(|a| !a.contains(&token) || token.is_empty()).cloned().collect::<Vec<_>>().join(" "))).await;
+        let mut c = Command::new(&prog);
+        c.args(&args).current_dir(wd).envs(&env);
+        let out = crate::proc::output(c, Duration::from_secs(1800)).await.map_err(|e| anyhow::anyhow!("{prog}: {e:#}"))?;
+        let said = st.masker.mask(&format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+        self.log(idx, said.replace('\n', "\r\n").into_bytes()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        anyhow::ensure!(out.status.success(), "{prog} didn't publish (exit {})", out.status.code().unwrap_or(-1));
+        Ok([("registry".to_owned(), registry)].into_iter().collect())
+    }
+
     async fn builtin(&self, st: &mut State, idx: u32, b: &super::builtins::Builtin, mut with: BTreeMap<String, String>, wd: &Path) -> anyhow::Result<Ran> {
         for i in b.inputs {
             if let (Some(d), false) = (i.default, with.contains_key(i.name)) {
@@ -2574,6 +2703,10 @@ impl Leg {
             }
             "attest" => {
                 outputs = self.attest(st, idx, &with, wd).await?;
+                true
+            }
+            "publish" => {
+                outputs = self.publish(st, idx, &with, wd).await?;
                 true
             }
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),

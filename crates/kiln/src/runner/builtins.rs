@@ -57,6 +57,17 @@ pub const BUILTINS: &[Builtin] = &[
         outputs: &[("kind", "The integration's kind."), ("env", "The variables set, comma-separated.")],
     },
     Builtin {
+        name: "publish",
+        description: "Publish a package to its registry (W12-R04) with an integration's credentials: npm (`npm publish`), PyPI (`uv publish`, else twine), crates.io (`cargo publish`), NuGet (`dotnet nuget push`), RubyGems (`gem push`), Maven (`mvn deploy`). A private registry (Artifactory, Nexus, GitHub Packages, GitLab Packages, CodeArtifact, Azure Artifacts, Artifact Registry, Cloudsmith) is the integration's `registry`.",
+        inputs: &[
+            Input { name: "ecosystem", description: "npm, pypi, crates, nuget, rubygems or maven.", default: None, required: true },
+            input("integration", "The registry's credentials: an integration of the leg's, by name (its token, and its `registry` URL).", None),
+            input("path", "What to publish: the package's directory (npm, cargo, maven), its files (a pattern: dist/* for PyPI, *.nupkg, *.gem).", Some(".")),
+            input("registry", "The registry's URL, when not the integration's or the ecosystem's public one.", None),
+        ],
+        outputs: &[("registry", "Where it went.")],
+    },
+    Builtin {
         name: "attest",
         description: "Attest what the job built (W18): SLSA v1.0 provenance the server makes from its own records of the run, which the job's steps can't write, and an SBOM of the working directory's lockfiles when asked, signed by the server as Sigstore bundles (beside each file as `<file>.sigstore.json`). kiln's way to attest: `actions/attest-build-provenance` works only with a Fulcio that trusts kiln's OIDC issuer.",
         inputs: &[

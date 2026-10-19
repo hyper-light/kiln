@@ -866,6 +866,85 @@ async fn referrers(hub: &Hub, name: &str, digest: &str, req: &Request) -> Answer
     Ok(r)
 }
 
+// ------------------------------------------------------------------ attestations
+
+/// Sigstore's bundle, as an OCI artifact (what `cosign` 2.4's `--new-bundle-format` looks for).
+pub const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
+
+/// The repository in kiln's registry an image reference names (`kiln.example:7070/acme/app:1` is
+/// `acme/app`), when the reference is to kiln's registry: its public host, or one of
+/// `[ci.registry] hosts`.
+pub fn local_name(hub: &Hub, reference: &str) -> Option<String> {
+    let (host, rest) = reference.trim().split_once('/')?;
+    let own = crate::githost::host_of(&hub.cfg.server.public_url);
+    if !(host.eq_ignore_ascii_case(&own) || hub.cfg.ci.registry.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))) {
+        return None;
+    }
+    let name = rest.split('@').next().unwrap_or(rest);
+    // A tag after the last `/` part's colon.
+    let name = match name.rsplit_once(':') {
+        Some((n, tag)) if !tag.contains('/') => n,
+        _ => name,
+    };
+    valid_name(name).then(|| name.to_owned())
+}
+
+/// Attaches `bundle` (a Sigstore bundle about `subject`, its predicate `predicate_type`) to that
+/// image in kiln's repository `name` through the referrers API: an artifact manifest whose
+/// subject is the image (W18). `None` when the image isn't there.
+pub async fn attach(hub: &Hub, name: &str, subject: &str, bundle: &[u8], predicate_type: &str) -> anyhow::Result<Option<String>> {
+    let (n, d) = (name.to_owned(), subject.to_owned());
+    let target: Option<(String, i64)> = hub.store.call(move |c| Ok(c.query_row("SELECT media_type, size FROM registry_manifests WHERE repo = ?1 AND digest = ?2", params![n, d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
+    let Some((media_type, size)) = target else { return Ok(None) };
+    let mut blobs = Vec::new();
+    for bytes in [b"{}".as_slice(), bundle] {
+        let path = crate::ci::services::cas::staging(hub).join(format!("attach-{}", crate::util::new_id()));
+        let (p, b) = (path.clone(), bytes.to_vec());
+        crate::rt::blocking(move || -> std::io::Result<()> {
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&p, b)
+        })
+        .await??;
+        let obj = crate::ci::services::cas::put_file(hub, &path).await;
+        let _ = crate::rt::blocking(move || std::fs::remove_file(path)).await;
+        let obj = obj?;
+        let digest = format!("sha256:{}", obj.digest);
+        link(hub, name, &digest, obj.size).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        blobs.push((digest, obj.size));
+    }
+    let ((cd, cs), (bd, bs)) = match (blobs.first(), blobs.get(1)) {
+        (Some(c), Some(b)) => (c.clone(), b.clone()),
+        _ => anyhow::bail!("the attestation's blobs"),
+    };
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": BUNDLE_TYPE,
+        "config": { "mediaType": EMPTY_TYPE, "digest": cd, "size": cs },
+        "layers": [{ "mediaType": BUNDLE_TYPE, "digest": bd, "size": bs }],
+        "subject": { "mediaType": media_type, "digest": subject, "size": size },
+        "annotations": { "dev.sigstore.bundle.content": "dsse-envelope", "dev.sigstore.bundle.predicateType": predicate_type },
+    });
+    let body = serde_json::to_vec(&manifest)?;
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+    let annotations = manifest.get("annotations").map(Value::to_string);
+    let (n, d, s, len) = (name.to_owned(), digest.clone(), subject.to_owned(), i64::try_from(body.len()).unwrap_or(i64::MAX));
+    hub.store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO registry_manifests (repo, digest, media_type, artifact_type, subject, annotations, body, size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (repo, digest) DO NOTHING",
+                params![n, d, OCI_MANIFEST, BUNDLE_TYPE, s, annotations, body, len, crate::util::now_unix()],
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(Some(digest))
+}
+
 // ------------------------------------------------------------------ collection
 
 /// What a collection removed.

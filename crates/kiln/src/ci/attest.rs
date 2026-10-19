@@ -253,7 +253,25 @@ pub async fn reported(hub: &Hub, leg: &str, idx: u32, nonce: &str, mut subjects:
     if let Some((kind, doc)) = doc {
         made.push((kind.into(), s.bundle(&a::statement(&subjects, kind, doc))?));
     }
+    // Images in kiln's registry carry them as referrers (W18, W12-R01), where `cosign` and the
+    // referrers API find them.
+    let attached: Vec<(String, String, String, Value)> = subjects
+        .iter()
+        .filter_map(|sub| {
+            let repo = crate::ci::registry::local_name(hub, &sub.name)?;
+            let digest = sub.digest.iter().find(|(alg, _)| alg.eq_ignore_ascii_case("sha256")).map(|(_, hex)| format!("sha256:{}", hex.to_ascii_lowercase()))?;
+            Some(made.iter().map(move |(kind, bundle)| (repo.clone(), digest.clone(), kind.clone(), bundle.clone())).collect::<Vec<_>>())
+        })
+        .flatten()
+        .collect();
     keep(hub, run, leg.to_owned(), idx, nonce.to_owned(), "kiln", &subjects, made).await?;
+    for (repo, digest, kind, bundle) in attached {
+        match crate::ci::registry::attach(hub, &repo, &digest, bundle.to_string().as_bytes(), &kind).await {
+            Ok(Some(d)) => tracing::info!(repo = %repo, subject = %digest, referrer = %d, "an attestation attached to its image"),
+            Ok(None) => tracing::debug!(repo = %repo, subject = %digest, "the image isn't in kiln's registry; its attestation stays with the run"),
+            Err(e) => tracing::warn!(repo = %repo, error = %format!("{e:#}"), "an attestation couldn't be attached to its image"),
+        }
+    }
     Ok(())
 }
 

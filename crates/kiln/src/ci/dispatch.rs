@@ -1510,6 +1510,11 @@ impl Dispatch {
                 graphql_url: "/api/graphql".into(),
                 github_token: job_token,
                 cache_mode: Some(cache_mode.as_str().into()),
+                registry_url: "/".into(),
+                // The package proxies jobs go through by themselves (W12-R04).
+                proxies: self.hub.cfg.ci.registry.proxies.iter().filter(|p| p.jobs).map(|p| (p.ecosystem.clone(), format!("/_kiln/proxy/{}", p.name.clone().unwrap_or_else(|| p.ecosystem.clone())))).collect(),
+                // Images from the registries kiln mirrors come through it (W12-R02).
+                mirrors: self.hub.cfg.ci.registry.mirrors.iter().map(|m| (m.upstream.clone(), m.prefix())).collect(),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
             actions: r.actions.clone(),

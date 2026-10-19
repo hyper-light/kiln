@@ -554,3 +554,83 @@ jobs:
     assert!(!log.contains("ghp_fake_secret"), "the token is masked: {log}");
     Ok(())
 }
+
+/// An attestation of an image in kiln's registry is attached to it (docs/ci.md W18, W12-R01): the
+/// referrers API lists kiln's signed provenance as a Sigstore bundle about the image, and `cosign`
+/// (its container, when the runner has its image) verifies it with the server's key.
+#[test]
+fn w18_attestation_on_image() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".kiln"))?;
+    std::fs::write(repo.join("README.md"), "attested\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!("[ci.registry]\nanonymous_pull = [\"acme/app\"]\n\n[[repos]]\nname = \"acme/app\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let port = s.port;
+    let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("admin:{}", s.admin)));
+    let a = [("Authorization", basic.as_str())];
+    // An image in kiln's registry.
+    let (config, layer) = (br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{}}"#.to_vec(), b"a layer".to_vec());
+    for blob in [&config, &layer] {
+        assert_eq!(send(port, "POST", &format!("/v2/acme/app/blobs/uploads/?digest={}", digest(blob)), &a, blob)?.status, 201);
+    }
+    let m = manifest(&config, &[&layer], None, None);
+    let md = digest(&m);
+    assert_eq!(send(port, "PUT", "/v2/acme/app/manifests/v1", &[a[0], ("Content-Type", MANIFEST)], &m)?.status, 201);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
+        if body.contains("acme/app") && !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // A job attests it.
+    std::fs::write(
+        repo.join(".kiln/ci.yaml"),
+        format!("name: attest\non: {{ push: {{}} }}\njobs:\n  attest:\n    runs-on: [self-hosted, local]\n    steps:\n      - uses: kiln/attest@v1\n        with:\n          subject-name: 127.0.0.1:{port}/acme/app\n          subject-digest: {md}\n"),
+    )?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "attest"])?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let referrers = loop {
+        let g = send(port, "GET", &format!("/v2/acme/app/referrers/{md}?artifactType=application/vnd.dev.sigstore.bundle.v0.3%2Bjson"), &a, b"")?;
+        let v = g.json();
+        if v.get("manifests").and_then(Value::as_array).is_some_and(|l| !l.is_empty()) {
+            break v;
+        }
+        let (_, runs) = common::http(port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        anyhow::ensure!(std::time::Instant::now() < deadline, "nothing attached: {v}\n{runs}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(referrers.pointer("/manifests/0/annotations/dev.sigstore.bundle.predicateType").and_then(Value::as_str), Some("https://slsa.dev/provenance/v1"), "{referrers}");
+    // The bundle itself, through the referrer's manifest.
+    let rd = referrers.pointer("/manifests/0/digest").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let rm = send(port, "GET", &format!("/v2/acme/app/manifests/{rd}"), &a, b"")?.json();
+    assert_eq!(rm.pointer("/subject/digest").and_then(Value::as_str), Some(md.as_str()), "{rm}");
+    let bd = rm.pointer("/layers/0/digest").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let bundle = send(port, "GET", &format!("/v2/acme/app/blobs/{bd}"), &a, b"")?;
+    assert!(String::from_utf8_lossy(&bundle.body).contains("dsseEnvelope"), "{}", String::from_utf8_lossy(&bundle.body));
+    // cosign, where its image is: kiln's key verifies the bundle found through the referrers API
+    // as an attestation of the image's manifest (whose digest is the subject's).
+    let cosign = "ghcr.io/sigstore/cosign/cosign:v2.4.1";
+    if std::process::Command::new("docker").args(["image", "inspect", cosign]).output().is_ok_and(|o| o.status.success()) {
+        let (_, pem) = common::http(port, "GET", "/_kiln/attestation-key.pem", &s.admin, None)?;
+        std::fs::write(dir.path().join("key.pem"), pem)?;
+        std::fs::write(dir.path().join("root.json"), "{\"mediaType\":\"application/vnd.dev.sigstore.trustedroot+json;version=0.1\"}")?;
+        std::fs::write(dir.path().join("bundle.json"), &bundle.body)?;
+        std::fs::write(dir.path().join("manifest.json"), &m)?;
+        let o = std::process::Command::new("docker")
+            .args(["run", "--rm", "--network", "host", "-v"])
+            .arg(format!("{}:/w", dir.path().display()))
+            .args([cosign, "verify-blob-attestation", "--key", "/w/key.pem", "--bundle", "/w/bundle.json", "--new-bundle-format", "--insecure-ignore-tlog", "--trusted-root", "/w/root.json", "--type", "slsaprovenance1", "/w/manifest.json"])
+            .output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success(), "cosign: {said}");
+    }
+    Ok(())
+}
