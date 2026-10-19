@@ -81,6 +81,7 @@ certificate is accepted on first use, and nothing is fetched to decide.
 | POST | `/api/peers/:id/challenge` | a new challenge for a peering still waiting; the last stops working (admin) |
 | POST | `/api/peers/:id/complete` | `{response}`: peer (admin) |
 | POST | `/api/peers/authorize` | `{challenge, role}`: let the challenger in; `{peer, response}` (admin) |
+| PUT | `/api/peers/:id` | `{url}`: change where a cluster we open is reached (its key is what's trusted: no new codes) (admin) |
 | DELETE | `/api/peers/:id` | end a peering, either way (admin) |
 | GET | `/api/peers/open` | the clusters someone signed in may open (the picker) |
 | POST | `/api/peers/:id/frame` | `{origin, action, grant, expires_at}` for the person asking |

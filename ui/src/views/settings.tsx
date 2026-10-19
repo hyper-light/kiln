@@ -20,6 +20,8 @@ import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { UpdatesHold, UpdatesPanel, UpdatesStatus } from "@/views/settings-updates";
 import { DeploySettings } from "@/views/settings-deploy";
+import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
+import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
 
 const methodsRes: Res<{ password: boolean; token: boolean }> = {
   key: "auth/methods",
@@ -27,7 +29,7 @@ const methodsRes: Res<{ password: boolean; token: boolean }> = {
 };
 
 export default function Settings() {
-  warm(updatesRes, methodsRes);
+  warm(updatesRes, methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes);
   const [query, setQuery] = React.useState("");
   // At /settings#<section or group>, arriving or following a link here: that one opens.
   const { hash } = useLocation();
@@ -44,6 +46,9 @@ export default function Settings() {
       <SettingsSearch value={query} onChange={setQuery} />
       <SettingsSections query={query}>
         <SettingsSection id="device" index={1} title="This device" about="How kiln behaves in this browser" words="browser phone">
+          <Loadable label="notifications" fallback={<NotificationsHold />}>
+            <NotificationsGroup />
+          </Loadable>
           <MotionGroup />
         </SettingsSection>
         <SettingsSection

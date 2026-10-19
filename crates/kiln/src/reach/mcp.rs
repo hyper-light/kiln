@@ -54,7 +54,12 @@ once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
 folder, so edit here and build or test there; for a command that isn't about this repository, pass sync: false (it runs \
 in that machine's home folder). `runners` lists the machines, best first. Long commands can run in the background \
-(background: true), then `output` and `stop`."
+(background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
+`agents_start` them with a clear brief, `agents_wait` for them and read what they concluded with `agents_result`: \
+they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
+skill says how). To show the person a file from this machine (a screenshot, a recording, a PDF, a log), write its full \
+path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \
+shows it in the conversation and keeps a copy, so it still shows after the file goes."
         .to_owned();
     if !machines.is_empty() {
         s.push_str(&format!(" This kiln's machines: {machines}."));
@@ -122,7 +127,37 @@ fn command_schema(waits: bool) -> Value {
     json!({"type": "object", "properties": props, "required": ["command"]})
 }
 
+/// kiln's `agents.*` operations as tools of their own (`agents_start`, …), asked of the server
+/// for this session like the rest of kiln's operations: what an agent starts here is its child.
+fn agent_tools() -> Vec<Value> {
+    crate::harness::ops::list_ops()
+        .iter()
+        .map(|o| {
+            json!({
+                "name": crate::mcp::tool_name(o.name),
+                "title": o.name,
+                "description": o.summary,
+                "inputSchema": (o.input)(),
+                "annotations": {"readOnlyHint": o.read_only, "destructiveHint": o.destructive, "openWorldHint": false},
+            })
+        })
+        .collect()
+}
+
+/// The agents operation a tool is, by its name (`agents_start` is `agents.start`).
+fn agent_op(tool: &str) -> Option<&'static str> {
+    crate::harness::ops::list_ops().iter().map(|o| o.name).find(|n| crate::mcp::tool_name(n) == tool)
+}
+
 fn tools() -> Value {
+    let mut t = base_tools();
+    if let Some(list) = t.as_array_mut() {
+        list.extend(agent_tools());
+    }
+    t
+}
+
+fn base_tools() -> Value {
     json!([
         {
             "name": "code_run",
@@ -504,7 +539,17 @@ impl Server {
                 let (v, failed) = self.stop(&id, OUTPUT_MAX);
                 text_result(&v, failed)
             }
-            other => text_result(&json!({"error": format!("no tool {other}")}), true),
+            // kiln's agents operations, asked of the server for this session.
+            other => match agent_op(other) {
+                Some(op) => match self.ask(json!({"op": "call", "name": op, "input": args})) {
+                    Ok(a) => match a.get("ok") {
+                        Some(v) => text_result(v, false),
+                        None => text_result(&a, true),
+                    },
+                    Err(e) => text_result(&json!({"error": format!("{e:#}")}), true),
+                },
+                None => text_result(&json!({"error": format!("no tool {other}")}), true),
+            },
         }
     }
 }
@@ -740,7 +785,10 @@ mod tests {
         assert_eq!(a.pointer("/env/1"), Some(&json!({"name": "KILN_SESSION", "value": "s1"})));
         let t = tools();
         let names: Vec<&str> = t.as_array().into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
-        assert_eq!(names, ["code_run", "code_search", "runners", "run", "output", "stop"]);
+        assert_eq!(names.get(..6), Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]));
+        assert!(names.contains(&"agents_start") && names.contains(&"agents_wait") && names.contains(&"agents_result"), "agents' tools too: {names:?}");
+        assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
+        assert_eq!(agent_op("run"), None);
         assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));
         let i = instructions(None, "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));

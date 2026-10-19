@@ -158,11 +158,15 @@ pub struct Hub {
     /// Transcript requests waiting for their machine's answer, by request number.
     ai_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<Option<String>>>>,
     ai_seq: AtomicU64,
+    /// File reads (`crate::harness::files`) waiting for their machine's answer: its JSON and bytes.
+    file_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<(String, Vec<u8>)>>>,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
     pub generation: u64,
+    /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
+    pub runners_before: AtomicU64,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -201,6 +205,8 @@ pub struct Hub {
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
     pub tasks: crate::sync::tasks::Tasks,
+    /// Notifications to people's devices (`crate::push`).
+    pub push: crate::push::Service,
 }
 
 impl Hub {
@@ -241,11 +247,13 @@ impl Hub {
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
+            file_requests: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             launching: Mutex::new(HashMap::new()),
             started: Instant::now(),
             generation,
+            runners_before: AtomicU64::new(0),
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
@@ -267,6 +275,7 @@ impl Hub {
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             places,
             tasks,
+            push: crate::push::Service::default(),
         })
     }
 
@@ -543,6 +552,64 @@ impl Hub {
         }
     }
 
+    /// A piece of a file on a machine, for whoever views agent session `session` there
+    /// (`crate::harness::files`): its answer's JSON and the bytes. Asked of the runner process
+    /// holding the session; `Ok(None)` when that one doesn't read files ([`proto::CAP_FILES`]).
+    pub async fn harness_file_read(&self, machine: &str, session: &str, path: &str, offset: u64, len: u32) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        /// A piece may be a megabyte from a machine on a slow link.
+        const WAIT: Duration = Duration::from_secs(30);
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let msg = ServerMsg::HarnessFileRead { req, session: session.to_owned(), path: path.to_owned(), offset, len };
+        let peer = {
+            let mut inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            let to = inst.route(machine, &msg);
+            to.filter(|p| inst.get(*p).is_some_and(|i| i.caps & proto::CAP_FILES != 0))
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let frame = proto::encode(&msg)?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.file_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(WAIT, rx).await.ok() } else { None };
+        self.file_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(a)) => Ok(Some(a)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
+    /// Ask machine `machine` something by its newest runner process announcing `cap` (`msg` given
+    /// the question's number), and wait up to `wait` for its [`AgentMsg::Answer`]. `Ok(None)`: no
+    /// process of it announces `cap` (its kiln is too old); `Ok(Some(json))`: what it answered.
+    pub async fn ask_runner(&self, machine: &str, cap: u32, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<String>>> {
+        let peer = {
+            let inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            inst.newest_with(machine, cap)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&msg(req))?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(json)) => Ok(Some(json)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
     /// A machine's past sessions (JSON `[PastSession]`).
     pub async fn harness_history(&self, machine: &str, kind: Option<String>, limit: u32) -> anyhow::Result<Option<String>> {
         self.ai_ask(machine, move |req| ServerMsg::HarnessHistory { req, kind, limit }).await
@@ -722,8 +789,9 @@ impl Hub {
                     }
                 }
             }
-            // Bulk frames are job output, but on the conversation feed's lane (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO => {
+            // Bulk frames are job output, but on the conversation feed's and the files' lanes
+            // (messages, in bulk).
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
                 let chunk: proto::LogChunk = proto::decode(&data)?;
                 if self.owns_job(peer, &chunk.job) {
                     self.logs.append(&chunk.job, chunk.idx, &chunk.data);
@@ -958,7 +1026,7 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
-            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } => {
+            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } | AgentMsg::Answer { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
                 }
@@ -966,6 +1034,11 @@ impl Hub {
             AgentMsg::DirList { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(Some(json));
+                }
+            }
+            AgentMsg::HarnessFileData { req, json, data } => {
+                if let Some(tx) = self.file_requests.lock().remove(&req) {
+                    let _ = tx.send((json, data));
                 }
             }
             AgentMsg::Build { build, caps } => {
@@ -1974,8 +2047,29 @@ impl Hub {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A hub of its own for a test: its data in a folder that lives as long as the process (tests
+    /// end with it), a QUIC endpoint on a free loopback port, no runners, its agents off unless a
+    /// test turns terminals on.
+    pub(crate) async fn scratch_hub() -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_with(|_| {}).await
+    }
+
+    pub(crate) async fn scratch_hub_with(f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        let dir = tempfile::tempdir()?.keep();
+        let mut cfg = Config::default();
+        cfg.server.data_dir = dir.clone();
+        cfg.terminal.enabled = false;
+        f(&mut cfg);
+        let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
+        let leaf = pki.server_leaf(&[])?;
+        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+        let store = Store::in_memory()?;
+        let logs = Logs::new(dir.join("logs"), 1 << 20);
+        Ok(Hub::new(Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
+    }
 
     #[test]
     fn an_outpost_has_its_label_and_no_slots() {

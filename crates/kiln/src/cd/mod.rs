@@ -785,6 +785,31 @@ impl Cd {
         }
     }
 
+    /// An app's definition, as kiln holds it now.
+    pub(crate) fn definition(&self, id: &str) -> Option<AppDef> {
+        self.apps.read().get(id).map(|e| e.def.clone())
+    }
+
+    /// What `def` renders: its sources read at their revisions as an app's are, its artifacts as a
+    /// plan takes them (no registry is asked). A release previewed before it is released
+    /// (docs/deploy-api.md §8.1).
+    pub(crate) async fn render_definition(self: &Arc<Self>, def: AppDef) -> Result<Vec<Value>> {
+        let cluster = self.clusters.read().get(&def.destination.cluster).cloned();
+        let (kube_version, api_versions) = match &cluster {
+            Some(c) => (c.version.read().clone(), c.discovery.read().api_versions.clone()),
+            None => (None, Vec::new()),
+        };
+        let cd = Arc::clone(self);
+        crate::rt::blocking(move || {
+            let mut r = cd.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
+            let (artifacts, pull_secrets) = cd.planned_artifacts(&def, &r.revision);
+            r.add_artifacts(artifacts, pull_secrets);
+            cd.render_app(&def, &r, r.key, kube_version.as_deref(), &api_versions).map(|(objects, _children)| objects)
+        })
+        .await
+        .and_then(|r| r)
+    }
+
     /// Renders every source of an app into one list; Argo CD Applications among the objects are
     /// its children (app of apps), returned apart.
     fn render_app(&self, def: &AppDef, inputs: &Resolved, key: u64, kube_version: Option<&str>, api_versions: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
@@ -1445,11 +1470,6 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                 }
             }
         });
-    }
-    // Agents kiln starts on this machine get its MCP server and skills.
-    let port = hub.cfg.server.http_addr.rsplit_once(':').map(|(_, p)| p.to_owned()).unwrap_or_else(|| "7070".into());
-    if let Err(e) = crate::mcp::init_kit(&hub, &format!("http://127.0.0.1:{port}")) {
-        tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
     }
     tracing::info!(apps = cd.apps.read().len(), "deployments ready");
     let _ = hub.shutdown.cancelled().await;

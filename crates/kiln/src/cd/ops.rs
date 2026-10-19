@@ -264,11 +264,6 @@ pub fn ops() -> &'static [Op] {
                 input: || obj_schema(json!({"name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "registry"]}, "repository": {"type": "string"}, "integration": {"type": "string"}}), &["name", "kind"]),
                 run: images_set),
         ]
-        .into_iter()
-        // Plans share the one table (crates/kiln/src/plans/ops.rs).
-        .chain(crate::plans::ops::list_ops())
-        .chain(crate::goals::ops::list_ops())
-        .collect()
     })
 }
 
@@ -988,13 +983,22 @@ fn sync_request(v: &Value, by: &str) -> Result<SyncRequest, Fail> {
 
 /// Whether an app can start a sync now: none is running, and its render didn't fail.
 fn ready_to_sync(cd: &Cd, id: &str) -> Result<(), Fail> {
+    not_syncing(cd, id)?;
+    let statuses = cd.statuses.read();
+    let Some(s) = statuses.get(id) else { return Ok(()) };
+    if let Some(m) = s.message.as_deref().filter(|m| m.starts_with("render failed")) {
+        return Err(bad(format!("{id} can't sync: its {m}")));
+    }
+    Ok(())
+}
+
+/// No sync of the app is under way. All a rollback asks: git's head failing to render, or its
+/// artifacts not built yet, is no reason not to go back.
+fn not_syncing(cd: &Cd, id: &str) -> Result<(), Fail> {
     let statuses = cd.statuses.read();
     let Some(s) = statuses.get(id) else { return Ok(()) };
     if s.operation.as_ref().is_some_and(|o| matches!(o.phase, OpPhase::DryRun | OpPhase::Running | OpPhase::Failing | OpPhase::Terminating)) {
         return Err((StatusCode::CONFLICT, format!("{id} is already syncing; stop that sync first")));
-    }
-    if let Some(m) = s.message.as_deref().filter(|m| m.starts_with("render failed")) {
-        return Err(bad(format!("{id} can't sync: its {m}")));
     }
     Ok(())
 }
@@ -1080,7 +1084,7 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
     if super::is_shadow(&def) {
         return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
     }
-    ready_to_sync(cd, &id)?;
+    not_syncing(cd, &id)?;
     let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
     let current = history.iter().rev().find(|d| d.succeeded).and_then(|d| d.key);
     let target = match to {
@@ -1112,7 +1116,7 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
         (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone())
     };
     let (cd2, d2, at) = (cd.clone(), def.clone(), commits.clone());
-    let (mut head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
+    let (head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
         let head = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
         let back = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
         Ok((head, back))
@@ -1120,10 +1124,9 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
     .await
     .and_then(|r| r)
     .map_err(|e| bad(format!("{e:#}")))?;
-    // The head's artifacts as the source poll resolves them (the pin compares its content), and
-    // the deployment's exactly as it recorded them.
-    let (a, p) = cd.resolve_artifacts(&def, &head.revision).await.map_err(|e| bad(format!("{e:#}")))?;
-    head.add_artifacts(a, p);
+    // The pin holds while git renders what it rendered: the head's content before its artifacts,
+    // as the source poll compares it. A rollback never waits for the head's artifacts: the head
+    // may be what broke, or its image still building. The deployment's are exactly as recorded.
     let (a, p) = cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     back.add_artifacts(a, p);
     let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };

@@ -1193,7 +1193,8 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   font-size: 12px;
 }
 .hx-usage-stop,
-.hx-usage-move {
+.hx-usage-move,
+.hx-usage-cost {
   display: grid;
   grid-template-columns: 7.5rem minmax(0, 1fr);
   align-items: center;
@@ -1204,18 +1205,17 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 .hx-usage-stop > .hx-pick {
   justify-self: start;
 }
-.hx-usage-end {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
+/* As tall as a window's row, so it doesn't crowd the select above it. */
+.hx-usage-cost {
+  min-height: 26px;
+  margin: 0;
 }
-.hx-usage-more {
-  min-height: 28px;
-  color: #a1a4ad;
-  font-size: 12px;
-  text-decoration: underline;
-  text-decoration-color: #a1a4ad55;
-  text-underline-offset: 3px;
+/* What it has cost, in the windows' figures' voice. */
+.hx-usage-cost-v {
+  color: var(--color-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 /* A phone: when it starts over in the time left only, so each window stays one row. */
 @container (max-width: 520px) {
@@ -1227,13 +1227,11 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
     display: none;
   }
   .hx-usage-stop,
-  .hx-usage-move {
+  .hx-usage-move,
+  .hx-usage-cost {
     grid-template-columns: 6.25rem minmax(0, 1fr);
     gap: 10px;
   }
-}
-.hx-usage-more:hover {
-  color: var(--color-bright);
 }
 .ag-run .hx-limit-badge {
   height: auto;

@@ -110,7 +110,11 @@ kiln machines · kiln tokens create|list|revoke · kiln api GET /api/runs
   - ACP agents through session parameters.
   Each acts for whoever started it (with their rights), so every call is audited under the agent,
   on behalf of its user (`agent:<session>@<runner> for <user>`). Agents the server itself starts get
-  `/api/mcp` with a token of their own.
+  `/api/mcp` with a token of their own (`kiln_mcp_session-<id>_…`, which works only while kiln runs
+  that agent), and act for whoever started them the same way (`agent:<session> for <user>`).
+- **Agents' own operations** (`agents.*`, `plans.*`, `goals.*`) are tools too, with deployments on
+  or off, each checked as its route (`agents.run`): an agent starts, waits on and reads other
+  agents, and what it starts can do no more than it can (docs/agents.md, "Agents that run agents").
 
 ## Audit
 

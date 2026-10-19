@@ -27,6 +27,9 @@ use crate::config::Config;
 use crate::hub::Hub;
 use crate::sup::{self, Registry};
 
+/// A runner seen this recently before the server started counts as connected before it.
+const RUNNERS_BEFORE_S: i64 = 900;
+
 pub fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
     R.get_or_init(Registry::default)
@@ -65,6 +68,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
+    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
     let requeued = store.recover().await?;
     if requeued > 0 {
         tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
@@ -94,6 +98,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
@@ -128,12 +133,20 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling
     // or schedules, terminals, agents, sync, fleet or UI.
     if !cfg.ci.local {
+        // Agents kiln starts on this machine get its MCP server and skills (each agent a token of
+        // its own: docs/agents.md, "Agents that run agents").
+        let port = cfg.server.http_addr.rsplit_once(':').map(|(_, p)| p.to_owned()).unwrap_or_else(|| "7070".into());
+        if let Err(e) = crate::mcp::init_kit(&hub, &format!("http://127.0.0.1:{port}")) {
+            tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
+        }
         child!("sampler", h => h.sampler_loop());
         child!("retention", h => h.retention_loop());
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
         child!("goal-stacks", h => crate::goals::run(h));
+        child!("plan-runs", h => crate::plans::agents::drive(h));
         child!("harness", h => crate::harness::registry::Registry::run_local(h));
+        child!("push", h => crate::push::run(h));
         child!("gitops-discover", h => crate::gitops::discover_loop(h));
         child!("gitops-poll", h => crate::gitops::poll_loop(h));
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));

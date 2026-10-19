@@ -153,6 +153,49 @@ impl Argo {
         self.ok(Method::Put, &format!("/api/v1/applications/{}/spec?{}", enc(name), self.app_query()), Some(&spec)).await.map(|_| ())
     }
 
+    /// The manifests an Application renders: at `revision` (a chart's version) when given.
+    pub async fn manifests(&self, name: &str, revision: Option<&str>) -> Result<Vec<Value>, String> {
+        let rev = revision.map(|r| format!("&revision={}", enc(r))).unwrap_or_default();
+        let v = self.ok(Method::Get, &format!("/api/v1/applications/{}/manifests?{}{rev}", enc(name), self.app_query()), None).await?;
+        let objects = v.get("manifests").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|s| serde_json::from_str::<Value>(s).ok());
+        // Helm's test hooks are rendered, and never synced: Argo CD runs no `helm test`.
+        Ok(objects.filter(|o| !o.pointer("/metadata/annotations/helm.sh~1hook").and_then(Value::as_str).is_some_and(|h| h.contains("test"))).collect())
+    }
+
+    /// What Argo CD compares of an Application: each object's live, normalized and predicted states.
+    pub async fn managed_resources(&self, name: &str) -> Result<Vec<Value>, String> {
+        let v = self.ok(Method::Get, &format!("/api/v1/applications/{}/managed-resources?{}", enc(name), self.app_query()), None).await?;
+        Ok(v.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    /// The last `tail` lines of an object's pods' logs: `{pod, ts, text}`, oldest first, as KilnCD's.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn logs(&self, name: &str, group: &str, kind: &str, object: &str, namespace: Option<&str>, container: Option<&str>, tail: u32) -> Result<Vec<Value>, String> {
+        let mut q = format!("{}&group={}&kind={}&resourceName={}&tailLines={tail}&follow=false", self.app_query(), enc(group), enc(kind), enc(object));
+        if let Some(ns) = namespace {
+            q.push_str(&format!("&namespace={}", enc(ns)));
+        }
+        if let Some(c) = container {
+            q.push_str(&format!("&container={}", enc(c)));
+        }
+        let (status, v) = self.call(Method::Get, &format!("/api/v1/applications/{}/logs?{q}", enc(name)), None).await?;
+        if !(200..300).contains(&status) {
+            return Err(answered(status, &v));
+        }
+        // A stream of `{"result": {content, timeStamp, podName}}`, one a line.
+        let text = match &v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        Ok(text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|e| e.get("result").cloned())
+            .filter(|r| r.get("last").and_then(Value::as_bool) != Some(true))
+            .map(|r| json!({ "pod": r.get("podName"), "ts": r.get("timeStamp"), "text": r.get("content") }))
+            .collect())
+    }
+
     /// Makes Argo CD know an OCI Helm registry (public: no credentials).
     pub async fn ensure_oci_repo(&self, url: &str) -> Result<(), String> {
         let body = json!({ "repo": url, "type": "helm", "enableOCI": true, "name": url.replace(['/', ':', '.'], "-") });
@@ -345,7 +388,7 @@ mod tests {
     }
 
     fn app(package: Package) -> App {
-        App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), archived: false }
+        App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false }
     }
 
     fn helm() -> Package {

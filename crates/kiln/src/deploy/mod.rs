@@ -11,6 +11,7 @@
 //! - [`check`]: what a release is checked for before it is recorded; [`gates`]: what it waits for
 //!   before its commit.
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
+//! - [`scaffold`]: an app's source repository, made from its template's starter.
 //! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
 //!   operations agents reach through MCP and code mode.
 
@@ -22,10 +23,13 @@ pub mod flow;
 pub mod gates;
 pub mod host;
 pub mod kilncd;
+pub mod metrics;
 pub mod model;
 pub mod ops;
 pub mod provider;
+pub mod reads;
 pub mod repo;
+pub mod scaffold;
 pub mod store;
 
 use std::sync::Arc;

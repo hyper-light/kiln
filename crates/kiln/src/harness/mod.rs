@@ -12,6 +12,9 @@
 //! * [`session`] — one agent session: the harness process, its adapter and its state.
 //! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
 //! * [`registry`] — the server's mirror of every session, for any number of viewers.
+//! * [`lineage`] — agents an agent starts: its children, held to no more than it has.
+//! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
+//! * [`wait`] — where agents stand, and waiting for them to settle.
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 
 pub mod acp;
@@ -24,11 +27,15 @@ pub mod core;
 pub mod diff;
 pub mod elicit;
 pub mod elsewhere;
+pub mod files;
 pub mod handoff;
 pub mod host;
+pub mod kept;
 pub mod kinds;
+pub mod lineage;
 pub mod model;
 pub mod moving;
+pub mod ops;
 pub mod pause;
 pub mod registry;
 pub mod relocate;
@@ -37,3 +44,4 @@ pub mod session;
 pub mod survivors;
 pub mod socket;
 pub mod transcript;
+pub mod wait;

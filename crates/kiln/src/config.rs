@@ -32,6 +32,10 @@ pub struct Config {
     pub ci: ci::Ci,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
     pub conversations: Conversations,
+    /// Notifications to people's devices (docs/notifications.md).
+    pub push: crate::push::Push,
+    /// Agents that start agents (docs/agents.md, "Agents that run agents").
+    pub agents: Agents,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
     /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
     pub agent: crate::runner::probe::Declared,
@@ -173,6 +177,22 @@ pub struct Conversations {
     /// while the store has nothing else to do, then put in its place. Runners and mirrors compact
     /// theirs.
     pub compact: bool,
+}
+
+/// `[agents]`: how far agents may start agents (docs/agents.md, "Agents that run agents").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Agents {
+    /// How many agents deep a chain may go below the one a person started (that one is 0).
+    pub max_depth: u32,
+    /// How many children still running one agent may have at once.
+    pub max_children: u32,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Self { max_depth: 3, max_children: 24 }
+    }
 }
 
 impl Conversations {

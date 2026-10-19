@@ -19,11 +19,15 @@ import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, 
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
+import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handlePush, pushHeard } from "./push.ts";
+import { handleReview } from "./review.ts";
+import { handleDoctor } from "./doctor.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -459,11 +463,13 @@ function historicalRun(created: number, seed: number) {
 /* ------------------------------------------------------------------ */
 
 function emit(ev: ServerEvent) {
+  pushHeard(ev);
   const msg = JSON.stringify(ev);
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
+setFamilyEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -1173,6 +1179,7 @@ const MIME: Record<string, string> = {
   ".woff": "font/woff",
   ".png": "image/png",
   ".json": "application/json",
+  ".webmanifest": "application/manifest+json",
   ".ico": "image/x-icon",
 };
 
@@ -1252,6 +1259,10 @@ const server = http.createServer(async (req, res) => {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));
       return json(res, 200, { ok: true });
     }
+    // ---- files the long session's messages mention ----
+    if (handleLongFiles(p, url, req, res)) return;
+    // ---- agents that run agents ----
+    if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
@@ -1575,6 +1586,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handleReview(req, res, url, { json, err, body, emit: (ev) => emit(ev as never) })) return;
+    if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
+    if (await handleDoctor(req, res, url, { json, err, body, runners: () => [...agents.values()].map((a) => ({ name: a.name, connected: a.connected, os: a.os })) })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
     if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
@@ -1615,7 +1629,7 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))) return;
+    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleFamilySession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))) return;
     ws.close(1008, "no such socket");
   });
 });

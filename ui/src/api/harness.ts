@@ -59,6 +59,8 @@ export interface ToolCall {
   tool_short?: string;
   /** Skill calls: which skill. */
   skill?: string;
+  /** A command run on another machine (kiln reach): the runner once picked, what it must be (`linux/amd64`) until then, "" while kiln picks the best. */
+  runner?: string;
 }
 
 export type Body =
@@ -249,6 +251,36 @@ export interface ExitInfo {
 }
 
 /** One file's change since the agent first touched it (the server keeps it cumulative). */
+/** A file as its machine had it (`crate::harness::files::Meta`). */
+export interface FileMeta {
+  size: number;
+  /** Unix ms. */
+  mtime: number;
+  mime: string;
+  /** In pixels as it shows, for a picture or a recording whose start says. */
+  width?: number;
+  height?: number;
+}
+
+/**
+ * A file a finished message mentioned, as the server kept it (`crate::harness::kept::Kept`): the
+ * file as it was when the message (`seq`) was done. `sha`: a copy is kept (served for good);
+ * without one it's read from its machine when someone looks. `error`: why it couldn't be read.
+ */
+export interface KeptFile {
+  path: string;
+  seq: number;
+  meta?: FileMeta;
+  sha?: string;
+  error?: string;
+}
+
+/** A conversation's kept files with these added (each path and message once). */
+function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
+  const fresh = added.filter((a) => !was.some((w) => w.path === a.path && w.seq === a.seq));
+  return fresh.length ? [...was, ...fresh] : was;
+}
+
 export interface FileChange {
   path: string;
   created?: boolean;
@@ -612,6 +644,21 @@ export interface AgentInfo {
   limits?: Limit[];
   account?: string;
   plan?: string;
+  /** The agent that started it (docs/agents.md, "Agents that run agents"). */
+  parent?: string;
+  /** The plan run it does a step of. */
+  plan_run?: string;
+  /** Started without its harness's skip-every-check mode (an agent it starts can't have it either). */
+  no_bypass?: boolean;
+}
+
+/** An agent's children that still run (and theirs), as `agents.children` gives them. */
+export interface AgentChild {
+  id: string;
+  name: string;
+  kind: string;
+  status: Status;
+  parent?: string;
 }
 
 export interface KindInfo {
@@ -711,6 +758,8 @@ export type Command =
 export type Update =
   | { t: "open"; info: AgentInfo }
   | { t: "changes"; files: FileChange[] }
+  /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
+  | { t: "files"; files: KeptFile[] }
   | { t: "error"; error: string }
   | { t: "closed" }
   | { t: "state"; state: State }
@@ -779,6 +828,10 @@ export const harnessApi = {
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
+  /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
+  end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
+  /** The agents an agent started that still run (and theirs). */
+  children: (id: string) => call<{ children: AgentChild[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/children`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
   move: (id: string, to: string, now = false, kind?: string, model?: string) =>
@@ -834,6 +887,8 @@ export interface Snapshot {
   events: HEvent[];
   /** The changeset, file by file (null until the server sends one). */
   changes: FileChange[] | null;
+  /** Files its finished messages mention, as the server kept them. */
+  files: KeptFile[];
   error: string | null;
   /** The first snapshot is in: until then there's nothing to show but a loader. */
   ready: boolean;
@@ -867,7 +922,7 @@ export function lastTurnFrom(s: Snapshot): number | null {
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null, ranFrom: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, files: [], error: null, ready: false, stopAsked: null, ranFrom: null };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -950,6 +1005,7 @@ interface Incoming {
   meta: Meta | null;
   state: State | null;
   changes: FileChange[] | null;
+  files: KeptFile[] | null;
   byId: Map<string, HEvent>;
   /** Some of its events came. */
   events: boolean;
@@ -1282,7 +1338,7 @@ export class SessionStore {
 
   private begin(info: AgentInfo | null, told: boolean) {
     window.clearTimeout(this.hold);
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, byId: new Map(), events: false, told };
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, files: null, byId: new Map(), events: false, told };
     this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
     this.wait();
   }
@@ -1302,6 +1358,9 @@ export class SessionStore {
         break;
       case "changes":
         inc.changes = u.files;
+        break;
+      case "files":
+        inc.files = withFiles(inc.files ?? [], u.files);
         break;
       case "events":
         inc.events = true;
@@ -1342,6 +1401,7 @@ export class SessionStore {
       state: share(s.state, inc.state),
       ranFrom: inc.state?.turn_started ?? s.ranFrom,
       changes: share(s.changes, inc.changes),
+      files: inc.files ? share(s.files, inc.files) : s.files,
       error: null,
       ready: true,
     };
@@ -1374,6 +1434,9 @@ export class SessionStore {
     switch (u.t) {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
+        break;
+      case "files":
+        this.snap = { ...this.snap, files: withFiles(this.snap.files, u.files) };
         break;
       case "state":
       case "state_patch": {

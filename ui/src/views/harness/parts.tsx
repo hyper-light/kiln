@@ -8,6 +8,7 @@ import { relativeTime } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { MarkdownBody } from "@/lib/markdown";
+import { MessageFile, MessageSeq } from "./files";
 import { CopyBlock } from "@/components/ui/copy-block";
 
 /** "12s ago" (`ts` in unix seconds), kept current by the shared clock: only this text re-renders as it counts, not the row around it. */
@@ -107,10 +108,28 @@ export { CopyBlock };
 
 /** The agent's prose: GitHub-flavored markdown (tables, lists, task lists, quotes, code), drawn the
  *  console's way. Text only: HTML in it is never injected. */
-export const Prose = React.memo(function Prose({ text, className, ev }: { text: string; className?: string; /** The event it says (for find). */ ev?: string }) {
+export const Prose = React.memo(function Prose({
+  text,
+  className,
+  ev,
+  seq,
+}: {
+  text: string;
+  className?: string;
+  /** The event it says (for find). */
+  ev?: string;
+  /** A message's `seq`: the files it mentions show in it, as they were then (files.tsx). */
+  seq?: number;
+}) {
   return (
     <div className={cn("hx-prose", className)} data-ev={ev}>
-      <MarkdownBody text={text} />
+      {seq == null ? (
+        <MarkdownBody text={text} />
+      ) : (
+        <MessageSeq.Provider value={seq}>
+          <MarkdownBody text={text} files={MessageFile} />
+        </MessageSeq.Provider>
+      )}
     </div>
   );
 });

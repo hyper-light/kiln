@@ -179,11 +179,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             // The owner, by the admin token, its session or an MCP token kiln minted; else a
             // user's session or token, whose operations the route table judges one by one.
             let caller = match crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers())) {
-                Some(actor) => {
-                    let mut c = crate::authz::Caller::owner();
-                    c.name = actor;
-                    Some(c)
-                }
+                // An agent session's own token: that agent, acting for whoever started it.
+                Some(actor) => match crate::mcp::token_caller(&hub, &actor).await {
+                    Some(Ok(c)) => Some(c),
+                    Some(Err(why)) => return Err(err(StatusCode::UNAUTHORIZED, why)),
+                    None => {
+                        let mut c = crate::authz::Caller::owner();
+                        c.name = actor;
+                        Some(c)
+                    }
+                },
                 None => caller_of(&hub, req.headers()).await,
             };
             return match caller {
@@ -232,6 +237,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
+        (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
         (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
         (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
         (&Method::GET, ["dl", "kiln", target, build]) => return download_build(&hub, target, build).await,
@@ -312,6 +318,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let host = srv::header_str(&req, &header::HOST).unwrap_or_default().to_owned();
             crate::peers::frame(&hub, &caller, id, &host, is_secure(&hub, &req)).map_err(|(c, m)| err(c, m))
         }
+        (&Method::PUT, ["api", "peers", id]) => {
+            let id = (*id).to_owned();
+            crate::peers::readdress(&hub, &caller.name, &id, req).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::DELETE, ["api", "peers", id]) => crate::peers::remove(&hub, &caller.name, id).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => crate::deploy::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
@@ -320,6 +330,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "push", rest @ ..]) => crate::push::api::route(&hub, &caller, &method, rest, req).await.map_err(|(c, m)| err(c, m)),
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
@@ -391,6 +402,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "join-requests", id, "deny"]) => deny_join(&hub, id).await,
         (&Method::DELETE, ["api", "agents", name]) => forget_agent(&hub, name).await,
+        // What's wrong with a runner, and repairs to it (`crate::doctor`, docs/releases.md).
+        (&Method::GET, ["api", "agents", name, "diagnose"]) => crate::doctor::diagnose(&hub, name).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "agents", name, "repair"]) => {
+            let name = (*name).to_owned();
+            let ask: crate::doctor::Ask = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            crate::doctor::repair(&hub, &name, &ask).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+        }
         (&Method::POST, ["api", "agents", name, "drain"]) => {
             let name = (*name).to_owned();
             drain_agent(&hub, &name, req).await
@@ -447,6 +465,18 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
             }
         }
+        // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        (&Method::GET, ["api", "plans", "runs"]) => own_op(&hub, &caller, "plans.runs.list", query_value(&q)).await,
+        (&Method::GET, ["api", "plans", "runs", run]) => own_op(&hub, &caller, "plans.runs.get", json!({ "run": run })).await,
+        (&Method::POST, ["api", "plans", "runs", run, "stop"]) => own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run })).await,
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => own_op(&hub, &caller, "plans.runs.retry", json!({ "run": run, "step": n })).await,
+        // Taking a step over, and saying it's met, are a person's: no operation does them.
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let by = caller.name.clone();
+            let r = if *what == "take" { crate::plans::agents::take(&hub, run, n, &by).await } else { crate::plans::agents::met(&hub, run, n, &by).await };
+            r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
         (&Method::GET, ["api", "plans"]) => plans_list(&hub, &q).await,
         (&Method::POST, ["api", "plans"]) => plans_create(&hub, req).await,
         (&Method::GET, ["api", "plans", id]) => crate::plans::get(&hub, id).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
@@ -455,7 +485,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "plans", id, "versions"]) => crate::plans::versions(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::GET, ["api", "plans", id, "runs"]) => crate::plans::runs(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::POST, ["api", "plans", id, "restore"]) => plans_restore(&hub, id, req).await,
-        (&Method::POST, ["api", "plans", id, "run"]) => plans_run(&hub, id, req).await,
+        (&Method::POST, ["api", "plans", id, "run"]) => {
+            let id = (*id).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            own_op(&hub, &caller, "plans.run", body).await
+        }
         (&Method::POST, ["api", "plans", id, "share"]) => plans_share(&hub, id, req).await,
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
@@ -483,6 +520,23 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
+        // Agents that run agents (`agents.*`, docs/agents.md): each operation is its route.
+        (&Method::GET, ["api", "harness", "agents"]) => own_op(&hub, &caller, "agents.list", query_value(&q)).await,
+        (&Method::POST, ["api", "harness", "agents"]) => {
+            let body = body_value(req).await?;
+            own_op(&hub, &caller, "agents.start", body).await
+        }
+        (&Method::GET, ["api", "harness", "agents", "wait"]) => own_op(&hub, &caller, "agents.wait", query_value(&q)).await,
+        (&Method::GET, ["api", "harness", "agents", id]) => own_op(&hub, &caller, "agents.get", json!({ "agent": id })).await,
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => own_op(&hub, &caller, &format!("agents.{what}"), json!({ "agent": id })).await,
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop")]) => {
+            let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            own_op(&hub, &caller, &name, body).await
+        }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
         (&Method::POST, ["api", "harness", "sessions"]) => harness_open(&hub, req).await,
@@ -539,6 +593,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
         (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
         (&Method::POST, ["api", "conversations", "restore"]) => conversation_restore(&hub, req).await,
+        // Files the conversation's messages mention: kept by the server, or read on its machine now.
+        (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => harness_kept_file(&hub, id, sha, &req).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "file"]) => harness_file(&hub, id, q.get("path").cloned(), &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -549,6 +606,185 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+// ------------------------------------------------------------------ files in conversations
+
+/// The part of a `size`-byte file a request asks for (`Range: bytes=…`): `Ok(None)` for all of it,
+/// `Err` when it asks for none of it.
+fn byte_range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(v) = srv::header_str(req, &header::RANGE) else { return Ok(None) };
+    let Some(spec) = v.trim().strip_prefix("bytes=") else { return Ok(None) };
+    // More than one part: all of it (a player asks for one).
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let (a, b) = spec.split_once('-').ok_or(())?;
+    let last = size.checked_sub(1).ok_or(())?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        ("", n) => {
+            let n: u64 = n.parse().map_err(|_| ())?;
+            if n == 0 {
+                return Err(());
+            }
+            (size.saturating_sub(n), last)
+        }
+        (s, "") => (s.parse().map_err(|_| ())?, last),
+        (s, e) => (s.parse().map_err(|_| ())?, e.parse::<u64>().map_err(|_| ())?.min(last)),
+    };
+    if start > end {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+/// `Content-Disposition` for a file shown in place, under its own name.
+fn inline_named(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut enc = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+            enc.push(char::from(b));
+        } else {
+            enc.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("inline; filename*=UTF-8''{enc}")
+}
+
+/// A file shown in a conversation: its type (one that can run code, SVG or HTML, runs none: it's
+/// sandboxed, away from the session), how long a copy holds, and which part of it this is.
+fn file_response(meta: &crate::harness::files::Meta, path: &str, etag: &str, immutable: bool, range: Option<(u64, u64)>, body: srv::Body) -> Response {
+    let (status, len) = match range {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, b - a + 1),
+        None => (StatusCode::OK, meta.size),
+    };
+    let mime = if meta.mime.is_empty() { "application/octet-stream" } else { meta.mime.as_str() };
+    let mut r = srv::response(status, mime, body);
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(len));
+    h.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static(if immutable { "private, max-age=31536000, immutable" } else { "private, no-cache" }));
+    if let Ok(v) = header::HeaderValue::from_str(etag) {
+        h.insert(header::ETAG, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(&inline_named(path)) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if let Some((a, b)) = range
+        && let Ok(v) = header::HeaderValue::from_str(&format!("bytes {a}-{b}/{}", meta.size))
+    {
+        h.insert(header::CONTENT_RANGE, v);
+    }
+    if mime.starts_with("image/svg") || mime.starts_with("text/html") || mime.starts_with("text/xml") {
+        h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox"));
+    }
+    r
+}
+
+/// The answer when a viewer already has this version (`If-None-Match`).
+fn unchanged(req: &Request, etag: &str, immutable: bool) -> Option<Response> {
+    let have = srv::header_str(req, &header::IF_NONE_MATCH)?;
+    if !have.split(',').any(|t| t.trim() == etag || t.trim() == "*") {
+        return None;
+    }
+    let mut r = srv::status(StatusCode::NOT_MODIFIED);
+    if let Ok(v) = header::HeaderValue::from_str(etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static(if immutable { "private, max-age=31536000, immutable" } else { "private, no-cache" }));
+    Some(r)
+}
+
+/// A range past the end of a `size`-byte file.
+fn unsatisfiable(size: u64) -> Response {
+    let mut r = srv::status(StatusCode::RANGE_NOT_SATISFIABLE);
+    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes */{size}")) {
+        r.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
+    r
+}
+
+/// `GET /api/harness/sessions/:id/files/:sha`: a file one of the conversation's messages
+/// mentioned, as the server kept it (`crate::harness::kept`). That never changes: cached for good.
+async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -> R {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let gone = || err(StatusCode::NOT_FOUND, "no such file in this conversation");
+    let kept = hub.harness.keeper.find(id, sha).ok_or_else(gone)?;
+    let blob = hub.harness.keeper.blob(sha).ok_or_else(gone)?;
+    let meta = kept.meta.clone().unwrap_or_default();
+    let etag = format!("\"{}\"", sha.to_ascii_lowercase());
+    if let Some(r) = unchanged(req, &etag, true) {
+        return Ok(r);
+    }
+    let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+    let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    let size = meta.size;
+    crate::rt::spawn(async move {
+        let Ok(Ok(mut file)) = crate::rt::blocking(move || std::fs::File::open(&blob)).await else { return };
+        let mut at = start;
+        while size > 0 && at <= end {
+            let want = (end - at + 1).min(256 * 1024);
+            let read = crate::rt::blocking(move || -> std::io::Result<(std::fs::File, Vec<u8>)> {
+                file.seek(SeekFrom::Start(at))?;
+                let mut buf = Vec::new();
+                (&mut file).take(want).read_to_end(&mut buf)?;
+                Ok((file, buf))
+            })
+            .await;
+            let Ok(Ok((f, buf))) = read else { return };
+            if buf.is_empty() {
+                return;
+            }
+            file = f;
+            at += buf.len() as u64;
+            if tx.send(Bytes::from(buf)).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(file_response(&meta, &kept.path, &etag, true, range, srv::channel_body(rx)))
+}
+
+/// `GET /api/harness/sessions/:id/file?path=`: a file one of the conversation's messages mentions,
+/// read on its machine now: one that isn't kept (too big, past a budget, from before kiln kept
+/// files), in pieces as the viewer takes it.
+async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
+    use crate::harness::kept::piece;
+    let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
+    let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    // What it is, and how big, before the part asked for.
+    let (answer, _) = piece(hub, &location, id, &path, 0, 0)
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{e:#}")))?
+        .ok_or_else(|| err(StatusCode::NOT_IMPLEMENTED, "this agent's machine runs a kiln too old to show files: upgrade its runner"))?;
+    let Some(meta) = answer.meta else { return Err(err(StatusCode::NOT_FOUND, answer.error.unwrap_or_else(|| "it can't be read".to_owned()))) };
+    let etag = format!("W/\"{}-{}\"", meta.size, meta.mtime);
+    if let Some(r) = unchanged(req, &etag, false) {
+        return Ok(r);
+    }
+    let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+    let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    let (tx, rx) = async_channel::bounded::<Bytes>(2);
+    let (h, session, p, m) = (hub.clone(), id.to_owned(), path.clone(), meta.clone());
+    crate::rt::spawn(async move {
+        let mut at = start;
+        while m.size > 0 && at <= end {
+            let want = u32::try_from((end - at + 1).min(u64::from(crate::harness::files::PIECE))).unwrap_or(crate::harness::files::PIECE);
+            let Ok(Some((a, d))) = piece(&h, &location, &session, &p, at, want).await else { return };
+            // It changed on the way: stop, and the viewer asks again.
+            if a.meta.as_ref().is_none_or(|n| n.size != m.size || n.mtime != m.mtime) || d.is_empty() {
+                return;
+            }
+            at += d.len() as u64;
+            if tx.send(Bytes::from(d)).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(file_response(&meta, &path, &etag, false, range, srv::channel_body(rx)))
 }
 
 /// A front-door handler's answer as the API's.
@@ -1009,37 +1245,6 @@ async fn plans_restore(hub: &Hub, id: &str, req: Request) -> R {
     let p = crate::plans::restore(hub, id, r.version, "admin").await.map_err(plan_err)?;
     hub.store.audit("admin".into(), "plan.restore".into(), format!("{} (v{} as v{})", p.title, r.version, p.version)).await;
     Ok(srv::json(StatusCode::OK, &p))
-}
-
-#[derive(Deserialize)]
-struct PlanRun {
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    new: Option<PlanRunNew>,
-    #[serde(default)]
-    mode: crate::plans::Mode,
-}
-
-#[derive(Deserialize)]
-struct PlanRunNew {
-    #[serde(default)]
-    target: Option<String>,
-    kind: String,
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-async fn plans_run(hub: &Hub, id: &str, req: Request) -> R {
-    let r: PlanRun = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let target = match (r.session, r.new) {
-        (Some(s), _) => crate::plans::Target::Session(s),
-        (None, Some(n)) => crate::plans::Target::New { target: n.target.unwrap_or_else(|| "local".into()), kind: n.kind, cwd: n.cwd },
-        (None, None) => return Err(err(StatusCode::BAD_REQUEST, "say where to run it: an agent (`session`) or a new one (`new`)")),
-    };
-    let ran = crate::plans::run(hub, id, target, r.mode, "admin").await.map_err(plan_err)?;
-    hub.store.audit("admin".into(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
-    Ok(srv::json(StatusCode::OK, &ran))
 }
 
 #[derive(Deserialize)]
@@ -2580,6 +2785,8 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
     if !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
     }
+    // Who opens it: `kiln spawn --on` and `kiln agents` in it act for them.
+    let opener = req.extensions().get::<crate::authz::Caller>().and_then(crate::authz::Caller::opener);
     let t: NewTerminal = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
@@ -2599,6 +2806,9 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
         }
         None => return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<machine>\"")),
     };
+    if let Some(o) = opener {
+        let _ = hub.store.kv_set(crate::mcp::terminal_opener_key(&session.id), o).await;
+    }
     Ok(srv::json(StatusCode::CREATED, &session.info()))
 }
 
@@ -2905,6 +3115,31 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     Ok(srv::json(StatusCode::CREATED, &b))
 }
 
+/// One of kiln's own operations (agents, plans, goal stacks) as its HTTP route, which the route
+/// table let through (and the audit trail records): `crate::ops::own`.
+async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
+    let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
+    crate::ops::run_own(cx, name, input).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+}
+
+/// A query as an operation's input: each parameter a string.
+fn query_value(q: &HashMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(q.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
+}
+
+/// A request's JSON body as an operation's input (none: `{}`).
+async fn body_value(req: Request) -> Result<serde_json::Value, ApiError> {
+    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(err(StatusCode::BAD_REQUEST, "the body is a JSON object")),
+        Err(e) => Err(err(StatusCode::BAD_REQUEST, format!("the body isn't JSON: {e}"))),
+    }
+}
+
 #[derive(Deserialize)]
 struct HarnessOpen {
     target: String,
@@ -2918,6 +3153,10 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
+    // Who started an agent, and the plan run it works for, are kiln's to say (`agents.start`,
+    // `plans.run`), never what's asked.
+    body.spec.parent = None;
+    body.spec.plan_run = None;
     // Agents run programs as the machine's user, like terminals: the same switch governs both.
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
@@ -3210,6 +3449,38 @@ async fn readyz(hub: &Hub) -> Response {
     }
 }
 
+/// `/healthz/server`: how this server is, for the checks that watch a deploy of kiln
+/// (docs/cd-targets.md §10). The commit it runs; how long it has been up; how many times kiln's
+/// supervisor started it again (a crash, or the kernel's OOM killer: neither shows in its pod's
+/// status); its container's memory, from its cgroup; and its runners, connected now and just
+/// before it started, and the share of those back (checks' criteria compare, they don't count).
+/// Numbers and the commit only, so it's open, as `/healthz` is.
+fn server_health(hub: &Hub) -> Response {
+    let memory = crate::os::cgroup::memory().map(|m| json!({ "used": m.used, "limit": m.limit, "share": m.share(), "peak": m.peak, "oom_kills": m.oom_kills }));
+    let connected = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).count() as u64;
+    let before = hub.runners_before.load(std::sync::atomic::Ordering::Relaxed);
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "commit": COMMIT,
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_s": hub.started.elapsed().as_secs(),
+            "restarts": hub.generation.saturating_sub(1),
+            "memory": memory,
+            "runners": { "connected": connected, "before": before, "back": back(connected, before) },
+        }),
+    )
+}
+
+/// The share of the runners connected before a start that are connected now, to three places:
+/// all of them when there were none.
+fn back(connected: u64, before: u64) -> f64 {
+    if before == 0 {
+        return 1.0;
+    }
+    (connected.min(before) as f64 / before as f64 * 1000.0).round() / 1000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3255,6 +3526,14 @@ mod tests {
             assert!(script.contains("@@KILN_SERVER@@"));
             assert!(script.contains("/dl/kiln/"));
         }
+    }
+
+    #[test]
+    fn the_share_of_runners_back_after_a_start() {
+        assert_eq!(back(0, 0), 1.0, "none before: all of them");
+        assert_eq!(back(3, 6), 0.5);
+        assert_eq!(back(2, 3), 0.667);
+        assert_eq!(back(9, 6), 1.0, "more than before is all of them");
     }
 
     #[test]

@@ -213,6 +213,14 @@ impl Host {
         self.sessions.lock().get(id).cloned()
     }
 
+    /// Each session and its harness's process, where one runs (which agent a process is: a
+    /// `kiln` command run by an agent's tool, `super::socket`). The sessions' own locks are taken
+    /// after this host's is let go.
+    pub fn harness_pids(&self) -> Vec<(String, Option<u32>)> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect()
+    }
+
     pub fn list(&self) -> Vec<Info> {
         let mut v: Vec<Info> = self.sessions.lock().values().map(|s| s.info()).collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
@@ -827,6 +835,9 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
+        parent: spec.parent.clone(),
+        plan_run: spec.plan_run.clone(),
+        no_bypass: !spec.allow_bypass,
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]
@@ -972,7 +983,13 @@ mod tests {
             // that the record has, and one only its mark says is its.
             let mut harness = std::process::Command::new("sleep").arg("60").spawn()?;
             let mut recorded = std::process::Command::new("sleep").arg("61").spawn()?;
-            let out = std::process::Command::new("sh").arg("-c").arg("sleep 62 >/dev/null 2>&1 & echo $!").env(survivors::MARK, "a").output()?;
+            let Some(sleep_62) = survivors::sleeper(62) else {
+                eprintln!("skipped: nothing here sleeps as a process whose environment can be read");
+                let _ = harness.kill();
+                let _ = recorded.kill();
+                return Ok(());
+            };
+            let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_62} >/dev/null 2>&1 & echo $!")).env(survivors::MARK, "a").output()?;
             let marked: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
             let mine = survivors::scan(&[("me".to_owned(), Some(std::process::id()))]).remove("me").unwrap_or_default().under;
             let ran = |pid: u32| -> anyhow::Result<Ran> { mine.iter().find(|r| r.pid == pid).cloned().ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
@@ -1001,7 +1018,7 @@ mod tests {
                 assert!(tasks.iter().any(|t| t.id == format!("left-{pid}") && t.status == "running" && t.left_running()), "{pid} taken back over: {tasks:?}");
             }
             let said = queue.first().map(|q| q.text.clone()).unwrap_or_default();
-            assert!(said.contains("Pick up where you left off") && said.contains("sleep 61") && said.contains("sleep 62"), "{said}");
+            assert!(said.contains("Pick up where you left off") && said.contains("sleep 61") && said.contains("62"), "{said}");
             // Stopped from kiln, it ends (waited for without holding up the session doing it).
             s.command(Command::StopTask { task: format!("left-{}", recorded.id()) });
             let mut stopped = false;

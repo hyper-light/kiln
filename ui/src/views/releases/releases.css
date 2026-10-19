@@ -1,0 +1,479 @@
+/* Releases: the environments board (apps down, environments across, a cell for what runs and what
+   is on its way), what waits for people, one app's environments side by side, and one release.
+   The board scrolls sideways inside its frame on a phone, never the page; everything else stacks. */
+
+/* ---------------------------------------------------------------- shared */
+.rel-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+}
+.rel-quiet {
+  color: var(--color-faint);
+  font-size: 12.5px;
+}
+.rel-msg {
+  margin: 4px 0 0;
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.rel-msg-inline {
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
+.rel-what {
+  color: var(--color-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.rel-who {
+  color: var(--color-meta);
+  font-size: 11.5px;
+}
+.rel-link {
+  color: var(--color-link);
+  font-size: 13px;
+}
+.rel-to {
+  color: var(--color-secondary);
+  font-weight: 400;
+}
+.rel-tag {
+  margin-left: 6px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 999px;
+  padding: 0 6px;
+  color: var(--color-muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.rel-answer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ---------------------------------------------------------------- what waits for people */
+.rel-approvals-panel {
+  margin-bottom: 16px;
+}
+/* A little air between a page's head and what follows it. */
+.rel-approvals-panel,
+.rel-board-wrap,
+.rel-envs,
+.rel-grid {
+  margin-top: 18px;
+}
+.rel-approvals {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rel-approvals li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  border-top: 1px solid var(--color-line);
+  padding: 10px 0;
+}
+.rel-approvals li:first-child {
+  border-top: 0;
+}
+.rel-approvals li > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+/* ---------------------------------------------------------------- the board */
+.rel-board-wrap {
+  /* Its own containing block: what is positioned in a cell (a label for screen readers) scrolls
+     with the board, and never widens the page. */
+  position: relative;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+}
+.rel-board {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.rel-board th,
+.rel-board td {
+  border-bottom: 1px solid var(--color-line);
+  padding: 10px 14px;
+  text-align: left;
+  vertical-align: top;
+}
+.rel-board tr:last-child th,
+.rel-board tr:last-child td {
+  border-bottom: 0;
+}
+.rel-board thead th {
+  color: var(--color-secondary);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.rel-board th small {
+  display: block;
+  color: var(--color-faint);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+.rel-board tbody th a {
+  color: var(--color-link);
+}
+.rel-cell {
+  min-width: 150px;
+}
+.rel-none {
+  color: var(--color-faint);
+}
+.rel-running {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-foreground);
+}
+.rel-version {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.rel-flight {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--color-secondary);
+  font-size: 11.5px;
+}
+
+/* ---------------------------------------------------------------- one app */
+.rel-envs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.rel-env-facts {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+.rel-env-facts dt {
+  color: var(--color-meta);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.rel-env-facts dd {
+  margin: 2px 0 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.rel-env-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.rel-delivery {
+  margin-bottom: 12px;
+}
+.rel-history {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rel-history li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  border-top: 1px solid var(--color-line);
+  padding: 9px 0;
+}
+.rel-history li:first-child {
+  border-top: 0;
+}
+.rel-history a {
+  color: var(--color-link);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.rel-env-name {
+  color: var(--color-secondary);
+  font-size: 12.5px;
+}
+
+/* ---------------------------------------------------------------- the release dialog */
+.rel-dialog {
+  display: grid;
+  gap: 14px;
+}
+.rel-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.rel-textarea {
+  width: 100%;
+  min-height: 160px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 12px;
+  background: var(--color-code);
+  padding: 10px 12px;
+  color: var(--color-foreground);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.rel-candidates {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+.rel-candidates label {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+/* ---------------------------------------------------------------- one release */
+.rel-grid {
+  display: grid;
+  gap: 12px;
+}
+.rel-gates,
+.rel-answers,
+.rel-artifacts {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rel-gates li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.rel-gates svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+}
+.rel-gates li[data-passed="true"] svg {
+  color: var(--color-ok);
+}
+.rel-gates li[data-passed="false"] svg {
+  color: var(--color-fail);
+}
+.rel-gates li > div {
+  display: grid;
+}
+.rel-gate-name {
+  color: var(--color-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.rel-gate-detail {
+  color: var(--color-muted);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.rel-answers li {
+  color: var(--color-secondary);
+  font-size: 12.5px;
+}
+.rel-answers [data-approved="true"] {
+  color: var(--color-ok);
+}
+.rel-answers [data-approved="false"] {
+  color: var(--color-fail);
+}
+.rel-answers q {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-muted);
+}
+.rel-artifacts {
+  margin-top: 12px;
+  font-size: 12.5px;
+}
+.rel-artifacts span {
+  color: var(--color-meta);
+}
+.rel-artifacts code {
+  overflow-wrap: anywhere;
+}
+.rel-pre {
+  max-height: 420px;
+  margin: 0;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--color-code);
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- a new app */
+.rel-template {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--color-muted);
+  font-size: 13px;
+}
+.rel-template code {
+  overflow-wrap: anywhere;
+  color: var(--color-foreground);
+}
+.rel-new-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.rel-register {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+.rel-register > :first-child {
+  min-width: 200px;
+}
+.rel-head-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rel-gap {
+  margin-top: 0.75rem;
+}
+.rel-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.rel-keep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--color-foreground);
+}
+.rel-env-page {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 16px;
+  margin: 20px 0 16px;
+}
+.rel-stack {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+.rel-stack > .rel-register {
+  margin-top: 0;
+}
+.rel-board thead th a {
+  color: inherit;
+}
+.rel-board thead th a:hover {
+  color: var(--color-link);
+}
+
+/* ---------------------------------------------------------------- what runs, as the provider sees it */
+.rel-reads {
+  margin-top: 16px;
+}
+.rel-objects {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rel-objects li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  border-bottom: 1px solid var(--color-line);
+  padding: 10px 0;
+  font-size: 13px;
+}
+.rel-objects li:last-child {
+  border-bottom: 0;
+}
+.rel-object {
+  display: inline-flex;
+  min-width: min(100%, 18rem);
+  flex: 1 1 18rem;
+  align-items: center;
+  gap: 8px;
+}
+.rel-object-name {
+  overflow-wrap: anywhere;
+}
+.rel-manifests {
+  display: grid;
+  gap: 8px;
+}
+.rel-manifest summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 6px 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.rel-log {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-code);
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rel-title-in {
+  color: var(--color-faint);
+}
+.rel-tabs {
+  margin-top: 8px;
+}
+.rel-log {
+  margin-top: 12px;
+}
