@@ -342,6 +342,51 @@ export interface ScrapeTest {
   took_ms?: number;
 }
 
+/** An SLO as it is sent (docs/observe.md §9.2): a ratio of good events to total, or time slices meeting a condition. */
+export interface SloIn {
+  name: string;
+  description?: string;
+  type: "ratio" | "slices";
+  /** A ratio's queries, of counts. */
+  good?: string;
+  total?: string;
+  /** A time slice SLO's query, its condition (`< 0.3`) and its slice (60 or 300 s). */
+  query?: string;
+  condition?: string;
+  slice_s?: 60 | 300;
+  /** Percent: 99.9. */
+  target: number;
+  warning?: number;
+  timeframe: "7d" | "30d" | "90d";
+  tags?: string[];
+}
+
+export type SloState = "OK" | "WARN" | "BREACHED" | "NO DATA" | "INVALID";
+
+/** An SLO's standing, read from the store when asked. */
+export interface SloStanding {
+  state: SloState;
+  sli?: number | null;
+  good?: number;
+  total?: number;
+  /** Percent of the error budget left (below 0 once spent). */
+  budget_left?: number | null;
+  /** Over the last 1h, 6h, 1d and 3d: the error rate over the budget's. */
+  burn_rates?: Record<string, number | null>;
+  /** Each UTC day the timeframe touches (the SLO's own page). */
+  days?: { day: number; sli: number | null; budget_left: number | null }[];
+  error?: string;
+}
+
+export type Slo = SloIn & {
+  id: string;
+  created: number;
+  modified: number;
+  standing: SloStanding;
+  /** The monitors that alert on it (its own page). */
+  alerts?: { id: string; name: string; query: string; state: MonitorState }[];
+};
+
 /** What a configuration would read, pulled once and nothing written. */
 export interface CloudTest {
   ok: boolean;
@@ -422,6 +467,11 @@ export const observeApi = {
   tailPath: (query: string) => `${BASE}/logs/tail?query=${enc(query)}`,
   status: (signal?: AbortSignal) => request<ObserveStatus>("GET", `${BASE}/status`, undefined, { signal }),
   verify: () => request<unknown>("POST", `${BASE}/verify`, {}),
+  slos: (signal?: AbortSignal) => request<{ slos: Slo[] }>("GET", `${BASE}/slos`, undefined, { signal }).then((r) => r.slos),
+  slo: (id: string, signal?: AbortSignal) => request<Slo>("GET", `${BASE}/slos/${enc(id)}`, undefined, { signal }),
+  createSlo: (s: SloIn) => request<Slo>("POST", `${BASE}/slos`, s),
+  updateSlo: (id: string, s: SloIn) => request<Slo>("PUT", `${BASE}/slos/${enc(id)}`, s),
+  deleteSlo: (id: string) => request<void>("DELETE", `${BASE}/slos/${enc(id)}`),
   monitors: (signal?: AbortSignal) => request<{ monitors: Monitor[] }>("GET", `${BASE}/monitors`, undefined, { signal }).then((r) => r.monitors),
   monitor: (id: string, signal?: AbortSignal) => request<Monitor>("GET", `${BASE}/monitors/${enc(id)}`, undefined, { signal }),
   createMonitor: (m: MonitorIn) => request<Monitor>("POST", `${BASE}/monitors`, m),

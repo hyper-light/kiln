@@ -18,6 +18,7 @@ import {
   type QueryAnswer,
   type Scrape,
   type HeatmapAnswer,
+  type Slo,
 } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
@@ -32,6 +33,7 @@ const SECTIONS = [
   { to: "/observe/logs", label: "Logs" },
   { to: "/observe/events", label: "Events" },
   { to: "/observe/monitors", label: "Monitors" },
+  { to: "/observe/slos", label: "SLOs" },
   { to: "/observe/integrations", label: "Integrations" },
   { to: "/observe/live", label: "Live" },
 ];
@@ -415,6 +417,8 @@ export const statusRes: Res<ObserveStatus> = { key: "observe/status", fetch: (s)
 export const monitorsRes: Res<Monitor[]> = { key: "observe/monitors", fetch: (s) => observeApi.monitors(s), opts: { pollMs: 30_000 } };
 // One item's key is not under its list's: a list refreshed after a delete must not refresh the item deleted.
 export const monitorRes = (id: string): Res<Monitor> => ({ key: `observe/monitor/${id}`, fetch: (s) => observeApi.monitor(id, s), opts: { pollMs: 30_000 } });
+export const slosRes: Res<Slo[]> = { key: "observe/slos", fetch: (s) => observeApi.slos(s), opts: { pollMs: 60_000 } };
+export const sloRes = (id: string): Res<Slo> => ({ key: `observe/slo/${id}`, fetch: (s) => observeApi.slo(id, s), opts: { pollMs: 60_000 } });
 export const integrationsRes: Res<Integration[]> = { key: "observe/integrations", fetch: (s) => observeApi.integrations(s) };
 export const cloudsRes: Res<Cloud[]> = { key: "observe/clouds", fetch: (s) => observeApi.clouds(s), opts: { pollMs: 10_000 } };
 export const scrapesRes: Res<Scrape[]> = { key: "observe/scrapes", fetch: (s) => observeApi.scrapes(s), opts: { pollMs: 10_000 } };

@@ -621,6 +621,151 @@ const scenarios = {
       for (const n of [name, `${name}-g`]) await api("DELETE", `/api/observe/v1/clouds/${n}`);
     }
   },
+
+  /** A ratio SLO made from the form over counts whose share failing is known: its standing as the
+   * page and the API say it; its two burn-rate alerts added, then evaluated to the burn rate; its
+   * deletion refused while they read it; its target changed; then deleted. */
+  async "an SLO is made, alerted on, changed and deleted"() {
+    const metric = "e2e.slo.requests";
+    const tag = `run:${run}`;
+    // Two hours of minutes ending at the last five-minute edge, 0.5% of each failing: an SLI of
+    // 99.5% whatever window reads them, so half a 99% target's budget left and a burn rate of 0.5.
+    const end = Math.floor(Date.now() / 300_000) * 300_000;
+    const pts = (v) => Array.from({ length: 120 }, (_, i) => [(end - 120 * 60_000 + i * 60_000) / 1000, v]);
+    const series = [
+      { metric, type: "count", tags: ["status:ok", tag], points: pts(995) },
+      { metric, type: "count", tags: ["status:error", tag], points: pts(5) },
+    ];
+    expect((await api("POST", "/api/observe/v1/series", { series })).status === 202, "writing the counts");
+    const name = `E2E checkout ${run}`;
+    const slo = (id) => api("GET", `/api/observe/v1/slos/${id}`);
+    let id;
+    const alerts = [];
+    try {
+      await page.goto(`${BASE}/observe/slos/new`);
+      await fillIn(page.getByLabel("Name", { exact: true }), name);
+      await fillIn(page.getByLabel("Good events", { exact: true }), `sum:${metric}{status:ok,${tag}}.as_count()`);
+      await fillIn(page.getByLabel("All events", { exact: true }), `sum:${metric}{${tag}}.as_count()`);
+      await fillIn(page.getByLabel("Target (%)", { exact: true }), "99");
+      await fillIn(page.getByLabel("Warning (%, optional)", { exact: true }), "99.6");
+      await page.getByRole("group", { name: "Timeframe", exact: true }).getByRole("button", { name: "7 days", exact: true }).click();
+      await fillIn(page.getByLabel("Tags", { exact: true }), `e2e:${run}`);
+      await page.getByRole("button", { name: "Make the SLO", exact: true }).click();
+      await page.waitForURL(/\/observe\/slos\/s[0-9a-f]{16}$/);
+      id = page.url().split("/").pop();
+      // Every minute applied before it is read.
+      const s = await until("its standing over all 120,000 events", async () => ((await slo(id)).body?.standing?.total === 120_000 ? (await slo(id)).body : null));
+      expect(
+        s.name === name && s.type === "ratio" && s.target === 99 && s.warning === 99.6 && s.timeframe === "7d" && JSON.stringify(s.tags) === JSON.stringify([`e2e:${run}`]),
+        `kept as made: ${JSON.stringify(s)}`,
+      );
+      const st = s.standing;
+      expect(
+        st.state === "WARN" &&
+          st.good === 119_400 &&
+          Math.abs(st.sli - 99.5) < 1e-9 &&
+          Math.abs(st.budget_left - 50) < 1e-6 &&
+          ["1h", "6h", "1d", "3d"].every((w) => Math.abs(st.burn_rates[w] - 0.5) < 1e-9),
+        `99.5% against 99%, warned under 99.6%: ${JSON.stringify(st)}`,
+      );
+      await page.reload();
+      await page.locator("header .lead").getByText("Warn", { exact: true }).waitFor();
+      const facts = page.locator("dl.facts");
+      for (const t of ["99.500%", "99%, warn under 99.6%", "50.0%", "0.50× · 0.50× · 0.50× · 0.50×"]) await facts.getByText(t, { exact: true }).waitFor();
+      await page.getByRole("region", { name: "Day by day" }).locator("canvas").first().waitFor();
+
+      // The workbook's two alerts, for seven days: 2% of the budget in an hour, 5% in six.
+      await page.getByRole("button", { name: "Add burn-rate alerts", exact: true }).click();
+      for (const pace of ["fast", "steady"]) await page.getByRole("link", { name: `${name}: error budget burning ${pace}`, exact: true }).waitFor();
+      alerts.push(...((await slo(id)).body.alerts ?? []).map((a) => a.id));
+      const queries = await Promise.all(alerts.map(async (a) => (await api("GET", `/api/observe/v1/monitors/${a}`)).body.query));
+      const want = [`slo("${id}").burn_rate("1h", "5m") > 3.36`, `slo("${id}").burn_rate("6h", "30m") > 1.4`];
+      expect(JSON.stringify(queries.sort()) === JSON.stringify(want.sort()), `the alerts' queries: ${JSON.stringify(queries)}`);
+      for (const a of alerts)
+        await until(`${a} evaluated to the burn rate, 0.5, under its threshold`, async () => {
+          const m = (await api("GET", `/api/observe/v1/monitors/${a}`)).body;
+          return m.state === "OK" && m.groups?.length === 1 && Math.abs(m.groups[0].value - 0.5) < 1e-9;
+        });
+
+      // Refused while the alerts read it, and kept.
+      await page.getByRole("button", { name: "Delete the SLO", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await page.getByText("Couldn't delete the SLO").first().waitFor();
+      await page.getByRole("dialog").waitFor({ state: "detached" });
+      problems.splice(0, problems.length, ...problems.filter((p) => !p.startsWith("HTTP 409 DELETE")));
+      expect((await slo(id)).status === 200, "the SLO kept while its alerts read it");
+
+      // In the list, warned.
+      await page.goto(`${BASE}/observe/slos`);
+      const row = page.getByRole("row").filter({ has: page.getByRole("link", { name, exact: true }) });
+      await row.waitFor();
+      const text = (await row.textContent()) ?? "";
+      expect(/Warn/.test(text) && /99% · 7d/.test(text) && /99\.500%/.test(text), `its row: ${text}`);
+
+      // Its target lowered under the SLI and its warning taken off: met.
+      await row.getByRole("link", { name, exact: true }).click();
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await fillIn(page.getByLabel("Target (%)", { exact: true }), "99.4");
+      await fillIn(page.getByLabel("Warning (%, optional)", { exact: true }), "");
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await page.getByRole("button", { name: "Edit", exact: true }).waitFor();
+      const changed = (await slo(id)).body;
+      expect(changed.target === 99.4 && changed.warning === undefined && changed.standing.state === "OK" && changed.created === s.created, `changed: ${JSON.stringify(changed)}`);
+      await page.locator("header .lead").getByText("OK", { exact: true }).waitFor();
+      // 0.5% failing of a 0.6% budget: a sixth of it left.
+      for (const t of ["99.4%", "16.7%"]) await page.locator("dl.facts").getByText(t, { exact: true }).waitFor();
+
+      for (const a of alerts.splice(0)) expect((await api("DELETE", `/api/observe/v1/monitors/${a}`)).status < 300, `deleting ${a}`);
+      await page.getByRole("button", { name: "Delete the SLO", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await page.waitForURL(/\/observe\/slos$/);
+      expect((await slo(id)).status === 404, "the SLO gone");
+      await page.getByRole("heading", { name: "SLOs", exact: true }).waitFor();
+      // The list shows what it had until its refetch lands, as every list here does after a delete.
+      await until("nor listed", async () => (await page.getByRole("link", { name, exact: true }).count()) === 0);
+    } finally {
+      for (const a of alerts) await api("DELETE", `/api/observe/v1/monitors/${a}`);
+      if (id) await api("DELETE", `/api/observe/v1/slos/${id}`);
+    }
+  },
+
+  /** A time-slice SLO made from the form: the minutes whose latency met its condition, of all. */
+  async "a time-slice SLO counts the minutes that meet its condition"() {
+    const metric = "e2e.slo.latency";
+    const tag = `run:${run}`;
+    // Two hours of minutes, the last twelve over 300 ms: 108 of the 120 slices met, 90%.
+    const end = Math.floor(Date.now() / 300_000) * 300_000;
+    const points = Array.from({ length: 120 }, (_, i) => [(end - 120 * 60_000 + i * 60_000) / 1000, i >= 108 ? 0.9 : 0.12]);
+    expect((await api("POST", "/api/observe/v1/series", { series: [{ metric, type: "gauge", tags: [tag], points }] })).status === 202, "writing the latencies");
+    const name = `E2E latency ${run}`;
+    let id;
+    try {
+      await page.goto(`${BASE}/observe/slos/new`);
+      await fillIn(page.getByLabel("Name", { exact: true }), name);
+      await page.getByRole("group", { name: "Indicator", exact: true }).getByRole("button", { name: "Time slices", exact: true }).click();
+      await fillIn(page.getByLabel("Query", { exact: true }), `max:${metric}{${tag}}`);
+      await fillIn(page.getByLabel("Condition", { exact: true }), "< 0.3");
+      await page.getByRole("group", { name: "Slice", exact: true }).getByRole("button", { name: "1 min", exact: true }).click();
+      await fillIn(page.getByLabel("Target (%)", { exact: true }), "95");
+      await page.getByRole("group", { name: "Timeframe", exact: true }).getByRole("button", { name: "7 days", exact: true }).click();
+      await page.getByRole("button", { name: "Make the SLO", exact: true }).click();
+      await page.waitForURL(/\/observe\/slos\/s[0-9a-f]{16}$/);
+      id = page.url().split("/").pop();
+      const s = await until("its 120 slices counted", async () => {
+        const r = await api("GET", `/api/observe/v1/slos/${id}`);
+        return r.body?.standing?.total === 120 ? r.body : null;
+      });
+      expect(s.type === "slices" && s.query === `max:${metric}{${tag}}` && s.condition === "< 0.3" && s.slice_s === 60, `kept as made: ${JSON.stringify(s)}`);
+      // 10% of slices missed of a 5% budget: twice it spent, breached.
+      const st = s.standing;
+      expect(st.good === 108 && st.state === "BREACHED" && Math.abs(st.sli - 90) < 1e-9 && Math.abs(st.budget_left + 100) < 1e-6, `108 of 120 met: ${JSON.stringify(st)}`);
+      await page.reload();
+      await page.locator("header .lead").getByText("Breached", { exact: true }).waitFor();
+      for (const t of ["90.0%", "95%", "-100.0%"]) await page.locator("dl.facts").getByText(t, { exact: true }).waitFor();
+    } finally {
+      if (id) await api("DELETE", `/api/observe/v1/slos/${id}`);
+    }
+  },
 };
 
 let failed = 0;

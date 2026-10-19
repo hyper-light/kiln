@@ -21,7 +21,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
-| O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13). Next: their page in the UI | in progress |
+| O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
@@ -754,8 +754,8 @@ outlier monitors (§9).
 
 ### 9.2 Service level objectives
 
-An SLO (`kiln_obs::slo`, kept by the server in `<observe>/slos.json`) is what share of what a
-service does it promises is good, over a rolling timeframe (7, 30 or 90 days), Datadog's model:
+An SLO (`kiln_obs::slo`, kept by the server in `<observe>/slos.json`) is a promise of how much of
+what a service does is good, over a rolling timeframe (7, 30 or 90 days), Datadog's model:
 
 - **ratio**: good events over all of them, each a metric query of counts
   (`sum:http.requests{status:2xx}.as_count()` over `sum:http.requests{*}.as_count()`), every
@@ -785,7 +785,10 @@ slo("<id>").error_budget() < 25              the budget left, percent
 The burn-rate form is the workbook's multiwindow, multi-burn-rate alert: the long window says the
 rate is real, the short that it still is, so an alert resolves within the short window of the
 burning stopping. Its suggested pairs for a 30-day SLO: 14.4 over 1 h and 5 m, 6 over 6 h and 30 m
-(pages), 1 over 3 d and 6 h (a ticket). An SLO a monitor reads is not deleted until the monitor is.
+(pages), 1 over 3 d and 6 h (a ticket). Those are shares of the budget (2% of it in an hour, 5% in
+six, 10% in three days), so another timeframe's rates are scaled to its hours: 3.36 and 1.4 for 7
+days, 43.2 and 18 for 90; the SLO's page adds the two that page so. An SLO a monitor reads is not
+deleted until the monitor is.
 
 ## 10. Integrations
 
@@ -941,6 +944,13 @@ time range and the search in the address (a page is a link).
   range with its thresholds, what it said (its events), mute and unmute; made and edited in a form
   that checks its query. A composite (the form's other kind) is its monitors chosen by letter and a
   condition over the letters; its page lists what it reads, each one's state a link away.
+- **SLOs**: their states, in trouble first; each one's target and timeframe, SLI, budget left (a
+  meter) and the hour's burn rate. An SLO's page: its standing and its four burn rates; each day's
+  SLI against the target and the budget left through it, as lines (an SLI's days differ in their
+  last places, so its axis begins just under the lowest of them and the target, which bars, measured
+  from zero, cannot); and the monitors that alert on it, the workbook's two for its timeframe added
+  in a click while none reads its burn rate. Made and edited in a form: good events over all, or
+  time slices of a query meeting a condition.
 - **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
   each one's mention to copy. The clouds kiln reads: each one's state, what it reads (its logs too:
   log groups, a filter, workspaces), its credentials and its last pull (series, and the log records
@@ -1769,7 +1779,14 @@ ratio SLO of them and a time-slice SLO of the latency. Its SLI, budget left and 
 as the workbook reckons them, exactly (the hour's 50, all of it bad; the six hours' 19.5); 22 of 36
 five-minute slices met; a monitor `slo("…").burn_rate("1h", "15m") > 14.4` alerting at the lesser
 window's 50, the SLO's page listing it; the SLO not deleted while the monitor reads it. 2026-10-18:
-passes (21 s).
+passes (21 s). In a browser: an SLO made from the form over counts of which 0.5% fail, a target of
+99 warned under 99.6: WARN, its SLI 99.500%, half its budget left and every burn rate 0.5, the page
+and the API alike; its two burn-rate alerts added from its page, their queries the workbook's for
+seven days (3.36 over 1 h and 5 m, 1.4 over 6 h and 30 m), each evaluated to 0.5 and OK; its
+deletion refused while they read it; its target lowered to 99.4 and its warning taken off: OK, a
+sixth of its budget left; then deleted, and gone from the list. A time-slice SLO made from the
+form, minutes of a latency the last twelve of 120 over 300 ms: 108 met, 90%, breached against 95,
+its budget spent twice over (−100%). 2026-10-18: both pass in Chromium and in WebKit as a phone.
 
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a
