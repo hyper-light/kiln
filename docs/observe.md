@@ -26,7 +26,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -634,8 +634,6 @@ time, sent again until answered; §5), from:
 - **Logs collected on every machine** (§8.1): files, containers' logs and the journal, as a source
   says.
 
-To come: CloudWatch Metric Streams' OpenTelemetry format (its JSON is taken, §10.2).
-
 **Taking what comes, and refusing** (`crate::observe::owner`, `crate::observe::ingest`): a request
 is answered 200 only once its points have room, taken where it is answered (an atomic reservation
 against the batcher's bound, 4 M points and 64 MiB of logs; released as writes are cut), so nothing
@@ -1114,17 +1112,24 @@ Both take observe's ingest token (or the admin's), each in its own place:
 
 - **Kinesis Data Firehose**, an HTTP endpoint destination (`https://<kiln>/v1/firehose`, its access
   key the ingest token, `Content-Encoding` gzip or not, its common attributes tags of everything it
-  brings): **CloudWatch Metric Streams** in their JSON output format, each record's lines a
-  minute's statistics of a metric, named and tagged as the pull names them (`aws.<namespace>.
-  <metric>`: `.sum` and `.samplecount` counts, the average `sum / count` the name itself,
-  `.maximum`, `.minimum` and the percentiles asked gauges; `region`, `aws_account`, each dimension);
+  brings): **CloudWatch Metric Streams** in each output format, a minute's statistics of a metric
+  named and tagged as the pull names them (`aws.<namespace>.<metric>`: `.sum` and `.samplecount`
+  counts, the average `sum / count` the name itself, `.maximum`, `.minimum` and the percentiles
+  asked gauges; `region`, `aws_account`, each dimension), the same series from any of them (a test
+  of one datum in all three): JSON, each record's lines a datum; OpenTelemetry 1.0.0, each record
+  one or more `ExportMetricsServiceRequest`s each after its length (a varint), a datum a summary's
+  data point (its `count` the sample count, its `sum` the sum, its quantile 0 the minimum, 1 the
+  maximum, the rest percentiles: 0.999 `.p99_9`; its time its start, CloudWatch's period's), its
+  `Namespace`, `MetricName` and `Dimensions` (a map) attributes, its resource's `cloud.region` and
+  `cloud.account.id`; and 0.7.0, the same but for labels (the namespace, the name, each dimension).
+  A request of a record that does not read is not taken, the record counted, the others' points
+  kept;
   and **CloudWatch Logs' subscriptions**, each record a gzip'd message of a group's events, as the
   pull makes records (the account `aws_account`, the region the delivery stream's), a
   `CONTROL_MESSAGE` (its check that the destination is there) taken and dropped. Its answer is
   Firehose's (`requestId` echoed, `timestamp`, `errorMessage` when not taken: 401 for a wrong key,
-  503 while observe is busy, which Firehose sends again). A record of no shape kiln reads (Metric
-  Streams' OpenTelemetry format, a log's message alone after Firehose's own extraction) is counted
-  and not read.
+  503 while observe is busy, which Firehose sends again). A record of no shape kiln reads (a log's
+  message alone after Firehose's own extraction) is counted and not read.
 - **Pub/Sub push subscriptions** (`https://<kiln>/v1/pubsub?token=<the ingest token>`), a Cloud
   Logging sink's topic: each message a log entry, read as the pull reads entries; answered 204 (an
   acknowledgement), and 503 while observe is busy (Pub/Sub sends it again). A message that is no
@@ -2112,6 +2117,8 @@ token. Their figures are functions of the minute, so what is stored is checked m
   the same counts;
 - the clouds' pushes, sent as the clouds send them: a Firehose delivery (gzip'd, its stream's ARN
   and common attributes in its headers) of a metric stream's five minutes of two instances' CPU, a
+  stream's five minutes of a table's reads in OpenTelemetry 1.0.0's format (its average, count,
+  p99, minimum and maximum read back), a
   CloudWatch Logs subscription's six events and its health check; a wrong key refused in Firehose's
   words, the request's id echoed; the same delivery sent again, and another with an event already
   taken: every series as the pull names it (the average, the counts, the extremes) and every event

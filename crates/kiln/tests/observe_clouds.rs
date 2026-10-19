@@ -1141,6 +1141,73 @@ fn firehose(f: &Fleet, key: &str, request: &str, records: &[Vec<u8>]) -> anyhow:
     Ok((code, serde_json::from_slice(&answer).unwrap_or(Value::Null)))
 }
 
+/// A metric stream's record in OpenTelemetry 1.0.0's format, as CloudWatch writes one: an
+/// `ExportMetricsServiceRequest` after its length, a summary point a minute (`count`, `sum`, the
+/// quantiles 0, 0.99 and 1), named and tagged by attributes, the dimensions a map.
+fn otel_stream_record(table: &str, minutes: &[(i64, u64, f64, f64, f64, f64)]) -> Vec<u8> {
+    use kiln_obs::otlp::pb::Writer;
+    let kv = |w: &mut Writer, k: &str, v: &str| {
+        w.message(7, |kv| {
+            kv.str(1, k);
+            kv.message(2, |av| av.str(1, v));
+        })
+    };
+    let mut w = Writer::default();
+    w.message(1, |rm| {
+        rm.message(1, |res| {
+            for (k, v) in [("cloud.provider", "aws"), ("cloud.account.id", "123456789012"), ("cloud.region", "eu-west-1"), ("aws.exporter.arn", "arn:aws:cloudwatch:eu-west-1:123456789012:metric-stream/kiln")] {
+                res.message(1, |a| {
+                    a.str(1, k);
+                    a.message(2, |av| av.str(1, v));
+                });
+            }
+        });
+        rm.message(2, |sm| {
+            sm.message(2, |m| {
+                m.str(1, "amazonaws.com/AWS/DynamoDB/ConsumedReadCapacityUnits");
+                m.str(3, "1");
+                m.message(11, |summary| {
+                    for &(start, count, sum, min, p99, max) in minutes {
+                        summary.message(1, |dp| {
+                            dp.fixed64(2, start as u64 * 1_000_000);
+                            dp.fixed64(3, (start as u64 + 60_000) * 1_000_000);
+                            dp.fixed64(4, count);
+                            dp.double(5, sum);
+                            // The 0 quantile's own field left out, as proto3 writes a zero.
+                            dp.message(6, |q| q.double(2, min));
+                            dp.message(6, |q| {
+                                q.double(1, 0.99);
+                                q.double(2, p99);
+                            });
+                            dp.message(6, |q| {
+                                q.double(1, 1.0);
+                                q.double(2, max);
+                            });
+                            kv(dp, "Namespace", "AWS/DynamoDB");
+                            kv(dp, "MetricName", "ConsumedReadCapacityUnits");
+                            dp.message(7, |a| {
+                                a.str(1, "Dimensions");
+                                a.message(2, |av| {
+                                    av.message(6, |map| {
+                                        map.message(1, |d| {
+                                            d.str(1, "TableName");
+                                            d.message(2, |v| v.str(1, table));
+                                        })
+                                    })
+                                });
+                            });
+                        });
+                    }
+                });
+            });
+        });
+    });
+    let mut out = Vec::new();
+    kiln_obs::varint::put(&mut out, w.buf.len() as u64);
+    out.extend_from_slice(&w.buf);
+    out
+}
+
 #[test]
 #[ignore = "starts a kiln server as a process"]
 fn the_clouds_pushes_are_taken_once_each_as_their_pulls_name_them() -> anyhow::Result<()> {
@@ -1160,7 +1227,9 @@ fn the_clouds_pushes_are_taken_once_each_as_their_pulls_name_them() -> anyhow::R
     let events: Vec<Value> = (0..6i64).map(|i| json!({ "id": format!("ev{i}"), "timestamp": t + i * 1000, "message": if i == 2 { "[ERROR] card declined".to_owned() } else { format!("[INFO] charge {i}") } })).collect();
     let logs = json!({ "messageType": "DATA_MESSAGE", "owner": "123456789012", "logGroup": "/aws/lambda/checkout", "logStream": "2026/10/18/[$LATEST]a", "subscriptionFilters": ["kiln"], "logEvents": events });
     let control = json!({ "messageType": "CONTROL_MESSAGE", "owner": "CloudwatchLogs", "logGroup": "", "logStream": "", "subscriptionFilters": [], "logEvents": [{ "id": "", "timestamp": t, "message": "CWL CONTROL MESSAGE: Checking health of destination Firehose." }] });
-    let delivery = [lines.into_bytes(), gz(logs.to_string().as_bytes()), gz(control.to_string().as_bytes())];
+    // A stream in OpenTelemetry's format: a table's reads, five minutes.
+    let reads: Vec<(i64, u64, f64, f64, f64, f64)> = (0..5i64).map(|m| (t + m * 60_000, 4, 4.0 * (2.0 + m as f64), 1.0, 2.0 + m as f64 + 1.5, 2.0 + m as f64 + 2.0)).collect();
+    let delivery = [lines.into_bytes(), gz(logs.to_string().as_bytes()), gz(control.to_string().as_bytes()), otel_stream_record("orders", &reads)];
 
     // Its key must be the ingest token; the answer is Firehose's, its id echoed.
     let (code, answer) = firehose(&f, "not-the-token", "req-0", &delivery)?;
@@ -1181,6 +1250,13 @@ fn the_clouds_pushes_are_taken_once_each_as_their_pulls_name_them() -> anyhow::R
     expect(&f, "avg:aws.ec2.cpuutilization{instanceid:i-2}", from, to, |m| 40.0 + ((m - t) / 60_000) as f64)?;
     expect(&f, "sum:aws.ec2.cpuutilization.samplecount{instanceid:i-2}.as_count()", from, to, |_| 5.0)?;
     expect(&f, "max:aws.ec2.cpuutilization.maximum{instanceid:i-1}", from, to, |m| 15.0 + ((m - t) / 60_000) as f64)?;
+    // OpenTelemetry's format, named and tagged as JSON's: its average, its count, its quantiles.
+    let minute = |m: i64| ((m - t) / 60_000) as f64;
+    expect(&f, "avg:aws.dynamodb.consumed_read_capacity_units{tablename:orders,region:eu-west-1,aws_account:123456789012,team:pay}", from, to, |m| 2.0 + minute(m))?;
+    expect(&f, "sum:aws.dynamodb.consumed_read_capacity_units.samplecount{tablename:orders}.as_count()", from, to, |_| 4.0)?;
+    expect(&f, "max:aws.dynamodb.consumed_read_capacity_units.p99{tablename:orders}", from, to, |m| 3.5 + minute(m))?;
+    expect(&f, "min:aws.dynamodb.consumed_read_capacity_units.minimum{tablename:orders}", from, to, |_| 1.0)?;
+    expect(&f, "max:aws.dynamodb.consumed_read_capacity_units.maximum{tablename:orders}", from, to, |m| 4.0 + minute(m))?;
     let checkout = records(&f, "source:lambda service:checkout", t - 60_000, 7)?;
     anyhow::ensure!(checkout.len() == 7, "six events and the new one, each once: {} {checkout:#?}", checkout.len());
     anyhow::ensure!(checkout.iter().all(|r| r["attributes"]["region"] == "eu-west-1" && r["attributes"]["aws_account"] == "123456789012" && r["attributes"]["team"] == "pay"), "{checkout:#?}");

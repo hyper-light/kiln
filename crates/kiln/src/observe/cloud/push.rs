@@ -1,10 +1,11 @@
 //! The clouds' pushes (`docs/observe.md` §10.2): what a cloud sends kiln, where a pull would ask.
 //!
 //! - Amazon Kinesis Data Firehose's HTTP endpoint delivery (`POST /v1/firehose`), its access key
-//!   observe's ingest token: CloudWatch Metric Streams in their JSON output format, named as the
-//!   pulled metrics are (`aws.<namespace>.<metric>` with `.sum`, `.samplecount`, `.maximum`,
-//!   `.minimum`, the average as the name itself), and CloudWatch Logs' subscriptions, as the pulled
-//!   logs are. Firehose's common attributes are tags of every series and record.
+//!   observe's ingest token: CloudWatch Metric Streams in their JSON output format or their
+//!   OpenTelemetry formats (1.0.0 and 0.7.0), named as the pulled metrics are (`aws.<namespace>.
+//!   <metric>` with `.sum`, `.samplecount`, `.maximum`, `.minimum` and percentiles, the average as
+//!   the name itself), and CloudWatch Logs' subscriptions, as the pulled logs are. Firehose's common
+//!   attributes are tags of every series and record.
 //! - Google Cloud Pub/Sub's push subscriptions (`POST /v1/pubsub?token=<the ingest token>`): a
 //!   Cloud Logging sink's entries, as the pulled logs are.
 //!
@@ -21,6 +22,7 @@ use bytes::Bytes;
 use http::StatusCode;
 use kiln_obs::batch::{Kind, SeriesKey};
 use kiln_obs::logs::record::Record;
+use kiln_obs::otlp::pb::{Fields, PbError};
 use serde_json::{Value, json};
 
 use super::{Seen, aws, gcp, id_of, key};
@@ -54,7 +56,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct Unpacked {
     pub series: Vec<(SeriesKey, Vec<(i64, f64)>)>,
     pub logs: Vec<(u64, Record)>,
-    /// Records of no shape kiln reads (Metric Streams' OpenTelemetry format, a log's message alone).
+    /// Records of no shape kiln reads (a log's message alone, a malformed one).
     pub skipped: u64,
 }
 
@@ -73,51 +75,264 @@ fn gunzip(data: &[u8], max: usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// A Metric Streams record's statistics as series (the pulls' names and tags): `.sum` and
-/// `.samplecount` counts, the average `sum / count` the name itself, the rest gauges.
-fn stream_points(v: &Value, tags: &[(String, String)], out: &mut BTreeMap<u64, (SeriesKey, Vec<(i64, f64)>)>) -> bool {
-    let (Some(ns), Some(metric), Some(ts), Some(value)) = (v.get("namespace").and_then(Value::as_str), v.get("metric_name").and_then(Value::as_str), v.get("timestamp").and_then(Value::as_i64), v.get("value").and_then(Value::as_object)) else {
-        return false;
-    };
-    let name = aws::metric_name(ns, metric);
+/// Series by fingerprint, their points, as a delivery's records add them.
+type Points = BTreeMap<u64, (SeriesKey, Vec<(i64, f64)>)>;
+
+/// A metric's tags as a stream's datum gives them: its region and account, its dimensions by their
+/// names in lower case, then Firehose's common attributes.
+fn stream_tags(region: Option<&str>, account: Option<&str>, dimensions: impl Iterator<Item = (String, String)>, tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut own: Vec<(String, String)> = Vec::new();
-    for (k, field) in [("region", "region"), ("aws_account", "account_id")] {
-        if let Some(x) = v.get(field).and_then(Value::as_str).filter(|x| !x.is_empty()) {
+    for (k, x) in [("region", region), ("aws_account", account)] {
+        if let Some(x) = x.filter(|x| !x.is_empty()) {
             own.push((k.to_owned(), x.to_owned()));
         }
     }
-    for (k, x) in v.get("dimensions").and_then(Value::as_object).into_iter().flatten() {
-        if let Some(x) = x.as_str() {
-            own.push((k.to_ascii_lowercase(), x.to_owned()));
-        }
-    }
+    own.extend(dimensions.map(|(k, x)| (k.to_ascii_lowercase(), x)));
     own.extend(tags.iter().cloned());
+    own
+}
+
+/// A period's statistics as series (the pulls' names): `.sum` and `.samplecount` counts, the
+/// average `sum / count` the name itself, the rest (`stats`: each one's suffix, `maximum`,
+/// `minimum`, `p99`) gauges.
+fn stream_stats(name: &str, own: &[(String, String)], ts: i64, sum_count: Option<(f64, f64)>, stats: &[(String, f64)], out: &mut Points) {
     let pairs: Vec<(&str, &str)> = own.iter().map(|(k, x)| (k.as_str(), x.as_str())).collect();
-    let mut put = |metric: String, kind: Kind, x: f64| {
+    let mut put = |metric: &str, kind: Kind, x: f64| {
         if x.is_finite()
-            && let Some(k) = key(&metric, &pairs, kind)
+            && let Some(k) = key(metric, &pairs, kind)
         {
             out.entry(k.fp).or_insert_with(|| (k, Vec::new())).1.push((ts, x));
         }
     };
-    let stat = |k: &str| value.get(k).and_then(Value::as_f64);
-    if let (Some(sum), Some(count)) = (stat("sum"), stat("count")) {
-        put(format!("{name}.sum"), Kind::Count, sum);
-        put(format!("{name}.samplecount"), Kind::Count, count);
+    if let Some((sum, count)) = sum_count {
+        put(&format!("{name}.sum"), Kind::Count, sum);
+        put(&format!("{name}.samplecount"), Kind::Count, count);
         if count > 0.0 {
-            put(name.clone(), Kind::Gauge, sum / count);
+            put(name, Kind::Gauge, sum / count);
         }
     }
-    for (k, x) in value {
-        let Some(x) = x.as_f64() else { continue };
-        match k.as_str() {
-            "sum" | "count" => {}
-            "max" => put(format!("{name}.maximum"), Kind::Gauge, x),
-            "min" => put(format!("{name}.minimum"), Kind::Gauge, x),
-            other => put(format!("{name}.{}", aws::suffix(other)), Kind::Gauge, x),
-        }
+    for (suffix, x) in stats {
+        put(&format!("{name}.{suffix}"), Kind::Gauge, *x);
     }
+}
+
+/// A Metric Streams record's statistics as series (the pulls' names and tags): `.sum` and
+/// `.samplecount` counts, the average `sum / count` the name itself, the rest gauges.
+fn stream_points(v: &Value, tags: &[(String, String)], out: &mut Points) -> bool {
+    let (Some(ns), Some(metric), Some(ts), Some(value)) = (v.get("namespace").and_then(Value::as_str), v.get("metric_name").and_then(Value::as_str), v.get("timestamp").and_then(Value::as_i64), v.get("value").and_then(Value::as_object)) else {
+        return false;
+    };
+    let dimensions = v.get("dimensions").and_then(Value::as_object).into_iter().flatten().filter_map(|(k, x)| Some((k.clone(), x.as_str()?.to_owned())));
+    let own = stream_tags(v.get("region").and_then(Value::as_str), v.get("account_id").and_then(Value::as_str), dimensions, tags);
+    let stat = |k: &str| value.get(k).and_then(Value::as_f64);
+    let stats: Vec<(String, f64)> = value
+        .iter()
+        .filter_map(|(k, x)| {
+            let suffix = match k.as_str() {
+                "sum" | "count" => return None,
+                "max" => "maximum".to_owned(),
+                "min" => "minimum".to_owned(),
+                other => aws::suffix(other),
+            };
+            Some((suffix, x.as_f64()?))
+        })
+        .collect();
+    stream_stats(&aws::metric_name(ns, metric), &own, ts, stat("sum").zip(stat("count")), &stats, out);
     true
+}
+
+/// A Metric Streams record in OpenTelemetry's formats (1.0.0 and 0.7.0): one or more
+/// `ExportMetricsServiceRequest`s, each after its length (an unsigned varint). `None` when the
+/// record is not one: its frames do not cover it exactly, or one does not start as a request does,
+/// with its resources (field 1, length-delimited: `0x0A`), as JSON's `{"` never does.
+fn otel_frames(raw: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut at = raw;
+    let mut frames = Vec::new();
+    while !at.is_empty() {
+        let n = usize::try_from(kiln_obs::varint::get(&mut at)?).ok()?;
+        let (frame, rest) = at.split_at_checked(n)?;
+        if frame.first() != Some(&0x0A) {
+            return None;
+        }
+        frames.push(frame);
+        at = rest;
+    }
+    (!frames.is_empty()).then_some(frames)
+}
+
+/// A `KeyValue` (1.0.0's attributes, and a resource's): its key and its `AnyValue`'s bytes.
+fn key_value(kv: &[u8]) -> Result<(&str, &[u8]), PbError> {
+    let (mut k, mut v) = ("", &[][..]);
+    for f in Fields::new(kv) {
+        match f? {
+            (1, w) => k = w.str().unwrap_or(""),
+            (2, w) => v = w.bytes().unwrap_or(&[]),
+            _ => {}
+        }
+    }
+    Ok((k, v))
+}
+
+/// An `AnyValue`'s string (`string_value`), if it holds one.
+fn any_str(v: &[u8]) -> Result<Option<&str>, PbError> {
+    for f in Fields::new(v) {
+        if let (1, w) = f? {
+            return Ok(w.str());
+        }
+    }
+    Ok(None)
+}
+
+/// A quantile's statistic, as CloudWatch names it: 0 `minimum`, 1 `maximum`, 0.99 `p99`, 0.999
+/// `p99_9` (`p99.9`'s suffix).
+fn quantile_stat(q: f64) -> Option<String> {
+    if q == 0.0 {
+        return Some("minimum".into());
+    }
+    if q == 1.0 {
+        return Some("maximum".into());
+    }
+    if !(q > 0.0 && q < 1.0) {
+        return None;
+    }
+    // A percentile with six places at the most, its trailing zeros dropped: 0.999 × 100 is
+    // 99.89999999999999 in binary, CloudWatch's `p99.9`.
+    let mut p = format!("{:.6}", q * 100.0);
+    while p.ends_with('0') {
+        p.pop();
+    }
+    if p.ends_with('.') {
+        p.pop();
+    }
+    Some(aws::suffix(&format!("p{p}")))
+}
+
+/// One `ExportMetricsServiceRequest` of a Metric Stream in OpenTelemetry's format, as its JSON is
+/// read ([`stream_points`]): each data point a period's summary (its `count` the `SampleCount`, its
+/// `sum` the `Sum`, its quantiles 0 and 1 the `Minimum` and `Maximum`, the rest percentiles; from
+/// its start, CloudWatch's period's), named by its `Namespace` and `MetricName` and tagged by its
+/// `Dimensions` (1.0.0: attributes, the dimensions a map; 0.7.0: labels, the dimensions the rest),
+/// with its resource's `cloud.region` and `cloud.account.id`. Whether it held a point.
+fn stream_otel(frame: &[u8], tags: &[(String, String)], out: &mut Points) -> Result<bool, PbError> {
+    let mut read = false;
+    for f in Fields::new(frame) {
+        let (1, w) = f? else { continue };
+        let (mut region, mut account, mut scopes) = (None, None, Vec::new());
+        for f in Fields::new(w.bytes().unwrap_or(&[])) {
+            match f? {
+                (1, w) => {
+                    for f in Fields::new(w.bytes().unwrap_or(&[])) {
+                        let (1, w) = f? else { continue };
+                        let (k, v) = key_value(w.bytes().unwrap_or(&[]))?;
+                        match k {
+                            "cloud.region" => region = any_str(v)?,
+                            "cloud.account.id" => account = any_str(v)?,
+                            _ => {}
+                        }
+                    }
+                }
+                (2, w) => scopes.push(w.bytes().unwrap_or(&[])),
+                _ => {}
+            }
+        }
+        for scope in scopes {
+            for f in Fields::new(scope) {
+                let (2, w) = f? else { continue };
+                let (mut metric, mut summary) = ("", None);
+                for f in Fields::new(w.bytes().unwrap_or(&[])) {
+                    match f? {
+                        (1, w) => metric = w.str().unwrap_or(""),
+                        (11, w) => summary = w.bytes(),
+                        _ => {}
+                    }
+                }
+                for f in Fields::new(summary.unwrap_or(&[])) {
+                    let (1, w) = f? else { continue };
+                    read |= stream_otel_point(w.bytes().unwrap_or(&[]), metric, region, account, tags, out)?;
+                }
+            }
+        }
+    }
+    Ok(read)
+}
+
+/// A summary's data point ([`stream_otel`]): whether it was one of a stream's.
+fn stream_otel_point(p: &[u8], metric: &str, region: Option<&str>, account: Option<&str>, tags: &[(String, String)], out: &mut Points) -> Result<bool, PbError> {
+    let (mut ns, mut name) = (None, None);
+    let mut dimensions: Vec<(String, String)> = Vec::new();
+    let (mut start, mut end, mut count, mut sum) = (0u64, 0u64, 0u64, 0.0f64);
+    let mut stats: Vec<(String, f64)> = Vec::new();
+    for f in Fields::new(p) {
+        match f? {
+            // 0.7.0's labels: `StringKeyValue`s, the namespace, the name and each dimension.
+            (1, w) => {
+                let (mut k, mut v) = ("", "");
+                for f in Fields::new(w.bytes().unwrap_or(&[])) {
+                    match f? {
+                        (1, w) => k = w.str().unwrap_or(""),
+                        (2, w) => v = w.str().unwrap_or(""),
+                        _ => {}
+                    }
+                }
+                match k {
+                    "Namespace" => ns = Some(v),
+                    "MetricName" => name = Some(v),
+                    "" => {}
+                    _ => dimensions.push((k.to_owned(), v.to_owned())),
+                }
+            }
+            (2, w) => start = w.u64().unwrap_or(0),
+            (3, w) => end = w.u64().unwrap_or(0),
+            (4, w) => count = w.u64().unwrap_or(0),
+            (5, w) => sum = w.f64().unwrap_or(0.0),
+            (6, w) => {
+                let (mut q, mut v) = (0.0, f64::NAN);
+                for f in Fields::new(w.bytes().unwrap_or(&[])) {
+                    match f? {
+                        (1, w) => q = w.f64().unwrap_or(f64::NAN),
+                        (2, w) => v = w.f64().unwrap_or(f64::NAN),
+                        _ => {}
+                    }
+                }
+                if let Some(stat) = quantile_stat(q) {
+                    stats.push((stat, v));
+                }
+            }
+            // 1.0.0's attributes: the namespace, the name, and the dimensions as a map.
+            (7, w) => {
+                let (k, v) = key_value(w.bytes().unwrap_or(&[]))?;
+                match k {
+                    "Namespace" => ns = any_str(v)?,
+                    "MetricName" => name = any_str(v)?,
+                    "Dimensions" => {
+                        for f in Fields::new(v) {
+                            let (6, w) = f? else { continue };
+                            for f in Fields::new(w.bytes().unwrap_or(&[])) {
+                                let (1, w) = f? else { continue };
+                                let (k, v) = key_value(w.bytes().unwrap_or(&[]))?;
+                                if let (false, Some(v)) = (k.is_empty(), any_str(v)?) {
+                                    dimensions.push((k.to_owned(), v.to_owned()));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    // Without its attributes, the metric's own name says them: `amazonaws.com/<namespace>/<name>`.
+    let named = metric.strip_prefix("amazonaws.com/").and_then(|m| m.rsplit_once('/'));
+    let (Some(ns), Some(name)) = (ns.or(named.map(|n| n.0)), name.or(named.map(|n| n.1))) else { return Ok(false) };
+    let at = if start > 0 { start } else { end };
+    if at == 0 || ns.is_empty() || name.is_empty() {
+        return Ok(false);
+    }
+    let ts = i64::try_from(at / 1_000_000).unwrap_or(i64::MAX);
+    let own = stream_tags(region, account, dimensions.into_iter(), tags);
+    stream_stats(&aws::metric_name(ns, name), &own, ts, Some((sum, count as f64)), &stats, out);
+    Ok(true)
 }
 
 /// A CloudWatch Logs subscription's message (`DATA_MESSAGE`) as records; a `CONTROL_MESSAGE` (its
@@ -146,11 +361,32 @@ fn subscription_logs(v: &Value, region: &str, tags: &[(String, String)], out: &m
 pub fn unpack_firehose(records: &[Value], region: &str, tags: &[(String, String)]) -> Result<Unpacked, String> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut out = Unpacked::default();
-    let mut points: BTreeMap<u64, (SeriesKey, Vec<(i64, f64)>)> = BTreeMap::new();
+    let mut points = Points::new();
     for r in records {
         let data = r.get("data").and_then(Value::as_str).ok_or("a record without data")?;
         let raw = b64.decode(data).map_err(|e| format!("a record's data is not base64: {e}"))?;
         let raw = if raw.starts_with(&[0x1f, 0x8b]) { gunzip(&raw, RECORD)? } else { raw };
+        // OpenTelemetry's format: each request's points kept only if all of it reads; the record
+        // counted as not read if one did not, or none held a point.
+        if let Some(frames) = otel_frames(&raw) {
+            let (mut read, mut bad) = (false, false);
+            for frame in frames {
+                let mut mine = Points::new();
+                match stream_otel(frame, tags, &mut mine) {
+                    Ok(r) => {
+                        read |= r;
+                        for (fp, (k, p)) in mine {
+                            points.entry(fp).or_insert_with(|| (k, Vec::new())).1.extend(p);
+                        }
+                    }
+                    Err(_) => bad = true,
+                }
+            }
+            if bad || !read {
+                out.skipped += 1;
+            }
+            continue;
+        }
         let text = String::from_utf8_lossy(&raw);
         let mut read = false;
         // Newline-delimited JSON (Metric Streams' JSON), or one object (a subscription's message).
@@ -407,6 +643,175 @@ mod tests {
         anyhow::ensure!(r.source == "lambda" && r.service == "checkout" && r.severity == 17 && r.attrs.contains(&("aws_account".into(), "123456789012".into())) && r.attrs.contains(&("env".into(), "prod".into())), "{r:?}");
         anyhow::ensure!(region_of("arn:aws:firehose:eu-west-1:123456789012:deliverystream/kiln") == "eu-west-1");
         anyhow::ensure!(common_attributes(Some(r#"{"commonAttributes":{"team":"pay"}}"#)) == vec![("team".to_owned(), "pay".to_owned())]);
+        Ok(())
+    }
+
+    /// A stream's datum in OpenTelemetry 1.0.0's format: its resource, a summary point of each
+    /// period (`start_ms`, a minute), its quantiles as AWS writes them (0's quantile left out, as
+    /// proto3 leaves out zeros).
+    fn otel_100(points: &[(i64, u64, f64, &[(f64, f64)])], named: bool) -> Vec<u8> {
+        use kiln_obs::otlp::pb::Writer;
+        let mut w = Writer::default();
+        w.message(1, |rm| {
+            rm.message(1, |res| {
+                for (k, v) in [("cloud.provider", "aws"), ("cloud.account.id", "123456789012"), ("cloud.region", "us-east-1"), ("aws.exporter.arn", "arn:aws:cloudwatch:us-east-1:123456789012:metric-stream/s")] {
+                    res.message(1, |kv| {
+                        kv.str(1, k);
+                        kv.message(2, |av| av.str(1, v));
+                    });
+                }
+            });
+            rm.message(2, |sm| {
+                sm.message(2, |m| {
+                    m.str(1, "amazonaws.com/AWS/DynamoDB/ConsumedReadCapacityUnits");
+                    m.str(3, "1");
+                    m.message(11, |summary| {
+                        for &(start_ms, count, sum, quantiles) in points {
+                            summary.message(1, |dp| {
+                                dp.fixed64(2, start_ms as u64 * 1_000_000);
+                                dp.fixed64(3, (start_ms as u64 + 60_000) * 1_000_000);
+                                dp.fixed64(4, count);
+                                dp.double(5, sum);
+                                for &(q, v) in quantiles {
+                                    dp.message(6, |qv| {
+                                        if q != 0.0 {
+                                            qv.double(1, q);
+                                        }
+                                        qv.double(2, v);
+                                    });
+                                }
+                                if named {
+                                    for (k, v) in [("Namespace", "AWS/DynamoDB"), ("MetricName", "ConsumedReadCapacityUnits")] {
+                                        dp.message(7, |kv| {
+                                            kv.str(1, k);
+                                            kv.message(2, |av| av.str(1, v));
+                                        });
+                                    }
+                                }
+                                dp.message(7, |kv| {
+                                    kv.str(1, "Dimensions");
+                                    kv.message(2, |av| {
+                                        av.message(6, |map| {
+                                            map.message(1, |d| {
+                                                d.str(1, "TableName");
+                                                d.message(2, |av| av.str(1, "MyTable"));
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                        }
+                    });
+                });
+            });
+        });
+        w.buf
+    }
+
+    /// The same in 0.7.0's: the namespace, the name and the dimensions as labels.
+    fn otel_070(points: &[(i64, u64, f64, &[(f64, f64)])]) -> Vec<u8> {
+        use kiln_obs::otlp::pb::Writer;
+        let mut w = Writer::default();
+        w.message(1, |rm| {
+            rm.message(1, |res| {
+                for (k, v) in [("cloud.provider", "aws"), ("cloud.account.id", "123456789012"), ("cloud.region", "us-east-1")] {
+                    res.message(1, |kv| {
+                        kv.str(1, k);
+                        kv.message(2, |av| av.str(1, v));
+                    });
+                }
+            });
+            rm.message(2, |ilm| {
+                ilm.message(2, |m| {
+                    m.str(1, "amazonaws.com/AWS/DynamoDB/ConsumedReadCapacityUnits");
+                    m.message(11, |summary| {
+                        for &(start_ms, count, sum, quantiles) in points {
+                            summary.message(1, |dp| {
+                                for (k, v) in [("Namespace", "AWS/DynamoDB"), ("MetricName", "ConsumedReadCapacityUnits"), ("TableName", "MyTable")] {
+                                    dp.message(1, |l| {
+                                        l.str(1, k);
+                                        l.str(2, v);
+                                    });
+                                }
+                                dp.fixed64(2, start_ms as u64 * 1_000_000);
+                                dp.fixed64(3, (start_ms as u64 + 60_000) * 1_000_000);
+                                dp.fixed64(4, count);
+                                dp.double(5, sum);
+                                for &(q, v) in quantiles {
+                                    dp.message(6, |qv| {
+                                        qv.double(1, q);
+                                        qv.double(2, v);
+                                    });
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+        });
+        w.buf
+    }
+
+    /// Requests one after another, each after its length.
+    fn delimited(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for f in frames {
+            kiln_obs::varint::put(&mut out, f.len() as u64);
+            out.extend_from_slice(f);
+        }
+        out
+    }
+
+    fn series_of(u: &Unpacked) -> Vec<String> {
+        let mut out: Vec<String> = u.series.iter().filter_map(|(s, p)| kiln_obs::batch::parse_key(&s.key).ok().map(|k| format!("{} {:?} {:?} {p:?}", k.metric, s.kind, k.tags))).collect();
+        out.sort();
+        out
+    }
+
+    /// A stream's datum is the same series whichever of its three formats it came in: JSON's,
+    /// OpenTelemetry 1.0.0's (its quantiles, its dimensions a map), and 0.7.0's (labels).
+    #[test]
+    fn a_metric_stream_s_opentelemetry_formats_read_as_its_json_does() -> anyhow::Result<()> {
+        let t = 1_800_000_000_000i64;
+        let one: &[(f64, f64)] = &[(0.0, 1.0), (0.99, 2.5), (0.999, 2.9), (1.0, 3.0)];
+        let two: &[(f64, f64)] = &[(0.0, 2.0), (1.0, 2.0)];
+        let points = [(t, 2u64, 5.0, one), (t + 60_000, 1, 2.0, two)];
+        let mut lines = String::new();
+        for (ts, count, sum, value) in [(t, 2.0, 5.0, json!({ "min": 1.0, "p99": 2.5, "p99.9": 2.9, "max": 3.0 })), (t + 60_000, 1.0, 2.0, json!({ "min": 2.0, "max": 2.0 }))] {
+            let mut value = value;
+            if let Some(o) = value.as_object_mut() {
+                o.insert("sum".into(), json!(sum));
+                o.insert("count".into(), json!(count));
+            }
+            lines.push_str(&json!({ "metric_stream_name": "s", "account_id": "123456789012", "region": "us-east-1", "namespace": "AWS/DynamoDB", "metric_name": "ConsumedReadCapacityUnits", "dimensions": { "TableName": "MyTable" }, "timestamp": ts, "value": value, "unit": "None" }).to_string());
+            lines.push('\n');
+        }
+        let tags = [("team".to_owned(), "pay".to_owned())];
+        let json_way = unpack_firehose(&[json!({ "data": b64(lines.as_bytes()) })], "us-east-1", &tags).map_err(anyhow::Error::msg)?;
+        let want = series_of(&json_way);
+        anyhow::ensure!(want.len() == 7 && json_way.skipped == 0, "{want:#?}");
+        // 1.0.0: both periods in one request; then each in a request of its own, one record.
+        let v100 = unpack_firehose(&[json!({ "data": b64(&delimited(&[otel_100(&points, true)])) })], "us-east-1", &tags).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(series_of(&v100) == want && v100.skipped == 0, "{:#?}\nagainst {want:#?}", series_of(&v100));
+        let split = delimited(&[otel_100(&points[..1], true), otel_100(&points[1..], true)]);
+        anyhow::ensure!(series_of(&unpack_firehose(&[json!({ "data": b64(&split) })], "us-east-1", &tags).map_err(anyhow::Error::msg)?) == want);
+        // Without its attributes, named by its metric's name.
+        anyhow::ensure!(series_of(&unpack_firehose(&[json!({ "data": b64(&delimited(&[otel_100(&points, false)])) })], "us-east-1", &tags).map_err(anyhow::Error::msg)?) == want);
+        let v070 = unpack_firehose(&[json!({ "data": b64(&delimited(&[otel_070(&points)])) })], "us-east-1", &tags).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(series_of(&v070) == want && v070.skipped == 0, "{:#?}", series_of(&v070));
+        // A request cut short: its record not read and counted so, the others' points kept.
+        let whole = otel_100(&points[..1], true);
+        let mut cut = delimited(std::slice::from_ref(&whole));
+        cut.truncate(cut.len() - 3);
+        let short = whole.get(..whole.len() - 3).unwrap_or(&[]);
+        let mut lying = Vec::new();
+        kiln_obs::varint::put(&mut lying, short.len() as u64);
+        lying.extend_from_slice(short);
+        let u = unpack_firehose(&[json!({ "data": b64(&cut) }), json!({ "data": b64(&lying) }), json!({ "data": b64(&delimited(&[otel_100(&points[1..], true)])) })], "us-east-1", &tags).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(u.skipped == 2 && u.points() == 5, "{} skipped, {} points: {:#?}", u.skipped, u.points(), series_of(&u));
+        // JSON that happens to start as a length would (`{` is 123) is still JSON.
+        anyhow::ensure!(otel_frames(lines.as_bytes()).is_none());
+        anyhow::ensure!(quantile_stat(0.5).as_deref() == Some("p50") && quantile_stat(0.999).as_deref() == Some("p99_9") && quantile_stat(0.9999).as_deref() == Some("p99_99") && quantile_stat(1.5).is_none());
         Ok(())
     }
 
