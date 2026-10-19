@@ -389,9 +389,22 @@ impl Core {
 
     /// A file's cumulative change, recomputed (None: it is back to how it was), and its baseline
     /// when the recomputation had to work it out.
-    pub fn set_change(&mut self, abs: &str, change: Option<super::model::FileChange>, resolved: Option<Baseline>) {
+    pub fn set_change(&mut self, abs: &str, mut change: Option<super::model::FileChange>, resolved: Option<Baseline>) {
         if let Some(b) = resolved {
             self.baselines.insert(abs.to_owned(), b);
+        }
+        if let Some(c) = change.as_mut() {
+            if let Some(before) = self.changes.get(abs) {
+                // Recomputing the same diff does not make it a newer change.
+                let at = c.at;
+                c.at = before.at;
+                if *c == *before {
+                    return;
+                }
+                c.at = at;
+            }
+        } else if !self.changes.contains_key(abs) {
+            return;
         }
         match change {
             Some(c) => {
@@ -787,6 +800,36 @@ mod tests {
         assert_eq!(c.take_out(), vec![Update::Stream { id: "three".into(), text: "?".into() }]);
         assert_eq!(c.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["one", "reply one", "three"]);
         assert!(c.get("three").is_some_and(|e| matches!(&e.body, Body::Assistant { text, .. } if text == "three!?")));
+    }
+
+    #[test]
+    fn unchanged_diffs_do_not_resend_the_changeset() {
+        use super::super::model::{FileChange, Hunk};
+        let mut c = Core::new();
+        c.take_out();
+        let first = FileChange {
+            path: "a.rs".into(), created: true, deleted: false, added: 1, removed: 0,
+            hunks: vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+one".into()] }],
+            truncated: false, at: 1,
+        };
+        c.set_change("/a.rs", Some(first.clone()), None);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.as_slice() == std::slice::from_ref(&first))));
+        let mut same = first.clone();
+        same.at = 2;
+        c.set_change("/a.rs", Some(same), Some(Baseline::Absent));
+        assert!(c.take_out().is_empty());
+        assert_eq!(c.baselines.get("/a.rs"), Some(&Baseline::Absent));
+        assert_eq!(c.changes(), vec![first.clone()]);
+        let mut changed = first;
+        changed.at = 3;
+        changed.hunks = vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+two".into()] }];
+        c.set_change("/a.rs", Some(changed.clone()), None);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.as_slice() == std::slice::from_ref(&changed))));
+        c.set_change("/a.rs", None, None);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.is_empty())));
+        assert_eq!((c.state.files_changed, c.state.lines_added, c.state.lines_removed), (0, 0, 0));
+        c.set_change("/a.rs", None, None);
+        assert!(c.take_out().is_empty());
     }
 
     #[test]
