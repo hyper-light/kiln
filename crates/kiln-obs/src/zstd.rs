@@ -31,138 +31,358 @@ const BLOCK_MAX: usize = 128 << 10;
 
 /// A frame's (or frames') content into `out` (cleared first), `max` bytes at the most.
 pub fn decompress(input: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), ZstdError> {
-    out.clear();
-    let mut at = input;
-    if at.is_empty() {
-        return Err(ZstdError::Magic);
-    }
-    while !at.is_empty() {
-        let (m, _) = at.split_first_chunk::<4>().ok_or(Truncated)?;
-        let magic = u32::from_le_bytes(*m);
-        if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
-            // A skippable frame: its size, then that many bytes.
-            let (s, rest) = at.get(4..).and_then(|r| r.split_first_chunk::<4>()).ok_or(Truncated)?;
-            let n = usize::try_from(u32::from_le_bytes(*s)).map_err(|_| Corrupt)?;
-            at = rest.get(n..).ok_or(Truncated)?;
-            continue;
-        }
-        if magic != MAGIC {
-            return Err(ZstdError::Magic);
-        }
-        at = frame(at.get(4..).unwrap_or_default(), out, max)?;
-    }
-    Ok(())
+    Decoder::default().decompress(input, out, max)
 }
 
-/// One frame (after its magic): its blocks' content appended to `out`; what follows it.
-fn frame<'a>(input: &'a [u8], out: &mut Vec<u8>, max: usize) -> Result<&'a [u8], ZstdError> {
-    let (&fhd, mut at) = input.split_first().ok_or(Truncated)?;
-    let fcs_flag = fhd >> 6;
-    let single = fhd & 0x20 != 0;
-    if fhd & 0x08 != 0 {
-        return Err(Corrupt);
+/// A decoder's tables and buffers, kept from one frame to the next: one a receiver keeps allocates
+/// nothing a frame once they have grown (the predefined tables made once).
+#[derive(Debug, Default)]
+pub struct Decoder {
+    literals: Vec<u8>,
+    huffman: Huffman,
+    has_huffman: bool,
+    /// The sequences' tables (literals' lengths, offsets, matches' lengths), and whether each is
+    /// this frame's (a repeat of one before it is refused).
+    tables: [Fse; 3],
+    has: [bool; 3],
+    rep: [usize; 3],
+    scratch: Scratch,
+    defaults: Option<Box<[Fse; 3]>>,
+}
+
+/// What a table is built with.
+#[derive(Debug, Default)]
+struct Scratch {
+    counts: Vec<i16>,
+    next: Vec<u32>,
+    weights: Vec<u8>,
+    weights_fse: Fse,
+}
+
+impl Decoder {
+    pub fn new() -> Self {
+        Self::default()
     }
-    let checksum = fhd & 0x04 != 0;
-    let dict_bytes = match fhd & 3 {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        _ => 4,
-    };
-    if !single {
-        // The window descriptor: how far back a match may reach (all of what this frame wrote is
-        // kept, so any offset within it is taken).
-        let (_, rest) = at.split_first().ok_or(Truncated)?;
-        at = rest;
-    }
-    let (dict, rest) = at.split_at_checked(dict_bytes).ok_or(Truncated)?;
-    at = rest;
-    if dict.iter().any(|&b| b != 0) {
-        return Err(ZstdError::Dictionary);
-    }
-    let fcs_bytes = match fcs_flag {
-        0 if single => 1,
-        0 => 0,
-        1 => 2,
-        2 => 4,
-        _ => 8,
-    };
-    let (fcs, rest) = at.split_at_checked(fcs_bytes).ok_or(Truncated)?;
-    at = rest;
-    let declared = (fcs_bytes > 0).then(|| {
-        let v = fcs.iter().rev().fold(0u64, |a, &b| (a << 8) | u64::from(b));
-        if fcs_bytes == 2 { v + 256 } else { v }
-    });
-    if declared.is_some_and(|d| d > max as u64) {
-        return Err(ZstdError::TooLarge);
-    }
-    let start = out.len();
-    let mut state = State::default();
-    loop {
-        let (h, rest) = at.split_first_chunk::<3>().ok_or(Truncated)?;
-        at = rest;
-        let header = u32::from(h[0]) | (u32::from(h[1]) << 8) | (u32::from(h[2]) << 16);
-        let last = header & 1 != 0;
-        let size = usize::try_from(header >> 3).map_err(|_| Corrupt)?;
-        match (header >> 1) & 3 {
-            0 => {
-                let (raw, rest) = at.split_at_checked(size).ok_or(Truncated)?;
-                at = rest;
-                if size > BLOCK_MAX || out.len() + size > max {
-                    return Err(if size > BLOCK_MAX { Corrupt } else { ZstdError::TooLarge });
-                }
-                out.extend_from_slice(raw);
+
+    /// A frame's (or frames') content into `out` (cleared first), `max` bytes at the most.
+    pub fn decompress(&mut self, input: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), ZstdError> {
+        out.clear();
+        let mut at = input;
+        if at.is_empty() {
+            return Err(ZstdError::Magic);
+        }
+        if self.defaults.is_none() {
+            self.defaults = Some(Box::new([fse_table(&LL_DEFAULT, 6)?, fse_table(&OF_DEFAULT, 5)?, fse_table(&ML_DEFAULT, 6)?]));
+        }
+        while !at.is_empty() {
+            let (m, _) = at.split_first_chunk::<4>().ok_or(Truncated)?;
+            let magic = u32::from_le_bytes(*m);
+            if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+                // A skippable frame: its size, then that many bytes.
+                let (s, rest) = at.get(4..).and_then(|r| r.split_first_chunk::<4>()).ok_or(Truncated)?;
+                let n = usize::try_from(u32::from_le_bytes(*s)).map_err(|_| Corrupt)?;
+                at = rest.get(n..).ok_or(Truncated)?;
+                continue;
             }
-            1 => {
-                let (&b, rest) = at.split_first().ok_or(Truncated)?;
-                at = rest;
-                if size > BLOCK_MAX || out.len() + size > max {
-                    return Err(if size > BLOCK_MAX { Corrupt } else { ZstdError::TooLarge });
-                }
-                out.resize(out.len() + size, b);
+            if magic != MAGIC {
+                return Err(ZstdError::Magic);
             }
-            2 => {
-                let (block, rest) = at.split_at_checked(size).ok_or(Truncated)?;
-                at = rest;
+            at = self.frame(at.get(4..).unwrap_or_default(), out, max)?;
+        }
+        Ok(())
+    }
+
+    /// One frame (after its magic): its blocks' content appended to `out`; what follows it.
+    fn frame<'a>(&mut self, input: &'a [u8], out: &mut Vec<u8>, max: usize) -> Result<&'a [u8], ZstdError> {
+        let (&fhd, mut at) = input.split_first().ok_or(Truncated)?;
+        let fcs_flag = fhd >> 6;
+        let single = fhd & 0x20 != 0;
+        if fhd & 0x08 != 0 {
+            return Err(Corrupt);
+        }
+        let checksum = fhd & 0x04 != 0;
+        let dict_bytes = match fhd & 3 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        if !single {
+            // The window descriptor: how far back a match may reach (all of what this frame wrote
+            // is kept, so any offset within it is taken).
+            let (_, rest) = at.split_first().ok_or(Truncated)?;
+            at = rest;
+        }
+        let (dict, rest) = at.split_at_checked(dict_bytes).ok_or(Truncated)?;
+        at = rest;
+        if dict.iter().any(|&b| b != 0) {
+            return Err(ZstdError::Dictionary);
+        }
+        let fcs_bytes = match fcs_flag {
+            0 if single => 1,
+            0 => 0,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        let (fcs, rest) = at.split_at_checked(fcs_bytes).ok_or(Truncated)?;
+        at = rest;
+        let declared = (fcs_bytes > 0).then(|| {
+            let v = fcs.iter().rev().fold(0u64, |a, &b| (a << 8) | u64::from(b));
+            if fcs_bytes == 2 { v + 256 } else { v }
+        });
+        if declared.is_some_and(|d| d > max as u64) {
+            return Err(ZstdError::TooLarge);
+        }
+        let start = out.len();
+        // A frame begins with nothing to repeat.
+        self.has_huffman = false;
+        self.has = [false; 3];
+        self.rep = [1, 4, 8];
+        loop {
+            let (h, rest) = at.split_first_chunk::<3>().ok_or(Truncated)?;
+            at = rest;
+            let header = u32::from(h[0]) | (u32::from(h[1]) << 8) | (u32::from(h[2]) << 16);
+            let last = header & 1 != 0;
+            let size = usize::try_from(header >> 3).map_err(|_| Corrupt)?;
+            if size > BLOCK_MAX {
+                return Err(Corrupt);
+            }
+            match (header >> 1) & 3 {
+                0 => {
+                    let (raw, rest) = at.split_at_checked(size).ok_or(Truncated)?;
+                    at = rest;
+                    if out.len() + size > max {
+                        return Err(ZstdError::TooLarge);
+                    }
+                    out.extend_from_slice(raw);
+                }
+                1 => {
+                    let (&b, rest) = at.split_first().ok_or(Truncated)?;
+                    at = rest;
+                    if out.len() + size > max {
+                        return Err(ZstdError::TooLarge);
+                    }
+                    out.resize(out.len() + size, b);
+                }
+                2 => {
+                    let (block, rest) = at.split_at_checked(size).ok_or(Truncated)?;
+                    at = rest;
+                    self.compressed(block, out, start, max)?;
+                }
+                _ => return Err(Corrupt),
+            }
+            if last {
+                break;
+            }
+        }
+        if declared.is_some_and(|d| d != (out.len() - start) as u64) {
+            return Err(Corrupt);
+        }
+        if checksum {
+            let (c, rest) = at.split_first_chunk::<4>().ok_or(Truncated)?;
+            at = rest;
+            let want = u32::from_le_bytes(*c);
+            if (xxh64(out.get(start..).unwrap_or_default(), 0) as u32) != want {
+                return Err(ZstdError::Checksum);
+            }
+        }
+        Ok(at)
+    }
+
+    /// The literals section: its literals into `self.literals`; the bytes it took.
+    fn literals(&mut self, block: &[u8]) -> Result<usize, ZstdError> {
+        let &b0 = block.first().ok_or(Truncated)?;
+        let kind = b0 & 3;
+        let format = (b0 >> 2) & 3;
+        let byte = |i: usize| block.get(i).copied().map(usize::from).ok_or(Truncated);
+        self.literals.clear();
+        match kind {
+            0 | 1 => {
+                let (size, header) = match format {
+                    0 | 2 => (usize::from(b0 >> 3), 1),
+                    1 => ((usize::from(b0) >> 4) + (byte(1)? << 4), 2),
+                    _ => ((usize::from(b0) >> 4) + (byte(1)? << 4) + (byte(2)? << 12), 3),
+                };
                 if size > BLOCK_MAX {
                     return Err(Corrupt);
                 }
-                compressed(block, out, start, max, &mut state)?;
+                if kind == 0 {
+                    self.literals.extend_from_slice(block.get(header..header + size).ok_or(Truncated)?);
+                    Ok(header + size)
+                } else {
+                    let b = block.get(header).copied().ok_or(Truncated)?;
+                    self.literals.resize(size, b);
+                    Ok(header + 1)
+                }
             }
-            _ => return Err(Corrupt),
-        }
-        if last {
-            break;
+            _ => {
+                let (streams, header, regen, comp) = match format {
+                    0 | 1 => {
+                        let v = usize::from(b0) | (byte(1)? << 8) | (byte(2)? << 16);
+                        (if format == 0 { 1 } else { 4 }, 3, (v >> 4) & 0x3FF, (v >> 14) & 0x3FF)
+                    }
+                    2 => {
+                        let v = usize::from(b0) | (byte(1)? << 8) | (byte(2)? << 16) | (byte(3)? << 24);
+                        (4, 4, (v >> 4) & 0x3FFF, (v >> 18) & 0x3FFF)
+                    }
+                    _ => {
+                        let v = usize::from(b0) | (byte(1)? << 8) | (byte(2)? << 16) | (byte(3)? << 24) | (byte(4)? << 32);
+                        (4, 5, (v >> 4) & 0x3FFFF, (v >> 22) & 0x3FFFF)
+                    }
+                };
+                if regen > BLOCK_MAX {
+                    return Err(Corrupt);
+                }
+                let mut data = block.get(header..header + comp).ok_or(Truncated)?;
+                if kind == 2 {
+                    let used = read_huffman(data, &mut self.huffman, &mut self.scratch)?;
+                    self.has_huffman = true;
+                    data = data.get(used..).ok_or(Truncated)?;
+                } else if !self.has_huffman {
+                    return Err(Corrupt);
+                }
+                let (h, lits) = (&self.huffman, &mut self.literals);
+                lits.reserve(regen);
+                if streams == 1 {
+                    h.stream(data, regen, lits)?;
+                } else {
+                    let (jump, rest) = data.split_first_chunk::<6>().ok_or(Truncated)?;
+                    let sizes = [usize::from(u16::from_le_bytes([jump[0], jump[1]])), usize::from(u16::from_le_bytes([jump[2], jump[3]])), usize::from(u16::from_le_bytes([jump[4], jump[5]]))];
+                    let segment = regen.div_ceil(4);
+                    let last = regen.checked_sub(3 * segment).ok_or(Corrupt)?;
+                    let mut at = rest;
+                    for n in sizes {
+                        let (s, r) = at.split_at_checked(n).ok_or(Truncated)?;
+                        at = r;
+                        h.stream(s, segment, lits)?;
+                    }
+                    h.stream(at, last, lits)?;
+                }
+                Ok(header + comp)
+            }
         }
     }
-    if declared.is_some_and(|d| d != (out.len() - start) as u64) {
-        return Err(Corrupt);
-    }
-    if checksum {
-        let (c, rest) = at.split_first_chunk::<4>().ok_or(Truncated)?;
+
+    /// A compressed block: its literals and sequences executed into `out` (the frame's content
+    /// from `start`).
+    fn compressed(&mut self, block: &[u8], out: &mut Vec<u8>, start: usize, max: usize) -> Result<(), ZstdError> {
+        let lit = self.literals(block)?;
+        let mut at = block.get(lit..).ok_or(Truncated)?;
+        let (&b0, rest) = at.split_first().ok_or(Truncated)?;
         at = rest;
-        let want = u32::from_le_bytes(*c);
-        if (xxh64(out.get(start..).unwrap_or_default(), 0) as u32) != want {
-            return Err(ZstdError::Checksum);
+        let n = match b0 {
+            0 => 0usize,
+            1..=127 => usize::from(b0),
+            128..=254 => {
+                let (&b1, rest) = at.split_first().ok_or(Truncated)?;
+                at = rest;
+                ((usize::from(b0) - 128) << 8) + usize::from(b1)
+            }
+            255 => {
+                let (b, rest) = at.split_first_chunk::<2>().ok_or(Truncated)?;
+                at = rest;
+                usize::from(b[0]) + (usize::from(b[1]) << 8) + 0x7F00
+            }
+        };
+        if n == 0 {
+            if out.len() + self.literals.len() > max {
+                return Err(ZstdError::TooLarge);
+            }
+            out.extend_from_slice(&self.literals);
+            return Ok(());
         }
-    }
-    Ok(at)
-}
-
-/// What a frame's blocks carry from one to the next: the literals' Huffman table, the sequences'
-/// tables, the repeat offsets.
-struct State {
-    huffman: Option<Huffman>,
-    ll: Option<Fse>,
-    of: Option<Fse>,
-    ml: Option<Fse>,
-    rep: [usize; 3],
-    literals: Vec<u8>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self { huffman: None, ll: None, of: None, ml: None, rep: [1, 4, 8], literals: Vec::new() }
+        let (&modes, rest) = at.split_first().ok_or(Truncated)?;
+        at = rest;
+        if modes & 3 != 0 {
+            return Err(Corrupt);
+        }
+        let Self { tables, has, scratch, defaults, literals, rep, .. } = self;
+        let defaults = defaults.as_deref().ok_or(Corrupt)?;
+        let [ll, of, ml] = tables;
+        let [ll_has, of_has, ml_has] = has;
+        let [ll_def, of_def, ml_def] = defaults;
+        let used = table_for(modes >> 6, at, ll_def, 9, 35, ll, ll_has, scratch)?;
+        at = at.get(used..).ok_or(Truncated)?;
+        let used = table_for((modes >> 4) & 3, at, of_def, 8, 31, of, of_has, scratch)?;
+        at = at.get(used..).ok_or(Truncated)?;
+        let used = table_for((modes >> 2) & 3, at, ml_def, 9, 52, ml, ml_has, scratch)?;
+        at = at.get(used..).ok_or(Truncated)?;
+        let mut s = Back::new(at)?;
+        let mut ll_state = s.read(ll.log) as usize;
+        let mut of_state = s.read(of.log) as usize;
+        let mut ml_state = s.read(ml.log) as usize;
+        let mut lit_at = 0usize;
+        for i in 0..n {
+            let (le, oe, me) = (ll.entry(ll_state), of.entry(of_state), ml.entry(ml_state));
+            let of_code = u32::from(oe.symbol);
+            if of_code > 31 {
+                return Err(Corrupt);
+            }
+            let offset_value = (1u64 << of_code) + s.read(of_code);
+            let ml_code = usize::from(me.symbol);
+            let match_len = ML_BASE.get(ml_code).copied().ok_or(Corrupt)? as usize + s.read(u32::from(*ML_BITS.get(ml_code).ok_or(Corrupt)?)) as usize;
+            let ll_code = usize::from(le.symbol);
+            let lit_len = LL_BASE.get(ll_code).copied().ok_or(Corrupt)? as usize + s.read(u32::from(*LL_BITS.get(ll_code).ok_or(Corrupt)?)) as usize;
+            // The offset: a new one past 3, else one of the three last (shifted when there are no
+            // literals before it).
+            let offset = if offset_value > 3 {
+                let o = usize::try_from(offset_value - 3).map_err(|_| Corrupt)?;
+                *rep = [o, rep[0], rep[1]];
+                o
+            } else {
+                match offset_value as usize + usize::from(lit_len == 0) {
+                    1 => rep[0],
+                    2 => {
+                        let o = rep[1];
+                        *rep = [o, rep[0], rep[2]];
+                        o
+                    }
+                    3 => {
+                        let o = rep[2];
+                        *rep = [o, rep[0], rep[1]];
+                        o
+                    }
+                    _ => {
+                        let o = rep[0].checked_sub(1).ok_or(Corrupt)?;
+                        *rep = [o, rep[0], rep[1]];
+                        o
+                    }
+                }
+            };
+            // The literals, then the match.
+            let lits = literals.get(lit_at..lit_at + lit_len).ok_or(Corrupt)?;
+            lit_at += lit_len;
+            if out.len() + lit_len + match_len > max {
+                return Err(ZstdError::TooLarge);
+            }
+            out.extend_from_slice(lits);
+            let have = out.len() - start;
+            if offset == 0 || offset > have {
+                return Err(Corrupt);
+            }
+            let from = out.len() - offset;
+            let mut left = match_len;
+            while left > 0 {
+                let take = left.min(out.len() - from);
+                out.extend_from_within(from..from + take);
+                left -= take;
+            }
+            if i + 1 < n {
+                ll_state = usize::from(le.base) + s.read(u32::from(le.bits)) as usize;
+                ml_state = usize::from(me.base) + s.read(u32::from(me.bits)) as usize;
+                of_state = usize::from(oe.base) + s.read(u32::from(oe.bits)) as usize;
+            }
+        }
+        if !s.done() {
+            return Err(Corrupt);
+        }
+        let tail = literals.get(lit_at..).ok_or(Corrupt)?;
+        if out.len() + tail.len() > max {
+            return Err(ZstdError::TooLarge);
+        }
+        out.extend_from_slice(tail);
+        Ok(())
     }
 }
 
@@ -170,9 +390,16 @@ impl Default for State {
 
 /// `n` bits (≤ 57) of `data` from bit `lo` up (bit `i` is `data[i / 8] >> (i % 8)`), the bit at `lo`
 /// the value's lowest; bits below 0 or past the end are zeros.
+#[inline]
 fn bits(data: &[u8], lo: i64, n: u32) -> u64 {
     if n == 0 || lo + i64::from(n) <= 0 {
         return 0;
+    }
+    // A word read whole where eight bytes are there (all but the stream's last few bytes).
+    if let Ok(at) = usize::try_from(lo)
+        && let Some(w) = data.get(at / 8..at / 8 + 8).and_then(|b| <[u8; 8]>::try_from(b).ok())
+    {
+        return (u64::from_le_bytes(w) >> (at % 8)) & ((1u64 << n) - 1);
     }
     let (below, lo) = if lo < 0 { (u32::try_from(-lo).unwrap_or(64), 0usize) } else { (0, usize::try_from(lo).unwrap_or(usize::MAX)) };
     let n = n.saturating_sub(below);
@@ -204,12 +431,14 @@ impl<'a> Back<'a> {
         Ok(Self { data, left: (data.len() as i64 - 1) * 8 + marker })
     }
 
+    #[inline]
     fn read(&mut self, n: u32) -> u64 {
         self.left -= i64::from(n);
         bits(self.data, self.left, n)
     }
 
     /// The next `n` bits, not consumed.
+    #[inline]
     fn peek(&self, n: u32) -> u64 {
         bits(self.data, self.left - i64::from(n), n)
     }
@@ -240,9 +469,20 @@ struct Fse {
 
 /// A table from its symbols' normalised counts (`-1`: less than one) at `log`.
 fn fse_table(counts: &[i16], log: u32) -> Result<Fse, ZstdError> {
+    let mut t = Fse::default();
+    fse_table_into(counts, log, &mut t, &mut Vec::new())?;
+    Ok(t)
+}
+
+/// [`fse_table`] into `out`, its room kept (`next` the counts' scratch).
+fn fse_table_into(counts: &[i16], log: u32, out: &mut Fse, next: &mut Vec<u32>) -> Result<(), ZstdError> {
     let size = 1usize << log;
-    let mut table = vec![Entry::default(); size];
-    let mut next = vec![0u32; counts.len()];
+    out.log = log;
+    out.table.clear();
+    out.table.resize(size, Entry::default());
+    next.clear();
+    next.resize(counts.len(), 0);
+    let table = &mut out.table;
     let mut high = size - 1;
     for (s, &c) in counts.iter().enumerate() {
         if c == -1 {
@@ -272,7 +512,7 @@ fn fse_table(counts: &[i16], log: u32) -> Result<Fse, ZstdError> {
     if pos != 0 {
         return Err(Corrupt);
     }
-    for e in &mut table {
+    for e in table.iter_mut() {
         let n = next.get_mut(usize::from(e.symbol)).ok_or(Corrupt)?;
         let state = *n;
         *n += 1;
@@ -281,12 +521,12 @@ fn fse_table(counts: &[i16], log: u32) -> Result<Fse, ZstdError> {
         e.bits = u8::try_from(nb).map_err(|_| Corrupt)?;
         e.base = u16::try_from((state << nb).checked_sub(u32::try_from(size).map_err(|_| Corrupt)?).ok_or(Corrupt)?).map_err(|_| Corrupt)?;
     }
-    Ok(Fse { log, table })
+    Ok(())
 }
 
-/// A table described as RFC 8878 §4.1.1 has it (its counts, read forward), `max_log` its accuracy
-/// at the most and `max_symbol` its largest symbol; the bytes it took.
-fn read_fse(input: &[u8], max_log: u32, max_symbol: usize) -> Result<(Fse, usize), ZstdError> {
+/// A table described as RFC 8878 §4.1.1 has it (its counts, read forward) into `out`, `max_log`
+/// its accuracy at the most and `max_symbol` its largest symbol; the bytes it took.
+fn read_fse(input: &[u8], max_log: u32, max_symbol: usize, out: &mut Fse, counts: &mut Vec<i16>, next: &mut Vec<u32>) -> Result<usize, ZstdError> {
     let mut pos: i64 = 0;
     let data = input;
     let total = data.len() as i64 * 8;
@@ -298,7 +538,7 @@ fn read_fse(input: &[u8], max_log: u32, max_symbol: usize) -> Result<(Fse, usize
     let mut remaining: i64 = (1 << log) + 1;
     let mut threshold: i64 = 1 << log;
     let mut nb: u32 = log + 1;
-    let mut counts: Vec<i16> = Vec::with_capacity(max_symbol + 1);
+    counts.clear();
     while remaining > 1 {
         if counts.len() > max_symbol {
             return Err(Corrupt);
@@ -342,17 +582,21 @@ fn read_fse(input: &[u8], max_log: u32, max_symbol: usize) -> Result<(Fse, usize
         return Err(Corrupt);
     }
     let used = usize::try_from((pos + 7) / 8).map_err(|_| Corrupt)?;
-    Ok((fse_table(&counts, log)?, used))
+    fse_table_into(counts, log, out, next)?;
+    Ok(used)
 }
 
 impl Fse {
+    #[inline]
     fn entry(&self, state: usize) -> Entry {
         self.table.get(state).copied().unwrap_or_default()
     }
 
-    /// A table of one symbol (RLE).
-    fn rle(symbol: u8) -> Self {
-        Self { log: 0, table: vec![Entry { symbol, bits: 0, base: 0 }] }
+    /// A table of one symbol (RLE), into this one.
+    fn set_rle(&mut self, symbol: u8) {
+        self.log = 0;
+        self.table.clear();
+        self.table.push(Entry { symbol, bits: 0, base: 0 });
     }
 }
 
@@ -370,17 +614,18 @@ struct Huffman {
     table: Vec<HuffEntry>,
 }
 
-/// A Huffman table from its description (RFC 8878 §4.2.1): its weights, direct or FSE-coded; the
-/// bytes it took.
-fn read_huffman(input: &[u8]) -> Result<(Huffman, usize), ZstdError> {
+/// A Huffman table from its description (RFC 8878 §4.2.1) into `out`: its weights, direct or
+/// FSE-coded; the bytes it took.
+fn read_huffman(input: &[u8], out: &mut Huffman, scratch: &mut Scratch) -> Result<usize, ZstdError> {
     let (&header, rest) = input.split_first().ok_or(Truncated)?;
-    let mut weights: Vec<u8> = Vec::with_capacity(256);
+    let Scratch { counts, next, weights, weights_fse: fse } = scratch;
+    weights.clear();
     let used = if header < 128 {
         // FSE-coded weights: a table (its accuracy 6 at the most), then two states read
         // alternately from a backward stream until it is spent.
         let n = usize::from(header);
         let block = rest.get(..n).ok_or(Truncated)?;
-        let (fse, took) = read_fse(block, 6, 255)?;
+        let took = read_fse(block, 6, 255, fse, counts, next)?;
         let mut s = Back::new(block.get(took..).ok_or(Truncated)?)?;
         let mut s1 = s.read(fse.log) as usize;
         let mut s2 = s.read(fse.log) as usize;
@@ -428,20 +673,22 @@ fn read_huffman(input: &[u8]) -> Result<(Huffman, usize), ZstdError> {
     }
     weights.push(u8::try_from(rest_weight.trailing_zeros() + 1).map_err(|_| Corrupt)?);
     let mut rank = [0u32; 13];
-    for &w in &weights {
+    for &w in weights.iter() {
         if let Some(r) = rank.get_mut(usize::from(w)) {
             *r += 1;
         }
     }
     let mut start = [0u32; 13];
-    let mut next = 0u32;
+    let mut next_start = 0u32;
     for w in 1..=log as usize {
         if let (Some(s), Some(&r)) = (start.get_mut(w), rank.get(w)) {
-            *s = next;
-            next += r << (w - 1);
+            *s = next_start;
+            next_start += r << (w - 1);
         }
     }
-    let mut table = vec![HuffEntry::default(); 1usize << log];
+    out.log = log;
+    out.table.clear();
+    out.table.resize(1usize << log, HuffEntry::default());
     for (symbol, &w) in weights.iter().enumerate() {
         if w == 0 {
             continue;
@@ -449,12 +696,12 @@ fn read_huffman(input: &[u8]) -> Result<(Huffman, usize), ZstdError> {
         let len = 1u32 << (w - 1);
         let s = start.get_mut(usize::from(w)).ok_or(Corrupt)?;
         let bits = u8::try_from(log + 1 - u32::from(w)).map_err(|_| Corrupt)?;
-        for e in table.get_mut(*s as usize..(*s + len) as usize).ok_or(Corrupt)? {
+        for e in out.table.get_mut(*s as usize..(*s + len) as usize).ok_or(Corrupt)? {
             *e = HuffEntry { symbol: u8::try_from(symbol).map_err(|_| Corrupt)?, bits };
         }
         *s += len;
     }
-    Ok((Huffman { log, table }, used))
+    Ok(used)
 }
 
 impl Huffman {
@@ -473,82 +720,6 @@ impl Huffman {
     }
 }
 
-// --------------------------------------------------------------------------------- literals
-
-/// The literals section: its literals into `state.literals`; the bytes it took.
-fn literals(block: &[u8], state: &mut State) -> Result<usize, ZstdError> {
-    let &b0 = block.first().ok_or(Truncated)?;
-    let kind = b0 & 3;
-    let format = (b0 >> 2) & 3;
-    let byte = |i: usize| block.get(i).copied().map(usize::from).ok_or(Truncated);
-    state.literals.clear();
-    match kind {
-        0 | 1 => {
-            let (size, header) = match format {
-                0 | 2 => (usize::from(b0 >> 3), 1),
-                1 => ((usize::from(b0) >> 4) + (byte(1)? << 4), 2),
-                _ => ((usize::from(b0) >> 4) + (byte(1)? << 4) + (byte(2)? << 12), 3),
-            };
-            if size > BLOCK_MAX {
-                return Err(Corrupt);
-            }
-            if kind == 0 {
-                state.literals.extend_from_slice(block.get(header..header + size).ok_or(Truncated)?);
-                Ok(header + size)
-            } else {
-                let b = block.get(header).copied().ok_or(Truncated)?;
-                state.literals.resize(size, b);
-                Ok(header + 1)
-            }
-        }
-        _ => {
-            let (streams, header, regen, comp) = match format {
-                0 | 1 => {
-                    let v = usize::from(b0) | (byte(1)? << 8) | (byte(2)? << 16);
-                    (if format == 0 { 1 } else { 4 }, 3, (v >> 4) & 0x3FF, (v >> 14) & 0x3FF)
-                }
-                2 => {
-                    let v = usize::from(b0) | (byte(1)? << 8) | (byte(2)? << 16) | (byte(3)? << 24);
-                    (4, 4, (v >> 4) & 0x3FFF, (v >> 18) & 0x3FFF)
-                }
-                _ => {
-                    let v = usize::from(b0) | (byte(1)? << 8) | (byte(2)? << 16) | (byte(3)? << 24) | (byte(4)? << 32);
-                    (4, 5, (v >> 4) & 0x3FFFF, (v >> 22) & 0x3FFFF)
-                }
-            };
-            if regen > BLOCK_MAX {
-                return Err(Corrupt);
-            }
-            let mut data = block.get(header..header + comp).ok_or(Truncated)?;
-            if kind == 2 {
-                let (h, used) = read_huffman(data)?;
-                state.huffman = Some(h);
-                data = data.get(used..).ok_or(Truncated)?;
-            }
-            let h = state.huffman.take().ok_or(Corrupt)?;
-            let result = (|| {
-                if streams == 1 {
-                    return h.stream(data, regen, &mut state.literals);
-                }
-                let (jump, rest) = data.split_first_chunk::<6>().ok_or(Truncated)?;
-                let sizes = [usize::from(u16::from_le_bytes([jump[0], jump[1]])), usize::from(u16::from_le_bytes([jump[2], jump[3]])), usize::from(u16::from_le_bytes([jump[4], jump[5]]))];
-                let segment = regen.div_ceil(4);
-                let last = regen.checked_sub(3 * segment).ok_or(Corrupt)?;
-                let mut at = rest;
-                for (i, &n) in sizes.iter().enumerate() {
-                    let (s, r) = at.split_at_checked(n).ok_or(Truncated)?;
-                    at = r;
-                    h.stream(s, if i < 3 { segment } else { last }, &mut state.literals)?;
-                }
-                h.stream(at, last, &mut state.literals)
-            })();
-            state.huffman = Some(h);
-            result?;
-            Ok(header + comp)
-        }
-    }
-}
-
 // -------------------------------------------------------------------------------- sequences
 
 const LL_BASE: [u32; 36] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
@@ -562,11 +733,15 @@ const LL_DEFAULT: [i16; 36] = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2
 const ML_DEFAULT: [i16; 53] = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1];
 const OF_DEFAULT: [i16; 29] = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1];
 
-/// A sequence table by its mode: predefined, RLE, given, or the block before's.
-fn table_for(mode: u8, data: &[u8], default: &[i16], default_log: u32, max_log: u32, max_symbol: usize, prev: &mut Option<Fse>) -> Result<usize, ZstdError> {
+/// A sequence table by its mode, into `table`: predefined (`default`), RLE, given, or the block
+/// before's; the bytes its description took.
+#[allow(clippy::too_many_arguments)]
+fn table_for(mode: u8, data: &[u8], default: &Fse, max_log: u32, max_symbol: usize, table: &mut Fse, has: &mut bool, scratch: &mut Scratch) -> Result<usize, ZstdError> {
     match mode {
         0 => {
-            *prev = Some(fse_table(default, default_log)?);
+            table.log = default.log;
+            table.table.clone_from(&default.table);
+            *has = true;
             Ok(0)
         }
         1 => {
@@ -574,139 +749,22 @@ fn table_for(mode: u8, data: &[u8], default: &[i16], default_log: u32, max_log: 
             if usize::from(s) > max_symbol {
                 return Err(Corrupt);
             }
-            *prev = Some(Fse::rle(s));
+            table.set_rle(s);
+            *has = true;
             Ok(1)
         }
         2 => {
-            let (t, used) = read_fse(data, max_log, max_symbol)?;
-            *prev = Some(t);
+            let used = read_fse(data, max_log, max_symbol, table, &mut scratch.counts, &mut scratch.next)?;
+            *has = true;
             Ok(used)
         }
         _ => {
-            if prev.is_none() {
+            if !*has {
                 return Err(Corrupt);
             }
             Ok(0)
         }
     }
-}
-
-/// A compressed block: its literals and sequences executed into `out` (the frame's content from
-/// `start`).
-fn compressed(block: &[u8], out: &mut Vec<u8>, start: usize, max: usize, state: &mut State) -> Result<(), ZstdError> {
-    let lit = literals(block, state)?;
-    let mut at = block.get(lit..).ok_or(Truncated)?;
-    let (&b0, rest) = at.split_first().ok_or(Truncated)?;
-    at = rest;
-    let n = match b0 {
-        0 => 0usize,
-        1..=127 => usize::from(b0),
-        128..=254 => {
-            let (&b1, rest) = at.split_first().ok_or(Truncated)?;
-            at = rest;
-            ((usize::from(b0) - 128) << 8) + usize::from(b1)
-        }
-        255 => {
-            let (b, rest) = at.split_first_chunk::<2>().ok_or(Truncated)?;
-            at = rest;
-            usize::from(b[0]) + (usize::from(b[1]) << 8) + 0x7F00
-        }
-    };
-    if n == 0 {
-        if out.len() + state.literals.len() > max {
-            return Err(ZstdError::TooLarge);
-        }
-        out.extend_from_slice(&state.literals);
-        return Ok(());
-    }
-    let (&modes, rest) = at.split_first().ok_or(Truncated)?;
-    at = rest;
-    if modes & 3 != 0 {
-        return Err(Corrupt);
-    }
-    let used = table_for(modes >> 6, at, &LL_DEFAULT, 6, 9, 35, &mut state.ll)?;
-    at = at.get(used..).ok_or(Truncated)?;
-    let used = table_for((modes >> 4) & 3, at, &OF_DEFAULT, 5, 8, 31, &mut state.of)?;
-    at = at.get(used..).ok_or(Truncated)?;
-    let used = table_for((modes >> 2) & 3, at, &ML_DEFAULT, 6, 9, 52, &mut state.ml)?;
-    at = at.get(used..).ok_or(Truncated)?;
-    let (Some(ll), Some(of), Some(ml)) = (state.ll.as_ref(), state.of.as_ref(), state.ml.as_ref()) else { return Err(Corrupt) };
-    let mut s = Back::new(at)?;
-    let mut ll_state = s.read(ll.log) as usize;
-    let mut of_state = s.read(of.log) as usize;
-    let mut ml_state = s.read(ml.log) as usize;
-    let mut lit_at = 0usize;
-    for i in 0..n {
-        let (le, oe, me) = (ll.entry(ll_state), of.entry(of_state), ml.entry(ml_state));
-        let of_code = u32::from(oe.symbol);
-        if of_code > 31 {
-            return Err(Corrupt);
-        }
-        let offset_value = (1u64 << of_code) + s.read(of_code);
-        let ml_code = usize::from(me.symbol);
-        let match_len = ML_BASE.get(ml_code).copied().ok_or(Corrupt)? as usize + s.read(u32::from(*ML_BITS.get(ml_code).ok_or(Corrupt)?)) as usize;
-        let ll_code = usize::from(le.symbol);
-        let lit_len = LL_BASE.get(ll_code).copied().ok_or(Corrupt)? as usize + s.read(u32::from(*LL_BITS.get(ll_code).ok_or(Corrupt)?)) as usize;
-        // The offset: a new one past 3, else one of the three last (shifted when there are no
-        // literals before it).
-        let offset = if offset_value > 3 {
-            let o = usize::try_from(offset_value - 3).map_err(|_| Corrupt)?;
-            state.rep = [o, state.rep[0], state.rep[1]];
-            o
-        } else {
-            let idx = offset_value as usize + usize::from(lit_len == 0);
-            match idx {
-                1 => state.rep[0],
-                2 => {
-                    let o = state.rep[1];
-                    state.rep = [o, state.rep[0], state.rep[2]];
-                    o
-                }
-                3 => {
-                    let o = state.rep[2];
-                    state.rep = [o, state.rep[0], state.rep[1]];
-                    o
-                }
-                _ => {
-                    let o = state.rep[0].checked_sub(1).ok_or(Corrupt)?;
-                    state.rep = [o, state.rep[0], state.rep[1]];
-                    o
-                }
-            }
-        };
-        // The literals, then the match.
-        let lits = state.literals.get(lit_at..lit_at + lit_len).ok_or(Corrupt)?;
-        lit_at += lit_len;
-        if out.len() + lit_len + match_len > max {
-            return Err(ZstdError::TooLarge);
-        }
-        out.extend_from_slice(lits);
-        let have = out.len() - start;
-        if offset == 0 || offset > have {
-            return Err(Corrupt);
-        }
-        let from = out.len() - offset;
-        let mut left = match_len;
-        while left > 0 {
-            let take = left.min(out.len() - from);
-            out.extend_from_within(from..from + take);
-            left -= take;
-        }
-        if i + 1 < n {
-            ll_state = usize::from(le.base) + s.read(u32::from(le.bits)) as usize;
-            ml_state = usize::from(me.base) + s.read(u32::from(me.bits)) as usize;
-            of_state = usize::from(oe.base) + s.read(u32::from(oe.bits)) as usize;
-        }
-    }
-    if !s.done() {
-        return Err(Corrupt);
-    }
-    let tail = state.literals.get(lit_at..).ok_or(Corrupt)?;
-    if out.len() + tail.len() > max {
-        return Err(ZstdError::TooLarge);
-    }
-    out.extend_from_slice(tail);
-    Ok(())
 }
 
 // ------------------------------------------------------------------------------------ XXH64

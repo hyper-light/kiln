@@ -43,10 +43,21 @@ pub fn is_datadog(path: &[&str]) -> bool {
     matches!(path, ["api", "v1" | "v2" | "beta", ..] | ["intake", ..])
 }
 
+thread_local! {
+    /// A zstd decoder each thread keeps: its tables and buffers grown once, a payload allocates
+    /// nothing to unzip.
+    static ZSTD: std::cell::RefCell<kiln_obs::zstd::Decoder> = std::cell::RefCell::new(kiln_obs::zstd::Decoder::new());
+}
+
 fn unzip(encoding: &str, body: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     out.clear();
     match encoding.trim().to_ascii_lowercase().as_str() {
-        "zstd" => kiln_obs::zstd::decompress(body, out, MAX_BODY).map_err(|e| e.to_string()),
+        "zstd" => ZSTD
+            .with(|d| match d.try_borrow_mut() {
+                Ok(mut d) => d.decompress(body, out, MAX_BODY),
+                Err(_) => kiln_obs::zstd::Decoder::new().decompress(body, out, MAX_BODY),
+            })
+            .map_err(|e| e.to_string()),
         "deflate" => read_bounded(flate2::read::ZlibDecoder::new(body), out),
         "gzip" => read_bounded(flate2::read::GzDecoder::new(body), out),
         "" | "identity" => {

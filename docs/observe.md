@@ -2270,20 +2270,23 @@ found); one core takes some 2.5 million samples a second this way.
 
 ### 12.22 Zstandard
 
-`cargo bench -p kiln-obs --bench zstd`: frames the reference CLI (zstd 1.5.7) wrote, unzipped into a
-buffer kept from one to the next, beside the reference's own decompression (`zstd -b`) of the same
-content (fedora, 2026-10-19):
+`cargo bench -p kiln-obs --bench zstd`: frames the reference CLI (zstd 1.5.7) wrote, unzipped by a
+decoder and into a buffer both kept from one to the next (as the Agent's intake keeps one a
+thread), beside the reference's own decompression (`zstd -b`) of the same content on the same
+machine (adacachy, AMD Ryzen 9 9950X3D2, 2026-10-19):
 
 | frame | content | kiln, MB/s | the reference, MB/s | allocations | page faults |
 | --- | --- | --- | --- | --- | --- |
-| text, two blocks, level 3 with its checksum | 179,250 | 901 | 3,748 | 33 | 0 |
-| the same, level 19 | 179,250 | 1,320 | 3,789 | 38 | 0 |
-| the same, --fast=5 | 179,250 | 653 | — | 19 | 0 |
-| binary, level 3 | 34,608 | 5,032 | 12,024 | 10 | 0 |
+| text, two blocks, level 3 with its checksum | 179,250 | 1,720 | 5,089 | 0 (33 before) | 0 |
+| the same, level 19 | 179,250 | 2,782 | 7,644 | 0 (38) | 0 |
+| the same, --fast=5 | 179,250 | 1,827 | — | 0 (19) | 0 |
+| binary, level 3 | 34,608 | 9,212 | 19,158 | 0 (10) | 0 |
 
-A quarter of the reference's speed, written for safety first: a few KB of an Agent's payload is
-microseconds. Its bits are read a field at a time; a container kept between reads, and tables kept
-from one frame to the next, are what would close the gap.
+A third to a half of the reference's speed, in safe code. What moved it (from a quarter, and 19
+to 38 allocations a frame): a bitstream's bits read a word at a time where eight bytes are there
+(they had been gathered a byte at a time), and a decoder that keeps its tables (the predefined ones
+made once), its literals and its scratch from frame to frame. A few KB of an Agent's payload is a
+few microseconds.
 
 ## 13. Scenarios
 
