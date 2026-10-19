@@ -94,6 +94,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents` | `Agent[]` |
 | DELETE | `/api/agents/:name` | forget agent |
 | POST | `/api/agents/:name/drain` | `{ draining: bool }` |
+| GET | `/api/agents/:name/diagnose` | what's wrong with that runner, worst first, each with its repair ([releases.md](releases.md#diagnosing-and-repairing-a-runner)) |
+| POST | `/api/agents/:name/repair` | `{ action, way? }`: a repair a diagnosis offers |
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |

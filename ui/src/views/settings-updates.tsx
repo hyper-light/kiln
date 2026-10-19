@@ -8,10 +8,10 @@
 import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { create } from "zustand";
-import { Bot, ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Bot, ChevronDown, RefreshCw, Stethoscope, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay, UpgradeWayOpen } from "@/api/types";
+import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerDiagnosis, RunnerFinding, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay, UpgradeWayOpen } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, Facts, SelectField } from "@/components/ui/misc";
@@ -153,7 +153,7 @@ export function UpdatesPanel() {
     });
   const [checking, setChecking] = React.useState(false);
   // The runner an agent is being started for, to find out why its upgrade failed.
-  const [diagnosing, setDiagnosing] = React.useState<{ r: RunnerUpdate; job: UpdateJob | undefined } | null>(null);
+  const [diagnosing, setDiagnosing] = React.useState<{ r: RunnerUpdate; job: UpdateJob | undefined; findings?: RunnerFinding[] } | null>(null);
   const navigate = useNavigate();
   const pending = usePending((s) => s.pending);
   const fileRef = React.useRef<HTMLInputElement>(null);
@@ -380,7 +380,7 @@ export function UpdatesPanel() {
                     run: () => startRunner(r, way),
                   });
                 }}
-                onDiagnose={() => setDiagnosing({ r, job })}
+                onAskAgent={(findings) => setDiagnosing({ r, job, findings })}
               />
             );
           })}
@@ -394,7 +394,7 @@ export function UpdatesPanel() {
           onOpenChange={(o) => {
             if (!o) setDiagnosing(null);
           }}
-          defaults={{ target: `agent:${diagnosing.r.name}`, cwd: diagnosing.r.checkout ?? undefined, prompt: diagnosisPrompt(diagnosing.r, diagnosing.job, newest) }}
+          defaults={{ target: `agent:${diagnosing.r.name}`, cwd: diagnosing.r.checkout ?? undefined, prompt: diagnosisPrompt(diagnosing.r, diagnosing.job, newest, diagnosing.findings) }}
           onStarted={(agents) => {
             setDiagnosing(null);
             navigate(agents.length === 1 && agents[0] ? `/agents/${agents[0].id}` : "/agents");
@@ -623,7 +623,7 @@ function RunnerRow({
   selected,
   onSelect,
   onPolicy,
-  onDiagnose,
+  onAskAgent,
 }: {
   r: RunnerUpdate;
   /** The newest kiln, when kiln knows it. */
@@ -638,8 +638,8 @@ function RunnerRow({
   selected: boolean;
   onSelect: (on: boolean) => void;
   onPolicy: (p: UpdatePolicy) => void;
-  /** Start an agent on it to find out why it isn't upgrading. */
-  onDiagnose: () => void;
+  /** Start an agent on it to find out what's wrong, told what kiln's checks found. */
+  onAskAgent: (findings: RunnerFinding[]) => void;
 }) {
   const st = runnerState(r, job);
   const missing = Boolean(r.connected && !r.up_to_date && !r.target_build && r.target);
@@ -651,11 +651,33 @@ function RunnerRow({
   // The way that failed comes first (to try it again), else the way kiln would take.
   const first = failed ? wayOf(failed) : r.how === "build" ? "build" : "download";
   open.sort((a, b) => Number(b.way === first) - Number(a.way === first));
-  // Stuck: behind, and no way to upgrade it now.
-  const stuck = behind && open.length === 0 && ways.length > 0;
   const build = r.commit ? shortSha(r.commit) : (r.build ?? "build not reported");
   // On its way to another build: that has a line of its own, with what happens next.
   const moving = r.connected && !r.up_to_date;
+  const [diag, setDiag] = React.useState<Diagnosing | null>(null);
+  const look = async () => {
+    setDiag((s) => ({ ...(s ?? {}), looking: true, error: undefined }));
+    try {
+      const d = await api.diagnoseRunner(r.name);
+      setDiag((s) => ({ ...(s ?? {}), looking: false, d }));
+    } catch (e) {
+      setDiag((s) => ({ ...(s ?? {}), looking: false, error: errorMessage(e) }));
+    }
+  };
+  const repair = async (f: RunnerFinding) => {
+    const fix = f.fix;
+    if (!fix) return;
+    setDiag((s) => s && { ...s, working: fix.action, said: undefined });
+    try {
+      const out = await api.repairRunner(r.name, fix.action, fix.way);
+      const text = out.job ? "The upgrade started: it's followed above." : (out.message ?? "Done.");
+      setDiag((s) => s && { ...s, working: undefined, said: { ok: true, text } });
+      invalidate("updates");
+      if (!out.job) void look();
+    } catch (e) {
+      setDiag((s) => s && { ...s, working: undefined, said: { ok: false, text: errorMessage(e) } });
+    }
+  };
   return (
     <li className="upd-runner">
       <div className="upd-runner-top">
@@ -717,9 +739,9 @@ function RunnerRow({
                 {wayLabel(w.way, i === 0, failed !== undefined && wayOf(failed) === w.way)}
               </Button>
             ))}
-          {r.connected && (failed || stuck) && !plan && (
-            <Button size="xs" variant="ghost" onClick={onDiagnose}>
-              <Bot /> Diagnose
+          {r.connected && !plan && (
+            <Button size="xs" variant="ghost" aria-expanded={diag !== null} onClick={() => (diag ? setDiag(null) : void look())}>
+              <Stethoscope /> {diag ? "Hide the diagnosis" : "Diagnose"}
             </Button>
           )}
         </div>
@@ -733,6 +755,7 @@ function RunnerRow({
           </p>
         )}
         {plan}
+        {diag && <DiagnosisPanel name={r.name} s={diag} onRepair={(f) => void repair(f)} onAgain={() => void look()} onAskAgent={onAskAgent} />}
         {r.instances.length > 1 && (
           <ul className="upd-procs">
             {r.instances.map((i) => (
@@ -900,10 +923,96 @@ function toWaits(which: UpdateJob["timed_out"]) {
   );
 }
 
+/* ---------------------------- diagnosing ---------------------------- */
+
+/** A row's diagnosis as it goes: being looked at, what was found, a repair under way and what it said. */
+interface Diagnosing {
+  looking?: boolean;
+  d?: RunnerDiagnosis;
+  error?: string;
+  working?: string;
+  said?: { ok: boolean; text: string };
+}
+
+const FINDING_TONE: Record<RunnerFinding["level"], string> = { fail: "failed", warn: "timed_out", info: "skipped", ok: "succeeded" };
+
+/**
+ * What kiln's checks found about a runner, in its row: what's wrong first, each with the repair
+ * that fixes it when kiln can make it; then asking an agent (told all of it) and looking again.
+ */
+function DiagnosisPanel({ name, s, onRepair, onAgain, onAskAgent }: { name: string; s: Diagnosing; onRepair: (f: RunnerFinding) => void; onAgain: () => void; onAskAgent: (findings: RunnerFinding[]) => void }) {
+  if (!s.d) {
+    return s.error ? (
+      <p className="st-note" data-tone="error">
+        Couldn&rsquo;t diagnose {name}: {s.error}
+      </p>
+    ) : (
+      <p className="st-note">Looking at {name}…</p>
+    );
+  }
+  const d = s.d;
+  const wrong = d.findings.filter((f) => f.level !== "ok");
+  const fine = d.findings.length - wrong.length;
+  // A repair is offered once, on the worst finding it fixes (the list is worst first).
+  const offered = new Set<string>();
+  const fixOf = (f: RunnerFinding) => {
+    const key = f.fix ? `${f.fix.action}:${f.fix.way ?? ""}` : "";
+    if (!f.fix || offered.has(key)) return undefined;
+    offered.add(key);
+    return f.fix;
+  };
+  return (
+    <div className="upd-diag" aria-live="polite">
+      {wrong.length === 0 ? (
+        <p className="upd-diag-title">Nothing wrong found{fine ? `: ${fine} check${fine === 1 ? "" : "s"} fine` : ""}.</p>
+      ) : (
+        <ul className="upd-diag-list">
+          {wrong.map((f) => {
+            const fix = fixOf(f);
+            return (
+              <li key={f.id} className="upd-diag-item">
+                <StatusDot status={FINDING_TONE[f.level]} title={f.level} />
+                <div className="min-w-0 flex-1">
+                  <p className="upd-diag-title">{f.title}</p>
+                  {f.detail && (f.detail.includes("\n") ? <pre className="upd-diag-log">{f.detail}</pre> : <p className="upd-sub">{f.detail}</p>)}
+                </div>
+                {fix && (
+                  <Button size="xs" variant="secondary" disabled={s.working !== undefined} onClick={() => onRepair(f)}>
+                    {s.working === fix.action ? "Working…" : fix.label}
+                  </Button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {!d.machine_checked && d.why && <p className="st-note">Only what the server knows: {name} itself wasn&rsquo;t looked at ({d.why}).</p>}
+      {s.said && (
+        <p className="st-note" data-tone={s.said.ok ? undefined : "error"}>
+          {s.said.text}
+        </p>
+      )}
+      <div className="upd-diag-acts">
+        <Button size="xs" variant="ghost" onClick={() => onAskAgent(d.findings)}>
+          <Bot /> Ask an agent
+        </Button>
+        <Button size="xs" variant="ghost" disabled={s.looking} onClick={onAgain}>
+          <RefreshCw /> {s.looking ? "Looking…" : "Look again"}
+        </Button>
+        {wrong.length > 0 && fine > 0 && (
+          <span className="upd-sub">
+            {fine} other check{fine === 1 ? "" : "s"} fine
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------- diagnosing with an agent ---------------------------- */
 
 /** The first message of an agent started on a runner to find out why it isn't upgrading, and fix that. */
-function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, newest: FleetTarget | null): string {
+function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, newest: FleetTarget | null, findings?: RunnerFinding[]): string {
   const failed = job?.state === "failed" ? job : undefined;
   const at = (t: number) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
   const tail = failed ? failed.log.slice(-40) : [];
@@ -922,6 +1031,9 @@ function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, newest: Fl
     ...stuck.map((w) => `- ${w.way === "build" ? "It can't build kiln itself now" : "It can't download a build now"}: ${w.why}.`),
     r.next ? `- What kiln does next: it ${r.next}.` : "",
     tail.length ? `- Its last lines, as kiln kept them:\n\n${tail.map((l) => `    ${l}`).join("\n")}` : "",
+    ...(findings ?? [])
+      .filter((f) => f.level !== "ok")
+      .map((f) => `- kiln's checks (${f.level}): ${f.title}${f.detail && !f.detail.includes("\n") ? `. ${f.detail}` : ""}${f.fix ? ` Kiln can repair it: ${f.fix.label}.` : ""}`),
     "",
     "Where to look:",
     `- You should be on ${r.name}. If you aren't, run commands there with kiln reach (on: "${r.name}").`,

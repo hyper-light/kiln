@@ -1973,6 +1973,11 @@ async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf)
 
 static UPGRADING: AtomicBool = AtomicBool::new(false);
 
+/// Whether this runner is fetching an upgrade now (`crate::doctor` leaves the caches alone meanwhile).
+pub fn upgrading() -> bool {
+    UPGRADING.load(Ordering::Acquire)
+}
+
 /// The downloaded binary and its install's output, in the runner's own directory.
 fn upgrade_files(own_dir: &Path) -> (PathBuf, PathBuf) {
     (own_dir.join(if cfg!(windows) { "kiln-upgrade.exe" } else { "kiln-upgrade" }), own_dir.join("kiln-upgrade.log"))
@@ -2219,6 +2224,7 @@ pub fn kiln_checkout() -> Option<PathBuf> {
 
 /// Everything this build's runner can do ([`AgentMsg::Build`]).
 pub const RUNNER_CAPS: u32 = CAP_UPGRADE
+    | crate::proto::CAP_DOCTOR
     | crate::proto::CAP_UPDATES
     | crate::proto::CAP_FACTS
     | crate::proto::CAP_TAKEOVER
