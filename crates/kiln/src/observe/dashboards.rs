@@ -196,7 +196,7 @@ fn search_widget(title: &str, kind: &str, search: &str, (x, y, w, h): (u32, u32,
     Widget { id: format!("{}-{x}-{y}", kind), title: title.into(), kind: kind.into(), queries: Vec::new(), search: search.into(), text: String::new(), layout: Layout { x, y, w, h }, options: Value::Null }
 }
 
-/// kiln's own dashboards: its hosts, its CI, its CD.
+/// kiln's own dashboards: its hosts, its CI, its CD, its repositories' sync.
 pub fn builtins() -> Vec<Dashboard> {
     let host = vec![TemplateVariable { name: "host".into(), tag: "host".into(), default: "*".into() }];
     vec![
@@ -246,6 +246,32 @@ pub fn builtins() -> Vec<Dashboard> {
                 widget("Deploys", "timeseries", &["sum:kiln.cd.deploys{$app} by {result}.as_count()"], (0, 0, 6, 4), json!({ "display": "bars" })),
                 widget("Apps by health", "timeseries", &["sum:kiln.cd.apps{*} by {health}"], (6, 0, 6, 4), json!({})),
                 search_widget("Deploys and status changes", "events", "service:kiln.cd", (0, 4, 12, 5)),
+            ],
+            builtin: true,
+            created: 0,
+            modified: 0,
+        },
+        Dashboard {
+            id: "builtin:sync".into(),
+            title: "Repo sync".into(),
+            description: "Repositories kept in step across machines: what is committed, how far each copy is behind and how it is, what was dropped or conflicted, and agents' moves.".into(),
+            template_variables: vec![TemplateVariable { name: "repo".into(), tag: "repo".into(), default: "*".into() }],
+            widgets: vec![
+                widget("Steps committed", "timeseries", &["sum:kiln_sync_steps_committed_total{$repo} by {repo}.as_count()"], (0, 0, 4, 4), json!({ "display": "bars" })),
+                widget("Changes", "timeseries", &["sum:kiln_sync_changes_total{$repo} by {kind}.as_count()"], (4, 0, 4, 4), json!({ "display": "bars" })),
+                widget("Commit time, p95 (s)", "timeseries", &["p95:kiln_sync_commit_seconds{$repo} by {repo}"], (8, 0, 4, 4), json!({ "unit": "s" })),
+                widget("Copies behind (steps)", "timeseries", &["max:kiln_sync_copy_lag_steps{$repo} by {repo,machine}"], (0, 4, 4, 4), json!({})),
+                widget("Copies in error or offline", "toplist", &["max:kiln_sync_copy_state{$repo,state:error} by {repo,machine}", "max:kiln_sync_copy_state{$repo,state:offline} by {repo,machine}"], (4, 4, 4, 4), json!({})),
+                widget("Since a copy was heard (s)", "timeseries", &["max:kiln_sync_copy_heard_age_seconds{$repo} by {machine}"], (8, 4, 4, 4), json!({ "unit": "s" })),
+                widget("Dropped, by reason", "timeseries", &["sum:kiln_sync_dropped_total{$repo} by {reason}.as_count()"], (0, 8, 4, 4), json!({ "display": "bars" })),
+                widget("Conflicts", "timeseries", &["sum:kiln_sync_conflicts_total{$repo} by {repo}.as_count()", "max:kiln_sync_conflict_files{$repo} by {repo}"], (4, 8, 4, 4), json!({})),
+                widget("Errors", "timeseries", &["sum:kiln_sync_errors_total{$repo} by {kind}.as_count()"], (8, 8, 4, 4), json!({ "display": "bars" })),
+                widget("Applied after a change, p95 (s)", "timeseries", &["p95:kiln_sync_apply_lag_seconds{$repo} by {repo}"], (0, 12, 4, 4), json!({ "unit": "s" })),
+                widget("Transfers", "timeseries", &["sum:kiln_sync_transfers_total{$repo} by {result}.as_count()"], (4, 12, 4, 4), json!({ "display": "bars" })),
+                widget("Contents moved (bytes/s)", "timeseries", &["sum:kiln_sync_blob_bytes_total{*} by {direction}"], (8, 12, 4, 4), json!({ "unit": "B/s" })),
+                widget("Moves", "timeseries", &["sum:kiln_moves_total{*} by {result}.as_count()"], (0, 16, 4, 4), json!({ "display": "bars" })),
+                widget("A move's barrier, p95 (s)", "timeseries", &["p95:kiln_move_barrier_seconds{*}", "p95:kiln_move_files_wait_seconds{*}"], (4, 16, 4, 4), json!({ "unit": "s" })),
+                search_widget("Sync's events", "events", "service:kiln.sync", (8, 16, 4, 4)),
             ],
             builtin: true,
             created: 0,

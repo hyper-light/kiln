@@ -541,7 +541,7 @@ its schema (§13). Built:
 | `POST logs/facets` | `{query, from, to, facets, top}` → each facet's most common values and how many it has, every facet in one pass |
 | `POST logs/patterns` | `{query, from, to}` → the search's newest records (10,000 at the most) grouped by their template (Drain, §12.13): each its count, first and last seen, newest message and its records by status, the most common first |
 | `GET logs/tail?query=&rate=` | live tail (§6), a WebSocket: each 200 ms, `{type: "records", records, read, matched, missed, ms}`, the tick's records (all the search matched, or a uniform sample past `rate` a second: 50 unless said, 1 to 1,000) and how many rows it read, matched and missed (missed: it fell more than the feed's bound behind); idle, one a second, its counts 0. `{type: "error", message}`, then closed, for a search that does not parse, a rate out of bounds, or a node that 16 tails follow already |
-| `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, read-only) and yours, kept in `<observe>/dashboards.json` |
+| `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, `builtin:sync`, read-only) and yours, kept in `<observe>/dashboards.json` |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
@@ -598,7 +598,18 @@ time, sent again until answered; §5), from:
 - **The process** (`kiln.process.*`: memory, CPU, open files, threads).
 - **kiln's registry**, what `/metrics` serves Prometheus, scraped under its Prometheus names
   (`kiln_prom`'s parser takes any text exposition): the server's, and every runner's own (what that
-  process counts: its repositories' sync, its moves), each of its host.
+  process counts: its repositories' sync, its moves), each of its host. The repositories' sync has
+  a dashboard of kiln's own (`builtin:sync`: steps committed, changes, commit time, each copy's
+  lag, state and when it was last heard, what was dropped and why, conflicts, errors, how long a
+  change takes to reach other machines, transfers, agents' moves and their barriers, its events),
+  and these monitors watch it well:
+  `max(last_5m):max:kiln_sync_copy_state{state:error} by {repo,machine} > 0` (a copy in error);
+  `max(last_30m):min:kiln_sync_copy_state{state:offline} by {repo,machine} > 0` (away half an hour);
+  `sum(last_15m):sum:kiln_sync_dropped_total{reason:too_big} by {repo}.as_count() > 0` (what is
+  never synced); `max(last_10m):p95:kiln_sync_apply_lag_seconds{*} by {repo} > 30`;
+  `max(last_10m):max:kiln_sync_copy_heard_age_seconds{*} by {repo,machine} > 120`;
+  `sum(last_15m):sum:kiln_sync_errors_total{*} by {repo,kind}.as_count() > 0`; and a log monitor
+  on `source:kiln.event service:kiln.sync @event.type:sync.conflict`.
 - **kiln CI**: each job's and run's duration, queue time, footprint and count by repo, pipeline,
   job, status, runner, branch and trigger, and each an event.
 - **kiln CD**: each deploy (by app, trigger, result) and each change of an app's health or sync as
@@ -1396,8 +1407,8 @@ time range and the search in the address (a page is a link).
   query, not read again from bars that may be coarser than the buckets they came of). A cell or a
   bar, hovered or tapped, says its range and count. Template variables above them (`$host` in a query stands for
   `host:<value>`, or any), chosen from the tag's values, kept in the address. Your own are edited in
-  place: add, change, move, resize, remove, then save; kiln's own (hosts, CI, CD) are copied to be
-  changed.
+  place: add, change, move, resize, remove, then save; kiln's own (hosts, CI, CD, repo sync) are
+  copied to be changed.
 - **Metrics explorer**: a query, its series over the range and each one's last, average, least and
   most; with no query, every metric kiln keeps, found by name. A query goes onto a dashboard, or
   into a monitor, in a step. An `anomalies()` series is drawn with its band beneath it, in its color,
