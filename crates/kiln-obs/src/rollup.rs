@@ -121,14 +121,30 @@ impl Agg {
     }
 }
 
-/// Each window a series has samples in, `(index, aggregates)`; `None` for one with a sample that is
-/// not finite. Its index: the window's start over its width.
-fn windows(width: i64, ts: &[i64], vs: &[f64], out: &mut Vec<(i64, Option<Agg>)>) {
-    out.clear();
-    let mut cur: Option<(i64, Option<Agg>)> = None;
-    for (&t, &v) in ts.iter().zip(vs) {
-        let k = t.div_euclid(width);
-        match &mut cur {
+/// A tier's windows as a series' samples come, one at a time (time order): each window it has
+/// samples in, `(index, aggregates)`, `None` for one with a sample that is not finite. Its index:
+/// the window's start over its width.
+#[derive(Debug)]
+struct Windows {
+    width: i64,
+    cur: Option<(i64, Option<Agg>)>,
+    done: Vec<(i64, Option<Agg>)>,
+}
+
+impl Windows {
+    fn new(width: i64) -> Self {
+        Self { width, cur: None, done: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.cur = None;
+        self.done.clear();
+    }
+
+    #[inline]
+    fn push(&mut self, t: i64, v: f64) {
+        let k = t.div_euclid(self.width);
+        match &mut self.cur {
             Some((ck, agg)) if *ck == k => {
                 if let Some(a) = agg {
                     if v.is_finite() {
@@ -139,65 +155,119 @@ fn windows(width: i64, ts: &[i64], vs: &[f64], out: &mut Vec<(i64, Option<Agg>)>
                 }
             }
             _ => {
-                if let Some(w) = cur.take() {
-                    out.push(w);
+                if let Some(w) = self.cur.take() {
+                    self.done.push(w);
                 }
-                cur = Some((k, v.is_finite().then(|| Agg::of(v))));
+                self.cur = Some((k, v.is_finite().then(|| Agg::of(v))));
             }
         }
     }
-    if let Some(w) = cur {
-        out.push(w);
+
+    /// Every window, the last one's samples taken.
+    fn finish(&mut self) -> &[(i64, Option<Agg>)] {
+        if let Some(w) = self.cur.take() {
+            self.done.push(w);
+        }
+        &self.done
     }
 }
 
-/// Room [`build`] keeps from series to series.
-#[derive(Debug, Default)]
+/// Each window a series has samples in (`Windows`), of a tier of `width`, at once.
+fn windows(width: i64, ts: &[i64], vs: &[f64], out: &mut Vec<(i64, Option<Agg>)>) {
+    let mut w = Windows { width, cur: None, done: std::mem::take(out) };
+    w.clear();
+    for (&t, &v) in ts.iter().zip(vs) {
+        w.push(t, v);
+    }
+    w.finish();
+    *out = w.done;
+}
+
+/// A series' rollups as its samples come ([`Builder::push`], then [`Builder::finish`]): every
+/// tier's windows in one pass, a window's aggregates kept and not its samples, so a merge builds a
+/// series' rollups as it reads its chunks, holding its windows (a week's: 2,016 and 168), not its
+/// samples. Its room is kept from series to series.
+#[derive(Debug)]
 pub struct Builder {
-    windows: Vec<(i64, Option<Agg>)>,
+    tiers: [Windows; TIERS.len()],
     tier: Vec<u8>,
     col: BitWriter,
     list: Vec<u8>,
     body: Vec<u8>,
 }
 
-/// `kind`'s rollups of samples `ts` and `vs` (in time order, each time once) into `out`, cleared:
-/// each tier of [`TIERS`] that takes at most `raw_bytes / KEEP_RATIO` (the bytes the samples take),
-/// nothing when none does.
-pub fn build(kind: Kind, ts: &[i64], vs: &[f64], raw_bytes: usize, b: &mut Builder, out: &mut Vec<u8>) {
-    out.clear();
-    out.push(0);
-    let mut kept = 0u8;
-    for &width in &TIERS {
-        windows(width, ts, vs, &mut b.windows);
-        encode_tier(kind, width, b);
-        if b.windows.is_empty() || b.tier.len().saturating_mul(KEEP_RATIO) > raw_bytes {
-            continue;
+impl Default for Builder {
+    fn default() -> Self {
+        Self { tiers: TIERS.map(Windows::new), tier: Vec::new(), col: BitWriter::default(), list: Vec::new(), body: Vec::new() }
+    }
+}
+
+impl Builder {
+    /// A series begun: what the last one left, forgotten.
+    pub fn begin(&mut self) {
+        for t in &mut self.tiers {
+            t.clear();
         }
-        out.extend_from_slice(&b.tier);
-        kept += 1;
     }
-    if kept == 0 {
+
+    /// The series' next sample, in time order and each time once.
+    #[inline]
+    pub fn push(&mut self, t: i64, v: f64) {
+        for w in &mut self.tiers {
+            w.push(t, v);
+        }
+    }
+
+    /// The series' rollups into `out`, cleared: each tier of [`TIERS`] that takes at most
+    /// `raw_bytes / KEEP_RATIO` (the bytes its samples take), nothing when none does.
+    pub fn finish(&mut self, kind: Kind, raw_bytes: usize, out: &mut Vec<u8>) {
         out.clear();
-    } else if let Some(n) = out.first_mut() {
-        *n = kept;
+        out.push(0);
+        let mut kept = 0u8;
+        let Self { tiers, tier, col, list, body } = self;
+        for w in tiers.iter_mut() {
+            let width = w.width;
+            let done = w.finish();
+            encode_tier(kind, width, done, col, list, body, tier);
+            if done.is_empty() || tier.len().saturating_mul(KEEP_RATIO) > raw_bytes {
+                continue;
+            }
+            out.extend_from_slice(tier);
+            kept += 1;
+        }
+        if kept == 0 {
+            out.clear();
+        } else if let Some(n) = out.first_mut() {
+            *n = kept;
+        }
     }
+}
+
+/// `kind`'s rollups of samples `ts` and `vs` (in time order, each time once) into `out`, cleared
+/// ([`Builder::finish`]).
+pub fn build(kind: Kind, ts: &[i64], vs: &[f64], raw_bytes: usize, b: &mut Builder, out: &mut Vec<u8>) {
+    b.begin();
+    for (&t, &v) in ts.iter().zip(vs) {
+        b.push(t, v);
+    }
+    b.finish(kind, raw_bytes, out);
 }
 
 /// Each tier's windows and bytes for these samples, kept or not: what [`build`] weighs.
 pub fn sizes(kind: Kind, ts: &[i64], vs: &[f64], b: &mut Builder) -> [(usize, usize); TIERS.len()] {
     let mut out = [(0, 0); TIERS.len()];
+    let mut done = Vec::new();
     for (o, &width) in out.iter_mut().zip(&TIERS) {
-        windows(width, ts, vs, &mut b.windows);
-        encode_tier(kind, width, b);
-        *o = (b.windows.len(), b.tier.len());
+        windows(width, ts, vs, &mut done);
+        let Builder { tier, col, list, body, .. } = b;
+        encode_tier(kind, width, &done, col, list, body, tier);
+        *o = (done.len(), b.tier.len());
     }
     out
 }
 
-/// `b.windows` as a tier of `width` into `b.tier`, its byte length before it.
-fn encode_tier(kind: Kind, width: i64, b: &mut Builder) {
-    let Builder { windows, tier, col, list, body } = b;
+/// `windows` as a tier of `width` into `tier`, its byte length before it.
+fn encode_tier(kind: Kind, width: i64, windows: &[(i64, Option<Agg>)], col: &mut BitWriter, list: &mut Vec<u8>, body: &mut Vec<u8>, tier: &mut Vec<u8>) {
     list.clear();
     let mut prev = None;
     for &(k, a) in windows.iter() {

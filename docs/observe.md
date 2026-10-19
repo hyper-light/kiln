@@ -264,8 +264,9 @@ its sums, a counter its first, last and increases) without reading the rest.
 
 **Made at merges, checked when fetched.** A cut writes none (it decodes nothing, under the store's
 hold); the first merge to take its block makes them. A merge that copies a series' region whole
-copies its rollups; one that appends or packs anew makes them from the merged samples (17% more
-merging time, measured). A block fetched from another replica (§5) is verified with every series'
+copies its rollups; one that appends builds them as it reads the chunks, every tier in one pass,
+holding a series' windows and not its samples (a week's are 2,016 and 168); one that packs anew,
+from the samples it holds to pack (17% more merging time, measured). A block fetched from another replica (§5) is verified with every series'
 rollups recomputed from its samples, window by window, to the bit (which tiers it keeps is its
 writer's to choose): a replica's rollups are what keeps its answers its peers', so they are
 recomputed, not trusted. Measured on 30 days of kiln's cluster (§12.16): a month at a chart's 240
@@ -1533,7 +1534,9 @@ out):
 **Merging.** Making rollups at merges, the same binary with and without (an environment switch in
 a copy of the tree, in turn, load average 58–76): merges 7.6 s and 8.9 s of the 30 days' writing
 (+17%), all of it 12.0 and 12.2 s. Joining inputs' rollups instead of making them anew from the
-samples is what would take that back.
+samples is what would take that back. The rollups first came from a series' samples decoded whole
+(16 bytes a sample); built as the chunks are read instead, the most heap a merge holds over the 30
+days' writing fell from 6.1 MB to 4.2 MB (counted by hyper-measure, the same either run).
 
 ## 13. Scenarios
 

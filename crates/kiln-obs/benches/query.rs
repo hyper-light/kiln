@@ -125,6 +125,8 @@ fn long_ranges(series: &[corpus::Series]) {
     let mut cursors = vec![0usize; keep.len()];
     let started = Instant::now();
     let mut merging = std::time::Duration::ZERO;
+    // The most heap a merge held over what was live before it.
+    let mut merge_peak = 0i64;
     for d in 0..days {
         cursors.iter_mut().for_each(|c| *c = 0);
         for part in 0..4 {
@@ -144,20 +146,23 @@ fn long_ranges(series: &[corpus::Series]) {
             cuts += 1;
             store.cut(Point { index: cuts, term: 1 }).unwrap();
             let m = Instant::now();
+            alloc::begin();
             store.compact().unwrap();
+            merge_peak = merge_peak.max(alloc::end().peak);
             merging += m.elapsed();
         }
     }
     let (bytes, rolled) = store.block_bytes();
     println!(
-        "long ranges: {} series, {samples} samples over {days} days, {cuts} cuts; {} blocks, {:.1} MB ({:.2} bytes a sample), rollups {:.1}% of them; written in {:.1} s, merges {:.1} s",
+        "long ranges: {} series, {samples} samples over {days} days, {cuts} cuts; {} blocks, {:.1} MB ({:.2} bytes a sample), rollups {:.1}% of them; written in {:.1} s, merges {:.1} s, a merge's heap {:.1} MB at the most",
         keep.len(),
         store.block_count(),
         bytes as f64 / 1e6,
         bytes as f64 / samples as f64,
         100.0 * rolled as f64 / bytes as f64,
         started.elapsed().as_secs_f64(),
-        merging.as_secs_f64()
+        merging.as_secs_f64(),
+        merge_peak as f64 / 1e6
     );
     let end = t0 + days * day;
     // `KOBS_PROFILE=<query>`: that query alone, over the month at 240 points, rollups read, again

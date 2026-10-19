@@ -368,15 +368,14 @@ impl Rewrite {
                     w.region(*fp, *kind, key, &buf, crc, *span, had)?;
                     continue;
                 }
-                ts.clear();
-                vs.clear();
                 let mut bytes = 0usize;
+                builder.begin();
                 for c in blk.chunks_in(*i, &buf, i64::MIN, i64::MAX)? {
                     let (_, _, count, chunk) = c?;
-                    ChunkRef::new(chunk, count).decode_into(&mut ts, &mut vs).map_err(|e| BlockError::Decode(blk.path().to_owned(), e))?;
+                    stream(&mut builder, chunk, count, blk.path())?;
                     bytes += chunk.len();
                 }
-                rollup::build(*kind, &ts, &vs, bytes, &mut builder, &mut rollups);
+                builder.finish(*kind, bytes, &mut rollups);
                 w.region(*fp, *kind, key, &buf, crc, *span, &rollups)?;
                 continue;
             }
@@ -395,16 +394,15 @@ impl Rewrite {
                 }
                 let samples: u64 = chunks.iter().map(|c| u64::from(c.2)).sum();
                 if !chunks.is_empty() && samples / chunks.len() as u64 >= u64::from(CHUNK_SAMPLES / 2) {
-                    ts.clear();
-                    vs.clear();
+                    builder.begin();
                     for ((blk, i, _), region) in holders.iter().zip(&regions) {
                         for c in blk.chunks_in(*i, region, i64::MIN, i64::MAX)? {
                             let (_, _, count, chunk) = c?;
-                            ChunkRef::new(chunk, count).decode_into(&mut ts, &mut vs).map_err(|e| BlockError::Decode(blk.path().to_owned(), e))?;
+                            stream(&mut builder, chunk, count, blk.path())?;
                         }
                     }
                     let bytes = chunks.iter().map(|c| c.3.len()).sum();
-                    rollup::build(*kind, &ts, &vs, bytes, &mut builder, &mut rollups);
+                    builder.finish(*kind, bytes, &mut rollups);
                     w.series(*fp, *kind, key, &chunks, &rollups)?;
                     continue;
                 }
@@ -434,6 +432,15 @@ impl Rewrite {
     pub fn input_bytes(&self) -> u64 {
         self.from.iter().filter_map(|(_, f)| std::fs::metadata(self.dir.join(f)).ok()).map(|m| m.len()).sum()
     }
+}
+
+/// A chunk's samples into a rollups' builder, as they decode: nothing of them held.
+fn stream(b: &mut rollup::Builder, chunk: &[u8], count: u32, path: &Path) -> Result<(), StoreError> {
+    let mut d = ChunkRef::new(chunk, count).iter();
+    while let Some((t, v)) = d.next_sample().map_err(|e| BlockError::Decode(path.to_owned(), e))? {
+        b.push(t, v);
+    }
+    Ok(())
 }
 
 fn remove_if_there(path: &Path) -> Result<(), StoreError> {
