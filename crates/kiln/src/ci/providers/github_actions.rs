@@ -1,7 +1,8 @@
 //! GitHub Actions as a CI provider (docs/ci.md W23-R03), through the GitHub App: its workflow runs,
-//! their jobs and steps kept in kiln's tables as they change (the App's `workflow_run` and
-//! `workflow_job` events, and a look every 20 seconds); a job's log read from GitHub when asked for;
-//! reruns (all, failed jobs, one job), cancels and `workflow_dispatch` sent to GitHub.
+//! their jobs and steps kept in kiln's tables as they change (the App's `workflow_run`,
+//! `workflow_job` and `deployment_review` events, and a look every 20 seconds); a job's log and a
+//! run's artifacts read from GitHub when asked for; reruns (all, failed jobs, one job), cancels,
+//! `workflow_dispatch` and deployment reviews sent to GitHub; environments and their deployments.
 
 use anyhow::{anyhow, bail};
 use rusqlite::{OptionalExtension as _, params};
@@ -135,7 +136,7 @@ pub async fn on_event(hub: &Hub, event: &str, v: &Value) -> anyhow::Result<()> {
         return Ok(());
     }
     let run = match event {
-        "workflow_run" => v.get("workflow_run").cloned(),
+        "workflow_run" | "deployment_review" => v.get("workflow_run").cloned(),
         _ => {
             let id = v.pointer("/workflow_job/run_id").and_then(Value::as_u64).ok_or_else(|| anyhow!("a job event without its run"))?;
             let name = app.name_of(&repo).unwrap_or_default();
@@ -197,17 +198,137 @@ pub async fn dispatch(hub: &Hub, repo: &Repo, workflow: &str, git_ref: &str, inp
 pub async fn logs(hub: &Hub, repo: &Repo, job: &str) -> anyhow::Result<String> {
     let (app, name) = app_for(hub, repo).await?;
     let t = token(&app, &name, false).await?;
+    let b = redirected(&app, &t, &format!("/repos/{name}/actions/jobs/{job}/logs"), 64 << 20).await?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// The run's artifacts: `[{ id, name, size, created_at, expires_at, expired }]`.
+pub async fn artifacts(hub: &Hub, repo: &Repo, run: &str) -> anyhow::Result<Vec<Value>> {
+    let (app, name) = app_for(hub, repo).await?;
+    let t = token(&app, &name, false).await?;
+    let (st, v) = app.call(Method::Get, &format!("/repos/{name}/actions/runs/{run}/artifacts?per_page=100"), Auth::Token(&t), None).await?;
+    if st != 200 {
+        bail!("GitHub's artifacts ({st}): {}", github::said(&v));
+    }
+    Ok(v.get("artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|a| {
+            json!({
+                "id": a.get("id").and_then(Value::as_u64).map(|n| n.to_string()),
+                "name": a.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "size": a.get("size_in_bytes").and_then(Value::as_i64),
+                "created_at": unix(a.get("created_at")),
+                "expires_at": unix(a.get("expires_at")),
+                "expired": a.get("expired").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect())
+}
+
+/// One artifact's zip: GitHub answers with a redirect to it, which is read without the token.
+pub async fn artifact(hub: &Hub, repo: &Repo, id: &str) -> anyhow::Result<bytes::Bytes> {
+    let (app, name) = app_for(hub, repo).await?;
+    let t = token(&app, &name, false).await?;
+    redirected(&app, &t, &format!("/repos/{name}/actions/artifacts/{id}/zip"), 2 << 30).await
+}
+
+/// A download GitHub redirects to storage for (a log, an artifact).
+async fn redirected(app: &App, token: &str, path: &str, limit: usize) -> anyhow::Result<bytes::Bytes> {
     let client = crate::http::client::github()?;
-    let resp = client.request(Method::Get, &format!("{}/repos/{name}/actions/jobs/{job}/logs", app.api)).bearer(&t).header("Accept", "application/vnd.github+json").header("User-Agent", "kiln").send().await?;
+    let resp = client.request(Method::Get, &format!("{}{path}", app.api)).bearer(token).header("Accept", "application/vnd.github+json").header("User-Agent", "kiln").send().await?;
     let status = resp.status();
     if (300..400).contains(&status) {
         let to = resp.header("location").ok_or_else(|| anyhow!("GitHub's redirect has no location"))?.to_owned();
-        let r = client.request(Method::Get, &to).header("User-Agent", "kiln").send().await?;
-        anyhow::ensure!(r.is_success(), "the log ({})", r.status());
-        return Ok(String::from_utf8_lossy(&r.bytes(64 << 20).await?).into_owned());
+        let r = client.request(Method::Get, &to).header("User-Agent", "kiln").timeout(std::time::Duration::from_secs(120)).send().await?;
+        anyhow::ensure!(r.is_success(), "the download ({})", r.status());
+        return r.bytes(limit).await;
     }
-    anyhow::ensure!(status == 200, "GitHub has no log for it ({status})");
-    Ok(String::from_utf8_lossy(&resp.bytes(64 << 20).await?).into_owned())
+    anyhow::ensure!(status == 200, "GitHub has nothing there ({status})");
+    resp.bytes(limit).await
+}
+
+/// The run's deployments waiting for review: `[{ environment, environment_id, wait_timer, can_approve }]`.
+pub async fn pending(hub: &Hub, repo: &Repo, run: &str) -> anyhow::Result<Vec<Value>> {
+    let (app, name) = app_for(hub, repo).await?;
+    let t = token(&app, &name, false).await?;
+    let (st, v) = app.call(Method::Get, &format!("/repos/{name}/actions/runs/{run}/pending_deployments"), Auth::Token(&t), None).await?;
+    if st != 200 {
+        bail!("GitHub's pending deployments ({st}): {}", github::said(&v));
+    }
+    Ok(v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            json!({
+                "environment": p.pointer("/environment/name").and_then(Value::as_str).unwrap_or_default(),
+                "environment_id": p.pointer("/environment/id").and_then(Value::as_u64),
+                "wait_timer": p.get("wait_timer").and_then(Value::as_i64),
+                "can_approve": p.get("current_user_can_approve").and_then(Value::as_bool),
+            })
+        })
+        .collect())
+}
+
+/// Approves or rejects the run's deployments waiting for `environments` (every one when none is
+/// named). GitHub takes reviews from its required reviewers, people: the person's own token when
+/// they signed in with GitHub (`as_person`), else the App's, which GitHub accepts only where the App
+/// may review.
+pub async fn approve(hub: &Hub, repo: &Repo, run: &str, environments: &[String], approved: bool, comment: &str, as_person: Option<&str>) -> anyhow::Result<Value> {
+    let (app, name) = app_for(hub, repo).await?;
+    let waiting = pending(hub, repo, run).await?;
+    let ids: Vec<u64> = waiting
+        .iter()
+        .filter(|p| environments.is_empty() || p.get("environment").and_then(Value::as_str).is_some_and(|e| environments.iter().any(|n| n.eq_ignore_ascii_case(e))))
+        .filter_map(|p| p.get("environment_id").and_then(Value::as_u64))
+        .collect();
+    if ids.is_empty() {
+        bail!("the run waits for no review{}", if environments.is_empty() { String::new() } else { format!(" of {}", environments.join(", ")) });
+    }
+    let t = match as_person {
+        Some(t) => t.to_owned(),
+        None => {
+            let p = [("actions".to_owned(), "write".to_owned()), ("deployments".to_owned(), "write".to_owned()), ("metadata".to_owned(), "read".to_owned())].into();
+            app.token(&name, &p).await?
+        }
+    };
+    let body = json!({ "environment_ids": ids, "state": if approved { "approved" } else { "rejected" }, "comment": comment });
+    let (st, v) = app.call(Method::Post, &format!("/repos/{name}/actions/runs/{run}/pending_deployments"), Auth::Token(&t), Some(&body)).await?;
+    if st != 200 {
+        bail!("GitHub took no review ({st}): {}", github::said(&v));
+    }
+    Ok(json!({ "provider": GITHUB_ACTIONS, "environments": ids, "state": if approved { "approved" } else { "rejected" }, "as": if as_person.is_some() { "person" } else { "app" } }))
+}
+
+/// The repository's environments on GitHub, each with its latest deployment.
+pub async fn environments(hub: &Hub, repo: &Repo) -> anyhow::Result<Vec<Value>> {
+    let (app, name) = app_for(hub, repo).await?;
+    let p = [("deployments".to_owned(), "read".to_owned()), ("actions".to_owned(), "read".to_owned()), ("metadata".to_owned(), "read".to_owned())].into();
+    let t = app.token(&name, &p).await?;
+    let (st, v) = app.call(Method::Get, &format!("/repos/{name}/environments?per_page=30"), Auth::Token(&t), None).await?;
+    if st != 200 {
+        bail!("GitHub's environments ({st}): {}", github::said(&v));
+    }
+    let mut out = Vec::new();
+    for e in v.get("environments").and_then(Value::as_array).into_iter().flatten().take(20) {
+        let env = e.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (st, deps) = app.call(Method::Get, &format!("/repos/{name}/deployments?environment={}&per_page=1", crate::ci::cli::enc(&env)), Auth::Token(&t), None).await?;
+        let last = (st == 200).then(|| deps.as_array().and_then(|l| l.first()).cloned()).flatten();
+        let state = match last.as_ref().and_then(|d| d.get("id")).and_then(Value::as_u64) {
+            Some(id) => {
+                let (st, s) = app.call(Method::Get, &format!("/repos/{name}/deployments/{id}/statuses?per_page=1"), Auth::Token(&t), None).await?;
+                (st == 200).then(|| s.pointer("/0/state").and_then(Value::as_str).map(str::to_owned)).flatten()
+            }
+            None => None,
+        };
+        out.push(json!({
+            "provider": GITHUB_ACTIONS,
+            "name": env,
+            "deployment": last.map(|d| json!({ "state": state, "commit": d.get("sha"), "ref": d.get("ref"), "created_at": unix(d.get("created_at")) })),
+        }));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

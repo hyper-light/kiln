@@ -66,6 +66,30 @@ pub struct Ci {
     /// # GitHub Enterprise Server: api_url = "https://ghe.example.com/api/v3", web_url = "https://ghe.example.com"
     /// ```
     pub github: GithubApp,
+    /// `[[ci.gitlab]]`: GitLab instances kiln acts on (docs/ci.md W23-R04; docs/deploy-api.md §7),
+    /// GitLab.com or self-managed, each with a token (a group's or project's access token, or a
+    /// person's) with the `api` scope.
+    ///
+    /// ```toml
+    /// [[ci.gitlab]]
+    /// url = "https://gitlab.com"
+    /// token_file = "/etc/kiln/gitlab-token"
+    /// webhook_secret_file = "/etc/kiln/gitlab-webhook-secret"   # the webhooks' secret token
+    /// groups = ["acme"]                                          # what the token covers; none: everything
+    /// ```
+    pub gitlab: Vec<GitlabHost>,
+    /// `[ci.bitbucket]`: Bitbucket Cloud (docs/ci.md W23-R05), with an access token (a workspace's,
+    /// project's or repository's), or a user and an app password or API token (an API token's user
+    /// is the account's email).
+    ///
+    /// ```toml
+    /// [ci.bitbucket]
+    /// token_file = "/etc/kiln/bitbucket-token"
+    /// # or: username = "kiln-bot", password_file = "/etc/kiln/bitbucket-app-password"
+    /// webhook_secret_file = "/etc/kiln/bitbucket-webhook-secret"
+    /// workspaces = ["acme"]
+    /// ```
+    pub bitbucket: Option<BitbucketHost>,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
     ///
     /// ```toml
@@ -95,6 +119,56 @@ pub struct GithubApp {
 impl Default for GithubApp {
     fn default() -> Self {
         GithubApp { app_id: None, private_key_file: None, webhook_secret_file: None, api_url: "https://api.github.com".into(), web_url: "https://github.com".into() }
+    }
+}
+
+/// A GitLab kiln acts on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitlabHost {
+    /// Its web origin: repositories there are this GitLab's.
+    pub url: String,
+    /// Its REST API (`{url}/api/v4` unless set).
+    pub api_url: Option<String>,
+    pub token_file: std::path::PathBuf,
+    pub webhook_secret_file: Option<std::path::PathBuf>,
+    /// The groups the token covers (`acme`, `acme/platform`); none: every project there.
+    pub groups: Vec<String>,
+}
+
+impl Default for GitlabHost {
+    fn default() -> Self {
+        GitlabHost { url: "https://gitlab.com".into(), api_url: None, token_file: std::path::PathBuf::new(), webhook_secret_file: None, groups: Vec::new() }
+    }
+}
+
+/// Bitbucket Cloud, as kiln acts on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BitbucketHost {
+    pub web_url: String,
+    pub api_url: String,
+    /// An access token.
+    pub token_file: Option<std::path::PathBuf>,
+    /// Or a user and their app password (or API token).
+    pub username: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
+    pub webhook_secret_file: Option<std::path::PathBuf>,
+    /// The workspaces it covers; none: every one.
+    pub workspaces: Vec<String>,
+}
+
+impl Default for BitbucketHost {
+    fn default() -> Self {
+        BitbucketHost {
+            web_url: "https://bitbucket.org".into(),
+            api_url: "https://api.bitbucket.org/2.0".into(),
+            token_file: None,
+            username: None,
+            password_file: None,
+            webhook_secret_file: None,
+            workspaces: Vec::new(),
+        }
     }
 }
 

@@ -5,7 +5,11 @@
 //! follow it, report a commit or deployment status, read a push webhook, and create a repository
 //! from a template.
 
+pub mod bitbucket;
 pub mod github;
+pub mod gitlab;
+pub mod hooks;
+pub mod pulls;
 pub mod web;
 
 use std::sync::Arc;
@@ -126,15 +130,47 @@ pub enum GitHost {
     /// kiln's own git server ([`crate::ci::hosting`]).
     Kiln,
     Github(Arc<github::App>),
+    Gitlab(Arc<gitlab::Gitlab>),
+    Bitbucket(Arc<bitbucket::Bitbucket>),
 }
 
-/// The host of `repo`: kiln for repositories it hosts, GitHub for one on the App's GitHub.
+/// The host of `repo`: kiln for repositories it hosts, GitHub for one on the App's GitHub, a GitLab
+/// `[[ci.gitlab]]` covers, or Bitbucket.
 pub async fn for_repo(hub: &Hub, repo: &Repo) -> Option<GitHost> {
     if crate::ci::hosting::native_path(hub, repo).is_some() {
         return Some(GitHost::Kiln);
     }
-    let app = github::app(hub).await?;
-    app.name_of(repo).map(|_| GitHost::Github(app))
+    if let Some(app) = github::app(hub).await
+        && app.name_of(repo).is_some()
+    {
+        return Some(GitHost::Github(app));
+    }
+    if let Some((g, _)) = gitlab::for_repo(hub, repo).await {
+        return Some(GitHost::Gitlab(g));
+    }
+    bitbucket::for_repo(hub, repo).await.map(|(b, _)| GitHost::Bitbucket(b))
+}
+
+/// A secret file's text, trimmed (`None` when it's empty).
+pub(crate) async fn read_secret(file: &std::path::Path) -> anyhow::Result<Option<String>> {
+    let f = file.to_path_buf();
+    let text = crate::rt::blocking(move || std::fs::read_to_string(&f).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))).await??;
+    Ok(Some(text.trim().to_owned()).filter(|t| !t.is_empty()))
+}
+
+/// `web`'s URL for the repository `name` with git credentials in it (for a push that leaves no
+/// config behind).
+pub(crate) fn with_credentials(web: &str, user: &str, password: &str, name: &str) -> String {
+    let (scheme, rest) = web.split_once("://").unwrap_or(("https", web));
+    format!("{scheme}://{}:{}@{rest}/{name}.git", crate::ci::cli::enc(user), crate::ci::cli::enc(password))
+}
+
+/// git's `http.<url>.extraheader` settings for the GitLabs and Bitbucket kiln reaches: their
+/// credentials for what they cover, read as git runs (as GitHub's token is).
+pub(crate) fn git_headers(hub: &Hub) -> Vec<(String, String)> {
+    let mut out = gitlab::git_headers(hub);
+    out.extend(bitbucket::git_headers(hub));
+    out
 }
 
 /// `host[:port]` and the path of a clone URL (`https://h/o/r.git`, `git@h:o/r.git`,
@@ -170,6 +206,8 @@ impl GitHost {
                 Ok(Reader { url: crate::ci::hosting::clone_url(&path), header: None })
             }
             GitHost::Github(app) => app.reader(repo).await,
+            GitHost::Gitlab(g) => g.reader(repo),
+            GitHost::Bitbucket(b) => b.reader(repo),
         }
     }
 
@@ -180,6 +218,8 @@ impl GitHost {
         match self {
             GitHost::Kiln => kiln_commit(hub, repo, branch, expected, files, message, author).await,
             GitHost::Github(app) => app.commit(repo, branch, expected, files, message, author).await,
+            GitHost::Gitlab(g) => g.commit(hub, repo, branch, expected, files, message, author).await,
+            GitHost::Bitbucket(b) => b.commit(hub, repo, branch, expected, files, message, author).await,
         }
     }
 
@@ -196,13 +236,10 @@ impl GitHost {
                 return moved.map(|_| ()).map_err(|_| CommitError::Moved);
             }
             GitHost::Github(app) => app.push_url(repo).await?,
+            GitHost::Gitlab(g) => g.push_url(repo)?,
+            GitHost::Bitbucket(b) => b.push_url(repo)?,
         };
-        let lease = format!("--force-with-lease=refs/heads/{branch}:{}", expected.unwrap_or(""));
-        match crate::gitops::run_git(hub, &["-C", local, "push", "--quiet", &lease, &target, &format!("{sha}:refs/heads/{branch}")], std::time::Duration::from_secs(600)).await {
-            Ok(_) => Ok(()),
-            Err(e) if format!("{e:#}").contains("stale info") || format!("{e:#}").contains("rejected") => Err(CommitError::Moved),
-            Err(e) => Err(CommitError::Other(e)),
-        }
+        push_lease(hub, local, &target, sha, branch, expected).await
     }
 
     /// Opens a change from `head` into `base`.
@@ -218,6 +255,8 @@ impl GitHost {
                 Ok(ChangeRef { number: u64::from(o.number), url: o.url })
             }
             GitHost::Github(app) => app.open_change(repo, head, base, title, body).await,
+            GitHost::Gitlab(g) => g.open_change(repo, head, base, title, body).await,
+            GitHost::Bitbucket(b) => b.open_change(repo, head, base, title, body).await,
         }
     }
 
@@ -235,6 +274,8 @@ impl GitHost {
                 })
             }
             GitHost::Github(app) => app.change(repo, number).await,
+            GitHost::Gitlab(g) => g.change(repo, number).await,
+            GitHost::Bitbucket(b) => b.change(repo, number).await,
         }
     }
 
@@ -247,6 +288,8 @@ impl GitHost {
                 Ok(())
             }
             GitHost::Github(app) => app.status(repo, sha, status).await,
+            GitHost::Gitlab(g) => g.status(repo, sha, status).await,
+            GitHost::Bitbucket(b) => b.status(hub, repo, sha, status).await,
         }
     }
 
@@ -259,6 +302,8 @@ impl GitHost {
                 Ok(())
             }
             GitHost::Github(app) => app.deployment(repo, sha, environment, state, url).await,
+            GitHost::Gitlab(g) => g.deployment(repo, sha, environment, state, url).await,
+            GitHost::Bitbucket(b) => b.deployment(hub, repo, sha, environment, state, url).await,
         }
     }
 
@@ -267,6 +312,8 @@ impl GitHost {
         match self {
             GitHost::Kiln => None,
             GitHost::Github(_) => github::push_event(headers, body),
+            GitHost::Gitlab(_) => gitlab::push_event(headers, body),
+            GitHost::Bitbucket(_) => bitbucket::push_event(headers, body),
         }
     }
 
@@ -280,15 +327,57 @@ impl GitHost {
                 crate::ci::hosting::create_from(hub, name, &from).await.map(|_| ())
             }
             GitHost::Github(app) => app.create_from_template(template, name, private).await,
+            GitHost::Gitlab(g) => g.create_from_template(template, name, private).await,
+            GitHost::Bitbucket(b) => b.create_from_template(hub, template, name, private).await,
         }
     }
 }
 
-/// A commit in kiln's own repository: the files written in a scratch index on `expected`'s tree,
-/// the branch moved by compare-and-swap.
+/// Pushes `sha` from the repository at `local` to `url`'s `branch`, if it's still at `expected`
+/// (`None`: if it isn't there yet).
+async fn push_lease(hub: &Hub, local: &str, url: &str, sha: &str, branch: &str, expected: Option<&str>) -> Result<(), CommitError> {
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{}", expected.unwrap_or(""));
+    match crate::gitops::run_git(hub, &["-C", local, "push", "--quiet", &lease, url, &format!("{sha}:refs/heads/{branch}")], std::time::Duration::from_secs(600)).await {
+        Ok(_) => Ok(()),
+        Err(e) if format!("{e:#}").contains("stale info") || format!("{e:#}").contains("rejected") => Err(CommitError::Moved),
+        Err(e) => Err(CommitError::Other(e)),
+    }
+}
+
+/// A commit in kiln's own repository: made on `expected`, then the branch moved by compare-and-swap.
 async fn kiln_commit(hub: &Hub, repo: &Repo, branch: &str, expected: Option<&str>, files: &[Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
     let path = crate::ci::hosting::native_path(hub, repo).ok_or_else(|| anyhow::anyhow!("{} isn't hosted here", repo.name))?;
     let p = path.to_string_lossy().into_owned();
+    let made = build_commit(hub, &p, expected, files, message, author).await?;
+    let Committed::New(sha) = &made else { return Ok(made) };
+    let r = crate::ci::diffs::git_run(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), sha, expected.unwrap_or(NO_COMMIT)], &[], Vec::new()).await?;
+    if !r.ok {
+        return Err(CommitError::Moved);
+    }
+    Ok(made)
+}
+
+/// A commit for a repository on another host: made in kiln's mirror of it on `expected` (fetched
+/// first when the mirror hasn't got it), then pushed to `url` with a lease on `expected`, so it never
+/// lands on a head it wasn't made on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remote_commit(hub: &Hub, repo: &Repo, url: &str, branch: &str, expected: Option<&str>, files: &[Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
+    let path = match expected {
+        Some(e) => crate::gitops::ensure_commit(hub, repo, e).await?,
+        None if crate::gitops::mirror_path(hub, &repo.name).join("HEAD").exists() => crate::gitops::mirror_path(hub, &repo.name),
+        None => crate::gitops::sync_mirror(hub, repo).await?,
+    };
+    let p = path.to_string_lossy().into_owned();
+    let made = build_commit(hub, &p, expected, files, message, author).await?;
+    let Committed::New(sha) = &made else { return Ok(made) };
+    push_lease(hub, &p, url, sha, branch, expected).await?;
+    Ok(made)
+}
+
+/// The commit object for `files` written on `expected`'s tree (none: an empty one) in the
+/// repository at `p`, through a scratch index; no ref moves. `Unchanged` when the tree is the same.
+async fn build_commit(hub: &Hub, p: &str, expected: Option<&str>, files: &[Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
+    let p = p.to_owned();
     let run = |args: Vec<String>, env: Vec<(String, String)>, input: Vec<u8>| {
         let p = p.clone();
         async move {
@@ -358,12 +447,7 @@ async fn kiln_commit(hub: &Hub, repo: &Repo, branch: &str, expected: Option<&str
     if !r.ok {
         return Err(CommitError::Other(anyhow::anyhow!("git commit-tree: {}", String::from_utf8_lossy(&r.err).trim())));
     }
-    let sha = String::from_utf8_lossy(&r.out).trim().to_owned();
-    let r = run(vec!["update-ref".into(), format!("refs/heads/{branch}"), sha.clone(), expected.unwrap_or(NO_COMMIT).to_owned()], vec![], vec![]).await?;
-    if !r.ok {
-        return Err(CommitError::Moved);
-    }
-    Ok(Committed::New(sha))
+    Ok(Committed::New(String::from_utf8_lossy(&r.out).trim().to_owned()))
 }
 
 /// A webhook body's JSON, when it is JSON.

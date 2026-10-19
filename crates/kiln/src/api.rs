@@ -235,6 +235,9 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         // The GitHub App's events and GitHub's return from making it (W14-R10): open, they carry
         // their own proof (a signature; a state kiln handed out).
         (&Method::POST, ["api", "hooks", "github", "app"]) => return crate::githost::web::webhook(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        // GitLab's and Bitbucket's webhooks, checked with their secrets (docs/ci.md W23-R04, R05).
+        (&Method::POST, ["api", "hooks", "gitlab"]) => return crate::githost::hooks::gitlab(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "hooks", "bitbucket"]) => return crate::githost::hooks::bitbucket(&hub, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ci", "github", "app", "callback"]) => return crate::githost::web::callback(&hub, &req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "shared", "plans", token]) => return shared_plan(&hub, token).await,
         (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {

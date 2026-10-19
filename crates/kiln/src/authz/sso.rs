@@ -327,6 +327,16 @@ pub async fn token_of(hub: &Hub, provider: &str, user_id: &str) -> Option<String
     String::from_utf8(crate::ci::secrets::open_master(hub, &s, &n, TOKEN_AAD).ok()?).ok()
 }
 
+/// The person's own token on the host at `web` (W23-R08: what they do from kiln is theirs there),
+/// when they signed in with that host's `provider` and kiln signs people in with that very host.
+pub async fn person_token(hub: &Hub, provider: &str, user_id: &str, web: &str) -> Option<String> {
+    let c = client(hub, provider).await?;
+    if web.is_empty() || crate::githost::host_of(&c.authorize) != crate::githost::host_of(web) {
+        return None;
+    }
+    token_of(hub, provider, user_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

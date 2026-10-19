@@ -1,11 +1,13 @@
 //! CI providers (docs/ci.md W23): a repository's CI runs on KilnCI (this engine) or on its host's
-//! own CI, which kiln drives through the host's API (GitHub Actions here; GitLab CI/CD and Bitbucket
-//! Pipelines with their hosts), or on several. A provider's runs are kept in kiln's own tables,
-//! marked with the provider and their ids there (W23-R09), so the run list, the run page, insights,
-//! notifications and the API show every provider's runs alike; logs are read from the provider when
-//! asked for; reruns, cancels, dispatches and approvals go to it.
+//! own CI, which kiln drives through the host's API (GitHub Actions, GitLab CI/CD, Bitbucket
+//! Pipelines), or on several. A provider's runs are kept in kiln's own tables, marked with the
+//! provider and their ids there (W23-R09), so the run list, the run page, insights, notifications
+//! and the API show every provider's runs alike; logs and artifacts are read from the provider when
+//! asked for; reruns, cancels, dispatches and approvals go to it (R01).
 
+pub mod bitbucket_pipelines;
 pub mod github_actions;
+pub mod gitlab_ci;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::Fail;
+use crate::authz::Caller;
 use crate::hub::Hub;
 use crate::store::Repo;
 
@@ -27,6 +30,11 @@ pub const BITBUCKET_PIPELINES: &str = "bitbucket-pipelines";
 
 fn fail(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+/// What a provider said when it didn't do what was asked.
+fn upstream(e: anyhow::Error) -> Fail {
+    (StatusCode::BAD_GATEWAY, format!("{e:#}"))
 }
 
 /// The providers a repository's CI runs on (W23-R07): KilnCI unless its settings say otherwise.
@@ -44,12 +52,23 @@ pub async fn available(hub: &Hub, repo: &Repo) -> Vec<&'static str> {
     {
         out.push(GITHUB_ACTIONS);
     }
+    if crate::githost::gitlab::for_repo(hub, repo).await.is_some() {
+        out.push(GITLAB_CI);
+    }
+    if crate::githost::bitbucket::for_repo(hub, repo).await.is_some() {
+        out.push(BITBUCKET_PIPELINES);
+    }
     out
 }
 
 /// Whether KilnCI runs a repository's workflows.
 pub async fn kiln_runs(hub: &Hub, repo: &Repo) -> bool {
     chosen(hub, repo).await.iter().any(|p| p == KILN)
+}
+
+/// The other providers a repository's CI runs on.
+async fn elsewhere(hub: &Hub, repo: &Repo) -> Vec<String> {
+    chosen(hub, repo).await.into_iter().filter(|p| p != KILN).collect()
 }
 
 /// A run as a provider reports it, in kiln's words (W23-R09) and its own.
@@ -133,6 +152,20 @@ pub async fn record(hub: &Hub, repo: &Repo, provider: &str, run: &ExtRun, jobs: 
                     id
                 }
             };
+            let listed = jobs.as_ref().map(|l| l.iter().map(|j| j.external_id.clone()).collect::<Vec<_>>());
+            if let Some(listed) = listed {
+                // The provider lists the attempt's jobs as they are now: a retried job (GitLab's) is a
+                // new one, and the one it replaced goes.
+                let mut q = tx.prepare("SELECT id, external_id FROM jobs WHERE run_id = ?1 AND run_attempt = ?2")?;
+                let kept: Vec<(String, Option<String>)> = q.query_map(params![id, run.attempt], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+                drop(q);
+                for (leg, ext) in kept {
+                    if !ext.is_some_and(|e| listed.contains(&e)) {
+                        tx.execute("DELETE FROM steps WHERE job_id = ?1", [&leg])?;
+                        tx.execute("DELETE FROM jobs WHERE id = ?1", [&leg])?;
+                    }
+                }
+            }
             for j in jobs.unwrap_or_default() {
                 let leg: Option<String> = tx.query_row("SELECT id FROM jobs WHERE run_id = ?1 AND external_id = ?2", params![id, j.external_id], |r| r.get(0)).optional()?;
                 let labels = serde_json::to_string(&j.labels).unwrap_or_else(|_| "[]".into());
@@ -190,26 +223,187 @@ pub async fn of_leg(hub: &Hub, leg: &str) -> anyhow::Result<Option<(Repo, String
     Ok(Some((repo, provider, run, job)))
 }
 
-/// Reruns a provider's run: `all`, `failed`, or one `job` (the leg's kiln id).
+/// Reruns a provider's run: `all`, `failed`, or one `job` (the leg's kiln id); GitLab's `play`.
 pub async fn rerun(hub: &Hub, repo: &Repo, provider: &str, run: &str, mode: &str, job: Option<&str>) -> Result<Value, Fail> {
     match provider {
-        GITHUB_ACTIONS => github_actions::rerun(hub, repo, run, mode, job).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}"))),
-        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other} doesn't rerun from kiln yet"))),
+        GITHUB_ACTIONS => github_actions::rerun(hub, repo, run, mode, job).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::rerun(hub, repo, run, mode, job).await.map_err(upstream),
+        BITBUCKET_PIPELINES => bitbucket_pipelines::rerun(hub, repo, run, mode).await.map_err(upstream),
+        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other} doesn't rerun from kiln"))),
     }
 }
 
 pub async fn cancel(hub: &Hub, repo: &Repo, provider: &str, run: &str) -> Result<Value, Fail> {
     match provider {
-        GITHUB_ACTIONS => github_actions::cancel(hub, repo, run).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}"))),
-        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other} doesn't cancel from kiln yet"))),
+        GITHUB_ACTIONS => github_actions::cancel(hub, repo, run).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::cancel(hub, repo, run).await.map_err(upstream),
+        BITBUCKET_PIPELINES => bitbucket_pipelines::cancel(hub, repo, run).await.map_err(upstream),
+        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other} doesn't cancel from kiln"))),
     }
 }
 
-/// A provider's leg's log, as text.
-pub async fn logs(hub: &Hub, repo: &Repo, provider: &str, job: &str) -> Result<String, Fail> {
+/// A provider's leg's log, as text: the leg is `job` of the provider's run `run`.
+pub async fn logs(hub: &Hub, repo: &Repo, provider: &str, run: &str, job: &str) -> Result<String, Fail> {
     match provider {
-        GITHUB_ACTIONS => github_actions::logs(hub, repo, job).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}"))),
-        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other}'s logs come later"))),
+        GITHUB_ACTIONS => github_actions::logs(hub, repo, job).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::logs(hub, repo, job).await.map_err(upstream),
+        BITBUCKET_PIPELINES => bitbucket_pipelines::logs(hub, repo, run, job).await.map_err(upstream),
+        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other}'s logs aren't read here"))),
+    }
+}
+
+/// A manual run of a repository whose CI isn't KilnCI's (`None` when KilnCI's is chosen, so KilnCI
+/// runs it): `workflow` (GitHub's file, Bitbucket's custom pipeline; GitLab has one) at `git_ref`
+/// with `inputs` (GitLab's and Bitbucket's variables).
+pub async fn dispatch(hub: &Hub, repo: &Repo, workflow: &str, git_ref: &str, inputs: &Value) -> Option<Result<(), Fail>> {
+    let chosen = chosen(hub, repo).await;
+    if chosen.iter().any(|p| p == KILN) {
+        return None;
+    }
+    let provider = chosen.into_iter().next()?;
+    Some(match provider.as_str() {
+        GITHUB_ACTIONS => github_actions::dispatch(hub, repo, workflow, git_ref, inputs).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::dispatch(hub, repo, git_ref, inputs).await.map(|_| ()).map_err(upstream),
+        BITBUCKET_PIPELINES => bitbucket_pipelines::dispatch(hub, repo, workflow, git_ref, inputs).await.map(|_| ()).map_err(upstream),
+        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other} doesn't start runs from kiln"))),
+    })
+}
+
+/// A run's artifacts on its provider: `[{ id, name, size, created_at, expires_at, expired }]`.
+pub async fn artifacts(hub: &Hub, repo: &Repo, provider: &str, run: &str) -> Result<Vec<Value>, Fail> {
+    match provider {
+        GITHUB_ACTIONS => github_actions::artifacts(hub, repo, run).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::artifacts(hub, repo, run).await.map_err(upstream),
+        // Bitbucket's API doesn't serve a pipeline's artifacts.
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// One artifact's archive.
+pub async fn artifact(hub: &Hub, repo: &Repo, provider: &str, run: &str, artifact: &str) -> Result<bytes::Bytes, Fail> {
+    let _ = run;
+    match provider {
+        GITHUB_ACTIONS => github_actions::artifact(hub, repo, artifact).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::artifact(hub, repo, artifact).await.map_err(upstream),
+        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other}'s API doesn't serve artifacts"))),
+    }
+}
+
+/// What a run waits for on its provider: deployments to review.
+pub async fn pending(hub: &Hub, repo: &Repo, provider: &str, run: &str) -> Result<Vec<Value>, Fail> {
+    match provider {
+        GITHUB_ACTIONS => github_actions::pending(hub, repo, run).await.map_err(upstream),
+        GITLAB_CI => gitlab_ci::pending(hub, repo, run).await.map_err(upstream),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Approves or rejects what a run waits for on its provider, as the person when they signed in with
+/// that host (W23-R08), else with kiln's credentials there.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve(hub: &Hub, repo: &Repo, provider: &str, run: &str, environments: &[String], approved: bool, comment: &str, caller: Option<&Caller>) -> Result<Value, Fail> {
+    let user = caller.and_then(|c| c.user.as_deref());
+    match provider {
+        GITHUB_ACTIONS => {
+            let web = crate::githost::github::app(hub).await.map(|a| a.web.clone()).unwrap_or_default();
+            let token = match user {
+                Some(u) => crate::authz::sso::person_token(hub, "github", u, &web).await,
+                None => None,
+            };
+            github_actions::approve(hub, repo, run, environments, approved, comment, token.as_deref()).await.map_err(upstream)
+        }
+        GITLAB_CI => {
+            let web = crate::githost::gitlab::for_repo(hub, repo).await.map(|(g, _)| g.web.clone()).unwrap_or_default();
+            let token = match user {
+                Some(u) => crate::authz::sso::person_token(hub, "gitlab", u, &web).await,
+                None => None,
+            };
+            gitlab_ci::approve(hub, repo, run, environments, approved, comment, token.as_deref()).await.map_err(upstream)
+        }
+        other => Err((StatusCode::NOT_IMPLEMENTED, format!("{other} has no deployment approvals kiln can give"))),
+    }
+}
+
+/// The repository's environments on its other providers, each with its latest deployment.
+pub async fn environments(hub: &Hub, repo: &Repo) -> Vec<Value> {
+    let mut out = Vec::new();
+    for p in elsewhere(hub, repo).await {
+        let got = match p.as_str() {
+            GITHUB_ACTIONS => github_actions::environments(hub, repo).await,
+            GITLAB_CI => gitlab_ci::environments(hub, repo).await,
+            BITBUCKET_PIPELINES => bitbucket_pipelines::environments(hub, repo).await,
+            _ => Ok(Vec::new()),
+        };
+        match got {
+            Ok(l) => out.extend(l),
+            Err(e) => out.push(json!({ "provider": p, "error": format!("{e:#}") })),
+        }
+    }
+    out
+}
+
+/// `GET /api/ci/repos/:repo/providers/workflows`: each chosen provider's CI files, checked: GitHub's
+/// YAML by kiln's own checks (W02), GitLab's by its CI lint; Bitbucket's API has no check.
+pub async fn workflows(hub: &Hub, repo_key: &str) -> Result<Value, Fail> {
+    let repo = repo_by(hub, repo_key).await?;
+    let mut out = Vec::new();
+    for p in chosen(hub, &repo).await {
+        out.push(match p.as_str() {
+            GITLAB_CI => gitlab_ci::lint(hub, &repo, None).await.unwrap_or_else(|e| json!({ "provider": p, "path": ".gitlab-ci.yml", "error": format!("{e:#}") })),
+            BITBUCKET_PIPELINES => json!({ "provider": p, "path": "bitbucket-pipelines.yml", "checked": false, "note": "Bitbucket's API has no check of bitbucket-pipelines.yml" }),
+            // KilnCI and GitHub Actions read the same files, checked as W02 checks them.
+            _ => json!({ "provider": p, "path": ".github/workflows", "checked_at": format!("/api/ci/repos/{}/workflows", crate::ci::cli::enc(&repo.name)) }),
+        });
+    }
+    Ok(json!({ "repo": repo.name, "workflows": out }))
+}
+
+/// `GET /api/ci/repos/:repo/commits/:sha/checks`: every provider's runs of a commit, together.
+pub async fn checks(hub: &Hub, repo_key: &str, sha: &str) -> Result<Value, Fail> {
+    let repo = repo_by(hub, repo_key).await?;
+    let (id, want) = (repo.id.clone(), sha.to_ascii_lowercase());
+    let runs: Vec<Value> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT id, provider, COALESCE(run_name, pipeline), status, conclusion, external_url, number, created_at, finished_at FROM runs WHERE repo_id = ?1 AND (sha = ?2 OR sha LIKE ?2 || '%') ORDER BY created_at")?;
+            let rows = q.query_map(params![id, want], |r| {
+                Ok(json!({ "run": r.get::<_, String>(0)?, "provider": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?, "status": r.get::<_, String>(3)?, "conclusion": r.get::<_, Option<String>>(4)?,
+                           "url": r.get::<_, Option<String>>(5)?, "number": r.get::<_, i64>(6)?, "created_at": r.get::<_, i64>(7)?, "finished_at": r.get::<_, Option<i64>>(8)? }))
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(fail)?;
+    let state = if runs.iter().any(|r| matches!(r.get("status").and_then(Value::as_str), Some("failed" | "timed_out"))) {
+        "failure"
+    } else if runs.iter().any(|r| matches!(r.get("status").and_then(Value::as_str), Some("queued" | "running"))) {
+        "pending"
+    } else if runs.is_empty() {
+        "none"
+    } else {
+        "success"
+    };
+    Ok(json!({ "repo": repo.name, "sha": sha, "state": state, "checks": runs }))
+}
+
+/// `POST /api/ci/repos/:repo/providers/sync`: the repository's runs on its other providers, looked
+/// at now.
+pub async fn sync_now(hub: &Hub, repo_key: &str) -> Result<Value, Fail> {
+    let repo = repo_by(hub, repo_key).await?;
+    let mut done = Vec::new();
+    for p in elsewhere(hub, &repo).await {
+        sync_one(hub, &repo, &p).await.map_err(upstream)?;
+        done.push(p);
+    }
+    Ok(json!({ "repo": repo.name, "synced": done }))
+}
+
+async fn sync_one(hub: &Hub, repo: &Repo, provider: &str) -> anyhow::Result<()> {
+    match provider {
+        GITHUB_ACTIONS => github_actions::sync(hub, repo).await,
+        GITLAB_CI => gitlab_ci::sync(hub, repo).await,
+        BITBUCKET_PIPELINES => bitbucket_pipelines::sync(hub, repo).await,
+        _ => Ok(()),
     }
 }
 
@@ -224,7 +418,7 @@ pub async fn set(hub: &Hub, repo_key: &str, body: &Value, by: &str) -> Result<Va
     let repo = repo_by(hub, repo_key).await?;
     let asked: Vec<String> = body.get("providers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
     if asked.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "`providers`: at least one (`kiln`, `github-actions`)".into()));
+        return Err((StatusCode::BAD_REQUEST, format!("`providers`: at least one ({KILN}, {GITHUB_ACTIONS}, {GITLAB_CI}, {BITBUCKET_PIPELINES})")));
     }
     let may = available(hub, &repo).await;
     if let Some(p) = asked.iter().find(|p| !may.contains(&p.as_str())) {
@@ -255,11 +449,10 @@ pub async fn sync_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         let Ok(repos) = hub.store.repos().await else { continue };
         for repo in repos {
-            let chosen = chosen(&hub, &repo).await;
-            if chosen.iter().any(|p| p == GITHUB_ACTIONS)
-                && let Err(e) = github_actions::sync(&hub, &repo).await
-            {
-                tracing::debug!(repo = %repo.name, error = %format!("{e:#}"), "GitHub Actions' runs didn't sync");
+            for p in elsewhere(&hub, &repo).await {
+                if let Err(e) = sync_one(&hub, &repo, &p).await {
+                    tracing::debug!(repo = %repo.name, provider = %p, error = %format!("{e:#}"), "a provider's runs didn't sync");
+                }
             }
         }
     }

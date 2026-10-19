@@ -47,7 +47,7 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             }
         }
         // GitHub Actions' runs, for repositories whose CI provider it is (W23-R03).
-        ("workflow_run" | "workflow_job", _) => {
+        ("workflow_run" | "workflow_job" | "deployment_review", _) => {
             let (hub2, event2) = (Arc::clone(hub), event.clone());
             crate::rt::spawn(async move {
                 if let Err(e) = crate::ci::providers::github_actions::on_event(&hub2, &event2, &v).await {

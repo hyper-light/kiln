@@ -144,13 +144,18 @@ struct DispatchAsk {
 /// `POST /api/ci/repos/:repo/workflows/<path>/dispatches { ref, inputs }` (W03-R11): GitHub's
 /// `workflow_dispatch`. 204 when the run starts.
 pub async fn dispatch(hub: &Hub, repo: &str, path: &str, body: Incoming) -> Result<Response, Fail> {
+    let v: serde_json::Value = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    dispatch_value(hub, repo, path, v).await
+}
+
+/// [`dispatch`], its body read already.
+pub async fn dispatch_value(hub: &Hub, repo: &str, path: &str, body: serde_json::Value) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
-    let ask: DispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
-    // A repository whose CI is GitHub Actions' (W23-R03): GitHub starts it.
-    let providers = super::providers::chosen(hub, &repo).await;
-    if !providers.iter().any(|p| p == super::providers::KILN) && providers.iter().any(|p| p == super::providers::GITHUB_ACTIONS) {
-        let inputs = serde_json::Value::Object(ask.inputs.clone());
-        super::providers::github_actions::dispatch(hub, &repo, path, &ask.git_ref, &inputs).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    let ask: DispatchAsk = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
+    // A repository whose CI is another provider's (W23-R01): that provider starts it.
+    let inputs = serde_json::Value::Object(ask.inputs.clone());
+    if let Some(started) = super::providers::dispatch(hub, &repo, path, &ask.git_ref, &inputs).await {
+        started?;
         return Ok(srv::status(StatusCode::NO_CONTENT));
     }
     super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln").await.map_err(|r| (r.status, r.message))?;

@@ -194,7 +194,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal) |
-| W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub); the provider core; GitHub Actions (runs, logs, rerun, cancel, dispatch); events for agents; SSO with GitHub, GitLab and Bitbucket |
+| W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
 ---
 
@@ -4863,8 +4863,8 @@ act on the same things:
   - merging by the host's methods (merge, squash, rebase or fast-forward);
   - every provider's checks;
   - kiln's inbox includes them.
-- **W23-R07 Choosing.** Per repository (`PUT /api/ci/providers/:repo`, the repository's settings
-  page, `kiln ci provider <repo> <provider>`). KilnCI is the default, so nothing changes for a
+- **W23-R07 Choosing.** Per repository (`PUT /api/ci/repos/:repo/providers`, the repository's settings
+  page, `kiln repo provider <repo> <provider…>`). KilnCI is the default, so nothing changes for a
   repository until someone picks its host's CI. Several may run on one repository (KilnCI running
   `.github/workflows` beside GitHub Actions, say) when the user chooses so.
 - **W23-R08 SSO** with GitHub, GitLab and Bitbucket (asked 2026-10-18), beside kiln's own sign-in
@@ -4933,11 +4933,50 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
   - the host's token kept sealed with the linked account, for acting on the host as the person;
   - GitHub's falls back to the App's OAuth client when the manifest flow made one.
   - Checked against a fake of all three (`w23_r08_sso`).
+- *Done.* GitLab and Bitbucket as git hosts (`crate::githost::gitlab`, `bitbucket`; `[[ci.gitlab]]`,
+  `[ci.bitbucket]`), beside kiln's own and GitHub, for CD's release repositories and CI alike:
+  - git reads, mirrors and pushes with their credentials (`http.<url>.extraheader` for what they
+    cover);
+  - commits made here and pushed with a lease on the head they were made on (GitLab's and
+    Bitbucket's commit APIs build on whatever a branch holds by then);
+  - merge and pull requests and their state, commit statuses (a release's too: Bitbucket has no
+    deployments API outside Pipelines), GitLab's deployments;
+  - push webhooks;
+  - new repositories from a template (GitLab: a fork, then unlinked; Bitbucket: a new repository
+    with the template's history).
+- *Done.* GitLab CI/CD (R04) and Bitbucket Pipelines (R05) as providers:
+  - pipelines and their jobs (Bitbucket's steps) kept as runs and legs, synced every 20 seconds and
+    at once on signed webhooks (`POST /api/hooks/gitlab` with GitLab's `X-Gitlab-Token`;
+    `POST /api/hooks/bitbucket` with `X-Hub-Signature`): GitLab's pipeline, job and deployment
+    events, Bitbucket's build statuses;
+  - a job's trace (a step's log) read when asked for;
+  - GitLab: retry (failed jobs, a job), play (a manual job), cancel, a new pipeline with variables,
+    `all` as a new pipeline when the branch is still at the run's commit;
+  - Bitbucket: `all` as a new pipeline on the same commit and selector, stop, custom pipelines with
+    variables. Bitbucket's API has no rerun of failed steps (its web page has); kiln says so.
+- *Done.* The rest of R01's contract, for every provider:
+  - `artifacts(run)`: `GET /api/ci/runs/:id/artifacts`, `…/artifacts/:artifact/download` (GitHub's
+    artifacts, GitLab's job archives; Bitbucket's API serves none);
+  - `approve(run, …)`: `GET /api/ci/runs/:id/pending`, `POST /api/ci/runs/:id/approve` (GitHub's
+    pending deployment reviews, GitLab's protected environments' approvals), given as the person
+    when they signed in with that host;
+  - `workflows(repo)`: `GET /api/ci/repos/:repo/providers/workflows` (GitLab's CI lint);
+  - `checks(sha)`: `GET /api/ci/repos/:repo/commits/:sha/checks`, every provider's runs of a commit;
+  - `watch(repo)`: webhooks, the 20-second sync, and `POST /api/ci/repos/:repo/providers/sync`;
+  - environments with their latest deployments on every provider, in `GET /api/ci/environments`.
+  - Checked against fakes of all three APIs (`w23_ac01_contract`).
+- *Done.* R06's API: the host's pull requests, merge requests and pull requests in one shape
+  (`GET /api/ci/repos/:repo/pulls`, `…/pulls/:n` with the conversation, threads on lines, reviews,
+  files, merge methods and every provider's checks; `POST …/comments`, `…/reviews`, `…/merge`),
+  acted on as the person when they signed in with that host (R08's last part), else with kiln's
+  credentials there.
+  - Checked against fakes of all three (`w23_r06_pulls`).
 - *Who builds what.* The review pages (W14-R06, AC06; R06 here) are the agentic work's, under
-  W21's rules, against W14's APIs.
-- *Left.* Artifacts and approvals from providers (R01); GitLab CI/CD and Bitbucket Pipelines and
-  their hosts (R04, R05); pull requests from other hosts in the review pages (R06); acting on the
-  host as the signed-in person (R08's last part); AC01 to AC03.
+  W21's rules, against W14's APIs and R06's.
+- *Left.* The review pages showing other hosts' pull requests (the agentic work's, against R06's
+  API) and kiln's inbox with them; GitHub's review threads' resolved state (GraphQL only); AC02
+  and AC03, which need test repositories on GitHub, GitLab and Bitbucket and their credentials
+  (user-assisted).
 
 ## 4. API, events, CLI and MCP reference
 
