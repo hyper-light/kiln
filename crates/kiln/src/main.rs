@@ -221,7 +221,7 @@ struct ServerArgs {
     #[arg(long, env = "KILN_URL")]
     url: Option<String>,
     /// The server's admin token.
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
 }
 
@@ -241,7 +241,7 @@ struct OutpostArgs {
     /// join, as `kiln join` does: it shows a verification code, and an admin approves it (Runners ->
     /// Add machines) once the codes match. Once it has its certificate it runs on that, and needs
     /// neither again.
-    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
     /// Its name in kiln (default: this machine's hostname).
     #[arg(long, env = "KILN_AGENT_NAME")]
@@ -261,7 +261,7 @@ struct AgentArgs {
     /// QUIC address (host:port); defaults to what the server advertised at enrollment.
     #[arg(long, env = "KILN_QUIC")]
     quic: Option<String>,
-    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[arg(long, env = "KILN_AGENT_NAME")]
     name: Option<String>,
@@ -787,5 +787,20 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&serde_json::to_string_pretty(&v)?);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    /// A token may begin with `-` (base64url): `--token <it>` takes it as the value, not a flag.
+    #[test]
+    fn a_token_that_begins_with_a_dash_is_taken_as_the_token() {
+        for args in [&["kiln", "agent", "--server", "http://x:7070", "--token", "-Hq3_z"][..], &["kiln", "outpost", "--server", "http://x:7070", "--token", "-Hq3_z"][..]] {
+            assert!(super::Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        assert!(super::Cli::try_parse_from(["kiln", "install", "--agent", "--server", "http://x:7070", "--token", "-Hq3_z"]).is_ok());
+        assert!(super::Cli::try_parse_from(["kiln", "cd", "--token", "-Hq3_z", "apps"]).is_ok());
     }
 }
