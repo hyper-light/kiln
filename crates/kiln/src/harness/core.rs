@@ -539,9 +539,10 @@ impl Core {
         let Some(e) = usize::try_from(seq.saturating_sub(front)).ok().and_then(|p| self.events.get_mut(p)) else { return };
         match &mut e.body {
             Body::Assistant { text: t, .. } | Body::Thinking { text: t, .. } => {
-                if t.len() < super::model::TEXT_MAX {
-                    t.push_str(text);
+                if t.len() >= super::model::TEXT_MAX {
+                    return;
                 }
+                t.push_str(text);
             }
             _ => return,
         }
@@ -782,6 +783,25 @@ mod tests {
         };
         assert_eq!(ids, vec!["b", "a"]);
         assert_eq!(c.events().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn streaming_deltas_stop_where_the_kept_text_stops() {
+        for body in [
+            Body::Assistant { text: "x".repeat(super::super::model::TEXT_MAX - 1), streaming: true },
+            Body::Thinking { text: "x".repeat(super::super::model::TEXT_MAX - 1), streaming: true, redacted: false },
+        ] {
+            let mut c = Core::new();
+            c.upsert("a", None, body);
+            c.take_out();
+            // Keep the existing whole-chunk boundary behavior, including multibyte text.
+            c.append("a", "é");
+            c.append("a", "discarded");
+            assert_eq!(c.take_out(), vec![Update::Stream { id: "a".into(), text: "é".into() }]);
+            assert!(c.get("a").is_some_and(|e| matches!(&e.body, Body::Assistant { text, .. } | Body::Thinking { text, .. } if text.len() == super::super::model::TEXT_MAX + 1 && text.ends_with('é'))));
+            c.append("a", "also discarded");
+            assert!(c.take_out().is_empty());
+        }
     }
 
     #[test]
