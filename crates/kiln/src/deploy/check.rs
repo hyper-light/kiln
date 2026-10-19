@@ -32,6 +32,8 @@ pub async fn missing_version(hub: &Hub, package: &Package, file: &ReleaseFile) -
             }
         }
         Package::Git { repo: git_repo, .. } => git_ref(hub, git_repo, version).await,
+        // A platform's versions are its own: KilnCD finds out.
+        Package::Platform { .. } => None,
     }
 }
 

@@ -8,7 +8,8 @@
 //! - [`repo`]: the release repository's layout.
 //! - [`host`]: kiln's own git server.
 //! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD; [`provider`]: what they answer.
-//! - [`check`]: what a release is checked for before it is recorded.
+//! - [`check`]: what a release is checked for before it is recorded; [`gates`]: what it waits for
+//!   before its commit.
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
 //! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
 //!   operations agents reach through MCP and code mode.
@@ -18,6 +19,7 @@ pub mod argocd;
 pub mod check;
 pub mod cli;
 pub mod flow;
+pub mod gates;
 pub mod host;
 pub mod kilncd;
 pub mod model;

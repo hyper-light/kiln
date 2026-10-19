@@ -234,7 +234,7 @@ pub async fn in_flight(store: &Store, app: &str, env: &str) -> anyhow::Result<Op
     let spec: Option<String> = store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT spec FROM deploy_releases WHERE app = ?1 AND environment = ?2 AND state IN ('waiting', 'committing', 'delivering') ORDER BY id LIMIT 1",
+                "SELECT spec FROM deploy_releases WHERE app = ?1 AND environment = ?2 AND state IN ('waiting', 'waiting_approval', 'committing', 'delivering') ORDER BY id LIMIT 1",
                 params![app, env],
                 |r| r.get(0),
             )

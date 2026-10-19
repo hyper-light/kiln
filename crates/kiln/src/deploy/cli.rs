@@ -57,6 +57,9 @@ pub struct DeployArgs {
     /// A config release: this file becomes the environment's values.yaml.
     #[arg(long)]
     values: Option<PathBuf>,
+    /// A promotion: what this environment runs, the same version and artifacts.
+    #[arg(long = "from")]
+    from: Option<String>,
     /// Return once the release is asked for, without following it.
     #[arg(long)]
     no_wait: bool,
@@ -93,6 +96,18 @@ enum DeployCmd {
     },
     /// Stop a release that is waiting or being delivered.
     Cancel { release: i64 },
+    /// Approve a release waiting for approval.
+    Approve {
+        release: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reject a release waiting for approval: it is cancelled.
+    Reject {
+        release: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Run the app in the environment again, at its last version.
     Enable {
         app: String,
@@ -130,32 +145,7 @@ enum AppCmd {
     /// An app, and what runs where.
     Show { app: String },
     /// Create (or replace) an app.
-    Create {
-        app: String,
-        #[arg(long, default_value = "default")]
-        project: String,
-        /// Owner teams: the owner first, then a co-owner and an ops owner.
-        #[arg(long = "owner")]
-        owners: Vec<String>,
-        /// A Helm chart's repository (`oci://…` or a Helm repository's URL).
-        #[arg(long, conflicts_with = "git_repo")]
-        helm_repo: Option<String>,
-        #[arg(long, requires = "helm_repo")]
-        chart: Option<String>,
-        /// The chart's version, when it isn't the release's (`${{ release.version }}`).
-        #[arg(long, requires = "helm_repo")]
-        chart_version: Option<String>,
-        /// A git repository whose path deploys at the release's version (a ref).
-        #[arg(long)]
-        git_repo: Option<String>,
-        #[arg(long, default_value = "")]
-        path: String,
-        /// A value: `image.tag=${{ release.artifacts.image.tag }}`.
-        #[arg(long = "set")]
-        set: Vec<String>,
-        #[arg(long)]
-        namespace: Option<String>,
-    },
+    Create(Box<NewApp>),
     /// Register an app in an environment.
     Register {
         app: String,
@@ -183,6 +173,46 @@ enum AppCmd {
     },
     /// Delete an app registered nowhere.
     Delete { app: String },
+}
+
+/// `kiln app create`: an app and how it is deployed.
+#[derive(clap::Args)]
+struct NewApp {
+    app: String,
+    #[arg(long, default_value = "default")]
+    project: String,
+    /// Owner teams: the owner first, then a co-owner and an ops owner.
+    #[arg(long = "owner")]
+    owners: Vec<String>,
+    /// A Helm chart's repository (`oci://…` or a Helm repository's URL).
+    #[arg(long, conflicts_with = "git_repo")]
+    helm_repo: Option<String>,
+    #[arg(long, requires = "helm_repo")]
+    chart: Option<String>,
+    /// The chart's version, when it isn't the release's (`${{ release.version }}`).
+    #[arg(long, requires = "helm_repo")]
+    chart_version: Option<String>,
+    /// A git repository whose path deploys at the release's version (a ref).
+    #[arg(long)]
+    git_repo: Option<String>,
+    /// A platform KilnCD deploys to (aws-lambda, aws-ecs, cloudflare-workers, vercel), with
+    /// `--spec`: its definition.
+    #[arg(long, conflicts_with_all = ["helm_repo", "git_repo"], requires = "spec")]
+    platform: Option<String>,
+    /// The platform's definition, a YAML or JSON file, as its key in .kiln/deploy.yaml holds it.
+    #[arg(long, requires = "platform")]
+    spec: Option<PathBuf>,
+    /// Where the platform's own files are (a task definition, wrangler.jsonc), at each
+    /// release's version; with `--path`.
+    #[arg(long, requires = "platform")]
+    files_repo: Option<String>,
+    #[arg(long, default_value = "")]
+    path: String,
+    /// A value: `image.tag=${{ release.artifacts.image.tag }}`.
+    #[arg(long = "set")]
+    set: Vec<String>,
+    #[arg(long)]
+    namespace: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -228,6 +258,10 @@ enum EnvCmd {
         /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
         #[arg(long)]
         agents: bool,
+        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after, soak,
+        /// approvals, windows, checks, freeze.
+        #[arg(long)]
+        gates: Option<PathBuf>,
     },
     Rm { env: String },
 }
@@ -319,6 +353,9 @@ async fn follow(api: &Api, mut r: Value) -> Result<bool> {
         let shown = format!("{state} {}", s(&r, "message"));
         if shown != last && !api.json {
             println!("{}", line(&r));
+            if state == "waiting_approval" {
+                println!("        approve it: kiln deploy approve {id}");
+            }
             last = shown;
         }
         match state.as_str() {
@@ -375,6 +412,16 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
+        Some(DeployCmd::Approve { release, note }) => {
+            let v = api.call(Method::Post, &format!("/releases/{release}/approve"), Some(json!({ "note": note }))).await?;
+            api.print(&v, |v| println!("{}", line(v)));
+            return Ok(());
+        }
+        Some(DeployCmd::Reject { release, note }) => {
+            let v = api.call(Method::Post, &format!("/releases/{release}/reject"), Some(json!({ "note": note }))).await?;
+            api.print(&v, |v| println!("{}", line(v)));
+            return Ok(());
+        }
         Some(DeployCmd::Cancel { release }) => {
             let v = api.call(Method::Post, &format!("/releases/{release}/cancel"), None).await?;
             api.print(&v, |v| println!("{}", line(v)));
@@ -386,6 +433,21 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
         None => {
             let app = args.app.context("which app? kiln deploy <app> <version> --to <env>")?;
             let env = args.to.context("which environment? --to <env>")?;
+            if let Some(from) = args.from {
+                if args.version.is_some() || args.values.is_some() {
+                    bail!("--from promotes what another environment runs: no version or --values with it");
+                }
+                let ask = json!({ "app": app, "environment": env, "promote_from": from });
+                let r = api.call(Method::Post, "/releases", Some(ask)).await?;
+                if args.no_wait {
+                    api.print(&r, |r| println!("{}", line(r)));
+                    return Ok(());
+                }
+                if !follow(&api, r).await? {
+                    bail!("the release didn't succeed");
+                }
+                return Ok(());
+            }
             let ask = match (args.version, args.values) {
                 (Some(v), None) => {
                     let mut arts = serde_json::Map::new();
@@ -441,16 +503,23 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 }
             });
         }
-        AppCmd::Create { app, project, owners, helm_repo, chart, chart_version, git_repo, path, set, namespace } => {
+        AppCmd::Create(new) => {
+            let NewApp { app, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace } = *new;
             let mut sets = BTreeMap::new();
             for kv in &set {
                 let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set name=value"))?;
                 sets.insert(k.to_owned(), v.to_owned());
             }
-            let package = match (helm_repo, git_repo) {
-                (Some(repo), None) => json!({ "kind": "helm", "repo": repo, "chart": chart.context("--chart: the chart's name")?, "chart_version": chart_version, "set": sets }),
-                (None, Some(repo)) => json!({ "kind": "git", "repo": repo, "path": path, "set": sets }),
-                _ => bail!("how is it deployed? --helm-repo and --chart, or --git-repo (and --path)"),
+            let package = match (helm_repo, git_repo, platform) {
+                (Some(repo), None, None) => json!({ "kind": "helm", "repo": repo, "chart": chart.context("--chart: the chart's name")?, "chart_version": chart_version, "set": sets }),
+                (None, Some(repo), None) => json!({ "kind": "git", "repo": repo, "path": path, "set": sets }),
+                (None, None, Some(provider)) => {
+                    let file = spec.context("--spec: the platform's definition")?;
+                    let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+                    let spec: Value = serde_yaml::from_str(&text).with_context(|| format!("{} doesn't read as YAML", file.display()))?;
+                    json!({ "kind": "platform", "provider": provider, "spec": spec, "repo": files_repo, "path": path })
+                }
+                _ => bail!("how is it deployed? --helm-repo and --chart, --git-repo (and --path), or --platform and --spec"),
             };
             let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace });
             let v = api.call(Method::Post, "/apps", Some(body)).await?;
@@ -507,7 +576,14 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents } => {
+        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates } => {
+            let gates: Value = match gates {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+                    serde_yaml::from_str(&text).with_context(|| format!("{} doesn't read as YAML", path.display()))?
+                }
+                None => Value::Null,
+            };
             let body = json!({
                 "name": env,
                 "provider": provider,
@@ -517,6 +593,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },
                 "agents": { "deploy": agents },
+                "gates": gates,
             });
             let v = api.call(Method::Post, "/environments", Some(body)).await?;
             api.print(&v, |v| println!("environment {} ready", s(v, "name")));

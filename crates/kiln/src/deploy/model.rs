@@ -25,9 +25,9 @@ pub struct Environment {
     pub release_repo: RepoRef,
     #[serde(default)]
     pub targets: Targets,
-    /// What a release waits for before its commit. Only `concurrency` is enforced so far (§9.1).
-    #[serde(default)]
-    pub gates: Value,
+    /// What a release waits for before its commit (§9.1).
+    #[serde(default, deserialize_with = "null_is_default")]
+    pub gates: Gates,
     #[serde(default)]
     pub sync: SyncSettings,
     #[serde(default)]
@@ -54,6 +54,93 @@ pub struct AgentPolicy {
 
 fn kilncd() -> String {
     KILNCD.to_owned()
+}
+
+/// A field left out, or `null`, is its default.
+fn null_is_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// What a release waits for before its commit (docs/deploy-api.md §9.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gates {
+    /// Environments a new version runs in first: the same version, with the same artifacts,
+    /// succeeded there and still runs there (txst's required environments).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// How long it must have run in each of them (`30m`, `2h`, `1d`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soak: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Approvals>,
+    /// When releases may go (`allow`) or may not (`deny`), as Argo CD's sync windows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<Window>,
+    /// Checks built in: `no-snapshots`, `owners-set`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    /// Held, and why (an incident, a holiday): no release goes until it's lifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze: Option<String>,
+}
+
+/// People who approve a release before it goes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approvals {
+    /// How many.
+    #[serde(default = "one")]
+    pub count: u32,
+    /// Who may, by name; anyone who may approve releases here (`runs.approve`) when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<String>,
+    /// Whoever asked for the release may approve it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_approve: bool,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// A window: it opens at each time its schedule names, for `duration`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Window {
+    /// Releases go only while a window of these is open (five-field cron).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<String>,
+    /// Releases wait while it is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<String>,
+    /// `90m`, `2h`, `1d`.
+    pub duration: String,
+    /// The schedule's time zone (`Europe/Berlin`); UTC when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// A gate's result on a release, with its evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateResult {
+    pub gate: String,
+    pub passed: bool,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub evidence: Value,
+}
+
+/// A person's answer to a release waiting for approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    /// Who, as the audit names them.
+    pub by: String,
+    pub at: i64,
+    #[serde(default = "yes")]
+    pub approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A release repository: a repository and branch on a git host, and the directory under which
@@ -97,6 +184,10 @@ pub struct Targets {
     /// Clusters, by the provider's names for them. None: the cluster kiln runs in.
     #[serde(default)]
     pub kubernetes: Vec<String>,
+    /// Beyond Kubernetes, by provider, as `.kiln/environments.yaml` names them (docs/cd-targets.md
+    /// §4): `aws-lambda: { account: aws-prod, region: us-east-1 }`. KilnCD environments only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platforms: BTreeMap<String, serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +304,33 @@ pub enum Package {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         set: BTreeMap<String, String>,
     },
+    /// A platform KilnCD deploys to beyond Kubernetes (docs/cd-targets.md §3): its provider
+    /// (`aws-lambda`, `aws-ecs`, `cloudflare-workers`, `vercel`) and its definition, as the
+    /// provider's key in `.kiln/deploy.yaml` holds it, with `${{ release.* }}`, `${{ env.name }}`
+    /// and `${{ app.name }}` filled for each release (KilnCD's `${{ git.* }}` and
+    /// `${{ artifacts.* }}` left to it). The platform's own files (a task definition,
+    /// `wrangler.jsonc`) come from `repo` at `path`, at the release's version. KilnCD environments
+    /// only.
+    Platform {
+        provider: String,
+        #[serde(default)]
+        spec: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
+    },
+}
+
+impl Package {
+    /// What a release sets (Helm's `--set`); a platform's definition holds its own settings.
+    pub fn set(&self) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        match self {
+            Self::Helm { set, .. } | Self::Git { set, .. } => set,
+            Self::Platform { .. } => &NONE,
+        }
+    }
 }
 
 /// An app in an environment (docs/deploy-api.md §5).
@@ -259,7 +377,10 @@ impl Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
+    /// Held by a gate, or by the release before it.
     Waiting,
+    /// Held for people's approval.
+    WaitingApproval,
     Committing,
     Delivering,
     Succeeded,
@@ -275,6 +396,7 @@ impl State {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Waiting => "waiting",
+            Self::WaitingApproval => "waiting_approval",
             Self::Committing => "committing",
             Self::Delivering => "delivering",
             Self::Succeeded => "succeeded",
@@ -288,6 +410,7 @@ impl State {
     pub fn parse(s: &str) -> Option<Self> {
         [
             Self::Waiting,
+            Self::WaitingApproval,
             Self::Committing,
             Self::Delivering,
             Self::Succeeded,
@@ -302,7 +425,7 @@ impl State {
 
     /// Still moving: a registration has at most one release in flight.
     pub fn in_flight(self) -> bool {
-        matches!(self, Self::Waiting | Self::Committing | Self::Delivering)
+        matches!(self, Self::Waiting | Self::WaitingApproval | Self::Committing | Self::Delivering)
     }
 }
 
@@ -365,6 +488,15 @@ pub struct Release {
     /// What the provider last said about it.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub provider: Value,
+    /// Each gate's result, with its evidence (§9.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<GateResult>,
+    /// People's answers, while it waited for approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<Approval>,
+    /// The upstream release it promotes (the same version and artifacts, §9.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<i64>,
     /// The key it was asked for with: asked for again with it, it is this release again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,

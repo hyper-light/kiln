@@ -196,13 +196,14 @@ pub fn ops() -> &'static [Op] {
                     let n = id(&v)?;
                     answer(store::release(&service()?.hub.store, n).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {n}")))?)
                 }),
-            op!("deploy.releases.create", "Release an app in an environment: a new `version` (with its `artifacts`), new `values` (a config release: the environment's values.yaml), or `enabled` true or false. Exactly one of them. It answers at once, the release `committing` or `waiting`: follow it with deploy.releases.wait. A version that isn't in its registry is refused (422), and agents release only where the environment lets them (403).", ro: false, destructive: true,
+            op!("deploy.releases.create", "Release an app in an environment: a new `version` (with its `artifacts`), new `values` (a config release: the environment's values.yaml), `enabled` true or false, or `promote_from` another environment. Exactly one of them. The environment's gates come first (upstream environments, soak, windows, checks, approvals): one it can't pass is refused (409), one that holds it leaves it `waiting`, or `waiting_approval` for people (deploy.releases.approve). It answers at once, the release `committing` or `waiting`: follow it with deploy.releases.wait. A version that isn't in its registry is refused (422), and agents release only where the environment lets them (403).", ro: false, destructive: true,
                 input: || schema(json!({
                     "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV},
                     "version": {"type": "string", "description": "The version: a chart version, or a git package's branch, tag or commit."},
                     "artifacts": {"type": "object", "description": "Build outputs it deploys, by name: `{repository, tag, digest}`.", "additionalProperties": {"type": "object"}},
                     "values": {"type": "string", "description": "A config release: YAML that becomes the environment's values.yaml."},
                     "enabled": {"type": "boolean", "description": "Run the app here again (true), or stop running it (false)."},
+                    "promote_from": {"type": "string", "description": "A promotion: exactly what this environment runs, the same version and artifacts."},
                     "keep": {"type": "boolean", "description": "With enabled false: leave what it runs in place."},
                     "idempotency_key": {"type": "string", "description": KEY}
                 }), &["app", "environment"]),
@@ -231,6 +232,14 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}, "idempotency_key": {"type": "string", "description": "With one, a release cancelled already is no error."}}), &["id"]),
                 route: |v| Ok((Method::POST, path(&["releases", &id(v)?.to_string(), "cancel"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(flow::cancel(&*service()?, &Who::of(&cx.caller), id(&v)?, opt_text(&v, "idempotency_key").is_some()).await?) }),
+            op!("deploy.releases.approve", "Approve a release waiting for approval (`waiting_approval`): the approval counts toward its environment's, and the release goes once there are enough. Agents answer only where the environment lets them (agents: { approve: true }), and whoever asked for a release doesn't approve it unless the environment says so.", ro: false, destructive: false,
+                input: || schema(json!({"id": {"type": "integer", "description": RELEASE}, "note": {"type": "string", "description": "Why, for the record."}}), &["id"]),
+                route: |v| Ok((Method::POST, path(&["releases", &id(v)?.to_string(), "approve"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(flow::answer(&*service()?, &Who::of(&cx.caller), id(&v)?, true, opt_text(&v, "note")).await?) }),
+            op!("deploy.releases.reject", "Reject a release waiting for approval: it is cancelled, and says who rejected it and why.", ro: false, destructive: false,
+                input: || schema(json!({"id": {"type": "integer", "description": RELEASE}, "note": {"type": "string", "description": "Why."}}), &["id"]),
+                route: |v| Ok((Method::POST, path(&["releases", &id(v)?.to_string(), "reject"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(flow::answer(&*service()?, &Who::of(&cx.caller), id(&v)?, false, opt_text(&v, "note")).await?) }),
             op!("deploy.releases.wait", "Wait for a release to finish (`until: done`, the default) or to move at all (`until: any`), for at most `timeout_s` seconds (600 at most): the release as it is then, whether it is done, and whether the time ran out.", ro: true, destructive: false,
                 input: || schema(json!({
                     "id": {"type": "integer", "description": RELEASE}, "until": {"type": "string", "enum": ["done", "any"]},

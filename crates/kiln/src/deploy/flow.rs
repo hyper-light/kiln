@@ -19,7 +19,8 @@ use super::argocd;
 use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
-use super::model::{App, Artifact, Concurrency, Environment, KILN_HOST, KILNCD, Kind, Origin, Registration, Release, ReleaseFile, State};
+use super::gates::{self, Verdict};
+use super::model::{App, Approval, Artifact, Concurrency, Environment, KILN_HOST, KILNCD, Kind, Origin, Registration, Release, ReleaseFile, State};
 use super::{Deploy, repo, store};
 
 /// An error and the status that says what went wrong.
@@ -51,9 +52,10 @@ fn dns_label(what: &str, s: &str) -> Result<(), Fail> {
     if ok { Ok(()) } else { Err(bad(format!("{what} {s:?}: lowercase letters, digits and '-', at most 63, starting and ending with a letter or digit"))) }
 }
 
-/// Tells every client, and whoever waits on it, that a release moved.
+/// Tells every client, and whoever waits on it, that a release moved; one waiting for approval
+/// says so, and who may give it (`needs`, `approvers`).
 fn emit_release(d: &Deploy, r: &Release) {
-    d.hub.emit(&json!({
+    let mut e = json!({
         "type": "deploy",
         "id": r.id,
         "app": r.app,
@@ -62,7 +64,15 @@ fn emit_release(d: &Deploy, r: &Release) {
         "state": r.state,
         "by": r.requested_by,
         "release": r,
-    }));
+    });
+    if r.state == State::WaitingApproval
+        && let Some(m) = e.as_object_mut()
+    {
+        let reviewers = r.gates.iter().find(|g| g.gate == "approvals").and_then(|g| g.evidence.get("reviewers")).cloned().unwrap_or(Value::Null);
+        m.insert("needs".into(), json!("approval"));
+        m.insert("approvers".into(), reviewers);
+    }
+    d.hub.emit(&e);
     d.changes.send(r.id);
 }
 
@@ -159,11 +169,36 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.release_repo.root.split('/').any(|s| s == "..") {
         return Err(bad("the release repository's root can't climb out of it"));
     }
+    for (provider, place) in &e.targets.platforms {
+        if argo_of(&e).is_some() {
+            return Err(bad(format!("Argo CD environments deploy to Kubernetes only: {provider} is a KilnCD environment's target")));
+        }
+        let (target, _) = kiln_cd::providers::target_of(provider, place).map_err(|m| bad(format!("targets.platforms.{provider}: {m}")))?;
+        let Some(def) = kiln_cd::providers::get(provider) else { continue };
+        if !def.built {
+            return Err(bad(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", def.title)));
+        }
+        // Its account is an integration of the provider's kind (a runner's targets need none).
+        if def.integration != "runner" {
+            match crate::ci::integrations::get(&d.hub, &target.account).await.map_err(internal)? {
+                Some(i) if i.kind == def.integration => {}
+                Some(i) => return Err(bad(format!("targets.platforms.{provider}: {} is an integration of kind {}, and {} deploys through one of kind {}", target.account, i.kind, def.title, def.integration))),
+                None => return Err(bad(format!("targets.platforms.{provider}: no integration `{}` (Settings → Integrations): {} deploys through an {} account", target.account, def.title, def.integration))),
+            }
+        }
+    }
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
     ensure_release_repo(d, &e.release_repo).await.map_err(bad)?;
     store::put_environment(&d.hub.store, &e).await.map_err(internal)?;
+    // Its gates may have changed: what waits on them looks again now.
+    let held = store::releases(&d.hub.store, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, limit: 1000 }).await.map_err(internal)?;
+    let now = crate::util::now_unix();
+    for r in held.iter().filter(|r| gates::holding(r.state)) {
+        store::schedule(&d.hub.store, r.id, now).await.map_err(internal)?;
+    }
+    d.wake.notify();
     audit(d, actor, "deploy.environment.put", e.name.clone()).await;
     Ok(e)
 }
@@ -237,11 +272,20 @@ pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
     match &a.package {
         super::model::Package::Helm { repo, chart, .. } if repo.is_empty() || chart.is_empty() => return Err(bad("a Helm package names its repository and its chart")),
         super::model::Package::Git { repo, .. } if repo.is_empty() => return Err(bad("a git package names its repository")),
+        super::model::Package::Platform { provider, spec, .. } => {
+            match kiln_cd::providers::get(provider) {
+                None => return Err(bad(format!("kiln deploys to no platform {provider} (aws-ecs, aws-lambda, cloudflare-workers, vercel)"))),
+                Some(def) if !def.built => return Err(bad(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", def.title))),
+                Some(_) => {}
+            }
+            if !spec.is_object() {
+                return Err(bad(format!("a {provider} package's spec is its definition: an object, as its key in .kiln/deploy.yaml")));
+            }
+            repo::check_value(spec, repo::PLATFORM_KEEPS).map_err(|e| bad(format!("spec: {e}")))?;
+        }
         _ => {}
     }
-    for (k, v) in match &a.package {
-        super::model::Package::Helm { set, .. } | super::model::Package::Git { set, .. } => set,
-    } {
+    for (k, v) in a.package.set() {
         repo::check(v).map_err(|e| bad(format!("set {k}: {e}")))?;
     }
     store::put_app(&d.hub.store, &a).await.map_err(internal)?;
@@ -297,6 +341,14 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     }
     if store::registration(&d.hub.store, app_name, env_name).await.map_err(internal)?.is_some() {
         return Err(conflict(format!("{app_name} is registered in {env_name} already")));
+    }
+    if let super::model::Package::Platform { provider, .. } = &a.package {
+        if argo_of(&env).is_some() {
+            return Err(conflict(format!("{app_name} deploys to {provider}, and {env_name} is on Argo CD, which deploys to Kubernetes only: register it in a KilnCD environment")));
+        }
+        if !env.targets.platforms.contains_key(provider) {
+            return Err(conflict(format!("{env_name} has no {provider} target: give it targets.platforms.{provider}: {{ account: <integration>, … }} first")));
+        }
     }
     let rr = &env.release_repo;
     let values = repo::values_file(rr, &a, env_name);
@@ -401,6 +453,9 @@ pub struct Ask {
     pub rollback: Option<RollbackAsk>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// A promotion: exactly what this environment runs, its version and artifacts (§9.2).
+    #[serde(default)]
+    pub promote_from: Option<String>,
     /// Disabling: keep what the app runs, rather than remove it.
     #[serde(default)]
     pub keep: bool,
@@ -442,9 +497,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     if a.archived {
         return Err(conflict(format!("{} is archived: no new releases", a.name)));
     }
-    let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some()].iter().filter(|b| **b).count();
+    let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some()].iter().filter(|b| **b).count();
     if asked != 1 {
-        return Err(bad("ask for exactly one of: a version, values, a rollback, or enabled"));
+        return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, or promote_from"));
     }
     let now = crate::util::now_unix();
     let mut r = Release {
@@ -464,6 +519,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         rolled_back_by: None,
         keep: ask.keep,
         provider: Value::Null,
+        gates: Vec::new(),
+        approvals: Vec::new(),
+        promoted_from: None,
         idempotency_key: key,
         created_at: now,
         committed_at: None,
@@ -509,6 +567,20 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         r.rollback_of = Some(to.id);
     } else if let Some(enabled) = ask.enabled {
         r.kind = if enabled { Kind::Enable } else { Kind::Disable };
+    } else if let Some(from) = ask.promote_from {
+        if from == env.name {
+            return Err(bad("a promotion comes from another environment"));
+        }
+        let up = registration(d, &a.name, &from).await?;
+        let running = match up.running {
+            Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+            None => None,
+        };
+        let running = running.filter(|x| x.version.is_some()).ok_or_else(|| conflict(format!("nothing of {} runs in {from} to promote", a.name)))?;
+        r.kind = Kind::Deploy;
+        r.version = running.version.clone();
+        r.artifacts = running.artifacts.clone();
+        r.promoted_from = Some(running.id);
     }
     // The version is where the package comes from (docs/deploy-api.md §9, step 1).
     if matches!(r.kind, Kind::Deploy | Kind::Rollback) {
@@ -517,13 +589,24 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
         }
     }
+    // The gates (§9.1): one it can't pass by waiting refuses it now; one that holds it, it waits on.
+    match gates::evaluate(d, &r, &env, &a).await.map_err(internal)? {
+        Verdict::Refuse { why, .. } => return Err(conflict(why)),
+        Verdict::Hold { results, why, approval, .. } => {
+            r.gates = results;
+            r.state = if approval { State::WaitingApproval } else { State::Waiting };
+            r.message = Some(why);
+        }
+        Verdict::Go(results) => r.gates = results,
+    }
     if let Some(other) = store::in_flight(&d.hub.store, &a.name, &env.name).await.map_err(internal)? {
         match env.concurrency {
             Concurrency::Reject => return Err(conflict(format!("release {} is in flight for {} in {}: wait for it, or cancel it", other.id, a.name, env.name))),
-            Concurrency::Queue => {
+            Concurrency::Queue if r.state == State::Committing => {
                 r.state = State::Waiting;
                 r.message = Some(format!("waits for release {}", other.id));
             }
+            Concurrency::Queue => {}
         }
     }
     let (r, new) = store::insert_release(&d.hub.store, &r).await.map_err(internal)?;
@@ -545,7 +628,7 @@ pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Relea
     agents_may(who, &environment(d, &r.environment).await?, "cancel releases")?;
     let was = r.state;
     match was {
-        State::Waiting | State::Delivering => {}
+        State::Waiting | State::WaitingApproval | State::Delivering => {}
         // A retried cancel (with an idempotency key) finds it cancelled already.
         State::Cancelled if again => return Ok(r),
         State::Committing => return Err(conflict(format!("release {id} is being committed right now: cancel it in a moment, or roll back"))),
@@ -569,6 +652,50 @@ pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Relea
     }
     d.wake.notify();
     audit(d, actor, "deploy.cancel", format!("release {id}")).await;
+    emit_release(d, &r);
+    Ok(r)
+}
+
+/// A person's answer to a release waiting for approval (docs/deploy-api.md §9.1): an approval
+/// counts toward the environment's `approvals`, and the release goes once there are enough; a
+/// rejection cancels it.
+pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option<String>) -> Result<Release, Fail> {
+    let mut r = store::release(&d.hub.store, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
+    let env = environment(d, &r.environment).await?;
+    if who.agent && !env.agents.approve {
+        return Err((StatusCode::FORBIDDEN, format!("agents may not answer approvals in {}: a person does, unless they allow it (agents: {{ approve: true }})", env.name)));
+    }
+    let Some(rules) = env.gates.approvals.clone() else { return Err(conflict(format!("{} asks for no approvals", env.name))) };
+    if !gates::holding(r.state) {
+        return Err(conflict(format!("release {id} is {}: nothing waits for an answer", r.state.as_str())));
+    }
+    let me = gates::person(&who.name).to_owned();
+    if !rules.reviewers.is_empty() && !rules.reviewers.contains(&me) {
+        return Err((StatusCode::FORBIDDEN, format!("{me} isn't one of {}'s reviewers ({})", env.name, rules.reviewers.join(", "))));
+    }
+    if approved && !rules.self_approve && me == gates::person(&r.requested_by) {
+        return Err((StatusCode::FORBIDDEN, format!("{me} asked for release {id}: someone else approves it")));
+    }
+    let now = crate::util::now_unix();
+    let note = note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+    let was = r.state;
+    r.approvals.retain(|x| gates::person(&x.by) != me);
+    r.approvals.push(Approval { by: who.name.clone(), at: now, approved, note: note.clone() });
+    if !approved {
+        r.state = State::Cancelled;
+        r.ended_at = Some(now);
+        r.message = Some(format!("rejected by {}{}", who.name, note.as_deref().map(|n| format!(": {n}")).unwrap_or_default()));
+    }
+    if !store::update_release(&d.hub.store, &r, was).await.map_err(internal)? {
+        return Err(conflict(format!("release {id} moved meanwhile: look again")));
+    }
+    if approved {
+        store::schedule(&d.hub.store, id, now).await.map_err(internal)?;
+    } else {
+        store::done(&d.hub.store, id).await.map_err(internal)?;
+    }
+    d.wake.notify();
+    audit(d, &who.name, if approved { "deploy.approve" } else { "deploy.reject" }, format!("release {id}")).await;
     emit_release(d, &r);
     Ok(r)
 }
@@ -620,15 +747,41 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     let env = store::environment(st, &r.environment).await?;
     let timeout = env.as_ref().map_or(15 * 60, |e| i64::try_from(e.watch.timeout_secs).unwrap_or(900));
     match r.state {
-        State::Waiting => match store::in_flight(st, &r.app, &r.environment).await? {
+        State::Waiting | State::WaitingApproval => match store::in_flight(st, &r.app, &r.environment).await? {
             Some(o) if o.id != r.id => store::schedule(st, id, now + 2).await?,
             _ => {
-                r.state = State::Committing;
-                r.message = None;
-                if store::update_release(st, &r, State::Waiting).await? {
-                    emit_release(d, &r);
+                let was = r.state;
+                let (Some(env), Some(a)) = (env.clone(), store::app(st, &r.app).await?) else {
+                    return finish(d, r, State::Failed, Some("its app or environment is gone".into())).await;
+                };
+                match gates::evaluate(d, &r, &env, &a).await? {
+                    Verdict::Go(results) => {
+                        r.gates = results;
+                        r.state = State::Committing;
+                        r.message = None;
+                        if store::update_release(st, &r, was).await? {
+                            emit_release(d, &r);
+                        }
+                        store::schedule(st, id, now).await?;
+                    }
+                    Verdict::Hold { results, why, approval, until } => {
+                        let state = if approval { State::WaitingApproval } else { State::Waiting };
+                        let moved = state != r.state || r.message.as_deref() != Some(why.as_str());
+                        r.gates = results;
+                        r.state = state;
+                        r.message = Some(why);
+                        if store::update_release(st, &r, was).await? && moved {
+                            emit_release(d, &r);
+                        }
+                        // An answer wakes it at once; otherwise it looks again when the gate says,
+                        // and every five minutes at least.
+                        store::schedule(st, id, until.unwrap_or(now + 300).clamp(now + 1, now + 300)).await?;
+                    }
+                    Verdict::Refuse { results, why } => {
+                        r.gates = results;
+                        finish(d, r, State::Failed, Some(why)).await?;
+                    }
                 }
-                store::schedule(st, id, now).await?;
             }
         },
         State::Committing => match commit_release(d, &r).await {
@@ -1083,6 +1236,9 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     rolled_back_by: None,
                     keep: false,
                     provider: Value::Null,
+                    gates: Vec::new(),
+                    approvals: Vec::new(),
+                    promoted_from: None,
                     idempotency_key: None,
                     created_at: now,
                     committed_at: Some(now),
@@ -1112,7 +1268,7 @@ mod tests {
             provider: KILNCD.into(),
             release_repo: Default::default(),
             targets: Default::default(),
-            gates: Value::Null,
+            gates: Default::default(),
             sync: Default::default(),
             watch: Default::default(),
             concurrency: Default::default(),

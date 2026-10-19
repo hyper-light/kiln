@@ -11,6 +11,7 @@
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
+//! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
 //!
 //! A release, rollback or cancel asked for with an `Idempotency-Key` header (or
 //! `idempotency_key`) is the same one when asked for again.
@@ -50,6 +51,14 @@ fn ok(v: &impl serde::Serialize) -> Result<Response, Fail> {
 
 fn created(v: &impl serde::Serialize) -> Result<Response, Fail> {
     Ok(srv::json(StatusCode::CREATED, v))
+}
+
+/// What an approval or a rejection says.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Note {
+    #[serde(default)]
+    note: Option<String>,
 }
 
 fn release_id(s: &str) -> Result<i64, Fail> {
@@ -119,6 +128,8 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             created(&flow::release(&d, &who, ask).await?)
         }
         (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
+        (&Method::POST, ["releases", id, "approve"]) => ok(&flow::answer(&d, &who, release_id(id)?, true, body::<Note>(req.into_body()).await?.note).await?),
+        (&Method::POST, ["releases", id, "reject"]) => ok(&flow::answer(&d, &who, release_id(id)?, false, body::<Note>(req.into_body()).await?.note).await?),
         (&Method::POST, ["releases", id, "cancel"]) => ok(&flow::cancel(&d, &who, release_id(id)?, key.is_some()).await?),
         (&Method::POST, ["releases", id, "rollback"]) => {
             let of = store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?;
