@@ -844,8 +844,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         h.restore_from(convo.as_ref());
         h
     });
-    // A copy of the server's store this runner keeps, if the server picks it (a mirror).
+    // A copy of the server's store this runner keeps, if the server picks it (a mirror), and
+    // that copy sent back while the server restores its store from it.
     let mut mirror: Option<crate::convo::feed::Intake> = None;
+    let mut mirror_store: Option<crate::convo::store::Store> = None;
+    let mut restoring: Option<(String, crate::convo::feed::Shipper)> = None;
     let shipper = convo.clone().map(|st| {
         // The harnesses' own records, followed into the store.
         if let Some(h) = harness.clone() {
@@ -1522,6 +1525,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Down);
                 }
+                // A copy being sent back stops: the server asks again if it still needs it.
+                restoring = None;
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
                 }
@@ -1971,26 +1976,48 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             continue;
                         }
+                        // The server lost its store: the copy of it this runner keeps goes back.
+                        if let crate::convo::feed::Msg::Restore { .. } = &m {
+                            if mirror.is_none()
+                                && convo.is_some()
+                                && own_dir.join(crate::convo::MIRROR_FILE).exists()
+                                && let Some((st, intake)) = open_mirror(&own_dir, &uplink.0)
+                            {
+                                (mirror_store, mirror) = (Some(st), Some(intake));
+                            }
+                            if let Some(st) = &mirror_store {
+                                let (ship, out) = crate::convo::feed::Shipper::start_restore(st.clone());
+                                let up = uplink.0.clone();
+                                crate::rt::spawn(async move {
+                                    while let Ok((json, data)) = out.recv().await {
+                                        if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                ship.link(crate::convo::feed::Link::Up);
+                                tracing::info!("the server lost its conversation store: sending back the copy this runner keeps");
+                                restoring = Some((st.id().to_owned(), ship));
+                            } else {
+                                let none = crate::convo::feed::encode(&crate::convo::feed::Msg::Restored { store: String::new(), rev: 0 });
+                                uplink.0.send(Up::Convo(AgentMsg::Convo { json: none, data: Vec::new() })).await.ok();
+                            }
+                            continue;
+                        }
+                        // The server's answers about the copy being sent back.
+                        if let Some((id, ship)) = &restoring
+                            && id == m.store()
+                        {
+                            ship.link(crate::convo::feed::Link::Heard(m));
+                            continue;
+                        }
                         // The server's store, of which this runner keeps a copy (a mirror), beside
                         // its own store; opened the first time the server sends it.
-                        if mirror.is_none() && convo.is_some() {
-                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().keep_closed()).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
-                                Ok((intake, out)) => {
-                                    let up = uplink.0.clone();
-                                    crate::rt::spawn(async move {
-                                        while let Ok(o) = out.recv().await {
-                                            if up.send(Up::Convo(AgentMsg::Convo { json: o.json, data: Vec::new() })).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    });
-                                    Some(intake)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %format!("{e:#}"), "this runner can't keep a copy of the conversation store");
-                                    None
-                                }
-                            });
+                        if mirror.is_none()
+                            && convo.is_some()
+                            && let Some((st, intake)) = open_mirror(&own_dir, &uplink.0)
+                        {
+                            (mirror_store, mirror) = (Some(st), Some(intake));
                         }
                         if let Some(intake) = &mirror {
                             intake.heard(SERVER_PEER, "server", json, data);
@@ -2562,6 +2589,30 @@ fn adopt_handover(
         tracing::info!(terminals = adopted, "terminals carried across the upgrade");
     }
     start
+}
+
+
+/// The copy of the server's conversation store this runner keeps (a mirror), beside its own, and
+/// the intake that takes the server's feed into it, its answers going up the link.
+fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
+    let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().keep_closed())?;
+    match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays) {
+        Ok((intake, out)) => {
+            let up = up.clone();
+            crate::rt::spawn(async move {
+                while let Ok(o) = out.recv().await {
+                    if up.send(Up::Convo(AgentMsg::Convo { json: o.json, data: Vec::new() })).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some((st, intake))
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "this runner can't keep a copy of the conversation store");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

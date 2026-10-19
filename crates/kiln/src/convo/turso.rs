@@ -36,6 +36,11 @@ pub struct Turso {
     rev: u64,
     /// Record lines written before this number may still be kept uncompressed (0: none are).
     squeeze_below: u64,
+    /// A mirror's copy is restoring this store (`copied` has sessions): what else writes a
+    /// session it brought takes it over from the copy.
+    copying: bool,
+    /// The rows being written are a copy's ([`Engine::take_copy`]).
+    filling: bool,
 }
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
@@ -117,7 +122,7 @@ impl Turso {
             }
         };
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0 };
+        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0, copying: false, filling: false };
         t.migrate(schema)?;
         if schema < 2 {
             return Ok(t);
@@ -141,7 +146,103 @@ impl Turso {
             Some(b) => b,
             None => rev + 1,
         };
+        if schema >= 3 {
+            t.copying = t.one_int(sql::COPIED_ANY, &[])?.is_some();
+        }
         Ok(t)
+    }
+
+    /// A batch of `peer`'s feed that follows its number `from` ([`Engine::take`]), or of a copy
+    /// restoring this store (`copy`, [`Engine::take_copy`]): a copy brings back the sessions this
+    /// store has nothing of, and leaves alone those it has anything of from elsewhere.
+    fn take_rows(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes, copy: bool) -> anyhow::Result<Took> {
+        let have = self.peer(peer)?;
+        if from != have || batch.upto < from {
+            return Ok(Took { rev: have, gap: true, ..Took::default() });
+        }
+        let now = crate::util::now_ms();
+        let (peer, machine) = (peer.to_owned(), machine.map(str::to_owned));
+        self.transaction(|t| {
+            let mut w = t.writes()?;
+            let mut epochs: HashMap<String, u64> = HashMap::new();
+            let mut copied: HashMap<String, bool> = HashMap::new();
+            let mut took = Took { rev: batch.upto, ..Took::default() };
+            for c in &batch.rows {
+                let session = c.row.session();
+                if copy {
+                    let ours = match copied.get(session) {
+                        Some(o) => *o,
+                        None => {
+                            let o = if t.one_int(sql::COPIED_HAS, &[txt(session)])?.is_some() {
+                                true
+                            } else if t.known(session)? {
+                                false
+                            } else {
+                                let mut add = t.prepare(sql::COPIED_ADD)?;
+                                t.run(&mut add, &[txt(session)], |_| Ok(()))?;
+                                t.copying = true;
+                                true
+                            };
+                            copied.insert(session.to_owned(), o);
+                            o
+                        }
+                    };
+                    // What the copy dropped is gone from it already: nothing to drop here.
+                    if !ours || matches!(c.row, Row::Reset { .. } | Row::RecordReset { .. }) {
+                        took.left += 1;
+                        continue;
+                    }
+                }
+                let current = match epochs.get(session) {
+                    Some(e) => *e,
+                    None => {
+                        let e = t.epoch_of(session)?;
+                        epochs.insert(session.to_owned(), e);
+                        e
+                    }
+                };
+                // A former writer's rows (it moved on elsewhere) never count again.
+                if c.epoch < current {
+                    took.fenced += 1;
+                    continue;
+                }
+                if c.epoch > current {
+                    // Its new writer, from here on: said before its rows (it may be new here).
+                    t.rev += 1;
+                    let r = t.rev;
+                    t.run(&mut w.session, &[txt(session), Value::Null, Value::Null, Value::Null, Value::Null, int(now), seq(c.epoch), seq(r)], |_| Ok(()))?;
+                    epochs.insert(session.to_owned(), c.epoch);
+                }
+                t.rev += 1;
+                let r = t.rev;
+                t.write(&mut w, &c.row, r)?;
+                took.applied += 1;
+            }
+            // Where each session it brought runs: the machine of this feed (a former writer's
+            // rows, left out, don't say so). A mirror's feed says it in its rows instead.
+            if let Some(machine) = &machine {
+                let mut at = t.prepare(sql::SESSION_MACHINE)?;
+                for (session, epoch) in &epochs {
+                    let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
+                    if theirs {
+                        t.run(&mut at, &[txt(session), txt(machine)], |_| Ok(()))?;
+                    }
+                }
+            }
+            let mut set = t.prepare(sql::PEER_SET)?;
+            t.run(&mut set, &[txt(&peer), seq(batch.upto), int(now)], |_| Ok(()))?;
+            Ok(took)
+        })
+    }
+
+    /// Whether the store has anything of `session`: its row, an event, a line of its record.
+    fn known(&self, session: &str) -> anyhow::Result<bool> {
+        for q in [sql::KNOWN_SESSION, sql::KNOWN_EVENTS, sql::KNOWN_RECORDS] {
+            if self.one_int(q, &[txt(session)])?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -390,6 +491,12 @@ impl Turso {
     fn write(&self, w: &mut Writes, row: &Row, rev: u64) -> anyhow::Result<()> {
         let r = seq(rev);
         let none = |_: &TRow| Ok(());
+        // While a copy restores this store, what else writes a session it brought (its own
+        // machine's feed, come back) takes it over: the copy's later rows of it are left out.
+        if self.copying && !self.filling {
+            let mut gone = self.prepare(sql::COPIED_DROP)?;
+            self.run(&mut gone, &[txt(row.session())], none)?;
+        }
         match row {
             Row::Session { session, info, meta, state, changes, epoch, open, at } => {
                 self.run(
@@ -554,58 +661,29 @@ impl Engine for Turso {
     }
 
     fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
-        let have = self.peer(peer)?;
-        if from != have || batch.upto < from {
-            return Ok(Took { rev: have, gap: true, ..Took::default() });
-        }
-        let now = crate::util::now_ms();
-        let (peer, machine) = (peer.to_owned(), machine.map(str::to_owned));
-        self.transaction(|t| {
-            let mut w = t.writes()?;
-            let mut epochs: HashMap<String, u64> = HashMap::new();
-            let mut took = Took { rev: batch.upto, ..Took::default() };
-            for c in &batch.rows {
-                let session = c.row.session();
-                let current = match epochs.get(session) {
-                    Some(e) => *e,
-                    None => {
-                        let e = t.epoch_of(session)?;
-                        epochs.insert(session.to_owned(), e);
-                        e
-                    }
-                };
-                // A former writer's rows (it moved on elsewhere) never count again.
-                if c.epoch < current {
-                    took.fenced += 1;
-                    continue;
-                }
-                if c.epoch > current {
-                    // Its new writer, from here on: said before its rows (it may be new here).
-                    t.rev += 1;
-                    let r = t.rev;
-                    t.run(&mut w.session, &[txt(session), Value::Null, Value::Null, Value::Null, Value::Null, int(now), seq(c.epoch), seq(r)], |_| Ok(()))?;
-                    epochs.insert(session.to_owned(), c.epoch);
-                }
-                t.rev += 1;
-                let r = t.rev;
-                t.write(&mut w, &c.row, r)?;
-                took.applied += 1;
-            }
-            // Where each session it brought runs: the machine of this feed (a former writer's
-            // rows, left out, don't say so). A mirror's feed says it in its rows instead.
-            if let Some(machine) = &machine {
-                let mut at = t.prepare(sql::SESSION_MACHINE)?;
-                for (session, epoch) in &epochs {
-                    let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
-                    if theirs {
-                        t.run(&mut at, &[txt(session), txt(machine)], |_| Ok(()))?;
-                    }
-                }
-            }
-            let mut set = t.prepare(sql::PEER_SET)?;
-            t.run(&mut set, &[txt(&peer), seq(batch.upto), int(now)], |_| Ok(()))?;
-            Ok(took)
-        })
+        self.take_rows(peer, machine, from, batch, false)
+    }
+
+    fn take_copy(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.filling = true;
+        let took = self.take_rows(peer, None, from, batch, true);
+        self.filling = false;
+        took
+    }
+
+    fn end_copy(&mut self) -> anyhow::Result<usize> {
+        let n = self.one_int(sql::COPIED_COUNT, &[])?.and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+        self.exec(sql::COPIED_CLEAR)?;
+        self.copying = false;
+        Ok(n)
+    }
+
+    fn is_empty(&mut self) -> anyhow::Result<bool> {
+        Ok(self.one_int(sql::ANY_SESSION, &[])?.is_none() && self.one_int(sql::ANY_EVENT, &[])?.is_none())
+    }
+
+    fn top(&mut self) -> u64 {
+        self.rev
     }
 
     fn peer(&mut self, peer: &str) -> anyhow::Result<u64> {
@@ -909,6 +987,54 @@ mod tests {
             assert_eq!(t.marks(s)?.len(), 2, "{s}");
             assert_eq!(t.record(s, "cc-b", 0, 10)?.len(), 5, "{s}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_brings_back_what_the_store_lost_and_leaves_alone_what_it_has() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("c.db"))?;
+        let session = |s: &str, state: &str| Row::Session { session: s.into(), info: Some(format!("{{\"id\":\"{s}\"}}")), meta: None, state: Some(format!("{{\"title\":\"{state}\"}}")), changes: None, epoch: None, open: true, at: 5 };
+        let event = |s: &str, id: &str, text: &str| super::super::rows::of(s, &said(id, 1, text), 5).into_iter().next().ok_or_else(|| anyhow::anyhow!("no event row"));
+        let line = |s: &str, n: u64| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: format!("{{\"n\":{n}}}") }));
+        let changes = |rows: Vec<Row>, from: u64| Changes { upto: from + rows.len() as u64, rows: rows.into_iter().enumerate().map(|(i, row)| Change { rev: from + 1 + i as u64, epoch: 0, row }).collect() };
+        // Its machine's own feed brought `live` back already.
+        t.take("box/s1", Some("box"), 0, &changes(vec![session("live", "now"), event("live", "e1", "said now")?], 0))?;
+        // The copy has `live` as it was, and two sessions the store lost.
+        let copy = vec![
+            session("live", "before"),
+            event("live", "e1", "said before")?,
+            event("live", "e0", "only in the copy")?,
+            session("gone", "gone's"),
+            event("gone", "g1", "from a machine that is gone")?,
+            line("gone", 0),
+            Row::Closed { session: "gone".into(), at: 9 },
+            Row::Machine { session: "gone".into(), machine: "old-box".into() },
+            Row::Reset { session: "gone".into(), from: Some(0), at: 9 },
+            session("back", "back's"),
+            event("back", "b1", "from the copy")?,
+        ];
+        let took = t.take_copy("mirror/m1", 0, &changes(copy, 0))?;
+        assert_eq!((took.applied, took.left), (7, 4), "{took:?}");
+        // What the store had from elsewhere stays as it was.
+        let live = t.kept("live", 10)?.ok_or_else(|| anyhow::anyhow!("live is gone"))?;
+        assert!(live.state.as_deref().is_some_and(|s| s.contains("now")));
+        assert_eq!(live.events.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), vec!["said now"]);
+        // What it lost is back, as it was: its events, record, end and machine.
+        let gone = t.kept("gone", 10)?.ok_or_else(|| anyhow::anyhow!("gone didn't come back"))?;
+        assert_eq!(gone.events.len(), 1);
+        assert_eq!(gone.closed_at, Some(9));
+        assert_eq!(t.record("gone", "cc", 0, 10)?.len(), 1);
+        assert_eq!(t.one_int("SELECT count(*) FROM sessions WHERE id = 'gone' AND machine = 'old-box'", &[])?, Some(1));
+        // `back`'s machine comes back mid-copy: from then on its own feed is what counts.
+        t.take("box2/s2", Some("box2"), 0, &changes(vec![event("back", "b1", "said on its machine")?], 0))?;
+        let more = t.take_copy("mirror/m1", 11, &changes(vec![event("back", "b2", "late copy")?, event("gone", "g2", "more of gone")?], 11))?;
+        assert_eq!((more.applied, more.left), (1, 1), "{more:?}");
+        let back = t.kept("back", 10)?.ok_or_else(|| anyhow::anyhow!("back is gone"))?;
+        assert_eq!(back.events.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), vec!["said on its machine"]);
+        // Whole: the copy brought back one session it still has.
+        assert_eq!(t.end_copy()?, 1);
+        assert!(!t.copying);
         Ok(())
     }
 

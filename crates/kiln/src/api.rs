@@ -570,6 +570,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "conversations", "search"]) => conversation_search(&hub, &q).await,
         // The runners that keep a copy of the server's conversation store (docs/conversations.md, "Mirrors").
         (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": hub.harness.copies.as_ref().map(|m| m.view()).unwrap_or_default() }))),
+        // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
+        (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
+        (&Method::POST, ["api", "conversations", "restore"]) => conversation_restore(&hub, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -2832,6 +2835,19 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
     let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
     Ok(srv::json(StatusCode::OK, &json!({ "events": events })))
+}
+
+#[derive(Deserialize)]
+struct RestoreFrom {
+    from: String,
+}
+
+/// `POST /api/conversations/restore` `{from}`: ask that mirror for its copy of the conversation
+/// store, and restore this one from it: what the copy brings fills in what the store lacks.
+async fn conversation_restore(hub: &Arc<Hub>, req: Request) -> R {
+    let b: RestoreFrom = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    hub.harness.restore_from(hub, b.from.trim()).map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::ACCEPTED, &hub.harness.restore_view()))
 }
 
 /// `GET /api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=`: events across

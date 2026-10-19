@@ -66,26 +66,51 @@ impl std::fmt::Display for CommitError {
     }
 }
 
-/// The repositories kiln hosts.
+/// The repositories kiln hosts: its native repositories (docs/ci.md W14), whose bare repositories
+/// live under one root as `<owner>/<name>.git`.
 #[derive(Debug, Clone)]
 pub struct Hosted {
     root: PathBuf,
 }
 
 impl Hosted {
-    pub fn new(data_dir: &Path) -> Self {
-        Self { root: data_dir.join("deploy").join("repos") }
+    /// The repositories under `root` (`crate::ci::hosting::root`).
+    pub fn new(root: &Path) -> Self {
+        Self { root: root.to_owned() }
     }
 
-    /// A repository's directory. Names are one or more segments of letters, digits, `-`, `_` and
-    /// `.`, never `..`: a name can't reach outside the hosted root.
+    /// A repository's directory. A name is `owner/name`, each of letters, digits, `-`, `_` and
+    /// `.`, never `.` or `..`: a name can't reach outside the hosted root.
     pub fn path(&self, repo: &str) -> anyhow::Result<PathBuf> {
-        let ok = !repo.is_empty()
-            && repo.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".." && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
-        if !ok {
-            bail!("{repo:?} isn't a repository name kiln hosts (letters, digits, '-', '_', '.', segments joined by '/')");
+        let repo = repo.trim_end_matches(".git");
+        let seg = |s: &str| !s.is_empty() && s != "." && s != ".." && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        match repo.split_once('/') {
+            Some((owner, name)) if seg(owner) && seg(name) => Ok(self.root.join(owner).join(format!("{name}.git"))),
+            _ => bail!("{repo:?} isn't a repository name kiln hosts: `owner/name`, of letters, digits, '-', '_' and '.'"),
         }
-        Ok(self.root.join(format!("{}.git", repo.trim_end_matches(".git"))))
+    }
+
+    /// Moves the repositories of an older root (`<data>/deploy/repos`, before release repositories
+    /// were native ones) into this one, where this one has none by their name. What moved.
+    pub fn adopt(&self, old: &Path) -> Vec<String> {
+        let mut moved = Vec::new();
+        let Ok(owners) = std::fs::read_dir(old) else { return moved };
+        for owner in owners.flatten().filter(|e| e.path().is_dir()) {
+            let Ok(repos) = std::fs::read_dir(owner.path()) else { continue };
+            for r in repos.flatten() {
+                let (from, name) = (r.path(), r.file_name().to_string_lossy().into_owned());
+                let to = self.root.join(owner.file_name()).join(&name);
+                if !name.ends_with(".git") || !from.join("HEAD").is_file() || to.exists() {
+                    continue;
+                }
+                let renamed = std::fs::create_dir_all(self.root.join(owner.file_name())).and_then(|()| std::fs::rename(&from, &to));
+                match renamed {
+                    Ok(()) => moved.push(format!("{}/{}", owner.file_name().to_string_lossy(), name.trim_end_matches(".git"))),
+                    Err(e) => tracing::warn!(from = %from.display(), to = %to.display(), error = %e, "deploy: a release repository couldn't move into kiln's hosted root"),
+                }
+            }
+        }
+        moved
     }
 
     /// The URL git reads it at on this machine (KilnCD's mirrors clone from it).
@@ -312,37 +337,49 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let h = Hosted::new(tmp.path());
         let who = Author::default();
-        let first = h.commit("releases", "main", None, &[file("shop/web/staging/release.json", "{}")], "register web\n\nKiln-Release: 0", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let first = h.commit("kiln/releases", "main", None, &[file("shop/web/staging/release.json", "{}")], "register web\n\nKiln-Release: 0", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
         let Committed::New(first) = first else { anyhow::bail!("the first commit is new") };
-        assert_eq!(h.head("releases", "main")?.as_deref(), Some(first.as_str()));
-        assert_eq!(h.read("releases", &first, "shop/web/staging/release.json")?.as_deref(), Some(&b"{}"[..]));
-        assert_eq!(h.read("releases", &first, "nothing/here")?, None);
+        assert_eq!(h.head("kiln/releases", "main")?.as_deref(), Some(first.as_str()));
+        assert_eq!(h.read("kiln/releases", &first, "shop/web/staging/release.json")?.as_deref(), Some(&b"{}"[..]));
+        assert_eq!(h.read("kiln/releases", &first, "nothing/here")?, None);
         // Made on a head that has moved: refused, and nothing changes.
-        assert!(matches!(h.commit("releases", "main", None, &[file("x", "1")], "late", &who), Err(CommitError::Moved)));
-        let second = h.commit("releases", "main", Some(&first), &[file("shop/web/staging/values.yaml", "a: 1\n")], "config", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(matches!(h.commit("kiln/releases", "main", None, &[file("x", "1")], "late", &who), Err(CommitError::Moved)));
+        let second = h.commit("kiln/releases", "main", Some(&first), &[file("shop/web/staging/values.yaml", "a: 1\n")], "config", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
         assert!(matches!(second, Committed::New(_)));
-        assert!(h.read("releases", second.sha(), "shop/web/staging/release.json")?.is_some(), "what the commit didn't touch is kept");
+        assert!(h.read("kiln/releases", second.sha(), "shop/web/staging/release.json")?.is_some(), "what the commit didn't touch is kept");
         // The same files again: nothing to commit.
-        let same = h.commit("releases", "main", Some(second.sha()), &[file("shop/web/staging/values.yaml", "a: 1\n")], "again", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let same = h.commit("kiln/releases", "main", Some(second.sha()), &[file("shop/web/staging/values.yaml", "a: 1\n")], "again", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!(same, Committed::Unchanged(second.sha().to_owned()));
         // Removing a file.
-        let third = h.commit("releases", "main", Some(second.sha()), &[Change { path: "shop/web/staging/values.yaml".into(), content: None }], "drop", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(h.read("releases", third.sha(), "shop/web/staging/values.yaml")?, None);
-        let log = h.commits_since("releases", "main", Some(&first))?;
+        let third = h.commit("kiln/releases", "main", Some(second.sha()), &[Change { path: "shop/web/staging/values.yaml".into(), content: None }], "drop", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(h.read("kiln/releases", third.sha(), "shop/web/staging/values.yaml")?, None);
+        let log = h.commits_since("kiln/releases", "main", Some(&first))?;
         assert_eq!(log.iter().map(|c| c.message.lines().next().unwrap_or("")).collect::<Vec<_>>(), ["config", "drop"]);
         assert_eq!(log.first().map(|c| c.paths.clone()), Some(vec!["shop/web/staging/values.yaml".to_owned()]));
-        let all = h.commits_since("releases", "main", None)?;
+        let all = h.commits_since("kiln/releases", "main", None)?;
         assert_eq!(all.first().and_then(|c| c.trailer("Kiln-Release")), Some("0"));
         Ok(())
     }
 
     #[test]
-    fn names_stay_inside_the_hosted_root() {
-        let h = Hosted::new(Path::new("/data"));
-        assert!(h.path("releases").is_ok());
-        assert!(h.path("team/releases.git").is_ok());
-        for bad in ["", "../etc", "a/../b", "a//b", "a b", "/abs"] {
+    fn names_stay_inside_the_hosted_root() -> anyhow::Result<()> {
+        let h = Hosted::new(Path::new("/data/hosted"));
+        assert_eq!(h.path("team/releases.git")?, Path::new("/data/hosted/team/releases.git"));
+        for bad in ["", "releases", "../etc", "a/../b", "a//b", "a b", "/abs", "a/b/c", "./b"] {
             assert!(h.path(bad).is_err(), "{bad:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn release_repositories_move_into_the_hosted_root_once() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (old, root) = (tmp.path().join("deploy/repos"), tmp.path().join("hosted"));
+        Hosted::new(&old).commit("kiln/releases", "main", None, &[file("a", "1")], "first", &Author::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let h = Hosted::new(&root);
+        assert_eq!(h.adopt(&old), ["kiln/releases"]);
+        assert!(h.head("kiln/releases", "main")?.is_some(), "its history came along");
+        assert!(h.adopt(&old).is_empty(), "nothing moves twice");
+        Ok(())
     }
 }

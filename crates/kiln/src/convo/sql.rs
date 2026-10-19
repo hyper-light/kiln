@@ -72,6 +72,9 @@ pub const MIGRATIONS: &[&str] = &[
         rev INTEGER NOT NULL,
         at INTEGER NOT NULL
     );",
+    // 3: the sessions a mirror's copy brought back into this store while it restores from it:
+    // the copy fills those in, and leaves alone what the store has from anywhere else.
+    "CREATE TABLE IF NOT EXISTS copied (session TEXT PRIMARY KEY);",
 ];
 
 /// Where the migrations done so far are counted.
@@ -143,6 +146,21 @@ pub const RECORD_FIRST_LINES: &str = "SELECT n FROM records WHERE session = ?1 A
 /// A file of a session's record let go through line `?3`. No drop is written: every store lets
 /// an ended session's record go by its own clock, so no feed carries it.
 pub const RECORDS_PRUNE: &str = "DELETE FROM records WHERE session = ?1 AND source = ?2 AND n <= ?3";
+
+/// A copy restoring this store (`copied`): the sessions it brought, and whether one is its.
+pub const COPIED_HAS: &str = "SELECT 1 FROM copied WHERE session = ?1";
+pub const COPIED_ADD: &str = "INSERT INTO copied (session) VALUES (?1) ON CONFLICT (session) DO NOTHING";
+pub const COPIED_DROP: &str = "DELETE FROM copied WHERE session = ?1";
+pub const COPIED_ANY: &str = "SELECT 1 FROM copied LIMIT 1";
+pub const COPIED_COUNT: &str = "SELECT count(*) FROM copied";
+pub const COPIED_CLEAR: &str = "DELETE FROM copied";
+/// Whether the store has anything of a session: its row, an event, a line of its record.
+pub const KNOWN_SESSION: &str = "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1";
+pub const KNOWN_EVENTS: &str = "SELECT 1 FROM events WHERE session = ?1 LIMIT 1";
+pub const KNOWN_RECORDS: &str = "SELECT 1 FROM records WHERE session = ?1 LIMIT 1";
+/// Whether the store holds any session at all.
+pub const ANY_SESSION: &str = "SELECT 1 FROM sessions LIMIT 1";
+pub const ANY_EVENT: &str = "SELECT 1 FROM events LIMIT 1";
 
 /// What was dropped, numbered as the writes are (each one kept: a feed sends them in order).
 pub const DROP_ADD: &str = "INSERT INTO drops (rev, session, what, source, n, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
