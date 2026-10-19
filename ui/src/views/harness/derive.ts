@@ -4,6 +4,7 @@
  */
 import { useState } from "react";
 import type { FileDiff, HEvent, ToolCall, ToolKind } from "@/api/harness";
+import { isShowPage } from "./page-of";
 
 export type ToolEvent = Extract<HEvent, { kind: "tool" }>;
 
@@ -19,6 +20,8 @@ export type StepGroup = "explore" | "edit" | "shell" | "web" | "agent" | "plan" 
 
 export type Item =
   | Step
+  /** A page the agent showed (`show_page`): the page itself, not a row of a step. */
+  | { type: "page"; key: string; event: ToolEvent }
   | { type: "note"; key: string; event: Extract<HEvent, { kind: "assistant" }> }
   | { type: "thought"; key: string; event: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }
   /** `repeats`: the same notice said again right after itself, shown once with a count. */
@@ -90,7 +93,9 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
     const t: Turn = cur ?? open(null, e.at, `start-${e.id}`);
     t.ended = e.at;
     if (e.by && !t.by && e.kind !== "notice") t.by = e.by;
-    if (e.kind === "tool") {
+    if (e.kind === "tool" && isShowPage(e)) {
+      t.items.push({ type: "page", key: e.id, event: e });
+    } else if (e.kind === "tool") {
       const g = GROUP[e.tool] ?? "tool";
       const last = t.items.at(-1);
       if (last && last.type === "step" && last.group === g && MERGES[g]) last.calls.push(e);

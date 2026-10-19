@@ -33,6 +33,8 @@ export interface Me {
   public_url?: string;
   /** Its runners' front doors (`https://kiln.home`, …). */
   origins?: string[];
+  /** Where pages agents show are served, when not here (docs/previews.md). */
+  pages_url?: string | null;
 }
 
 export interface Repo {

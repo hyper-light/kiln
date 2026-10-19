@@ -67,6 +67,10 @@ pub struct Server {
     pub https_cert: Option<PathBuf>,
     /// Its PEM private key.
     pub https_key: Option<PathBuf>,
+    /// Where pages agents show are served (docs/previews.md), as `https://kiln-pages.example`: a
+    /// site of its own, so browsers keep pages apart from kiln. Unset: kiln's own address serves
+    /// them, each sandboxed in an origin of its own.
+    pub pages_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +350,7 @@ impl Default for Server {
             https: false,
             https_cert: None,
             https_key: None,
+            pages_url: None,
         }
     }
 }

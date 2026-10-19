@@ -9,6 +9,7 @@ pub mod api;
 pub mod authz;
 pub mod autodetect;
 pub mod bluegreen;
+pub mod browser;
 pub mod cd;
 pub mod deploy;
 pub mod ci;
