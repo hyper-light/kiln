@@ -10,6 +10,7 @@
     "serve": "bun server/main.ts",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
+    "test": "tsx --tsconfig tsconfig.app.json --test tests/*.test.ts",
     "lint": "eslint .",
     "mock": "tsx mock/server.ts"
   },
