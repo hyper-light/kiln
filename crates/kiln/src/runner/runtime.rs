@@ -1737,6 +1737,10 @@ impl Leg {
         let at = |host: &Path, inside: String| if same { host.to_string_lossy().into_owned() } else { inside };
         super::docker::PathMap::new(vec![
             (l.workspace.clone(), at(&l.workspace, format!("/__w/{repo}/{repo}"))),
+            // The workspace's parent too, the leg's own directory, as on GitHub's runners: what a
+            // step makes beside the workspace (CodeQL's `../results`) is the runner user's, and the
+            // host's.
+            (l.runner_workspace.clone(), at(&l.runner_workspace, format!("/__w/{repo}"))),
             (l.temp.join("_github_home"), "/github/home".into()),
             (l.temp.join("_github_workflow"), "/github/workflow".into()),
             (l.temp.clone(), at(&l.temp, "/__w/_temp".into())),
@@ -3660,6 +3664,23 @@ jobs:
         // getIDToken: the token for its audience, masked from the moment it arrived.
         assert!(step.contains("id token: aud=kiln-f20 sub=repo:acme/app:ref:refs/heads/main"), "{step}");
         assert!(step.contains("the token itself: ***") && !all.contains(&jwt), "the token is masked: {step}");
+        Ok(())
+    }
+
+    /// A job container's paths are GitHub's, the workspace's parent among them: what a step
+    /// makes beside the workspace (CodeQL's `../results`) lands in the leg's own directory.
+    #[test]
+    fn job_containers_have_the_workspace_parent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let a = AssignmentV2 { job_id: "leg-p".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
+        let (tx, _rx) = async_channel::unbounded();
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default() };
+        let l = Layout::new(tmp.path(), "leg-p", "acme/app", None);
+        let map = leg.container_map(&l);
+        assert_eq!(map.translate(&l.workspace.to_string_lossy()), "/__w/app/app");
+        assert_eq!(map.translate(&l.temp.to_string_lossy()), "/__w/_temp");
+        assert_eq!(map.to_host("/__w/app/results"), Some(l.runner_workspace.join("results")));
+        assert!(map.mounts().contains(&format!("{}:/__w/app", l.runner_workspace.display())), "{:?}", map.mounts());
         Ok(())
     }
 

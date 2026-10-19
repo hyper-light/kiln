@@ -2198,10 +2198,18 @@ Gives step execution for `uses:`.
   - **`permissions:`** above what the job grants fail the leg with `KCI4031`, which names the
     scope and the grant to add.
   - Verified end to end: an action needing `deployments: write`, used by a job that grants none.
+- *Done.* AC02 (`w07_ac02_pins`): a run's first job holds while the test moves the tag of the
+  action it ran. Its second job still gets the pinned commit, and so does a rerun. "Rerun with
+  fresh actions" (`fresh_actions` on `POST /api/ci/runs/:id/rerun`, `kiln rerun --fresh-actions`)
+  pins it again and gets the commit the tag names now.
 - *Done.* AC03 (`w07_ac03_mirror_offline`): a run with two jobs, one using a mirrored action,
   one an action its source never had. The first job passes and the second fails with the
   message, the run conclusion being `failure`, not a startup failure. With the source gone, the
   next run's pin comes from the mirror, and the first job passes again.
+- *Done.* AC05: `kiln_ci::policy`'s unit tests (`w07_ac05_*`).
+- *Done.* AC06 (`w07_ac06_declared_secrets`): an action declaring a required `DEPLOY_KEY`
+  fails its run as it starts with `KCI4040`, naming the job, the scopes searched and the command
+  that adds it. Once the secret is set, the next run passes, the action using it masked.
 - *Done.* AC04 (`crates/kiln/tests/actions.rs`), on a server with its own runner, with its
   actions from a source of the test's own (`[[ci.actions.sources]]`):
   - a JavaScript action with `pre` and `post`;
@@ -2219,12 +2227,12 @@ Gives step execution for `uses:`.
   then the post steps, in reverse.
 - *Left.*
   - R01's `kiln://`.
-  - The pins on the run page, "rerun with fresh actions", and storing tarballs in W08's store
-    (today they are files under `<data>/actions/tar`).
+  - The pins on the run page and its "rerun with fresh actions" (the API and CLI have it), and
+    storing tarballs in W08's store (today they are files under `<data>/actions/tar`).
   - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
     `kiln/deploy`, `kiln/attest`, `kiln/upload` and `kiln/download`, each with its workstream.
   - musl Node for Alpine job containers, with W13.
-  - AC01, AC02, AC05 and AC06.
+  - AC01 (with W22-AC02).
 
 ### W08 Runtime services: store, caches, artifacts, reuse
 

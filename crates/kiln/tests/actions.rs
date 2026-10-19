@@ -216,6 +216,119 @@ fn w07_ac03_mirror_offline() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The legs of the run's attempt `attempt` (a rerun is the run's next attempt, its legs new),
+/// once every one has finished: (job, log of its steps).
+fn attempt_logs(s: &common::Server, run: &str, attempt: i64) -> anyhow::Result<Vec<(String, String)>> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let detail = get(s.port, &s.admin, &format!("/api/ci/runs/{run}?attempt={attempt}"))?;
+        let legs = detail.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
+        let done = legs.len() == 2 && legs.iter().all(|l| l.get("conclusion").is_some_and(|c| !c.is_null()));
+        if done {
+            let mut out = Vec::new();
+            for l in &legs {
+                let id = l.get("id").and_then(Value::as_str).unwrap_or_default();
+                let mut log = String::new();
+                for step in 0..3 {
+                    let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{id}/logs?step={step}"), &s.admin, None)?;
+                    log.push_str(&text);
+                }
+                out.push((l.get("key").and_then(Value::as_str).unwrap_or_default().to_owned(), log));
+            }
+            return Ok(out);
+        }
+        let state: Vec<String> = legs.iter().map(|l| format!("{} attempt {} {} {}", l.get("key").and_then(Value::as_str).unwrap_or_default(), l.get("attempt").and_then(Value::as_i64).unwrap_or(0), l.get("status").and_then(Value::as_str).unwrap_or_default(), l.get("conclusion").and_then(Value::as_str).unwrap_or("-"))).collect();
+        anyhow::ensure!(Instant::now() < deadline, "attempt {attempt} didn't finish: {state:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn says(legs: &[(String, String)], job: &str) -> String {
+    let log = legs.iter().find(|(k, _)| k == job).map(|(_, l)| l.as_str()).unwrap_or_default();
+    ["one", "two"].iter().find(|w| log.contains(&format!("kinds/hello says {w}"))).map_or_else(|| format!("nothing in: {log}"), |w| (*w).to_owned())
+}
+
+/// AC02: a run resolves `kinds/hello@v1` once. Moving the tag while the run is underway doesn't
+/// change what its later legs get, nor what a rerun gets; "rerun with fresh actions" pins it
+/// again and gets the commit the tag names now.
+#[test]
+fn w07_ac02_pins() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src");
+    let hello = |word: &str| format!("name: hello\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"kinds/hello says {word}\"\n");
+    commit(&src.join("kinds/hello"), &[("action.yml", &hello("one"))], Some("v1"))?;
+    let repo = dir.path().join("repo");
+    let s = server_for(dir.path(), &src, &repo)?;
+    // The first job waits, its action already run, until the test has moved the tag.
+    let go = dir.path().join("go");
+    let wf = format!(
+        "on: push\njobs:\n  first:\n    runs-on: local\n    steps:\n      - uses: kinds/hello@v1\n      - run: while [ ! -e '{}' ]; do sleep 0.2; done\n  second:\n    needs: first\n    runs-on: local\n    steps:\n      - uses: kinds/hello@v1\n",
+        go.display()
+    );
+    commit(&repo, &[(".github/workflows/pins.yml", &wf)], None)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let run = loop {
+        let runs = get(s.port, &s.admin, "/api/ci/runs?repo=acme/kinds&limit=5")?;
+        if let Some(id) = runs.pointer("/runs/0/id").and_then(Value::as_str) {
+            let detail = get(s.port, &s.admin, &format!("/api/ci/runs/{id}"))?;
+            let first_running = detail.get("legs").and_then(Value::as_array).into_iter().flatten().any(|l| l.get("key").and_then(Value::as_str) == Some("first") && l.get("status").and_then(Value::as_str) == Some("running"));
+            if first_running {
+                break id.to_owned();
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run never got going: {runs}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    // The tag moves on while the run is underway.
+    commit(&src.join("kinds/hello"), &[("action.yml", &hello("two"))], Some("v1"))?;
+    std::fs::write(&go, "")?;
+    let legs = attempt_logs(&s, &run, 1)?;
+    assert_eq!((says(&legs, "first").as_str(), says(&legs, "second").as_str()), ("one", "one"), "the run's legs keep its pin");
+    // A rerun keeps the run's pins.
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/rerun"), &s.admin, Some(&serde_json::json!({ "mode": "all" })))?;
+    anyhow::ensure!(st == 201, "rerun: {st} {body}");
+    let legs = attempt_logs(&s, &run, 2)?;
+    assert_eq!((says(&legs, "first").as_str(), says(&legs, "second").as_str()), ("one", "one"), "a rerun keeps the run's pins");
+    // Rerun with fresh actions: pinned again, now.
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/rerun"), &s.admin, Some(&serde_json::json!({ "mode": "all", "fresh_actions": true })))?;
+    anyhow::ensure!(st == 201, "rerun with fresh actions: {st} {body}");
+    let legs = attempt_logs(&s, &run, 3)?;
+    assert_eq!((says(&legs, "first").as_str(), says(&legs, "second").as_str()), ("two", "two"), "fresh actions get what the tag names now");
+    Ok(())
+}
+
+/// A kiln action declaring the secret it needs (W07-R11, W09-R07).
+const DEPLOY: &[(&str, &str)] = &[(
+    "action.yml",
+    "name: deploy\nsecrets:\n  DEPLOY_KEY: { required: true, description: \"Key for the deploy host\" }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"deploying with ${{ secrets.DEPLOY_KEY }}\"\n",
+)];
+
+/// AC06: an action declaring a required secret fails the run as it starts (`KCI4040`, saying
+/// where it looked and how to add it) while the secret isn't set, and runs once it is, the
+/// secret there inside it and masked.
+#[test]
+fn w07_ac06_declared_secrets() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src");
+    commit(&src.join("kinds/deploy"), DEPLOY, Some("v1"))?;
+    let repo = dir.path().join("repo");
+    let s = server_for(dir.path(), &src, &repo)?;
+    commit(&repo, &[(".github/workflows/deploy.yml", "on: push\njobs:\n  ship:\n    runs-on: local\n    steps:\n      - uses: kinds/deploy@v1\n")], None)?;
+    let (run, _) = finished(&s, 0)?;
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("startup_failure"), "{run}");
+    let why = run.get("error").and_then(Value::as_str).unwrap_or_default();
+    assert!(why.contains("KCI4040") && why.contains("`kinds/deploy@v1` in job `ship` needs the secret DEPLOY_KEY") && why.contains("kiln secrets set DEPLOY_KEY --scope repo:acme/kinds"), "{why}");
+    let (st, body) = http(s.port, "PUT", "/api/ci/secrets/DEPLOY_KEY?scope=repo:acme/kinds", &s.admin, Some(&serde_json::json!({ "value": "hunter2-deploy-key" })))?;
+    anyhow::ensure!(st < 300, "set the secret: {st} {body}");
+    commit(&repo, &[("README.md", "again\n")], None)?;
+    let (run, legs) = finished(&s, 1)?;
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("success"), "{run}");
+    let leg = legs.first().and_then(|l| l.pointer("/leg/id")).and_then(Value::as_str).unwrap_or_default();
+    let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
+    assert!(log.contains("deploying with ***") && !log.contains("hunter2-deploy-key"), "the action has the secret, masked: {log}");
+    Ok(())
+}
+
 #[test]
 fn w07_ac04_kinds() -> anyhow::Result<()> {
     if !docker_works() {

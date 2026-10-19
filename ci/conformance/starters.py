@@ -91,6 +91,7 @@ KNOWN = {
     "code-scanning_mobsf.yml": "as on GitHub: the pinned mobsfscan requires semgrep 0.50.1, which pip finds nowhere on PyPI now",
     "code-scanning_phpmd.yml": "as on GitHub: setup-php installs PHPMD 3, whose command line the starter's `phpmd ./ sarif …` predates",
     "code-scanning_anchore.yml": "as on GitHub: the pinned scan-action's grype gets its schema's last vulnerability database, a year old, and refuses it",
+    "code-scanning_kubesec.yml": "as on GitHub: the starter's `template: template/sarif.tpl` isn't where kubesec's image keeps it (`/templates/sarif.tpl`), so kubesec renders the name itself as its template, which isn't SARIF",
     "code-scanning_pmd.yml": "as on GitHub Enterprise Server: pmd-github-action asks the API it's given (`GITHUB_API_URL`) for pmd/pmd's latest release, which only github.com has",
     "code-scanning_puppet-lint.yml": "as on GitHub's ubuntu-latest: the pinned setup-ruby v1.146.0 predates Ubuntu 24.04, and Ruby 2.7 isn't built for it",
     "code-scanning_rubocop.yml": "as on GitHub's ubuntu-latest: the pinned setup-ruby v1.146.0 predates Ubuntu 24.04, and Ruby 2.6 isn't built for it",
