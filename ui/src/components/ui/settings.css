@@ -1,0 +1,512 @@
+/* ------------------------------------------------------------------ */
+/* Settings: sections that open and close, groups, rows (settings.tsx). */
+/* One type scale: 15px a section's title, 13px what you read and      */
+/* choose, 12px what explains it, 10.5px the mono eyebrows.            */
+/* ------------------------------------------------------------------ */
+
+@layer components {
+.st {
+  --st-title: 15px;
+  --st-body: 13px;
+  --st-small: 12px;
+  --st-eyebrow: 10.5px;
+  --st-bright: #e1e5e9;
+  --st-text: #c9d0da;
+  --st-muted: #8f99a8;
+  --st-rule: #20262e;
+  --st-control: 34px;
+}
+@media (pointer: coarse) {
+  .st {
+    --st-control: 38px;
+  }
+}
+
+/* Controls read at the size of the words around them. */
+.st .field,
+.st .select select {
+  min-height: var(--st-control);
+}
+.st .field input,
+.st .field select,
+.st .field textarea {
+  min-height: calc(var(--st-control) - 2px);
+  font-size: var(--st-body);
+}
+.st .select select {
+  padding-block: 4px;
+  font-size: var(--st-body);
+}
+.st .field-label {
+  margin-bottom: 6px;
+  color: #aab3c1;
+  font-family: inherit;
+  font-size: var(--st-small);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.st .field-hint {
+  font-size: var(--st-small);
+  color: var(--st-muted);
+}
+.st code {
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+}
+
+/* ---------------------------- search ---------------------------- */
+
+.st-search {
+  margin-bottom: 14px;
+}
+.st-search > svg {
+  flex: none;
+}
+.st-search input::-webkit-search-cancel-button {
+  appearance: none;
+}
+.st-search-clear {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: calc(var(--st-control) - 2px);
+  color: #9499a5;
+}
+.st-search-clear:hover {
+  color: #e3e4e9;
+}
+.st-search-clear:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 70%);
+  outline-offset: -4px;
+  border-radius: 4px;
+}
+
+/* ---------------------------- sections ---------------------------- */
+
+.st-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.st-none {
+  display: none;
+  margin: 8px 2px;
+  color: var(--st-muted);
+  font-size: var(--st-body);
+}
+.st-sections[data-searching]:not(:has(.st-group)) > .st-none {
+  display: block;
+}
+/* Searching: a section none of whose groups matched isn't shown. */
+.st-sections[data-searching] > .st-section:not(:has(.st-group)) {
+  display: none;
+}
+
+/* A section or group a link brings into view clears the header bar over the page. */
+.st-section,
+.st-group {
+  scroll-margin-top: 76px;
+}
+.st-section {
+  position: relative;
+  min-width: 0;
+  border: 1px solid #262c35;
+  border-radius: 9px;
+  background:
+    radial-gradient(ellipse at 0 0, #a4bacc06, transparent 65%),
+    #0a0c0f;
+}
+.st-section[data-open] {
+  border-color: #2e3540;
+}
+/* The spectral rule over an open section, as over a panel. */
+.st-section[data-open]::before {
+  position: absolute;
+  top: 0;
+  left: 16%;
+  right: 16%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #9fbab852, #a7aed05e, #c4a8bd45, transparent);
+  content: "";
+  pointer-events: none;
+}
+.st-section-h {
+  margin: 0;
+  font: inherit;
+}
+.st-section-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 56px;
+  padding: 11px 16px;
+  border-radius: 9px;
+  color: inherit;
+  text-align: left;
+}
+.st-section-head:hover {
+  background: rgb(255 255 255 / 2%);
+}
+.st-section-head:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 70%);
+  outline-offset: -2px;
+}
+.st-index {
+  flex: none;
+  align-self: flex-start;
+  padding-top: 3px;
+  color: #6f7885;
+  font-family: var(--font-mono);
+  font-size: var(--st-eyebrow);
+  letter-spacing: 0.08em;
+}
+.st-section-words {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.st-section-title {
+  color: var(--st-bright);
+  font-size: var(--st-title);
+  font-weight: 450;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+.st-section-about {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.st-section-status {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  color: #d2dce8;
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.st-section-status [data-tone="queued"] {
+  color: #d8c8b0;
+}
+.st-section-status [data-tone="succeeded"] {
+  color: #a8c9bc;
+}
+.st-chev {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: #8f99a8;
+  transition: transform 0.2s var(--ease);
+}
+[data-open] > .st-section-h .st-chev,
+.st-group[data-open] > .st-group-head .st-chev {
+  transform: rotate(180deg);
+}
+.st-section-body {
+  min-width: 0;
+  padding: 0 16px 6px;
+  border-top: 1px solid var(--st-rule);
+}
+
+/* ---------------------------- groups ---------------------------- */
+
+.st-group {
+  min-width: 0;
+  padding: 14px 0;
+  border-top: 1px solid var(--st-rule);
+}
+.st-section-body > .st-group:first-child,
+.st-section-body > :first-child .st-group:first-child {
+  border-top: 0;
+}
+.st-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+.st-group[data-open] > .st-group-head {
+  margin-bottom: 10px;
+}
+.st-group-title {
+  margin: 0;
+  color: #a3aab8;
+  font-family: var(--font-mono);
+  font-size: var(--st-eyebrow);
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  line-height: 1.6;
+  text-transform: uppercase;
+}
+.st-group-about {
+  margin: 3px 0 0;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.st-group-toggle {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  color: inherit;
+  text-align: left;
+}
+.st-group-toggle .st-chev {
+  margin-top: 2px;
+}
+.st-group-toggle:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 70%);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+.st-group-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.st-group-body {
+  min-width: 0;
+}
+
+/* ---------------------------- rows ---------------------------- */
+
+.st-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 24px;
+  min-width: 0;
+  padding: 10px 0;
+  border-top: 1px solid rgb(255 255 255 / 4%);
+}
+.st-group-body > .st-row:first-child,
+.st-group-body > form > .st-row:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.st-row-words {
+  min-width: 0;
+}
+.st-label {
+  display: block;
+  color: var(--st-bright);
+  font-size: var(--st-body);
+  font-weight: 450;
+  line-height: 1.45;
+}
+.st-help {
+  margin: 2px 0 0;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.st-row-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+@media (max-width: 640px) {
+  .st-section-head {
+    gap: 10px;
+    padding: 10px 12px;
+  }
+  .st-section-body {
+    padding: 0 12px 4px;
+  }
+  .st-row:not([data-inline]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .st-row:not([data-inline]) > .st-row-control {
+    justify-content: flex-start;
+  }
+}
+
+/* A short value or fact in a row, in mono: a build, a platform, an address. */
+.st-value {
+  color: var(--st-text);
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+  overflow-wrap: anywhere;
+}
+/* A line of what something says now, under its row or group. */
+.st-note {
+  margin: 8px 0 0;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.st-note[data-tone="error"] {
+  color: #d1aaad;
+}
+/* Facts (a build's, a session's): label over value, compact. */
+.st .facts {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px 20px;
+}
+.st .facts > div {
+  padding-top: 0;
+  border-top: 0;
+}
+.st .facts dt {
+  margin-bottom: 2px;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+}
+.st .facts dd {
+  font-size: var(--st-small);
+}
+/* A list of items in a group (registries, accounts, images, binaries), a row each. */
+.st-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.st-list > li {
+  min-width: 0;
+  padding: 10px 0;
+  border-top: 1px solid rgb(255 255 255 / 4%);
+}
+.st-list > li:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.st-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  min-width: 0;
+}
+.st-item-name {
+  color: var(--st-bright);
+  font-size: var(--st-body);
+  font-weight: 450;
+  overflow-wrap: anywhere;
+}
+.st-item-meta {
+  min-width: 0;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  overflow-wrap: anywhere;
+}
+.st-item-meta.mono {
+  font-family: var(--font-mono);
+}
+.st-item-acts {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+/* A form opened in a group (adding a registry, an account): fields side by side as they fit. */
+.st-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid #262c35;
+  border-radius: 8px;
+}
+.st-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 12px;
+}
+.st-row + .st-fields {
+  margin-top: 10px;
+}
+.st-form-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+/* A field that takes a link or a name: as wide as it needs, the whole row on a phone. */
+.st-wide {
+  width: min(100%, 300px);
+}
+@media (max-width: 640px) {
+  .st-wide {
+    flex: 1 1 200px;
+    width: auto;
+  }
+}
+/* The password and its repeat side by side, the button after them; stacked on a phone. */
+.st-password {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+.st-password-go {
+  margin-bottom: 1px;
+}
+@media (max-width: 640px) {
+  .st-password {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .st-password-go {
+    justify-self: start;
+  }
+}
+/* An item that is one setting (an image and where it lives): the item's row is the setting's row. */
+.st-list > li > .st-row {
+  padding: 0;
+  border-top: 0;
+}
+/* What a cloud needs to trust kiln, under the account being added. */
+.st-trust {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: rgb(255 255 255 / 3%);
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.6;
+}
+.st-trust p {
+  margin: 0;
+}
+.st-trust code {
+  color: #c9ccd3;
+  overflow-wrap: anywhere;
+}
+/* A number of minutes and its unit. */
+.st-num {
+  width: 110px;
+}
+.st-num input {
+  text-align: right;
+}
+.st-num > span {
+  padding-right: 10px;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+}
+}
