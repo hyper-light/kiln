@@ -183,7 +183,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
-| W12 | Registries | W08 (store) | blocked (W08) | |
+| W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches with an offline fallback |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); review UI and REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
@@ -2921,7 +2921,43 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   and to GHCR and Docker Hub with tokens, and the credentials are gone after the leg. *E2E against
   test tenants, user-assisted.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.* R01, kiln's OCI registry (`crates/kiln/src/ci/registry/`), at `/v2/` on the main origin
+  and on `[ci.registry] listen`:
+  - the Distribution Specification v1.1's pull, push (monolithic and chunked uploads, a chunk out
+    of order refused, cross-repository mounts), content discovery (tags in pages, the referrers
+    API and its `artifactType` filter, the catalog) and content management (deleting tags,
+    manifests and blobs);
+  - blobs in the content-addressed store (W08), so a layer kiln has in a cache, an artifact or
+    another repository is stored once; manifests, tags and uploads in SQLite; a manifest whose
+    blobs (an index: whose manifests) aren't there is refused;
+  - Docker's token authentication (`/v2/token`): PATs, agents' and jobs' tokens (a job pushes where
+    `packages: write` lets it, in its own repository's names); pull is `artifacts.read`, push and
+    delete `artifacts.write`, where the name lives; anonymous pull opt-in by namespace;
+  - an hourly collection: uploads left a day, blobs no manifest of their repository uses (the
+    store then frees what nothing else uses).
+  - Checked against the spec's four parts (`w12_ac01_conformance`), and with the OCI
+    distribution-spec conformance suite itself, v1.1.1 (`w12_ac01_official_suite`, with
+    `KILN_OCI_CONFORMANCE` naming its `go test -c` binary): 76 of its 80 specs run and pass; the
+    other four are its alternatives for a registry set up beforehand, for automatic mounts, and for
+    a mount that didn't happen (kiln's did).
+- *Done.* R07: a tag pushed or moved is a `registry_package` event (`published`, `updated`) on the
+  hub, and for the workflows of the repository the name is under, with the package in
+  `github.event.registry_package` (`w12_r07_registry_package`).
+- *Done.* R02, pull-through caches (`[[ci.registry.mirrors]]`), for any upstream: a manifest by
+  digest, or a blob, comes from the upstream once and from kiln after; a tag is asked again after
+  `tag_ttl`; under a prefix (`/v2/docker.io/library/alpine/…`, containerd's `hosts.toml` with
+  `override_path`) and at the root of a mirror's own `listen` (Docker's `registry-mirrors`);
+  anyone signed in pulls (anyone at all with `anonymous`), no one pushes. R06: an upstream out of
+  reach is answered with kiln's copy and a `Warning` saying so. Checked against a fake upstream
+  with Docker's token challenge and a redirect to storage (`w12_ac02_pull_through`): the second
+  pull asks the upstream for no blob.
+- *Left.* R02's runners pulling through the mirrors by themselves (Docker's `registry-mirrors`,
+  containerd's `hosts.toml`, shards' settings, Firecracker's root file systems); R03, jobs'
+  OCI credentials (kiln's own registry by the job token, federation for ECR, Artifact Registry and
+  ACR, tokens for the rest); R04, the package registries' configuration, caching proxies and
+  publishing; R05, private registries as upstreams and targets; AC03 and AC04.
 
 ### W13 Runners and executors
 
@@ -5077,6 +5113,14 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/incidents?repo=&state=` · `/api/incidents/:id` | `incidents.*` | runs.read | W20 |
 | POST | `/api/runs/:id/bisect` | `ci.runs.bisect` | runs.trigger | W20 |
 | POST · GET · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` | `experiments.*` | experiments.run | W20 |
+| GET · PUT | `/api/ci/repos/:repo/providers` | `ci.providers.get`, `.set` (`{ providers }`: what its CI runs on) | runs.read · settings.manage | W23 |
+| POST | `/api/ci/repos/:repo/providers/sync` | `ci.providers.sync` (other providers' runs, looked at now) | runs.read | W23 |
+| GET | `/api/ci/repos/:repo/providers/workflows` | `ci.providers.workflows` (each provider's CI files, checked) | runs.read | W23 |
+| GET | `/api/ci/repos/:repo/commits/:sha/checks` | `ci.providers.checks` (every provider's runs of a commit) | runs.read | W23 |
+| GET | `/api/ci/runs/:id/pending` · `/api/ci/runs/:id/artifacts/:artifact/download` | `ci.runs.pending`, `ci.runs.artifact` (whichever provider's run) | runs.read · artifacts.read | W23 |
+| GET · POST | `/api/ci/repos/:repo/pulls[/:n]` · `/:n/{comments,reviews,merge}` | `host.pulls.*` (GitHub's, GitLab's and Bitbucket's; as the person when they signed in with that host) | diffs.read · diffs.review · diffs.land | W23 |
+| POST | `/api/hooks/gitlab` · `/api/hooks/bitbucket` | GitLab's and Bitbucket's webhooks | open, their secret | W23 |
+| GET | `/api/auth/sso` · `/api/auth/:provider/{start,callback}` | SSO with GitHub, GitLab and Bitbucket | open | W23 |
 
 GitHub-compatible runtime services (W08, W10), the facade (W14) and the registry (W12) are listed
 in §2.6; they are not part of the route table's public API but are authenticated by the same
@@ -5108,6 +5152,7 @@ kiln clone · submit · sync · land [D…] [--strategy S] · diffs · cr open �
 kiln metrics criterion|hyperfine|gobench|pytest-benchmark|gbench|k6 PATH
 kiln store verify|gc                    kiln ci bench [--scheduler|--expr|--parse|--cache|--logs]
 kiln tokens create|list|revoke          kiln login
+kiln repo provider <repo> [provider…]
 ```
 
 ### 4.4 MCP names

@@ -90,6 +90,15 @@ pub struct Ci {
     /// workspaces = ["acme"]
     /// ```
     pub bitbucket: Option<BitbucketHost>,
+    /// `[ci.registry]`: kiln's own OCI registry at `/v2/` (docs/ci.md W12-R01).
+    ///
+    /// ```toml
+    /// [ci.registry]
+    /// listen = "0.0.0.0:5000"            # its own address too (the main origin serves it as well)
+    /// anonymous_pull = ["acme/public"]   # namespaces anyone may pull
+    /// max_blob = 21474836480             # bytes a blob may have (20 GiB)
+    /// ```
+    pub registry: Registry,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
     ///
     /// ```toml
@@ -169,6 +178,62 @@ impl Default for BitbucketHost {
             webhook_secret_file: None,
             workspaces: Vec::new(),
         }
+    }
+}
+
+/// kiln's OCI registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Registry {
+    /// An address of its own (`0.0.0.0:5000`), beside the main origin's `/v2/`.
+    pub listen: Option<String>,
+    /// Namespaces (`acme`, `acme/public`; `*`: all) anyone may pull from, without signing in.
+    pub anonymous_pull: Vec<String>,
+    /// The biggest blob, in bytes (20 GiB by default).
+    pub max_blob: Option<u64>,
+    /// `[[ci.registry.mirrors]]`: pull-through caches of other registries (docs/ci.md W12-R02).
+    ///
+    /// ```toml
+    /// [[ci.registry.mirrors]]
+    /// upstream = "docker.io"            # ghcr.io, quay.io, gcr.io, us-docker.pkg.dev, public.ecr.aws, mcr.microsoft.com, registry.k8s.io, …
+    /// listen = "0.0.0.0:5001"           # Docker's registry-mirrors (Docker Hub) pull here, at the root
+    /// anonymous = true                  # pulls without signing in (a public upstream's)
+    /// username = "kiln"                 # the upstream's credentials (Docker Hub's pull limits)
+    /// password_file = "/etc/kiln/dockerhub-token"
+    /// ```
+    pub mirrors: Vec<Mirror>,
+}
+
+/// A registry kiln pulls through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mirror {
+    /// The upstream, as image references name it (`docker.io`, `ghcr.io`).
+    pub upstream: String,
+    /// Its API, when not the upstream's own (`https://<upstream>`; Docker Hub's is known).
+    pub url: Option<String>,
+    /// Names through kiln start with this (default: the upstream): `/v2/docker.io/library/alpine/…`.
+    pub prefix: Option<String>,
+    /// An address serving it at the root, for Docker's `registry-mirrors`.
+    pub listen: Option<String>,
+    /// Anyone may pull through it, without signing in.
+    pub anonymous: bool,
+    pub username: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
+    /// Seconds a tag is trusted before asking the upstream again (300).
+    pub tag_ttl: Option<u64>,
+}
+
+impl Mirror {
+    /// The names' prefix through kiln.
+    pub fn prefix(&self) -> String {
+        self.prefix.clone().unwrap_or_else(|| self.upstream.clone()).trim_matches('/').to_owned()
+    }
+}
+
+impl Registry {
+    pub fn max_blob_bytes(&self) -> u64 {
+        self.max_blob.unwrap_or(20 << 30)
     }
 }
 

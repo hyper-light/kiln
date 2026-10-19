@@ -173,6 +173,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let seg = segments(&path);
     let s: Vec<&str> = seg.iter().map(String::as_str).collect();
 
+    // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
+    // of its own (an upload streams for as long as it takes).
+    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
+        let h = Arc::clone(&hub);
+        return crate::rt::spawn(async move { crate::ci::registry::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
+    }
+
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
         (&Method::POST, ["api", "mcp"]) => {

@@ -245,7 +245,8 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
                    AND digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
                    AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
                    AND digest NOT IN (SELECT object FROM ci_release_assets)
-                   AND digest NOT IN (SELECT object FROM test_reports)",
+                   AND digest NOT IN (SELECT object FROM test_reports)
+                   AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)",
                 params![now - grace],
             )?;
             let mut used = HashSet::new();
