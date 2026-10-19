@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -2052,6 +2052,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             intake.heard(SERVER_PEER, "server", json, data);
                         }
                     }
+                    ServerMsg::HarnessFileRead { req, session: _, path, offset, len } => {
+                        // A file one of its sessions' messages mentions, for whoever views it: a
+                        // piece, read off this loop, sent on the files' own lane.
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let read = crate::rt::blocking(move || crate::harness::files::read(&path, offset, len)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
+                            let json = serde_json::to_string(&crate::harness::files::Answer::of(&read)).unwrap_or_default();
+                            let data = read.map(|(_, d)| d).unwrap_or_default();
+                            let _ = up.send(Up::File(AgentMsg::HarnessFileData { req, json, data })).await;
+                        });
+                    }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
                         let up = uplink.0.clone();
@@ -2280,11 +2291,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
+                    Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.

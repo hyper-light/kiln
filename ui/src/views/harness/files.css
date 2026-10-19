@@ -1,0 +1,212 @@
+/* Files a message mentions (files.tsx), in the console's voice: a quiet mono chip in the words that
+   opens in place, and pictures at their own size, bounded to the column and a screen's height.
+   Nothing here changes size as it loads: a picture's box comes from its kept width and height. */
+
+.mf {
+  display: inline;
+}
+.mf-plain {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+
+/* ---------------------------------------------------------------- the chip */
+.mf-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  height: 24px;
+  margin: 0 1px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid #2b2d32;
+  border-radius: 6px;
+  background: #101114;
+  color: #c3c8d2;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 22px;
+  vertical-align: 1px;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.hx-prose a.mf-chip {
+  color: #c3c8d2;
+  text-decoration: none;
+}
+/* 40px to tap, without taking more room in the line. */
+.mf-chip::before {
+  position: absolute;
+  inset: -8px -2px;
+  content: "";
+}
+.mf-chip > svg {
+  flex: none;
+  color: #8f929b;
+}
+.mf-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mf-size {
+  flex: none;
+  color: #7b7e88;
+}
+.mf[data-open] > .mf-chip {
+  border-color: #55545e;
+  color: var(--color-bright);
+}
+.mf-chip:focus-visible,
+.mf-picture-tap:focus-visible,
+.mf-open:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+.mf-chip:disabled {
+  cursor: default;
+  color: #7b7e88;
+}
+@media (hover: hover) {
+  .mf-chip:not(:disabled):hover,
+  .hx-prose a.mf-chip:hover {
+    border-color: #55545e;
+    color: var(--color-bright);
+  }
+}
+
+/* ---------------------------------------------------------------- what a chip opens */
+.mf-opened {
+  display: block;
+  margin: 8px 0 4px;
+}
+/* A picture or a recording whose size is known (--w, --h) takes its box before a byte of it comes:
+   as wide as the column, its own width, or what a screen's height allows, whichever is least. */
+.mf-opened > img,
+.mf-opened > video {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: min(70dvh, 640px);
+  border: 1px solid #1d1f23;
+  border-radius: 6px;
+  background: #0c0d10;
+}
+.mf-opened > audio {
+  display: block;
+  width: min(100%, 420px);
+  height: 40px;
+}
+.mf-text {
+  max-height: min(60dvh, 520px);
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid #1d1f23;
+  border-radius: 6px;
+  background: #0c0d10;
+}
+.mf-pre {
+  display: block;
+  color: #d2d4da;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mf-note {
+  display: block;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- a picture the message shows */
+.mf-picture {
+  display: block;
+  margin: 8px 0 2px;
+}
+/* The picture's box is its button's, taken from its known size (--w, --h) before a byte of it comes:
+   as wide as the column, its own width, or what a screen's height allows, whichever is least. */
+.mf-picture-tap {
+  display: block;
+  width: min(100%, calc(var(--w) * 1px), calc(min(70dvh, 640px) * var(--w) / var(--h)));
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+  -webkit-tap-highlight-color: transparent;
+}
+.mf-picture[data-whole] .mf-picture-tap {
+  cursor: zoom-out;
+}
+.mf-opened > [style*="--w"] {
+  width: min(100%, calc(var(--w) * 1px), calc(min(70dvh, 640px) * var(--w) / var(--h)));
+  max-width: none;
+  max-height: none;
+  aspect-ratio: var(--w) / var(--h);
+}
+.mf-picture img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: var(--w) / var(--h);
+  border: 1px solid #1d1f23;
+  border-radius: 6px;
+  background: #0c0d10;
+}
+.mf-picture[data-whole] .mf-picture-tap {
+  width: min(100%, calc(var(--w) * 1px));
+}
+.mf-caption {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 4px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.mf-caption > * {
+  flex: none;
+}
+.mf-caption-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mf-open {
+  position: relative;
+  display: inline-flex;
+  color: #8f929b;
+}
+.mf-open::before {
+  position: absolute;
+  inset: -12px;
+  content: "";
+}
+@media (hover: hover) {
+  .mf-open:hover {
+    color: var(--color-bright);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mf-chip {
+    transition: none;
+  }
+}
+:root[data-motion="paused"] .mf-chip {
+  transition: none;
+}

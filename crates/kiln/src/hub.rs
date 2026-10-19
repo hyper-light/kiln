@@ -158,6 +158,8 @@ pub struct Hub {
     /// Transcript requests waiting for their machine's answer, by request number.
     ai_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<Option<String>>>>,
     ai_seq: AtomicU64,
+    /// File reads (`crate::harness::files`) waiting for their machine's answer: its JSON and bytes.
+    file_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<(String, Vec<u8>)>>>,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Launch>>,
@@ -245,6 +247,7 @@ impl Hub {
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
+            file_requests: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             launching: Mutex::new(HashMap::new()),
@@ -549,6 +552,37 @@ impl Hub {
         }
     }
 
+    /// A piece of a file on a machine, for whoever views agent session `session` there
+    /// (`crate::harness::files`): its answer's JSON and the bytes. Asked of the runner process
+    /// holding the session; `Ok(None)` when that one doesn't read files ([`proto::CAP_FILES`]).
+    pub async fn harness_file_read(&self, machine: &str, session: &str, path: &str, offset: u64, len: u32) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        /// A piece may be a megabyte from a machine on a slow link.
+        const WAIT: Duration = Duration::from_secs(30);
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let msg = ServerMsg::HarnessFileRead { req, session: session.to_owned(), path: path.to_owned(), offset, len };
+        let peer = {
+            let mut inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            let to = inst.route(machine, &msg);
+            to.filter(|p| inst.get(*p).is_some_and(|i| i.caps & proto::CAP_FILES != 0))
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let frame = proto::encode(&msg)?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.file_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(WAIT, rx).await.ok() } else { None };
+        self.file_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(a)) => Ok(Some(a)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
     /// Ask machine `machine` something by its newest runner process announcing `cap` (`msg` given
     /// the question's number), and wait up to `wait` for its [`AgentMsg::Answer`]. `Ok(None)`: no
     /// process of it announces `cap` (its kiln is too old); `Ok(Some(json))`: what it answered.
@@ -755,8 +789,9 @@ impl Hub {
                     }
                 }
             }
-            // Bulk frames are job output, but on the conversation feed's lane (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO => {
+            // Bulk frames are job output, but on the conversation feed's and the files' lanes
+            // (messages, in bulk).
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
                 let chunk: proto::LogChunk = proto::decode(&data)?;
                 if self.owns_job(peer, &chunk.job) {
                     self.logs.append(&chunk.job, chunk.idx, &chunk.data);
@@ -999,6 +1034,11 @@ impl Hub {
             AgentMsg::DirList { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(Some(json));
+                }
+            }
+            AgentMsg::HarnessFileData { req, json, data } => {
+                if let Some(tx) = self.file_requests.lock().remove(&req) {
+                    let _ = tx.send((json, data));
                 }
             }
             AgentMsg::Build { build, caps } => {

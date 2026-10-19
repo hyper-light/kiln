@@ -2237,13 +2237,14 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_ACTIONS
     | crate::proto::CAP_REACH
     | crate::proto::CAP_JOB_TTY
+    | crate::proto::CAP_FILES
     | crate::proto::CAP_POOLS;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
 /// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,
 /// repo copies or reach.
 pub const OUTPOST_CAPS: u32 =
-    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP;
+    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP | crate::proto::CAP_FILES;
 
 /// An outpost's [`AgentMsg::Build`].
 pub fn outpost_build() -> AgentMsg {

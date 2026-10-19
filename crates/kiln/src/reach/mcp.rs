@@ -57,7 +57,9 @@ in that machine's home folder). `runners` lists the machines, best first. Long c
 (background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
 `agents_start` them with a clear brief, `agents_wait` for them and read what they concluded with `agents_result`: \
 they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
-skill says how)."
+skill says how). To show the person a file from this machine (a screenshot, a recording, a PDF, a log), write its full \
+path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \
+shows it in the conversation and keeps a copy, so it still shows after the file goes."
         .to_owned();
     if !machines.is_empty() {
         s.push_str(&format!(" This kiln's machines: {machines}."));
