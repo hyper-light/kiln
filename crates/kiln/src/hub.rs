@@ -976,6 +976,7 @@ impl Hub {
                 }
                 if caps & proto::CAP_CONVO != 0 {
                     self.mirrors_seen();
+                    self.harness.restore_due(self, &agent);
                 }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
@@ -987,9 +988,19 @@ impl Hub {
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Convo { json, data } => {
-                // About the server's own store: a mirror's answer. Else the runner's own store's feed.
+                // About the server's own store: a mirror's answer. A mirror's copy sent back to
+                // restore it from, when asked for. Else the runner's own store's feed.
                 let msg = crate::convo::feed::decode(&json);
                 match (&self.harness.copies, msg) {
+                    (_, Some(crate::convo::feed::Msg::Hello { store, restore: true })) => {
+                        if self.harness.restore_accepts(&agent, &store)
+                            && let Some(f) = &self.harness.feed
+                        {
+                            f.accept_restore(&store);
+                            f.heard(peer, &agent, json, data);
+                        }
+                    }
+                    (_, Some(crate::convo::feed::Msg::Restored { store, .. })) => self.harness.restore_done(self, &agent, &store),
                     (Some(m), Some(msg)) if msg.store() == m.store_id() => m.heard(&agent, msg),
                     _ => {
                         if let Some(f) = &self.harness.feed {
