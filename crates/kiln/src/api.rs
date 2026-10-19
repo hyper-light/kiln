@@ -2882,6 +2882,10 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
+    // Who started an agent, and the plan run it works for, are kiln's to say (`agents.start`,
+    // `plans.run`), never what's asked.
+    body.spec.parent = None;
+    body.spec.plan_run = None;
     // Agents run programs as the machine's user, like terminals: the same switch governs both.
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));

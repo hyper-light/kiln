@@ -72,6 +72,13 @@ pub struct Spec {
     /// otherwise (a runner's name, or `linux/amd64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<String>,
+    /// The agent that started it (`harness::lineage`): kiln sets it from who asked, never from
+    /// what was asked (`POST /api/harness/sessions` drops it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_run: Option<String>,
 }
 
 fn yes() -> bool {
@@ -102,6 +109,8 @@ impl Default for Spec {
             takeover_pid: None,
             takeover_stop: false,
             reach: None,
+            parent: None,
+            plan_run: None,
         }
     }
 }
@@ -213,6 +222,16 @@ pub struct Info {
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The agent that started it (as `Spec::parent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The plan run it does a step of (as `Spec::plan_run`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_run: Option<String>,
+    /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
+    /// an agent it starts can't have it either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_bypass: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -722,6 +741,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         keep_off: false,
         move_on_limit: false,
         pause_at: None,
+        parent: spec.parent.clone(),
+        plan_run: spec.plan_run.clone(),
+        no_bypass: !spec.allow_bypass,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -2299,6 +2321,9 @@ mod tests {
             keep_off: false,
             move_on_limit: false,
             pause_at: None,
+            parent: None,
+            plan_run: None,
+            no_bypass: false,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

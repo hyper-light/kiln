@@ -948,6 +948,9 @@ impl Registry {
                         keep_off: false,
                         move_on_limit: false,
                         pause_at: None,
+                        parent: spec.parent.clone(),
+                        plan_run: spec.plan_run.clone(),
+                        no_bypass: !spec.allow_bypass,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);

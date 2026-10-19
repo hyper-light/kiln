@@ -84,6 +84,10 @@ pub fn package(store: &Store, id: &str, from: &str, to: &str, cwd: Option<&str>)
         mode: non_empty(&state.mode),
         effort: non_empty(&state.effort),
         reach: state.reach.clone(),
+        // Who started it, and the plan run it works for, go along; so does a ceiling it had.
+        parent: info.parent.clone(),
+        plan_run: info.plan_run.clone(),
+        allow_bypass: !info.no_bypass,
         ..Spec::default()
     };
     Ok(moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state))
