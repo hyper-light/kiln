@@ -187,6 +187,26 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             };
         }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
+        // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
+        (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &crate::authz::sso::providers(&hub).await)),
+        (&Method::GET, ["api", "auth", provider, "start"]) => {
+            let q = srv::query(&req);
+            return match crate::authz::sso::start(&hub, provider, q.get("return").map(String::as_str)).await {
+                Ok(to) => Ok(srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &to)),
+                Err((c, m)) => Err(err(c, m)),
+            };
+        }
+        (&Method::GET, ["api", "auth", provider, "callback"]) => {
+            let q = srv::query(&req);
+            let (code, state) = (q.get("code").cloned().unwrap_or_default(), q.get("state").cloned().unwrap_or_default());
+            return match crate::authz::sso::callback(&hub, provider, &code, &state).await {
+                Ok((session, _, back)) => {
+                    let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &back);
+                    Ok(srv::with_header(r, header::SET_COOKIE, &cookie_for(&session, is_secure(&hub, &req))))
+                }
+                Err((c, m)) => Err(err(c, m)),
+            };
+        }
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
         (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,

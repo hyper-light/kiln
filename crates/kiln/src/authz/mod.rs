@@ -16,6 +16,7 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod sso;
 pub mod tokens;
 
 use std::collections::HashMap;

@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 pub mod ci;
+pub mod sso;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -30,6 +31,8 @@ pub struct Config {
     pub cd: Cd,
     /// CI (docs/ci.md).
     pub ci: ci::Ci,
+    /// Signing in with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
+    pub sso: sso::Sso,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
     pub conversations: Conversations,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and

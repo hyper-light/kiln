@@ -194,7 +194,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal) |
-| W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub); the provider core; GitHub Actions (runs, logs, rerun, cancel, dispatch); events for agents |
+| W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub); the provider core; GitHub Actions (runs, logs, rerun, cancel, dispatch); events for agents; SSO with GitHub, GitLab and Bitbucket |
 
 ---
 
@@ -4920,11 +4920,24 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
 - *Done.* For agents (the agentic work's C and K, which builds on it): who an agent's diff is for
   (`author_for`), and events for comments, reviews, a diff version's finished runs (`diff_run`,
   with the failed legs' excerpts) and the land queue (`queue`).
+- *Done.* R08's SSO (`crates/kiln/src/authz/sso.rs`, `[sso.github]`, `[sso.gitlab]`,
+  `[sso.bitbucket]`):
+  - sign-in with OAuth 2's code flow (`/api/auth/:provider/start`, `/callback`; the providers at
+    `/api/auth/sso` for the sign-in page), states used once, the way back always kiln's own;
+  - the host's API says who signed in (a stable id, a verified email) and what they belong to:
+    GitHub's organizations and teams, GitLab's groups, Bitbucket's workspaces;
+  - sign-in limited to `allowed` memberships;
+  - the kiln user: the linked account's, else the verified email's (users now have one), else a
+    new one where `create_users` allows;
+  - `grants` by membership, given at each sign-in and taken back when it's gone;
+  - the host's token kept sealed with the linked account, for acting on the host as the person;
+  - GitHub's falls back to the App's OAuth client when the manifest flow made one.
+  - Checked against a fake of all three (`w23_r08_sso`).
 - *Who builds what.* The review pages (W14-R06, AC06; R06 here) are the agentic work's, under
   W21's rules, against W14's APIs.
 - *Left.* Artifacts and approvals from providers (R01); GitLab CI/CD and Bitbucket Pipelines and
-  their hosts (R04, R05); pull requests from other hosts in the review pages (R06); SSO (R08);
-  AC01 to AC03.
+  their hosts (R04, R05); pull requests from other hosts in the review pages (R06); acting on the
+  host as the signed-in person (R08's last part); AC01 to AC03.
 
 ## 4. API, events, CLI and MCP reference
 

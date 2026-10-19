@@ -197,7 +197,19 @@ jobs:
     git(&work, &["commit", "-qm", "first"])?;
     git(&work, &["push", "-q", &gh.join("acme/app.git").to_string_lossy(), "HEAD:main"])?;
     let port = free_port()?;
-    let daemon = Command::new("git").args(["daemon", "--reuseaddr", "--export-all", &format!("--port={port}"), "--listen=127.0.0.1"]).arg(format!("--base-path={}", gh.display())).arg(&gh).spawn()?;
+    // The daemon dies with this test, however it ends (`setpriv --pdeathsig`, where there is one).
+    // `git daemon` would run it as a child that outlives a killed `git`: git-daemon itself.
+    let exec_path = String::from_utf8(Command::new("git").arg("--exec-path").output()?.stdout)?.trim().to_owned();
+    let git_daemon = Path::new(&exec_path).join("git-daemon");
+    let tied = Command::new("setpriv").arg("--help").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("pdeathsig"));
+    let mut cmd = if tied {
+        let mut c = Command::new("setpriv");
+        c.args(["--pdeathsig", "KILL"]).arg(&git_daemon);
+        c
+    } else {
+        Command::new(&git_daemon)
+    };
+    let daemon = cmd.args(["--reuseaddr", "--export-all", &format!("--port={port}"), "--listen=127.0.0.1"]).arg(format!("--base-path={}", gh.display())).arg(&gh).spawn()?;
     let _daemon = Daemon(daemon);
     std::thread::sleep(Duration::from_millis(500));
 
