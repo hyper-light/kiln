@@ -38,6 +38,11 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("run.cancelled", "a run was cancelled"),
     ("approval.waiting", "a run waits for a reviewer to deploy to an environment"),
     ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),
+    // An agent's notes (docs/agentic.md N2, `crate::push`), as people's devices get them.
+    ("agent.needs_you", "an agent waits on a person: an approval, a question or a plan"),
+    ("agent.finished", "an agent's turn ended (not stopped by a person)"),
+    ("agent.stopped", "an agent crashed or couldn't start"),
+    ("agent.paused", "an agent reached a usage limit and waits for it to reset"),
 ];
 
 /// Sent only when named: they come too often for `*`.
@@ -347,5 +352,8 @@ mod tests {
         assert!(in_scope(&all, None) && !in_scope(&sub("org:acme", json!(["*"])), None), "events about no repository go to server-wide subscriptions only");
         assert!(check_events(&json!({ "events": "run, job" })).is_ok() && check_events(&json!({ "events": ["*"] })).is_ok() && check_events(&json!({})).is_ok());
         assert!(check_events(&json!({ "events": "run, sample" })).is_err() && check_events(&json!({ "events": 3 })).is_err());
+        // An agent's notes (N2): named, or with `*`; about no repository, so server-wide only.
+        assert!(takes(&wanted(&json!({ "events": "agent.needs_you" })), "agent.needs_you") && takes(&wanted(&all.config), "agent.finished"));
+        assert!(check_events(&json!({ "events": ["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"] })).is_ok());
     }
 }

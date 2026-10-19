@@ -82,10 +82,87 @@ export interface PlanVersion {
 export interface PlanRun {
   id: string;
   version: number;
+  /** The agent it went to (empty for one agent per step). */
   session: string;
-  mode: "message" | "steps" | "goals";
+  mode: "message" | "steps" | "goals" | "agents";
   at: number;
   by: string;
+  /** One agent per step: how the run stands. */
+  state?: "running" | "stopped" | "done";
+}
+
+/** One agent per step: a run, started. */
+export interface PlanStarted {
+  run: string;
+  steps: number;
+  /** Said of how its steps run (asked side by side, they run one at a time for now). */
+  note?: string | null;
+}
+
+/** Where a step of a run stands. */
+export type StepStand = "waiting" | "working" | "needs_you" | "yours" | "met" | "unmet" | "stopped";
+
+/** An agent, as the `agents.*` operations show it. */
+export interface AgentBrief {
+  id: string;
+  name: string;
+  kind: string;
+  machine: string;
+  cwd: string;
+  status: string;
+  stand: string;
+  mode: string;
+  summary: string;
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  cost_usd: number;
+  doing?: string;
+  needs?: { id: string; tool: string; tool_name: string; title: string }[];
+}
+
+/** One step of a run of one agent per step. */
+export interface RunStep {
+  /** Its number, from 1. */
+  n: number;
+  title: string;
+  /** What its agent is held to. */
+  goal: string;
+  stand: StepStand;
+  agent: AgentBrief | null;
+  agent_id: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+  reason: string | null;
+  tries: number;
+}
+
+/** A run of one agent per step, as it stands. */
+export interface PlanRunView {
+  id: string;
+  plan: string;
+  title: string;
+  version: number;
+  state: "running" | "stopped" | "done";
+  reason: string | null;
+  note: string | null;
+  at: number;
+  ended_at: number | null;
+  by: string;
+  steps: RunStep[];
+  met: number;
+  total: number;
+}
+
+/** A run of one agent per step, as lists show it. */
+export interface PlanRunBrief {
+  id: string;
+  plan: string;
+  title: string;
+  state: "running" | "stopped" | "done";
+  met: number;
+  total: number;
+  at: number;
 }
 
 export interface PlanRan {
@@ -103,8 +180,8 @@ export interface SharedPlan {
   updated_at: number;
 }
 
-/** How a plan runs: as one message, a message a step, or a goal a step (the agent's goal stack). */
-export type PlanMode = "message" | "steps" | "goals";
+/** How a plan runs: as one message, a message a step, a goal a step (the agent's goal stack), or an agent a step. */
+export type PlanMode = "message" | "steps" | "goals" | "agents";
 
 export type PlanRunTarget = { session: string } | { new: { target: string; kind: string; cwd?: string } };
 
@@ -119,11 +196,20 @@ export const plansApi = {
   versions: (id: string, signal?: AbortSignal) => request<PlanVersion[]>("GET", `/api/plans/${enc(id)}/versions`, undefined, { signal }),
   runs: (id: string, signal?: AbortSignal) => request<PlanRun[]>("GET", `/api/plans/${enc(id)}/runs`, undefined, { signal }),
   restore: (id: string, version: number) => request<Plan>("POST", `/api/plans/${enc(id)}/restore`, { version }),
-  run: (id: string, target: PlanRunTarget, mode: PlanMode) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode }),
+  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode }),
+  /** One agent per step, on the machine and harness given, one after another. */
+  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }) => request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents" }),
+  /** Runs of one agent per step (`active`: those under way). */
+  agentRuns: (active: boolean, signal?: AbortSignal) => request<{ runs: PlanRunBrief[] }>("GET", `/api/plans/runs${active ? "?active=1" : ""}`, undefined, { signal }),
+  runView: (run: string, signal?: AbortSignal) => request<PlanRunView>("GET", `/api/plans/runs/${enc(run)}`, undefined, { signal }),
+  stopRun: (run: string) => request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/stop`),
+  /** Retry a step with a new agent; take it over (kiln stops holding its agent to it); or say it's met. */
+  step: (run: string, n: number, act: "retry" | "take" | "met") => request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`),
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };
 
 export const planHref = (id: string) => `/agents/plans/${enc(id)}`;
+export const runHref = (run: string) => `/agents/plans/runs/${enc(run)}`;
 /** A shared plan's link, through this address or another of the server's (`https://kiln.dev`, …). */
 export const shareUrl = (token: string, base = window.location.origin) => `${base.replace(/\/+$/, "")}/shared/plans/${enc(token)}`;

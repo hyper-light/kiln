@@ -87,6 +87,33 @@ fn ran_of(sys: &sysinfo::System, pid: sysinfo::Pid) -> Option<Ran> {
 /// exited under what it left running).
 pub const MARK: &str = "KILN_AGENT";
 
+/// The agent session process `pid` belongs to, of `sessions` (each with its harness's process):
+/// the one whose harness is that process or one of its ancestors, else the one its environment
+/// marks it as ([`MARK`]). `None`: none of them (a person's shell). Blocking.
+pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String> {
+    use sysinfo::Pid;
+    if sessions.is_empty() {
+        return None;
+    }
+    let sys = system(None);
+    let mut at = Pid::from_u32(pid);
+    // Up the tree: a tool's command runs under its harness.
+    for _ in 0..64 {
+        if let Some((id, _)) = sessions.iter().find(|(_, h)| *h == Some(at.as_u32())) {
+            return Some(id.clone());
+        }
+        match sys.process(at).and_then(sysinfo::Process::parent) {
+            Some(p) if p != at => at = p,
+            _ => break,
+        }
+    }
+    // Started by one and parented elsewhere since (it daemonized): its mark says whose it is.
+    let env = refreshed(Some(&[pid]), true);
+    let prefix = format!("{MARK}=");
+    let marked = env.process(Pid::from_u32(pid))?.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str())).map(str::to_owned))?;
+    sessions.iter().any(|(id, _)| *id == marked).then_some(marked)
+}
+
 /// What one look at a session's processes found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Seen {

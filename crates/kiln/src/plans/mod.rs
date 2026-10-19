@@ -4,6 +4,7 @@
 //! step a message waiting in the agent's queue for the turn before it to end. The same operations
 //! serve the console (`/api/plans`), agents (kiln's MCP server: `plans.*`) and code mode.
 
+pub mod agents;
 pub mod criteria;
 pub mod ops;
 
@@ -173,10 +174,14 @@ pub struct Version {
 pub struct Run {
     pub id: String,
     pub version: i64,
+    /// The agent it went to (none for one agent per step: see `agents`).
     pub session: String,
     pub mode: String,
     pub at: i64,
     pub by: String,
+    /// One agent per step: `running`, `stopped` or `done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 /// A new plan.
@@ -222,6 +227,9 @@ pub enum Mode {
     /// Each step a goal in the agent's goal stack (`crate::goals`): the next goes once the one
     /// before is met (its harness's own /goal where it has one).
     Goals,
+    /// Each step an agent of its own, held to the step as a goal ([`agents`]): the next starts
+    /// once the one before is met.
+    Agents,
 }
 
 impl Mode {
@@ -230,6 +238,7 @@ impl Mode {
             Self::Message => "message",
             Self::Steps => "steps",
             Self::Goals => "goals",
+            Self::Agents => "agents",
         }
     }
 }
@@ -597,8 +606,8 @@ pub async fn runs(hub: &Hub, id: &str) -> R<Vec<Run>> {
     Ok(hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT id, version, session, mode, at, by FROM plan_runs WHERE plan_id = ?1 ORDER BY at DESC LIMIT 100")?;
-            let rows = st.query_map(params![id], |r| Ok(Run { id: r.get(0)?, version: r.get(1)?, session: r.get(2)?, mode: r.get(3)?, at: r.get(4)?, by: r.get(5)? }))?.collect::<Result<Vec<_>, _>>()?;
+            let mut st = c.prepare("SELECT id, version, session, mode, at, by, state FROM plan_runs WHERE plan_id = ?1 ORDER BY at DESC LIMIT 100")?;
+            let rows = st.query_map(params![id], |r| Ok(Run { id: r.get(0)?, version: r.get(1)?, session: r.get(2)?, mode: r.get(3)?, at: r.get(4)?, by: r.get(5)?, state: r.get(6)? }))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await?)
@@ -624,8 +633,11 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R
     if mode == Mode::Goals {
         return run_goals(hub, &p, target, by).await;
     }
+    if mode == Mode::Agents {
+        return Err(Error::Bad("one agent per step starts agents of its own: run it with `new` (agents::start)".into()));
+    }
     let messages: Vec<String> = match mode {
-        Mode::Message | Mode::Goals => vec![message(&p)],
+        Mode::Message | Mode::Goals | Mode::Agents => vec![message(&p)],
         Mode::Steps => {
             let steps: Vec<&String> = p.steps.iter().take(STEPS).collect();
             if steps.is_empty() {
