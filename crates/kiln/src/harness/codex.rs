@@ -194,6 +194,9 @@ pub struct Codex {
     resume: Option<String>,
     model: Option<String>,
     allow_bypass: bool,
+    /// This run's tag, in the ids of the notices it makes ([`super::core::run_tag`]).
+    #[serde(default = "super::core::run_tag")]
+    run: String,
     notice_seq: u64,
     mode: String,
     /// Reasoning summaries in turns (auto, concise, detailed, none).
@@ -279,6 +282,7 @@ impl Codex {
             resume,
             model: model.filter(|m| !m.is_empty()),
             allow_bypass,
+            run: super::core::run_tag(),
             notice_seq: 0,
             mode,
             summary: None,
@@ -518,7 +522,7 @@ impl Codex {
 
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>) {
         self.notice_seq += 1;
-        core.upsert(&format!("notice-{}", self.notice_seq), None, Body::Notice { level, text: text.into() });
+        core.upsert(&format!("notice-{}-{}", self.run, self.notice_seq), None, Body::Notice { level, text: text.into() });
     }
 
     fn busy(&self, core: &Core) -> bool {

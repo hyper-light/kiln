@@ -195,11 +195,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // of its own (an upload streams for as long as it takes).
     if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
         let h = Arc::clone(&hub);
-        return crate::rt::spawn(async move { boxed(|| crate::ci::registry::proxy::handle(&h, req)).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
+        return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::proxy::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
     }
     if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
         let h = Arc::clone(&hub);
-        return crate::rt::spawn(async move { boxed(|| crate::ci::registry::handle(&h, req)).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
+        return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
     }
 
     // Open routes (their own auth, if any).
@@ -603,7 +603,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, &op, json!({ "agent": id }))).await
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change")]) => {
+        (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
@@ -612,6 +613,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, &name, body)).await
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
+        (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
@@ -3248,6 +3250,22 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
 // ------------------------------------------------------------------ agent sessions (kiln-native)
 
 /// The harnesses each machine offers; `?target=` narrows it to one ("local", "agent:<name>").
+/// Where agents can have workspaces of their own (docs/agentic.md, W), by target (`local`,
+/// `agent:<name>`): `{available, why_not?, mount?}` for the server and each connected runner.
+async fn harness_workspaces(hub: &Hub) -> Response {
+    let mut out = serde_json::Map::new();
+    let mut targets = vec!["local".to_owned()];
+    targets.extend(hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
+    for t in targets {
+        let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
+            Ok(()) => json!({"available": true}),
+            Err(why) => json!({"available": false, "why_not": why}),
+        };
+        out.insert(t, v);
+    }
+    srv::json(StatusCode::OK, &serde_json::Value::Object(out))
+}
+
 fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     let all = hub.harness.kinds();
     match q.get("target") {
@@ -3433,6 +3451,16 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     // `plans.run`), never what's asked.
     body.spec.parent = None;
     body.spec.plan_run = None;
+    // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
+    // machine that can make one: one that can't would let it work in the folder itself, unasked.
+    match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
+        None | Some("folder") => body.spec.workspace = None,
+        Some("volume") => {
+            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|why| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+            body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
+        }
+        Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("a workspace is \"folder\" or \"volume\", not {other:?}"))),
+    }
     // Agents run programs as the machine's user, like terminals: the same switch governs both.
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));

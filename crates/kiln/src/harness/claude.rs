@@ -172,6 +172,9 @@ pub struct Claude {
     turn: bool,
     /// Tool calls we denied (their error result reads as a denial, not a failure).
     denied: BTreeSet<String>,
+    /// This run's tag, in the ids of the notices it makes ([`super::core::run_tag`]).
+    #[serde(default = "super::core::run_tag")]
+    run: String,
     notice_seq: u64,
     allow_bypass: bool,
     /// Bypass was chosen, which it was not started able to use: it starts again able to.
@@ -243,6 +246,7 @@ impl Claude {
             inflight: BTreeSet::new(),
             turn: false,
             denied: BTreeSet::new(),
+            run: super::core::run_tag(),
             notice_seq: 0,
             allow_bypass,
             bypass_next: false,
@@ -516,7 +520,7 @@ impl Claude {
 
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>, parent: Option<String>) {
         self.notice_seq += 1;
-        core.upsert(&format!("notice-{}", self.notice_seq), parent, Body::Notice { level, text: text.into() });
+        core.upsert(&format!("notice-{}-{}", self.run, self.notice_seq), parent, Body::Notice { level, text: text.into() });
     }
 
     /// Something is being worked on: note when the turn began.

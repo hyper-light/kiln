@@ -47,6 +47,7 @@ const E_FOLDER: usize = 1;
 const E_LOOK: usize = 2;
 
 /// The agent's handle on this machine's sync.
+#[derive(Clone)]
 pub struct Runner {
     tx: Sender<Input>,
 }
@@ -57,6 +58,59 @@ enum Input {
     Connected(bool),
     Fetched(String, Got),
     Uploaded(String, bool),
+    /// Look at once at the copy a folder is in (a session leaving it), and say what that found.
+    LookNow(PathBuf, futures::channel::oneshot::Sender<Option<Looked>>),
+    /// How the copy a folder is in stands.
+    Standing(PathBuf, futures::channel::oneshot::Sender<Option<Standing>>),
+}
+
+/// Where a copy stood in its repo's log when an agent session left it (`crate::harness::moving`):
+/// the machine the session goes to takes the log that far before the session goes on there, so
+/// it never starts on files older than the ones it left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub repo: String,
+    pub index: u64,
+}
+
+/// What a look asked for now found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Looked {
+    pub repo: String,
+    /// It could look: its folder had taken everything committed, and the server was there.
+    pub looked: bool,
+    /// Steps it proposed.
+    pub proposed: usize,
+}
+
+/// How a copy stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Standing {
+    pub repo: String,
+    /// The copy's folder.
+    pub folder: String,
+    /// Files its last look left out, too big for sync (relative to its folder).
+    pub skipped: Vec<String>,
+    /// Through where its folder has taken the log, and what it hasn't taken yet.
+    pub reached: u64,
+    pub behind: usize,
+    /// Its own changes the log hasn't brought back yet, and contents it waits for.
+    pub unsent: usize,
+    pub waiting: usize,
+    pub connected: bool,
+    pub error: Option<String>,
+}
+
+static GLOBAL: std::sync::OnceLock<Runner> = std::sync::OnceLock::new();
+
+/// This process's sync, once the agent started it: what an agent session moving between machines
+/// asks (`crate::harness::session`).
+pub fn set_global(r: Runner) {
+    let _ = GLOBAL.set(r);
+}
+
+pub fn global() -> Option<&'static Runner> {
+    GLOBAL.get()
 }
 
 /// What a fetch found.
@@ -123,6 +177,21 @@ impl Runner {
     /// The link to the server came up, or went down.
     pub fn connected(&self, up: bool) {
         let _ = self.tx.send(Input::Connected(up));
+    }
+
+    /// Looks at once at the copy `folder` is in, proposing what changed there: none when no copy
+    /// here holds it.
+    pub async fn look_now(&self, folder: &Path) -> Option<Looked> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.tx.send(Input::LookNow(folder.to_path_buf(), tx)).ok()?;
+        rx.await.ok().flatten()
+    }
+
+    /// How the copy `folder` is in stands: none when no copy here holds it.
+    pub async fn standing(&self, folder: &Path) -> Option<Standing> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.tx.send(Input::Standing(folder.to_path_buf(), tx)).ok()?;
+        rx.await.ok().flatten()
     }
 }
 
@@ -275,6 +344,11 @@ struct Owner {
     swept: Instant,
 }
 
+/// A folder as the file system resolves it (links followed), so one reached two ways is one.
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
@@ -390,7 +464,58 @@ impl Owner {
             Input::Uploaded(hash, ok) => {
                 self.uploads.insert(hash, if ok { Upload::Done } else { Upload::Failed(Instant::now() + RETRY) });
             }
+            Input::LookNow(folder, reply) => {
+                let _ = reply.send(self.look_now(&folder));
+            }
+            Input::Standing(folder, reply) => {
+                let _ = reply.send(self.standing(&folder));
+            }
         }
+    }
+
+    /// The copy `folder` is in: the deepest, when copies nest.
+    fn copy_of(&self, folder: &Path) -> Option<(String, u64)> {
+        let want = canonical(folder);
+        self.held.iter().filter(|(_, h)| want.starts_with(canonical(Path::new(&h.spec.path)))).max_by_key(|(_, h)| h.spec.path.len()).map(|(k, _)| k.clone())
+    }
+
+    /// Looks at the copy `folder` is in now, as [`Owner::look`] does each folder in turn.
+    fn look_now(&mut self, folder: &Path) -> Option<Looked> {
+        let key = self.copy_of(folder)?;
+        let ready = self.connected && self.told;
+        let h = self.held.get_mut(&key)?;
+        let mut out = Looked { repo: h.spec.repo.clone(), ..Looked::default() };
+        if !ready || !h.r.machine().idle() || h.r.machine().copy.adopting() {
+            return Some(out);
+        }
+        let feed = h.r.machine_mut();
+        match feed.copy.propose(&self.blobs, now_ms()) {
+            Ok(steps) => {
+                h.errors[E_LOOK] = if steps.is_empty() { None } else { feed.save().err().map(|e| format!("the copy's state: {e}")) };
+                h.looked = true;
+                out.looked = true;
+                out.proposed = steps.len();
+            }
+            Err(e) => h.errors[E_LOOK] = Some(format!("looking at the folder: {e}")),
+        }
+        Some(out)
+    }
+
+    fn standing(&self, folder: &Path) -> Option<Standing> {
+        let h = self.held.get(&self.copy_of(folder)?)?;
+        let feed = h.r.machine();
+        let (reached, behind) = feed.progress();
+        Some(Standing {
+            repo: h.spec.repo.clone(),
+            folder: h.spec.path.clone(),
+            skipped: feed.copy.skipped.iter().map(|s| s.path.clone()).collect(),
+            reached,
+            behind,
+            unsent: feed.copy.state.sent.len(),
+            waiting: h.waiting,
+            connected: self.connected,
+            error: h.errors.iter().flatten().next().cloned().or_else(|| self.error.clone()),
+        })
     }
 
     fn heard(&mut self, msg: Msg, raft: Vec<u8>) {

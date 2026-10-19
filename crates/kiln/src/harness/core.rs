@@ -152,6 +152,13 @@ pub struct PreviewJob {
     pub input: serde_json::Value,
 }
 
+/// A tag of one run of a harness's adapter: the ids of the events it makes carry it, so a harness
+/// started again (after a crash, or on another machine after a move) never takes the ids of an
+/// earlier run's, which would put what it says over what was said before.
+pub fn run_tag() -> String {
+    crate::util::new_id().chars().skip(20).collect()
+}
+
 pub struct Core {
     pub state: State,
     pub meta: Meta,

@@ -102,7 +102,15 @@ const family = new Map<string, Member>(
       "untrusted",
       "The retry test in crates/kiln/src/http/client.rs fails about one run in ten. Find out why and fix it. Done when 200 runs pass.",
       "Running the test 200 times.",
-      { parent: "fam-orch", doing: "Running cargo test -p kiln retry", files_changed: 1, lines_added: 6, lines_removed: 2 },
+      {
+        parent: "fam-orch",
+        doing: "Running cargo test -p kiln retry",
+        files_changed: 1,
+        lines_added: 6,
+        lines_removed: 2,
+        cwd: "/home/ada/.local/state/kiln/workspaces/kiln-famtests",
+        workspace: { kind: "volume", over: CWD, made: { volume: "c3f2bc748ffa0cb00001000000000012", name: "kiln-famtests", mount: "/home/ada/.local/state/kiln/workspaces/kiln-famtests" } },
+      },
     ),
     member(
       "fam-docs",
@@ -336,7 +344,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
 const CHANGESETS: Record<string, unknown[]> = {
   "fam-tests": [
     {
-      path: "/home/ada/src/kiln/crates/kiln/src/http/client.rs",
+      path: "/home/ada/.local/state/kiln/workspaces/kiln-famtests/crates/kiln/src/http/client.rs",
       added: 6,
       removed: 2,
       at: Date.now() - 600_000,
@@ -402,6 +410,15 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
+  if (p === "/api/harness/workspaces" && m === "GET") {
+    json(res, 200, {
+      local: { available: true },
+      "agent:metal-ryzen-01": { available: true },
+      "agent:metal-ryzen-02": { available: false, why_not: "Slates isn't installed on this machine" },
+      "agent:metal-epyc-01": { available: false, why_not: "fusermount3 isn't installed (the fuse3 package)" },
+    });
+    return true;
+  }
   if (p === "/api/harness/changes" && m === "GET") {
     const one = url.searchParams.get("agent");
     json(res, 200, { changes: [...changes.values()].filter((c) => !one || c.agent === one) });
@@ -432,7 +449,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     });
     return true;
   }
-  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change))?$/);
+  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land))?$/);
   if (!am) return false;
   const id = decodeURIComponent(am[1] ?? "");
   const what = am[2];
@@ -455,6 +472,28 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       branch: changes.get(id)?.branch ?? null,
       change_request: changes.get(id) ?? null,
     });
+  } else if (what === "workspace" && m === "GET") {
+    json(res, 200, { workspace: a.workspace ?? null, drift: a.workspace ? ["/crates/kiln/src/http/client.rs (Modified)"] : [] });
+  } else if (what === "land" && m === "POST") {
+    if (!a.workspace?.made) {
+      json(res, 409, { error: `${a.name} works in its folder itself: what it changed is there already` });
+      return true;
+    }
+    const b = await body<{ manifest?: string }>(req);
+    if (b.manifest === undefined) {
+      json(res, 200, {
+        plan: {
+          grant_required: true,
+          landing: 7,
+          manifest: "7b9cf3d31bed49590dce5886cb9c9fb21b2efe12ef21cdf3927ca5cd73ef9034",
+          summary: { by_action: [{ action: "replace", count: 1 }, { action: "create", count: 1 }], bytes: 2214, filtered_out: 1834 },
+          conflicts: [],
+        },
+        excludes: ["/.git"],
+        can_write: false,
+        why_not: "Slates on Linux can't take a person's go-ahead from kiln yet (Slates' GAP-A9-10): put the work up for review instead, or approve it with `slates grant` in the session that started Slates",
+      });
+    } else json(res, 200, { landed: { grant_required: false, outcome: { written: 2 } } });
   } else if (what === "change" && m === "POST") {
     if (!(a.files_changed ?? 0)) {
       json(res, 409, { error: `${a.name} hasn't changed any files yet` });
