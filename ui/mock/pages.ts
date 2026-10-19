@@ -782,9 +782,6 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         next: up ? null : mac ? `builds ${NEWEST.slice(0, 12)} itself` : `downloads build 0.1.0+a1b2c3d (${NEWEST.slice(0, 12)})`,
         how: up ? null : mac ? ("build" as const) : ("download" as const),
         checkout: mac ? "/Users/ada/Projects/kiln" : null,
-        policy: "notify" as const,
-        locked: false,
-        from: up ? null : mac ? null : "built by release run #412",
         ways:
           up || !a.connected
             ? []
