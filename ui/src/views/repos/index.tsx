@@ -86,6 +86,9 @@ export default function Repos() {
             <Button size="sm" variant="secondary" onClick={() => set({ sync: "1" })} disabled={syncing}>
               <FolderSync /> Sync a folder
             </Button>
+            <Button asChild size="sm" variant="secondary">
+              <Link to="/review">Review</Link>
+            </Button>
             <Tip content="Every machine looks at its repositories again now">
               <Button size="sm" variant="ghost" onClick={() => void look()}>
                 <ScanSearch /> Look again
