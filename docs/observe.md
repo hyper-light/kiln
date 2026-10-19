@@ -1788,6 +1788,35 @@ group found by its place (a name looked up hashed it every match: 2.5%), and dat
 offset reckoned without the zone table's lock; a set of every rule, one pass for all, was tried and
 was no faster. Next: a date read from the rule's own groups, and fewer allocations.
 
+### 12.18 Metrics from logs
+
+2026-10-19 on this machine, loaded (load average 50–130: other sessions compiling), so compared
+with each other: `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs --bench logmetrics`. The records
+of §12.8 (194,690 over 48.7 hours, moved to end now), applied as 195 entries of 1,000; then every
+window counted once, one metric (`status:error` by service and host) and five at once (every record
+by service; errors by service and host; `service:kube status:warn`; `"connection refused"` by
+service; Argo CD's `@grpc.time_ms` as a distribution with percentiles by its gRPC service), the
+median of five rounds:
+
+| | records/s | allocations a record |
+| --- | --- | --- |
+| applying, windows not noted | 680,000–708,000 | 0.055 |
+| applying, each batch's windows noted | 677,000–710,000 | 0.055 |
+
+| counting every window | windows | a window | records/s | a record | allocations a window |
+| --- | --- | --- | --- | --- | --- |
+| 48.7 hours (1.1 records a second), one metric | 17,549 | 0.19–0.22 ms | | | 20.5 |
+| 48.7 hours, five metrics | 17,549 | 0.23–0.31 ms | | | 61 |
+| the same records in 100 s (19,500 a window), one metric | 11 | 3.4 ms | 5.2 M | 193 ns | 38 |
+| the same records in 100 s, five metrics | 11 | 7.1–9.1 ms | 2.0–2.5 M | 400–513 ns | 1,040 |
+
+Noting the windows costs applying nothing measurable. A sparse window costs what reading the
+block it falls in does (a block of 256 KiB holds some twenty minutes of these records, read again
+for each of its windows): 0.2 ms each ten seconds. A dense one costs its records: at 100,000 records
+a second, five metrics take some 4–5% of a core. Of that (perf), a third is checking each row's
+text is UTF-8 as it is read, the rest reading rows and evaluating the searches; a distribution's
+allocations are its series' keys, a window's, not a record's.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
