@@ -475,6 +475,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["series"]) => ingest_series(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["distribution_points"]) => ingest_distributions(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),
+        (&Method::GET, ["openapi.json"]) => Ok(srv::json(StatusCode::OK, &super::openapi::document(env!("CARGO_PKG_VERSION")))),
         _ => Err(fail(StatusCode::NOT_FOUND, "no such observe route")),
     }
 }

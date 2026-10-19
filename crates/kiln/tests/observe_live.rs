@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Fleet, at, caught_up, raw};
+use common::{Fleet, at, caught_up, now_ms, raw};
 
 #[test]
 #[ignore = "starts a kiln server and two runners as processes"]
@@ -1164,5 +1164,173 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
     let total: f64 = at(&h, &["heatmap", "counts"]).as_array().into_iter().flatten().flat_map(|row| row.as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_f64()).sum();
     let rows = at(&h, &["heatmap", "rows"]);
     anyhow::ensure!(at(&h, &["heatmap", "distribution"]) == true && total == all.len() as f64 && rows.as_array().is_some_and(|r| r.len() <= 40), "{total} of {} in the heatmap: {rows}", all.len());
+    Ok(())
+}
+
+/// Whether `v` is what `schema` says, `doc` holding the schemas it names: OpenAPI 3.1's JSON Schema
+/// as far as the document uses it (`$ref`, `type`, `properties`, `required`, `items`, `enum`,
+/// `anyOf`, `oneOf`, `allOf`, `additionalProperties`); where it is not, the path to what is not.
+fn conforms(doc: &Value, schema: &Value, v: &Value, at: &str) -> Result<(), String> {
+    if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
+        let target = doc.pointer(r.trim_start_matches('#')).ok_or_else(|| format!("{at}: no schema {r}"))?;
+        return conforms(doc, target, v, at);
+    }
+    for (key, all) in [("allOf", true), ("anyOf", false), ("oneOf", false)] {
+        if let Some(list) = schema.get(key).and_then(Value::as_array) {
+            let tried: Vec<Result<(), String>> = list.iter().map(|s| conforms(doc, s, v, at)).collect();
+            let ok = if all { tried.iter().all(Result::is_ok) } else { tried.iter().any(Result::is_ok) };
+            if !ok {
+                return Err(tried.into_iter().filter_map(Result::err).collect::<Vec<_>>().join(" | "));
+            }
+        }
+    }
+    if let Some(t) = schema.get("type").and_then(Value::as_str) {
+        let fits = match t {
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "array" => v.is_array(),
+            "object" => v.is_object(),
+            "null" => v.is_null(),
+            _ => true,
+        };
+        if !fits {
+            return Err(format!("{at}: {v} is not {t}"));
+        }
+    }
+    if let (Some(allowed), Some(s)) = (schema.get("enum").and_then(Value::as_array), v.as_str())
+        && !allowed.iter().any(|a| a == s)
+    {
+        return Err(format!("{at}: {s:?} is none of {allowed:?}"));
+    }
+    if let Some(o) = v.as_object() {
+        for r in schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            if !o.contains_key(r) {
+                return Err(format!("{at}: no {r} in {}", Value::Object(o.clone())));
+            }
+        }
+        let props = schema.get("properties").and_then(Value::as_object);
+        for (k, x) in o {
+            match (props.and_then(|p| p.get(k)), schema.get("additionalProperties")) {
+                (Some(s), _) => conforms(doc, s, x, &format!("{at}.{k}"))?,
+                (None, Some(s)) if s.is_object() => conforms(doc, s, x, &format!("{at}.{k}"))?,
+                _ => {}
+            }
+        }
+    }
+    if let (Some(items), Some(a)) = (schema.get("items"), v.as_array()) {
+        for (i, x) in a.iter().enumerate() {
+            conforms(doc, items, x, &format!("{at}[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Observe's OpenAPI document (`/api/observe/v1/openapi.json`) held to what the routes answer: each
+/// route that answers without a service of its own outside (the clouds' and integrations' tests
+/// would reach one) asked as a client would, its answer checked against the schema the document
+/// gives that route and status, and an error against the error's.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    let doc = f.call("GET", "/api/observe/v1/openapi.json", None)?;
+    anyhow::ensure!(at(&doc, &["openapi"]) == "3.1.0" && at(&doc, &["paths"]).as_object().is_some_and(|p| p.len() > 30), "{doc:#}");
+    // The check finds what is wrong: a field of another type, one missing, a value of no enum.
+    let record = json!({ "$ref": "#/components/schemas/Record" });
+    let good = json!({ "ts_ns": 1, "status": "info", "severity": 9, "service": "", "host": "", "source": "", "message": "m", "attributes": {} });
+    anyhow::ensure!(conforms(&doc, &record, &good, "r").is_ok());
+    for bad in [json!({ "ts_ns": "1" }), json!({ "status": "loud" }), json!({ "attributes": { "a": 1 } })] {
+        let mut v = good.clone();
+        if let (Some(o), Value::Object(b)) = (v.as_object_mut(), bad) {
+            o.extend(b);
+        }
+        anyhow::ensure!(conforms(&doc, &record, &v, "r").is_err(), "{v} passed");
+    }
+    let mut missing = good.clone();
+    missing.as_object_mut().map(|o| o.remove("message"));
+    anyhow::ensure!(conforms(&doc, &record, &missing, "r").is_err(), "a missing field passed");
+    let check = |method: &str, path: &str, route: &str, body: Option<Value>, want: u16| -> anyhow::Result<Value> {
+        let (code, b) = f.request(method, path, body.as_ref())?;
+        let v: Value = if b.is_empty() { Value::Null } else { serde_json::from_slice(&b).map_err(|e| anyhow::anyhow!("{method} {path}: {code} not JSON ({e}): {}", String::from_utf8_lossy(&b)))? };
+        anyhow::ensure!(code == want, "{method} {path}: {code}, not {want}: {v}");
+        let op = doc.pointer(&format!("/paths/{}/{}", route.replace('~', "~0").replace('/', "~1"), method.to_ascii_lowercase())).ok_or_else(|| anyhow::anyhow!("{method} {route} is not in the document"))?;
+        let answer = op.pointer(&format!("/responses/{code}")).ok_or_else(|| anyhow::anyhow!("{method} {route}: {code} is not among its answers"))?;
+        if let Some(schema) = answer.pointer("/content/application~1json/schema") {
+            conforms(&doc, schema, &v, &format!("{method} {route} {code}")).map_err(anyhow::Error::msg)?;
+        }
+        Ok(v)
+    };
+    let base = "/api/observe/v1";
+    let now = now_ms();
+    // What there is to read: points, a distribution, records, an event.
+    let points: Vec<Value> = (0..30).map(|i| json!([(now - 600_000 + i * 20_000) as f64 / 1000.0, i as f64])).collect();
+    check("POST", &format!("{base}/series"), &format!("{base}/series"), Some(json!({ "series": [{ "metric": "api.check", "type": "gauge", "tags": ["env:prod"], "host": "h1", "points": points }] })), 202)?;
+    check("POST", &format!("{base}/distribution_points"), &format!("{base}/distribution_points"), Some(json!({ "series": [{ "metric": "api.lat", "host": "h1", "points": [[(now - 60_000) as f64 / 1000.0, [0.1, 0.2, 0.4]]] }] })), 202)?;
+    check("POST", &format!("{base}/logs"), &format!("{base}/logs"), Some(json!([{ "message": "api check failed", "status": "error", "service": "web", "hostname": "h1", "timestamp": now - 30_000, "attributes": { "route": "/pay" } }, { "message": "api check ok", "service": "web", "timestamp": now - 20_000 }])), 202)?;
+    check("POST", &format!("{base}/events"), &format!("{base}/events"), Some(json!({ "title": "deployed", "text": "web 1.2", "tags": ["service:web"], "alert_type": "info" })), 202)?;
+    // Applied before it is read.
+    let start = Instant::now();
+    while at(&f.call("POST", &format!("{base}/logs/search"), Some(&json!({ "query": "service:web", "from": now - 3_600_000, "to": now + 60_000 })))?, &["records"]).as_array().is_none_or(|r| r.len() < 2) {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the records were not applied");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let range = json!({ "from": now - 3_600_000, "to": now + 60_000 });
+    let with = |extra: Value| -> Value {
+        let mut b = range.clone();
+        if let (Some(o), Value::Object(e)) = (b.as_object_mut(), extra) {
+            o.extend(e);
+        }
+        b
+    };
+    let q = check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "avg:api.check{*} by {host}" }))), 200)?;
+    anyhow::ensure!(at(&q, &["series"]).as_array().is_some_and(|s| s.len() == 1), "{q}");
+    check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "p50:api.lat{*}", "heatmap": 20 }))), 200)?;
+    check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "sum:api.check{*}.rollup(sum, daily, 'America/New_York')" }))), 200)?;
+    check("GET", &format!("{base}/query?query=avg:api.check%7B*%7D&from={}&to={}", now - 3_600_000, now), &format!("{base}/query"), None, 200)?;
+    check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "avg:api.check{" }))), 400)?;
+    check("GET", &format!("{base}/metrics?match=api.*"), &format!("{base}/metrics"), None, 200)?;
+    check("GET", &format!("{base}/tags?key=host"), &format!("{base}/tags"), None, 200)?;
+    let found = check("POST", &format!("{base}/logs/search"), &format!("{base}/logs/search"), Some(with(json!({ "query": "service:web -source:kiln.event" }))), 200)?;
+    anyhow::ensure!(at(&found, &["records"]).as_array().is_some_and(|r| r.len() == 2), "{found}");
+    check("POST", &format!("{base}/logs/aggregate"), &format!("{base}/logs/aggregate"), Some(with(json!({ "query": "*", "by": ["service", "status"] }))), 200)?;
+    check("POST", &format!("{base}/logs/aggregate"), &format!("{base}/logs/aggregate"), Some(with(json!({ "query": "*", "by": ["service"], "step": 60_000 }))), 200)?;
+    check("POST", &format!("{base}/logs/facets"), &format!("{base}/logs/facets"), Some(with(json!({ "facets": ["service", "status", "@route"] }))), 200)?;
+    check("POST", &format!("{base}/logs/patterns"), &format!("{base}/logs/patterns"), Some(with(json!({ "query": "*" }))), 200)?;
+    check("POST", &format!("{base}/events/search"), &format!("{base}/events/search"), Some(with(json!({ "query": "*" }))), 200)?;
+    check("GET", &format!("{base}/status"), &format!("{base}/status"), None, 200)?;
+    // Monitors: made, read, validated, muted, unmuted, listed, deleted.
+    let m = check("POST", &format!("{base}/monitors"), &format!("{base}/monitors"), Some(json!({ "name": "api check high", "query": "avg(last_5m):avg:api.check{*} by {host} > 100", "message": "high", "tags": ["team:web"], "options": { "thresholds": { "critical": 100.0, "warning": 50.0 } } })), 201)?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let mpath = format!("{base}/monitors/{{id}}");
+    check("GET", &format!("{base}/monitors/{id}"), &mpath, None, 200)?;
+    check("PUT", &format!("{base}/monitors/{id}"), &mpath, Some(json!({ "name": "api check high", "query": "avg(last_5m):avg:api.check{*} by {host} > 200" })), 200)?;
+    check("POST", &format!("{base}/monitors/validate"), &format!("{base}/monitors/validate"), Some(json!({ "query": "logs(\"status:error\").last(\"5m\") > 10" })), 200)?;
+    check("POST", &format!("{base}/monitors/{id}/mute"), &format!("{base}/monitors/{{id}}/mute"), Some(json!({ "until": now + 3_600_000 })), 200)?;
+    check("POST", &format!("{base}/monitors/{id}/unmute"), &format!("{base}/monitors/{{id}}/unmute"), None, 200)?;
+    check("GET", &format!("{base}/monitors"), &format!("{base}/monitors"), None, 200)?;
+    check("GET", &format!("{base}/monitors/nope"), &mpath, None, 404)?;
+    check("DELETE", &format!("{base}/monitors/{id}"), &mpath, None, 204)?;
+    // Dashboards: made, read, changed, listed, deleted.
+    let d = check("POST", &format!("{base}/dashboards"), &format!("{base}/dashboards"), Some(json!({ "title": "api", "widgets": [{ "kind": "timeseries", "title": "check", "queries": ["avg:api.check{*}"] }, { "kind": "note", "text": "# hi" }] })), 201)?;
+    let did = at(&d, &["id"]).as_str().unwrap_or("").to_owned();
+    let dpath = format!("{base}/dashboards/{{id}}");
+    check("GET", &format!("{base}/dashboards/{did}"), &dpath, None, 200)?;
+    check("PUT", &format!("{base}/dashboards/{did}"), &dpath, Some(json!({ "title": "api, changed", "widgets": [] })), 200)?;
+    check("GET", &format!("{base}/dashboards"), &format!("{base}/dashboards"), None, 200)?;
+    check("DELETE", &format!("{base}/dashboards/{did}"), &dpath, None, 204)?;
+    // Integrations, scrapes and clouds as they are listed and kept (their tests reach outside).
+    check("PUT", &format!("{base}/integrations/hook"), &format!("{base}/integrations/{{name}}"), Some(json!({ "kind": "webhook", "url": "https://example.invalid/hook", "secret": "s" })), 204)?;
+    let listed = check("GET", &format!("{base}/integrations"), &format!("{base}/integrations"), None, 200)?;
+    anyhow::ensure!(!listed.to_string().contains("\"s\""), "a secret is not shown: {listed}");
+    check("DELETE", &format!("{base}/integrations/hook"), &format!("{base}/integrations/{{name}}"), None, 204)?;
+    check("PUT", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), Some(json!({ "url": "http://127.0.0.1:9/metrics", "every_s": 60 })), 204)?;
+    check("GET", &format!("{base}/scrapes"), &format!("{base}/scrapes"), None, 200)?;
+    check("DELETE", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), None, 204)?;
+    check("PUT", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), Some(json!({ "kind": "aws", "regions": ["us-east-1"], "paused": true, "log_groups": ["/aws/lambda/*"] })), 204)?;
+    check("GET", &format!("{base}/clouds"), &format!("{base}/clouds"), None, 200)?;
+    check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 204)?;
+    check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 404)?;
     Ok(())
 }

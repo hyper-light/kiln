@@ -16,7 +16,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
-| O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7); Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
+| O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7), described in OpenAPI 3.1 and held to what its routes answer; Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
@@ -492,7 +492,16 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else), each route under 
 kiln's (docs/access.md): every GET, and every query, search and check asked by POST, needs
 `observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
 developer's); integrations, clouds, scrape targets and the store's operations need `observe.manage` (a
-maintainer's). `/api/openapi.json` says each route's. Built:
+maintainer's), but their listings, `observe.read` (their secrets are never in them).
+
+**`GET openapi.json`** is the API described (`crate::observe::openapi`, OpenAPI 3.1): every route
+here and every one that takes what is sent in (OTLP, Firehose, Pub/Sub), each with what it takes
+and answers (its schema), its errors, and the capability it needs (`x-kiln-capability`): what a
+client, a generated SDK or a provisioning tool is written against. Held to what is so twice: a test
+reads the router's routes from its source and finds each in the document with the capability the
+gate asks (`crate::authz::rule`), and nothing in the document the router does not serve; a live
+scenario asks every route that answers without a service outside and checks each answer against
+its schema (§13). Built:
 
 | | |
 | --- | --- |
@@ -1714,6 +1723,16 @@ token. Their figures are functions of the minute, so what is stored is checked m
   once (seven); a Pub/Sub push of a Cloud Logging entry sent twice, taken once; a wrong token
   refused; kiln's counts of what was taken and sent again.
 2026-10-18: all pass (243 s; the pushes 99 s).
+
+**The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
+and an event posted; then every route that answers without a service outside, each asked as a
+client asks it (queries, a heatmap, a calendar rollup, a query in the query string, a query that
+does not parse; names and tags; log search, analytics with and without buckets, facets, patterns;
+events; the status; a monitor made, read, changed, validated, muted, unmuted, listed, missed and
+deleted; a dashboard the same; an integration, a scrape target and a cloud kept, listed (no secret
+shown) and removed, one removed twice), its answer checked against the schema
+`GET openapi.json` gives that route and status, a JSON Schema checker that is shown first to find a
+field of another type, one missing and a value of no enum. 2026-10-18: passes (23 s).
 
 **Distributions** (`observe_live.rs`): three hosts' latencies posted as Datadog's distribution
 points (2,000 each, log-normal), a fourth's as an OTLP exponential histogram (delta, 3,000) and a

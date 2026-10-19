@@ -11,6 +11,7 @@ pub mod hub;
 pub mod kiln;
 pub mod monitors;
 pub mod notify;
+pub mod openapi;
 pub mod ingest;
 pub mod otlp;
 pub mod owner;
