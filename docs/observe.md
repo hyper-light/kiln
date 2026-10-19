@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
-| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations), Windows' Event Log and macOS's unified log | in progress |
+| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations); the Event Log on a Windows machine | in progress |
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
@@ -650,7 +650,8 @@ how it goes in its status. A source is:
   (Docker's json-file logs, `/var/lib/docker/containers/*/*-json.log`: the container's id, and from
   its `config.v2.json` where kiln may read it, its name, image and Compose service), or `journald`
   (the systemd journal, its units or every one), or `syslog` (received where it listens,
-  `udp://` and `tcp://` addresses);
+  `udp://` and `tcp://` addresses), or `unified_log` (macOS's, an NSPredicate of its events and a
+  level), or `windows_event` (the Windows Event Log's channels, an XPath of their events);
 - how its lines read: `auto` (a line that is a JSON object is one, else text), `text`, `json`,
   `cri` (`<time> <stream> <P|F> <text>`, a long line's parts joined) or `docker` (the same in JSON),
   in UTF-8 or UTF-16; where a file there when the source starts, with no place kept, is read from
@@ -713,6 +714,32 @@ whole. Its severity and facility are its priority's, its host the one it names (
 address, `network.client.ip` either way), its service the source's or its program's. Syslog has no
 acknowledgement: a datagram there is no room for is dropped, and counted, while a TCP sender is held
 back (its connection is not read) until there is.
+
+**macOS's unified log** is read through `log stream --style ndjson --type log`, at the source's
+level and its predicate, events as they come (each within some 20–40 ms of being logged, measured
+on a laptop through a pipe). An event is known by its boot and its mach time (the machine's
+monotonic clock); its place is the last one written. As the source starts again, the stream starts
+first, then `log show` reads from that place to just past the stream's start, and the stream's
+events the catch-up held are dropped: nothing falls between, nothing is read twice. The catch-up
+reads what the log keeps on disk, the default level and above: info and debug events are held in
+memory, and `log show --info` reads a laptop's minute in 18 s against 1.5 s without, so what came at
+those levels while kiln was not reading is not read. An event's severity is its type's (`Fault`
+fatal, `Error`, `Default` a notice, `Info`, `Debug`), its service its process's, with its subsystem,
+category, process and thread as attributes.
+
+**The Windows Event Log** is read through `wevtutil`, as Datadog's `windows_event` source reads its
+channels: each channel asked each second for the events after its place, `wevtutil qe <channel>
+/q:"*[System[(EventRecordID>N)]]" /f:RenderedXml` (the source's query joined to it with `and`), 500
+at a time, oldest first, each with its message rendered (one whose provider is not installed here
+reads as its provider, event id and data). A channel's place is its last event's record id, kept once
+its record is written; a channel cleared (its newest id below the place) is read from its start. An
+event's severity is its level's (critical, error, warning, information, verbose), its service its
+provider's, with its channel, event id, record id, computer, task, keywords, process, thread, user
+and each `EventData` value (`windows.event_data.<name>`) as attributes. kiln reads the XML with a
+reader of its own (elements, attributes, text, the five entities and character references, CDATA),
+not a library. Neither source has a machine of its own platform in the scenarios' Linux fleet:
+the unified log's scenario runs on a Mac of the fleet, the Event Log's against a stand-in for
+`wevtutil` that answers its two queries from a channel's file of events, as Windows' does (§13).
 
 A source reads what kiln's process may read on each machine that reads it: a maintainer's to give.
 
@@ -2084,6 +2111,24 @@ matched, its last lines read, a token masked), its records found by a search onc
 saying it reads, then removed; and a syslog source made from the form, its address tried, a
 datagram sent there found as a record with its program, level and process; in Chromium and in
 WebKit as a phone.
+
+**The unified log and the Event Log** (`observe_unified.rs` on a Mac of the fleet;
+`observe_collect.rs` on Linux): a server and a runner on the Mac, a `unified_log` source of the
+runner's reading what `logger` writes (its predicate the run's own lines), every line numbered: 50
+lines read as they are written, each stored once with its process and the source's service and
+tags; the runner stopped, 50 lines written meanwhile, started again (they are read by `log show`,
+the stream started first): none lost, none repeated; then 300 lines at 100 a second while the runner
+is killed and started: none lost, 15 stored twice (in flight). Passes (70 s). The run found that a
+read waiting for a process's output to end can wait forever: on macOS a pipe is made and then marked
+close-on-exec in two steps, so a process the server starts meanwhile may hold its writing end open;
+a read now ends when the process has exited and its output has been quiet a moment. The Event Log's,
+against a stand-in for `wevtutil` (a channel's events one a line in a file, its two queries
+answered): 20 events there before the source, read from the channel's start; 40 more; 40 written
+while the runner is stopped; 300 written while it is killed: every event stored once (a kill
+repeated none of the 300), its message rendered, its level, provider, event id and data as
+attributes; then the channel cleared and five new events written: read from its start. Passes
+(2 min). The Windows build is checked (clippy, `x86_64-pc-windows-gnu`); `wevtutil` itself is not
+run by any scenario: the fleet has no Windows machine.
 
 **Pipelines** (`observe_collect.rs`): a server and a runner; a pipeline made through the API (a
 grok rule, an arithmetic processor, a status remapper) tried on records (a line its rule reads

@@ -17,6 +17,8 @@
 pub mod files;
 pub mod journald;
 pub mod syslog;
+pub mod unified;
+pub mod winevent;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -63,6 +65,10 @@ pub enum Kind {
     Journald,
     /// Syslog received over UDP and TCP (RFC 5424, RFC 3164).
     Syslog,
+    /// macOS's unified log, read through `log stream`.
+    UnifiedLog,
+    /// The Windows Event Log's channels, read through `wevtutil`.
+    WindowsEvent,
 }
 
 /// How a file's lines read.
@@ -158,6 +164,21 @@ pub struct Source {
     /// The zone an RFC 3164 time (which has none) is in: an IANA name; UTC unless said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// The unified log's events read: an NSPredicate (`subsystem == "com.example.app"`); every one
+    /// when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// The unified log's level read: `default`, `info` (unless said) or `debug`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// The Windows Event Log's channels read (`System`, `Application`,
+    /// `Microsoft-Windows-Sysmon/Operational`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
+    /// Which of their events: an XPath query, `*[...]` (`*[System[(Level=1 or Level=2)]]`); every
+    /// one when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,8 +214,30 @@ impl Source {
             Kind::Journald | Kind::Syslog if self.format != Format::Auto || self.encoding != Encoding::Utf8 => return Err("the journal's entries and syslog's messages are records already: no format or encoding".into()),
             Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Syslog if !self.units.is_empty() => return Err("units are the journal's".into()),
             Kind::Syslog if self.listen.is_empty() || self.listen.len() > 4 => return Err("a syslog source listens somewhere: udp://0.0.0.0:514, tcp://0.0.0.0:6514 (4 at the most)".into()),
-            Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Journald if !self.listen.is_empty() || self.timezone.is_some() => return Err("listen and timezone are a syslog source's".into()),
+            Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Journald | Kind::UnifiedLog if !self.listen.is_empty() || self.timezone.is_some() => return Err("listen and timezone are a syslog source's".into()),
+            Kind::UnifiedLog if !self.paths.is_empty() || !self.exclude.is_empty() || !self.units.is_empty() => return Err("paths are a file source's, units the journal's".into()),
+            Kind::UnifiedLog if self.format != Format::Auto || self.encoding != Encoding::Utf8 => return Err("the unified log's events are records already: no format or encoding".into()),
+            Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Journald | Kind::Syslog | Kind::WindowsEvent if self.predicate.is_some() || self.level.is_some() => return Err("predicate and level are a unified log source's".into()),
+            Kind::WindowsEvent if self.channels.is_empty() || self.channels.len() > 32 => return Err("a Windows event source's channels: 1 to 32 (System, Application)".into()),
+            Kind::WindowsEvent if !self.paths.is_empty() || !self.exclude.is_empty() || !self.units.is_empty() || !self.listen.is_empty() || self.timezone.is_some() => return Err("paths are a file source's, units the journal's, listen and timezone syslog's".into()),
+            Kind::WindowsEvent if self.format != Format::Auto || self.encoding != Encoding::Utf8 => return Err("the Event Log's events are records already: no format or encoding".into()),
+            Kind::File | Kind::Kubernetes | Kind::Docker | Kind::Journald | Kind::Syslog | Kind::UnifiedLog if !self.channels.is_empty() || self.query.is_some() => return Err("channels and query are a Windows event source's".into()),
             _ => {}
+        }
+        if self.channels.iter().any(|ch| ch.trim().is_empty() || ch.len() > 256 || ch.chars().any(|c| c.is_control() || c == '"')) {
+            return Err("a channel: its name (System, Microsoft-Windows-Sysmon/Operational)".into());
+        }
+        if let Some(q) = &self.query {
+            let q = q.trim();
+            if !(q.starts_with("*[") && q.ends_with(']')) || q.len() > 4096 || q.chars().any(char::is_control) {
+                return Err("a query: an XPath of the channel's events, *[...] (*[System[(Level=1 or Level=2)]])".into());
+            }
+        }
+        if self.predicate.as_deref().is_some_and(|p| p.trim().is_empty() || p.len() > 4096 || p.chars().any(char::is_control)) {
+            return Err("a predicate: an NSPredicate of 1 to 4096 characters".into());
+        }
+        if self.level.as_deref().is_some_and(|l| !matches!(l, "default" | "info" | "debug")) {
+            return Err("a level: default, info or debug".into());
         }
         for l in &self.listen {
             syslog::listen(l)?;
@@ -232,7 +275,7 @@ impl Source {
             regex(&r.pattern)?;
             match r.kind {
                 RuleKind::MaskSequences if r.replace_placeholder.as_deref().is_none_or(|p| p.len() > 256) => return Err("a mask_sequences rule's replace_placeholder: up to 256 characters".into()),
-                RuleKind::MultiLine if matches!(self.kind, Kind::Journald | Kind::Syslog) => return Err("the journal's entries and syslog's messages are records already: no multi_line rule".into()),
+                RuleKind::MultiLine if matches!(self.kind, Kind::Journald | Kind::Syslog | Kind::UnifiedLog | Kind::WindowsEvent) => return Err("the journal's entries, syslog's messages and the unified log's and the Event Log's events are records already: no multi_line rule".into()),
                 RuleKind::MultiLine => multi += 1,
                 _ => {}
             }
@@ -259,7 +302,7 @@ impl Source {
         match self.kind {
             Kind::Kubernetes => vec!["/var/log/pods/*/*/*.log".into()],
             Kind::Docker => vec!["/var/lib/docker/containers/*/*-json.log".into()],
-            Kind::File | Kind::Journald | Kind::Syslog => Vec::new(),
+            Kind::File | Kind::Journald | Kind::Syslog | Kind::UnifiedLog | Kind::WindowsEvent => Vec::new(),
         }
     }
 
@@ -288,6 +331,8 @@ impl Source {
             Kind::Docker => "docker",
             Kind::Journald => "journald",
             Kind::Syslog => "syslog",
+            Kind::UnifiedLog => "unified_log",
+            Kind::WindowsEvent => "windows_event",
         };
         Ok(Compiled {
             name: name.to_owned(),
@@ -300,6 +345,10 @@ impl Source {
             units: self.units.clone(),
             listen: self.listen.clone(),
             timezone: self.timezone.as_deref().map_or(Ok(kiln_obs::query::calendar::Zone::UTC), kiln_obs::query::calendar::Zone::named)?,
+            predicate: self.predicate.clone(),
+            level: self.level.clone(),
+            channels: self.channels.clone(),
+            query: self.query.clone(),
             service: self.service.clone(),
             source: self.source.clone().unwrap_or_else(|| default_source.to_owned()),
             tags: self.tags.iter().filter_map(|t| t.split_once(':')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
@@ -329,6 +378,10 @@ pub(crate) struct Compiled {
     pub units: Vec<String>,
     pub listen: Vec<String>,
     pub timezone: kiln_obs::query::calendar::Zone,
+    pub predicate: Option<String>,
+    pub level: Option<String>,
+    pub channels: Vec<String>,
+    pub query: Option<String>,
     pub service: Option<String>,
     pub source: String,
     pub tags: Vec<(String, String)>,
@@ -637,6 +690,8 @@ pub fn test(name: &str, s: &Source, host: &str) -> Value {
     let t0 = Instant::now();
     let sampled = match c.kind {
         Kind::Journald => journald::sample(&c, 20),
+        Kind::UnifiedLog => unified::sample(&c, 20),
+        Kind::WindowsEvent => winevent::sample(&c, 20),
         Kind::File | Kind::Kubernetes | Kind::Docker => files::sample(&c, 20),
         // Whether it may listen where it says, here: each address bound a moment.
         Kind::Syslog => files::Sampled {
@@ -674,12 +729,12 @@ pub fn test(name: &str, s: &Source, host: &str) -> Value {
         })
         .collect();
     serde_json::json!({
-        "ok": sampled.error.is_none() && (matches!(c.kind, Kind::Journald | Kind::Syslog) || sampled.matched > 0),
+        "ok": sampled.error.is_none() && (matches!(c.kind, Kind::Journald | Kind::Syslog | Kind::UnifiedLog | Kind::WindowsEvent) || sampled.matched > 0),
         "files": sampled.files.iter().map(|(p, b)| serde_json::json!({ "path": p, "bytes": b })).collect::<Vec<_>>(),
         "matched": sampled.matched,
         "records": records,
         "excluded": sampled.excluded,
-        "error": sampled.error.or_else(|| (!matches!(c.kind, Kind::Journald | Kind::Syslog) && sampled.matched == 0).then(|| "no file here matches its paths".to_owned())),
+        "error": sampled.error.or_else(|| (!matches!(c.kind, Kind::Journald | Kind::Syslog | Kind::UnifiedLog | Kind::WindowsEvent) && sampled.matched == 0).then(|| "no file here matches its paths".to_owned())),
         "took_ms": u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
 }
@@ -825,6 +880,8 @@ impl Collector {
                             }
                             match c.kind {
                                 Kind::Journald => journald::run(&c, &file, &stop2, &state2, &offer_to_observe),
+                                Kind::UnifiedLog => unified::run(&c, &file, &stop2, &state2, &offer_to_observe),
+                                Kind::WindowsEvent => winevent::run(&c, &file, &stop2, &state2, &offer_to_observe),
                                 Kind::File | Kind::Kubernetes | Kind::Docker => files::run(&c, &file, &stop2, &state2, &offer_to_observe),
                                 Kind::Syslog => syslog::run(c, &stop2, &state2, &(Arc::new(offer_to_observe) as syslog::Sink)),
                             }
@@ -869,6 +926,103 @@ impl Collector {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// Lines a process reads ahead of what is offered at the most: past them, it waits on its pipe.
+const LINES_AHEAD: usize = 4_096;
+/// The longest line read of a process's output (`journalctl --all` prints a field whole); a longer
+/// one is skipped.
+const LINE_MAX: usize = 4 << 20;
+
+/// A process whose output is read a line at a time (`journalctl`, macOS's `log`), the lines
+/// coming through a channel (a thread reads its pipe), what it says on stderr kept apart.
+pub(crate) struct Reading {
+    pub child: std::process::Child,
+    pub lines: std::sync::mpsc::Receiver<String>,
+    pub errors: std::thread::JoinHandle<String>,
+}
+
+/// Starts `cmd`, its output read a line at a time (`what` names its threads).
+pub(crate) fn read_lines(cmd: &mut std::process::Command, what: &str) -> std::io::Result<Reading> {
+    use std::io::{BufRead as _, Read as _};
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(LINES_AHEAD);
+    let out = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
+    let err = child.stderr.take().ok_or_else(|| std::io::Error::other("no stderr"))?;
+    std::thread::Builder::new().name(format!("kiln-{what}-read")).spawn(move || {
+        let mut r = std::io::BufReader::with_capacity(256 << 10, out);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match (&mut r).take(LINE_MAX as u64).read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    // Too long to be read whole: the rest of it skipped.
+                    if line.last() != Some(&b'\n') {
+                        let mut skip = Vec::new();
+                        let _ = r.read_until(b'\n', &mut skip);
+                        continue;
+                    }
+                    if tx.send(String::from_utf8_lossy(&line).into_owned()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    })?;
+    let errors = std::thread::Builder::new().name(format!("kiln-{what}-err")).spawn(move || {
+        let mut s = String::new();
+        let _ = err.take(64 << 10).read_to_string(&mut s);
+        s
+    })?;
+    Ok(Reading { child, lines: rx, errors })
+}
+
+/// How long a process's output is waited for after it exits.
+const AFTER_EXIT: Duration = Duration::from_millis(200);
+
+/// Whether `r`'s process has ended and its output been read (or will not come): an exit, then no
+/// line for [`AFTER_EXIT`]. Its output's end is not waited for alone: on macOS a process another
+/// thread starts as the pipe is made may hold its writing end open (the pipe is made, then marked
+/// close-on-exec, in two steps), and the end never comes.
+pub(crate) fn ended(r: &mut Reading, quiet_since: &mut Option<Instant>) -> bool {
+    if !matches!(r.child.try_wait(), Ok(Some(_))) {
+        *quiet_since = None;
+        return false;
+    }
+    quiet_since.get_or_insert_with(Instant::now).elapsed() >= AFTER_EXIT
+}
+
+/// Runs `cmd` to its end, `within` at the most: its lines, its exit, and what it said on stderr.
+pub(crate) fn output_lines(cmd: &mut std::process::Command, what: &str, within: Duration) -> std::io::Result<(Vec<String>, Option<std::process::ExitStatus>, String)> {
+    let mut r = read_lines(cmd, what)?;
+    let end = Instant::now() + within;
+    let mut out = Vec::new();
+    let mut quiet = None;
+    loop {
+        match r.lines.recv_timeout(Duration::from_millis(50)) {
+            Ok(l) => {
+                out.push(l);
+                quiet = None;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if ended(&mut r, &mut quiet) {
+                    break;
+                }
+                if Instant::now() >= end {
+                    let _ = r.child.kill();
+                    let _ = r.child.wait();
+                    return Ok((out, None, String::new()));
+                }
+            }
+        }
+    }
+    let status = r.child.wait().ok();
+    // What it said, if its pipe has closed: not waited for (as above).
+    let said = if r.errors.is_finished() { r.errors.join().unwrap_or_default() } else { String::new() };
+    Ok((out, status, said))
 }
 
 /// Records gathered for one offer, and where each source they came from may move its place once
@@ -981,6 +1135,10 @@ mod tests {
             units: Vec::new(),
             listen: Vec::new(),
             timezone: None,
+            predicate: None,
+            level: None,
+            channels: Vec::new(),
+            query: None,
             service: Some("app".into()),
             source: None,
             tags: vec!["env:prod".into()],

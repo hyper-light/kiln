@@ -535,7 +535,7 @@ fn origin(c: &Compiled, path: &Path) -> Origin {
                 service = s;
             }
         }
-        Kind::File | Kind::Journald | Kind::Syslog => {}
+        Kind::File | Kind::Journald | Kind::Syslog | Kind::UnifiedLog | Kind::WindowsEvent => {}
     }
     Origin { attrs, service }
 }
@@ -1080,6 +1080,10 @@ mod tests {
             units: Vec::new(),
             listen: Vec::new(),
             timezone: None,
+            predicate: None,
+            level: None,
+            channels: Vec::new(),
+            query: None,
             service: Some("app".into()),
             source: None,
             tags: Vec::new(),

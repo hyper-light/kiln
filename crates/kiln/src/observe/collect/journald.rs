@@ -6,25 +6,21 @@
 //!
 //! `KILN_JOURNALCTL` names another `journalctl` (a test's).
 
-use std::io::{BufRead as _, BufReader, Read as _};
+use std::io::Read as _;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use kiln_obs::logs::record::Record;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Batch, Compiled, InFlight, Offer, Start, State, Stop};
+use super::{Batch, Compiled, InFlight, Offer, Reading, Start, State, Stop};
 
 /// How long a round waits for the journal's next entry.
 const POLL: Duration = Duration::from_millis(250);
-/// Entries read ahead of what is offered at the most: past it, `journalctl` waits on its pipe.
-const AHEAD: usize = 4_096;
-/// The longest line read of an entry (`--all` prints a field whole).
-const ENTRY_MAX: usize = 4 << 20;
 /// How long after it exits `journalctl` is started again: doubling to the most.
 const AGAIN_MIN: Duration = Duration::from_secs(1);
 const AGAIN_MAX: Duration = Duration::from_secs(60);
@@ -88,45 +84,8 @@ fn entry(c: &Compiled, line: &str, now_ns: i64) -> Option<(Option<Record>, Strin
     Some((Some(r), cursor))
 }
 
-/// `journalctl` running, its lines coming through a channel (a thread reads its pipe).
-struct Reading {
-    child: Child,
-    lines: Receiver<String>,
-    errors: std::thread::JoinHandle<String>,
-}
-
 fn spawn(c: &Compiled, cursor: Option<&str>) -> std::io::Result<Reading> {
-    let mut child = Command::new(journalctl()).args(args(c, cursor)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let (tx, rx): (SyncSender<String>, Receiver<String>) = sync_channel(AHEAD);
-    let out = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
-    let err = child.stderr.take().ok_or_else(|| std::io::Error::other("no stderr"))?;
-    std::thread::Builder::new().name("kiln-journal-read".into()).spawn(move || {
-        let mut r = BufReader::with_capacity(256 << 10, out);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match (&mut r).take(ENTRY_MAX as u64).read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    // Too long to be read whole: the rest of it skipped.
-                    if line.last() != Some(&b'\n') {
-                        let mut skip = Vec::new();
-                        let _ = r.read_until(b'\n', &mut skip);
-                        continue;
-                    }
-                    if tx.send(String::from_utf8_lossy(&line).into_owned()).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    })?;
-    let errors = std::thread::Builder::new().name("kiln-journal-err".into()).spawn(move || {
-        let mut s = String::new();
-        let _ = err.take(64 << 10).read_to_string(&mut s);
-        s
-    })?;
-    Ok(Reading { child, lines: rx, errors })
+    super::read_lines(Command::new(journalctl()).args(args(c, cursor)), "journal")
 }
 
 /// The journal source's thread: `journalctl` read until told to stop (started again, after a
@@ -342,6 +301,10 @@ mod tests {
             units: vec!["nginx.service".into()],
             listen: Vec::new(),
             timezone: None,
+            predicate: None,
+            level: None,
+            channels: Vec::new(),
+            query: None,
             service: None,
             source: None,
             tags: vec!["env:prod".into()],

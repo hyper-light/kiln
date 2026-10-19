@@ -446,3 +446,141 @@ fn pipelines_parse_logs_where_they_are_taken_on_every_machine() -> anyhow::Resul
     Ok(())
 }
 
+
+/// A stand-in for `wevtutil qe`: a channel's events are `$WEVT_DIR/<channel>.xml`, one a line, as
+/// the real one writes them. `/rd:true /c:1`: the newest; `/q:...EventRecordID>N...`: those after
+/// N, oldest first, `/c:M` of them at the most (the query's other terms it leaves to the test).
+const WEVTUTIL: &str = r#"#!/bin/sh
+[ "$1" = qe ] || exit 1
+file="$WEVT_DIR/$2.xml"
+[ -f "$file" ] || { echo "The specified channel could not be found." >&2; exit 15007; }
+shift 2
+after=0; count=1000000; newest=0
+for a in "$@"; do
+  case "$a" in
+    /q:*) after=$(printf '%s' "$a" | sed -n 's/.*EventRecordID>\([0-9]*\).*/\1/p') ;;
+    /c:*) count="${a#/c:}" ;;
+    /rd:true) newest=1 ;;
+  esac
+done
+if [ "$newest" = 1 ]; then tail -n 1 "$file"; exit 0; fi
+awk -v after="$after" -v count="$count" '
+  { if (match($0, /<EventRecordID>[0-9]+</)) { id = substr($0, RSTART + 15, RLENGTH - 16) + 0; if (id > after && n < count) { print; n++ } } }
+' "$file"
+"#;
+
+/// Event `id` of channel `System` as `wevtutil` renders it: its level and message.
+fn win_event(id: u64, level: u8, message: &str) -> String {
+    let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now_ms() - 1000) * 1_000_000).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let t = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:07}Z", at.year(), u8::from(at.month()), at.day(), at.hour(), at.minute(), at.second(), at.nanosecond() / 100);
+    format!(
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='kiln-e2e'/><EventID>{}</EventID><Level>{level}</Level><TimeCreated SystemTime='{t}'/><EventRecordID>{id}</EventRecordID><Execution ProcessID='4242' ThreadID='7'/><Channel>System</Channel><Computer>win-e2e</Computer><Security/></System><EventData><Data Name='seq'>{id}</Data></EventData><RenderingInfo Culture='en-US'><Message>{message} &amp; seq={id}</Message><Level>Information</Level></RenderingInfo></Event>\n",
+        1000 + id % 7
+    )
+}
+
+fn append_events(path: &Path, ids: std::ops::Range<u64>) -> anyhow::Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    for id in ids {
+        // A line a write: the stand-in never reads half of one.
+        f.write_all(win_event(id, if id % 10 == 3 { 2 } else { 4 }, "service state changed").as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Each event's count of records stored (by its `seq`).
+fn win_counts(f: &Fleet, from: i64) -> anyhow::Result<BTreeMap<u64, u64>> {
+    let a = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": "source:windows_event", "from": from, "to": now_ms() + 60_000, "by": ["@windows.event_data.seq"] })))?;
+    let mut out = BTreeMap::new();
+    for g in at(&a, &["groups"]).as_array().into_iter().flatten() {
+        if let Some(seq) = at(g, &["group"]).as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str().and_then(|s| s.parse().ok())) {
+            out.insert(seq, at(g, &["value"]).as_f64().unwrap_or(0.0) as u64);
+        }
+    }
+    Ok(out)
+}
+
+fn win_settled(f: &Fleet, from: i64, seqs: std::ops::Range<u64>) -> anyhow::Result<BTreeMap<u64, u64>> {
+    let start = Instant::now();
+    loop {
+        let c = win_counts(f, from)?;
+        let missing: Vec<u64> = seqs.clone().filter(|s| !c.contains_key(s)).collect();
+        if missing.is_empty() {
+            return Ok(c);
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "{} events of {seqs:?} never stored, the first {:?}\n{}", missing.len(), &missing[..missing.len().min(20)], f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+#[ignore = "starts real processes"]
+fn windows_event_channels_are_read_once_each_through_a_stop_a_kill_and_a_clear() -> anyhow::Result<()> {
+    let t0 = now_ms() - 60_000;
+    let mut f = Fleet::new()?;
+    let root = f.root.path().to_owned();
+    let bin = root.join("bin");
+    let channels = root.join("channels");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&channels)?;
+    let fake = bin.join("wevtutil");
+    std::fs::write(&fake, WEVTUTIL)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let system = channels.join("System.xml");
+    // Events there before the source: read from the channel's start, as it says.
+    append_events(&system, 1..21)?;
+    let env = [("KILN_WEVTUTIL", fake.to_str().unwrap_or("")), ("WEVT_DIR", channels.to_str().unwrap_or(""))];
+    f.start_runner_with("r1", &env)?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    put_source(&f, "win", &json!({ "type": "windows_event", "channels": ["System"], "start": "beginning", "tags": ["team:win"], "on": "r1" }))?;
+    let c = win_settled(&f, t0, 1..21)?;
+    anyhow::ensure!(repeated(&c, 1..21).is_empty(), "{:?}", repeated(&c, 1..21));
+    // A record as stored: its message rendered, its level, what its event names.
+    let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:windows_event @windows.event_data.seq:13", "from": t0, "to": now_ms() + 60_000, "limit": 5 })))?;
+    let r = at(&found, &["records"]).as_array().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
+    anyhow::ensure!(at(&r, &["message"]) == "service state changed & seq=13" && at(&r, &["status"]) == "error" && at(&r, &["service"]) == "kiln-e2e" && at(&r, &["host"]) == "r1", "{r:#}");
+    anyhow::ensure!(at(&r, &["attributes", "windows.event_id"]) == "1006" && at(&r, &["attributes", "windows.channel"]) == "System" && at(&r, &["attributes", "team"]) == "win", "{r:#}");
+    append_events(&system, 21..61)?;
+    let c = win_settled(&f, t0, 1..61)?;
+    anyhow::ensure!(repeated(&c, 1..61).is_empty(), "{:?}", repeated(&c, 1..61));
+
+    // Stopped while events come, started again: from its place, none repeated.
+    f.stop_runner("r1");
+    append_events(&system, 61..101)?;
+    f.start_runner_with("r1", &env)?;
+    let c = win_settled(&f, t0, 1..101)?;
+    anyhow::ensure!(repeated(&c, 1..101).is_empty(), "a stop repeated {:?}", repeated(&c, 1..101));
+
+    // Killed while events come: none lost; those in flight stored twice at the most.
+    let writer = {
+        let system = system.clone();
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            for start in (101..401).step_by(10) {
+                append_events(&system, start..start + 10)?;
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Ok(())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    f.kill_runner("r1");
+    std::thread::sleep(Duration::from_millis(300));
+    f.start_runner_with("r1", &env)?;
+    writer.join().map_err(|_| anyhow::anyhow!("the writer panicked"))??;
+    let c = win_settled(&f, t0, 1..401)?;
+    let twice = repeated(&c, 101..401);
+    anyhow::ensure!(twice.iter().all(|&(_, n)| n == 2) && twice.len() <= 300, "a kill repeated {} events", twice.len());
+    eprintln!("a kill repeated {} of 300 events (in flight when it came); a stop none", twice.len());
+
+    // The channel cleared (its record ids begun again): read from its start.
+    std::fs::write(&system, "")?;
+    let fresh: String = (1..6).map(|id| win_event(id, 3, &format!("after the clear {id}")).replace(&format!("<Data Name='seq'>{id}</Data>"), &format!("<Data Name='seq'>{}</Data>", 1000 + id))).collect();
+    std::fs::write(&system, fresh)?;
+    let c = win_settled(&f, t0, 1001..1006)?;
+    anyhow::ensure!(repeated(&c, 1001..1006).is_empty(), "{:?}", repeated(&c, 1001..1006));
+    Ok(())
+}

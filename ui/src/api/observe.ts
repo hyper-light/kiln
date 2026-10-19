@@ -342,7 +342,7 @@ export interface ScrapeTest {
   took_ms?: number;
 }
 
-export type LogSourceKind = "file" | "kubernetes" | "docker" | "journald" | "syslog";
+export type LogSourceKind = "file" | "kubernetes" | "docker" | "journald" | "syslog" | "unified_log" | "windows_event";
 export type LogRuleKind = "exclude_at_match" | "include_at_match" | "mask_sequences" | "multi_line";
 
 /** Datadog's processing rules, in their order (a multi_line rule first). */
@@ -365,6 +365,12 @@ export interface LogSourceIn {
   /** A syslog source's: where it listens (`udp://0.0.0.0:514`), the zone of RFC 3164's times. */
   listen?: string[];
   timezone?: string;
+  /** macOS's unified log's: an NSPredicate of its events, and the level read. */
+  predicate?: string;
+  level?: "default" | "info" | "debug";
+  /** The Windows Event Log's: its channels, and an XPath of their events (`*[...]`). */
+  channels?: string[];
+  query?: string;
   service?: string;
   source?: string;
   tags?: string[];

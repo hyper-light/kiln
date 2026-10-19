@@ -427,7 +427,7 @@ fn schemas() -> Map<String, Value> {
         &["type", "pattern"],
     );
     let source_fields = [
-        ("type", describe(one_of(&["file", "kubernetes", "docker", "journald", "syslog"]), "files by their globs; a Kubernetes node's pods' logs; Docker's json-file logs; the systemd journal; syslog received")),
+        ("type", describe(one_of(&["file", "kubernetes", "docker", "journald", "syslog", "unified_log", "windows_event"]), "files by their globs; a Kubernetes node's pods' logs; Docker's json-file logs; the systemd journal; syslog received; macOS's unified log; the Windows Event Log's channels")),
         ("paths", describe(array(string()), "a file source's globs (/var/log/app/*.log); Kubernetes' and Docker's their own unless given")),
         ("exclude", describe(array(string()), "globs of paths not read")),
         ("format", one_of(&["auto", "text", "json", "cri", "docker"])),
@@ -436,6 +436,10 @@ fn schemas() -> Map<String, Value> {
         ("units", describe(array(string()), "the journal's units read (every unit when none)")),
         ("listen", describe(array(string()), "where a syslog source listens: udp://0.0.0.0:514, tcp://0.0.0.0:6514")),
         ("timezone", describe(string(), "the zone an RFC 3164 time (which has none) is in: an IANA name, UTC unless said")),
+        ("predicate", describe(string(), "the unified log's events read: an NSPredicate (subsystem == \"com.example.app\"); every one when none")),
+        ("level", describe(one_of(&["default", "info", "debug"]), "the unified log's level read (info unless said)")),
+        ("channels", describe(array(string()), "the Windows Event Log's channels read: System, Application, Microsoft-Windows-Sysmon/Operational")),
+        ("query", describe(string(), "which of their events: an XPath, *[...] (*[System[(Level=1 or Level=2)]]); every one when none")),
         ("service", string()),
         ("source", string()),
         ("tags", array(string())),

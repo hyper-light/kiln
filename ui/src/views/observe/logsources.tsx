@@ -28,8 +28,12 @@ const TYPES: { value: LogSourceKind; label: string }[] = [
   { value: "docker", label: "Docker containers" },
   { value: "journald", label: "systemd journal" },
   { value: "syslog", label: "Syslog (UDP, TCP)" },
+  { value: "unified_log", label: "macOS unified log" },
+  { value: "windows_event", label: "Windows Event Log" },
 ];
 const TYPE = Object.fromEntries(TYPES.map((t) => [t.value, t.label])) as Record<LogSourceKind, string>;
+/** The kinds that read files (their globs, their lines' format and encoding). */
+const FILES = new Set<LogSourceKind>(["file", "kubernetes", "docker"]);
 const DEFAULT_PATHS: Partial<Record<LogSourceKind, string>> = { kubernetes: "/var/log/pods/*/*/*.log", docker: "/var/lib/docker/containers/*/*-json.log" };
 const RULES: { value: LogRuleKind; label: string }[] = [
   { value: "exclude_at_match", label: "Leave out lines matching" },
@@ -57,7 +61,7 @@ const absolute = (p: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
 function stateOf(s: LogSource): keyof typeof STATE {
   if (s.machines.length === 0) return "starting";
   if (s.machines.some((m) => m.state.error)) return "failing";
-  if (s.type !== "journald" && s.type !== "syslog" && s.machines.every((m) => m.state.files === 0)) return "none";
+  if (FILES.has(s.type) && s.machines.every((m) => m.state.files === 0)) return "none";
   return "reading";
 }
 
@@ -65,6 +69,8 @@ function stateOf(s: LogSource): keyof typeof STATE {
 function reads(s: LogSource): string {
   if (s.type === "journald") return s.units?.length ? s.units.join(", ") : "every unit";
   if (s.type === "syslog") return (s.listen ?? []).join(", ");
+  if (s.type === "unified_log") return s.predicate?.trim() || "every event";
+  if (s.type === "windows_event") return (s.channels ?? []).join(", ") + (s.query ? ` ${s.query}` : "");
   return (s.paths?.length ? s.paths : [DEFAULT_PATHS[s.type] ?? ""]).join(", ");
 }
 
@@ -204,6 +210,10 @@ interface Form {
   units: string;
   listen: string;
   timezone: string;
+  predicate: string;
+  level: NonNullable<LogSourceIn["level"]>;
+  channels: string;
+  query: string;
   format: NonNullable<LogSourceIn["format"]>;
   start: NonNullable<LogSourceIn["start"]>;
   encoding: NonNullable<LogSourceIn["encoding"]>;
@@ -222,6 +232,10 @@ const formOf = (s: LogSource | null): Form => ({
   units: (s?.units ?? []).join(", "),
   listen: (s?.listen ?? []).join(", "),
   timezone: s?.timezone ?? "",
+  predicate: s?.predicate ?? "",
+  level: s?.level ?? "info",
+  channels: (s?.channels ?? []).join(", "),
+  query: s?.query ?? "",
   format: s?.format ?? "auto",
   start: s?.start ?? "end",
   encoding: s?.encoding ?? "utf-8",
@@ -238,7 +252,18 @@ function bodyOf(f: Form): LogSourceIn {
       ? { units: list(f.units), start: f.start }
       : f.type === "syslog"
         ? { listen: list(f.listen), timezone: f.timezone.trim() || undefined }
-        : { paths: lines(f.paths), exclude: lines(f.exclude), format: f.format, encoding: f.encoding, start: f.start };
+        : f.type === "unified_log"
+          ? { predicate: f.predicate.trim() || undefined, level: f.level, start: f.start }
+          : f.type === "windows_event"
+            ? {
+                channels: f.channels
+                  .split(",")
+                  .map((c) => c.trim())
+                  .filter(Boolean),
+                query: f.query.trim() || undefined,
+                start: f.start,
+              }
+            : { paths: lines(f.paths), exclude: lines(f.exclude), format: f.format, encoding: f.encoding, start: f.start };
   return {
     type: f.type,
     ...reads,
@@ -281,14 +306,18 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
   };
   const journal = f.type === "journald";
   const syslog = f.type === "syslog";
-  const files = !journal && !syslog;
+  const unified = f.type === "unified_log";
+  const windows = f.type === "windows_event";
+  const files = FILES.has(f.type);
   const validName = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/.test(f.name);
   const paths = lines(f.paths);
   const pathsOk = !files || ((f.type !== "file" || paths.length > 0) && [...paths, ...lines(f.exclude)].every(absolute));
   const listen = list(f.listen);
   const listenOk = !syslog || (listen.length > 0 && listen.length <= 4 && listen.every((l) => /^(udp|tcp):\/\/.+:\d+$/.test(l)));
   const rulesOk = f.rules.every((r) => r.pattern.trim() !== "") && f.rules.filter((r) => r.type === "multi_line").length <= 1 && !(!files && f.rules.some((r) => r.type === "multi_line"));
-  const ok = validName && pathsOk && listenOk && rulesOk;
+  const channelsOk = !windows || f.channels.split(",").some((c) => c.trim() !== "");
+  const queryOk = !windows || f.query.trim() === "" || /^\*\[.*\]$/.test(f.query.trim());
+  const ok = validName && pathsOk && listenOk && rulesOk && channelsOk && queryOk;
   const save = async () => {
     setBusy(true);
     try {
@@ -358,6 +387,46 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
                 spellCheck={false}
               />
             </div>
+          ) : unified ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[2fr_1fr]">
+              <TextField
+                label="Predicate (optional)"
+                value={f.predicate}
+                onChange={(e) => set({ predicate: e.target.value })}
+                placeholder='subsystem == "com.example.app"'
+                hint="An NSPredicate, as log stream takes one; every event when none."
+                spellCheck={false}
+              />
+              <SelectField
+                label="Level"
+                value={f.level}
+                onChange={(v) => set({ level: v as Form["level"] })}
+                options={[
+                  { value: "default", label: "Default" },
+                  { value: "info", label: "Info" },
+                  { value: "debug", label: "Debug" },
+                ]}
+              />
+            </div>
+          ) : windows ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField
+                label="Channels"
+                value={f.channels}
+                onChange={(e) => set({ channels: e.target.value })}
+                placeholder="System, Application"
+                hint={f.channels && !channelsOk ? "A channel at the least" : "As Event Viewer names them, a comma between."}
+                spellCheck={false}
+              />
+              <TextField
+                label="Query (optional)"
+                value={f.query}
+                onChange={(e) => set({ query: e.target.value })}
+                placeholder="*[System[(Level=1 or Level=2)]]"
+                hint={!queryOk ? "An XPath of the events, *[...]" : "Which of their events; every one when none."}
+                spellCheck={false}
+              />
+            </div>
           ) : journal ? (
             <TextField
               label="Units (optional)"
@@ -390,7 +459,7 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
             </div>
           )}
           {!syslog && (
-            <div className={journal ? "grid grid-cols-1 gap-3" : "grid grid-cols-1 gap-3 sm:grid-cols-3"}>
+            <div className={files ? "grid grid-cols-1 gap-3 sm:grid-cols-3" : "grid grid-cols-1 gap-3"}>
               {files && (
                 <SelectField
                   label="Lines are"
@@ -433,7 +502,19 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
               label="Service (optional)"
               value={f.service}
               onChange={(e) => set({ service: e.target.value })}
-              placeholder={f.type === "file" ? "the source's name" : syslog ? "each message's program" : journal ? "each entry's program" : "each container's"}
+              placeholder={
+                f.type === "file"
+                  ? "the source's name"
+                  : syslog
+                    ? "each message's program"
+                    : journal
+                      ? "each entry's program"
+                      : unified
+                        ? "each event's process"
+                        : windows
+                          ? "each event's provider"
+                          : "each container's"
+              }
               spellCheck={false}
             />
             <TextField label="Source (optional)" value={f.source} onChange={(e) => set({ source: e.target.value })} placeholder={f.type} spellCheck={false} />
@@ -495,7 +576,7 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
 
 /** A test's answer: the files matched on the server and how their last lines read. */
 function Tested({ t, kind }: { t: LogSourceTest; kind: LogSourceKind }) {
-  const journal = kind === "journald";
+  const journal = !FILES.has(kind);
   if (kind === "syslog")
     return (
       <div className="field-hint" role="status">
@@ -520,7 +601,15 @@ function Tested({ t, kind }: { t: LogSourceTest; kind: LogSourceKind }) {
       {t.records.length > 0 && (
         <>
           <p>
-            {journal ? "The journal's last entries" : "The newest file's last lines"} read as{t.excluded > 0 ? ` (${count(t.excluded)} left out by the rules)` : ""}:
+            {kind === "journald"
+              ? "The journal's last entries"
+              : kind === "unified_log"
+                ? "The unified log's last minute's events"
+                : kind === "windows_event"
+                  ? "The channels' last events"
+                  : "The newest file's last lines"}{" "}
+            read as
+            {t.excluded > 0 ? ` (${count(t.excluded)} left out by the rules)` : ""}:
           </p>
           <ul className="space-y-0.5 font-mono text-[11.5px]">
             {t.records.slice(-5).map((r, i) => (
