@@ -2039,6 +2039,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         Ev::Preview(None) => {}
                         Ev::Change((abs, (change, resolved))) => {
                             s.core.lock().set_change(&abs, change, resolved);
+                            while let Some(Some((abs, (change, resolved)))) = changes.next().now_or_never() {
+                                s.core.lock().set_change(&abs, change, resolved);
+                            }
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
                         Ev::Fx(None) => {}
