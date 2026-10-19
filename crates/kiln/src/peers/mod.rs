@@ -158,9 +158,16 @@ pub fn key(hub: &Hub) -> anyhow::Result<&'static codes::Key> {
     Ok(K.get_or_init(|| k))
 }
 
-/// This cluster's name in the codes it makes.
-fn our_name() -> String {
-    crate::os::hostname()
+/// This cluster's name, as the picker and the codes it makes say it: the host of its public
+/// address (`kiln.home`, `192.168.1.77`), else its machine's name. Not a pod's name, which a
+/// cluster in Kubernetes changes with every deploy.
+fn our_name(hub: &Hub) -> String {
+    let url = hub.cfg.server.public_url.trim();
+    let host = url.parse::<http::Uri>().ok().and_then(|u| u.host().map(|h| h.trim_start_matches('[').trim_end_matches(']').to_owned()));
+    match host {
+        Some(h) if !h.is_empty() && h != "localhost" && h != "127.0.0.1" && h != "::1" && h != "0.0.0.0" => h,
+        _ => crate::os::hostname(),
+    }
 }
 
 /// Load what the store keeps, then make it so: forwarders, listeners, runners told.
@@ -269,7 +276,7 @@ pub async fn register(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
     let (name, url) = (checked_name(&asked.name)?, checked_url(&asked.url)?);
     let k = key(hub).map_err(internal)?;
     let now = crate::util::now_unix();
-    let ch = codes::Challenge::new(&our_name(), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
+    let ch = codes::Challenge::new(&our_name(hub), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
     let peers = hub.peered.all();
     let p = Peer {
         id: crate::util::new_id(),
@@ -302,7 +309,7 @@ pub async fn rechallenge(hub: &Arc<Hub>, actor: &str, id: &str) -> Answer {
     }
     let k = key(hub).map_err(internal)?;
     let now = crate::util::now_unix();
-    let ch = codes::Challenge::new(&our_name(), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
+    let ch = codes::Challenge::new(&our_name(hub), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
     p.nonce.clone_from(&ch.c);
     p.expires_at = ch.x;
     save(hub, &p).await?;
@@ -383,7 +390,7 @@ pub async fn authorize(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
         created_by: actor.to_owned(),
         peered_at: now,
     };
-    let response = codes::Response::answer(&ch, &our_name(), k, role, &hub.pki.ca_der).and_then(|r| r.encode()).map_err(internal)?;
+    let response = codes::Response::answer(&ch, &our_name(hub), k, role, &hub.pki.ca_der).and_then(|r| r.encode()).map_err(internal)?;
     save(hub, &p).await?;
     hub.store.audit(actor.to_owned(), "peer.authorize".into(), format!("{} ({}) as {role}", p.name, p.public().map(|k| codes::fingerprint(&k)).unwrap_or_default())).await;
     hub.emit(&json!({ "type": "peers" }));
@@ -432,7 +439,7 @@ pub async fn list(hub: &Hub) -> Answer {
     Ok(srv::json(
         StatusCode::OK,
         &json!({
-            "name": our_name(), "fingerprint": codes::fingerprint(k.public()), "roles": codes::ROLES,
+            "name": our_name(hub), "fingerprint": codes::fingerprint(k.public()), "roles": codes::ROLES,
             "peers": peers.iter().map(|p| p.view(now)).collect::<Vec<_>>(),
         }),
     ))
@@ -441,7 +448,7 @@ pub async fn list(hub: &Hub) -> Answer {
 /// `GET /api/peers/open`: the clusters someone signed in here may open (the picker's list).
 pub fn openable(hub: &Hub) -> Answer {
     let peers: Vec<_> = hub.peered.all().into_iter().filter(|p| p.direction == Direction::Out && p.active()).map(|p| json!({ "id": p.id, "name": p.name, "slug": p.slug })).collect();
-    Ok(srv::json(StatusCode::OK, &json!({ "name": our_name(), "peers": peers })))
+    Ok(srv::json(StatusCode::OK, &json!({ "name": our_name(hub), "peers": peers })))
 }
 
 /// `POST /api/peers/:id/frame`: where to open a peer, for the person asking, from the address
