@@ -26,12 +26,12 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 | | Workstream | Depends on | Status |
 |---|---|---|---|
 | N | Notifications and a phone-first Mission Control | — | done: N1–N3 (docs/notifications.md); an iPhone check by a person is left |
-| O | Agents that run agents | — | built: O1–O5 (docs/agents.md, "Agents that run agents"), tested on a hub in process; O-AC1 with real harnesses across two machines not run yet |
+| O | Agents that run agents | — | done: O1–O5 (docs/agents.md, "Agents that run agents"), tested on a hub in process. O-AC1 passed 2026-10-19 with real harnesses and models (no mock model exists): a Claude Code agent on a Linux runner started a Claude Code and a Codex agent on a Mac runner through kiln's MCP tools, waited for both (14 s) and read both results |
 | P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P4 for steps in order: each met step's work goes up as one diff on the step before's, so the run ends as a stack (P-AC1, tested in process against kiln's own git hosting). Parallel steps run one at a time and say so: side by side they need workspaces of their own, held with Slates |
-| R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R3 and R5 (docs/releases.md, "Diagnosing and repairing a runner"); R4, a runner doctor that wakes by itself, waits on attachments (ci.md W20-R08) |
+| R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R5 (docs/releases.md, "Diagnosing and repairing a runner"; docs/agents.md, "Attached agents"): R4 is an agent attached to the runners, woken by a failed upgrade, a failing check or a machine offline (the CI's `runner.offline`), held to `diagnose` and `manage-runners`, its incident on the runner's row in Settings → Updates. R-AC1 against a live runner not run yet |
 | W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes; Linux landing: its issuer surface), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk on a person's go-ahead where Slates takes one from kiln: macOS). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents, moving an agent with a volume to another machine (refused, saying why), installing Slates from kiln's releases, workspaces on Windows (no mount there yet), writing to disk on Linux (Slates' issuer surface). W8 waits on Shards |
-| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). Agents reply in threads once review operations agents can call exist (W14's, being built); until then they answer with a new version |
-| K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | coordinating |
+| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). A comment's message tells the agent how to answer in its thread once W14's `ci.diffs.reply` is there (the CI work's, on its way to main); until then agents answer with a new version |
+| K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | K1: W20-R02's operations, the CI work's (in progress there, `ci.diffs.*` included); K2 built: attachments and incidents (W20-R08 to R10, `crate::ci::attach`; docs/agents.md, "Attached agents"), Agents → Attached, Mission Control grouping an attachment's agents under it; their questions come to Needs you and notifications as any agent's do |
 
 ## N: Notifications
 
@@ -187,6 +187,13 @@ wakes on a failed upgrade, a failing check or a machine offline past its grace. 
 the runner's page and in Settings → Updates; what needs a person comes to Needs you and to
 notifications.
 
+Built: an attachment on `runners` (or a runner, or a pool) wakes on `upgrade` (an upgrade job
+failed), `check` (kiln's checks of the machine, run every half hour for it, found something
+failing) and `offline` (the CI's `runner.offline`, two minutes gone). Its agent gets the failed
+upgrade's error and last lines, or the failing finding with all of them, may call `runners.*` and
+`updates.*` within `diagnose` and `manage-runners`, and its open incident shows in the runner's row
+in Settings → Updates.
+
 **R5 People too.** Settings → Updates: **Diagnose** shows R2's findings in the runner's row;
 **Repair** offers the fixes they name; **Ask an agent** starts the doctor with them.
 
@@ -310,6 +317,16 @@ allows agents (W20-R09). This is W20-R02's coverage, made the same across provid
 
 **K2** Attached agents and incidents (W20-R08 to R10) show in Mission Control grouped by what they
 look after, and their questions come to Needs you and to notifications (N).
+
+Built (docs/agents.md, "Attached agents"): `crate::ci::attach` keeps attachments and incidents,
+listens to kiln's events (`run.failed`, `deploy.failed`, `leg.flaky`, `land.ejected`,
+`runner.offline`, failed upgrades, `@mentions`) and ticks for `stuck`, `schedule` and `check`; one
+cause is one incident (its signature), within a day's limit; its agent acts for whoever attached
+it, held to its capabilities on what it looks after, and reports with `incidents.report`. Agents →
+Attached attaches, pauses and removes them and lists the incidents; Mission Control puts the agents
+an attachment woke under it; a run's page carries its incident card; a repository can keep its
+attachments in trunk's `.kiln/agents.yaml` (ci-agents.md's format). Not yet: a workspace of its own
+per incident (Slates, held).
 
 **Ownership** (agreed 2026-10-18):
 

@@ -2,19 +2,21 @@
  * Agents and the agents they started (docs/agents.md, "Agents that run agents"). In Mission
  * control a parent's children sit under it, indented, folding in the page's flow; a child that
  * needs you keeps its own place at the top, naming its parent. A plan run's agents (one per step)
- * sit under the run ("Plan: … · 2 of 3 met"). Ending a parent offers to end what it started too.
+ * sit under the run ("Plan: … · 2 of 3 met"), and the agents an attachment woke under it
+ * (docs/ci.md W20-R08). Ending a parent offers to end what it started too.
  */
 import * as React from "react";
 import "./family.css";
 import { ChevronRight } from "lucide-react";
 import { Link } from "@/lib/router";
+import { attachApi, onWords, type IncidentBrief } from "@/api/attach";
 import { harnessApi, type AgentInfo } from "@/api/harness";
 import { plansApi, runHref, type PlanRunBrief } from "@/api/plans";
 import { useLocalStorage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { agentLabel } from "./derive";
 
-/** A row of the list and the rows that go under it; or a plan run and its agents. */
+/** A row of the list and the rows that go under it; or a plan run, or an attachment, and its agents. */
 export interface Family<T> {
   row: T;
   kids: Family<T>[];
@@ -22,6 +24,36 @@ export interface Family<T> {
   of?: string;
   /** A plan run's group (`row` is its first agent's). */
   run?: PlanRunBrief;
+  /** An attachment's group: the agents its incidents woke. */
+  attached?: { id: string; name: string; on: string };
+}
+
+/**
+ * The agents an attachment woke under it, where the first of them was; one that needs you keeps
+ * its place, naming the attachment.
+ */
+function byAttachment<T extends { a: AgentInfo; stand: string }>(list: Family<T>[], incidents: IncidentBrief[]): Family<T>[] {
+  const out: Family<T>[] = [];
+  const groups = new Map<string, Family<T>>();
+  for (const f of list) {
+    const inc = f.run ? undefined : incidents.find((i) => i.agent === f.row.a.id);
+    if (!inc) {
+      out.push(f);
+      continue;
+    }
+    if (f.row.stand === "needs") {
+      out.push({ ...f, of: f.of ?? `${inc.name}, attached to ${onWords(inc.on)}` });
+      continue;
+    }
+    let g = groups.get(inc.attachment);
+    if (!g) {
+      g = { row: f.row, kids: [], attached: { id: inc.attachment, name: inc.name, on: inc.on } };
+      groups.set(inc.attachment, g);
+      out.push(g);
+    }
+    g.kids.push(f);
+  }
+  return out;
 }
 
 /**
@@ -116,6 +148,25 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
           </li>
         );
       }
+      if (f.attached) {
+        const at = f.attached;
+        const key = `attached-${at.id}`;
+        const open = !folded.includes(key);
+        return (
+          <li key={key} className="fam fam-run">
+            <div className="fam-run-head">
+              <button type="button" className="fam-fold fam-run-fold" aria-expanded={open} aria-label={open ? "Fold its agents" : "Show its agents"} onClick={() => toggle(key)}>
+                <ChevronRight size={13} className="fam-chev" aria-hidden="true" />
+              </button>
+              <Link to="/agents/attached" className="fam-run-link">
+                {at.name}, attached to {onWords(at.on)}
+              </Link>
+              <span className="fam-stand">{standing(f.kids)}</span>
+            </div>
+            {open && <ul className="ms-list fam-kids">{out(f.kids)}</ul>}
+          </li>
+        );
+      }
       const id = f.row.a.id;
       const open = !folded.includes(id);
       return (
@@ -137,21 +188,28 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
   return <>{out(items)}</>;
 }
 
+/** The incidents whose agents the list may show; none for someone who can't read them. */
+function WithAttached<T extends { a: AgentInfo; stand: string }>({ items, render }: { items: Family<T>[]; render: (row: T, of?: string) => React.ReactNode }) {
+  const incidents = useSuspenseResource("incidents/agents", (s) => attachApi.incidents(s).catch(() => [] as IncidentBrief[]), { on: ["incident"], pollMs: 30_000 }).data;
+  return <Families items={byAttachment(items, incidents)} render={render} />;
+}
+
 /** The plan runs whose agents the list shows (a done run's agents may still be listed). */
 function WithRuns<T extends { a: AgentInfo; stand: string }>({ rows, all, render }: { rows: T[]; all: AgentInfo[]; render: (row: T, of?: string) => React.ReactNode }) {
   const runs = useSuspenseResource("plans/runs/recent", (s) => plansApi.agentRuns(false, s), { on: ["harness", "harness_closed"], pollMs: 15_000 }).data.runs;
-  return <Families items={byRun(families(rows, all), runs)} render={render} />;
-}
-
-/** The list as families, a plan run's agents under the run. */
-export function AgentFamilies<T extends { a: AgentInfo; stand: string }>({ rows, all, render }: { rows: T[]; all: AgentInfo[]; render: (row: T, of?: string) => React.ReactNode }) {
-  const plain = <Families items={families(rows, all)} render={render} />;
-  if (!rows.some((r) => r.a.plan_run)) return plain;
+  const items = byRun(families(rows, all), runs);
   return (
-    <React.Suspense fallback={plain}>
-      <WithRuns rows={rows} all={all} render={render} />
+    <React.Suspense fallback={<Families items={items} render={render} />}>
+      <WithAttached items={items} render={render} />
     </React.Suspense>
   );
+}
+
+/** The list as families: a plan run's agents under the run, an attachment's under it. */
+export function AgentFamilies<T extends { a: AgentInfo; stand: string }>({ rows, all, render }: { rows: T[]; all: AgentInfo[]; render: (row: T, of?: string) => React.ReactNode }) {
+  const items = families(rows, all);
+  const plain = <Families items={items} render={render} />;
+  return <React.Suspense fallback={plain}>{rows.some((r) => r.a.plan_run) ? <WithRuns rows={rows} all={all} render={render} /> : <WithAttached items={items} render={render} />}</React.Suspense>;
 }
 
 /** An agent's live children, as the server knows them (theirs too). */

@@ -68,10 +68,10 @@ pub fn path(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// kiln's own operations: agents', plans', goal stacks' and runners', in the order they're listed.
+/// kiln's own operations: agents', plans', goal stacks', runners' and attachments', in the order they're listed.
 pub fn own() -> &'static [Op] {
     static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
-    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).collect())
+    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).chain(crate::ci::attach::list_ops()).collect())
 }
 
 /// Every operation this server has: CI's, deployments' when they're on, and kiln's own.
@@ -154,7 +154,7 @@ mod tests {
     /// runners' `runners.read` or `runners.manage`), and reads exactly when its route is a GET.
     #[test]
     fn kiln_s_own_operations_are_routes_of_the_table() {
-        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto"});
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1"});
         assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
         for op in own() {
             let route = (op.route)(&probe);
@@ -166,6 +166,11 @@ mod tests {
             let needs = match op.name {
                 "runners.list" | "runners.diagnose" | "updates.list" => "runners.read",
                 "runners.repair" | "updates.retry" | "updates.policy" => "runners.manage",
+                // Attachments and incidents: reading them is reading runs (each narrowed to what it
+                // looks after); attaching is `agents.attach`; reporting, the incident's own check.
+                "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",
+                "attachments.save" | "attachments.remove" | "attachments.pause" => "agents.attach",
+                "incidents.report" => crate::authz::SIGNED_IN,
                 _ => "agents.run",
             };
             assert_eq!(rule.capability, needs, "{}", op.name);

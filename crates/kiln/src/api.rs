@@ -526,6 +526,36 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             }
         }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        // Agents attached to what they look after, and their incidents (docs/ci.md W20-R08 to R10).
+        (&Method::GET, ["api", "attachments"]) => own_op(&hub, &caller, "attachments.list", query_value(&q)).await,
+        (&Method::POST, ["api", "attachments", "pause"]) => {
+            let body = body_value(req).await?;
+            own_op(&hub, &caller, "attachments.pause", body).await
+        }
+        (&Method::POST, ["api", "attachments"]) => {
+            let body = body_value(req).await?;
+            own_op(&hub, &caller, "attachments.save", body).await
+        }
+        (&Method::GET, ["api", "attachments", a]) => own_op(&hub, &caller, "attachments.get", json!({ "attachment": a })).await,
+        (&Method::PUT, ["api", "attachments", a]) => {
+            let a = (*a).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("attachment".into(), json!(a));
+            }
+            own_op(&hub, &caller, "attachments.save", body).await
+        }
+        (&Method::DELETE, ["api", "attachments", a]) => own_op(&hub, &caller, "attachments.remove", json!({ "attachment": a })).await,
+        (&Method::GET, ["api", "incidents"]) => own_op(&hub, &caller, "incidents.list", query_value(&q)).await,
+        (&Method::GET, ["api", "incidents", i]) => own_op(&hub, &caller, "incidents.get", json!({ "incident": i })).await,
+        (&Method::POST, ["api", "incidents", i, "report"]) => {
+            let i = (*i).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("incident".into(), json!(i));
+            }
+            own_op(&hub, &caller, "incidents.report", body).await
+        }
         (&Method::GET, ["api", "plans", "runs"]) => own_op(&hub, &caller, "plans.runs.list", query_value(&q)).await,
         (&Method::GET, ["api", "plans", "runs", run]) => own_op(&hub, &caller, "plans.runs.get", json!({ "run": run })).await,
         (&Method::POST, ["api", "plans", "runs", run, "stop"]) => own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run })).await,

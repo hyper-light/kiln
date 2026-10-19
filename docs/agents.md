@@ -413,8 +413,93 @@ title, state, review?, checks?, fix_checks, opened_at, updated_at, stack?}`: `pr
 request is opened); `state` is `open`, `landed` or `closed`; `stack` (`{run, step}`) says it is a
 step of a plan run's stack. Mission Control shows each agent's change
 on its row, with **Review** on a finished agent's open one; the Changes tab shows where it
-stands, linked, and pushes new versions. Replying in a review thread as the agent comes with
-review operations agents can call; until then an agent answers a comment with a new version.
+stands, linked, and pushes new versions. Where kiln has W14's review operations, a comment's
+message tells the agent how to answer in its thread (`ci.diffs.reply` with the thread's id);
+otherwise it answers a comment with a new version.
+
+## Attached agents
+
+An agent attached to what it looks after wakes when something happens there (docs/ci.md W20-R08 to
+R10; docs/agentic.md K2 and R4). **Agents → Attached** lists them and their incidents, and attaches
+one; `attachments.*` and `incidents.*` do the same for agents and code mode. An attachment names:
+
+- **What it looks after** (`on`, written as access scopes are): `repo:acme/app`,
+  `workflow:acme/app:.github/workflows/ci.yml`, `environment:acme/app:production`, `pool:gpu`,
+  `runner:metal-1`, or `runners` for every runner; for code, the `branches` whose runs wake it
+  (none: any).
+- **Its agent**: a harness kiln starts for each incident (`harness: {kind, on?, cwd?, model?,
+  effort?, mode?}`, `on` and `cwd` the machine and the checkout it works in), or a live agent it
+  tells instead (`session`).
+- **What wakes it** (`wake`): `failure` (a run of what it looks after failed, or a deployment to its
+  environment), `flaky` (a run had flaky tests), `ejected` (the land queue took a change out),
+  `stuck` (a job waited for a runner past `limits.stuck_minutes`), `mention` (`@name` in a comment),
+  `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two minutes), `upgrade`
+  (an upgrade failed) and `check` (kiln's checks of the machine, every half hour, found something
+  failing).
+- **What it may do** (`can`, W20-R09): it always reads what it looks after; beyond that `rerun`,
+  `cancel`, `diagnose`, `fix`, `edit-pipelines`, `quarantine`, `comment`, `experiment`,
+  `manage-runners`, `deploy`, `land`. Its agent acts for whoever attached it (who needs
+  `agents.attach` there), and its calls to kiln are held to these capabilities on what it looks
+  after: kiln refuses it the rest.
+- **Its limits** (`limits`): incidents a day (`sessions_per_day`, 10), reruns per failure
+  (`reruns_per_failure`, 2), when a job is stuck (`stuck_minutes`, 15); **its playbook**, and
+  **who reviews** what it opens.
+
+What wakes it opens an **incident**, or adds to the open one with the same signature (what failed
+and how, with numbers, paths and hashes taken out), so one cause never starts two agents. Its
+agent is given the bundle: what happened, each failed job's failing step with the log around the
+error, the last green run, the same thing before and how it went, what it may do, its playbook,
+and how to report. It says what it found with `incidents.report`: `class` (flaky,
+infrastructure, regression, pipeline, dependency, other), `summary`, `links`, `state` (reported,
+resolved; dismissing is a person's). A failure that keeps coming back from reruns past its limit
+tells the agent to stop rerunning. An incident waits for a person instead (`waiting`, saying why)
+while its attachment is paused, past its limit for the day, or when its agent couldn't start.
+**Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
+its workflows' and environments' too. Mission Control puts the agents an attachment woke under it,
+and their questions come to Needs you and to notifications as any agent's do. A runner doctor's
+open incident shows in the runner's row in Settings → Updates.
+
+| Operation | Route | |
+|---|---|---|
+| `attachments.list` | `GET /api/attachments` | `on?` → `{attachments: [{attachment, open, today, latest}]}` |
+| `attachments.get` | `GET /api/attachments/:id` | → `{attachment, grants, incidents}` |
+| `attachments.save` | `POST /api/attachments`, `PUT /api/attachments/:id` | an attachment → `{attachment, grants}` |
+| `attachments.remove` | `DELETE /api/attachments/:id` | its incidents stay |
+| `attachments.pause` | `POST /api/attachments/pause` | `{attachment?, on?, paused}` |
+| `incidents.list` | `GET /api/incidents` | `state?`, `attachment?`, `limit?` → `{incidents}`, newest first |
+| `incidents.get` | `GET /api/incidents/:id` | the bundle, and each time it happened |
+| `incidents.report` | `POST /api/incidents/:id/report` | `{class?, summary?, links?, state?}`: its agent, or a person who may attach there |
+
+A run that woke an attached agent shows the incident on its page: who looks after it, where it
+stands, what its agent found and opened, and a link to the agent.
+
+**In the repository.** A repository can keep its attachments in trunk's `.kiln/agents.yaml`, read
+like the rest of its policy (from trunk, never from a change, within a minute of landing):
+
+```yaml
+agents:
+  ci-doctor:
+    harness: claude              # claude, codex, acp:<name>
+    model: opus
+    effort: high
+    machine: linux/amd64         # where its agents run (a machine, or what it needs)
+    cwd: ~/src/app               # their folder there
+    attach: { pipelines: [ci], branches: [main] }   # or environments: [production]
+    wake: [failure, flaky, stuck, ejected]          # or { schedule: "0 6 * * 1" }
+    can: [read, rerun, diagnose, fix, comment, quarantine]
+    limits: { per-day: { sessions: 10 }, reruns-per-failure: 2 }
+    instructions: .kiln/agents/ci-doctor.md         # its playbook: a file on trunk, or the words
+    reviewers: [ada]
+```
+
+Each looks after the repository, narrowed to its pipelines, environments and branches. It acts for
+kiln's owner, held to its capabilities there, and is changed by a change to that file. Kiln keeps
+only its pause switch. An agent the file names but can't be (an unknown harness, a wake that isn't
+one) is left out, and the server's log says why. `@name` in a comment calls a repository's own
+attachment only on that repository's diffs.
+
+Not yet: a workspace of its own per incident (its agent works in the folder named; workspaces wait
+on Slates), and the file's per-day runner minutes and tokens, which are read but not held to.
 
 ## Commands
 

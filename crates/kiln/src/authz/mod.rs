@@ -434,6 +434,16 @@ pub static ROUTES: &[Rule] = &[
     any("/api/harness/**", "agents.run", At::Server),
     any("/api/ai-sessions", "agents.run", At::Server),
     any("/api/ai-sessions/**", "agents.run", At::Server),
+    // Attached agents and their incidents (docs/ci.md W20-R08 to R10): the handlers narrow by
+    // what each attachment looks after; reporting is an incident's agent's, or a person's who may
+    // attach there.
+    r("GET", "/api/attachments", "runs.read", At::Anywhere),
+    r("GET", "/api/attachments/*", "runs.read", At::Anywhere),
+    any("/api/attachments", "agents.attach", At::Anywhere),
+    any("/api/attachments/**", "agents.attach", At::Anywhere),
+    r("POST", "/api/incidents/*/report", SIGNED_IN, At::Server),
+    r("GET", "/api/incidents", "runs.read", At::Anywhere),
+    r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
     any("/api/places", "agents.run", At::Server),

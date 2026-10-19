@@ -137,6 +137,10 @@ pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> R
         return Err("whoever started this agent can't sign in here any more".to_owned());
     };
     caller.agent = Some(session.to_owned());
+    // An agent kiln started for an attachment does no more than its capabilities give it.
+    if let Some(limit) = crate::ci::attach::limit_for(hub, session).await {
+        caller = caller.limited_to(limit);
+    }
     Ok(caller)
 }
 
