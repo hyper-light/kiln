@@ -625,7 +625,10 @@ impl Registry {
                     }
                 });
             }
-            match super::socket::serve(&hub.harness.local, super::socket::path("server", &hub.harness.dir)) {
+            // What the server's own terminals and agents ask of kiln (`kiln spawn --on`, `kiln
+            // agents wait`) is answered here.
+            let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
+            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
             }
@@ -1077,6 +1080,9 @@ impl Registry {
                         move_on_limit: false,
                         move_plan: Default::default(),
                         pause_at: None,
+                        parent: spec.parent.clone(),
+                        plan_run: spec.plan_run.clone(),
+                        no_bypass: !spec.allow_bypass,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);
@@ -1304,6 +1310,20 @@ impl Registry {
     /// The parsed state of a session (for checks before acting on it).
     pub fn state(&self, id: &str) -> Option<State> {
         self.mirrors.lock().get(id).and_then(|m| serde_json::from_value(m.state.clone()).ok())
+    }
+
+    /// A session as lists show it.
+    pub fn info(&self, id: &str) -> Option<Info> {
+        self.mirrors.lock().get(id).map(|m| m.info.clone())
+    }
+
+    /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
+    /// last reported, its last reply on its main thread (an `assistant` event) and its changeset.
+    pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
+        let g = self.mirrors.lock();
+        let m = g.get(id)?;
+        let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
+        Some((m.state.clone(), reply, m.changes.clone()))
     }
 }
 

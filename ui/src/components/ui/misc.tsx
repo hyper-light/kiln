@@ -13,15 +13,18 @@ export function PageIntro({
   title,
   lead,
   actions,
+  compact,
 }: {
   index: number;
   label: string;
   title: React.ReactNode;
   lead?: React.ReactNode;
   actions?: React.ReactNode;
+  /** On a phone, one line: the title, then the lead, then the actions. */
+  compact?: boolean;
 }) {
   return (
-    <header className="page-intro">
+    <header className="page-intro" data-compact={compact || undefined}>
       <div className="min-w-0">
         <div className="eyebrow">
           <span className="spectrum-rule" />

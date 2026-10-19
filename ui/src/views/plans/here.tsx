@@ -26,7 +26,10 @@ interface Draft {
   items: PlanItem[];
 }
 
-const MODES: { value: PlanMode; label: string }[] = [
+/** How a plan runs on this agent (one agent per step starts agents of its own: from the plan's page). */
+type HereMode = Exclude<PlanMode, "agents">;
+
+const MODES: { value: HereMode; label: string }[] = [
   { value: "message", label: "One message: the whole plan" },
   { value: "steps", label: "Step by step: a step a turn" },
   { value: "goals", label: "Goals: each step a /goal, the next once it's met" },
@@ -44,7 +47,7 @@ function Here({ session }: { session: string }) {
   const res = useRes(plansRes);
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [picked, setPicked] = React.useState("");
-  const [mode, setMode] = React.useState<PlanMode>("message");
+  const [mode, setMode] = React.useState<HereMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<string | null>(null);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
@@ -156,7 +159,7 @@ function Here({ session }: { session: string }) {
         v{plan.version} · changed {relativeTime(plan.updated_at)}
         {plan.runs ? ` · run ${plan.runs}×` : ""} · <Link to={planHref(plan.id)}>open in Plans</Link>
       </p>
-      {n > 0 && <SelectField label="Run as" value={mode} onChange={(v) => setMode(v as PlanMode)} options={MODES} />}
+      {n > 0 && <SelectField label="Run as" value={mode} onChange={(v) => setMode(v as HereMode)} options={MODES} />}
       <div className="plan-actions">
         <Button size="sm" variant="secondary" disabled={busy} onClick={() => void run()}>
           {busy ? "Sending…" : "Run here"}

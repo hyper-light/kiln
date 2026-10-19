@@ -390,6 +390,28 @@ pub async fn authorize(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
     Ok(srv::json(StatusCode::OK, &json!({ "peer": p.view(now), "response": response })))
 }
 
+#[derive(Deserialize)]
+struct Readdress {
+    url: String,
+}
+
+/// `PUT /api/peers/:id` (`{url}`): where a cluster our people open is reached from here, changed
+/// (a typo, `https://` for a port that speaks plain HTTP, a move). Its key is what's trusted, not
+/// its address, so no new codes are needed.
+pub async fn readdress(hub: &Arc<Hub>, actor: &str, id: &str, req: Request) -> Answer {
+    let asked: Readdress = srv::body_json(req.into_body(), BODY_LIMIT).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let url = checked_url(&asked.url)?;
+    let mut p = find(hub, id, Some(Direction::Out))?;
+    if p.url == url {
+        return Ok(srv::json(StatusCode::OK, &p.view(crate::util::now_unix())));
+    }
+    let was = std::mem::replace(&mut p.url, url);
+    save(hub, &p).await?;
+    hub.store.audit(actor.to_owned(), "peer.readdress".into(), format!("{}: {was} → {}", p.name, p.url)).await;
+    refresh(hub).await;
+    Ok(srv::json(StatusCode::OK, &p.view(crate::util::now_unix())))
+}
+
 /// `DELETE /api/peers/:id`: a peering ends here (the other side keeps its half until it ends it
 /// too, but nothing passes this way any more).
 pub async fn remove(hub: &Arc<Hub>, actor: &str, id: &str) -> Answer {

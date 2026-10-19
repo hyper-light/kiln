@@ -612,6 +612,21 @@ export interface AgentInfo {
   limits?: Limit[];
   account?: string;
   plan?: string;
+  /** The agent that started it (docs/agents.md, "Agents that run agents"). */
+  parent?: string;
+  /** The plan run it does a step of. */
+  plan_run?: string;
+  /** Started without its harness's skip-every-check mode (an agent it starts can't have it either). */
+  no_bypass?: boolean;
+}
+
+/** An agent's children that still run (and theirs), as `agents.children` gives them. */
+export interface AgentChild {
+  id: string;
+  name: string;
+  kind: string;
+  status: Status;
+  parent?: string;
 }
 
 export interface KindInfo {
@@ -779,6 +794,10 @@ export const harnessApi = {
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
+  /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
+  end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
+  /** The agents an agent started that still run (and theirs). */
+  children: (id: string) => call<{ children: AgentChild[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/children`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
   move: (id: string, to: string, now = false, kind?: string, model?: string) =>
