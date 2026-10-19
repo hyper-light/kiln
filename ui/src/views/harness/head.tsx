@@ -13,6 +13,7 @@ import { relativeTime } from "@/lib/format";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
 import { useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
+import { AtLimit } from "./elsewhere";
 import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
 import { RunSettings, type RunSettingsProps } from "./run-settings";
@@ -258,8 +259,13 @@ export function AgentHeader({
           plan={plan}
           stopAt={state?.pause_at ?? null}
           onStopAt={(percent) => send({ type: "pause_at", percent })}
-          moveOn={state?.move_on_limit ?? false}
-          onMoveOn={(on) => send({ type: "move_on_limit", on })}
+          elsewhere={
+            info && (
+              <React.Suspense fallback={null}>
+                <AtLimit agent={info} state={state} send={send} />
+              </React.Suspense>
+            )
+          }
           onMore={() => {
             setUsage(false);
             onUsage();

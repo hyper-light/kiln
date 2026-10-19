@@ -21,6 +21,7 @@ import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, 
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
+import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongSession, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import {
@@ -1252,6 +1253,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
     // ---- harness accounts (and the demo agents to see them from) ----
+    if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 

@@ -1238,21 +1238,14 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   align-items: center;
   gap: 8px;
 }
-.hx-usage-stop .select select {
-  min-height: 28px;
-  padding: 3px 28px 3px 9px;
-  font-size: 12px;
-}
-.hx-usage-stop .select > svg {
-  right: 9px;
-}
 .hx-usage-move {
   display: inline-flex;
-  min-height: 28px;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  cursor: pointer;
+  gap: 6px 8px;
+  min-width: 0;
 }
+/* Its plan and the way to its cost and status, at the end of the line (on one of their own when it's full). */
 .hx-usage-end {
   display: inline-flex;
   align-items: center;

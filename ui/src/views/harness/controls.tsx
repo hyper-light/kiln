@@ -6,10 +6,11 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
-import { harnessApi, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
+import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { AtLimit } from "./elsewhere";
 
 type Send = (c: Command) => void;
 
@@ -139,8 +140,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
 
 /** Every session-wide control the harness offers, by group. */
 /** kiln's own settings for usage limits, whatever the harness: where it pauses, and whether it goes on elsewhere. */
-function LimitRows({ state, send }: { state: State | null; send: Send }) {
-  const moving = Boolean(state?.move_on_limit);
+function LimitRows({ agent, state, send }: { agent: AgentInfo | null; state: State | null; send: Send }) {
   return (
     <section className="hx-ctl-group">
       <div className="hx-eyebrow">Usage limits</div>
@@ -160,22 +160,41 @@ function LimitRows({ state, send }: { state: State | null; send: Send }) {
           </select>
         </div>
       </div>
-      <div className="hx-ctl">
-        <div className="hx-ctl-text">
-          <span className="hx-ctl-label">Go on elsewhere at a limit</span>
-          <span className="hx-dim text-[12px]">It moves to another of your machines with room: its harness signed in to another account, or another harness its conversation can be carried into (Claude Code ⇄ Codex). Its conversation and repository go along.</span>
+      {agent && (
+        <div className="hx-ctl">
+          <div className="hx-ctl-text">
+            <span className="hx-ctl-label">At a limit</span>
+            <span className="hx-dim text-[12px]">
+              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or one its conversation
+              can be carried into (Claude Code ⇄ Codex). Its conversation and repository go along.
+            </span>
+          </div>
+          <div className="hx-ctl-input">
+            <React.Suspense fallback={null}>
+              <AtLimit agent={agent} state={state} send={send} />
+            </React.Suspense>
+          </div>
         </div>
-        <div className="hx-ctl-input">
-          <button type="button" role="switch" aria-checked={moving} aria-label="Go on elsewhere at a limit" className="hx-switch" onClick={() => send({ type: "move_on_limit", on: !moving })}>
-            <span />
-          </button>
-        </div>
-      </div>
+      )}
     </section>
   );
 }
 
-export function SettingsSheet({ open, onOpenChange, meta, state, send }: { open: boolean; onOpenChange: (o: boolean) => void; meta: Meta | null; state: State | null; send: Send }) {
+export function SettingsSheet({
+  open,
+  onOpenChange,
+  agent,
+  meta,
+  state,
+  send,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  agent: AgentInfo | null;
+  meta: Meta | null;
+  state: State | null;
+  send: Send;
+}) {
   const { confirm, dialog } = useConfirm();
   const controls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session");
   const groups = React.useMemo(() => {
@@ -192,7 +211,7 @@ export function SettingsSheet({ open, onOpenChange, meta, state, send }: { open:
           description="Everything this harness lets kiln set or do. Changes apply to this agent from its next step."
         >
           <div className="hx-ctls">
-            <LimitRows state={state} send={send} />
+            <LimitRows agent={agent} state={state} send={send} />
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">
