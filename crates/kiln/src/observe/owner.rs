@@ -190,6 +190,8 @@ enum Input {
     Scrapes(Vec<(String, super::scrape::Target)>),
     /// The server's log sources, all of them: as scrape targets.
     LogSources(Vec<(String, super::collect::Source)>),
+    /// The server's log pipelines, in order: every runner is told them all.
+    Pipelines(Vec<super::pipeline::PipelineDef>),
 }
 
 /// What a node has taken to write and not yet cut into a write, against the batcher's bound: taken
@@ -420,6 +422,11 @@ impl Observe {
         let _ = self.tx.send(Input::LogSources(all));
     }
 
+    /// The server's log pipelines now: every runner is told them, now and when it connects.
+    pub fn set_pipelines(&self, all: Vec<super::pipeline::PipelineDef>) {
+        let _ = self.tx.send(Input::Pipelines(all));
+    }
+
     /// Log records of kiln's own (its events): taken up to the bound itself, else refused and
     /// counted as dropped.
     pub fn log(&self, records: Vec<Record>) {
@@ -444,9 +451,14 @@ impl Observe {
         self.log_within_acked(records, max, count, None).is_ok()
     }
 
-    fn log_within_acked(&self, records: Vec<Record>, max: u64, count: bool, ack: Option<super::ingest::Ack>) -> Result<(), Vec<Record>> {
+    fn log_within_acked(&self, mut records: Vec<Record>, max: u64, count: bool, ack: Option<super::ingest::Ack>) -> Result<(), Vec<Record>> {
         if records.is_empty() && ack.is_none() {
             return Ok(());
+        }
+        // The pipelines, where the records are taken. A reader's (acked) records were processed as
+        // it gathered them: one refused comes back to be offered again, and is not processed twice.
+        if ack.is_none() {
+            super::pipeline::kept::process(&mut records);
         }
         let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
         let a = &self.admission;
@@ -598,6 +610,7 @@ struct Owner {
     /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
     scrapes: Vec<(String, super::scrape::Target)>,
     log_sources: Vec<(String, super::collect::Source)>,
+    pipelines: Vec<super::pipeline::PipelineDef>,
     joiner: Joiner,
     part: u64,
     error: Option<String>,
@@ -669,6 +682,7 @@ impl Owner {
             batcher: Batcher::new(rand::random()),
             scrapes: Vec::new(),
             log_sources: Vec::new(),
+            pipelines: Vec::new(),
             joiner: Joiner::default(),
             part: 0,
             error: None,
@@ -870,6 +884,13 @@ impl Owner {
                     self.send_log_sources(&machine);
                 }
             }
+            Input::Pipelines(all) => {
+                self.pipelines = all;
+                let up: Vec<String> = self.up.iter().cloned().collect();
+                for machine in up {
+                    self.send(&machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
+                }
+            }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::LogsAcked(records, ack) => self.batcher.logs_acked(records, ack, Instant::now()),
             Input::Staged { generation, msg, ok } => {
@@ -941,6 +962,7 @@ impl Owner {
         self.send(machine, Msg::Member { member, token, group: self.members.group.clone() }, Vec::new());
         self.send_scrapes(machine);
         self.send_log_sources(machine);
+        self.send(machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
     }
 
     /// Tells `machine` the scrape targets it reads.
@@ -1000,7 +1022,7 @@ impl Owner {
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
             }
-            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } | Msg::LogSources { .. } => {}
+            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } | Msg::LogSources { .. } | Msg::Pipelines { .. } => {}
         }
     }
 
@@ -1118,6 +1140,7 @@ impl Owner {
                     c.set(&sources);
                 }
             }
+            Msg::Pipelines { pipelines } => super::pipeline::kept::activate(&pipelines),
             Msg::Write { .. } | Msg::Status(_) => {}
         }
     }

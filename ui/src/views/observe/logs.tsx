@@ -15,6 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { PageIntro } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
+import { Link } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import {
   Histogram,
@@ -111,7 +112,19 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
   return (
     <div className="container-console page">
       <title>{`${k.title} · Observe · kiln`}</title>
-      <PageIntro index={8} label="Observe" title={k.title} lead={k.lead} />
+      <PageIntro
+        index={8}
+        label="Observe"
+        title={k.title}
+        lead={k.lead}
+        actions={
+          kind === "logs" ? (
+            <Button variant="secondary" asChild>
+              <Link to="/observe/pipelines">Pipelines</Link>
+            </Button>
+          ) : undefined
+        }
+      />
       <ObserveNav />
       <SearchForm key={q} initial={q} onSearch={setQ} placeholder={kind === "events" ? "service:kiln.ci status:error" : 'service:api status:error "connection refused"'} />
       <div className="mb-5">

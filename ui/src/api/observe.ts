@@ -410,6 +410,79 @@ export interface LogSourceTest {
   took_ms: number;
 }
 
+export type ProcessorType =
+  | "grok-parser"
+  | "date-remapper"
+  | "status-remapper"
+  | "service-remapper"
+  | "message-remapper"
+  | "trace-id-remapper"
+  | "attribute-remapper"
+  | "url-parser"
+  | "user-agent-parser"
+  | "category-processor"
+  | "arithmetic-processor"
+  | "string-builder-processor"
+  | "lookup-processor"
+  | "pipeline";
+
+/** A pipeline's processor, Datadog's shape: its type and that type's fields (docs/observe.md §8.2). */
+export interface Processor {
+  type: ProcessorType;
+  name?: string;
+  is_enabled?: boolean;
+  source?: string;
+  samples?: string[];
+  grok?: { match_rules: string; support_rules?: string };
+  sources?: string[];
+  target?: string;
+  target_format?: "auto" | "string" | "integer" | "double";
+  preserve_source?: boolean;
+  override_on_conflict?: boolean;
+  normalize_ending_slashes?: boolean;
+  is_encoded?: boolean;
+  categories?: { filter: { query: string }; name: string }[];
+  expression?: string;
+  template?: string;
+  is_replace_missing?: boolean;
+  lookup_table?: string[];
+  default_lookup?: string | null;
+  filter?: { query: string };
+  processors?: Processor[];
+}
+
+/** A log pipeline as it is sent: its filter (a search; empty, every record) and its processors in order. */
+export interface PipelineIn {
+  name: string;
+  is_enabled: boolean;
+  filter: { query: string };
+  processors: Processor[];
+}
+
+/** A pipeline as the API shows it; kiln's own (`builtin`) read-only but for whether it is on. */
+export type Pipeline = PipelineIn & { id: string; builtin: boolean; created?: number; modified?: number };
+
+/** A record to try pipelines on, and what one makes of it. */
+export interface PipelineSample {
+  message: string;
+  service?: string;
+  host?: string;
+  source?: string;
+  status?: string;
+  attributes?: Record<string, string>;
+}
+
+export interface PipelineResult {
+  ts_ns: number;
+  status: string;
+  service: string;
+  host: string;
+  source: string;
+  message: string;
+  attributes: Record<string, string>;
+  trace_id: string | null;
+}
+
 /** An SLO as it is sent (docs/observe.md §9.2): a ratio of good events to total, or time slices meeting a condition. */
 export interface SloIn {
   name: string;
@@ -561,6 +634,14 @@ export const observeApi = {
   putScrape: (name: string, t: ScrapeIn) => request<void>("PUT", `${BASE}/scrapes/${enc(name)}`, t),
   deleteScrape: (name: string) => request<void>("DELETE", `${BASE}/scrapes/${enc(name)}`),
   testScrape: (name: string, t: ScrapeIn) => request<ScrapeTest>("POST", `${BASE}/scrapes/${enc(name)}/test`, t),
+  pipelines: (signal?: AbortSignal) => request<{ pipelines: Pipeline[] }>("GET", `${BASE}/pipelines`, undefined, { signal }).then((r) => r.pipelines),
+  pipeline: (id: string, signal?: AbortSignal) => request<Pipeline>("GET", `${BASE}/pipelines/${enc(id)}`, undefined, { signal }),
+  createPipeline: (p: PipelineIn) => request<Pipeline>("POST", `${BASE}/pipelines`, p),
+  updatePipeline: (id: string, p: PipelineIn) => request<Pipeline>("PUT", `${BASE}/pipelines/${enc(id)}`, p),
+  deletePipeline: (id: string) => request<void>("DELETE", `${BASE}/pipelines/${enc(id)}`),
+  orderPipelines: (ids: string[]) => request<void>("PUT", `${BASE}/pipeline_order`, { pipeline_ids: ids }),
+  tryPipeline: (pipeline: PipelineIn | null, records: PipelineSample[]) =>
+    request<{ records: PipelineResult[] }>("POST", `${BASE}/pipeline_test`, { ...(pipeline ? { pipeline } : {}), records }).then((r) => r.records),
   logSources: (signal?: AbortSignal) => request<{ log_sources: LogSource[] }>("GET", `${BASE}/log_sources`, undefined, { signal }).then((r) => r.log_sources),
   putLogSource: (name: string, s: LogSourceIn) => request<void>("PUT", `${BASE}/log_sources/${enc(name)}`, s),
   deleteLogSource: (name: string) => request<void>("DELETE", `${BASE}/log_sources/${enc(name)}`),

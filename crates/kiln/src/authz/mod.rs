@@ -411,6 +411,11 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/clouds/**", "observe.manage", At::Server),
     any("/api/observe/v1/scrapes/**", "observe.manage", At::Server),
     any("/api/observe/v1/log_sources/**", "observe.manage", At::Server),
+    // Pipelines change every record stored from then on: a maintainer's; trying one, a reader's.
+    r("POST", "/api/observe/v1/pipeline_test", "observe.read", At::Server),
+    any("/api/observe/v1/pipelines", "observe.manage", At::Server),
+    any("/api/observe/v1/pipelines/**", "observe.manage", At::Server),
+    any("/api/observe/v1/pipeline_order", "observe.manage", At::Server),
     r("POST", "/api/observe/v1/compact", "observe.manage", At::Server),
     r("POST", "/api/observe/v1/verify", "observe.manage", At::Server),
     any("/api/observe/v1/**", "observe.write", At::Server),

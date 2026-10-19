@@ -16,6 +16,7 @@ pub mod openapi;
 pub mod ingest;
 pub mod otlp;
 pub mod owner;
+pub mod pipeline;
 pub mod scrape;
 pub mod slos;
 pub mod spans;

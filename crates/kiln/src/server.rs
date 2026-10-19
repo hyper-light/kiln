@@ -192,6 +192,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "scrapes did not start: no HTTPS client"),
         }
+        // Log pipelines: kept here, applied here and by every runner.
+        let pipelines = std::sync::Arc::new(crate::observe::pipeline::kept::Pipelines::open(&cfg.data("observe")));
+        crate::observe::pipeline::kept::activate(&pipelines.defs());
+        if let Some(o) = crate::observe::api::get() {
+            o.set_pipelines(pipelines.defs());
+        }
+        crate::observe::api::set_pipelines(pipelines);
         // Logs collected: the sources kept here, the server's own read here, each runner told its
         // own.
         let sources = std::sync::Arc::new(crate::observe::collect::Sources::open(&cfg.data("observe")));

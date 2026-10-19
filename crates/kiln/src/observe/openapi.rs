@@ -483,6 +483,62 @@ fn schemas() -> Map<String, Value> {
             &["ok", "files", "matched", "records", "excluded", "took_ms"],
         ),
     );
+    // Log pipelines (§8.2): Datadog's own shape, a processor its `type` and that type's fields.
+    let processor = describe(
+        object(
+            &[
+                (
+                    "type",
+                    one_of(&[
+                        "grok-parser",
+                        "date-remapper",
+                        "status-remapper",
+                        "service-remapper",
+                        "message-remapper",
+                        "trace-id-remapper",
+                        "attribute-remapper",
+                        "url-parser",
+                        "user-agent-parser",
+                        "category-processor",
+                        "arithmetic-processor",
+                        "string-builder-processor",
+                        "lookup-processor",
+                        "pipeline",
+                    ]),
+                ),
+                ("name", string()),
+                ("is_enabled", boolean()),
+            ],
+            &["type"],
+        ),
+        "Datadog's processor: its type's fields beside these (a grok parser's source and grok rules, a remapper's sources and target, …)",
+    );
+    let pipeline_fields = [
+        ("name", string()),
+        ("is_enabled", boolean()),
+        ("filter", object(&[("query", describe(string(), "a log search; empty: every record"))], &[])),
+        ("processors", array(processor)),
+    ];
+    put("PipelineIn", object(&pipeline_fields, &["name"]));
+    let mut kept: Vec<(&str, Value)> = pipeline_fields.to_vec();
+    kept.push(("id", string()));
+    kept.push(("builtin", describe(boolean(), "kiln's own: read-only, but for whether it is on")));
+    kept.push(("created", integer()));
+    kept.push(("modified", integer()));
+    put("Pipeline", object(&kept, &["id", "builtin", "name", "is_enabled", "filter", "processors"]));
+    put(
+        "PipelineTest",
+        object(
+            &[
+                ("pipeline", describe(schema("PipelineIn"), "the pipeline tried; none: every one applied now, in order")),
+                (
+                    "records",
+                    array(object(&[("message", string()), ("service", string()), ("host", string()), ("source", string()), ("status", string()), ("attributes", map_of(string()))], &["message"])),
+                ),
+            ],
+            &["records"],
+        ),
+    );
     let common = [
         ("interval_s", describe(integer(), "seconds between pulls (300)")),
         ("lookback_s", describe(integer(), "seconds a pull reads back (three intervals)")),
@@ -824,6 +880,27 @@ fn ops() -> Vec<Op<'static>> {
         op("post", "/distribution_points", "Writes a distribution's values (Datadog's v1 distribution points)", "observe.write", Some(body("DistributionIntake")), vec![accepted(object(&[("values", integer())], &["values"]))]),
         op("post", "/logs", "Writes log records (Datadog's log intake)", "observe.write", Some(body("LogIntake")), vec![accepted(object(&[("records", integer())], &["records"]))]),
         op("get", "/openapi.json", "This document", "observe.read", None, vec![("200", answer_of("OpenAPI 3.1", any()))]),
+        op("get", "/pipelines", "Lists the log pipelines in the order they apply: kiln's own, then yours", "observe.read", None, vec![("200", answer_of("the pipelines", object(&[("pipelines", array(schema("Pipeline")))], &["pipelines"])))]),
+        op("post", "/pipelines", "Makes a log pipeline, last (checked: it compiles)", "observe.manage", Some(body("PipelineIn")), vec![("201", answer("made", Some("Pipeline")))]),
+        Op { params: vec![id()], ..op("get", "/pipelines/{id}", "A log pipeline", "observe.read", None, vec![ok("Pipeline")]) },
+        Op { params: vec![id()], ..op("put", "/pipelines/{id}", "Changes a log pipeline (kiln's own: whether it is on)", "observe.manage", Some(body("PipelineIn")), vec![ok("Pipeline")]) },
+        Op { params: vec![id()], ..op("delete", "/pipelines/{id}", "Removes a log pipeline of yours (kiln's own are turned off instead: 400)", "observe.manage", None, vec![no_content()]) },
+        op(
+            "put",
+            "/pipeline_order",
+            "Puts your pipelines in an order (every one of them, each once)",
+            "observe.manage",
+            Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("pipeline_ids", array(string()))], &["pipeline_ids"]) } } })),
+            vec![no_content()],
+        ),
+        op(
+            "post",
+            "/pipeline_test",
+            "What a pipeline (or every one, in order) makes of records given: nothing kept",
+            "observe.read",
+            Some(body("PipelineTest")),
+            vec![("200", answer_of("the records processed", object(&[("records", array(object(&[("ts_ns", integer()), ("status", string()), ("service", string()), ("host", string()), ("source", string()), ("message", string()), ("attributes", map_of(string())), ("trace_id", nullable(string()))], &["message", "attributes"])))], &["records"])))],
+        ),
         op("get", "/slos", "Lists SLOs, each its standing", "observe.read", None, vec![("200", answer_of("the SLOs", object(&[("slos", array(schema("Slo")))], &["slos"])))]),
         op("post", "/slos", "Makes an SLO", "observe.write", Some(body("SloIn")), vec![("201", answer("made", Some("SloKept")))]),
         Op { params: vec![id()], ..op("get", "/slos/{id}", "An SLO, its standing day by day, and the monitors that alert on it", "observe.read", None, vec![ok("Slo")]) },

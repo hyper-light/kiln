@@ -877,11 +877,13 @@ pub(crate) struct Batch<M> {
     pub records: Vec<Record>,
     pub bytes: usize,
     pub marks: Vec<M>,
+    /// Records through the pipelines already: a refused offer's come back, not processed twice.
+    pub processed: usize,
 }
 
 impl<M> Default for Batch<M> {
     fn default() -> Self {
-        Self { records: Vec::new(), bytes: 0, marks: Vec::new() }
+        Self { records: Vec::new(), bytes: 0, marks: Vec::new(), processed: 0 }
     }
 }
 
@@ -919,10 +921,16 @@ impl<M> InFlight<M> {
         }
         let ack = Ack::new();
         let n = b.records.len() as u64;
+        // Through the pipelines once, the first time they are offered.
+        if let Some(fresh) = b.records.get_mut(b.processed..) {
+            super::pipeline::kept::process(fresh);
+        }
+        b.processed = b.records.len();
         match offer(std::mem::take(&mut b.records), ack.clone()) {
             Ok(()) => {
                 self.queue.push_back((ack, std::mem::take(&mut b.marks), n));
                 b.bytes = 0;
+                b.processed = 0;
                 true
             }
             Err(back) => {

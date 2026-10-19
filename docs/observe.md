@@ -23,6 +23,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations), Windows' Event Log and macOS's unified log | in progress |
+| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
@@ -494,8 +495,9 @@ same search syntax.
 Under `/api/observe/v1/` (all JSON; the UI uses nothing else), each route under a capability of
 kiln's (docs/access.md): every GET, and every query, search and check asked by POST, needs
 `observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
-developer's); integrations, clouds, scrape targets, log sources (they read machines' files) and the
-store's operations need `observe.manage` (a maintainer's), but their listings, `observe.read` (their
+developer's); integrations, clouds, scrape targets, log sources (they read machines' files), log
+pipelines (they change every record stored after) and the store's operations need `observe.manage`
+(a maintainer's), but their listings, `observe.read` (their
 secrets are never in them).
 
 **`GET openapi.json`** is the API described (`crate::observe::openapi`, OpenAPI 3.1): every route
@@ -527,6 +529,7 @@ its schema (§13). Built:
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
+| `GET/POST pipelines`, `GET/PUT/DELETE pipelines/{id}`, `PUT pipeline_order`, `POST pipeline_test` | log pipelines (§8.2), in the order they apply, kiln's own first (read-only but for whether they are on: one is turned off, not removed); a pipeline made or changed is checked (it compiles) and applied from the next record on every machine; `pipeline_test` runs a pipeline given (or every one, in order) on records given and keeps nothing |
 | `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
@@ -698,6 +701,36 @@ acknowledgement: a datagram there is no room for is dropped, and counted, while 
 back (its connection is not read) until there is.
 
 A source reads what kiln's process may read on each machine that reads it: a maintainer's to give.
+
+### 8.2 Pipelines
+
+How records are read as they are taken (`crate::observe::pipeline`), Datadog's log pipelines, so one
+exported from Datadog reads here as it is: each pipeline a filter (a log search; empty, every
+record) and processors run in order on each record it matches, the pipelines in order, each reading
+what those before it made. The server keeps them (`<observe>/pipelines.json`) and tells every runner
+the list; each node applies it where it takes a record (a request's, a log source's, a cloud's), so
+what is stored is read already, on the machine that took it. A source's records are run through
+once, as they are gathered: an offer refused comes back and is not run again.
+
+The processors are Datadog's: the **grok parser** (rules of literal text, a regular expression, and
+`%{matcher(args):attribute:filter(args)}` tokens, matching a value whole, the first rule that
+matches extracting its attributes; helper rules, and match rules given before, inlined; Datadog's
+matchers, `notSpace`, `data`, `word`, `integer`, `number`, `boolean`, the quoted strings, `uuid`,
+`mac`, `ip`, `ipOrHost`, `hostname`, `port`, `regex("…")`, `date("pattern"[, "timezone"])` with
+Java's date patterns, and filters `number`, `integer`, `boolean`, `nullIf`, `json`, `keyvalue`,
+`lowercase`, `uppercase`, `decodeuricomponent`, `querystring`, `url`, `useragent`, `scale`); the
+**date**, **status**, **service**, **message** and **trace id** remappers (each reading the first of
+its attributes a record has: a time as RFC 3339 or seconds to nanoseconds since the epoch; a status
+as Datadog's remapper reads one, syslog's 0–7 or a word by its start); the **attribute remapper**;
+the **URL** and **user-agent parsers**; the **category processor** (the first of its searches that
+matches names the record); the **arithmetic processor** (`+ - * / %`, `abs`, `ceil`, `floor`,
+`round`, `min`, `max`); the **string builder**; the **lookup processor**; and a **pipeline** nested
+in one, one deep. Rust's regular expressions do not backtrack: an atomic group `(?>…)` reads as a
+group, which matches the same wherever the atomic one would not have to give anything back.
+
+kiln carries pipelines for nginx's and Apache's access and error logs (Datadog's own rules, then the
+time, the HTTP status's category as its status, the URL and the user agent read), applied to records
+of `source:nginx` and `source:apache`: read-only, turned off or copied to be changed.
 
 ## 9. Monitors
 
@@ -1035,6 +1068,11 @@ time range and the search in the address (a page is a link).
   from zero, cannot); and the monitors that alert on it, the workbook's two for its timeframe added
   in a click while none reads its burn rate. Made and edited in a form: good events over all, or
   time slices of a query meeting a condition.
+- **Pipelines** (a link from the logs explorer): kiln's own and yours in the order they apply, each
+  its filter, processors and whether it is on; turned off and on, yours moved and removed, kiln's
+  copied to be changed. A pipeline's page lists its processors in order, each edited as its type
+  has it (a grok parser's rules tried on its samples as they are written), and tries a record on the
+  pipeline as it is, saved or not, before it is kept.
 - **Logs kiln collects** (Integrations' fourth part): each source's state over the machines that
   read it (reading, failing, no files), what it reads, its records and how far behind it is;
   added and edited in a form that tests the source on the server (the files it matches, how the
@@ -1686,6 +1724,7 @@ machine other sessions share (rates over runs given as a range):
 | CRI, JSON in it | 657–709 k | 150–162 | 39 | 2,718 |
 | Java stack traces, `multi_line` (10 lines a record) | 11.9–12.2 M | 612–630 | 2.2 | 156 |
 | the access log, an exclude and a mask | 2.5–2.9 M | 353–409 | 9.1 | 681 |
+| the access log through kiln's nginx pipeline (§8.2) | 145–160 k | 20–23 | 75 | 3,731 |
 
 A busy node writes some thousands of lines a second; one core reads hundreds of thousands. A text
 line's nine allocations are its record's strings (its text, service, host, source, the file's path
@@ -1693,6 +1732,14 @@ and the tags, each a `String` of `kiln_obs`'s `Record`); a JSON line's thirty-si
 serde_json's tree of it: its fields moved into the record rather than copied took 46 to 37, the
 record's attributes sized once 37 to 36. Next: a streaming JSON reader (no tree), and records handed
 to the batcher encoded, as rows (no strings a record at all).
+
+Through kiln's nginx pipeline a line costs some ten plain ones (the same run: 1.8 M lines a second
+plain, 160 k parsed, on a loaded machine): perf puts 18% in the regular expressions' backtracker
+reading a matching rule's groups (and a date's again), 14% in their lazy DFAs, 8% setting
+attributes, the rest allocation. A rule is told by the DFA alone before its groups are read, each
+group found by its place (a name looked up hashed it every match: 2.5%), and dates in UTC or with an
+offset reckoned without the zone table's lock; a set of every rule, one pass for all, was tried and
+was no faster. Next: a date read from the rule's own groups, and fewer allocations.
 
 ## 13. Scenarios
 
@@ -1922,6 +1969,20 @@ matched, its last lines read, a token masked), its records found by a search onc
 saying it reads, then removed; and a syslog source made from the form, its address tried, a
 datagram sent there found as a record with its program, level and process; in Chromium and in
 WebKit as a phone.
+
+**Pipelines** (`observe_collect.rs`): a server and a runner; a pipeline made through the API (a
+grok rule, an arithmetic processor, a status remapper) tried on records (a line its rule reads
+parsed, one it does not left as it is), then a record posted to the server stored parsed; a log
+source of the runner reading nginx's access log, `source:nginx`, its 20 lines stored parsed on the
+runner by kiln's own pipeline (each its method, its URL's query, its 5xx an error, found by
+`@http.status_code:>=500`); that pipeline turned off (kiln's own are not removed: 400) and a line
+after stored as it came, on the runner too. Passes (2 min). In a browser: a pipeline made on its
+page, its grok rules tried on a sample in the processor's dialog, the whole tried on a line, kept, a
+record posted after stored parsed; kiln's nginx pipeline turned off and on from its row; the
+pipeline removed; in Chromium and WebKit as a phone. The two bugs these found: a processor's dialog
+kept inside the pipeline's form saved the pipeline before the processor was in it (a portal's
+submit still reaches the form React holds it in), and the source tried guessed once from the filter
+as it was when the page opened.
 
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a

@@ -1437,6 +1437,24 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     check("GET", &format!("{base}/log_sources"), &format!("{base}/log_sources"), None, 200)?;
     check("DELETE", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), None, 204)?;
     check("DELETE", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), None, 404)?;
+    // Pipelines: made, read, changed, ordered, tried, removed; kiln's own turned off, not removed.
+    let pipeline = json!({ "name": "p", "filter": { "query": "source:app" }, "processors": [{ "type": "grok-parser", "name": "g", "grok": { "match_rules": "r %{word:verb} %{notSpace:path}" } }, { "type": "status-remapper", "sources": ["level"] }] });
+    let p1 = check("POST", &format!("{base}/pipelines"), &format!("{base}/pipelines"), Some(pipeline.clone()), 201)?;
+    let p2 = check("POST", &format!("{base}/pipelines"), &format!("{base}/pipelines"), Some(pipeline.clone()), 201)?;
+    let (i1, i2) = (at(&p1, &["id"]).as_str().unwrap_or("").to_owned(), at(&p2, &["id"]).as_str().unwrap_or("").to_owned());
+    let ppath = format!("{base}/pipelines/{{id}}");
+    check("GET", &format!("{base}/pipelines/{i1}"), &ppath, None, 200)?;
+    check("PUT", &format!("{base}/pipelines/{i1}"), &ppath, Some(pipeline.clone()), 200)?;
+    check("POST", &format!("{base}/pipelines"), &format!("{base}/pipelines"), Some(json!({ "name": "bad", "processors": [{ "type": "grok-parser", "grok": { "match_rules": "r %{nonesuch:x}" } }] })), 400)?;
+    check("GET", &format!("{base}/pipelines"), &format!("{base}/pipelines"), None, 200)?;
+    check("PUT", &format!("{base}/pipeline_order"), &format!("{base}/pipeline_order"), Some(json!({ "pipeline_ids": [i2, i1] })), 204)?;
+    check("POST", &format!("{base}/pipeline_test"), &format!("{base}/pipeline_test"), Some(json!({ "pipeline": pipeline, "records": [{ "message": "GET /x", "source": "app" }] })), 200)?;
+    check("PUT", &format!("{base}/pipelines/builtin:apache"), &ppath, Some(json!({ "name": "Apache httpd", "is_enabled": false })), 200)?;
+    check("DELETE", &format!("{base}/pipelines/builtin:apache"), &ppath, None, 400)?;
+    check("PUT", &format!("{base}/pipelines/builtin:apache"), &ppath, Some(json!({ "name": "Apache httpd", "is_enabled": true })), 200)?;
+    for i in [&i1, &i2] {
+        check("DELETE", &format!("{base}/pipelines/{i}"), &ppath, None, 204)?;
+    }
     check("PUT", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), Some(json!({ "kind": "aws", "regions": ["us-east-1"], "paused": true, "log_groups": ["/aws/lambda/*"] })), 204)?;
     check("GET", &format!("{base}/clouds"), &format!("{base}/clouds"), None, 200)?;
     check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 204)?;

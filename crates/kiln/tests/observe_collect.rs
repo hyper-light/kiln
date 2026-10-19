@@ -373,3 +373,76 @@ fn syslog_is_received_over_udp_and_tcp_with_what_its_messages_name() -> anyhow::
     anyhow::ensure!(at(&st, &["records"]) == 7 && at(&st, &["excluded"]) == 1 && at(&st, &["dropped"]) == 0, "{st:#}");
     Ok(())
 }
+
+/// nginx's access lines as nginx writes them: `seq` in the path, a 5xx every tenth.
+fn nginx_line(seq: u64) -> String {
+    let t = time::OffsetDateTime::now_utc();
+    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][usize::from(u8::from(t.month())) - 1];
+    let status = if seq % 10 == 9 { 502 } else { 200 };
+    format!("192.0.2.{} - - [{:02}/{month}/{}:{:02}:{:02}:{:02} +0000] \"GET /orders/{seq}?page=2 HTTP/1.1\" {status} 512 \"-\" \"Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0\"\n", seq % 250, t.day(), t.year(), t.hour(), t.minute(), t.second())
+}
+
+#[test]
+#[ignore = "starts real processes"]
+fn pipelines_parse_logs_where_they_are_taken_on_every_machine() -> anyhow::Result<()> {
+    let t0 = now_ms() - 60_000;
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    // A pipeline of yours, for records posted to the server.
+    let made = f.call(
+        "POST",
+        "/api/observe/v1/pipelines",
+        Some(&json!({ "name": "shop timings", "filter": { "query": "source:shop" }, "processors": [
+            { "type": "grok-parser", "name": "timing", "source": "message", "grok": { "match_rules": "timing %{word:http.method} %{notSpace:http.url} took %{number:duration}ms level=%{word:lvl}" } },
+            { "type": "arithmetic-processor", "expression": "duration / 1000", "target": "duration_s" },
+            { "type": "status-remapper", "sources": ["lvl"] }
+        ] })),
+    )?;
+    let id = at(&made, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(id.starts_with('p'), "{made:#}");
+    // Tried on records, every pipeline applied now: a line its rule reads is parsed, one it does
+    // not read is left as it is.
+    let tried = f.call("POST", "/api/observe/v1/pipeline_test", Some(&json!({ "records": [{ "message": "GET /cart took 1250ms level=warn", "source": "shop" }, { "message": "GET /cart was slow", "source": "shop" }] })))?;
+    let records = at(&tried, &["records"]).as_array().cloned().unwrap_or_default();
+    anyhow::ensure!(records.len() == 2 && records.first().is_some_and(|r| at(r, &["attributes", "duration_s"]) == "1.25" && at(r, &["status"]) == "warn") && records.get(1).is_some_and(|r| at(r, &["attributes"]).as_object().is_some_and(serde_json::Map::is_empty)), "{tried:#}");
+    let tried = f.call("POST", "/api/observe/v1/pipeline_test", Some(&json!({ "records": [{ "message": "GET /cart took 1250ms level=warn", "source": "shop" }], "pipeline": { "name": "t", "processors": [{ "type": "grok-parser", "grok": { "match_rules": "r %{word:a} %{notSpace:b} took %{number:ms}ms level=%{word:l}" } }] } })))?;
+    anyhow::ensure!(at(&tried, &["records"]).as_array().and_then(|r| r.first()).is_some_and(|r| at(r, &["attributes", "ms"]) == "1250"), "{tried:#}");
+    let (code, _) = f.request("POST", "/api/observe/v1/logs", Some(&json!([{ "message": "GET /cart took 1250ms level=warn", "service": "shop", "source": "shop", "hostname": "web-1" }])))?;
+    anyhow::ensure!(code == 202, "{code}");
+    let shop = found(&f, t0, "source:shop", 1)?;
+    let r = shop.first().cloned().unwrap_or(Value::Null);
+    anyhow::ensure!(at(&r, &["attributes", "http.method"]) == "GET" && at(&r, &["attributes", "duration_s"]) == "1.25" && at(&r, &["status"]) == "warn", "{r:#}");
+    // kiln's own nginx pipeline, on the runner that reads nginx's log.
+    let dir = f.root.path().join("nginx");
+    std::fs::create_dir_all(&dir)?;
+    let log = dir.join("access.log");
+    std::fs::write(&log, (0..20).map(nginx_line).collect::<String>())?;
+    put_source(&f, "nginx", &json!({ "type": "file", "paths": [format!("{}/*.log", dir.display())], "start": "beginning", "source": "nginx", "service": "edge", "on": "r1" }))?;
+    let lines = found(&f, t0, "source:nginx", 20)?;
+    anyhow::ensure!(lines.iter().all(|r| at(r, &["host"]) == "r1" && at(r, &["attributes", "http.method"]) == "GET" && at(r, &["attributes", "http.url_details.queryString.page"]) == "2"), "parsed on r1: {:#}", lines.first().cloned().unwrap_or(Value::Null));
+    // The 5xx ones: errors, found by their status code.
+    let errors = search(&f, t0, "source:nginx @http.status_code:>=500")?;
+    anyhow::ensure!(errors.len() == 2 && errors.iter().all(|r| at(r, &["status"]) == "error" && at(r, &["attributes", "http.status_category"]) == "error"), "{errors:#?}");
+    // Turned off: lines from then on are kept as they are, on the runner too.
+    let (code, body) = f.request("PUT", "/api/observe/v1/pipelines/builtin:nginx", Some(&json!({ "name": "nginx", "is_enabled": false })))?;
+    anyhow::ensure!(code == 200, "{code} {}", String::from_utf8_lossy(&body));
+    let (code, _) = f.request("DELETE", "/api/observe/v1/pipelines/builtin:nginx", None)?;
+    anyhow::ensure!(code == 400, "kiln's own are turned off, not removed: {code}");
+    std::thread::sleep(Duration::from_secs(1));
+    std::fs::OpenOptions::new().append(true).open(&log)?.write_all(nginx_line(99).as_bytes())?;
+    let start = Instant::now();
+    loop {
+        let all = search(&f, t0, "source:nginx")?;
+        if let Some(r) = all.iter().find(|r| at(r, &["message"]).as_str().is_some_and(|m| m.contains("/orders/99?"))) {
+            anyhow::ensure!(at(r, &["attributes", "http.method"]).is_null(), "parsed though its pipeline is off: {r:#}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the line after never came\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/pipelines/{id}"), None)?;
+    anyhow::ensure!(code == 204);
+    Ok(())
+}
+

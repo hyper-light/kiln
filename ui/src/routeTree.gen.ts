@@ -43,6 +43,8 @@ import { Route as AppObserveDashboardsIndexRouteImport } from './routes/_app.obs
 import { Route as AppObserveDashboardsIdRouteImport } from './routes/_app.observe.dashboards.$id'
 import { Route as AppObserveMonitorsIndexRouteImport } from './routes/_app.observe.monitors.index'
 import { Route as AppObserveMonitorsIdRouteImport } from './routes/_app.observe.monitors.$id'
+import { Route as AppObservePipelinesIndexRouteImport } from './routes/_app.observe.pipelines.index'
+import { Route as AppObservePipelinesIdRouteImport } from './routes/_app.observe.pipelines.$id'
 import { Route as AppObserveSlosIndexRouteImport } from './routes/_app.observe.slos.index'
 import { Route as AppObserveSlosIdRouteImport } from './routes/_app.observe.slos.$id'
 import { Route as AppRunsIdIndexRouteImport } from './routes/_app.runs.$id.index'
@@ -220,6 +222,17 @@ const AppObserveMonitorsIdRoute = AppObserveMonitorsIdRouteImport.update({
   path: '/observe/monitors/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppObservePipelinesIndexRoute =
+  AppObservePipelinesIndexRouteImport.update({
+    id: '/observe/pipelines/',
+    path: '/observe/pipelines/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppObservePipelinesIdRoute = AppObservePipelinesIdRouteImport.update({
+  id: '/observe/pipelines/$id',
+  path: '/observe/pipelines/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppObserveSlosIndexRoute = AppObserveSlosIndexRouteImport.update({
   id: '/observe/slos/',
   path: '/observe/slos/',
@@ -283,11 +296,13 @@ export interface FileRoutesByFullPath {
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
   '/observe/dashboards/$id': typeof AppObserveDashboardsIdRoute
   '/observe/monitors/$id': typeof AppObserveMonitorsIdRoute
+  '/observe/pipelines/$id': typeof AppObservePipelinesIdRoute
   '/observe/slos/$id': typeof AppObserveSlosIdRoute
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans/': typeof AppAgentsPlansIndexRoute
   '/observe/dashboards/': typeof AppObserveDashboardsIndexRoute
   '/observe/monitors/': typeof AppObserveMonitorsIndexRoute
+  '/observe/pipelines/': typeof AppObservePipelinesIndexRoute
   '/observe/slos/': typeof AppObserveSlosIndexRoute
   '/runs/$id/': typeof AppRunsIdIndexRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
@@ -324,11 +339,13 @@ export interface FileRoutesByTo {
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
   '/observe/dashboards/$id': typeof AppObserveDashboardsIdRoute
   '/observe/monitors/$id': typeof AppObserveMonitorsIdRoute
+  '/observe/pipelines/$id': typeof AppObservePipelinesIdRoute
   '/observe/slos/$id': typeof AppObserveSlosIdRoute
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/plans': typeof AppAgentsPlansIndexRoute
   '/observe/dashboards': typeof AppObserveDashboardsIndexRoute
   '/observe/monitors': typeof AppObserveMonitorsIndexRoute
+  '/observe/pipelines': typeof AppObservePipelinesIndexRoute
   '/observe/slos': typeof AppObserveSlosIndexRoute
   '/runs/$id': typeof AppRunsIdIndexRoute
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
@@ -367,11 +384,13 @@ export interface FileRoutesById {
   '/_app/agents/plans/$id': typeof AppAgentsPlansIdRoute
   '/_app/observe/dashboards/$id': typeof AppObserveDashboardsIdRoute
   '/_app/observe/monitors/$id': typeof AppObserveMonitorsIdRoute
+  '/_app/observe/pipelines/$id': typeof AppObservePipelinesIdRoute
   '/_app/observe/slos/$id': typeof AppObserveSlosIdRoute
   '/_app/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
   '/_app/observe/dashboards/': typeof AppObserveDashboardsIndexRoute
   '/_app/observe/monitors/': typeof AppObserveMonitorsIndexRoute
+  '/_app/observe/pipelines/': typeof AppObservePipelinesIndexRoute
   '/_app/observe/slos/': typeof AppObserveSlosIndexRoute
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
@@ -410,11 +429,13 @@ export interface FileRouteTypes {
     | '/agents/plans/$id'
     | '/observe/dashboards/$id'
     | '/observe/monitors/$id'
+    | '/observe/pipelines/$id'
     | '/observe/slos/$id'
     | '/runs/$id/compare'
     | '/agents/plans/'
     | '/observe/dashboards/'
     | '/observe/monitors/'
+    | '/observe/pipelines/'
     | '/observe/slos/'
     | '/runs/$id/'
     | '/deployments/apps/$project/$name'
@@ -451,11 +472,13 @@ export interface FileRouteTypes {
     | '/agents/plans/$id'
     | '/observe/dashboards/$id'
     | '/observe/monitors/$id'
+    | '/observe/pipelines/$id'
     | '/observe/slos/$id'
     | '/runs/$id/compare'
     | '/agents/plans'
     | '/observe/dashboards'
     | '/observe/monitors'
+    | '/observe/pipelines'
     | '/observe/slos'
     | '/runs/$id'
     | '/deployments/apps/$project/$name'
@@ -493,11 +516,13 @@ export interface FileRouteTypes {
     | '/_app/agents/plans/$id'
     | '/_app/observe/dashboards/$id'
     | '/_app/observe/monitors/$id'
+    | '/_app/observe/pipelines/$id'
     | '/_app/observe/slos/$id'
     | '/_app/runs/$id/compare'
     | '/_app/agents/plans/'
     | '/_app/observe/dashboards/'
     | '/_app/observe/monitors/'
+    | '/_app/observe/pipelines/'
     | '/_app/observe/slos/'
     | '/_app/runs/$id/'
     | '/_app/deployments/apps/$project/$name'
@@ -749,6 +774,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveMonitorsIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/observe/pipelines/': {
+      id: '/_app/observe/pipelines/'
+      path: '/observe/pipelines'
+      fullPath: '/observe/pipelines/'
+      preLoaderRoute: typeof AppObservePipelinesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/observe/pipelines/$id': {
+      id: '/_app/observe/pipelines/$id'
+      path: '/observe/pipelines/$id'
+      fullPath: '/observe/pipelines/$id'
+      preLoaderRoute: typeof AppObservePipelinesIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/observe/slos/': {
       id: '/_app/observe/slos/'
       path: '/observe/slos'
@@ -824,11 +863,13 @@ interface AppRouteChildren {
   AppAgentsPlansIdRoute: typeof AppAgentsPlansIdRoute
   AppObserveDashboardsIdRoute: typeof AppObserveDashboardsIdRoute
   AppObserveMonitorsIdRoute: typeof AppObserveMonitorsIdRoute
+  AppObservePipelinesIdRoute: typeof AppObservePipelinesIdRoute
   AppObserveSlosIdRoute: typeof AppObserveSlosIdRoute
   AppRunsIdCompareRoute: typeof AppRunsIdCompareRoute
   AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
   AppObserveDashboardsIndexRoute: typeof AppObserveDashboardsIndexRoute
   AppObserveMonitorsIndexRoute: typeof AppObserveMonitorsIndexRoute
+  AppObservePipelinesIndexRoute: typeof AppObservePipelinesIndexRoute
   AppObserveSlosIndexRoute: typeof AppObserveSlosIndexRoute
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
@@ -865,11 +906,13 @@ const AppRouteChildren: AppRouteChildren = {
   AppAgentsPlansIdRoute: AppAgentsPlansIdRoute,
   AppObserveDashboardsIdRoute: AppObserveDashboardsIdRoute,
   AppObserveMonitorsIdRoute: AppObserveMonitorsIdRoute,
+  AppObservePipelinesIdRoute: AppObservePipelinesIdRoute,
   AppObserveSlosIdRoute: AppObserveSlosIdRoute,
   AppRunsIdCompareRoute: AppRunsIdCompareRoute,
   AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
   AppObserveDashboardsIndexRoute: AppObserveDashboardsIndexRoute,
   AppObserveMonitorsIndexRoute: AppObserveMonitorsIndexRoute,
+  AppObservePipelinesIndexRoute: AppObservePipelinesIndexRoute,
   AppObserveSlosIndexRoute: AppObserveSlosIndexRoute,
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,
   AppDeploymentsAppsProjectNameRoute: AppDeploymentsAppsProjectNameRoute,

@@ -450,6 +450,15 @@ impl Search {
 
     /// Whether a row matches.
     pub fn row(&self, r: &RecordRef<'_>, s: &mut RowScratch) -> bool {
+        self.matches(r, s)
+    }
+
+    /// Whether a record not yet stored matches (a pipeline's filter's): as its row would.
+    pub fn record(&self, r: &crate::logs::record::Record, s: &mut RowScratch) -> bool {
+        self.matches(r, s)
+    }
+
+    fn matches<F: Fields>(&self, r: &F, s: &mut RowScratch) -> bool {
         s.lower.clear();
         let mut lowered = false;
         s.vals.clear();
@@ -523,17 +532,70 @@ fn leaf_block(l: &Leaf, b: &LogBlock, buf: &mut String) -> Maybe {
     }
 }
 
-fn leaf_row(l: &Leaf, r: &RecordRef<'_>, lower: &mut String, lowered: &mut bool, tok: &mut String) -> bool {
+/// What a search reads of a record: a stored row's, or a record's not yet stored. An attribute
+/// given twice is its first.
+pub trait Fields {
+    fn message(&self) -> &str;
+    fn service(&self) -> &str;
+    fn host(&self) -> &str;
+    fn source(&self) -> &str;
+    fn severity(&self) -> u8;
+    fn attr(&self, key: &str) -> Option<&str>;
+}
+
+impl Fields for RecordRef<'_> {
+    fn message(&self) -> &str {
+        self.message
+    }
+    fn service(&self) -> &str {
+        self.service
+    }
+    fn host(&self) -> &str {
+        self.host
+    }
+    fn source(&self) -> &str {
+        self.source
+    }
+    fn severity(&self) -> u8 {
+        self.severity
+    }
+    fn attr(&self, key: &str) -> Option<&str> {
+        RecordRef::attr(self, key)
+    }
+}
+
+impl Fields for crate::logs::record::Record {
+    fn message(&self) -> &str {
+        &self.message
+    }
+    fn service(&self) -> &str {
+        &self.service
+    }
+    fn host(&self) -> &str {
+        &self.host
+    }
+    fn source(&self) -> &str {
+        &self.source
+    }
+    fn severity(&self) -> u8 {
+        self.severity
+    }
+    fn attr(&self, key: &str) -> Option<&str> {
+        self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
+fn leaf_row<F: Fields>(l: &Leaf, r: &F, lower: &mut String, lowered: &mut bool, tok: &mut String) -> bool {
     let lower_msg = |lower: &mut String, lowered: &mut bool| {
         if !*lowered {
             lower.clear();
             // Most lines are ASCII: lowered a byte at a time (what `char::to_lowercase` gives
             // there), four to five times faster than a char at a time (§12.14).
-            if r.message.is_ascii() {
-                lower.push_str(r.message);
+            if r.message().is_ascii() {
+                lower.push_str(r.message());
                 lower.make_ascii_lowercase();
             } else {
-                for c in r.message.chars() {
+                for c in r.message().chars() {
                     lower.extend(c.to_lowercase());
                 }
             }
@@ -542,10 +604,10 @@ fn leaf_row(l: &Leaf, r: &RecordRef<'_>, lower: &mut String, lowered: &mut bool,
     };
     match l {
         Leaf::All => true,
-        Leaf::Field(Field::Service, t) => t.matches(r.service),
-        Leaf::Field(Field::Host, t) => t.matches(r.host),
-        Leaf::Field(Field::Source, t) => t.matches(r.source),
-        Leaf::Status(lo, hi) => (*lo..=*hi).contains(&r.severity),
+        Leaf::Field(Field::Service, t) => t.matches(r.service()),
+        Leaf::Field(Field::Host, t) => t.matches(r.host()),
+        Leaf::Field(Field::Source, t) => t.matches(r.source()),
+        Leaf::Status(lo, hi) => (*lo..=*hi).contains(&r.severity()),
         Leaf::Attr(k, m) => match r.attr(k) {
             None => false,
             Some(v) => match m {
@@ -562,7 +624,7 @@ fn leaf_row(l: &Leaf, r: &RecordRef<'_>, lower: &mut String, lowered: &mut bool,
         },
         Leaf::Word(w) => {
             let mut found = false;
-            tokens(r.message, tok, |t| {
+            tokens(r.message(), tok, |t| {
                 if t == w {
                     found = true;
                 }

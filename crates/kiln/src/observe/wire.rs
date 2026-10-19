@@ -69,6 +69,8 @@ pub enum Msg {
     Scrapes { targets: Vec<(String, super::scrape::Target)> },
     /// Server → runner: the log sources this machine reads (`super::collect`), as scrape targets.
     LogSources { sources: Vec<(String, super::collect::Source)> },
+    /// Server → runner: the log pipelines every node applies (`super::pipeline`), in order.
+    Pipelines { pipelines: Vec<super::pipeline::PipelineDef> },
 }
 
 /// What a write came to, as its sender needs it.

@@ -723,6 +723,70 @@ const scenarios = {
     }
   },
 
+  /** A pipeline made on its page: a grok parser whose rules are tried on a sample as they are
+   * written, an arithmetic processor, the whole tried on a line before it is kept; then a record
+   * posted is stored parsed. kiln's own nginx pipeline turned off and on from its row. */
+  async "a pipeline is made, tried, kept, and parses what comes after"() {
+    const name = `E2E timings ${run}`;
+    const source = `e2e-shop-${run}`;
+    let id;
+    try {
+      await page.goto(`${BASE}/observe/pipelines/new`);
+      await fillIn(page.getByLabel("Name", { exact: true }), name);
+      await fillIn(page.getByLabel("Filter", { exact: true }), `source:${source}`);
+      await page.getByLabel("A processor to add", { exact: true }).selectOption("grok-parser");
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+      let d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Rules", { exact: true }), "r %{word:http.method} %{notSpace:http.url} took %{number:duration}ms");
+      await fillIn(d.getByLabel("Samples", { exact: true }), "GET /cart took 1250ms");
+      await d.getByRole("button", { name: "Try the rules on the samples", exact: true }).click();
+      await d.getByRole("status").getByText("/cart", { exact: true }).waitFor();
+      await d.getByRole("button", { name: "Keep", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      await page.getByLabel("A processor to add", { exact: true }).selectOption("arithmetic-processor");
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+      d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Expression", { exact: true }), "duration / 1000");
+      await fillIn(d.getByLabel("Into", { exact: true }), "duration_s");
+      await d.getByRole("button", { name: "Keep", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      // The whole tried on a line, before it is kept: its source guessed from the filter.
+      await fillIn(page.getByLabel("Message", { exact: true }), "POST /pay took 50ms");
+      expect((await page.getByLabel("Source", { exact: true }).inputValue()) === source, "the source guessed from the filter");
+      await page.getByRole("button", { name: "Try it", exact: true }).click();
+      await page.getByRole("status").getByText("0.05", { exact: true }).waitFor();
+      await page.getByRole("button", { name: "Make the pipeline", exact: true }).click();
+      await page.waitForURL(/\/observe\/pipelines\/p[0-9a-f]{16}$/);
+      id = page.url().split("/").pop();
+      const kept = await api("GET", `/api/observe/v1/pipelines/${id}`);
+      expect(kept.body.processors.length === 2 && kept.body.filter.query === `source:${source}`, `kept as made: ${JSON.stringify(kept.body)}`);
+      // A record posted after: stored parsed.
+      expect((await api("POST", "/api/observe/v1/logs", [{ message: "PUT /cart took 750ms", service: "shop", hostname: "e2e", source }])).status === 202, "posting a record");
+      const found = await until("the record stored parsed", async () => {
+        const r = await api("POST", "/api/observe/v1/logs/search", { query: `source:${source}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 5 });
+        return r.body?.records?.[0];
+      });
+      expect(found.attributes["http.method"] === "PUT" && found.attributes.duration_s === "0.75", `the record: ${JSON.stringify(found)}`);
+      // kiln's own nginx pipeline: off, then on again, from its row.
+      await page.goto(`${BASE}/observe/pipelines`);
+      const nginx = page.getByRole("row").filter({ has: page.getByRole("link", { name: "nginx", exact: true }) });
+      await nginx.getByRole("button", { name: "Turn off nginx", exact: true }).click();
+      await nginx.getByText("Off", { exact: true }).waitFor();
+      expect((await api("GET", "/api/observe/v1/pipelines/builtin:nginx")).body.is_enabled === false, "turned off on the server");
+      await nginx.getByRole("button", { name: "Turn on nginx", exact: true }).click();
+      await nginx.getByText("On", { exact: true }).waitFor();
+      // Removed from its row.
+      const mine = page.getByRole("row").filter({ has: page.getByRole("link", { name, exact: true }) });
+      await mine.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until("its row gone", async () => (await mine.count()) === 0);
+      expect((await api("GET", `/api/observe/v1/pipelines/${id}`)).status === 404, "removed on the server");
+    } finally {
+      if (id) await api("DELETE", `/api/observe/v1/pipelines/${id}`);
+      await api("PUT", "/api/observe/v1/pipelines/builtin:nginx", { name: "nginx", is_enabled: true });
+    }
+  },
+
   /** A ratio SLO made from the form over counts whose share failing is known: its standing as the
    * page and the API say it; its two burn-rate alerts added, then evaluated to the burn rate; its
    * deletion refused while they read it; its target changed; then deleted. */

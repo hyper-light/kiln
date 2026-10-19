@@ -92,6 +92,50 @@ fn log_sources() -> Result<&'static std::sync::Arc<super::collect::Sources>, Fai
     LOG_SOURCES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log sources are kept by the server"))
 }
 
+/// The server's log pipelines, once it started.
+static PIPELINES: OnceLock<std::sync::Arc<super::pipeline::kept::Pipelines>> = OnceLock::new();
+
+pub fn set_pipelines(p: std::sync::Arc<super::pipeline::kept::Pipelines>) {
+    let _ = PIPELINES.set(p);
+}
+
+fn pipelines() -> Result<&'static std::sync::Arc<super::pipeline::kept::Pipelines>, Fail> {
+    PIPELINES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log pipelines are kept by the server"))
+}
+
+/// The pipelines now, applied: here from the next record, every runner told.
+fn apply_pipelines(p: &super::pipeline::kept::Pipelines) {
+    let defs = p.defs();
+    super::pipeline::kept::activate(&defs);
+    if let Some(o) = get() {
+        o.set_pipelines(defs);
+    }
+}
+
+/// A record to try pipelines on, as the API takes one.
+#[derive(Debug, Deserialize)]
+struct Sample {
+    message: String,
+    #[serde(default)]
+    service: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    attributes: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipelineTest {
+    /// The pipeline to try; none: every one applied now, in order.
+    #[serde(default)]
+    pipeline: Option<super::pipeline::PipelineDef>,
+    records: Vec<Sample>,
+}
+
 /// The sources now, applied: the server's own read from now, each runner told its own.
 fn apply_log_sources(s: &super::collect::Sources) {
     let all = s.list();
@@ -531,6 +575,83 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             let host = crate::os::hostname();
             let answer = crate::rt::blocking(move || super::collect::test(&name, &s, &host)).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &answer))
+        }
+        (&Method::GET, ["pipelines"]) => Ok(srv::json(StatusCode::OK, &json!({ "pipelines": pipelines()?.list() }))),
+        (&Method::POST, ["pipelines"]) => {
+            let def: super::pipeline::PipelineDef = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = pipelines()?;
+            let kept = store.create(def).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_pipelines(store);
+            Ok(srv::json(StatusCode::CREATED, &kept))
+        }
+        (&Method::GET, ["pipelines", id]) => pipelines()?.get(id).map(|p| srv::json(StatusCode::OK, &p)).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such pipeline")),
+        (&Method::PUT, ["pipelines", id]) => {
+            let id = (*id).to_owned();
+            let def: super::pipeline::PipelineDef = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = pipelines()?;
+            let kept = store.put(&id, def).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such pipeline"))?;
+            apply_pipelines(store);
+            Ok(srv::json(StatusCode::OK, &kept))
+        }
+        (&Method::DELETE, ["pipelines", id]) => {
+            let store = pipelines()?;
+            match store.delete(id).map_err(|e| fail(StatusCode::BAD_REQUEST, e))? {
+                true => {
+                    apply_pipelines(store);
+                    Ok(srv::status(StatusCode::NO_CONTENT))
+                }
+                false => Err(fail(StatusCode::NOT_FOUND, "no such pipeline")),
+            }
+        }
+        (&Method::PUT, ["pipeline_order"]) => {
+            #[derive(Deserialize)]
+            struct Order {
+                pipeline_ids: Vec<String>,
+            }
+            let o: Order = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = pipelines()?;
+            store.order(&o.pipeline_ids).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_pipelines(store);
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::POST, ["pipeline_test"]) => {
+            // What a pipeline (or every one, in order) makes of records given: nothing kept.
+            let t: PipelineTest = read_json(req.into_body(), QUERY_BODY).await?;
+            if t.records.len() > 100 {
+                return Err(fail(StatusCode::BAD_REQUEST, "100 records at the most"));
+            }
+            let now_ns = super::clock_ms().saturating_mul(1_000_000);
+            let mut records: Vec<Record> = t
+                .records
+                .into_iter()
+                .map(|s| Record {
+                    ts: now_ns,
+                    severity: s.status.as_deref().map_or(9, super::pipeline::status_of),
+                    service: s.service,
+                    host: s.host,
+                    source: s.source,
+                    message: s.message,
+                    attrs: s.attributes.into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect(),
+                    ..Record::default()
+                })
+                .collect();
+            super::pipeline::kept::try_on(t.pipeline.as_ref(), &mut records).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let out: Vec<Value> = records
+                .iter()
+                .map(|r| {
+                    json!({
+                        "ts_ns": r.ts,
+                        "status": kiln_obs::logs::record::level(r.severity),
+                        "service": r.service,
+                        "host": r.host,
+                        "source": r.source,
+                        "message": r.message,
+                        "attributes": r.attrs.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
+                        "trace_id": r.trace_id.map(|t| t.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+                    })
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "records": out })))
         }
         (&Method::GET, ["clouds"]) => Ok(srv::json(StatusCode::OK, &json!({ "clouds": clouds()?.list() }))),
         (&Method::PUT, ["clouds", name]) => {
