@@ -43,7 +43,8 @@ pub struct Live {
     /// The decoders' configurations (video, audio), for viewers that join.
     video: Mutex<Option<Bytes>>,
     audio: Mutex<Option<Bytes>>,
-    /// What it said that a viewer joining should know: opened, where it is, its title.
+    /// What it said that a viewer joining should know: opened, where it is, its title, the field
+    /// it's typed in and where its fields are, whether text is selected.
     said: Mutex<HashMap<String, String>>,
     /// When the last viewer left (unix ms; 0 while someone looks).
     unwatched: AtomicI64,
@@ -128,7 +129,7 @@ impl Relay {
         let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return };
         let v: Value = serde_json::from_str(&json).unwrap_or_default();
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
-            if matches!(k.as_str(), "opened" | "navigated" | "loaded") {
+            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected") {
                 live.said.lock().insert(k.clone(), json.clone());
             }
             if matches!(k.as_str(), "closed" | "error") {

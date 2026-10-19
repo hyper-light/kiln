@@ -5,12 +5,16 @@
  * at this screen's density), its sound as Opus once you turn it on; what you do in it goes back:
  * taps and the mouse, the wheel, keys by meaning, text from a phone's keyboard, a paste. Out of
  * view it's let go (the stream pauses, nothing is sent) and its last picture stays.
+ *
+ * A field of the page's that takes text has one of the viewer's own to type in, made like it: its
+ * keyboard (a tap on the field brings it up at once), its password manager's autofill, its Enter.
+ * What's selected in the page copies to the viewer's clipboard.
  */
 import * as React from "react";
-import { ArrowLeft, ArrowRight, Keyboard, RotateCw, Volume2, VolumeX, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Copy, Keyboard, RotateCw, Volume2, VolumeX, X } from "lucide-react";
 import type { ToolCall } from "@/api/harness";
 import { Beam, PrismLabel } from "./signals";
-import { chunkOf, liveOf, modifiers, type LiveStream } from "./live-of";
+import { chunkOf, fieldAt, liveOf, modifiers, secret, shapeOf, type FieldPlace, type LiveStream, type PageField } from "./live-of";
 import "./page.css";
 import "./live.css";
 
@@ -174,6 +178,36 @@ class Viewing {
   }
 }
 
+/** What the viewer's own field keeps in it, so a phone's keyboard has something to delete (its
+ *  Backspace says nothing in an empty field). Not in a password's, whose keys say themselves. */
+const KEEP = "\u200b";
+
+/** The viewer's field, made like the page's (`shapeOf`): set on the element itself, so it's right
+ *  the moment it takes the focus (a phone's keyboard is chosen then), and its type kept (`setType`:
+ *  React sets an input's type each time it renders it). */
+function shape(el: HTMLInputElement, f: Pick<PageField, "type" | "mode" | "ac" | "hint">, setType: (t: "text" | "password") => void) {
+  const s = shapeOf(f);
+  if (el.type !== s.type) el.type = s.type;
+  setType(s.type);
+  el.inputMode = s.inputMode;
+  el.autocomplete = s.autocomplete as AutoFill;
+  el.enterKeyHint = s.enterKeyHint;
+  el.value = s.type === "password" ? "" : KEEP;
+}
+
+/** Whether the viewer's field is already like the page's. */
+function like(el: HTMLInputElement, f: Pick<PageField, "type" | "mode" | "ac" | "hint">): boolean {
+  const s = shapeOf(f);
+  return el.type === s.type && el.inputMode === s.inputMode && el.autocomplete === s.autocomplete && el.enterKeyHint === s.enterKeyHint;
+}
+
+/** What a field of the page's is, in a word: its label, else its kind. */
+function fieldWord(f: PageField | null): string {
+  if (f?.label) return f.label;
+  const kinds: Record<string, string> = { password: "Password", email: "Email", url: "Address", tel: "Phone", search: "Search", number: "Number" };
+  return kinds[f?.type ?? ""] ?? "Text";
+}
+
 /** What the agent did, in a few words ("the agent clicked, typed"). */
 function agentWords(did: Record<string, unknown>[]): string {
   const verbs: Record<string, string> = { click: "clicked", tap: "tapped", type: "typed", key: "pressed a key", scroll: "scrolled", go: "went to a page", back: "went back", forward: "went forward", reload: "reloaded" };
@@ -197,7 +231,22 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const [marks, setMarks] = React.useState<{ n: number; x: number; y: number }[]>([]);
   const quiet = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const canvas = React.useRef<HTMLCanvasElement | null>(null);
-  const typing = React.useRef<HTMLTextAreaElement | null>(null);
+  /** The page's field that has the focus, and where its fields are; text selected in it. */
+  const [field, setField] = React.useState<PageField | null>(null);
+  const places = React.useRef<FieldPlace[]>([]);
+  const [selected, setSelected] = React.useState(false);
+  /** The viewer's own field (`shape`), typed in for the page's; whether it has the focus. */
+  const mirror = React.useRef<HTMLInputElement | null>(null);
+  const [mirrorType, setMirrorType] = React.useState<"text" | "password">("text");
+  const [typing, setTyping] = React.useState(false);
+  const mirrorRef = React.useCallback((el: HTMLInputElement | null) => {
+    mirror.current = el;
+    if (el) el.value = KEEP;
+  }, []);
+  const tapped = React.useRef(0);
+  /** A copy asked of the page, answered by its `copied`. */
+  const copying = React.useRef<((text: string) => void) | null>(null);
+  const boxEl = React.useRef<HTMLDivElement | null>(null);
   const viewing = React.useRef<Viewing | null>(null);
   const size = React.useRef({ width: 0, height: 0 });
   const live = React.useRef({ stream, sound, macPage });
@@ -244,6 +293,25 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           setStatus("ended");
           setWhy(String(e.error));
         }
+        const focus = e.focus as PageField | undefined;
+        if (focus) {
+          setField(focus.editable ? focus : null);
+          const m = mirror.current;
+          if (m && focus.editable) {
+            // The viewer's field is made like the page's (as it is, unless it's being typed in).
+            const typingIn = document.activeElement === m;
+            if (!typingIn || !like(m, focus)) shape(m, focus, setMirrorType);
+            // Just tapped into it: the keyboard comes up (where the tap's gesture still lets it).
+            if (!typingIn && touchViewer && performance.now() - tapped.current < 1500) m.focus({ preventScroll: true });
+          } else if (m && document.activeElement === m) m.blur();
+        }
+        if (Array.isArray(e.fields)) places.current = e.fields as FieldPlace[];
+        if (typeof e.selected === "boolean") setSelected(e.selected);
+        const copied = e.copied as { text?: string } | undefined;
+        if (copied && copying.current) {
+          copying.current(copied.text ?? "");
+          copying.current = null;
+        }
         const agent = e.agent as { did?: Record<string, unknown>[] } | undefined;
         if (agent?.did?.length) {
           setAgentDid(agentWords(agent.did));
@@ -272,6 +340,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   // The frame: its size is the page's window; in view it's live, out of view let go.
   const box = React.useCallback(
     (el: HTMLDivElement | null) => {
+      boxEl.current = el;
       if (!el) return;
       const root = el.closest<HTMLElement>(".hx-timeline");
       let pending: ReturnType<typeof setTimeout> | undefined;
@@ -334,25 +403,77 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
       moved.current = null;
     } else input([p]);
     if (e.pointerType === "touch") e.preventDefault();
+    if (k === "up" && e.pointerType !== "mouse") {
+      tapped.current = performance.now();
+      // A tap on one of the page's fields: the keyboard comes up now, in the tap's own gesture
+      // (a phone only lets it then), made for that field.
+      const f = fieldAt(places.current, p.x, p.y);
+      const m = mirror.current;
+      if (f && m) {
+        shape(m, f, setMirrorType);
+        m.focus({ preventScroll: true });
+      }
+    }
+  };
+  // A key by name, down and up.
+  const press = (name: string, text = "") => input([{ t: "k", k: "down", key: name, code: name, text }, { t: "k", k: "up", key: name, code: name }]);
+  // What's selected in the page, to the viewer's clipboard: asked of the page now, written as it
+  // answers (a clipboard item that waits for it, where the browser lets one; else its text then).
+  const copyOut = () => {
+    const text = new Promise<string>((resolve) => {
+      copying.current = resolve;
+      setTimeout(() => resolve(""), 3000);
+    });
+    send({ control: { copy: true } });
+    const later = () => void text.then((t) => (t ? navigator.clipboard?.writeText(t) : undefined)).catch(() => undefined);
+    try {
+      // Nothing came: nothing's written (the clipboard keeps what it had).
+      navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((t) => (t ? new Blob([t], { type: "text/plain" }) : Promise.reject(new Error("nothing selected")))) })]).catch(later);
+    } catch {
+      later();
+    }
   };
   const key = (k: "down" | "up") => (e: React.KeyboardEvent) => {
     // A paste comes as its text (the page's own clipboard isn't the viewer's).
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") return;
     e.preventDefault();
+    // A copy (or a cut) of what's selected comes to the viewer's clipboard; the page has the key too.
+    if (k === "down" && (e.metaKey || e.ctrlKey) && ["c", "x"].includes(e.key.toLowerCase()) && selected) copyOut();
     const text = k === "down" && e.key.length === 1 && !e.ctrlKey && !e.metaKey ? e.key : "";
     input([{ t: "k", k, key: e.key, code: e.code, text, mods: mods(e), rep: e.repeat, loc: e.location }]);
   };
 
-  // A phone's keyboard: a field of its own takes what it types, as text and compositions.
-  const typed = (e: React.FormEvent<HTMLTextAreaElement>) => {
+  // The viewer's own field: what's typed in it (a key, a word from a phone's keyboard, a password
+  // its password manager filled, a paste) goes to the page's, and it's emptied again.
+  const typed = (e: React.FormEvent<HTMLInputElement>) => {
     const ev = e.nativeEvent as InputEvent;
-    if (ev.isComposing) return;
+    // A composition goes as it's made, and whole as it ends.
+    if (ev.isComposing || ev.inputType === "insertCompositionText") return;
     const t = e.currentTarget;
-    if (ev.inputType === "deleteContentBackward") input([{ t: "k", k: "down", key: "Backspace", code: "Backspace" }, { t: "k", k: "up", key: "Backspace", code: "Backspace" }]);
-    else if (ev.inputType === "insertLineBreak") input([{ t: "k", k: "down", key: "Enter", code: "Enter", text: "\r" }, { t: "k", k: "up", key: "Enter", code: "Enter" }]);
-    else if (t.value) input([{ t: "x", text: t.value }]);
-    t.value = "";
+    const text = t.value.replaceAll(KEEP, "");
+    if (ev.inputType === "deleteContentBackward" || (t.type !== "password" && !t.value.includes(KEEP) && !text)) press("Backspace");
+    else if (ev.inputType === "insertLineBreak" || ev.inputType === "insertParagraph") press("Enter", "\r");
+    else if (text) input([{ t: "x", text }]);
+    t.value = t.type === "password" ? "" : KEEP;
   };
+  const typedKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    const t = e.currentTarget;
+    // Keys that type nothing go to the page's field as keys: moving in it, its Enter, Tab to the next.
+    if (["Enter", "Tab", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "Delete"].includes(e.key) || (e.key === "Backspace" && !t.value)) {
+      e.preventDefault();
+      press(e.key, e.key === "Enter" ? "\r" : "");
+      if (e.key === "Escape") t.blur();
+    }
+  };
+  // While it has the focus and a phone's keyboard takes part of the screen, the page's window is
+  // what's left above it (the page then keeps its field in sight).
+  const fit = React.useCallback(() => {
+    const el = boxEl.current;
+    const vv = window.visualViewport;
+    if (!el || !vv) return;
+    if (document.activeElement === mirror.current && vv.height < window.innerHeight * 0.85) el.style.setProperty("--lv-kb-h", `${Math.max(160, Math.round(vv.offsetTop + vv.height - el.getBoundingClientRect().top - 8))}px`);
+    else el.style.removeProperty("--lv-kb-h");
+  }, []);
 
   const go = (url: string) => {
     const u = /^[a-z]+:\/\//i.test(url) ? url : `http://${url}`;
@@ -375,6 +496,9 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     connect();
   };
 
+  // The viewer's own field shows while it's typed in, or (on a phone; anywhere, for what a password
+  // manager fills) while the page's field has the focus.
+  const shown = typing || (field !== null && (touchViewer || secret(field)));
   const word = status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended";
   return (
     <div className="pg lv" data-ev={ev} data-ev-live={stream.id} data-status={status}>
@@ -401,7 +525,22 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
               Sound
             </button>
           )}
-          <button type="button" className="pg-action" onClick={() => typing.current?.focus()}>
+          {selected && (
+            <button type="button" className="pg-action" onClick={copyOut}>
+              <Copy size={12} aria-hidden="true" />
+              Copy
+            </button>
+          )}
+          <button
+            type="button"
+            className="pg-action"
+            onClick={() => {
+              const m = mirror.current;
+              if (!m) return;
+              shape(m, field ?? { type: "text" }, setMirrorType);
+              m.focus({ preventScroll: true });
+            }}
+          >
             <Keyboard size={12} aria-hidden="true" />
             Type
           </button>
@@ -423,8 +562,40 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         <button type="button" className="pg-action" aria-label="Reload" title="Reload" onClick={() => send({ control: { reload: true } })}>
           <RotateCw size={12} aria-hidden="true" />
         </button>
+        {/* While a field of the page's takes text, the viewer's own for it (`shape`) is here; the
+            page's address otherwise. It's always there, so a tap can give it the focus at once. */}
+        {shown && <span className="lv-typing-what">{fieldWord(field)}</span>}
+        <input
+          ref={mirrorRef}
+          type={mirrorType}
+          className={`hx-input lv-mirror${shown ? "" : " lv-mirror-off"}`}
+          aria-label={`Type into the page's ${fieldWord(field).toLowerCase()} field`}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          tabIndex={shown ? 0 : -1}
+          onInput={typed}
+          onKeyDown={typedKey}
+          onCompositionUpdate={(e) => input([{ t: "i", text: e.data, start: e.data.length, end: e.data.length }])}
+          onCompositionEnd={(e) => {
+            input([{ t: "x", text: e.data }]);
+            const t = e.currentTarget;
+            setTimeout(() => (t.value = t.type === "password" ? "" : KEEP), 0);
+          }}
+          onFocus={() => {
+            setTyping(true);
+            window.visualViewport?.addEventListener("resize", fit);
+            fit();
+          }}
+          onBlur={() => {
+            setTyping(false);
+            window.visualViewport?.removeEventListener("resize", fit);
+            boxEl.current?.style.removeProperty("--lv-kb-h");
+          }}
+        />
         <input
           className="hx-input lv-address"
+          hidden={shown}
           value={editing ?? address}
           spellCheck={false}
           autoCapitalize="off"
@@ -461,7 +632,6 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         {marks.map((m) => (
           <span key={m.n} className="lv-mark" style={{ left: m.x, top: m.y }} aria-hidden="true" />
         ))}
-        <textarea ref={typing} className="lv-typing" aria-label="Type into the page" autoCapitalize="off" autoCorrect="off" onInput={typed} onCompositionUpdate={(e) => input([{ t: "i", text: e.data, start: e.data.length, end: e.data.length }])} onCompositionEnd={(e) => input([{ t: "x", text: e.data }])} />
         {(status === "ended" || status === "unsupported") && (
           <div className="lv-over">
             <p>{status === "unsupported" ? "This browser can't show live pages (it has no WebCodecs)." : why || "This live page ended."}</p>

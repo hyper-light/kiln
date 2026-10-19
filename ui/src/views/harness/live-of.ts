@@ -49,6 +49,44 @@ export function chunkOf(buf: ArrayBuffer): Chunk | null {
   return { kind, flags: String.fromCharCode(b[1] ?? 0), ts: Number(new DataView(buf).getBigInt64(2)), part: b[10] ?? 0, parts: b[11] ?? 1, data: b.subarray(12) };
 }
 
+/** The page's field that has the focus, as the page says it (`crate::browser::stream`'s FOCUS):
+ *  its type, input mode, autocomplete, Enter key's hint, label, and whether it takes lines. */
+export interface PageField {
+  editable: boolean;
+  type?: string;
+  mode?: string;
+  ac?: string;
+  hint?: string;
+  label?: string;
+  multi?: boolean;
+}
+
+/** A field's place in the page: x, y, width and height (CSS pixels), its type, input mode and
+ *  autocomplete. */
+export type FieldPlace = [number, number, number, number, string, string, string];
+
+/** The page's field at a point, if one is there. */
+export function fieldAt(places: FieldPlace[], x: number, y: number): PageField | null {
+  const p = places.find(([fx, fy, w, h]) => x >= fx && x <= fx + w && y >= fy && y <= fy + h);
+  return p ? { editable: true, type: p[4], mode: p[5], ac: p[6] } : null;
+}
+
+/** Whether a field takes what a password manager fills: a password, a username, a one-time code. */
+export const secret = (f: Pick<PageField, "type" | "ac">): boolean => f.type === "password" || /\b(username|current-password|new-password|one-time-code|webauthn)\b/.test(f.ac ?? "");
+
+/** The viewer's own field, made like the page's: a password's hides what's typed, the keyboard is
+ *  the one its input mode wants, and autofill offers what its autocomplete asks for. */
+export function shapeOf(f: Pick<PageField, "type" | "mode" | "ac" | "hint">): { type: "text" | "password"; inputMode: string; autocomplete: string; enterKeyHint: string } {
+  const password = f.type === "password";
+  const modes: Record<string, string> = { email: "email", url: "url", tel: "tel", number: "decimal", search: "search" };
+  return {
+    type: password ? "password" : "text",
+    inputMode: f.mode || modes[f.type ?? ""] || "text",
+    autocomplete: f.ac || (password ? "current-password" : f.type === "email" ? "email" : "off"),
+    enterKeyHint: f.hint ?? "",
+  };
+}
+
 /** Keys that are the viewer's shortcuts on a Mac and the page's with Control elsewhere. */
 const SHORTCUTS = new Set(["a", "c", "v", "x", "z", "y", "f", "s", "l", "r", "t", "b", "i", "u", "k"]);
 

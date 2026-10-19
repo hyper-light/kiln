@@ -606,7 +606,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
             let me = person(&req);
             let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id && l.for_whom(me.as_deref()));
-            if ours && hub.harness.streams.close(&hub, sid).await { Ok(srv::status(StatusCode::NO_CONTENT)) } else { Err(err(StatusCode::NOT_FOUND, "no such stream")) }
+            if ours && hub.harness.streams.close(&hub, sid).await {
+                hub.store.audit("admin".into(), "agent.stream.close".into(), format!("{id}: {sid}")).await;
+                Ok(srv::status(StatusCode::NO_CONTENT))
+            } else {
+                Err(err(StatusCode::NOT_FOUND, "no such stream"))
+            }
         }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
@@ -3492,6 +3497,9 @@ async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     // `{"start": true}`: the project's app first (its `.kiln/preview.yaml`), then its page.
     if spec.get("start").and_then(serde_json::Value::as_bool) == Some(true) {
         let started = crate::harness::streams::preview(hub, id, "start").await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+        if started.get("started").and_then(serde_json::Value::as_bool) == Some(true) {
+            hub.store.audit("admin".into(), "agent.app.start".into(), format!("{id}: {}", started.get("url").and_then(serde_json::Value::as_str).unwrap_or(""))).await;
+        }
         if let (Some(o), Some(url)) = (spec.as_object_mut(), started.get("url").cloned()) {
             o.insert("url".into(), url);
         }
@@ -3504,6 +3512,8 @@ async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
         o.entry("height").or_insert(serde_json::json!(640));
     }
     let live = hub.harness.streams.open(hub, id, spec, &by).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    let kind = profile.split(':').next().unwrap_or("conversation");
+    hub.store.audit("admin".into(), "agent.stream.open".into(), format!("{id}: {} ({kind} profile)", live.spec.get("url").and_then(serde_json::Value::as_str).unwrap_or(""))).await;
     Ok(srv::json(StatusCode::CREATED, &live.view()))
 }
 
@@ -3512,6 +3522,9 @@ async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
 /// that app.
 async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
     let v = crate::harness::streams::preview(hub, id, op).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    if op == "stop" && v.get("stopped").and_then(serde_json::Value::as_bool) == Some(true) {
+        hub.store.audit("admin".into(), "agent.app.stop".into(), id.to_owned()).await;
+    }
     Ok(srv::json(StatusCode::OK, &v))
 }
 
