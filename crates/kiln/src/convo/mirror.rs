@@ -63,6 +63,8 @@ pub struct Mirrors {
     chosen: Mutex<Vec<Chosen>>,
     feeds: Mutex<HashMap<String, Feed>>,
     out: async_channel::Sender<(PeerId, String, Vec<u8>)>,
+    /// What each mirror sent back to restore the store from: not sent to it again.
+    echoes: Option<Arc<super::feed::Echoes>>,
 }
 
 /// The candidates in the order they are picked in.
@@ -76,11 +78,12 @@ fn ranked(mut c: Vec<Candidate>, first: &[String]) -> Vec<Candidate> {
 
 impl Mirrors {
     /// The server's mirrors of `store`, `want` of them, picked from `first` first; what to send
-    /// each comes out of the receiver, `(peer, json, bytes)` for `ServerMsg::Convo`.
-    pub fn start(store: Store, want: usize, first: Vec<String>, file: PathBuf) -> (Arc<Self>, async_channel::Receiver<(PeerId, String, Vec<u8>)>) {
+    /// each comes out of the receiver, `(peer, json, bytes)` for `ServerMsg::Convo`. `echoes`:
+    /// what a mirror sent back to restore the store from, which its feed leaves out.
+    pub fn start(store: Store, want: usize, first: Vec<String>, file: PathBuf, echoes: Option<Arc<super::feed::Echoes>>) -> (Arc<Self>, async_channel::Receiver<(PeerId, String, Vec<u8>)>) {
         let chosen: Vec<Chosen> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let (out, rx) = async_channel::bounded(64);
-        (Arc::new(Self { store, want, first, file, chosen: Mutex::new(chosen), feeds: Mutex::new(HashMap::new()), out }), rx)
+        (Arc::new(Self { store, want, first, file, chosen: Mutex::new(chosen), feeds: Mutex::new(HashMap::new()), out, echoes }), rx)
     }
 
     /// The machines picked to keep a copy (`mirrors.json`).
@@ -106,7 +109,13 @@ impl Mirrors {
         if let Some(f) = feeds.get(machine) {
             return (f.shipper.clone(), f.peer.clone());
         }
-        let (shipper, said) = Shipper::start(self.store.clone());
+        let (shipper, said) = match self.echoes.clone() {
+            Some(echoes) => {
+                let m = machine.to_owned();
+                Shipper::start_skipping(self.store.clone(), Arc::new(move |rev| echoes.has(&m, rev)))
+            }
+            None => Shipper::start(self.store.clone()),
+        };
         let peer: Arc<Mutex<Option<PeerId>>> = Arc::default();
         let (to, out) = (peer.clone(), self.out.clone());
         crate::rt::spawn(async move {
@@ -239,7 +248,7 @@ mod tests {
     fn a_runner_named_first_takes_the_place_of_one_that_was_not() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (dir, store) = super::super::store::scratch()?;
-            let (m, _out) = Mirrors::start(store, 1, vec!["named".into()], dir.path().join("mirrors.json"));
+            let (m, _out) = Mirrors::start(store, 1, vec!["named".into()], dir.path().join("mirrors.json"), None);
             // The first to connect keeps the copy until the one named comes.
             m.connected(vec![cand("early", 100, 10)]);
             assert_eq!(m.view().iter().map(|v| v.machine.as_str()).collect::<Vec<_>>(), vec!["early"]);
@@ -254,17 +263,17 @@ mod tests {
         crate::rt::block_on(async move {
             let (dir, store) = super::super::store::scratch()?;
             let file = dir.path().join("mirrors.json");
-            let (m, _out) = Mirrors::start(store.clone(), 1, Vec::new(), file.clone());
+            let (m, _out) = Mirrors::start(store.clone(), 1, Vec::new(), file.clone(), None);
             m.connected(vec![cand("b", 200, 10), cand("a", 100, 10)]);
             assert_eq!(m.view().iter().map(|v| v.machine.as_str()).collect::<Vec<_>>(), vec!["a"]);
             // Kept across a restart of the server, and while it's away (a day at most).
-            let (m2, _out2) = Mirrors::start(store.clone(), 1, Vec::new(), file.clone());
+            let (m2, _out2) = Mirrors::start(store.clone(), 1, Vec::new(), file.clone(), None);
             m2.connected(vec![cand("b", 200, 10)]);
             assert_eq!(m2.view().iter().map(|v| (v.machine.as_str(), v.connected)).collect::<Vec<_>>(), vec![("a", false)]);
             // Away for longer: replaced.
             let stale = vec![Chosen { machine: "a".into(), chosen_at: 0, last_seen: crate::util::now_ms() - AWAY_MS - 1 }];
             std::fs::write(&file, serde_json::to_vec(&stale)?)?;
-            let (m3, _out3) = Mirrors::start(store, 1, Vec::new(), file);
+            let (m3, _out3) = Mirrors::start(store, 1, Vec::new(), file, None);
             m3.connected(vec![cand("b", 200, 10)]);
             assert_eq!(m3.view().iter().map(|v| (v.machine.as_str(), v.connected)).collect::<Vec<_>>(), vec![("b", true)]);
             Ok(())

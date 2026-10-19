@@ -128,6 +128,9 @@ pub struct Took {
     pub left: usize,
     /// The batch didn't follow what it had (`rev` says what it has): nothing was taken.
     pub gap: bool,
+    /// This store's own numbers the batch was written under, first and last (None: it wrote
+    /// nothing).
+    pub wrote: Option<(u64, u64)>,
 }
 
 /// A database the store keeps conversations in.
@@ -143,7 +146,9 @@ pub trait Engine: Send + 'static {
     /// Events matching `q`, newest first.
     fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>>;
     /// The rows written after number `from`, as they are now, oldest first, about `max_bytes`.
-    fn changes(&mut self, from: u64, max_bytes: usize) -> anyhow::Result<Changes>;
+    /// `kept`: record lines as they are kept ([`RecordRow::kept`](super::rows::RecordRow::kept)),
+    /// for a taker that takes them so; else as text.
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes>;
     /// Take a batch of `peer`'s feed, which follows number `from` of it, in one transaction:
     /// numbered here as this store's own writes, a session's rows from its latest writer alone.
     /// `machine`: the machine of the feed, where the sessions it brings run (None: its rows say,
@@ -277,9 +282,16 @@ impl Store {
         self.run(move |e| e.search(&q))
     }
 
-    /// The rows written after number `from`, about `max_bytes` of them. Blocking.
+    /// The rows written after number `from`, about `max_bytes` of them, record lines as text.
+    /// Blocking.
     pub fn changes(&self, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
-        self.run(move |e| e.changes(from, max_bytes))
+        self.changes_as(from, max_bytes, false)
+    }
+
+    /// [`Store::changes`], record lines as they are kept when `kept` ([`Engine::changes`]).
+    /// Blocking.
+    pub fn changes_as(&self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
+        self.run(move |e| e.changes(from, max_bytes, kept))
     }
 
     /// Take a batch of `peer`'s feed (it follows `from`; `machine` as for [`Engine::take`]).
@@ -508,7 +520,7 @@ mod tests {
         let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Some(Duration::from_secs(60)))?;
         let now = crate::util::now_ms();
         let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
-        let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into() }));
+        let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into(), kept: None }));
         store.put(vec![session("old"), line("old", 0), line("old", 1), Row::Closed { session: "old".into(), at: now - 3_600_000 }]);
         store.put(vec![session("new"), line("new", 0), Row::Closed { session: "new".into(), at: now }]);
         // Asked seldom: each question is the writer's work too, and it lets go only while idle.

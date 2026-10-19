@@ -69,6 +69,29 @@ pub struct RecordRow {
     /// The byte just past it in the file: where reading goes on.
     pub end: u64,
     pub line: String,
+    /// The line as the store it is from keeps it, compressed behind its codec byte, sent to a
+    /// taker that says it takes lines so (`kept` in [`From`](super::feed::Msg::From)): it is
+    /// kept the same way there, never decompressed and compressed again on the way. `line` is
+    /// then empty.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "kept_bytes")]
+    pub kept: Option<Vec<u8>>,
+}
+
+/// A kept line's bytes in a feed's JSON: base64.
+mod kept_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Option::<String>::deserialize(d)?.map(|t| base64::engine::general_purpose::STANDARD.decode(t).map_err(serde::de::Error::custom)).transpose()
+    }
 }
 
 /// An event, with what it is found by pulled out of its body.
@@ -113,7 +136,7 @@ impl Row {
         match self {
             Row::Session { info, meta, state, changes, .. } => 64 + [info, meta, state, changes].iter().map(|p| p.as_ref().map_or(0, String::len)).sum::<usize>(),
             Row::Event(e) => 128 + e.text.len() + e.body.len(),
-            Row::Record(r) => 64 + r.source.len() + r.line.len(),
+            Row::Record(r) => 64 + r.source.len() + r.line.len() + r.kept.as_ref().map_or(0, |k| k.len() / 3 * 4),
             Row::Reset { .. } | Row::Closed { .. } | Row::RecordReset { .. } | Row::Machine { .. } => 64,
         }
     }
