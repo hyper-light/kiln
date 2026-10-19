@@ -217,12 +217,40 @@ async fn who(hub: &Hub, req: &Request) -> Result<Who, Error> {
     }
 }
 
-/// `GET /v2/token?service=kiln&scope=…`: a registry token for the scopes the caller may have.
-pub async fn token(hub: &Arc<Hub>, req: Request) -> Response {
-    let q: HashMap<String, Vec<String>> = req.uri().query().unwrap_or_default().split('&').filter_map(|kv| kv.split_once('=')).fold(HashMap::new(), |mut m, (k, v)| {
-        m.entry(k.to_owned()).or_default().push(srv::decode(v));
+/// A query string's or form's fields, each name's values in order.
+fn fields(s: &str) -> HashMap<String, Vec<String>> {
+    s.split('&').filter_map(|kv| kv.split_once('=')).fold(HashMap::new(), |mut m, (k, v)| {
+        m.entry(srv::decode(k)).or_default().push(srv::decode(v));
         m
-    });
+    })
+}
+
+/// `GET /v2/token?service=kiln&scope=…`: a registry token for the scopes the caller may have.
+/// `POST /v2/token` is the OAuth2 form of it (`grant_type=password`, the PAT or job token as the
+/// password), which containerd and BuildKit try first; a refresh token isn't one kiln gives, so
+/// that grant is refused as they expect (400), and they ask with `GET`.
+pub async fn token(hub: &Arc<Hub>, req: Request) -> Response {
+    if req.method() == Method::POST {
+        let body = match srv::body_bytes(req.into_body(), 64 << 10).await {
+            Ok(b) => b,
+            Err(e) => return err(StatusCode::BAD_REQUEST, "UNSUPPORTED", format!("the form: {e:#}")).response(hub, None),
+        };
+        let f = fields(&String::from_utf8_lossy(&body));
+        let one = |k: &str| f.get(k).and_then(|v| v.first()).map(String::as_str).unwrap_or_default();
+        if one("grant_type") != "password" || one("password").is_empty() {
+            return base(srv::json(StatusCode::BAD_REQUEST, &json!({ "error": "unsupported_grant_type", "error_description": "kiln gives tokens for a password grant (a PAT or a job token), or by GET" })));
+        }
+        let Some(caller) = caller_of(hub, one("password")).await else {
+            return base(srv::json(StatusCode::UNAUTHORIZED, &json!({ "error": "invalid_grant", "error_description": "those credentials aren't kiln's" })));
+        };
+        let scopes = f.get("scope").cloned().unwrap_or_default();
+        let access = auth::grant(hub, Some(&caller), &scopes);
+        let scope = access.grants.iter().map(|(n, a)| format!("repository:{n}:{}", a.iter().map(|x| x.word()).collect::<Vec<_>>().join(","))).collect::<Vec<_>>().join(" ");
+        let t = auth::token(hub, &access);
+        let issued = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+        return base(srv::json(StatusCode::OK, &json!({ "access_token": t, "token": t, "scope": scope, "expires_in": auth::TOKEN_SECS, "issued_at": issued })));
+    }
+    let q = fields(req.uri().query().unwrap_or_default());
     let scopes = q.get("scope").cloned().unwrap_or_default();
     let caller = match auth::credentials(hub, srv::header_str(&req, &header::AUTHORIZATION)) {
         Credentials::None => None,

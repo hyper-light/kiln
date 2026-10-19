@@ -57,6 +57,18 @@ pub const BUILTINS: &[Builtin] = &[
         outputs: &[("kind", "The integration's kind."), ("env", "The variables set, comma-separated.")],
     },
     Builtin {
+        name: "build-image",
+        description: "Build a runner image (W13-R11) from `.kiln/images/<name>/Dockerfile` (docker buildx, multi-platform where the builder can) or an Agentfile (shards build), push it to kiln's registry with the job's token, and register it for pools and routing rules.",
+        inputs: &[
+            Input { name: "name", description: "The image's name: `.kiln/images/<name>/`.", default: None, required: true },
+            input("context", "The build's directory (`.kiln/images/<name>` by default).", None),
+            input("file", "The Dockerfile (`<context>/Dockerfile` by default).", None),
+            input("platforms", "Platforms, comma-separated (`linux/amd64,linux/arm64`); the runner's own by default.", None),
+            input("tag", "The tag (the commit's first twelve characters by default; `latest` too).", None),
+        ],
+        outputs: &[("image", "The image: `<registry>/<repository>@<digest>`."), ("digest", "Its digest.")],
+    },
+    Builtin {
         name: "publish",
         description: "Publish a package to its registry (W12-R04) with an integration's credentials: npm (`npm publish`), PyPI (`uv publish`, else twine), crates.io (`cargo publish`), NuGet (`dotnet nuget push`), RubyGems (`gem push`), Maven (`mvn deploy`). A private registry (Artifactory, Nexus, GitHub Packages, GitLab Packages, CodeArtifact, Azure Artifacts, Artifact Registry, Cloudsmith) is the integration's `registry`.",
         inputs: &[

@@ -43,7 +43,7 @@ impl Action {
         }
     }
 
-    fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             Self::Pull => "pull",
             Self::Push => "push",

@@ -124,6 +124,17 @@ fn w12_ac01_conformance() -> anyhow::Result<()> {
     assert_eq!(send(port, "GET", "/v2/", &a, b"")?.status, 200);
     let bad = send(port, "GET", "/v2/acme/app/tags/list", &[("Authorization", "Bearer kreg.e30.00")], b"")?;
     assert_eq!((bad.status, bad.code()), (401, "UNAUTHORIZED".to_owned()), "a forged token");
+    // OAuth2's form, which containerd and BuildKit ask with first: a password grant gets the same
+    // token; a refresh grant (kiln gives no refresh tokens) is refused as they expect, so they ask
+    // with GET; wrong credentials get nothing.
+    let form = [("Content-Type", "application/x-www-form-urlencoded")];
+    let g = send(port, "POST", "/v2/token", &form, format!("grant_type=password&service=kiln&client_id=containerd-client&username=admin&password={}&scope=repository%3Aacme%2Fapp%3Apull%2Cpush", s.admin).as_bytes())?;
+    assert_eq!(g.status, 200, "{}", String::from_utf8_lossy(&g.body));
+    assert_eq!(g.json().get("scope").and_then(Value::as_str), Some("repository:acme/app:pull,push"), "{}", String::from_utf8_lossy(&g.body));
+    let oauth = format!("Bearer {}", g.json().get("access_token").and_then(Value::as_str).unwrap_or_default());
+    assert_eq!(send(port, "GET", "/v2/acme/app/tags/list", &[("Authorization", oauth.as_str())], b"")?.status, 404, "the token works (no such repository yet)");
+    assert_eq!(send(port, "POST", "/v2/token", &form, b"grant_type=refresh_token&refresh_token=x&service=kiln")?.status, 400);
+    assert_eq!(send(port, "POST", "/v2/token", &form, b"grant_type=password&username=admin&password=wrong&service=kiln")?.status, 401);
 
     // Push, monolithic: a config and a layer.
     let (config, layer) = (br#"{"architecture":"amd64","os":"linux"}"#.to_vec(), b"layer one\n".repeat(1000));
@@ -632,5 +643,149 @@ fn w18_attestation_on_image() -> anyhow::Result<()> {
         let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         assert!(o.status.success(), "cosign: {said}");
     }
+    Ok(())
+}
+
+/// What a `kiln/build-image@v1` run left: the server, the image it registered, the leg's log.
+struct Built {
+    _dir: tempfile::TempDir,
+    s: common::Server,
+    image: Value,
+    log: String,
+}
+
+/// Builds `.kiln/images/tools/<file>` (`content`, beside a `hello.txt`) with `kiln/build-image@v1`
+/// on a local server's own runner, as a job with `packages: write`; fails unless the run succeeds.
+fn build_image(file: &str, content: &str) -> anyhow::Result<Built> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".kiln/images/tools"))?;
+    std::fs::write(repo.join(".kiln/images/tools").join(file), content)?;
+    std::fs::write(repo.join(".kiln/images/tools/hello.txt"), "built in kiln\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!("[[repos]]\nname = \"acme/images\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let port = s.port;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
+        if body.contains("acme/images") && !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(
+        repo.join(".kiln/ci.yaml"),
+        r#"name: images
+on: { push: {} }
+jobs:
+  build:
+    runs-on: [self-hosted, local]
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: kiln/checkout@v1
+      - id: tools
+        uses: kiln/build-image@v1
+        with: { name: tools, tag: v1 }
+      - run: echo "built ${{ steps.tools.outputs.image }}"
+"#,
+    )?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "images"])?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(900);
+    let run = loop {
+        let (_, body) = common::http(port, "GET", "/api/ci/runs?repo=acme/images&limit=5", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        if let Some(r) = v.get("runs").and_then(Value::as_array).and_then(|r| r.first()).filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).cloned() {
+            break r;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = common::http(port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..4 {
+        let (_, text) = common::http(port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    let (_, steps) = common::http(port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+    anyhow::ensure!(run.get("conclusion").and_then(Value::as_str) == Some("success"), "{steps}\n{log}\n{}", s.log());
+    let (_, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images", &s.admin, None)?;
+    let image = serde_json::from_str::<Value>(&body)?.pointer("/images/0").cloned().unwrap_or_default();
+    Ok(Built { _dir: dir, s, image, log })
+}
+
+/// Checks what `kiln/build-image@v1` registered against kiln's registry: the image by its name,
+/// tags `v1` and `latest` naming the registered digest, the step's output that image by digest,
+/// its platforms `platforms`.
+fn check_built(b: &Built, platforms: &Value) -> anyhow::Result<()> {
+    let (port, image) = (b.s.port, &b.image);
+    assert_eq!(image.get("name").and_then(Value::as_str), Some("tools"), "{image}");
+    assert_eq!(image.get("reference").and_then(Value::as_str), Some(format!("127.0.0.1:{port}/acme/images/images/tools:v1").as_str()), "{image}");
+    assert_eq!(image.get("platforms"), Some(platforms), "{image}");
+    let digest = image.get("digest").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert!(digest.starts_with("sha256:"), "{image}");
+    assert!(b.log.contains(&format!("built 127.0.0.1:{port}/acme/images/images/tools@{digest}")), "the step's output is the image by digest: {}", b.log);
+    let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("admin:{}", b.s.admin)));
+    let accept = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json";
+    for tag in ["v1", "latest"] {
+        let g = send(port, "GET", &format!("/v2/acme/images/images/tools/manifests/{tag}"), &[("Authorization", basic.as_str()), ("Accept", accept)], b"")?;
+        assert_eq!(g.status, 200, "{tag}: {}", String::from_utf8_lossy(&g.body));
+        assert_eq!(g.header("docker-content-digest"), digest, "{tag}");
+    }
+    let (_, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images&name=other", &b.s.admin, None)?;
+    assert_eq!(serde_json::from_str::<Value>(&body)?.get("images"), Some(&json!([])), "{body}");
+    Ok(())
+}
+
+fn on_path(prog: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
+}
+
+/// A runner image built in kiln (docs/ci.md W13-R11): `kiln/build-image@v1` builds
+/// `.kiln/images/<name>/Dockerfile` with `docker buildx`, pushes it to kiln's registry under the
+/// repository's `images/<name>` with the job's token (BuildKit asks for it with OAuth2's form),
+/// and the server registers it (`ci_images`) with the digest its registry holds and the
+/// platforms the image's manifest says.
+#[test]
+fn w13_r11_build_image() -> anyhow::Result<()> {
+    if !std::process::Command::new("docker").args(["buildx", "version"]).output().is_ok_and(|o| o.status.success()) {
+        eprintln!("w13_r11_build_image: no docker buildx here");
+        return Ok(());
+    }
+    let b = build_image("Dockerfile", "FROM scratch\nCOPY hello.txt /hello.txt\n")?;
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        a => a,
+    };
+    check_built(&b, &json!([format!("linux/{arch}")]))?;
+    assert!(b.log.contains("docker buildx build --push"), "{}", b.log);
+    Ok(())
+}
+
+/// The same for an Agentfile, which shards builds (W13-R06, R11): `shards build`, then
+/// `shards push` with kiln's credential helper, never Docker; its microVM image is Linux on the
+/// machine's architecture.
+#[test]
+fn w13_r11_build_agentfile() -> anyhow::Result<()> {
+    if !on_path("shards") {
+        eprintln!("w13_r11_build_agentfile: no shards here");
+        return Ok(());
+    }
+    let b = build_image("Agentfile", "FROM alpine:3.22\nCOPY hello.txt /hello.txt\nRUN cat /hello.txt\n")?;
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        a => a,
+    };
+    check_built(&b, &json!([format!("linux/{arch}")]))?;
+    assert!(b.log.contains("shards build") && b.log.contains("shards push"), "{}", b.log);
+    assert!(!b.log.contains("docker buildx"), "an Agentfile is never built with Docker: {}", b.log);
     Ok(())
 }

@@ -99,6 +99,17 @@ pub struct Ci {
     /// max_blob = 21474836480             # bytes a blob may have (20 GiB)
     /// ```
     pub registry: Registry,
+    /// `[ci.attest]`: how kiln signs attestations (docs/ci.md W18-R02).
+    ///
+    /// ```toml
+    /// [ci.attest]
+    /// signing = "keyless"                       # kiln (its own key, the default), key, kms or keyless
+    /// fulcio_url = "https://fulcio.example.com" # keyless: a Fulcio that trusts kiln's OIDC issuer
+    /// rekor_url = "https://rekor.example.com"
+    /// # key: key_file = "/etc/kiln/cosign.key", key_password_file = "/etc/kiln/cosign.password"
+    /// # kms: kms = "awskms:///arn:aws:kms:eu-west-1:123456789012:key/…", integration = "aws-signing"
+    /// ```
+    pub attest: Attest,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
     ///
     /// ```toml
@@ -275,6 +286,24 @@ impl Registry {
     pub fn max_blob_bytes(&self) -> u64 {
         self.max_blob.unwrap_or(20 << 30)
     }
+}
+
+/// How attestations are signed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Attest {
+    /// `kiln` (its own key), `key`, `kms` or `keyless`.
+    pub signing: Option<String>,
+    /// `key`: cosign's key file (or a PKCS#8 or SEC1 PEM), and its password's file.
+    pub key_file: Option<std::path::PathBuf>,
+    pub key_password_file: Option<std::path::PathBuf>,
+    /// `kms`: the key (`awskms:///<arn>`), and the `aws` integration kiln reaches it with.
+    pub kms: Option<String>,
+    pub integration: Option<String>,
+    /// `keyless`: Fulcio and Rekor, and the audience of kiln's identity token for Fulcio.
+    pub fulcio_url: Option<String>,
+    pub rekor_url: Option<String>,
+    pub audience: Option<String>,
 }
 
 /// How landed commits are signed.

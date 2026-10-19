@@ -51,7 +51,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W18: an attest step's SBOM and bundles, for its runner; the key that signs them.
         ["_kiln", "attestations", "sbom"] if req.method() == Method::POST => Some(super::attest::upload(hub, req).await),
         ["_kiln", "attestations"] => Some(super::attest::for_leg(hub, &req).await),
-        ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub)),
+        ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub).await),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -188,6 +188,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let caller = req.extensions().get::<crate::authz::Caller>().cloned();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT | Method::PATCH) { crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
             super::environments::route(hub, &method, tail, q, body, caller.as_ref()).await
+        }
+        // W13-R11: the runner images kiln built.
+        (&Method::GET, ["images"]) => super::images::list(hub, q).await,
+        // W18-R04: whether a digest has kiln's provenance meeting a requirement.
+        (&Method::POST, ["attestations", "verify"]) => {
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::attest::verify_route(hub, &body).await
         }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => super::routing::get(hub).await,

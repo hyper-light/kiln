@@ -371,6 +371,16 @@ pub enum JobEventV2 {
         #[serde(default)]
         sbom: bool,
     },
+    /// W13-R11: an image a `kiln/build-image@v1` step built and pushed to kiln's registry.
+    ImageBuilt {
+        idx: u32,
+        name: String,
+        /// Where it is (`<registry>/<repository>:<tag>`), and its digest.
+        reference: String,
+        digest: String,
+        #[serde(default)]
+        platforms: Vec<String>,
+    },
 }
 
 #[cfg(test)]

@@ -245,13 +245,14 @@ pub async fn reported(hub: &Hub, leg: &str, idx: u32, nonce: &str, mut subjects:
     if subjects.is_empty() {
         subjects.push(Subject { name: format!("git+{}@{}", f.repository, f.git_ref), digest: [("gitCommit".to_owned(), f.sha.clone())].into() });
     }
-    let s = signer(hub)?;
+    // Signed as `[ci.attest] signing` says (W18-R02): kiln's key, a key file, KMS, or keyless.
+    let workload = kiln_ci::oidc::Workload { repository: &f.repository, environment: None, git_ref: Some(&f.git_ref), sha: Some(&f.sha), actor: "kiln", source: "job", app: None, deployment: None, trigger: Some(&run) };
     let mut made: Vec<(String, Value)> = Vec::new();
     if provenance {
-        made.push((a::PROVENANCE.into(), s.bundle(&a::statement(&subjects, a::PROVENANCE, a::provenance(&f)))?));
+        made.push((a::PROVENANCE.into(), super::signing::bundle(hub, &a::statement(&subjects, a::PROVENANCE, a::provenance(&f)), &workload).await?));
     }
     if let Some((kind, doc)) = doc {
-        made.push((kind.into(), s.bundle(&a::statement(&subjects, kind, doc))?));
+        made.push((kind.into(), super::signing::bundle(hub, &a::statement(&subjects, kind, doc), &workload).await?));
     }
     // Images in kiln's registry carry them as referrers (W18, W12-R01), where `cosign` and the
     // referrers API find them.
@@ -310,10 +311,76 @@ pub async fn for_run(hub: &Hub, run: &str) -> Result<Response, Fail> {
     Ok(srv::json(StatusCode::OK, &json!({ "attestations": list.into_iter().map(row_json).collect::<Vec<_>>() })))
 }
 
+/// What an environment's `require-provenance` asks of an image (docs/ci.md W18-R04).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct Requirement {
+    /// The builder (kiln's own, `<public_url>/ci@v1`, by default).
+    pub builder: Option<String>,
+    /// The workflows (paths, globs) it may have come from; none: any.
+    pub workflows: Vec<String>,
+    /// The branches (globs) its ref may be; none: any.
+    pub branches: Vec<String>,
+}
+
+/// Whether kiln's own provenance about `digest`, its signature verified, meets `req`: the
+/// attestation's id when one does, else why none did.
+pub async fn verify_provenance(hub: &Hub, digest: &str, req: &Requirement) -> anyhow::Result<Result<i64, String>> {
+    let sql = format!("SELECT {COLUMNS} FROM ci_attestations a JOIN ci_attestation_subjects s ON s.attestation_id = a.id WHERE s.digest = ?1 AND a.origin = 'kiln' AND a.predicate_type = ?2 ORDER BY a.id DESC LIMIT 50");
+    let found = rows(hub, sql, digest.to_ascii_lowercase(), a::PROVENANCE.to_owned()).await?;
+    if found.is_empty() {
+        return Ok(Err(format!("kiln has no provenance of {digest}")));
+    }
+    let builder = req.builder.clone().unwrap_or_else(|| format!("{}/ci@v1", hub.cfg.server.public_url.trim_end_matches('/')));
+    let mut why = Vec::new();
+    for (id, _, _, _, _, _, bundle, _) in found {
+        let b: Value = serde_json::from_str(&bundle).unwrap_or(Value::Null);
+        if !super::signing::verify(hub, &b).await.unwrap_or(false) {
+            why.push(format!("#{id}: its signature doesn't verify"));
+            continue;
+        }
+        let Some(st) = a::statement_of(&b) else { continue };
+        let names_it = st.get("subject").and_then(Value::as_array).into_iter().flatten().any(|s| s.pointer("/digest/sha256").and_then(Value::as_str).is_some_and(|h| format!("sha256:{h}") == digest.to_ascii_lowercase()));
+        let p = st.get("predicate").cloned().unwrap_or(Value::Null);
+        let by = p.pointer("/runDetails/builder/id").and_then(Value::as_str).unwrap_or_default();
+        let path = p.pointer("/buildDefinition/externalParameters/workflow/path").and_then(Value::as_str).unwrap_or_default();
+        let git_ref = p.pointer("/buildDefinition/externalParameters/workflow/ref").and_then(Value::as_str).unwrap_or_default();
+        let branch = git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref);
+        if !names_it {
+            why.push(format!("#{id}: about something else"));
+        } else if by != builder {
+            why.push(format!("#{id}: built by {by}, not {builder}"));
+        } else if !req.workflows.is_empty() && !req.workflows.iter().any(|w| crate::pipeline::glob_match(w, path)) {
+            why.push(format!("#{id}: from {path}, not {}", req.workflows.join(", ")));
+        } else if !req.branches.is_empty() && !req.branches.iter().any(|g| crate::pipeline::glob_match(g, branch)) {
+            why.push(format!("#{id}: from {git_ref}, not {}", req.branches.join(", ")));
+        } else {
+            return Ok(Ok(id));
+        }
+    }
+    Ok(Err(why.join("; ")))
+}
+
+/// `POST /api/ci/attestations/verify` `{ digest, builder?, workflows?, branches? }`: whether an
+/// image (or file) has kiln's verified provenance meeting the requirement (for CD's
+/// `require-provenance`, W18-R04).
+pub async fn verify_route(hub: &Hub, body: &Value) -> Result<Response, Fail> {
+    let digest = body.get("digest").and_then(Value::as_str).filter(|d| d.starts_with("sha256:")).ok_or_else(|| (StatusCode::BAD_REQUEST, "`digest`: sha256:<hex>".to_owned()))?;
+    let req: Requirement = serde_json::from_value(body.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let v = match verify_provenance(hub, digest, &req).await.map_err(internal)? {
+        Ok(id) => json!({ "digest": digest, "verified": true, "attestation": id }),
+        Err(why) => json!({ "digest": digest, "verified": false, "why": why }),
+    };
+    Ok(srv::json(StatusCode::OK, &v))
+}
+
 /// `GET /_kiln/attestation-key.pem`: the public key kiln's bundles are signed with.
-pub fn key_pem(hub: &Hub) -> Result<Response, Fail> {
-    let s = signer(hub).map_err(internal)?;
-    Ok(srv::text(StatusCode::OK, &s.public_pem()))
+pub async fn key_pem(hub: &Hub) -> Result<Response, Fail> {
+    // The configured signer's (W18-R02): kiln's own key, the key file's, KMS's; none when keyless.
+    match super::signing::public_pem(hub).await.map_err(internal)? {
+        Some(pem) => Ok(srv::text(StatusCode::OK, &pem)),
+        None => Err((StatusCode::NOT_FOUND, "kiln signs keyless: verify with Fulcio's and Rekor's roots and kiln's identity, not a key".into())),
+    }
 }
 
 /// `GET /api/v3/repos/:o/:r/attestations/:digest` (GitHub's shape): the repository's bundles of a

@@ -184,12 +184,12 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
-| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); pools, microVMs, k8s, UI-made image definitions left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); review UI and REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
-| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles, its own P-256 key), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; keyless, cosign key files and KMS, images' referrers (W12), R04, microVM containment (W13) left |
+| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check for CD (R04's kiln half), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, R04's CD half, AC04, microVM containment (W13) left |
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
@@ -3258,10 +3258,28 @@ enforcement points to W18, agent isolation to W20.
   traffic to the host, such as one of the fleet's, where a container could not reach a server
   on the same machine. Services then resolve by name to 127.0.0.1, and `job.services.<id>.ports`
   are their own.
+- *Done.* R11's builds: `kiln/build-image@v1` (`name`, and optionally `context`, `file`,
+  `platforms`, `tag`) builds `.kiln/images/<name>/`:
+  - a `Dockerfile` with `docker buildx build --push` (multi-platform where the builder can);
+  - an `Agentfile` with `shards build`, then `shards push`, on a runner with shards, never with
+    Docker (a runner without shards says so).
+
+  Both push to kiln's registry, as `<repo>/images/<name>:<tag>` (the commit's first twelve
+  characters by default) and `:latest`, signed in with the job's token through kiln's credential
+  helper (`packages: write`). The registry takes OAuth2's form of the token request too, which
+  containerd and BuildKit try first. The runner reports the image over its own channel
+  (`JobEventV2::ImageBuilt`). The server registers it (`ci_images`) only as its registry holds
+  it: under the leg's own repository, the digest one of its manifests there, and the platforms
+  read from that manifest (an index's members, else its config's). `GET /api/ci/images?repo=&name=`
+  lists them, newest first. The step's outputs are `image` (by digest) and `digest`.
+  `w13_r11_build_image` builds a Dockerfile this way and checks the registration against the
+  registry; `w13_r11_build_agentfile` does the same for an Agentfile where shards is installed.
 - *Left.*
   - R01's probes and R02.
   - The `firecracker`, `shards` and `k8s` executors (R05 to R07).
-  - Pools, opt-in Docker access and images built in kiln (R09 to R15).
+  - Pools (R09), and R11's other parts: definitions made in the UI ("Save to repo"), the
+    editor's checks (W21), `POST /api/ci/images` · `/validate` · `/:id/build`, kiln's shipped
+    definitions beyond the runner image, and example Agentfiles.
   - The ACs.
 
 ### W14 Code hosting, stacked diffs, review and landing
@@ -4040,8 +4058,8 @@ code from outside a repository's trust safely: microVMs or containers, limited e
 - **W18-AC04 Deploy policy.** An image without matching provenance is refused by an environment
   with `require-provenance`, and one with it deploys. *E2E.*
 
-**Progress.** R01, R03, R05–R08, AC01, AC02 and AC03 (in containers) done; R02 with the
-server's key:
+**Progress.** R01, R02, R03, R05–R08, AC01, AC02 and AC03 (in containers) done; R04's kiln
+half:
 - **Attesting.** `kiln/attest@v1` takes GitHub's subjects (`subject-path` patterns,
   `subject-name` with `subject-digest`, `subject-checksums`) and kiln's (`subject-image`, whose
   digests come from the runner's engine or the reference; `subjects`, files where one matches,
@@ -4124,11 +4142,30 @@ Done since:
   cosign's new bundle format keeps them; cosign verifies the bundle the referrers API returns
   with kiln's key (`w18_attestation_on_image`).
 
+- *Done.* R02's other signers, as `[ci.attest] signing` says (`kiln`, its own key, by default):
+  - `key`: a cosign key file (`cosign generate-key-pair`'s encrypted key: scrypt and NaCl's
+    secretbox, its password in `key_password_file`) or a PKCS#8 or SEC1 PEM (`key_file`);
+  - `kms`: an AWS KMS key (`kms = "awskms:///<arn>"`) through an `aws` integration
+    (`integration`), its public key and each signature asked of KMS (`GetPublicKey`, `Sign`,
+    ECDSA P-256 over SHA-256), the private key never leaving it;
+  - `keyless`: an identity token from kiln's own issuer (audience `sigstore`, the workload's
+    subject) for a Fulcio (`fulcio_url`) signing certificate of a key made for that one bundle,
+    with proof of possession; the DSSE envelope entered in Rekor (`rekor_url`); the bundle
+    carries the certificate chain and the log entry, and kiln's key PEM is a 404 that says so.
+
+  Checked with cosign: a key it made signs kiln's bundles, which `cosign verify-blob-attestation`
+  accepts (`w18_r02_cosign_key`); and against a fake Fulcio and Rekor that check the token's
+  audience and subject, the proof, and that the entry's verifier is the certificate
+  (`w18_r02_keyless`).
+- *Done.* R04's kiln half: `POST /api/ci/attestations/verify` (`{ digest, builder, workflows,
+  branches }`, globs) answers whether kiln's own provenance about a digest, its signature checked
+  again, meets the requirement: `{ verified, attestation }`, or `{ verified: false, why }`. CD's
+  `require-provenance` asks it before it deploys an image (W15-R03).
+
 Left:
-- keyless signing (Fulcio, Rekor), cosign key files and KMS;
 - attaching to images in other registries;
 - the SBOM differences in review;
-- R04 (with CD) and AC04;
+- R04's CD half (deploy-api's) and AC04;
 - microVM and `k8s` containment (W13), and the host's network namespace (opt-in).
 
 ### W19 Insights, audit and notifications

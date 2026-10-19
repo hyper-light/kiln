@@ -1597,6 +1597,12 @@ impl Dispatch {
                     tracing::warn!(leg, error = %format!("{e:#}"), "attestations could not be made");
                 }
             }
+            // W13-R11: an image the leg built into kiln's registry, registered for pools and rules.
+            JobEventV2::ImageBuilt { name, reference, digest, platforms, .. } => {
+                if let Err(e) = super::images::built(&self.hub, leg, &name, &reference, &digest, &platforms).await {
+                    tracing::warn!(leg, error = %format!("{e:#}"), "a built image could not be registered");
+                }
+            }
             JobEventV2::Group { .. } | JobEventV2::Mask { .. } | JobEventV2::TestReport { .. } => {}
         }
         Ok(())
