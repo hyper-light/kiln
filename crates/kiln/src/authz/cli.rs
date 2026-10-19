@@ -14,7 +14,7 @@ pub struct UsersArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
     /// The admin token, or a personal access token with `users.manage`.
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: UsersCmd,
@@ -42,7 +42,7 @@ enum UsersCmd {
 pub struct GrantsArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: GrantsCmd,
@@ -62,7 +62,7 @@ enum GrantsCmd {
 pub struct RolesArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: RolesCmd,
@@ -86,7 +86,7 @@ enum RolesCmd {
 pub struct TokensArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[command(subcommand)]
     cmd: TokensCmd,

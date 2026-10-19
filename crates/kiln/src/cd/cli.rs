@@ -16,7 +16,7 @@ pub struct CdArgs {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
     /// The server's admin token.
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
     /// Print JSON.
     #[arg(long, global = true)]

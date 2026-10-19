@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use super::rows::{EventRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Compacting, Engine, Kept, Mark, Query, SEARCH_MAX, Took, Unended};
+use super::store::{Change, Changes, Compacting, Engine, Kept, Mark, Query, SearchFrom, Took, Unended};
 
 /// How often a statement that finds the database busy tries again, and how long it waits between.
 const BUSY_TRIES: u32 = 50;
@@ -576,20 +576,6 @@ fn event_of(r: &TRow) -> anyhow::Result<EventRow> {
         text: s(10).unwrap_or_default(),
         body: s(11).ok_or_else(|| anyhow::anyhow!("an event without its body"))?,
     })
-}
-
-/// `word` as a LIKE pattern that matches it anywhere, its wildcards taken literally.
-fn like(word: &str) -> String {
-    let mut p = String::with_capacity(word.len() + 2);
-    p.push('%');
-    for c in word.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            p.push('\\');
-        }
-        p.push(c);
-    }
-    p.push('%');
-    p
 }
 
 /// The statements a transaction writes with, prepared once for it.
@@ -1378,32 +1364,52 @@ impl Engine for Turso {
         Ok(rows)
     }
 
-    fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>> {
-        let mut sql = String::from("SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE 1 = 1");
-        let mut params: Vec<Value> = Vec::new();
-        let mut and = |clause: &str, v: Value, sql: &mut String| {
-            params.push(v);
-            sql.push_str(&format!(" AND {clause} ?{}", params.len()));
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        // Newest first by an index, so nothing is sorted and it stops once it has `want`; the words
+        // matched here, as LIKE would (any case of an ASCII letter; `%` and `_` as they are).
+        let words: Vec<String> = q.q.split_whitespace().map(str::to_ascii_lowercase).collect();
+        let (sql, params) = match &q.session {
+            Some(s) => (sql::SEARCH_SESSION, vec![txt(s), int(from.map_or(i64::MAX, |f| f.key))]),
+            None => (sql::SEARCH_ALL, vec![int(from.map_or_else(|| q.until.map_or(i64::MAX, |u| u.saturating_sub(1)), |f| f.key))]),
         };
-        for (clause, v) in [("session =", &q.session), ("kind =", &q.kind), ("tool =", &q.tool), ("status =", &q.status)] {
-            if let Some(v) = v {
-                and(clause, Value::from_text(v.clone()), &mut sql);
+        let mut stmt = self.prepare(sql)?;
+        let (mut hits, mut looked, mut last, mut more) = (Vec::new(), 0usize, None, false);
+        self.run_while(&mut stmt, &params, |r| {
+            let (rowid, key) = (r.get::<i64>(0).map_err(fail)?, r.get::<i64>(1).map_err(fail)?);
+            // Looked at already (the same key as where it goes on from, a rowid not before it).
+            if from.is_some_and(|f| key == f.key && rowid >= f.rowid) {
+                return Ok(true);
             }
+            let at = r.get::<i64>(2).unwrap_or(0);
+            // Across agents it goes back in time: older than it looks back to, nothing more fits.
+            if q.session.is_none() && q.since.is_some_and(|s| at < s) {
+                return Ok(false);
+            }
+            looked += 1;
+            last = Some(SearchFrom { key, rowid });
+            let column = |i: usize| r.get::<String>(i).ok();
+            let fits = q.since.is_none_or(|s| at >= s)
+                && q.until.is_none_or(|u| at < u)
+                && [(&q.kind, 3), (&q.tool, 4), (&q.status, 5)].into_iter().all(|(w, i)| w.as_deref().is_none_or(|w| column(i).as_deref() == Some(w)))
+                && (words.is_empty() || {
+                    let text = column(6).unwrap_or_default().to_ascii_lowercase();
+                    words.iter().all(|w| text.contains(w.as_str()))
+                });
+            if fits {
+                hits.push(rowid);
+            }
+            more = hits.len() >= want || looked >= rows;
+            Ok(!more)
+        })?;
+        let mut whole = self.prepare(sql::EVENT_BY_ROWID)?;
+        let mut found = Vec::with_capacity(hits.len());
+        for rowid in hits {
+            self.run(&mut whole, &[int(rowid)], |r| {
+                found.push(event_of(r)?);
+                Ok(())
+            })?;
         }
-        if let Some(s) = q.since {
-            and("at >=", int(s), &mut sql);
-        }
-        if let Some(u) = q.until {
-            and("at <", int(u), &mut sql);
-        }
-        for word in q.q.split_whitespace() {
-            and("text LIKE", Value::from_text(like(word)), &mut sql);
-            sql.push_str(" ESCAPE '\\'");
-        }
-        let limit = q.limit.unwrap_or(100).min(SEARCH_MAX);
-        params.push(int(i64::try_from(limit).unwrap_or(100)));
-        sql.push_str(&format!(" ORDER BY at DESC, seq DESC LIMIT ?{}", params.len()));
-        self.event_rows(&sql, &params)
+        Ok((found, if more { last } else { None }))
     }
 }
 
@@ -1665,6 +1671,55 @@ mod tests {
         }
         drop(engine);
         assert_eq!(dump(&Turso::open(&path)?)?, was);
+        Ok(())
+    }
+
+    #[test]
+    fn a_search_a_slice_at_a_time_finds_what_one_look_does_once_each_newest_first() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("c.db"))?;
+        // 300 events of three agents, seven at each instant (the key a slice goes on from), a third
+        // of them saying the word.
+        let rows: Vec<Row> = (0..300u64)
+            .map(|n| {
+                let text = if n % 3 == 0 { format!("the needle {n}") } else { format!("hay {n}") };
+                let at = 1_000 + i64::try_from(n / 7).unwrap_or(0);
+                Row::Event(Box::new(EventRow { session: format!("a{}", n % 3), id: format!("e{n}"), seq: n, at, parent: None, by: None, kind: "assistant".into(), level: None, tool: None, status: None, text, body: "{}".into() }))
+            })
+            .collect();
+        t.apply(&rows)?;
+        let needle = |session: Option<&str>| Query { q: "NEEDLE".into(), session: session.map(str::to_owned), ..Query::default() };
+        for session in [None, Some("a0")] {
+            let q = needle(session);
+            let (all, rest) = t.search_some(&q, None, usize::MAX, usize::MAX)?;
+            assert!(rest.is_none());
+            assert_eq!(all.len(), 100, "{session:?}");
+            // Newest first.
+            assert!(all.windows(2).all(|w| matches!(w, [a, b] if (a.at, a.seq) >= (b.at, b.seq))), "{session:?}");
+            // Seven at a time, each slice going on from where the last ended: the same, once each.
+            let (mut sliced, mut from, mut slices) = (Vec::new(), None, 0);
+            loop {
+                let (some, next) = t.search_some(&q, from, 7, usize::MAX)?;
+                sliced.extend(some);
+                slices += 1;
+                match next {
+                    Some(n) => from = Some(n),
+                    None => break,
+                }
+            }
+            assert!(slices > 10);
+            assert_eq!(sliced.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), all.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), "{session:?}");
+        }
+        // As many as wanted, then where to go on from; a window of time; nothing for a word none says.
+        let (two, next) = t.search_some(&needle(None), None, usize::MAX, 2)?;
+        assert_eq!((two.len(), next.is_some()), (2, true));
+        let (all, _) = t.search_some(&needle(None), None, usize::MAX, usize::MAX)?;
+        let window = Query { since: Some(1_010), until: Some(1_020), ..needle(None) };
+        let (within, _) = t.search_some(&window, None, usize::MAX, usize::MAX)?;
+        assert_eq!(within.len(), all.iter().filter(|e| (1_010..1_020).contains(&e.at)).count());
+        assert!(!within.is_empty());
+        let none = Query { q: "nowhere".into(), ..Query::default() };
+        assert_eq!(t.search_some(&none, None, usize::MAX, usize::MAX)?, (Vec::new(), None));
         Ok(())
     }
 

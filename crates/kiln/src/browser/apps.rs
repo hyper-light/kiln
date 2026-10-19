@@ -95,7 +95,7 @@ pub fn look(session: &str, cwd: &Path, root: Option<u32>) -> Value {
         Some(Err(e)) => json!({"configured": true, "error": e}),
         Some(Ok(p)) => json!({"configured": true, "start": p.start, "port": p.port, "path": p.path, "running": running(session)}),
     };
-    json!({"ports": listening(root), "app": app})
+    json!({"ports": listening(root), "app": app, "engines": super::driven::available(), "devices": super::devices::DEVICES, "platform": std::env::consts::OS})
 }
 
 /// Start session `session`'s app (its folder `cwd`), unless it runs already, and wait for it to

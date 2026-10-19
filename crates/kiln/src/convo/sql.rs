@@ -123,6 +123,13 @@ pub const EVENTS_BEFORE: &str = "SELECT session, id, seq, at, parent, by, kind, 
 
 /// The columns an event row is read from, in this order.
 pub const EVENT_COLUMNS: usize = 12;
+/// A search looks at events newest first by an index, a slice at a time: across every agent by
+/// time (`events_by_time`), from `?1` back; in one agent's by number (`events_by_seq`), from `?2`
+/// back. Each row: its rowid, the key it goes in order of, its time, kind, tool, status, text.
+pub const SEARCH_ALL: &str = "SELECT rowid, at, at, kind, tool, status, text FROM events WHERE at <= ?1 ORDER BY at DESC, rowid DESC";
+pub const SEARCH_SESSION: &str = "SELECT rowid, seq, at, kind, tool, status, text FROM events WHERE session = ?1 AND seq <= ?2 ORDER BY seq DESC, rowid DESC";
+/// An event a search found, whole.
+pub const EVENT_BY_ROWID: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE rowid = ?1";
 
 pub const RECORD_UPSERT: &str = "INSERT INTO records (session, source, n, line_end, line, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     ON CONFLICT (session, source, n) DO UPDATE SET line_end = excluded.line_end, line = excluded.line, rev = excluded.rev";

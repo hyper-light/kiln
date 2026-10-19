@@ -66,7 +66,7 @@ try {
 if ($Outpost) {
   Write-Host "kiln ($target) is in $dir, not installed: it runs here as an outpost until you stop it (Ctrl-C)"
   $outpostArgs = @('outpost', '--server', $Server, '--state-dir', $dir)
-  if ($Token) { $outpostArgs += @('--token', $Token) }
+  if ($Token) { $outpostArgs += @("--token=$Token") }
   if ($Name) { $outpostArgs += @('--name', $Name) }
   & $exe @outpostArgs
   return
@@ -85,7 +85,7 @@ if ($Join -or -not $Token) {
 }
 
 $installArgs = @('install', '--agent', '--unattended', '--server', $Server)
-if ($Token) { $installArgs += @('--token', $Token) }
+if ($Token) { $installArgs += @("--token=$Token") }
 if ($Labels) { $installArgs += @('--labels', $Labels) }
 if ($Name) { $installArgs += @('--name', $Name) }
 if ($Slots) { $installArgs += @('--slots', $Slots) }

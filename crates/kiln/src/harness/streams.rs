@@ -146,6 +146,9 @@ impl Relay {
         // The runner process holding the session streams it: it must know how.
         let caps = hub.routed_caps(&machine, &msg).await;
         anyhow::ensure!(caps & CAP_STREAM != 0, "{machine} runs a kiln too old to stream pages: upgrade its runner");
+        // Another engine, or a device: a runner from before would stream Chromium as its viewer is.
+        let other = spec.get("engine").and_then(Value::as_str).is_some_and(|e| !e.is_empty() && e != "chromium") || spec.get("device").and_then(Value::as_str).is_some_and(|d| !d.is_empty());
+        anyhow::ensure!(!other || caps & crate::proto::CAP_ENGINES != 0, "{machine} runs a kiln too old for other engines and devices: upgrade its runner");
         let live = Arc::new(Live {
             id: id.clone(),
             session: session.to_owned(),
@@ -404,9 +407,14 @@ pub async fn ask(hub: &Arc<Hub>, session: &str, q: &Value) -> anyhow::Result<Val
         Some("open") => {
             let url = q.get("url").and_then(Value::as_str).unwrap_or("");
             let title = q.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()).unwrap_or(url);
-            let spec = json!({"url": url, "title": title, "width": 390, "height": 640, "scale": 2.0, "mobile": false});
+            let mut spec = json!({"url": url, "title": title, "width": 390, "height": 640, "scale": 2.0, "mobile": false});
+            for k in ["engine", "device"] {
+                if let (Some(o), Some(v)) = (spec.as_object_mut(), q.get(k).and_then(Value::as_str).filter(|v| !v.is_empty())) {
+                    o.insert(k.into(), json!(v));
+                }
+            }
             let live = hub.harness.streams.open(hub, session, spec, &format!("agent:{session}")).await?;
-            Ok(json!({"id": live.id, "session": session, "url": url, "title": title}))
+            Ok(json!({"id": live.id, "session": session, "url": url, "title": title, "engine": live.spec.get("engine"), "device": live.spec.get("device")}))
         }
         other => anyhow::bail!("streams don't do {other:?}"),
     }

@@ -103,6 +103,25 @@ pub struct Query {
 
 /// Most results one search returns.
 pub const SEARCH_MAX: usize = 500;
+/// How long one go of a search may hold the store, about: the events it looks at in a go grow
+/// or shrink to it (from `SEARCH_SLICE_FIRST`, between `SEARCH_SLICE_MIN` and `SEARCH_SLICE`), as
+/// the disk is quick or not (one agent's events, spread through the file, are slower than the
+/// newest of every agent's), and the store does what else waits between them.
+pub const SEARCH_SLICE_TIME: Duration = Duration::from_millis(50);
+pub const SEARCH_SLICE_FIRST: usize = 2_000;
+pub const SEARCH_SLICE_MIN: usize = 250;
+pub const SEARCH_SLICE: usize = 20_000;
+/// How long one search goes on, at most: past that it answers with the newest matches it found
+/// (it looks newest first).
+pub const SEARCH_WAIT: Duration = Duration::from_secs(8);
+
+/// Where a search goes on from: the order key of the last event it looked at (its time; its
+/// number, in one agent's) and its rowid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchFrom {
+    pub key: i64,
+    pub rowid: i64,
+}
 
 /// A row as a feed sends it: its number in the store it is from, and its session's epoch there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,8 +187,10 @@ pub trait Engine: Send + 'static {
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
     /// A session's events before `before` (its event numbers), the newest `limit`, oldest first.
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
-    /// Events matching `q`, newest first.
-    fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>>;
+    /// Events matching `q`, newest first: up to `want` of them among the next `rows` events it
+    /// looks at after `from` (None: from the newest), and where to go on from (None: it has looked
+    /// at every one).
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)>;
     /// The rows written after number `from`, as they are now, oldest first, about `max_bytes`.
     /// `kept`: record lines as they are kept ([`RecordRow::kept`](super::rows::RecordRow::kept)),
     /// for a taker that takes them so; else as text.
@@ -303,9 +324,35 @@ impl Store {
         self.run(move |e| e.events(&s, before, limit))
     }
 
-    /// Events matching `q`, newest first. Blocking.
+    /// Events matching `q`, newest first, looked for a slice at a time: each slice is a job of its
+    /// own, so a search that looks at every event (for a word that is rare, or in none) holds the
+    /// store a slice at a time, never for all of it. Past `SEARCH_WAIT`, the newest matches it
+    /// found. Blocking.
     pub fn search(&self, q: Query) -> anyhow::Result<Vec<EventRow>> {
-        self.run(move |e| e.search(&q))
+        let limit = q.limit.unwrap_or(100).min(SEARCH_MAX);
+        let (q, until) = (Arc::new(q), Instant::now() + SEARCH_WAIT);
+        let (mut found, mut from, mut rows) = (Vec::new(), None, SEARCH_SLICE_FIRST);
+        while found.len() < limit {
+            let (q, want) = (q.clone(), limit - found.len());
+            let (more, next, took) = self.run(move |e| {
+                let began = Instant::now();
+                let (more, next) = e.search_some(&q, from, rows, want)?;
+                Ok((more, next, began.elapsed()))
+            })?;
+            found.extend(more);
+            rows = if took > SEARCH_SLICE_TIME {
+                (rows / 2).max(SEARCH_SLICE_MIN)
+            } else if took < SEARCH_SLICE_TIME / 2 {
+                (rows * 2).min(SEARCH_SLICE)
+            } else {
+                rows
+            };
+            match next {
+                Some(next) if Instant::now() < until => from = Some(next),
+                _ => break,
+            }
+        }
+        Ok(found)
     }
 
     /// The rows written after number `from`, about `max_bytes` of them, record lines as text.
