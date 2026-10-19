@@ -249,11 +249,11 @@ pub fn ops() -> &'static [Op] {
             op!("deploy.releases.list", "Releases, newest first: of an app, in an environment, in a state (waiting, committing, delivering, succeeded, failed, cancelled, rolled_back, superseded).", ro: true, destructive: false,
                 input: || schema(json!({
                     "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV},
-                    "state": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+                    "state": {"type": "string"}, "version": {"type": "string", "description": "Those of one version."}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
                 }), &[]),
                 route: |v| {
                     let mut q = HashMap::new();
-                    for k in ["app", "environment", "state"] {
+                    for k in ["app", "environment", "state", "version"] {
                         if let Some(x) = opt_text(v, k) {
                             q.insert(k.to_owned(), x);
                         }
@@ -266,9 +266,31 @@ pub fn ops() -> &'static [Op] {
                         None => None,
                     };
                     let limit = v.get("limit").and_then(Value::as_u64).and_then(|l| usize::try_from(l).ok()).unwrap_or(50);
-                    let q = store::ReleaseQuery { app: opt_text(&v, "app"), environment: opt_text(&v, "environment"), state, limit };
+                    let q = store::ReleaseQuery { app: opt_text(&v, "app"), environment: opt_text(&v, "environment"), state, version: opt_text(&v, "version"), limit };
                     answer(json!({ "releases": store::releases(&service()?.hub.store, q).await.map_err(internal)? }))
                 }),
+            op!("deploy.metrics", "Delivery metrics from the releases (DORA's four keys): how often changes land, lead time from asked to landed, change failure rate (failed or rolled back), time to restore; for an app, an environment, or all, over `days` (30).", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]),
+                route: |v| {
+                    let mut q = HashMap::new();
+                    for k in ["app", "environment"] {
+                        if let Some(x) = opt_text(v, k) {
+                            q.insert(k.to_owned(), x);
+                        }
+                    }
+                    Ok((Method::GET, path(&["metrics"]), q))
+                },
+                run: |_cx: Cx, v: Value| async move {
+                    let days = v.get("days").and_then(Value::as_i64).unwrap_or(30).clamp(1, 365);
+                    let list = store::releases(&service()?.hub.store, store::ReleaseQuery { app: opt_text(&v, "app"), environment: opt_text(&v, "environment"), limit: 1000, ..store::ReleaseQuery::default() })
+                        .await
+                        .map_err(internal)?;
+                    Ok(super::metrics::compute(&list, crate::util::now_unix(), days))
+                }),
+            op!("deploy.registrations.versions", "The versions an app has run in an environment, newest first: when each first and last landed, how often, and whether it runs now.", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["versions"])?, HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { answer(json!({ "versions": api::versions(&*service()?, &text(&v, "app")?, &text(&v, "environment")?).await? })) }),
             op!("deploy.releases.get", "One release: its kind, state, version, artifacts, commit, who asked, its message, and what its provider last said.", ro: true, destructive: false,
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}}), &["id"]),
                 route: |v| Ok((Method::GET, path(&["releases", &id(v)?.to_string()]), HashMap::new())),

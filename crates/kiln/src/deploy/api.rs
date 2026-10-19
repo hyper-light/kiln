@@ -5,6 +5,8 @@
 //! | Route | |
 //! | --- | --- |
 //! | `GET /board` | every registration, what runs and what's in flight, and what waits for approval |
+//! | `GET /metrics?app&environment&days` | delivery metrics: DORA's four keys, from the releases |
+//! | `GET /apps/{app}/environments/{env}/versions` | the versions it has run |
 //! | `GET`, `POST /environments`; `GET`, `PUT`, `DELETE /environments/{env}` | environments |
 //! | `GET`, `POST /templates`; `GET`, `PUT`, `DELETE /templates/{name}` | what apps are made from |
 //! | `GET`, `POST /apps`; `GET`, `PUT`, `PATCH`, `DELETE /apps/{app}` (`?everywhere&keep`) | apps |
@@ -94,6 +96,18 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
         }
 
         (&Method::GET, ["board"]) => ok(&board(&d).await?),
+        (&Method::GET, ["metrics"]) => {
+            let days = q.get("days").and_then(|x| x.parse().ok()).unwrap_or(30i64).clamp(1, 365);
+            let list = store::releases(store, store::ReleaseQuery { app: q.get("app").cloned(), environment: q.get("environment").cloned(), limit: 1000, ..store::ReleaseQuery::default() })
+                .await
+                .map_err(internal)?;
+            let mut m = super::metrics::compute(&list, crate::util::now_unix(), days);
+            if let Some(o) = m.as_object_mut() {
+                o.insert("app".into(), json!(q.get("app")));
+                o.insert("environment".into(), json!(q.get("environment")));
+            }
+            ok(&m)
+        }
         (&Method::GET, ["templates"]) => ok(&json!({ "templates": store::templates(store).await.map_err(internal)? })),
         (&Method::POST, ["templates"]) => created(&flow::put_template(&d, &actor, body::<Template>(req.into_body()).await?).await?),
         (&Method::GET, ["templates", name]) => ok(&store::template(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no template {name}")))?),
@@ -159,6 +173,7 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             };
             ok(&reads::read(&d, &a, &environment, read).await?)
         }
+        (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": versions(&d, app, env).await? })),
         (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": flow::candidates(&d, app, env).await? })),
 
         (&Method::GET, ["releases"]) => {
@@ -166,7 +181,13 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
                 Some(s) => Some(State::parse(s).ok_or_else(|| bad(format!("{s:?} isn't a release state")))?),
                 None => None,
             };
-            let query = store::ReleaseQuery { app: q.get("app").cloned(), environment: q.get("environment").cloned(), state, limit: q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50) };
+            let query = store::ReleaseQuery {
+                app: q.get("app").cloned(),
+                environment: q.get("environment").cloned(),
+                state,
+                version: q.get("version").filter(|v| !v.is_empty()).cloned(),
+                limit: q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50),
+            };
             ok(&json!({ "releases": store::releases(store, query).await.map_err(internal)? }))
         }
         (&Method::POST, ["releases"]) => {
@@ -206,6 +227,37 @@ async fn board(d: &Deploy) -> Result<Value, Fail> {
     Ok(json!({ "environments": environments, "apps": apps, "cells": cells, "waiting_approval": waiting }))
 }
 
+/// The versions a registration has run, newest first: when each first and last landed, how often,
+/// and whether it runs now.
+pub(super) async fn versions(d: &Deploy, app: &str, env: &str) -> Result<Vec<Value>, Fail> {
+    let st = &d.hub.store;
+    let reg = store::registration(st, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let list = store::releases(st, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), limit: 1000, ..store::ReleaseQuery::default() }).await.map_err(internal)?;
+    let running = reg.running.and_then(|id| list.iter().find(|r| r.id == id)).and_then(|r| r.version.clone());
+    let mut seen: Vec<(String, Vec<&super::model::Release>)> = Vec::new();
+    for r in list.iter().filter(|r| matches!(r.state, State::Succeeded | State::Superseded | State::RolledBack)) {
+        let Some(v) = &r.version else { continue };
+        match seen.iter_mut().find(|(x, _)| x == v) {
+            Some((_, rs)) => rs.push(r),
+            None => seen.push((v.clone(), vec![r])),
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .map(|(v, rs)| {
+            let ended: Vec<i64> = rs.iter().filter_map(|r| r.ended_at).collect();
+            json!({
+                "version": v,
+                "runs_now": running.as_deref() == Some(v.as_str()),
+                "releases": rs.len(),
+                "last_release": rs.first().map(|r| r.id),
+                "first_landed": ended.iter().min(),
+                "last_landed": ended.iter().max(),
+            })
+        })
+        .collect())
+}
+
 /// An app, with each environment it's registered in and what runs there.
 pub(super) async fn app_json(d: &Deploy, name: &str) -> Result<Value, Fail> {
     let a = store::app(&d.hub.store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
@@ -226,7 +278,7 @@ pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Resul
     let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
     let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
     let reg = store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
-    let recent = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, limit: 20 }).await.map_err(internal)?;
+    let recent = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, version: None, limit: 20 }).await.map_err(internal)?;
     let in_flight = recent.iter().find(|r| r.state.in_flight()).cloned();
     let running = recent.iter().find(|r| Some(r.id) == reg.running).cloned();
     let provider = match environment.provider.strip_prefix("argocd/") {

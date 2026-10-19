@@ -11,7 +11,7 @@ import { boardHref, deployApi, describe, providerName, releaseHref, STATE_DOT, S
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
-import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
+import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
@@ -219,6 +219,34 @@ function EnvCard({ app, env, others }: { app: string; env: string; others: strin
   );
 }
 
+/** A duration as people say it. */
+function took(secs: number | null | undefined) {
+  if (secs === null || secs === undefined) return "—";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
+}
+
+/** How it delivers, over the last 30 days: DORA's four keys, from its releases. */
+function Delivery({ app }: { app: string }) {
+  const m = useSuspenseResource(`deploy/metrics/app/${app}`, (s) => deployApi.metrics({ app, days: 30 }, s), { on: DEPLOY_EVENTS }).data;
+  if (m.changes === 0) return null;
+  const rate = m.change_failure_rate;
+  return (
+    <Panel eyebrow="Delivery" title="The last 30 days" className="rel-delivery">
+      <Facts
+        items={[
+          { label: "Changes landed", value: `${m.landed} (${m.per_day.toFixed(2)} a day)` },
+          { label: "Lead time, asked to landed", value: `${took(m.lead_time_secs.p50)} p50 · ${took(m.lead_time_secs.p90)} p90` },
+          { label: "Change failure rate", value: rate === null ? "—" : `${Math.round(rate * 100)}% (${m.failed})`, tone: rate !== null && rate > 0.15 ? "fail" : undefined },
+          { label: "Time to restore", value: m.time_to_restore_secs.count ? `${took(m.time_to_restore_secs.p50)} p50` : "nothing to restore" },
+        ]}
+      />
+    </Panel>
+  );
+}
+
 function Latest({ app }: { app: string }) {
   const list = useSuspenseResource(`deploy/releases/app/${app}`, (s) => deployApi.releases({ app, limit: 30 }, s), { on: DEPLOY_EVENTS }).data;
   if (!list.length) return null;
@@ -269,6 +297,9 @@ function AppView({ name }: { name: string }) {
           ))}
         </div>
       )}
+      <Loadable label="how it delivers">
+        <Delivery app={a.name} />
+      </Loadable>
       <Loadable label="its releases">
         <Latest app={a.name} />
       </Loadable>

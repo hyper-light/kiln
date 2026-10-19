@@ -128,6 +128,19 @@ export interface AppDetail {
   environments: { registration: Registration; running: Release | null }[];
 }
 
+/** DORA's four keys, from the releases (durations in seconds). */
+export interface Metrics {
+  days: number;
+  changes: number;
+  landed: number;
+  per_day: number;
+  lead_time_secs: { count: number; p50: number | null; p90: number | null };
+  failed: number;
+  change_failure_rate: number | null;
+  time_to_restore_secs: { count: number; p50: number | null; p90: number | null };
+  by_day: { day: string; landed: number; failed: number }[];
+}
+
 /** What a release asks for: exactly one of a version, values, enabled, or a promotion. */
 export interface ReleaseAsk {
   app: string;
@@ -158,6 +171,13 @@ export const deployApi = {
     return request<{ releases: Release[] }>("GET", `/api/deploy/releases${qs ? `?${qs}` : ""}`, undefined, { signal }).then((r) => r.releases);
   },
   release: (id: number, signal?: AbortSignal) => request<Release>("GET", `/api/deploy/releases/${id}`, undefined, { signal }),
+  metrics: (q: { app?: string; environment?: string; days?: number }, signal?: AbortSignal) => {
+    const qs = Object.entries(q)
+      .filter(([, v]) => v !== undefined && v !== "")
+      .map(([k, v]) => `${enc(k)}=${enc(String(v))}`)
+      .join("&");
+    return request<Metrics>("GET", `/api/deploy/metrics${qs ? `?${qs}` : ""}`, undefined, { signal });
+  },
   create: (ask: ReleaseAsk) => request<Release>("POST", "/api/deploy/releases", ask),
   cancel: (id: number) => request<Release>("POST", `/api/deploy/releases/${id}/cancel`, {}),
   approve: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/approve`, { note }),
