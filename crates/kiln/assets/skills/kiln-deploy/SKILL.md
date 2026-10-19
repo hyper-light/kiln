@@ -1,6 +1,6 @@
 ---
 name: kiln-deploy
-description: Ship a change through kiln's GitOps deployments - commit, watch the app render, sync and turn healthy, and confirm what changed. Use when asked to deploy, roll out, release or promote something kiln deploys.
+description: Ship a change through kiln's deployments - commit and watch the app render, sync and turn healthy; or release an app by version through its environments' gates (approvals, freezes, promotion) and roll it back. Use when asked to deploy, roll out, release, promote or roll back something kiln deploys.
 ---
 
 # Deploying with kiln
@@ -67,3 +67,59 @@ Undo a bad deploy from its history, not by hand:
   the one before is healthy. Hooks (`argocd.argoproj.io/hook: PreSync`, …) run in their phase.
 - An automatic sync of a revision that failed is not retried until git moves (or a retry policy
   says so). Fix forward in git.
+
+## Releases by API: apps released by version
+
+Some apps are released by version rather than by commit (docs/deploy-api.md): each is registered
+in environments (staging, production, …), and a **release** puts a version there, through gates
+(upstream environments, soak, approvals, windows, freezes). If `kiln.deploy.apps.get({ app })`
+knows the app, release it this way; the tools are `deploy_*` (code mode: `kiln.deploy.*`).
+
+1. **What runs where.** `kiln.deploy.apps.get({ app })`: each environment it's registered in, with
+   the release that runs there. `kiln.deploy.registrations.versions({ app, environment })`: what
+   it has run.
+2. **Release.** `kiln.deploy.releases.create({ app, environment, version, artifacts, idempotency_key })`.
+   Give an `idempotency_key` (any string you make up for this request): asked again with it, it's
+   the same release, never a second. `artifacts` is what the version deploys, by name, ideally by
+   digest: `{ image: { repository, tag, digest } }`. A version that doesn't exist is refused (422)
+   and the answer names the newest ones; pick one of those, don't guess again.
+3. **Wait.** `kiln.deploy.releases.wait({ id, timeout_s: 600 })` until `done`. Don't poll `get` in
+   a loop, and never ask for the release again while one is in flight.
+   - `succeeded`: it landed: its provider runs that version, synced and healthy.
+   - `waiting`: a gate holds it (an upstream environment that doesn't run the version yet, a
+     soak, a window, a freeze). Its `gates` say which, each with `passed` and `detail`, and
+     `message` says why. It goes by itself once the gate lets it.
+   - `waiting_approval`: people must approve it. Tell the person who asked, with its link; don't
+     approve your own request.
+   - `failed`: read `message` and `provider`. Its commit was reverted: what ran before runs
+     again. Fix forward and release again.
+4. **Promote.** `kiln.deploy.releases.create({ app, environment: "production", promote_from: "staging" })`
+   releases exactly what staging runs: the same version and artifacts.
+5. **Look before and after.** `kiln.deploy.registrations.diff({ app, environment })` (on Argo CD
+   with `version`: what deploying it would change), `.resources` (each object's sync and health),
+   `.manifests`, `.logs({ app, environment, kind: "Deployment", name })`.
+
+```js
+// code_run: release a version to staging and wait for it to land
+const r = await kiln.deploy.releases.create({ app: input.app, environment: "staging",
+  version: input.version, idempotency_key: `${input.app}-${input.version}-staging` });
+const w = await kiln.deploy.releases.wait({ id: r.id, timeout_s: 600 });
+return { id: r.id, state: w.release.state, done: w.done, message: w.release.message,
+  gates: (w.release.gates || []).filter(g => !g.passed) };
+```
+
+**Rolling back.** `kiln.deploy.releases.rollback({ app, environment })` goes back to the newest
+release that succeeded before what runs (`to: <release id>` picks one of
+`kiln.deploy.registrations.candidates({ app, environment })`), as a new release with that one's
+version, artifacts and values. `kiln.deploy.releases.cancel({ id })` stops one still waiting or
+being delivered (a delivery is reverted).
+
+**Rules for agents.**
+- You release only where the environment lets agents (its `agents.deploy`); approve only where
+  `agents.approve` says so, and never your own request. A 403 means a person must: say so, with
+  what you would have released, and stop. Don't work around it (committing to a release
+  repository by hand, or asking another agent).
+- One release at a time per app and environment: while one is in flight a second is refused
+  (409), or queued where the environment says so. Wait for it, or cancel it if that's what the
+  person asked.
+- A frozen environment holds every release until a person lifts the freeze: don't lift it.
