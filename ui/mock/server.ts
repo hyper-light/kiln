@@ -24,7 +24,7 @@ import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongFiles, handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleDoctor } from "./doctor.ts";
@@ -1223,6 +1223,8 @@ const server = http.createServer(async (req, res) => {
         ].join("\n"),
       );
     }
+    // Pages agents show: open, as the server's are (their address is their key).
+    if (handleShownPages(p, res)) return;
     if (!p.startsWith("/api/")) return serveStatic(p, res);
 
     // ---- auth (open) ----

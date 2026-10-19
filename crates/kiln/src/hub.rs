@@ -1152,7 +1152,7 @@ impl Hub {
                     }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
-                    Some("registry" | "call") => {
+                    Some("registry" | "call" | "page") => {
                         let (hub, runner) = (Arc::clone(self), agent.clone());
                         crate::rt::spawn(async move {
                             let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;

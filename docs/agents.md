@@ -645,7 +645,8 @@ load so nothing moves; sounds, PDFs, text and logs show as a chip that opens in 
   mentions); both take `Range`. Viewers hear what's kept as `{"t":"files","files":[...]}`, sent
   ahead of the events when they attach.
 
-kiln's MCP instructions tell agents to show files this way.
+kiln's MCP instructions tell agents to show files this way, and to show something live (a chart, a
+mock-up, a small tool) as a page: see docs/previews.md.
 
 ## Notes per harness
 

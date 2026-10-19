@@ -44,4 +44,5 @@ pub mod session;
 pub mod survivors;
 pub mod socket;
 pub mod transcript;
+pub mod visuals;
 pub mod wait;

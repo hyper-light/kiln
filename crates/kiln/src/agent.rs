@@ -430,6 +430,7 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
 /// build once it has taken over, or the old one again after a rollback (the paths are the same).
 #[cfg(unix)]
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
+    crate::browser::set_home(state_dir);
     if let Some(r) = reach
         && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir))
     {
@@ -745,6 +746,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             });
             let path = crate::reach::local::path(&name, &o.state_dir);
+            crate::browser::set_home(&o.state_dir);
             if take_over_pending.is_some() {
                 crate::reach::local::set_socket(path.to_string_lossy().into_owned());
             } else {
