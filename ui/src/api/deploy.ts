@@ -103,6 +103,39 @@ export interface App {
   archived: boolean;
 }
 
+/** The source repository a template makes for each app (§3.1): one of kiln's own. */
+export interface RepoTemplate {
+  /** `acme/{app}`: `{app}` and `{project}` filled in. */
+  name: string;
+  starter?: string;
+  starter_ref?: string;
+  branch: string;
+}
+
+/** What apps are made from (§3.2). */
+export interface Template {
+  name: string;
+  description?: string;
+  package?: Package;
+  namespace?: string;
+  checks?: string[];
+  properties?: Record<string, string[]>;
+  environments?: string[];
+  repository?: RepoTemplate;
+}
+
+/** An app as asked for: a template fills what isn't given. `source: ""` makes none. */
+export interface AppAsk {
+  name: string;
+  project?: string;
+  owners?: string[];
+  template?: string;
+  package?: Package;
+  namespace?: string;
+  properties?: Record<string, string>;
+  source?: string;
+}
+
 /** One registration on the board: what runs, and what's on its way. */
 export interface Cell {
   registration: Registration;
@@ -184,11 +217,17 @@ export const deployApi = {
   cancel: (id: number) => request<Release>("POST", `/api/deploy/releases/${id}/cancel`, {}),
   approve: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/approve`, { note }),
   reject: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/reject`, { note }),
+  templates: (signal?: AbortSignal) => request<{ templates: Template[] }>("GET", "/api/deploy/templates", undefined, { signal }).then((r) => r.templates),
+  environments: (signal?: AbortSignal) => request<{ environments: Environment[] }>("GET", "/api/deploy/environments", undefined, { signal }).then((r) => r.environments),
+  nameFree: (name: string) => request<{ name: string; available: boolean; why?: string | null }>("GET", `/api/deploy/app-names/${enc(name)}`),
+  createApp: (ask: AppAsk) => request<App>("POST", "/api/deploy/apps", ask),
+  register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
   pause: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/pause`, {}),
   resume: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/resume`, {}),
 };
 
 export const boardHref = "/deployments/releases";
+export const newAppHref = "/deployments/releases/new";
 export const releaseHref = (id: number) => `/deployments/releases/${id}`;
 export const releaseAppHref = (app: string) => `/deployments/releases/apps/${enc(app)}`;
 
@@ -231,6 +270,18 @@ export function describe(r: Release): string {
       return "config";
     default:
       return r.kind;
+  }
+}
+
+/** How a package deploys, in a few words: `oci://ghcr.io/acme/charts web`. */
+export function packageWords(p: Package): string {
+  switch (p.kind) {
+    case "helm":
+      return `${p.repo} ${p.chart}`;
+    case "git":
+      return `${p.repo}${p.path ? ` ${p.path}` : ""}`;
+    case "platform":
+      return p.provider;
   }
 }
 
