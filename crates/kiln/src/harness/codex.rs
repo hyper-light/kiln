@@ -182,6 +182,9 @@ pub struct Codex {
     thread: Option<String>,
     /// The turn under way.
     turn: Option<String>,
+    /// Runtime status pushed by Codex, including work started outside kiln.
+    #[serde(default)]
+    thread_status: Option<Status>,
     /// The message that started (or was steered into) the turn under way.
     turn_messages: Vec<String>,
     /// Messages to send once the thread exists or the turn under way has been interrupted.
@@ -269,6 +272,7 @@ impl Codex {
             asks: HashMap::new(),
             thread: None,
             turn: None,
+            thread_status: None,
             turn_messages: Vec::new(),
             waiting: Vec::new(),
             effort: None,
@@ -518,7 +522,7 @@ impl Codex {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.injecting || self.turn.is_some() || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
+        self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
@@ -537,8 +541,12 @@ impl Codex {
     }
 
     fn settle(&self, core: &mut Core) {
-        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
-        core.settle_status(running);
+        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_))) || matches!(self.thread_status, Some(Status::Running | Status::Waiting));
+        if let Some(status @ (Status::Waiting | Status::Starting | Status::Exited)) = self.thread_status {
+            core.set_status(status);
+        } else {
+            core.settle_status(running);
+        }
     }
 
     pub fn start(&mut self, core: &mut Core) {
@@ -576,6 +584,7 @@ impl Codex {
             t.ended.get_or_insert_with(Core::now);
         }
         self.turn = None;
+        self.thread_status = None;
         self.pending.clear();
         self.asks.clear();
         core.state.approvals.clear();
@@ -1094,6 +1103,7 @@ impl Codex {
     }
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        self.thread_status = None;
         let (approval, _, sandbox) = self.policies(core);
         let items = self.items(&m);
         let mut params = json!({
@@ -1469,6 +1479,9 @@ impl Codex {
                 if let Some(id) = thread.get("id").and_then(Value::as_str) {
                     self.thread = Some(id.to_owned());
                     core.state.harness_session = Some(id.to_owned());
+                }
+                if let Some(status) = thread.get("status") {
+                    self.thread_status(core, status);
                 }
                 if let Some(m) = result.get("model").and_then(Value::as_str) {
                     core.state.model = m.to_owned();
@@ -1956,9 +1969,38 @@ impl Codex {
         self.settle(core);
     }
 
+    fn thread_status(&mut self, core: &mut Core, status: &Value) {
+        let next = match status.get("type").and_then(Value::as_str) {
+            Some("active") if status.get("activeFlags").and_then(Value::as_array).is_some_and(|f| f.iter().any(|v| matches!(v.as_str(), Some("waitingOnApproval" | "waitingOnUserInput")))) => Status::Waiting,
+            Some("active") => Status::Running,
+            Some("idle") => Status::Idle,
+            Some("notLoaded") => Status::Starting,
+            Some("systemError") => Status::Exited,
+            _ => return,
+        };
+        self.thread_status = Some(next);
+        if !matches!(next, Status::Running | Status::Waiting) {
+            self.turn = None;
+            core.state.doing = None;
+            core.set_status(next);
+        }
+        core.state.exit = (next == Status::Exited).then(|| ExitInfo { code: None, error: Some("Codex reported a thread error".into()) });
+        core.touch_state();
+        self.settle(core);
+    }
+
     fn notification(&mut self, core: &mut Core, method: &str, p: Value) {
+        // One app-server can report child threads too. Their turns must not end the parent's.
+        if method != "serverRequest/resolved"
+            && let (Some(own), Some(thread)) = (self.thread.as_deref(), p.get("threadId").and_then(Value::as_str))
+            && own != thread
+        {
+            return;
+        }
         match method {
+            "thread/status/changed" => self.thread_status(core, p.get("status").unwrap_or(&Value::Null)),
             "turn/started" => {
+                self.thread_status = Some(Status::Running);
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
                 }
@@ -1968,9 +2010,15 @@ impl Codex {
                 }
                 core.state.doing = Some("Thinking".to_owned());
                 core.touch_state();
+                self.settle(core);
             }
             "turn/completed" => {
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
+                if let (Some(current), Some(completed)) = (self.turn.as_deref(), turn.get("id").and_then(Value::as_str))
+                    && current != completed
+                {
+                    return;
+                }
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("completed");
                 match status {
                     "interrupted" => self.notice(core, Level::Info, "Interrupted"),
@@ -2008,6 +2056,7 @@ impl Codex {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
                 self.turn = None;
+                self.thread_status = Some(Status::Idle);
                 // How it ended, for kiln's keep-going.
                 let how = match status {
                     "completed" => "done",
@@ -3628,6 +3677,55 @@ mod tests {
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
         Ok(())
+    }
+
+    #[test]
+    fn child_notifications_cannot_end_or_replace_the_parent_turn() {
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "inProgress", "items": []}}})]);
+        assert_eq!(core.state.status, Status::Running);
+        let started = core.state.turn_started;
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "turnId": "child-turn", "itemId": "child-message", "delta": "Child text"}}),
+            json!({"method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "child-turn", "status": "completed", "items": []}}}),
+            json!({"method": "thread/status/changed", "params": {"threadId": "child", "status": {"type": "idle"}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "old-parent-turn", "status": "completed", "items": []}}}),
+        ]);
+        assert_eq!((core.state.status, c.turn.as_deref(), core.state.turn_started, core.state.usage.turns), (Status::Running, Some("parent-turn"), started, 0));
+        assert!(core.get("child-message").is_none());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "parent-turn", "status": "completed", "items": []}}})]);
+        assert_eq!(core.state.status, Status::Idle);
+    }
+
+    #[test]
+    fn thread_runtime_status_survives_item_updates_and_keeps_approvals_waiting() {
+        let (mut c, mut core, _) = opened();
+        let status = |state: Value| json!({"method": "thread/status/changed", "params": {"threadId": "th1", "status": state}});
+        feed(&mut c, &mut core, &[status(json!({"type": "active", "activeFlags": []}))]);
+        c.item(&mut core, &json!({"type": "agentMessage", "id": "reply", "text": "Still working"}), true);
+        assert_eq!(core.state.status, Status::Running);
+        assert!(c.busy(&core));
+        for flag in ["waitingOnApproval", "waitingOnUserInput"] {
+            feed(&mut c, &mut core, &[status(json!({"type": "active", "activeFlags": [flag]}))]);
+            c.settle(&mut core);
+            assert_eq!(core.state.status, Status::Waiting);
+        }
+        feed(&mut c, &mut core, &[
+            status(json!({"type": "active", "activeFlags": []})),
+            json!({"id": "approval", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th1", "turnId": "turn", "itemId": "command", "command": "build", "cwd": "/work"}}),
+            status(json!({"type": "idle"})),
+        ]);
+        assert_eq!(core.state.status, Status::Waiting);
+        // An approval's resolution can come from a child thread whose request was shown here.
+        feed(&mut c, &mut core, &[json!({"method": "serverRequest/resolved", "params": {"threadId": "child", "requestId": "approval"}})]);
+        assert_eq!(core.state.status, Status::Idle);
+        for (state, expected) in [("notLoaded", Status::Starting), ("systemError", Status::Exited), ("idle", Status::Idle)] {
+            feed(&mut c, &mut core, &[status(json!({"type": state}))]);
+            c.settle(&mut core);
+            assert_eq!(core.state.status, expected);
+            assert_eq!(core.state.exit.is_some(), expected == Status::Exited);
+        }
     }
 
     #[test]
