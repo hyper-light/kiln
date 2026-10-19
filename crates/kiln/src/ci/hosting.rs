@@ -634,6 +634,14 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     for t in trunk_list.iter().filter(|t| took.contains(&format!("refs/heads/{t}"))) {
         mirror_trunk(hub, repo, &p, t);
     }
+    // What a job pushes with its token starts no run, as GitHub starts none for what a
+    // `GITHUB_TOKEN` does (but `workflow_dispatch` and `repository_dispatch`): a job doesn't start
+    // itself again. Its moves are recorded first, so the poller finds them taken.
+    if super::diffs::by_job(&user) {
+        for u in updates.iter().filter(|u| !u.deletes() && took.contains(&u.name) && !u.name.starts_with("refs/for/")) {
+            let _ = hub.store.advance_ref(repo.id.clone(), u.name.clone(), u.new.clone()).await;
+        }
+    }
     hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
     // The poller takes the new refs now: events, runs.
     if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {

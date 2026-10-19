@@ -432,7 +432,10 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     let base_url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let out: Vec<Outcome> = outcomes.into_iter().map(|(number, version, kind, title)| Outcome { name: format!("D{number}"), number, version, kind, title, url: format!("{base_url}/diffs/D{number}") }).collect();
     hub.store.audit(s.pushed_by.to_owned(), "diffs.submit".into(), format!("{} {}: {}", s.repo.name, s.trunk, out.iter().map(|o| format!("D{} v{} {}", o.number, o.version, o.kind)).collect::<Vec<_>>().join(", "))).await;
-    // Their checks.
+    // Their checks, unless a job's token pushed them (it starts no run, as on GitHub).
+    if by_job(s.pushed_by) {
+        return Ok(out);
+    }
     let (hub2, repo, trunk, author, base_sha) = (hub.clone(), s.repo.clone(), s.trunk.to_owned(), s.author.clone(), trunk_sha);
     crate::rt::spawn(async move {
         for f in fresh {
@@ -482,6 +485,12 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
     (e, d)
 }
 
+/// Whether a job's token did it (`job:<leg>`): what a `GITHUB_TOKEN` does starts no run on
+/// GitHub (but `workflow_dispatch` and `repository_dispatch`), so a job never starts itself again.
+pub(crate) fn by_job(principal: &str) -> bool {
+    principal.starts_with("job:")
+}
+
 /// Starts a new version's workflows: those the engine runs whose `on` takes either event (a
 /// change request's: `pull_request`).
 pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, author: &(String, &'static str), f: &Fresh) -> anyhow::Result<()> {
@@ -505,17 +514,102 @@ pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, 
 /// workflows, as the trunk is now, trusted and given the same pull request, as GitHub raises it.
 /// What the pull request's branch changed in its workflows never runs this way.
 async fn target(hub: &Hub, repo: &Repo, trunk: &str, pr: &Event, message: &str, author: &str) -> anyhow::Result<()> {
-    let dir = super::hosting::native_path(hub, repo).unwrap_or_else(|| gitops::mirror_path(hub, &repo.name));
-    let spec = format!("refs/heads/{trunk}^{{commit}}");
-    let tip = gitops::run_git(hub, &["-C", &dir.to_string_lossy(), "rev-parse", "--verify", "--quiet", &spec], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|s| s.len() == 40);
-    let Some(tip) = tip else { return Ok(()) };
-    let _ = gitops::ensure_commit(hub, repo, &tip).await;
+    let Some(tip) = tip(hub, repo, trunk).await else { return Ok(()) };
     let e = Event { name: "pull_request_target".into(), git_ref: format!("refs/heads/{trunk}"), sha: tip.clone(), trusted: true, ..pr.clone() };
-    let commit = super::load::load(hub, repo, &tip).await?;
+    start_at(hub, repo, &e, &tip, message, author).await
+}
+
+/// A branch's tip in the repository's own git: the hosted repository when kiln hosts it (a push
+/// is there before the mirror has it), else the mirror.
+async fn tip(hub: &Hub, repo: &Repo, branch: &str) -> Option<String> {
+    let dir = super::hosting::native_path(hub, repo).unwrap_or_else(|| gitops::mirror_path(hub, &repo.name));
+    let spec = format!("refs/heads/{branch}^{{commit}}");
+    gitops::run_git(hub, &["-C", &dir.to_string_lossy(), "rev-parse", "--verify", "--quiet", &spec], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|s| s.len() == 40)
+}
+
+/// Runs the workflows of commit `sha` that take event `e`.
+async fn start_at(hub: &Hub, repo: &Repo, e: &Event, sha: &str, message: &str, author: &str) -> anyhow::Result<()> {
+    let _ = gitops::ensure_commit(hub, repo, sha).await;
+    let commit = super::load::load(hub, repo, sha).await?;
     for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
-        super::events::start(hub, repo, &e, l, message, author, Value::Null).await?;
+        super::events::start(hub, repo, e, l, message, author, Value::Null).await?;
     }
     Ok(())
+}
+
+/// What the hub says happened in a diff's conversation (a `comment` published, a `review`), as
+/// workflow events (W03-R09, A.6). GitHub's: `issue_comment` for a comment on it as a whole, run
+/// from the default branch; `pull_request_review_comment` for one on its lines and
+/// `pull_request_review`, run from its latest version as `pull_request` is. kiln's: `comment`,
+/// from the trunk, with whom it mentions, and `review`, its state the action. Never for what a
+/// job's token did, as on GitHub.
+pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let kind = s("type");
+    let who = match kind.as_str() {
+        "comment" => s("author"),
+        "review" if s("action") != "resign" => s("reviewer"),
+        _ => return Ok(()),
+    };
+    if who.is_empty() || by_job(&who) || !hub.ci.enabled() {
+        return Ok(());
+    }
+    let Some(d) = find(hub, &s("diff")).await? else { return Ok(()) };
+    let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name == d.repo) else { return Ok(()) };
+    let Some(latest) = versions(hub, &d).await?.pop() else { return Ok(()) };
+    let facts = super::events::facts(hub, &repo).await;
+    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone() };
+    let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
+    let (pr, _) = events_of(&repo, &facts.repo, &d.trunk, &latest.base, &author, &f, None);
+    // `user:ada` is GitHub's `ada`; an agent's name is its first word.
+    let login = who.split_once(':').map_or(who.as_str(), |(_, n)| n).split(' ').next().unwrap_or_default().to_owned();
+    let now = crate::deploy::repo::rfc3339(crate::util::now_unix());
+    // GitHub's numeric ids: the comment's row, or the reviewer's latest review's.
+    let is_comment = kind == "comment";
+    let (did, item) = (d.id.clone(), s(if is_comment { "comment" } else { "reviewer" }));
+    let id: u64 = hub
+        .store
+        .call(move |c| {
+            let sql = if is_comment { "SELECT rowid FROM review_comments WHERE id = ?1 AND ?2 IS NOT NULL" } else { "SELECT rowid FROM reviews WHERE reviewer = ?1 AND diff_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1" };
+            Ok(c.query_row(sql, params![item, did], |r| r.get::<_, i64>(0)).optional()?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
+        })
+        .await
+        .unwrap_or(0);
+    if is_comment {
+        let file = v.get("file").and_then(Value::as_str).map(str::to_owned);
+        let c = context::Comment { id, body: s("body"), author: login.clone(), created_at: now, path: file.clone(), line: v.get("end_line").and_then(Value::as_u64), commit: Some(f.sha.clone()) };
+        let as_issue = context::issue_comment(&pr.payload, &c, &login);
+        if file.is_some() {
+            let e = Event { name: "pull_request_review_comment".into(), action: "created".into(), actor: login.clone(), payload: context::pull_request_review_comment(&pr.payload, &c, &login), ..pr.clone() };
+            start_at(hub, &repo, &e, &f.sha, &d.title, &who).await?;
+        } else if let Some(t) = tip(hub, &repo, &facts.default_branch).await {
+            let e = Event { name: "issue_comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", facts.default_branch), sha: t.clone(), base_ref: None, head_ref: None, trusted: true, changed: None, payload: as_issue.clone(), ..pr.clone() };
+            start_at(hub, &repo, &e, &t, &d.title, &who).await?;
+        }
+        if let Some(t) = tip(hub, &repo, &d.trunk).await {
+            let mut payload = as_issue;
+            if let Some(m) = payload.as_object_mut() {
+                let k = m.entry("kiln").or_insert_with(|| json!({}));
+                if let Some(k) = k.as_object_mut() {
+                    k.insert("mentions".into(), json!(context::mentions(&c.body)));
+                }
+            }
+            let e = Event { name: "comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", d.trunk), sha: t.clone(), trusted: true, changed: None, payload, ..pr.clone() };
+            start_at(hub, &repo, &e, &t, &d.title, &who).await?;
+        }
+        return Ok(());
+    }
+    let (state, kiln_state) = match s("action").as_str() {
+        "accept" => ("approved", "accepted"),
+        "request_changes" => ("changes_requested", "changes_requested"),
+        _ => ("commented", "commented"),
+    };
+    let r = context::Review { id, state: state.into(), body: s("body"), author: login.clone(), submitted_at: now, commit: f.sha.clone() };
+    let payload = context::pull_request_review(&pr.payload, &r, &login);
+    let e = Event { name: "pull_request_review".into(), action: "submitted".into(), actor: login.clone(), payload: payload.clone(), ..pr.clone() };
+    start_at(hub, &repo, &e, &f.sha, &d.title, &who).await?;
+    let e = Event { name: "review".into(), action: kiln_state.into(), actor: login, payload, ..pr };
+    start_at(hub, &repo, &e, &f.sha, &d.title, &who).await
 }
 
 /// A new version of `d` that kiln made (a restack onto a moved trunk, W14-R08): kept at its ref,

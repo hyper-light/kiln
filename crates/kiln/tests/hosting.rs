@@ -1180,9 +1180,7 @@ fn w14_r11_pull_requests_jobs_open_and_label() -> anyhow::Result<()> {
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::write(
         work.join(".github/workflows/pr.yml"),
-        r#"on:
-  push:
-    branches: [main]
+        r#"on: [push, pull_request]
 permissions:
   contents: write
   pull-requests: write
@@ -1231,7 +1229,7 @@ jobs:
     loop {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
-        let run = v.get("runs").and_then(Value::as_array).and_then(|r| r.iter().find(|r| text(r, "workflow").ends_with("pr.yml"))).cloned();
+        let run = v.get("runs").and_then(Value::as_array).and_then(|r| r.iter().find(|r| text(r, "workflow").ends_with("pr.yml") && text(r, "branch") == "main")).cloned();
         if let Some(r) = run.filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
             let id = text(&r, "id").to_owned();
             let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
@@ -1246,6 +1244,12 @@ jobs:
             // The change request is kiln's own, with the job's description and labels gone.
             let (_, crs) = http(s.port, "GET", "/api/repos/acme%2Fapp/change-requests", &s.admin, None)?;
             assert!(crs.contains("Renamed") && crs.contains("abandoned"), "{crs}");
+            // What the job's token did (its push of `feature`, its pull request) started no run, as
+            // on GitHub: the owner's push is the only one.
+            std::thread::sleep(Duration::from_secs(5));
+            let (_, all) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=20", &s.admin, None)?;
+            let n = serde_json::from_str::<Value>(&all)?.get("runs").and_then(Value::as_array).map_or(0, Vec::len);
+            assert_eq!(n, 1, "the job's token started runs: {all}");
             return Ok(());
         }
         anyhow::ensure!(Instant::now() < deadline, "no run: {body}\n{}", s.log());
@@ -1377,5 +1381,88 @@ jobs:
         }
         anyhow::ensure!(Instant::now() < deadline, "no run: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A change request's conversation raises workflow events on a native repository (docs/ci.md
+/// W03-R09, A.6): a comment on it as a whole `issue_comment` (from the default branch), one on its
+/// lines `pull_request_review_comment`, a review `pull_request_review`, and kiln's `comment` with
+/// its `commands` filter.
+#[test]
+fn w03_r09_native_conversation_events() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // GitHub's workflows run beside the `.kiln/` one.
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\ngithub_workflows = \"on\"", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/app") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    let job = |on: &str, say: &str| format!("on: {on}\njobs:\n  j:\n    runs-on: local\n    steps:\n      - run: echo \"{say}\"\n");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".github/workflows/comment.yml"), job("issue_comment", "issue_comment ${{ github.event.comment.body }} on ${{ github.event.issue.number }} by ${{ github.event.sender.login }} ref=${{ github.ref }}"))?;
+    std::fs::write(work.join(".github/workflows/line.yml"), job("pull_request_review_comment", "review comment on ${{ github.event.comment.path }}:${{ github.event.comment.line }}"))?;
+    std::fs::write(work.join(".github/workflows/review.yml"), job("pull_request_review", "review ${{ github.event.review.state }} by ${{ github.event.review.user.login }}"))?;
+    std::fs::write(work.join(".kiln/ship.yaml"), "on:\n  comment:\n    commands: [\"/deploy\"]\njobs:\n  d:\n    runs-on: local\n    steps:\n      - run: echo \"deploy asked, mentioning ${{ join(github.event.kiln.mentions, ',') }}\"\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "conversation workflows"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the workflows")?;
+    must(git(&home, &work, &["checkout", "-q", "-b", "feature"]), "branch")?;
+    std::fs::write(work.join("change.txt"), "one\ntwo\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "a change"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "feature"]), "the branch")?;
+    let (st, cr) = http(s.port, "POST", "/api/repos/acme%2Fapp/change-requests", &s.admin, Some(&json!({ "branch": "feature" })))?;
+    anyhow::ensure!(st == 200, "change request: {st} {cr}");
+    let name = serde_json::from_str::<Value>(&cr)?.get("change_request").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let number = name.trim_start_matches("CR").to_owned();
+    // The developer talks: a command, a plain remark, a line comment, an approval.
+    for (path, b) in [
+        ("comments", json!({ "body": "/deploy please @ada", "publish": true })),
+        ("comments", json!({ "body": "looks fine", "publish": true })),
+        ("comments", json!({ "body": "here", "file": "change.txt", "start_line": 2, "publish": true })),
+        ("review", json!({ "action": "accept", "body": "ship it" })),
+    ] {
+        let (st, out) = http(s.port, "POST", &format!("/api/diffs/{name}/{path}"), &dev, Some(&b))?;
+        anyhow::ensure!(st == 200, "{path}: {st} {out}");
+    }
+    let wanted = [
+        ("issue_comment", format!("issue_comment /deploy please @ada on {number} by dev ref=refs/heads/main")),
+        ("issue_comment", format!("issue_comment looks fine on {number} by dev")),
+        ("pull_request_review_comment", "review comment on change.txt:2".to_owned()),
+        ("pull_request_review", "review approved by dev".to_owned()),
+        ("comment", "deploy asked, mentioning ada".to_owned()),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=50", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut logs: Vec<(String, String)> = Vec::new();
+        for r in runs.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let id = text(r, "id").to_owned();
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
+            logs.push((text(r, "event").to_owned(), log));
+        }
+        if wanted.iter().all(|(event, said)| logs.iter().any(|(e, l)| e == event && l.contains(said.as_str()))) {
+            // kiln's `comment` ran for the command alone, not the plain remark.
+            assert_eq!(logs.iter().filter(|(e, _)| e == "comment").count(), 1, "{logs:?}");
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "not every conversation event ran: {logs:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(700));
     }
 }

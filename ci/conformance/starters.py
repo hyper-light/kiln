@@ -119,11 +119,40 @@ def family_reason(name, text):
         secrets = sorted(set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text)) - {"GITHUB_TOKEN"})
         if secrets:
             return "needs an account (" + ", ".join(secrets) + ")"
-        # Their SARIF goes to kiln's facade, as to GitHub's code scanning (W14).
-        if "upload-sarif" in text or "codeql-action" in text:
-            return None
-        return "needs GitHub's dependency graph or security APIs: not in kiln's facade yet (W14)"
+    # Their SARIF goes to kiln's facade, as to GitHub's code scanning, whichever action or
+    # reusable workflow uploads it (W14).
+    events = triggers(text)
+    if "push" not in events and name not in DISPATCH:
+        return "runs on " + ", ".join(f"`{e}`" for e in sorted(events)) + ", which this run's pushes don't raise"
     return None
+
+
+def triggers(text):
+    """The events a workflow's `on` names (a scalar, a flow list, or a mapping's keys)."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"""^(?:on|"on"|'on'|true):\s*(.*?)\s*(?:#.*)?$""", line)
+        if not m:
+            continue
+        if m.group(1):
+            return {e.strip().strip("'\"") for e in m.group(1).strip("[]").split(",") if e.strip()}
+        # A list (`- push`) or a mapping's keys (`push:`); a key's own list may sit at its indent.
+        events, indent, listed = set(), None, None
+        for nxt in lines[i + 1:]:
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if not nxt[0].isspace():
+                break
+            k = re.match(r"^(\s+)(-\s*)?([A-Za-z_]+)\s*:?", nxt)
+            if not k:
+                continue
+            width, item = len(k.group(1)), bool(k.group(2))
+            if indent is None:
+                indent, listed = width, item
+            if width == indent and item == listed:
+                events.add(k.group(3))
+        return events
+    return set()
 
 
 class Api:

@@ -259,6 +259,116 @@ pub fn pull_request(e: &Event, repo: &Repo, pr: &PullRequest) -> Value {
 }
 
 /// A `workflow_dispatch` payload.
+/// A comment on a pull request, as GitHub's payloads carry one.
+#[derive(Debug, Clone, Default)]
+pub struct Comment {
+    pub id: u64,
+    pub body: String,
+    /// Its author's login.
+    pub author: String,
+    /// RFC 3339.
+    pub created_at: String,
+    /// A comment on lines: its file, last line and commit.
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub commit: Option<String>,
+}
+
+/// A review of a pull request, as `pull_request_review` carries one.
+#[derive(Debug, Clone, Default)]
+pub struct Review {
+    pub id: u64,
+    /// GitHub's: `approved`, `changes_requested` or `commented`.
+    pub state: String,
+    pub body: String,
+    pub author: String,
+    pub submitted_at: String,
+    pub commit: String,
+}
+
+fn comment_json(c: &Comment, pr_url: &str) -> Value {
+    let mut v = json!({
+        "id": c.id, "node_id": format!("kiln-comment-{}", c.id), "body": c.body,
+        "user": { "login": c.author, "type": "User" }, "created_at": c.created_at, "updated_at": c.created_at,
+        "html_url": format!("{pr_url}#discussion_r{}", c.id), "author_association": "MEMBER",
+    });
+    if let (Some(m), Some(path)) = (v.as_object_mut(), &c.path) {
+        m.insert("path".into(), json!(path));
+        m.insert("line".into(), json!(c.line));
+        m.insert("side".into(), json!("RIGHT"));
+        m.insert("commit_id".into(), json!(c.commit));
+    }
+    v
+}
+
+/// The `pull_request` payload `pr` with its top-level `number` taken out and `key` put in, the
+/// sender `actor`: the shape of GitHub's events about a pull request's conversation.
+fn about(pr: &Value, key: &str, item: Value, action: &str, actor: &str) -> Value {
+    let mut v = pr.clone();
+    if let Some(m) = v.as_object_mut() {
+        m.remove("number");
+        m.insert("action".into(), json!(action));
+        m.insert(key.into(), item);
+        m.insert("sender".into(), json!({ "login": actor, "type": "User" }));
+    }
+    v
+}
+
+/// `issue_comment` (`created`) from a pull request's `pull_request` payload: the pull request as an
+/// issue (linking back to it), and the comment.
+pub fn issue_comment(pr: &Value, c: &Comment, actor: &str) -> Value {
+    let p = pr.get("pull_request").cloned().unwrap_or_default();
+    let url = p.get("html_url").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let issue = json!({
+        "number": p.get("number"), "title": p.get("title"), "body": p.get("body"), "state": p.get("state"),
+        "user": p.get("user"), "labels": p.get("labels").cloned().unwrap_or_else(|| json!([])), "html_url": url,
+        "pull_request": { "html_url": url },
+    });
+    let mut v = json!({
+        "action": "created", "issue": issue, "comment": comment_json(c, &url),
+        "repository": pr.get("repository"), "sender": { "login": actor, "type": "User" },
+    });
+    if let (Some(m), Some(k)) = (v.as_object_mut(), pr.get("kiln")) {
+        m.insert("kiln".into(), k.clone());
+    }
+    v
+}
+
+/// `pull_request_review_comment` (`created`): the comment on the pull request's lines.
+pub fn pull_request_review_comment(pr: &Value, c: &Comment, actor: &str) -> Value {
+    let url = pr.pointer("/pull_request/html_url").and_then(Value::as_str).unwrap_or_default().to_owned();
+    about(pr, "comment", comment_json(c, &url), "created", actor)
+}
+
+/// `pull_request_review` (`submitted`): the review.
+pub fn pull_request_review(pr: &Value, r: &Review, actor: &str) -> Value {
+    let url = pr.pointer("/pull_request/html_url").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let review = json!({
+        "id": r.id, "node_id": format!("kiln-review-{}", r.id), "user": { "login": r.author, "type": "User" }, "body": r.body,
+        "state": r.state, "commit_id": r.commit, "submitted_at": r.submitted_at, "html_url": format!("{url}#pullrequestreview-{}", r.id),
+        "author_association": "MEMBER",
+    });
+    about(pr, "review", review, "submitted", actor)
+}
+
+/// The names a comment mentions (`@ada`, `@review-bot`), in order, once each.
+pub fn mentions(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        // `ada@example.com` mentions no one.
+        if *c != '@' || i.checked_sub(1).and_then(|j| chars.get(j)).is_some_and(char::is_ascii_alphanumeric) {
+            continue;
+        }
+        let name: String = chars.iter().skip(i + 1).take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']')).collect();
+        let name = name.trim_end_matches('.').to_owned();
+        if !name.is_empty() && !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 pub fn workflow_dispatch(e: &Event, repo: &Repo, workflow_path: &str, inputs: &Value) -> Value {
     json!({ "inputs": inputs, "ref": e.git_ref, "repository": repo.payload(), "sender": { "login": e.actor, "type": "User" }, "workflow": workflow_path })
 }
@@ -338,6 +448,42 @@ pub fn workflow_run(action: &str, r: &RunSummary, repo: &Repo) -> Value {
         "repository": repo.payload(),
         "sender": user,
     })
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+
+    fn pr() -> Value {
+        json!({ "action": "opened", "number": 7, "pull_request": { "number": 7, "title": "A change", "body": "Why", "state": "open", "user": { "login": "ada" }, "html_url": "https://kiln.example/acme/app/pull/7", "labels": [] }, "repository": { "full_name": "acme/app" }, "sender": { "login": "ada" } })
+    }
+
+    #[test]
+    fn w03_conversation_events_are_githubs() {
+        let at = |v: &Value, p: &str| v.pointer(p).cloned().unwrap_or(Value::Null);
+        let c = Comment { id: 3, body: "/deploy @bo".into(), author: "bo".into(), created_at: "2026-10-19T00:00:00Z".into(), ..Comment::default() };
+        let v = issue_comment(&pr(), &c, "bo");
+        assert_eq!(at(&v, "/action"), json!("created"));
+        assert_eq!(at(&v, "/issue/number"), json!(7));
+        assert_eq!(at(&v, "/issue/pull_request/html_url"), json!("https://kiln.example/acme/app/pull/7"));
+        assert_eq!(at(&v, "/comment/body"), json!("/deploy @bo"));
+        assert_eq!(at(&v, "/sender/login"), json!("bo"));
+        assert!(v.pointer("/comment/path").is_none(), "a comment on the whole pull request has no path");
+        let line = Comment { path: Some("src/a.rs".into()), line: Some(12), commit: Some("f".repeat(40)), ..c.clone() };
+        let v = pull_request_review_comment(&pr(), &line, "bo");
+        assert_eq!((at(&v, "/action"), at(&v, "/comment/path"), at(&v, "/comment/line")), (json!("created"), json!("src/a.rs"), json!(12)));
+        assert_eq!(at(&v, "/pull_request/number"), json!(7));
+        assert!(v.get("number").is_none(), "GitHub's review events have no top-level number");
+        let r = Review { id: 9, state: "approved".into(), body: "lgtm".into(), author: "bo".into(), submitted_at: "2026-10-19T00:00:00Z".into(), commit: "e".repeat(40) };
+        let v = pull_request_review(&pr(), &r, "bo");
+        assert_eq!((at(&v, "/action"), at(&v, "/review/state"), at(&v, "/review/user/login")), (json!("submitted"), json!("approved"), json!("bo")));
+    }
+
+    #[test]
+    fn w03_mentions() {
+        assert_eq!(mentions("@ada and @review-bot[bot], thanks @ada."), vec!["ada".to_owned(), "review-bot[bot]".to_owned()]);
+        assert!(mentions("mail ada@example.com").is_empty());
+    }
 }
 
 #[cfg(test)]

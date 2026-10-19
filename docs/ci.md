@@ -174,7 +174,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
-| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native `pull_request_target`; the other native events left |
+| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native `pull_request_target`, comments and reviews (GitHub's and kiln's), nothing started by a job's token; `pull_request`'s other types, `land` and the CD and agent events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
@@ -1185,10 +1185,27 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
   pull request's branch changed in its workflows never runs this way. Checked end to end
   (`w03_r08_native_pull_request_target`: a branch that rewrites the workflow, whose rewrite
   doesn't run), and `actions/labeler@v5` labels a change request from it (W22-AC02).
+- *Done.* A diff's or change request's conversation, natively (R09, A.6), when a comment is
+  published or a review given:
+  - a comment on it as a whole raises GitHub's `issue_comment` (`created`), run from the default
+    branch as on GitHub, the pull request in the payload as an issue;
+  - a comment on its lines raises `pull_request_review_comment`, and a review
+    `pull_request_review` (`submitted`, `approved`, `changes_requested` or `commented`), both run
+    from its latest version as `pull_request` is;
+  - kiln's `comment` raises from the trunk, with whom it mentions (`kiln.mentions`) for the
+    `commands` and `mentions` filters, and kiln's `review` with the review's state.
+
+  Checked end to end (`w03_r09_native_conversation_events`): a command, a remark, a line comment
+  and an approval, kiln's `comment` running for the command alone.
+- *Done.* What a job's `GITHUB_TOKEN` does starts no run, as on GitHub (but `workflow_dispatch`
+  and `repository_dispatch`), so a job never starts itself again: its pushes (their moves are
+  recorded before the poller looks), the versions and pull requests it makes, and its comments
+  and reviews. Checked: a job that pushes a branch and opens a pull request for it, under a
+  workflow that runs on both, leaves its one run alone (`w14_r11_pull_requests_jobs_open_and_label`).
 - *Left.*
   - The App's events (with W14-R10).
-  - kiln's other native events: `pull_request`'s other types, `pull_request_review` and its
-    comments, `issue_comment` (with W14, W15 and W20).
+  - kiln's other native events: `pull_request`'s other types (edited, reopened, labeled,
+    ready_for_review), `land`, the CD and agent events (with W14, W15 and W20).
   - kiln dialect raising the `workflow_run` depth.
   - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05 as an integration
     test, AC07 to AC09.

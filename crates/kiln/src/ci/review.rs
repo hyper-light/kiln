@@ -575,7 +575,8 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
 
 /// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,
 /// how it ended, its failed legs (with where their failure excerpts are), and whose it is, for
-/// whoever follows the diff (an agent that wrote it, its person). For as long as the server runs.
+/// whoever follows the diff (an agent that wrote it, its person). And raises the workflow events
+/// of a diff's conversation (its comments and reviews). For as long as the server runs.
 pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.events.subscribe();
@@ -585,6 +586,12 @@ pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    // A diff's conversation raises its workflow events (W03-R09).
+                    if matches!(v.get("type").and_then(Value::as_str), Some("comment" | "review"))
+                        && let Err(e) = super::diffs::conversation(&hub, &v).await
+                    {
+                        tracing::warn!(diff = %v.get("diff").and_then(serde_json::Value::as_str).unwrap_or_default(), error = %format!("{e:#}"), "a diff's conversation started no workflows");
+                    }
                     let finished = v.get("type").and_then(Value::as_str) == Some("run")
                         && v.pointer("/run/status").and_then(Value::as_str).is_some_and(|s| matches!(s, "succeeded" | "failed" | "cancelled" | "timed_out" | "skipped"));
                     if finished

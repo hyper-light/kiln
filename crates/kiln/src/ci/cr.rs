@@ -144,11 +144,14 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
         let _ = gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/CR{number}/v{n}"), &s.head], LS_REMOTE_TIMEOUT).await;
         let fresh = diffs::Fresh { number, n, sha: s.head.clone(), parent: s.base.clone(), title: title.clone(), summary: summary.clone(), message: summary.clone(), draft, rebase_only, branch: Some(branch.to_owned()) };
         let (hub2, repo2, trunk2, author2, base2) = (hub.clone(), repo.clone(), trunk.to_owned(), by.author.clone(), s.base.clone());
-        crate::rt::spawn(async move {
-            if let Err(e) = diffs::checks(&hub2, &repo2, &trunk2, &base2, &author2, &fresh).await {
-                tracing::warn!(cr = fresh.number, version = fresh.n, error = %format!("{e:#}"), "a change request's workflows didn't start");
-            }
-        });
+        // A job's token (its push, or its `POST /pulls`) starts no run, as on GitHub.
+        if !diffs::by_job(&by.pushed_by) {
+            crate::rt::spawn(async move {
+                if let Err(e) = diffs::checks(&hub2, &repo2, &trunk2, &base2, &author2, &fresh).await {
+                    tracing::warn!(cr = fresh.number, version = fresh.n, error = %format!("{e:#}"), "a change request's workflows didn't start");
+                }
+            });
+        }
     }
     hub.store.audit(by.pushed_by.clone(), "change_requests.submit".into(), format!("{} CR{number} v{n} {kind} ({branch} into {trunk})", repo.name)).await;
     let _ = id;
