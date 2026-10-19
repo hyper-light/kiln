@@ -54,9 +54,13 @@ pub struct NewDevice {
     pub subscription: BrowserSubscription,
     #[serde(default)]
     pub device: String,
-    /// Absent: everything.
+    /// Absent: everything (or, with `replaces`, what that one heard).
     #[serde(default)]
     pub hears: Option<Vec<String>>,
+    /// The endpoint this one takes over from (the service worker's, when the push service
+    /// changed the subscription): that device's name and kinds go on, and it's forgotten.
+    #[serde(default)]
+    pub replaces: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,6 +171,11 @@ pub fn get(c: &Connection, principal: &str, id: &str) -> anyhow::Result<Option<D
     Ok(c.query_row(&format!("SELECT {COLUMNS} FROM push_subscriptions WHERE id = ?1 AND principal = ?2"), [id, principal], row).optional()?)
 }
 
+/// `principal`'s device with this endpoint.
+pub fn by_endpoint(c: &Connection, principal: &str, endpoint: &str) -> anyhow::Result<Option<Device>> {
+    Ok(c.query_row(&format!("SELECT {COLUMNS} FROM push_subscriptions WHERE endpoint = ?1 AND principal = ?2"), [endpoint.trim(), principal], row).optional()?)
+}
+
 /// Removes one of `principal`'s devices; whether there was one.
 pub fn remove(c: &Connection, principal: &str, id: &str) -> anyhow::Result<bool> {
     Ok(c.execute("DELETE FROM push_subscriptions WHERE id = ?1 AND principal = ?2", [id, principal])? > 0)
@@ -245,6 +254,7 @@ mod tests {
             subscription: BrowserSubscription { endpoint: endpoint.into(), keys: BrowserKeys { p256dh: super::super::vapid::b64(public.as_ref()), auth: super::super::vapid::b64([3u8; 16]) } },
             device: "Safari on iPhone".into(),
             hears: None,
+            replaces: None,
         })
     }
 

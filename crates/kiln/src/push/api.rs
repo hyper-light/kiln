@@ -66,10 +66,35 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
             if let Some(why) = unavailable(hub).await {
                 return Err((StatusCode::CONFLICT, why));
             }
-            let n: store::NewDevice = srv::body_json(req.into_body(), 16 << 10).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let mut n: store::NewDevice = srv::body_json(req.into_body(), 16 << 10).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            // The push service changed a device's subscription (the service worker says so): its
+            // name and kinds go on.
+            let (p, old) = (who.clone(), n.replaces.clone());
+            let before = match old {
+                Some(e) => hub.store.call(move |c| store::by_endpoint(c, &p, &e)).await.map_err(store_err)?,
+                None => None,
+            };
+            if let Some(b) = &before {
+                if n.device.trim().is_empty() {
+                    n.device.clone_from(&b.device);
+                }
+                if n.hears.is_none() {
+                    n.hears = Some(b.hears.clone());
+                }
+            }
             let (name, hears) = store::check_new(&n, &hub.cfg.push.allow_private).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             let (p, label) = (who.clone(), name.clone());
-            let d = hub.store.call(move |c| store::upsert(c, &p, &n, &name, &hears, crate::util::now_unix())).await.map_err(store_err)?;
+            let d = hub
+                .store
+                .call(move |c| {
+                    let d = store::upsert(c, &p, &n, &name, &hears, crate::util::now_unix())?;
+                    if let Some(b) = before.filter(|b| b.id != d.id) {
+                        store::remove(c, &p, &b.id)?;
+                    }
+                    Ok(d)
+                })
+                .await
+                .map_err(store_err)?;
             hub.store.audit(caller.name.clone(), "push.device".into(), format!("{label} hears {}", d.hears.join(", "))).await;
             hub.emit(&json!({ "type": "push" }));
             Ok(srv::json(StatusCode::CREATED, &d))
