@@ -14,8 +14,9 @@ This is docs/agentic.md N1 and N2; Mission Control's side is N3.
 | **Paused** | it reached a usage limit and waits for it to reset | normal |
 | **Low battery** | a machine your agents run on is at 20% or less | normal |
 
-Each device chooses which of these it hears (Settings → Notifications). Each agent can be muted
-from its ⋯ menu ("Mute notifications"); muting is yours alone and holds on every device.
+Each device chooses which of these it hears (Settings → This device → Notifications). Each agent
+can be muted from its ⋯ menu ("Mute notifications", then "Unmute notifications"); muting is yours
+alone and holds on every device.
 
 ## Who hears it
 
@@ -53,8 +54,11 @@ online, doesn't say it again.
 
 ## Turning it on
 
-Settings → Notifications → **Notify this device**. The browser asks for permission then, on that
-click, never before. What else it needs:
+Settings → This device → Notifications → **Notify this device** (`/settings#device.notifications`
+opens it). The browser asks for permission then, on that click, never before. Mission control
+offers the same in one quiet line ("Notifications are off here. Turn them on · Not now") while this
+device could have them and doesn't; "Not now" puts the line away in this browser. What else it
+needs:
 
 | Need | Why | What to do |
 |---|---|---|
@@ -65,6 +69,17 @@ click, never before. What else it needs:
 
 Settings says which one is missing when one is. It also lists your devices, what each hears, when
 each last got something and why it didn't, and sends a test.
+
+## Mission control on a phone
+
+Mission control opens on what needs you (docs/agentic.md N3):
+
+- Agents that need you are first, whatever the sort; the sort orders the rest. The list still
+  holds still while agents work: it's ordered when it's opened, refreshed, filtered or sorted.
+- On a phone the page's head is one line: its title, how the agents stand (cut to fit), Plans and
+  a + for new agents. The filter and the sort share a row.
+- The message box for many agents stays folded until you select agents, or open it with "Message
+  agents" at the list's head; it opens and folds in the page's flow, under that line.
 
 ## On the server
 

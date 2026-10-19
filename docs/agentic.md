@@ -25,7 +25,7 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 
 | | Workstream | Depends on | Status |
 |---|---|---|---|
-| N | Notifications and a phone-first Mission Control | — | building |
+| N | Notifications and a phone-first Mission Control | — | done: N1–N3 (docs/notifications.md); an iPhone check by a person is left |
 | O | Agents that run agents | — | building |
 | P | A plan run as one agent per step | O (W for parallel steps) | next |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | next |
