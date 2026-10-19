@@ -167,6 +167,7 @@ impl Turso {
             let mut epochs: HashMap<String, u64> = HashMap::new();
             let mut copied: HashMap<String, bool> = HashMap::new();
             let mut took = Took { rev: batch.upto, ..Took::default() };
+            let first = t.rev + 1;
             for c in &batch.rows {
                 let session = c.row.session();
                 if copy {
@@ -231,6 +232,7 @@ impl Turso {
             }
             let mut set = t.prepare(sql::PEER_SET)?;
             t.run(&mut set, &[txt(&peer), seq(batch.upto), int(now)], |_| Ok(()))?;
+            took.wrote = (t.rev >= first).then_some((first, t.rev));
             Ok(took)
         })
     }
@@ -311,6 +313,11 @@ impl Turso {
 
     /// Run `stmt` with `params`, handing each row to `each`.
     fn run(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.run_while(stmt, params, |r| each(r).map(|()| true))
+    }
+
+    /// [`Turso::run`], stopping once `each` says no more (false).
+    fn run_while(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
         stmt.reset().map_err(fail)?;
         for (i, p) in params.iter().enumerate() {
             stmt.bind_at(at(i + 1)?, p.clone()).map_err(fail)?;
@@ -319,8 +326,10 @@ impl Turso {
         loop {
             match stmt.step().map_err(fail)? {
                 StepResult::Row => {
-                    if let Some(row) = stmt.row() {
-                        each(row)?;
+                    if let Some(row) = stmt.row()
+                        && !each(row)?
+                    {
+                        return stmt.reset().map_err(fail);
                     }
                 }
                 StepResult::Done => return Ok(()),
@@ -455,6 +464,18 @@ fn squeeze(line: &str) -> Value {
     txt(line)
 }
 
+/// What the store keeps of a record line that came to it: kept as the store it is from keeps
+/// it, when it came so ([`RecordRow::kept`]); else [`squeeze`]d here.
+fn record_value(rec: &RecordRow) -> anyhow::Result<Value> {
+    match &rec.kept {
+        Some(k) => {
+            anyhow::ensure!(k.len() > 1 && k.first() == Some(&CODEC_BROTLI), "a record line kept in an unknown encoding");
+            Value::from_slice(k).map_err(|e| anyhow::anyhow!("a record line too large to keep: {e}"))
+        }
+        None => Ok(squeeze(&rec.line)),
+    }
+}
+
 /// A record line as [`squeeze`] kept it.
 fn unsqueeze(v: &Value) -> anyhow::Result<String> {
     use std::io::Read as _;
@@ -532,7 +553,7 @@ impl Turso {
                 self.run(&mut w.dropped, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
             }
             Row::Closed { session, at } => self.run(&mut w.close, &[txt(session), int(*at), r], none)?,
-            Row::Record(rec) => self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), squeeze(&rec.line), r], none)?,
+            Row::Record(rec) => self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), record_value(rec)?, r], none)?,
             Row::RecordReset { session, source, at } => {
                 self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
                 self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
@@ -548,15 +569,22 @@ impl Turso {
         Ok(self.one_int(sql::SESSION_EPOCH, &[txt(session)])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
     }
 
-    /// Rows of one kind after `from` (a page of them), each as `(rev, session, rows)`.
-    fn feed_page(&self, sql: &str, from: u64, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<Vec<(u64, String, Vec<Row>, Option<u64>)>> {
+    /// Rows of one kind after `from`, each as `(rev, session, rows, epoch)`: a page of them, or
+    /// fewer once they come to `max_bytes` (nothing more is read, or decompressed, than a batch
+    /// takes); and whether more may follow (the page is full, or stopped at the bytes).
+    #[allow(clippy::type_complexity)]
+    fn feed_page(&self, sql: &str, from: u64, max_bytes: usize, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
         let mut stmt = self.prepare(sql)?;
-        let mut out = Vec::new();
-        self.run(&mut stmt, &[seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(512))], |r| {
-            out.push(each(r)?);
-            Ok(())
+        let (mut out, mut bytes, mut full) = (Vec::new(), 0usize, false);
+        self.run_while(&mut stmt, &[seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(512))], |r| {
+            let page = each(r)?;
+            bytes += page.2.iter().map(Row::bytes).sum::<usize>();
+            out.push(page);
+            full = bytes >= max_bytes;
+            Ok(!full)
         })?;
-        Ok(out)
+        let more = full || out.len() >= FEED_PAGE;
+        Ok((out, more))
     }
 }
 
@@ -583,14 +611,14 @@ impl Engine for Turso {
         })
     }
 
-    fn changes(&mut self, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
         if from >= self.rev {
             return Ok(Changes { rows: Vec::new(), upto: from });
         }
         let s = |r: &TRow, i: usize| r.get::<String>(i).ok();
         // Each kind's rows after `from`: (rev, session, the rows it makes, its epoch if it says).
         let pages = [
-            self.feed_page(sql::FEED_SESSIONS, from, |r| {
+            self.feed_page(sql::FEED_SESSIONS, from, max_bytes, |r| {
                 let id = s(r, 0).unwrap_or_default();
                 let epoch = u(r, 7);
                 let closed = r.get::<i64>(6).ok();
@@ -603,15 +631,21 @@ impl Engine for Turso {
                 }
                 Ok((u(r, 8), id, rows, Some(epoch)))
             })?,
-            self.feed_page(sql::FEED_EVENTS, from, |r| {
+            self.feed_page(sql::FEED_EVENTS, from, max_bytes, |r| {
                 let e = event_of(r)?;
                 Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
             })?,
-            self.feed_page(sql::FEED_RECORDS, from, |r| {
-                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line: unsqueeze(r.get_value(4))? };
+            self.feed_page(sql::FEED_RECORDS, from, max_bytes, |r| {
+                // To a taker that takes them so, a compressed line goes as it is kept.
+                let v = r.get_value(4);
+                let (line, as_kept) = match v.to_blob() {
+                    Some(b) if kept && b.first() == Some(&CODEC_BROTLI) => (String::new(), Some(b.to_vec())),
+                    _ => (unsqueeze(v)?, None),
+                };
+                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line, kept: as_kept };
                 Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
             })?,
-            self.feed_page(sql::FEED_DROPS, from, |r| {
+            self.feed_page(sql::FEED_DROPS, from, max_bytes, |r| {
                 let session = s(r, 1).unwrap_or_default();
                 let at = r.get::<i64>(5).unwrap_or(0);
                 let row = match s(r, 2).as_deref() {
@@ -621,16 +655,15 @@ impl Engine for Turso {
                 Ok((u(r, 0), session, vec![row], None))
             })?,
         ];
-        // Complete through `bound`: a kind that filled its page may have more after its last.
+        // Complete through `bound`: a kind that filled its page, or its bytes, may have more after
+        // its last.
         let mut bound = self.rev;
-        for p in &pages {
-            if p.len() >= FEED_PAGE
-                && let Some((last, ..)) = p.last()
-            {
+        for (p, more) in &pages {
+            if *more && let Some((last, ..)) = p.last() {
                 bound = bound.min(*last);
             }
         }
-        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flatten().filter(|(rev, ..)| *rev <= bound).collect();
+        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flat_map(|(p, _)| p).filter(|(rev, ..)| *rev <= bound).collect();
         all.sort_by_key(|(rev, ..)| *rev);
         let mut epochs: HashMap<String, u64> = HashMap::new();
         let mut out = Changes { rows: Vec::new(), upto: bound };
@@ -929,7 +962,7 @@ mod tests {
         }
         let mut t = Turso::open(&path)?;
         assert!(!t.id().is_empty());
-        let all = t.changes(0, 1 << 20)?;
+        let all = t.changes(0, 1 << 20, false)?;
         let mut kinds: Vec<String> = all.rows.iter().map(|c| format!("{}:{}", c.row.session(), match &c.row { Row::Session { .. } => "session", Row::Closed { .. } => "closed", Row::Event(_) => "event", _ => "other" })).collect();
         kinds.sort();
         assert_eq!(kinds, vec!["a1:event", "a1:event", "a1:session", "a2:closed", "a2:session"]);
@@ -939,7 +972,7 @@ mod tests {
         assert_eq!(revs.len(), 4);
         let top = all.upto;
         t.apply(&[Row::Event(Box::new(super::super::rows::event("a1", &Event { id: "m3".into(), seq: 3, at: 9, parent: None, by: None, body: Body::Assistant { text: "new".into(), streaming: false } }).ok_or_else(|| anyhow::anyhow!("no row"))?))])?;
-        let next = t.changes(top, 1 << 20)?;
+        let next = t.changes(top, 1 << 20, false)?;
         assert_eq!(next.rows.len(), 1);
         assert!(next.rows.iter().all(|c| c.rev > top));
         // Reopened: the same id, and numbering goes on.
@@ -952,7 +985,7 @@ mod tests {
     }
 
     fn record(n: u64, line: &str) -> Row {
-        Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n, end: (n + 1) * 1000, line: line.into() }))
+        Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n, end: (n + 1) * 1000, line: line.into(), kept: None }))
     }
 
     #[test]
@@ -965,7 +998,7 @@ mod tests {
             rows.extend(super::super::rows::of(s, &said("m1", 1, "the clock was read twice"), 5));
             for source in ["cc-a", "cc-b"] {
                 for n in 0..5u64 {
-                    rows.push(Row::Record(Box::new(RecordRow { session: s.into(), source: source.into(), n, end: (n + 1) * 100, line: format!("{{\"n\":{n}}}") })));
+                    rows.push(Row::Record(Box::new(RecordRow { session: s.into(), source: source.into(), n, end: (n + 1) * 100, line: format!("{{\"n\":{n}}}"), kept: None })));
                 }
             }
         }
@@ -996,7 +1029,7 @@ mod tests {
         let mut t = Turso::open(&dir.path().join("c.db"))?;
         let session = |s: &str, state: &str| Row::Session { session: s.into(), info: Some(format!("{{\"id\":\"{s}\"}}")), meta: None, state: Some(format!("{{\"title\":\"{state}\"}}")), changes: None, epoch: None, open: true, at: 5 };
         let event = |s: &str, id: &str, text: &str| super::super::rows::of(s, &said(id, 1, text), 5).into_iter().next().ok_or_else(|| anyhow::anyhow!("no event row"));
-        let line = |s: &str, n: u64| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: format!("{{\"n\":{n}}}") }));
+        let line = |s: &str, n: u64| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: format!("{{\"n\":{n}}}"), kept: None }));
         let changes = |rows: Vec<Row>, from: u64| Changes { upto: from + rows.len() as u64, rows: rows.into_iter().enumerate().map(|(i, row)| Change { rev: from + 1 + i as u64, epoch: 0, row }).collect() };
         // Its machine's own feed brought `live` back already.
         t.take("box/s1", Some("box"), 0, &changes(vec![session("live", "now"), event("live", "e1", "said now")?], 0))?;
@@ -1052,7 +1085,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("c.db");
         let mut t = Turso::open(&path)?;
-        let line = |s: &str, n: u64, text: String| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: text }));
+        let line = |s: &str, n: u64, text: String| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: text, kept: None }));
         let mut rows = vec![Row::Session { session: "gone".into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 }];
         rows.extend((0..1_500u64).map(|n| line("gone", n, noise(2_000))));
         rows.push(Row::Closed { session: "gone".into(), at: 10 });
@@ -1071,10 +1104,10 @@ mod tests {
         assert_eq!(t.id(), id);
         assert_eq!(t.record("kept", "cc", 0, 100)?, kept);
         assert_eq!(t.kept("kept", 10)?.map(|k| k.events.len()), Some(1));
-        assert_eq!(t.changes(rev, 1 << 20)?.rows.len(), 0, "the numbers went on where they were");
+        assert_eq!(t.changes(rev, 1 << 20, false)?.rows.len(), 0, "the numbers went on where they were");
         t.apply(&[line("kept", 40, "{\"after\":true}".into())])?;
         assert_eq!(t.record("kept", "cc", 40, 10)?, vec![(40, "{\"after\":true}".to_owned())]);
-        assert!(t.changes(rev, 1 << 20)?.rows.iter().all(|c| c.rev > rev));
+        assert!(t.changes(rev, 1 << 20, false)?.rows.iter().all(|c| c.rev > rev));
         for left in [".compact", ".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
             assert!(!beside(&path, left).exists(), "{left} left beside the store");
         }
@@ -1116,7 +1149,7 @@ mod tests {
         let path = dir.path().join("c.db");
         let id = {
             let mut t = Turso::open(&path)?;
-            t.apply(&[Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n: 0, end: 1, line: "{\"in\":\"the copy\"}".into() }))])?;
+            t.apply(&[Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n: 0, end: 1, line: "{\"in\":\"the copy\"}".into(), kept: None }))])?;
             t.conn.execute(format!("VACUUM INTO '{}'", beside(&path, ".compact").display())).map_err(fail)?;
             t.id()
         };
@@ -1144,7 +1177,7 @@ mod tests {
         assert!(t.one_int("SELECT length(line) FROM records WHERE n = 0", &[])?.is_some_and(|b| (b as usize) < long.len() / 3));
         assert_eq!(t.record("s1", "cc", 0, 10)?, vec![(0, long.clone()), (1, short.to_owned())]);
         assert_eq!(t.marks("s1")?.first().map(|m| m.line.clone()), Some(short.to_owned()));
-        let fed: Vec<String> = t.changes(before, 1 << 20)?.rows.into_iter().filter_map(|c| if let Row::Record(r) = c.row { Some(r.line) } else { None }).collect();
+        let fed: Vec<String> = t.changes(before, 1 << 20, false)?.rows.into_iter().filter_map(|c| if let Row::Record(r) = c.row { Some(r.line) } else { None }).collect();
         assert_eq!(fed, vec![long, short.to_owned()]);
         Ok(())
     }
@@ -1226,6 +1259,50 @@ mod tests {
         let k = store.kept("a1", 5_000)?.ok_or_else(|| anyhow::anyhow!("nothing kept after reopening"))?;
         assert_eq!(k.events.len(), 2_000);
         assert!(k.events.iter().any(|e| e.id == "m7" && e.text == "reply seven, revised"));
+        Ok(())
+    }
+
+    #[test]
+    fn small_batches_bring_everything_once_in_order_and_a_line_sent_as_kept_is_kept_the_same() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut a = Turso::open(&dir.path().join("a.db"))?;
+        let mut b = Turso::open(&dir.path().join("b.db"))?;
+        // Sessions and long lines, one after another: two kinds, each read a page at a time.
+        let mut rows = Vec::new();
+        for n in 0..40u64 {
+            rows.push(Row::Session { session: format!("x{n}"), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 });
+            rows.push(Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n, end: (n + 1) * 100, line: format!("{{\"n\":{n},\"text\":\"{}\"}}", "words that compress well ".repeat(400)), kept: None })));
+        }
+        a.apply(&rows)?;
+        let (mut from, mut seen) = (0u64, Vec::new());
+        loop {
+            let batch = a.changes(from, 2_000, true)?;
+            if batch.rows.is_empty() {
+                break;
+            }
+            let sizes: Vec<usize> = batch.rows.iter().map(|c| c.row.bytes()).collect();
+            assert!(sizes.iter().sum::<usize>() < 2_000 + sizes.iter().max().copied().unwrap_or(0), "a batch of {sizes:?}");
+            seen.extend(batch.rows.iter().map(|c| c.rev));
+            let took = b.take("a", None, from, &batch)?;
+            assert!(!took.gap);
+            from = batch.upto;
+        }
+        assert_eq!(seen, (1..=80).collect::<Vec<u64>>(), "everything, once, in order");
+        // Each long line is kept byte for byte as it was: never decompressed on the way.
+        let raw = |t: &Turso| -> anyhow::Result<Vec<Vec<u8>>> {
+            let mut stmt = t.prepare("SELECT line FROM records ORDER BY n")?;
+            let mut out = Vec::new();
+            t.run(&mut stmt, &[], |r| {
+                out.push(r.get_value(0).to_blob().map(<[u8]>::to_vec).unwrap_or_default());
+                Ok(())
+            })?;
+            Ok(out)
+        };
+        let (kept_a, kept_b) = (raw(&a)?, raw(&b)?);
+        assert_eq!(kept_a.len(), 40);
+        assert!(kept_a.iter().all(|l| l.first() == Some(&CODEC_BROTLI)));
+        assert_eq!(kept_a, kept_b);
+        assert_eq!(b.record("s1", "cc", 39, 1)?.first().map(|(n, l)| (*n, l.starts_with("{\"n\":39,"))), Some((39, true)));
         Ok(())
     }
 }
