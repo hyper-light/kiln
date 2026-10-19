@@ -7,7 +7,7 @@ import * as React from "react";
 import { Link } from "@/lib/router";
 import { Check, Plus, X } from "lucide-react";
 
-import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseEnvHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release } from "@/api/deploy";
+import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseEnvHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release, type Template } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel } from "@/components/ui/misc";
@@ -26,6 +26,7 @@ export const DEPLOY_EVENTS = ["deploy", "deploy_registration"] as const;
 
 export const boardRes: Res<Board> = { key: "deploy/board", fetch: (s) => deployApi.board(s), opts: { on: DEPLOY_EVENTS, pollMs: 30_000 } };
 export const environmentsRes: Res<Environment[]> = { key: "deploy/environments", fetch: (s) => deployApi.environments(s), opts: { on: DEPLOY_EVENTS } };
+export const templatesRes: Res<Template[]> = { key: "deploy/templates", fetch: (s) => deployApi.templates(s), opts: { on: DEPLOY_EVENTS } };
 
 /** A release's state, as a dot and its words. */
 export function ReleaseState({ r }: { r: Release }) {
