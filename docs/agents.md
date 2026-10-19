@@ -243,11 +243,13 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, trunk?, fix_checks?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
+| `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
+| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
-lists shorten it). `workspace` is `folder` (the folder itself) until agents get workspaces of
-their own; `workspace` in a result is `null` until then, and `branch` and `change_request` are
-`null` until it has a change request.
+lists shorten it). `workspace` is `folder` (the folder itself, the default) or `volume` (a Slates
+volume of its own, where its machine can make one); in a result it is `null` for an agent in its
+folder, and `branch` and `change_request` are `null` until it has a change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
 files_changed, lines_added, lines_removed, cost_usd, doing?, parent?, plan_run?, last_turn?,
@@ -330,6 +332,36 @@ the server, as its children); `kiln agents list|send|interrupt|stop` work on thi
 (an agent sends to and stops only its own). The skill `kiln-agents` (docs: `kiln mcp`, skills)
 says when to fan out, how to brief a child, how to wait and read results, how to keep children's
 permissions low and how to merge their work.
+
+## Workspaces of their own
+
+An agent can work in **its own Slates volume** instead of the folder itself (New agents →
+Workspace → Its own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
+
+- **What it is.** On the agent's machine, before its harness starts, kiln lays an overlay volume
+  over the folder's repository and mounts it under the runner's state directory
+  (`workspaces/kiln-<id>`); the agent's folder is the same place in it. What it hasn't touched it
+  reads from the folder as it is now; what it changes (its edits, its build's output, git's own
+  writes) stays in the volume, in memory: the folder and other agents never see it. Several agents
+  on one folder each get their own.
+- **Where its work goes.** Up for review as a change request from the volume (**Open change
+  request**, `agents.change`: everything that changed there), or back into the folder:
+  **Write to disk…** shows what it would create, replace and delete (git's own directory stays
+  out), and any file changed in the folder since the agent changed it, in which
+  case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
+  a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
+  yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
+  Slates' command line leaves out one path per landing, so kiln leaves out `.git` and writes only
+  what git sees changed: when the agent's build output or dependencies would be written too, the
+  plan says to put the work up for review instead.
+- **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
+  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
+  user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
+  doesn't move to another machine yet.
+- **Where it can.** A machine with Slates installed (`slates` on `PATH`, or kiln's own under the
+  runner's state directory) and a mount it can make: FUSE through `fusermount3` on Linux, NFS on
+  loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
+  can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
 ## Change requests from agents
 

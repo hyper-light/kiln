@@ -371,6 +371,25 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
     }
 }
 
+/// Whether agents on `target` (`local`, `agent:<machine>`) can have workspaces of their own: its
+/// kiln asks its machine about folders, and its machine has Slates and can mount a volume.
+pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
+    let facts = match target.strip_prefix("agent:") {
+        None => crate::workspace::slates::facts().await,
+        Some(machine) => {
+            let caps = hub.instances.lock().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
+            if !caps {
+                return Err(format!("{machine}'s kiln is older than workspaces: upgrade it (Settings → Updates)"));
+            }
+            match hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone())) {
+                Some(f) => f,
+                None => return Err(format!("{machine} hasn't said yet whether it has Slates: try again in a minute")),
+            }
+        }
+    };
+    if facts.available { Ok(()) } else { Err(facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned())) }
+}
+
 /// Whether `target` names the machine `info` runs on.
 fn same_machine(info: &Info, target: &str) -> bool {
     info.target == target || (target == "local" && info.target.is_empty())
@@ -413,18 +432,17 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     if !kind.structured() {
         return Err(bad(format!("{} has no structured mode", kind.name)));
     }
-    match ask.workspace.as_deref().map(str::trim) {
-        None | Some("" | "folder") => {}
-        Some(w) => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("workspaces of their own ({w}) aren't here yet (docs/agentic.md, W): an agent works in its folder itself. Leave `workspace` out, or say \"folder\""),
-            ));
-        }
-    }
+    let volume = match ask.workspace.as_deref().map(str::trim) {
+        None | Some("" | "folder") => false,
+        Some("volume") => true,
+        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
+    };
     let count = ask.count.unwrap_or(1).clamp(1, 16);
     let default_target = by.parent.as_ref().map(|p| if p.target.is_empty() { "local".to_owned() } else { p.target.clone() });
     let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
+    if volume {
+        workspaces_on(hub, &target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+    }
     if target == "local" && !hub.cfg.terminal.enabled {
         return Err(refuse("terminals (and so agents) are off on the server: pick a runner with `on`"));
     }
@@ -449,6 +467,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         reach,
         parent: by.parent.as_ref().map(|p| p.id.clone()),
         plan_run: by.plan_run.clone(),
+        workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
         ..Spec::default()
     };
     let infos = hub.harness.open(hub, &target, spec, count).await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;

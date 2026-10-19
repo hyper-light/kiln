@@ -933,6 +933,10 @@ impl Objective {
 /// Everything about a session that is not the timeline. Small; sent whole on change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct State {
+    /// Moved here: where its folder stood in its repo's sync log on the machine it left. It goes
+    /// on once the folder here has taken the log that far, after a restart too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arriving: Option<crate::sync::runner::Mark>,
     pub status: Status,
     /// The harness's own session id (what `--resume` takes).
     #[serde(default, skip_serializing_if = "Option::is_none")]

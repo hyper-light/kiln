@@ -374,7 +374,35 @@ fn repo_path(file: &std::path::Path) -> String {
     at.and_then(|i| s.get(i + 1..)).unwrap_or(s.trim_start_matches('/')).trim_start_matches("./").to_owned()
 }
 
+/// The stack each thread of the runtime gets ([`kiln::rt`]): its shards run kiln's async work, whose
+/// futures nest deep, a debug build's deepest of all (verifying a webhook and `kiln workflow run`
+/// overflowed the 2 MiB a thread gets by default). Reserved, not used: pages are touched as needed.
+const THREAD_STACK: usize = 16 << 20;
+
+/// Threads spawned without a size of their own, the runtime's shards among them, get
+/// [`THREAD_STACK`]. Std reads `RUST_MIN_STACK` once, at the first spawn: it is set, read by a
+/// thread spawned and joined at once, then taken out again, so what kiln starts (agents, builds)
+/// sees the environment it was given. A value someone set stays as they set it.
+fn thread_stacks() {
+    if std::env::var_os("RUST_MIN_STACK").is_some() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: the first thing main does, while this process has one thread: nothing else reads or
+    // writes the environment meanwhile.
+    unsafe {
+        std::env::set_var("RUST_MIN_STACK", THREAD_STACK.to_string());
+    }
+    let _ = std::thread::spawn(|| {}).join();
+    #[allow(unsafe_code)]
+    // SAFETY: the thread above has ended: one thread again, as above.
+    unsafe {
+        std::env::remove_var("RUST_MIN_STACK");
+    }
+}
+
 fn main() -> ExitCode {
+    thread_stacks();
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();

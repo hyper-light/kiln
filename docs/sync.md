@@ -231,6 +231,10 @@ commits made after a sync joined move between copies with `git` (fetch, pull) un
   learner and a saved state per copy, and a content store. Every two seconds it looks at each folder
   that has taken everything committed, sends new contents over HTTP, then the steps; it fetches the
   contents committed steps name, writes them, and states durable only what the folder took.
+  An agent moving to another machine asks it two things ([reach.md](reach.md) §8): to look at its
+  folder now, and how its copy stands (how far its folder has taken the log, what it hasn't sent
+  yet or taken yet). The machine it leaves waits until nothing of its own is unsent; the machine it
+  goes to, until its folder has taken the log that far.
 - **Links:** Raft messages ride `ServerMsg::Sync`/`AgentMsg::Sync` on a lane of their own, an image
   in parts of 512 KiB. Contents go over `GET`/`PUT /api/sync/blobs/:hash?machine=`, with a token the
   server signs for each machine and gives it with its copies.

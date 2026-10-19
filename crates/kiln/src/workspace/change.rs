@@ -110,7 +110,7 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
     let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        super::serve(std::path::Path::new(&info.cwd), &json).await
+        super::serve(std::path::Path::new(&info.cwd), info.workspace.as_ref(), &json).await
     } else {
         let id = info.id.clone();
         let got = hub
@@ -186,7 +186,10 @@ pub fn branch_for(info: &Info) -> String {
         }
     }
     let slug = slug.trim_end_matches('-');
-    let short: String = info.id.chars().filter(char::is_ascii_alphanumeric).take(8).collect();
+    // The end of its id: kiln's ids start with the time they were made, so agents started within a
+    // minute of each other share their beginnings, never their ends.
+    let alnum: Vec<char> = info.id.chars().filter(char::is_ascii_alphanumeric).collect();
+    let short: String = alnum.get(alnum.len().saturating_sub(8)..).unwrap_or_default().iter().collect();
     if slug.is_empty() { format!("agents/{short}") } else { format!("agents/{slug}-{short}") }
 }
 
@@ -224,7 +227,9 @@ fn title_of(info: &Info, want: &Want) -> String {
 pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Result<Record, Fail> {
     let (_, _, changes) = hub.harness.conclusion(&info.id).unwrap_or_default();
     let paths: Vec<String> = changes.as_array().into_iter().flatten().filter_map(|f| f.get("path").and_then(Value::as_str)).map(str::to_owned).collect();
-    if paths.is_empty() {
+    // In a workspace of its own, everything that changed there is its: its commands' changes too.
+    let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some());
+    if paths.is_empty() && !own {
         return Err(fail(StatusCode::CONFLICT, format!("{} hasn't changed any files yet", info.name)));
     }
     let facts: Facts = serde_json::from_value(ask_machine(hub, info, &super::Ask::Git).await?.get("facts").cloned().unwrap_or_default()).map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("the machine's answer: {e}")))?;
@@ -274,7 +279,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         (remote, format!("refs/heads/{branch}"), None, None)
     };
     let ask = super::Ask::Change(super::Change {
-        paths: Some(paths),
+        paths: (!own).then_some(paths),
         message,
         fallback: Ident { name: format!("{} (kiln agent)", info.name), email: "agent@kiln.invalid".to_owned() },
         to: to.clone(),
@@ -379,10 +384,13 @@ mod tests {
 
     #[test]
     fn an_agent_s_branch_says_what_it_is_about_and_whose_it_is() {
-        let info = Info { id: "5f3a2b1c-9d8e".into(), title: "Fix the flaky reconnect test (again!)".into(), ..Info::default() };
-        assert_eq!(branch_for(&info), "agents/fix-the-flaky-reconnect-test-again-5f3a2b1c");
+        let info = Info { id: "0192abcd5f3a2b1c9d8e7f6a5b4c3d2e".into(), title: "Fix the flaky reconnect test (again!)".into(), ..Info::default() };
+        assert_eq!(branch_for(&info), "agents/fix-the-flaky-reconnect-test-again-5b4c3d2e");
+        // Two agents started in the same minute share their ids' beginnings, not their branches.
+        let twin = Info { id: "0192abcd5f3a2b1c9d8e7f6a11112222".into(), title: info.title.clone(), ..Info::default() };
+        assert_ne!(branch_for(&info), branch_for(&twin));
         let info = Info { id: "abcdef1234".into(), ..Info::default() };
-        assert_eq!(branch_for(&info), "agents/work-abcdef12");
+        assert_eq!(branch_for(&info), "agents/work-cdef1234");
         let long = Info { id: "12345678".into(), title: "x".repeat(200), ..Info::default() };
         assert!(branch_for(&long).len() <= "agents/".len() + 41 + 8, "{}", branch_for(&long));
         assert!(crate::ci::cr::branch_ok(&branch_for(&info), &["main".to_owned()]).is_ok());

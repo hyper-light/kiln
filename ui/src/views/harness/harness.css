@@ -1638,6 +1638,43 @@ textarea.hx-input {
 .hx-change-what a:hover {
   text-decoration: underline;
 }
+.hx-ws-bar {
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+}
+.hx-ws-bar > * {
+  min-width: 0;
+}
+.hx-ws-head {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+}
+.hx-ws-head .hx-change-what {
+  min-width: 0;
+}
+/* What a workspace is wraps rather than being cut: it's the line that says what this is. */
+.hx-ws-head .hx-change-sub {
+  white-space: normal;
+}
+.hx-ws-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 6px 6px 26px;
+}
+.hx-ws-conflicts {
+  margin: 0;
+  padding-left: 16px;
+  list-style: disc;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.hx-ws-actions {
+  display: flex;
+  gap: 8px;
+}
 .hx-change-sub {
   display: block;
   overflow: hidden;

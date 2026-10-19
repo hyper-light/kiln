@@ -193,8 +193,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         "cwd": info.cwd,
         "machine": wait::machine(&info.target),
         "cost_usd": info.cost_usd,
-        // Filled in once agents work in workspaces of their own (docs/agentic.md, W).
-        "workspace": Value::Null,
+        // Its workspace of its own (docs/agentic.md, W): the folder it's laid over, and its volume.
+        "workspace": info.workspace.as_ref().map(|w| json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)})),
         "branch": record.as_ref().map(|r| json!(r.branch)),
         "change_request": record.as_ref().map(crate::workspace::change::shown),
     }))
@@ -206,6 +206,36 @@ async fn change(cx: Cx, v: Value) -> Out {
     let want: crate::workspace::change::Want = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
     let r = crate::workspace::change::open(&cx.hub, &cx.caller.name, &info, want).await?;
     Ok(json!({"change_request": crate::workspace::change::shown(&r)}))
+}
+
+async fn workspace(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    let Some(w) = info.workspace.clone() else {
+        return Ok(json!({"workspace": Value::Null, "drift": []}));
+    };
+    let look = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Look).await?;
+    Ok(json!({"workspace": {"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)}, "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
+}
+
+async fn land(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    may_steer(&cx, &info.id)?;
+    if info.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
+        return Err((StatusCode::CONFLICT, format!("{} works in its folder itself: what it changed is there already", info.name)));
+    }
+    let Some(manifest) = v.get("manifest").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned) else {
+        let plan = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Plan).await?;
+        return Ok(plan);
+    };
+    // Writing to a person's folder waits on a person (docs/agentic.md: no agent answers what waits on one).
+    if cx.caller.agent.is_some() || cx.caller.kind == crate::authz::gate::Kind::Agent {
+        return Err((StatusCode::FORBIDDEN, "writing an agent's work to disk is a person's to say: they do it from the agent's Changes, or with this operation themselves".to_owned()));
+    }
+    let landed = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Land { manifest }).await?;
+    if landed.get("landed").is_some() {
+        cx.hub.store.audit(cx.caller.name.clone(), "agent.land".into(), format!("{} ({}): its workspace written to {}", info.name, lineage::short(&info.id), info.workspace.as_ref().and_then(|w| w.over.clone()).unwrap_or_default())).await;
+    }
+    Ok(landed)
 }
 
 async fn changes(cx: Cx, v: Value) -> Out {
@@ -326,7 +356,7 @@ pub fn list_ops() -> Vec<Op> {
                         "mode": {"type": "string", "description": "Its permission mode, at most yours (claude: plan, default, acceptEdits, auto, bypassPermissions; codex: read-only, untrusted, auto, full-access). Left out: its harness's default when that's within yours, else the most that is."},
                         "name": {"type": "string"},
                         "count": {"type": "integer", "minimum": 1, "maximum": 16},
-                        "workspace": {"type": "string", "enum": ["folder"], "description": "Where it works: its folder itself (workspaces of their own are to come)."}
+                        "workspace": {"type": "string", "enum": ["folder", "volume"], "description": "Where it works: `folder`, its folder itself (the default), or `volume`, a Slates volume of its own laid over the folder's repository, where what it changes stays its own until it goes up for review (agents.change) or a person writes it to disk. Where the machine has Slates."}
                     }),
                     &["kind"],
                 )
@@ -410,6 +440,32 @@ pub fn list_ops() -> Vec<Op> {
             },
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "change"]))),
             run: |cx, v| Box::pin(change(cx, v)),
+        },
+        Op {
+            name: "agents.workspace",
+            summary: "An agent's workspace of its own (a Slates volume over its folder): the folder it's laid over, its volume and mount, and the files under it that changed on disk after the agent changed them (drift).",
+            read_only: true,
+            destructive: false,
+            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "workspace"]))),
+            run: |cx, v| Box::pin(workspace(cx, v)),
+        },
+        Op {
+            name: "agents.land",
+            summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), for a person to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`) — only a person can write, never an agent. Build output and what git ignores stay out, and so does `.git`.",
+            read_only: false,
+            destructive: true,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "manifest": {"type": "string", "description": "The plan's manifest hash: what is written is exactly what that plan lists."}
+                    }),
+                    &["agent"],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "land"]))),
+            run: |cx, v| Box::pin(land(cx, v)),
         },
         Op {
             name: "agents.changes",

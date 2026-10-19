@@ -97,6 +97,9 @@ pub struct Acp {
     cur_agent: Option<String>,
     cur_thought: Option<String>,
     cur_user: Option<String>,
+    /// This run's tag, in the ids of the events it makes ([`super::core::run_tag`]).
+    #[serde(default = "super::core::run_tag")]
+    run: String,
     seq: u64,
     notice_seq: u64,
     /// The files each tool call changes, with their text before it (from its diff content).
@@ -140,6 +143,7 @@ impl Acp {
             cur_agent: None,
             cur_thought: None,
             cur_user: None,
+            run: super::core::run_tag(),
             seq: 0,
             notice_seq: 0,
             befores: HashMap::new(),
@@ -177,7 +181,7 @@ impl Acp {
 
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>) {
         self.notice_seq += 1;
-        core.upsert(&format!("notice-{}", self.notice_seq), None, Body::Notice { level, text: text.into() });
+        core.upsert(&format!("notice-{}-{}", self.run, self.notice_seq), None, Body::Notice { level, text: text.into() });
     }
 
     fn busy(&self, core: &Core) -> bool {
@@ -768,7 +772,7 @@ impl Acp {
                     Some(id) => core.append(&id, &text),
                     None => {
                         self.seq += 1;
-                        let id = format!("acp-{kind}-{}", self.seq);
+                        let id = format!("acp-{kind}-{}-{}", self.run, self.seq);
                         let body = match kind {
                             "agent_message_chunk" => Body::Assistant { text: text.clone(), streaming: true },
                             "agent_thought_chunk" => Body::Thinking { text: text.clone(), streaming: true, redacted: false },
@@ -1105,6 +1109,33 @@ mod tests {
         let w = written(&mut core);
         let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
         assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("and then"), "only the first message carries it");
+        Ok(())
+    }
+
+    /// The harness started again (after a crash, or on another machine after a move) says new
+    /// things under new ids: what it said before stays in the timeline, rather than its first
+    /// answers there taking the ids of the first ones here.
+    #[test]
+    fn a_harness_started_again_keeps_what_was_said_before() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        for (n, answer) in [(1, "the first answer"), (2, "the second answer")] {
+            let mut a = Acp::new(None);
+            a.start(&mut core);
+            feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+            feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": format!("s{n}")}})]);
+            let _ = written(&mut core);
+            a.command(&mut core, Command::Send { id: format!("m{n}"), text: format!("question {n}"), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            let w = written(&mut core);
+            let pid = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).and_then(|p| p.get("id").cloned()).unwrap_or_default();
+            feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": format!("s{n}"), "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": answer}}}})]);
+            feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}})]);
+            a.notice(&mut core, Level::Info, format!("run {n}"));
+        }
+        let answers: Vec<&str> = core.events().filter_map(|e| if let Body::Assistant { text, .. } = &e.body { Some(text.as_str()) } else { None }).collect();
+        assert_eq!(answers, ["the first answer", "the second answer"]);
+        let notices: Vec<&str> = core.events().filter_map(|e| if let Body::Notice { text, .. } = &e.body { Some(text.as_str()) } else { None }).filter(|t| t.starts_with("run ")).collect();
+        assert_eq!(notices, ["run 1", "run 2"]);
         Ok(())
     }
 
