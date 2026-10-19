@@ -51,8 +51,44 @@ fn dns_label(what: &str, s: &str) -> Result<(), Fail> {
     if ok { Ok(()) } else { Err(bad(format!("{what} {s:?}: lowercase letters, digits and '-', at most 63, starting and ending with a letter or digit"))) }
 }
 
+/// Tells every client, and whoever waits on it, that a release moved.
 fn emit_release(d: &Deploy, r: &Release) {
-    d.hub.emit(&json!({ "type": "deploy_release", "release": r }));
+    d.hub.emit(&json!({
+        "type": "deploy",
+        "id": r.id,
+        "app": r.app,
+        "environment": r.environment,
+        "kind": r.kind,
+        "state": r.state,
+        "by": r.requested_by,
+        "release": r,
+    }));
+    d.changes.send(r.id);
+}
+
+/// Who asks for a change: the name the audit, the release and its commit say, and whether it is
+/// an agent, which releases only where the environment lets agents (docs/cd-targets.md D6).
+#[derive(Debug, Clone)]
+pub struct Who {
+    pub name: String,
+    pub agent: bool,
+}
+
+impl Who {
+    pub fn of(caller: &crate::authz::Caller) -> Self {
+        Self { name: caller.name.clone(), agent: caller.kind == crate::authz::gate::Kind::Agent }
+    }
+}
+
+/// Agents change what runs only where the environment lets them.
+fn agents_may(who: &Who, env: &Environment, what: &str) -> Result<(), Fail> {
+    if !who.agent || env.agents.deploy {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        format!("agents may not {what} in {}: the environment doesn't let agents deploy. Ask a person to, or have them allow it (agents: {{ deploy: true }})", env.name),
+    ))
 }
 
 async fn audit(d: &Deploy, actor: &str, action: &str, detail: String) {
@@ -93,8 +129,16 @@ fn note(view: &mut Value, key: &str, v: Value) {
     }
 }
 
-pub async fn put_environment(d: &Deploy, actor: &str, e: Environment) -> Result<Environment, Fail> {
+pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<Environment, Fail> {
+    let actor = who.name.as_str();
     dns_label("environment", &e.name)?;
+    // What agents may do is a person's to say.
+    if who.agent {
+        let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?.map(|b| b.agents).unwrap_or_default();
+        if e.agents != before {
+            return Err((StatusCode::FORBIDDEN, format!("agents may not change what agents may do in {}: a person does", e.name)));
+        }
+    }
     match argo_of(&e) {
         Some(name) => {
             let i = crate::ci::integrations::get(&d.hub, name).await.map_err(internal)?.ok_or_else(|| bad(format!("no integration {name}: add the Argo CD instance in Settings → Integrations first")))?;
@@ -240,8 +284,10 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     Ok(reg)
 }
 
-pub async fn deregister(d: &Deploy, actor: &str, app_name: &str, env_name: &str, keep: bool) -> Result<(), Fail> {
+pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, keep: bool) -> Result<(), Fail> {
+    let actor = who.name.as_str();
     let (a, env) = (app(d, app_name).await?, environment(d, env_name).await?);
+    agents_may(who, &env, "deregister apps")?;
     let reg = registration(d, app_name, env_name).await?;
     if let Some(r) = store::in_flight(&d.hub.store, app_name, env_name).await.map_err(internal)? {
         return Err(conflict(format!("release {} is in flight for {app_name} in {env_name}: wait for it, or cancel it", r.id)));
@@ -318,6 +364,9 @@ pub struct Ask {
     /// Disabling: keep what the app runs, rather than remove it.
     #[serde(default)]
     pub keep: bool,
+    /// Asked for again with the same key, it is the same release (a retry after a timeout).
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -340,10 +389,16 @@ pub async fn candidates(d: &Deploy, app_name: &str, env_name: &str) -> Result<Ve
         .collect())
 }
 
-pub async fn release(d: &Deploy, actor: &str, ask: Ask) -> Result<Release, Fail> {
+pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
+    let actor = who.name.as_str();
     let a = app(d, &ask.app).await?;
     let env = environment(d, &ask.environment).await?;
     let _reg = registration(d, &ask.app, &ask.environment).await?;
+    agents_may(who, &env, "release apps")?;
+    let key = ask.idempotency_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
+    if key.as_ref().is_some_and(|k| k.len() > 255) {
+        return Err(bad("an idempotency key is at most 255 characters"));
+    }
     if a.archived {
         return Err(conflict(format!("{} is archived: no new releases", a.name)));
     }
@@ -369,10 +424,17 @@ pub async fn release(d: &Deploy, actor: &str, ask: Ask) -> Result<Release, Fail>
         rolled_back_by: None,
         keep: ask.keep,
         provider: Value::Null,
+        idempotency_key: key,
         created_at: now,
         committed_at: None,
         ended_at: None,
     };
+    // Asked for before with this key: that release, whatever it has become.
+    if let Some(k) = &r.idempotency_key
+        && let Some(same) = store::release_by_key(&d.hub.store, &a.name, &env.name, k).await.map_err(internal)?
+    {
+        return Ok(same);
+    }
     if let Some(v) = ask.version {
         if v.trim().is_empty() {
             return Err(bad("an empty version"));
@@ -424,7 +486,10 @@ pub async fn release(d: &Deploy, actor: &str, ask: Ask) -> Result<Release, Fail>
             }
         }
     }
-    let r = store::insert_release(&d.hub.store, &r).await.map_err(internal)?;
+    let (r, new) = store::insert_release(&d.hub.store, &r).await.map_err(internal)?;
+    if !new {
+        return Ok(r);
+    }
     store::schedule(&d.hub.store, r.id, now).await.map_err(internal)?;
     d.wake.notify();
     audit(d, actor, "deploy.release", format!("{} {} in {}: release {}", r.kind.as_str(), r.version.as_deref().unwrap_or(""), r.environment, r.id)).await;
@@ -434,11 +499,15 @@ pub async fn release(d: &Deploy, actor: &str, ask: Ask) -> Result<Release, Fail>
 
 /// Stops a release that is waiting, or being delivered. A delivering one is in git already: the
 /// worker reverts its commit, and hands the provider what ran before (docs/deploy-api.md §9).
-pub async fn cancel(d: &Deploy, actor: &str, id: i64) -> Result<Release, Fail> {
+pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Release, Fail> {
+    let actor = who.name.as_str();
     let mut r = store::release(&d.hub.store, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
+    agents_may(who, &environment(d, &r.environment).await?, "cancel releases")?;
     let was = r.state;
     match was {
         State::Waiting | State::Delivering => {}
+        // A retried cancel (with an idempotency key) finds it cancelled already.
+        State::Cancelled if again => return Ok(r),
         State::Committing => return Err(conflict(format!("release {id} is being committed right now: cancel it in a moment, or roll back"))),
         s => return Err(conflict(format!("release {id} is {}: nothing to cancel", s.as_str()))),
     }
@@ -974,11 +1043,12 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     rolled_back_by: None,
                     keep: false,
                     provider: Value::Null,
+                    idempotency_key: None,
                     created_at: now,
                     committed_at: Some(now),
                     ended_at: None,
                 };
-                let r = store::insert_release(st, &r).await?;
+                let (r, _) = store::insert_release(st, &r).await?;
                 if let Err(e) = deliver(d, &r).await {
                     tracing::warn!(release = r.id, error = %e, "deploy: delivering a commit kiln didn't make");
                 }
@@ -989,4 +1059,34 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
         st.kv_set(key, head).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authz::gate::Kind as CallerKind;
+
+    fn env(agents_deploy: bool) -> Environment {
+        Environment {
+            name: "production".into(),
+            provider: KILNCD.into(),
+            release_repo: Default::default(),
+            targets: Default::default(),
+            gates: Value::Null,
+            sync: Default::default(),
+            watch: Default::default(),
+            concurrency: Default::default(),
+            agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
+        }
+    }
+
+    #[test]
+    fn agents_release_only_where_the_environment_lets_them() {
+        let agent = Who::of(&crate::authz::Caller::with(CallerKind::Agent, "agent:fix-it for user:ada", None, None));
+        let person = Who::of(&crate::authz::Caller::with(CallerKind::User, "user:ada", None, None));
+        assert!(agent.agent && !person.agent);
+        assert!(matches!(agents_may(&agent, &env(false), "release apps"), Err((StatusCode::FORBIDDEN, m)) if m.contains("agents: { deploy: true }")));
+        assert!(agents_may(&agent, &env(true), "release apps").is_ok());
+        assert!(agents_may(&person, &env(false), "release apps").is_ok(), "a person releases anywhere the route table lets them");
+    }
 }

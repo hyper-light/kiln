@@ -11,6 +11,9 @@
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
+//!
+//! A release, rollback or cancel asked for with an `Idempotency-Key` header (or
+//! `idempotency_key`) is the same one when asked for again.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +22,7 @@ use http::{Method, StatusCode};
 use hyper::body::Incoming;
 use serde_json::{Value, json};
 
-use super::flow::{self, Ask, Fail, RollbackAsk};
+use super::flow::{self, Ask, Fail, RollbackAsk, Who};
 use super::model::{App, Environment, State};
 use super::{Deploy, argocd, kilncd, store};
 use crate::http::server::{self as srv, Request, Response};
@@ -56,19 +59,21 @@ fn release_id(s: &str) -> Result<i64, Fail> {
 /// Routes `/api/deploy/<rest>`.
 pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
-    let actor = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who { name: "admin".to_owned(), agent: false }, Who::of);
+    let actor = who.name.clone();
+    let key = req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let method = req.method().clone();
     let store = &d.hub.store;
     match (&method, rest) {
         (&Method::GET, ["environments"]) => ok(&json!({ "environments": store::environments(store).await.map_err(internal)? })),
-        (&Method::POST, ["environments"]) => created(&flow::put_environment(&d, &actor, body::<Environment>(req.into_body()).await?).await?),
+        (&Method::POST, ["environments"]) => created(&flow::put_environment(&d, &who, body::<Environment>(req.into_body()).await?).await?),
         (&Method::GET, ["environments", name]) => ok(&store::environment(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {name}")))?),
         (&Method::PUT, ["environments", name]) => {
             let e: Environment = body(req.into_body()).await?;
             if e.name != *name {
                 return Err(bad(format!("the body is environment {}, the path {name}", e.name)));
             }
-            ok(&flow::put_environment(&d, &actor, e).await?)
+            ok(&flow::put_environment(&d, &who, e).await?)
         }
         (&Method::DELETE, ["environments", name]) => {
             flow::delete_environment(&d, &actor, name).await?;
@@ -77,7 +82,7 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
 
         (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
         (&Method::POST, ["apps"]) => created(&flow::put_app(&d, &actor, body::<App>(req.into_body()).await?).await?),
-        (&Method::GET, ["apps", name]) => app_view(&d, name).await,
+        (&Method::GET, ["apps", name]) => ok(&app_json(&d, name).await?),
         (&Method::PUT, ["apps", name]) => {
             let a: App = body(req.into_body()).await?;
             if a.name != *name {
@@ -91,9 +96,9 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
         }
 
         (&Method::POST, ["apps", app, "environments", env]) => created(&flow::register(&d, &actor, app, env).await?),
-        (&Method::GET, ["apps", app, "environments", env]) => registration_view(&d, app, env).await,
+        (&Method::GET, ["apps", app, "environments", env]) => ok(&registration_json(&d, app, env).await?),
         (&Method::DELETE, ["apps", app, "environments", env]) => {
-            flow::deregister(&d, &actor, app, env, q.get("keep").is_some_and(|v| v == "true" || v == "1")).await?;
+            flow::deregister(&d, &who, app, env, q.get("keep").is_some_and(|v| v == "true" || v == "1")).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::POST, ["apps", app, "environments", env, "pause"]) => ok(&flow::pause(&d, &actor, app, env, true).await?),
@@ -108,20 +113,24 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             let query = store::ReleaseQuery { app: q.get("app").cloned(), environment: q.get("environment").cloned(), state, limit: q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50) };
             ok(&json!({ "releases": store::releases(store, query).await.map_err(internal)? }))
         }
-        (&Method::POST, ["releases"]) => created(&flow::release(&d, &actor, body::<Ask>(req.into_body()).await?).await?),
+        (&Method::POST, ["releases"]) => {
+            let mut ask: Ask = body(req.into_body()).await?;
+            ask.idempotency_key = ask.idempotency_key.or(key);
+            created(&flow::release(&d, &who, ask).await?)
+        }
         (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
-        (&Method::POST, ["releases", id, "cancel"]) => ok(&flow::cancel(&d, &actor, release_id(id)?).await?),
+        (&Method::POST, ["releases", id, "cancel"]) => ok(&flow::cancel(&d, &who, release_id(id)?, key.is_some()).await?),
         (&Method::POST, ["releases", id, "rollback"]) => {
             let of = store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?;
             let to: RollbackAsk = body(req.into_body()).await?;
-            created(&flow::release(&d, &actor, Ask { app: of.app, environment: of.environment, rollback: Some(to), ..Ask::default() }).await?)
+            created(&flow::release(&d, &who, Ask { app: of.app, environment: of.environment, rollback: Some(to), idempotency_key: key, ..Ask::default() }).await?)
         }
         _ => Err((StatusCode::NOT_FOUND, "not found".into())),
     }
 }
 
 /// An app, with each environment it's registered in and what runs there.
-async fn app_view(d: &Deploy, name: &str) -> Result<Response, Fail> {
+pub(super) async fn app_json(d: &Deploy, name: &str) -> Result<Value, Fail> {
     let a = store::app(&d.hub.store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
     let regs = store::registrations(&d.hub.store, Some(name), None).await.map_err(internal)?;
     let mut envs = Vec::new();
@@ -132,11 +141,11 @@ async fn app_view(d: &Deploy, name: &str) -> Result<Response, Fail> {
         };
         envs.push(json!({ "registration": reg, "running": running }));
     }
-    ok(&json!({ "app": a, "environments": envs }))
+    Ok(json!({ "app": a, "environments": envs }))
 }
 
 /// A registration: what runs, what's in flight, the latest releases, and what its provider says now.
-async fn registration_view(d: &Deploy, app: &str, env: &str) -> Result<Response, Fail> {
+pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Result<Value, Fail> {
     let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
     let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
     let reg = store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
@@ -162,5 +171,5 @@ async fn registration_view(d: &Deploy, app: &str, env: &str) -> Result<Response,
             json!({ "kind": "kilncd", "app": id, "status": status })
         }
     };
-    ok(&json!({ "registration": reg, "running": running, "in_flight": in_flight, "releases": recent, "provider": provider }))
+    Ok(json!({ "registration": reg, "running": running, "in_flight": in_flight, "releases": recent, "provider": provider }))
 }

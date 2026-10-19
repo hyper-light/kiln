@@ -35,6 +35,21 @@ pub struct Environment {
     /// A release asked for while another is in flight: refused (`reject`) or kept waiting (`queue`).
     #[serde(default)]
     pub concurrency: Concurrency,
+    /// What agents may do here (docs/cd-targets.md D6). Nothing, by default: a person releases.
+    #[serde(default)]
+    pub agents: AgentPolicy,
+}
+
+/// What agents may do in an environment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicy {
+    /// Release apps here: deploy, config, rollback, enable, disable, cancel, deregister.
+    #[serde(default)]
+    pub deploy: bool,
+    /// Answer what waits for an approval here (when gates do).
+    #[serde(default)]
+    pub approve: bool,
 }
 
 fn kilncd() -> String {
@@ -350,6 +365,9 @@ pub struct Release {
     /// What the provider last said about it.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub provider: Value,
+    /// The key it was asked for with: asked for again with it, it is this release again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committed_at: Option<i64>,

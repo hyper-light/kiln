@@ -251,6 +251,7 @@ mod tests {
             rolled_back_by: None,
             keep: false,
             provider: Value::Null,
+            idempotency_key: None,
             created_at: 1_792_356_000,
             committed_at: None,
             ended_at: None,

@@ -225,6 +225,9 @@ enum EnvCmd {
         /// A release asked for while another is in flight waits, rather than being refused.
         #[arg(long)]
         queue: bool,
+        /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
+        #[arg(long)]
+        agents: bool,
     },
     Rm { env: String },
 }
@@ -504,7 +507,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue } => {
+        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents } => {
             let body = json!({
                 "name": env,
                 "provider": provider,
@@ -513,6 +516,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "sync": { "prune": !no_prune, "self_heal": self_heal },
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },
+                "agents": { "deploy": agents },
             });
             let v = api.call(Method::Post, "/environments", Some(body)).await?;
             api.print(&v, |v| println!("environment {} ready", s(v, "name")));

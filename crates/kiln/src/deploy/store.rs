@@ -141,20 +141,36 @@ pub async fn delete_registration(store: &Store, app: &str, env: &str) -> anyhow:
 
 // ------------------------------------------------------------------ releases
 
-/// Records a new release, numbering it; returns it with its id.
-pub async fn insert_release(store: &Store, r: &Release) -> anyhow::Result<Release> {
+/// Records a new release, numbering it; returns it with its id, and `true`. One asked for with an
+/// idempotency key its registration has used already isn't recorded again: that release is
+/// returned, with `false`.
+pub async fn insert_release(store: &Store, r: &Release) -> anyhow::Result<(Release, bool)> {
     let mut r = r.clone();
-    let (app, env, state, created) = (r.app.clone(), r.environment.clone(), r.state.as_str(), r.created_at);
+    let (app, env, state, created, key) = (r.app.clone(), r.environment.clone(), r.state.as_str(), r.created_at, r.idempotency_key.clone());
     let draft = to_json(&r)?;
-    let id: i64 = store
+    let id: Result<i64, i64> = store
         .call(move |c| {
             let tx = c.transaction()?;
-            tx.execute("INSERT INTO deploy_releases (app, environment, state, spec, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![app, env, state, draft, created])?;
+            if let Some(k) = &key {
+                let used: Option<i64> =
+                    tx.query_row("SELECT id FROM deploy_releases WHERE app = ?1 AND environment = ?2 AND idempotency_key = ?3", params![app, env, k], |r| r.get(0)).optional()?;
+                if let Some(id) = used {
+                    return Ok(Err(id));
+                }
+            }
+            tx.execute(
+                "INSERT INTO deploy_releases (app, environment, state, spec, created_at, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![app, env, state, draft, created, key],
+            )?;
             let id = tx.last_insert_rowid();
             tx.commit()?;
-            Ok(id)
+            Ok(Ok(id))
         })
         .await?;
+    let id = match id {
+        Ok(id) => id,
+        Err(used) => return release(store, used).await?.map(|r| (r, false)).ok_or_else(|| anyhow::anyhow!("release {used} vanished")),
+    };
     r.id = id;
     let spec = to_json(&r)?;
     store
@@ -163,7 +179,7 @@ pub async fn insert_release(store: &Store, r: &Release) -> anyhow::Result<Releas
             Ok(())
         })
         .await?;
-    Ok(r)
+    Ok((r, true))
 }
 
 /// Writes a release back if its state is still `expected` (another server, or a cancel, may have
@@ -171,6 +187,15 @@ pub async fn insert_release(store: &Store, r: &Release) -> anyhow::Result<Releas
 pub async fn update_release(store: &Store, r: &Release, expected: State) -> anyhow::Result<bool> {
     let (id, state, spec, expected) = (r.id, r.state.as_str(), to_json(r)?, expected.as_str());
     store.call(move |c| Ok(c.execute("UPDATE deploy_releases SET state = ?2, spec = ?3 WHERE id = ?1 AND state = ?4", params![id, state, spec, expected])? > 0)).await
+}
+
+/// The release a registration was asked for with `key`, if it was.
+pub async fn release_by_key(store: &Store, app: &str, env: &str, key: &str) -> anyhow::Result<Option<Release>> {
+    let (app, env, key) = (app.to_owned(), env.to_owned(), key.to_owned());
+    let spec: Option<String> = store
+        .call(move |c| Ok(c.query_row("SELECT spec FROM deploy_releases WHERE app = ?1 AND environment = ?2 AND idempotency_key = ?3", params![app, env, key], |r| r.get(0)).optional()?))
+        .await?;
+    spec.as_deref().map(from_json).transpose()
 }
 
 pub async fn release(store: &Store, id: i64) -> anyhow::Result<Option<Release>> {

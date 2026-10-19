@@ -192,6 +192,7 @@ production:
   sync: { auto: true, prune: true, self_heal: true }
   watch: { timeout: 15m, settle: 30s, refused: 60s }
   concurrency: queue                  # a second release waits; or reject
+  agents: { deploy: false, approve: false }   # what agents may do here (cd-targets.md D6)
   notify: { chat: ["#deploys"], webhooks: [] }
 ```
 
@@ -201,6 +202,9 @@ production:
   in that Argo CD.
 - `via: pull-request` makes every release in the environment a pull request (a merge request on
   GitLab) on the release repository: the approval is the merge, made on the git host.
+- `agents` says what agents may do there: release (`deploy`: every kind of release, a cancel, a
+  deregistration) and answer approvals (`approve`). Neither by default; elsewhere an agent's change
+  is refused (`403`) and a person makes it. Only a person changes `agents`.
 
 ## 5. Registrations
 
@@ -392,7 +396,8 @@ kiln deployed through its own tracking annotation. Nothing is recreated either w
    there refuses the release (`422`, with the newest versions it has); one kiln can't ask lets it
    through, and the provider has the last word.
 2. **Concurrency.** One release in flight per registration. Another waits in line or is refused
-   (`409`), as the environment says. An `Idempotency-Key` returns the same release to a retried call.
+   (`409`), as the environment says. An `Idempotency-Key` (header, or `idempotency_key`) returns the
+   same release to a retried call, whatever it has become; a retried cancel finds it cancelled.
 3. **Gates** (§9.1). A release waiting on one is `waiting`, and says what for.
 4. **Record.** The release, with every gate's result, is written to KilnDB (`committing`).
 5. **Commit.** `release.json` (and `values.yaml` for a config release) on the environment's release
@@ -504,9 +509,21 @@ until the two become one.
   the deploy dialog, the rollback picker, an approvals inbox that works on a phone.
 - **Chat**: Slack first. Commands for the calls above, and a message per release that updates in
   place as it moves (txst's deployment messages), in the registration's channels.
-- **MCP**: one operation per call (`deploy.release`, `deploy.rollback`, `app.create`, …) in kiln's
-  code mode, with skills for a first deploy, a promotion and a rollback. Agents release only where
-  the environment lets them (cd-targets.md D6).
+- **MCP**: one operation per call, in kiln's registry of operations (ci.md W20): MCP tools
+  (`deploy_releases_create`) and code mode's `kiln.deploy.*`. Each is one of `/api/deploy`'s routes,
+  judged by the route table as that route is, and audited as it is:
+
+  | Operation | |
+  | --- | --- |
+  | `deploy.environments.list`, `.get`, `.put` | environments |
+  | `deploy.apps.list`, `.get`, `.put` | apps |
+  | `deploy.registrations.get`, `.create`, `.delete`, `.pause`, `.resume`, `.candidates` | registrations: what runs, register, deregister, the provider's automation, what a rollback can go to |
+  | `deploy.releases.list`, `.get`, `.create`, `.rollback`, `.cancel` | releases; `create` and `rollback` take an `idempotency_key` |
+  | `deploy.releases.wait` | until a release is done, or moves at all (`until: any`), for up to 600 s: no polling |
+
+  Every release moving is the event `{"type": "deploy", id, app, environment, kind, state, by,
+  release}`. Agents release only where the environment lets them (§4), with skills for a first
+  deploy, a promotion and a rollback to come.
 
 ## 13. What runs where, as one page
 
@@ -647,4 +664,5 @@ deployments, and aren't carried over.
 | Validation and refusals, on both providers | built: a chart version (OCI or Helm repository) or git ref that isn't there is refused before its record (`422`, with the newest versions); a release its provider refuses for `watch.refused` fails and its commit is reverted, as is one cancelled while delivering or never delivered. On live clusters: a missing version refused at once on each provider; values that break a chart (Argo CD) and a chart that won't render (KilnCD) each failed after the grace, reverted to a tree identical to the release before, the provider back on it; a cancel mid-delivery reverted and Argo CD rolled back |
 | P2: Argo CD instances as integrations (kind `argocd`: URL, namespace, CA, an account's token sealed), verified by their version and rights; an environment's provider `argocd/<integration>`; each registration one Application written through Argo CD's API (the package at the release's version, the environment's values inline, `kiln.release` as a Helm parameter), refreshed hard, followed to landed by the release it compared; pause and resume; disable (with `keep`), enable, deregister; status per provider | built. On a real Argo CD (v3.5.4, its own minikube profile): a deploy, a second version, a rollback and a config release each landed with the release they carried; pause turned the Application's automated sync off and resume back on; a disable with `keep` deleted the Application and left its objects, which the next enable adopted; a full disable removed both; a server killed mid-release finished it after its restart with one commit; deregistering removed the Application, its objects and the registration's files |
 | P2: ApplicationSets over the release repository, AppProjects, the repository registered for reading, diff, manifests, resources, logs, actions, the stream rather than polling; moving an environment between providers | not yet: ApplicationSets wait on release repositories being served (W14) |
+| The `deploy.*` operations (P8's MCP half, early, for agents: §12.3), the environment's `agents` policy, idempotency keys, the `deploy` event | built. Over MCP on the test server: a release with a key asked for twice was one release; `deploy.releases.wait` answered as it moved and when it landed; a missing version refused; a rollback with its key landed |
 | P3 to P8 | not yet |

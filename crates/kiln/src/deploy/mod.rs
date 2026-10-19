@@ -10,7 +10,8 @@
 //! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD; [`provider`]: what they answer.
 //! - [`check`]: what a release is checked for before it is recorded.
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
-//! - [`api`], [`cli`]: `/api/deploy` and `kiln deploy`, `kiln app`, `kiln env`.
+//! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
+//!   operations agents reach through MCP and code mode.
 
 pub mod api;
 pub mod argocd;
@@ -20,6 +21,7 @@ pub mod flow;
 pub mod host;
 pub mod kilncd;
 pub mod model;
+pub mod ops;
 pub mod provider;
 pub mod repo;
 pub mod store;
@@ -39,6 +41,8 @@ pub struct Deploy {
     pub owner: String,
     /// A release asked for, or moved: the worker looks at once rather than at its next tick.
     pub wake: crate::rt::Notify,
+    /// Each release that moved, by id, for whoever waits on one.
+    pub changes: crate::rt::Broadcast<i64>,
 }
 
 static DEPLOY: RwLock<Option<Arc<Deploy>>> = RwLock::new(None);
@@ -50,7 +54,13 @@ pub fn get() -> Option<Arc<Deploy>> {
 
 /// Runs the service until the server shuts down: the worker that follows releases.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let d = Arc::new(Deploy { hosted: host::Hosted::new(&hub.cfg.server.data_dir), owner: format!("server-{}", crate::util::new_id()), wake: crate::rt::Notify::new(), hub: Arc::clone(&hub) });
+    let d = Arc::new(Deploy {
+        hosted: host::Hosted::new(&hub.cfg.server.data_dir),
+        owner: format!("server-{}", crate::util::new_id()),
+        wake: crate::rt::Notify::new(),
+        changes: crate::rt::Broadcast::new(256),
+        hub: Arc::clone(&hub),
+    });
     *DEPLOY.write() = Some(Arc::clone(&d));
     let result = flow::work(&d).await;
     *DEPLOY.write() = None;

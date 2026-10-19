@@ -169,6 +169,7 @@ mod tests {
             sync: Default::default(),
             watch: Default::default(),
             concurrency: Default::default(),
+            agents: Default::default(),
         }
     }
 
