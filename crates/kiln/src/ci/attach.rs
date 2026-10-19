@@ -388,7 +388,7 @@ pub fn parse_file(repo: &str, file: &str, text: &str) -> (Vec<Attachment>, Vec<S
             workflows: e.attach.pipelines.into_iter().chain(e.attach.workflows).collect(),
             environments: e.attach.environments,
             source: Some(format!("{repo}:{file}")),
-            harness: e.session.is_none().then(|| Harness { kind, on: e.machine, cwd: e.cwd, model: e.model, effort: e.effort, mode: e.mode }),
+            harness: e.session.is_none().then_some(Harness { kind, on: e.machine, cwd: e.cwd, model: e.model, effort: e.effort, mode: e.mode }),
             session: e.session,
             wake,
             schedule,
@@ -728,7 +728,7 @@ async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trigger {
     if jobs.len() > JOBS {
         detail.push_str(&format!("\n…and {} more failed jobs.", jobs.len() - JOBS));
     }
-    if let Some((n, sha)) = last_green(hub, v, &workflow, &branch).await {
+    if let Some((n, sha)) = last_green(hub, v, &workflow, &branch, &run).await {
         detail.push_str(&format!("\n\nThe last green run of it on {branch} was #{n}, at commit {}: what changed since is between that commit and this one.", sha.get(..12).unwrap_or(&sha)));
     }
     let title = if first_error.is_empty() { format!("{name} failed on {branch}") } else { format!("{name} failed on {branch}: {}", first_error.chars().take(140).collect::<String>()) };
@@ -743,15 +743,18 @@ async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trigger {
 }
 
 /// The last green run of `workflow` on `branch` in the event's repository: its number and commit.
-async fn last_green(hub: &Hub, v: &Value, workflow: &str, branch: &str) -> Option<(i64, String)> {
+async fn last_green(hub: &Hub, v: &Value, workflow: &str, branch: &str, run: &str) -> Option<(i64, String)> {
     let repo_id = s(v, "/repo/id")?.to_owned();
-    let (wf, br) = (workflow.to_owned(), branch.to_owned());
+    let (wf, br, run) = (workflow.to_owned(), branch.to_owned(), run.to_owned());
     hub.store
         .call(move |c| {
             use rusqlite::OptionalExtension as _;
+            // Green before the failing run was made (a later push that already fixed it isn't
+            // "the last green"), newest made first; a run green on a rerun counts.
             Ok(c.query_row(
-                "SELECT number, sha FROM runs WHERE repo_id = ?1 AND COALESCE(workflow_id, '') = ?2 AND branch = ?3 AND conclusion = 'success' ORDER BY finished_at DESC LIMIT 1",
-                rusqlite::params![repo_id, wf, br],
+                "SELECT number, sha FROM runs WHERE repo_id = ?1 AND COALESCE(workflow_id, '') = ?2 AND branch = ?3 AND conclusion = 'success'
+                 AND created_at < (SELECT created_at FROM runs WHERE id = ?4) ORDER BY created_at DESC LIMIT 1",
+                rusqlite::params![repo_id, wf, br, run],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
@@ -1149,8 +1152,13 @@ async fn stuck(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT j.id, j.display, j.labels, r.id, p.name, COALESCE(r.workflow_id, ''), r.number, j.queued_at FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
-                 WHERE j.status = 'queued' AND j.queued_at IS NOT NULL AND j.queued_at < ?1 ORDER BY j.queued_at LIMIT 50",
+                // Waiting for a runner, not held by the dispatcher (an approval, a window, a wait
+                // timer, a concurrency group, a retry's backoff, a quota): timed from the start of
+                // its current wait.
+                "SELECT j.id, j.display, j.labels, r.id, p.name, COALESCE(r.workflow_id, ''), r.number, COALESCE(j.wait_since, j.queued_at) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
+                 WHERE j.status = 'queued' AND COALESCE(j.wait_since, j.queued_at) < ?1
+                   AND (j.wait_reason IS NULL OR json_extract(j.wait_reason, '$.reason') IN ('capacity', 'no-runner', 'unroutable', 'capability', 'scaling', 'reservation'))
+                 ORDER BY COALESCE(j.wait_since, j.queued_at) LIMIT 50",
             )?;
             let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -1685,6 +1693,41 @@ mod end_to_end {
             crate::rt::sleep(Duration::from_millis(25)).await;
         }
         anyhow::bail!("no incident {what}: {:?}", incidents(hub).await.iter().map(|i| (&i.name, &i.title, &i.state, &i.why)).collect::<Vec<_>>())
+    }
+
+    /// `stuck` is waiting for a runner, timed from the start of the current wait; what the
+    /// dispatcher holds on purpose (an approval, a window, a concurrency group) isn't.
+    #[test]
+    fn w20_r08_stuck_is_waiting_for_a_runner_not_held() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo = crate::store::Repo { id: "r1".into(), name: "acme/app".into(), clone_url: "https://example.com/acme/app.git".into(), branches: Vec::new(), poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None };
+            let repo_id = hub.store.upsert_repo(repo).await?.id;
+            let now = crate::util::now_unix();
+            hub.store
+                .call(move |c| {
+                    c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run1', ?1, 7, 'ci', 'push', 'main', 'abc', 'running', ?2)", rusqlite::params![repo_id, now - 7200])?;
+                    let legs: [(&str, i64, Option<i64>, Option<&str>); 4] = [
+                        ("no-runner-yet", now - 1800, None, None),
+                        ("awaiting-approval", now - 1800, None, Some(r#"{"reason":"approval","environment":"production"}"#)),
+                        ("just-requeued", now - 3600, Some(now - 120), Some(r#"{"reason":"capacity"}"#)),
+                        ("full-pool", now - 3600, Some(now - 1800), Some(r#"{"reason":"capacity"}"#)),
+                    ];
+                    for (leg, queued, since, reason) in legs {
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, wait_since, wait_reason) VALUES (?1, 'run1', ?1, ?1, 'queued', '[\"gpu\"]', '[]', '{}', ?2, ?3, ?4)",
+                            rusqlite::params![leg, queued, since, reason],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            let a = super::Attachment { wake: vec!["stuck".into()], limits: super::Limits { stuck_minutes: 15, ..super::Limits::default() }, ..super::Attachment::default() };
+            let mut found: Vec<String> = super::stuck(&hub, &[a]).await.into_iter().filter_map(|t| t.seen.what.split(", ").nth(1).map(str::to_owned)).collect();
+            found.sort();
+            anyhow::ensure!(found == ["full-pool", "no-runner-yet"], "{found:?}");
+            Ok(())
+        })
     }
 
     fn failed(n: i64, workflow: &str) -> Value {
