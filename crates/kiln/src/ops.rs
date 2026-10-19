@@ -1,6 +1,6 @@
-//! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]) and CI's
-//! ([`crate::ci::ops`]), each with its name, summary, input schema and whether it changes
-//! anything. The MCP tools and code mode's `kiln.*` are this list. Each operation is checked
+//! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]), releases by
+//! API ([`crate::deploy::ops`]) and CI's ([`crate::ci::ops`]), each with its name, summary, input
+//! schema and whether it changes anything. The MCP tools and code mode's `kiln.*` are this list. Each operation is checked
 //! against the route table as its HTTP route is, so a caller may do through them exactly what it
 //! may do over HTTP.
 
@@ -39,11 +39,12 @@ pub fn all(hub: &Hub) -> Vec<Info> {
     listed(hub.cfg.cd.enabled)
 }
 
-/// CI's operations, and deployments' with `cd`.
+/// CI's operations, and deployments' and releases' with `cd`.
 pub fn listed(cd: bool) -> Vec<Info> {
     let mut out: Vec<Info> = Vec::new();
     if cd {
         out.extend(crate::cd::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
+        out.extend(crate::deploy::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     }
     out.extend(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     out
@@ -54,6 +55,9 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = if input.is_null() { json!({}) } else { input };
     if name.starts_with("ci.") {
         return crate::ci::ops::call(cx, name, input).await;
+    }
+    if name.starts_with("deploy.") {
+        return crate::deploy::ops::call(cx, name, input).await;
     }
     let op = crate::cd::ops::ops().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
     // Deployments' routes: reading needs runs.read, the rest environments.deploy.

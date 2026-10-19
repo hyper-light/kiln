@@ -15,12 +15,12 @@ import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 
-interface Places {
+export interface Places {
   byTarget: Record<string, KindInfo[]>;
   runners: ReachRunner[];
 }
 
-const askPlaces = (signal: AbortSignal): Promise<Places> =>
+export const askPlaces = (signal: AbortSignal): Promise<Places> =>
   Promise.all([
     harnessApi.kindsAll().catch((): Record<string, KindInfo[]> => ({})),
     api.reachRunners(signal).then(

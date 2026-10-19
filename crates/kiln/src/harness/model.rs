@@ -1057,6 +1057,10 @@ pub struct State {
     /// conversation at a time (the server sees to it, `harness::elsewhere`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub move_on_limit: bool,
+    /// Where it goes on then, if a person said (`MovePlan`). Always sent, so a viewer knows its
+    /// runner takes one.
+    #[serde(default)]
+    pub move_plan: MovePlan,
     /// Windows a person resumed it in past its stop point (their `Limit::id`, and when they start
     /// over): the stop point leaves them be until then (`pause::waive_stop_point`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1068,6 +1072,34 @@ pub struct State {
     /// something.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub kept: u32,
+}
+
+/// Where an agent goes on at a usage limit, when it does (`State::move_on_limit`), as a person
+/// chose: a machine, and a harness and model there. What isn't said is left to kiln: whichever
+/// machine has room, in its own harness or one its conversation can be carried into
+/// (`harness::elsewhere`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovePlan {
+    /// The machine, `agent:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The harness it goes on in there (none: its own, or one it can be carried into).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The model, in that harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl MovePlan {
+    pub fn is_empty(&self) -> bool {
+        self.to.is_none() && self.kind.is_none() && self.model.is_none()
+    }
+
+    /// The machine it names, without `agent:`.
+    pub fn machine(&self) -> Option<&str> {
+        self.to.as_deref().map(|t| t.strip_prefix("agent:").unwrap_or(t))
+    }
 }
 
 /// How a turn ended (`Core::end_turn`): enough for kiln to tell a turn that's done from one that
@@ -1417,9 +1449,16 @@ pub enum Command {
         #[serde(default)]
         percent: Option<u8>,
     },
-    /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`).
+    /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`),
+    /// and where (`State::move_plan`): a machine (`agent:<name>`), a harness and a model there.
     MoveOnLimit {
         on: bool,
+        #[serde(default)]
+        to: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Another session on the same account reached a usage limit: wait for its reset too (the
     /// server sends it).

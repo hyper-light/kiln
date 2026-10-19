@@ -116,6 +116,10 @@ enum Cmd {
     Reach(kiln::reach::cli::ReachArgs),
     /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
     Cd(kiln::cd::cli::CdArgs),
+    /// Deploy an app by API: `kiln deploy web 1.4.2 --to staging`, rollbacks, history, status.
+    Deploy(kiln::deploy::cli::DeployArgs),
+    /// Apps deployed by API: create, register in environments, pause, deregister.
+    App(kiln::deploy::cli::AppArgs),
     /// CI secrets: set, list (names only), delete, import a dotenv file, rotate the data key.
     Secrets(kiln::ci::cli::SecretsArgs),
     /// CI variables (the `vars` context): set, list, delete.
@@ -681,6 +685,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             kiln::cd::cli::run(a, &cfg).await
+        }
+        Cmd::Deploy(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            kiln::deploy::cli::deploy(a, &cfg).await
+        }
+        Cmd::App(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            kiln::deploy::cli::app(a, &cfg).await
         }
         Cmd::Secrets(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

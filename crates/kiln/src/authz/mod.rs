@@ -390,6 +390,14 @@ pub static ROUTES: &[Rule] = &[
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),
+    // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
+    // registrations are their management.
+    r("GET", "/api/deploy/**", "runs.read", At::Server),
+    r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
+    r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
+    r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
+    any("/api/deploy/**", "environments.manage", At::Server),
     // Runners and machines.
     r("GET", "/api/agents", "runners.read", At::Server),
     r("GET", "/api/reach/runners", "runners.read", At::Server),

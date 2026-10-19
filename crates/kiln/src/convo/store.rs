@@ -123,6 +123,9 @@ pub struct Took {
     pub applied: usize,
     /// Rows of a session's former writer (a lower epoch than the one it has), left out.
     pub fenced: usize,
+    /// Rows of a copy ([`Engine::take_copy`]) of sessions this store has from elsewhere, or of
+    /// what the copy dropped, left out.
+    pub left: usize,
     /// The batch didn't follow what it had (`rev` says what it has): nothing was taken.
     pub gap: bool,
 }
@@ -157,6 +160,18 @@ pub trait Engine: Send + 'static {
     /// Compress the next `limit` record lines kept before lines were compressed, if any are left:
     /// whether more are.
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool>;
+    /// Take a batch of a mirror's copy of this store, sent back to restore it (it follows number
+    /// `from` of the copy): the sessions it brings that this store has nothing of come back as
+    /// they were, where their rows say they run; a session this store has anything of from
+    /// elsewhere (its machine's own feed) keeps what it has, and takes the session over if it
+    /// comes while the copy is being taken.
+    fn take_copy(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took>;
+    /// A copy has been taken whole: how many sessions it brought back.
+    fn end_copy(&mut self) -> anyhow::Result<usize>;
+    /// Whether the store holds no session at all (made just now, or lost and made again).
+    fn is_empty(&mut self) -> anyhow::Result<bool>;
+    /// The last number the store gave a write.
+    fn top(&mut self) -> u64;
     /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
     /// how many went (0: none are left). Their events stay.
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
@@ -279,6 +294,34 @@ impl Store {
             }
             Ok(took)
         })
+    }
+
+    /// Take a batch of a mirror's copy of this store ([`Engine::take_copy`]). Blocking.
+    pub fn take_copy(&self, peer: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
+        let p = peer.to_owned();
+        let w = self.watchers.clone();
+        self.run(move |e| {
+            let took = e.take_copy(&p, from, &batch)?;
+            if took.applied > 0 {
+                notify(&w);
+            }
+            Ok(took)
+        })
+    }
+
+    /// A copy has been taken whole: how many sessions it brought back. Blocking.
+    pub fn end_copy(&self) -> anyhow::Result<usize> {
+        self.run(|e| e.end_copy())
+    }
+
+    /// Whether the store holds no session at all. Blocking.
+    pub fn is_empty(&self) -> anyhow::Result<bool> {
+        self.run(|e| e.is_empty())
+    }
+
+    /// The last number the store gave a write. Blocking.
+    pub fn top(&self) -> anyhow::Result<u64> {
+        self.run(|e| Ok(e.top()))
     }
 
     /// Through where this store has `peer`'s feed. Blocking.
