@@ -178,7 +178,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         return match (&method, s.as_slice()) {
             (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => Ok(page_font(name)),
             (&Method::GET | &Method::HEAD, ["v", id, ..]) => page(&hub, id, &req).await,
-            _ => Err(err(StatusCode::NOT_FOUND, "not found")),
+            // An agent's app opened on a person's device (`crate::harness::opened`): its link's
+            // code, then whatever its device asks of it.
+            (&Method::GET, ["o", code]) => Ok(crate::harness::opened::enter(&hub, code)),
+            _ => match crate::harness::opened::of_request(&hub, &req) {
+                crate::harness::opened::Holds::Open(o) => Ok(crate::harness::opened::forward(&hub, &o, req).await),
+                crate::harness::opened::Holds::Ended => Ok(crate::harness::opened::ended()),
+                crate::harness::opened::Holds::Nothing => Err(err(StatusCode::NOT_FOUND, "not found")),
+            },
         };
     }
 
@@ -601,6 +608,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             stream_open(&hub, &id, req).await
         }
         (&Method::GET, ["api", "harness", "sessions", id, "streams", sid, "ws"]) => stream_ws(hub.clone(), id, sid, req),
+        // Its apps opened on people's own devices (`crate::harness::opened`): theirs alone.
+        (&Method::POST, ["api", "harness", "sessions", id, "opened"]) => {
+            let id = (*id).to_owned();
+            open_on_device(&hub, &id, req).await
+        }
+        (&Method::GET, ["api", "harness", "sessions", id, "opened"]) => Ok(srv::json(StatusCode::OK, &hub.harness.opened.of(id, person(&req).as_deref()))),
+        (&Method::DELETE, ["api", "harness", "sessions", id, "opened", oid]) => {
+            if hub.harness.opened.end(id, oid, person(&req).as_deref()) {
+                hub.store.audit("admin".into(), "agent.opened.end".into(), format!("{id}: {oid}")).await;
+                Ok(srv::status(StatusCode::NO_CONTENT))
+            } else {
+                Err(err(StatusCode::NOT_FOUND, "no such opening"))
+            }
+        }
         (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => preview_look(&hub, id, "look").await,
         (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => preview_look(&hub, id, "stop").await,
         (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
@@ -3515,6 +3536,37 @@ async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     let kind = profile.split(':').next().unwrap_or("conversation");
     hub.store.audit("admin".into(), "agent.stream.open".into(), format!("{id}: {} ({kind} profile)", live.spec.get("url").and_then(serde_json::Value::as_str).unwrap_or(""))).await;
     Ok(srv::json(StatusCode::CREATED, &live.view()))
+}
+
+/// `POST /api/harness/sessions/:id/opened` with `{port, path}`: the app on that port of the
+/// session's machine, opened on the person's own devices: a link at pages' own site, good once for
+/// ten minutes (`crate::harness::opened`). Only with `[server] pages_url`: kiln never serves an app
+/// from its own address, where it would have the person's kiln session.
+async fn open_on_device(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    let Some(site) = hub.cfg.server.pages_url.as_deref().map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| !u.is_empty()) else {
+        return Err(err(StatusCode::CONFLICT, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md). kiln never serves an app from its own address, where the app would have your kiln session"));
+    };
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "owner".to_owned(), |c| c.name.clone());
+    let me = person(&req);
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let port = b.get("port").and_then(serde_json::Value::as_u64).and_then(|p| u16::try_from(p).ok()).filter(|p| *p > 0).ok_or_else(|| err(StatusCode::BAD_REQUEST, "which port? (`port`)"))?;
+    let path = b.get("path").and_then(serde_json::Value::as_str).unwrap_or("/");
+    let machine = match hub.harness.location(id) {
+        Some(crate::harness::registry::Location::Machine(m)) => m,
+        Some(crate::harness::registry::Location::Local) => return Err(err(StatusCode::CONFLICT, "apps open on devices from runners: this session runs on the server itself")),
+        None => return Err(err(StatusCode::NOT_FOUND, "no such agent session")),
+    };
+    let caps = hub.routed_caps(&machine, &crate::proto::ServerMsg::PortOpen { conn: 0, session: id.to_owned(), port }).await;
+    if caps & crate::proto::CAP_PORTS == 0 {
+        return Err(err(StatusCode::CONFLICT, format!("{machine} runs a kiln too old to open its ports: upgrade its runner")));
+    }
+    let (o, code) = hub.harness.opened.create(id, port, path, &by, me);
+    hub.store.audit("admin".into(), "agent.opened.create".into(), format!("{id}: port {port}")).await;
+    let mut v = serde_json::to_value(&o).unwrap_or_default();
+    if let Some(m) = v.as_object_mut() {
+        m.insert("url".into(), serde_json::json!(format!("{site}/o/{code}")));
+    }
+    Ok(srv::json(StatusCode::CREATED, &v))
 }
 
 /// `GET /api/harness/sessions/:id/preview`: what a person may open live from the session (the

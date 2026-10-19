@@ -215,8 +215,8 @@ pub fn limits(server: bool) -> Limits {
         },
         streams_per_connection: 64,
         exchanges: if server { 4096 } else { 256 },
-        // Eight lanes kiln has always had, and `proto::LANE_STREAM` past them (a peer opens it only
-        // when the other side announced it takes it).
+        // Eight lanes kiln has always had, and `proto::LANE_STREAM` and `proto::LANE_PORTS` past
+        // them (a peer opens one only when the other side announced it takes it).
         lanes_per_peer: 16,
         lane_window: 1024,
         max_head: 64 << 10,

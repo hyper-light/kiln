@@ -824,6 +824,19 @@ export interface StreamView {
   said: { opened?: unknown; navigated?: { url?: string }; loaded?: { title?: string } };
 }
 
+/** An agent's app opened on this person's own devices (`crate::harness::opened`): `url` (when
+ *  just opened) its link, good once for ten minutes. */
+export interface Opened {
+  id: string;
+  session: string;
+  port: number;
+  path: string;
+  by: string;
+  at: number;
+  until: number;
+  url?: string;
+}
+
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
   /** What a person may open live from it: the ports its machine serves (its agent's first), its project's app. */
@@ -836,6 +849,11 @@ export const harnessApi = {
   openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
     call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
+  /** Open the app on a port of its machine on this person's own device: a link to follow there. */
+  openOnDevice: (id: string, body: { port: number; path?: string }) => call<Opened>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/opened`, body),
+  /** This person's apps of it open on their devices. */
+  opened: (id: string) => call<Opened[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/opened`),
+  endOpened: (id: string, opened: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/opened/${opened}`),
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),

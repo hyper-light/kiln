@@ -35,6 +35,11 @@ pub const LANE_FILES: u32 = 7;
 /// the feed. Past the first eight lanes: a peer allows sixteen (`crate::net::limits`); only runners
 /// announcing [`CAP_STREAM`] open it, and only to a server that asked them to stream.
 pub const LANE_STREAM: u32 = 8;
+/// Ports of agents' machines opened through the server for people's own devices
+/// (`crate::browser::ports`, `crate::harness::opened`): the bytes of each connection both ways.
+/// A lane of its own, so a page's files never wait behind a stream's picture or a terminal; only to
+/// runners announcing [`CAP_PORTS`].
+pub const LANE_PORTS: u32 = 9;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -159,6 +164,16 @@ pub enum AgentMsg {
     /// What stream `stream` says (JSON: opened, navigated, loaded, focus, dialog, closed, error), on
     /// [`LANE_STREAM`]. Appended last: postcard encodes variants by index.
     StreamEvent { stream: String, json: String },
+    /// Connection `conn` reached its port, or why not (`error`). On [`LANE_PORTS`].
+    PortOpened { conn: u64, error: Option<String> },
+    /// Bytes from connection `conn`'s port: at most `crate::browser::ports::WINDOW` the server
+    /// hasn't acknowledged ([`ServerMsg::PortAck`]).
+    PortData { conn: u64, data: Vec<u8> },
+    /// The runner took `bytes` more of what the server sent connection `conn`.
+    PortAck { conn: u64, bytes: u64 },
+    /// Connection `conn`'s port ended it (or it failed: `error`). Appended last: postcard encodes
+    /// variants by index.
+    PortClose { conn: u64, error: Option<String> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -235,6 +250,9 @@ pub const CAP_STREAM: u32 = 1 << 23;
 /// [`AgentMsg::Build`] capability: the runner says what a person may open live from its sessions
 /// and starts their projects' apps ([`ServerMsg::Preview`], `crate::browser::apps`).
 pub const CAP_PREVIEW: u32 = 1 << 24;
+/// [`AgentMsg::Build`] capability: the runner connects the server to ports its machine's processes
+/// listen on ([`ServerMsg::PortOpen`], on [`LANE_PORTS`], `crate::browser::ports`).
+pub const CAP_PORTS: u32 = 1 << 25;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -427,6 +445,17 @@ pub enum ServerMsg {
     /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_PREVIEW`]. Appended last: postcard
     /// encodes variants by index.
     Preview { req: u64, session: String, json: String },
+    /// Connect connection `conn` to port `port` on agent session `session`'s machine (on loopback,
+    /// a port its processes listen on: `crate::browser::ports`); answered by
+    /// [`AgentMsg::PortOpened`]. Only to runners announcing [`CAP_PORTS`], on [`LANE_PORTS`].
+    PortOpen { conn: u64, session: String, port: u16 },
+    /// Bytes for connection `conn`'s port.
+    PortData { conn: u64, session: String, data: Vec<u8> },
+    /// The server took `bytes` more of what connection `conn`'s runner sent: it may send that many
+    /// more (`crate::browser::ports::WINDOW`).
+    PortAck { conn: u64, session: String, bytes: u64 },
+    /// Connection `conn` is done with. Appended last: postcard encodes variants by index.
+    PortClose { conn: u64, session: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -645,6 +674,37 @@ mod tests {
         assert!(CAP_FILES.is_power_of_two() && CAP_FILES & taken == 0, "CAP_FILES is a bit of its own");
         let lanes = [LANE_CONTROL, LANE_TERM, LANE_LOGS, LANE_SYNC, LANE_REACH, 5, LANE_CONVO];
         assert!(LANE_FILES < 8 && !lanes.contains(&LANE_FILES), "a lane of its own, within the eight a peer has");
+        Ok(())
+    }
+
+    #[test]
+    fn ports_are_appended_after_previews() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Preview { req: 3, session: "s".into(), json: "{}".into() })?;
+        let server = [
+            ServerMsg::PortOpen { conn: 1, session: "s".into(), port: 5173 },
+            ServerMsg::PortData { conn: 1, session: "s".into(), data: b"GET / HTTP/1.1\r\n".to_vec() },
+            ServerMsg::PortAck { conn: 1, session: "s".into(), bytes: 65536 },
+            ServerMsg::PortClose { conn: 1, session: "s".into() },
+        ];
+        for (i, m) in server.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::StreamEvent { stream: "v".into(), json: "{}".into() })?;
+        let agent = [
+            AgentMsg::PortOpened { conn: 1, error: None },
+            AgentMsg::PortData { conn: 1, data: b"HTTP/1.1 200 OK\r\n".to_vec() },
+            AgentMsg::PortAck { conn: 1, bytes: 9 },
+            AgentMsg::PortClose { conn: 1, error: Some("reset".into()) },
+        ];
+        for (i, m) in agent.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1 + u8::try_from(i).unwrap_or(0)), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        assert!(CAP_PORTS.is_power_of_two() && CAP_PORTS > CAP_PREVIEW);
+        assert!(LANE_PORTS == LANE_STREAM + 1 && LANE_PORTS < crate::net::limits(true).lanes_per_peer, "a lane of its own, within what a peer allows");
         Ok(())
     }
 

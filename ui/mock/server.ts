@@ -1278,6 +1278,9 @@ const server = http.createServer(async (req, res) => {
       if (live[2] === "streams" && m === "GET") return json(res, 200, []);
       if (live[2] === "streams" && m === "POST") return err(res, 409, "the mock doesn't stream pages: run a kiln server and a runner for live pages");
     }
+    const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
+    if (opened && m === "GET") return json(res, 200, []);
+    if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

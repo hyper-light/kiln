@@ -2,11 +2,12 @@
  * Live pages you open yourself, in an agent's Tools tab (docs/previews.md, "Opening a page"): what
  * its machine is serving (its agent's servers first), the project's app (its `.kiln/preview.yaml`:
  * started for you), or any address, streamed live from the agent's machine in the browser profile
- * you pick. The ones you open are here, live; the agent's own are in the conversation.
+ * you pick. The ones you open are here, live; the agent's own are in the conversation. A port of
+ * its machine also opens on the person's own device, in its own browser (`crate::harness::opened`).
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
-import { harnessApi, type Listening, type PreviewLook, type StreamView } from "@/api/harness";
+import { harnessApi, type Listening, type Opened, type PreviewLook, type StreamView } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
@@ -71,6 +72,17 @@ function urlOf(typed: string): string {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t : `http://${t}`;
 }
 
+/** A typed address on the agent's machine itself (`localhost:3000/x`): its port and page. */
+function localOf(typed: string): { port: number; path: string } | undefined {
+  try {
+    const u = new URL(urlOf(typed));
+    if (!["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) || !u.port) return undefined;
+    return { port: Number(u.port), path: `${u.pathname}${u.search}` };
+  } catch {
+    return undefined;
+  }
+}
+
 /** What the server says of an open stream, as the live view shows it. */
 function streamOf(v: StreamView): LiveStream {
   const url = v.said.navigated?.url ?? v.spec.url ?? "";
@@ -90,6 +102,9 @@ function Pages({ session }: { session: string }) {
     { pollMs: 10_000 },
   );
   const listed = useSuspenseResource(`harness/streams/${session}`, () => harnessApi.streams(session).catch((): StreamView[] => []), { pollMs: 15_000 });
+  const openings = useSuspenseResource(`harness/opened/${session}`, () => harnessApi.opened(session).catch((): Opened[] => []), { pollMs: 30_000 });
+  const [deviceBusy, setDeviceBusy] = React.useState(false);
+  const [note, setNote] = React.useState<string | null>(null);
   const [pick, setPick] = React.useState("");
   const [address, setAddress] = React.useState("");
   const [profile, setProfile] = React.useState<Profile>("conversation");
@@ -110,6 +125,8 @@ function Pages({ session }: { session: string }) {
   const values = [...(startable ? ["app"] : []), ...theirs.map((o) => o.value), ...others.map((o) => o.value), "address"];
   const chosen = values.includes(pick) ? pick : (values[0] ?? "address");
   const port = ports.find((p) => `port:${p.port}` === chosen);
+  // What opens on the person's own device: a port of its machine (the app's once it runs).
+  const device = port ? { port: port.port, path: chosen === `port:${appPort}` ? (app.path ?? "/") : "/" } : chosen === "address" ? localOf(address) : undefined;
   // Yours: the ones opened here, then any you opened elsewhere (the agent's are in the conversation).
   const yours = [...here, ...listed.data.filter((v) => !v.by.startsWith("agent:") && !here.some((h) => h.id === v.id))].filter((v) => !closed.includes(v.id));
 
@@ -132,6 +149,45 @@ function Pages({ session }: { session: string }) {
     } finally {
       setBusy("");
     }
+  };
+  // On the person's own device: a link made by kiln, followed in a window opened now (in the tap's
+  // own gesture, which a phone wants for one) or copied for another device.
+  const onDevice = async (how: "here" | "copy") => {
+    if (!device) return;
+    const w = how === "here" ? window.open("", "_blank") : null;
+    let made: (url: string) => void = () => undefined;
+    const link = new Promise<string>((r) => (made = r));
+    if (how === "copy") {
+      const later = () => void link.then((u) => (u ? navigator.clipboard?.writeText(u) : undefined)).catch(() => undefined);
+      try {
+        navigator.clipboard.write([new ClipboardItem({ "text/plain": link.then((u) => (u ? new Blob([u], { type: "text/plain" }) : Promise.reject(new Error("no link")))) })]).catch(later);
+      } catch {
+        later();
+      }
+    }
+    setDeviceBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      const o = await harnessApi.openOnDevice(session, device);
+      openings.setData((l) => [o, ...l.filter((x) => x.id !== o.id)]);
+      made(o.url ?? "");
+      if (w && o.url) {
+        w.opener = null;
+        w.location.href = o.url;
+      }
+      if (how === "copy") setNote("Link copied. Open it on your other device within ten minutes: it works once.");
+    } catch (e) {
+      made("");
+      w?.close();
+      setError(errorMessage(e));
+    } finally {
+      setDeviceBusy(false);
+    }
+  };
+  const endOpened = (id: string) => {
+    openings.setData((l) => l.filter((o) => o.id !== id));
+    void harnessApi.endOpened(session, id).catch(() => undefined);
   };
   const close = (id: string) => {
     setClosed((c) => [...c, id]);
@@ -208,6 +264,33 @@ function Pages({ session }: { session: string }) {
         </Button>
       </form>
       <p className="field-hint lp-says">{PROFILE_SAYS[profile]}</p>
+      <div className="lp-device">
+        <span className="lp-device-what">On your device</span>
+        <Button size="sm" variant="secondary" disabled={!device || deviceBusy} onClick={() => void onDevice("here")}>
+          Open on this device
+        </Button>
+        <Button size="sm" variant="ghost" disabled={!device || deviceBusy} onClick={() => void onDevice("copy")}>
+          Copy a link
+        </Button>
+      </div>
+      {chosen === "app" && <p className="field-hint lp-says">Start the app first; then it opens on your device too.</p>}
+      {openings.data.length > 0 && (
+        <ul className="lp-opened" aria-label="Open on your devices">
+          {openings.data.map((o) => (
+            <li key={o.id}>
+              <code>
+                localhost:{o.port}
+                {o.path !== "/" ? o.path : ""}
+              </code>
+              <span>until {new Date(o.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+              <Button size="sm" variant="ghost" onClick={() => endOpened(o.id)}>
+                End
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {note && <p className="field-hint lp-says">{note}</p>}
       {app.configured &&
         (app.error ? (
           <p className="field-hint lp-says">.kiln/preview.yaml: {app.error}</p>

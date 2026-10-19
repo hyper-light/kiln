@@ -44,7 +44,11 @@ impl Owned {
             | ServerMsg::StreamControl { session, .. }
             | ServerMsg::StreamInput { session, .. }
             | ServerMsg::StreamClose { session, .. }
-            | ServerMsg::Preview { session, .. } => Some(Self::Agent(session.clone())),
+            | ServerMsg::Preview { session, .. }
+            | ServerMsg::PortOpen { session, .. }
+            | ServerMsg::PortData { session, .. }
+            | ServerMsg::PortAck { session, .. }
+            | ServerMsg::PortClose { session, .. } => Some(Self::Agent(session.clone())),
             ServerMsg::Assign(a) => Some(Self::Job(a.job_id.clone())),
             // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
             ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),

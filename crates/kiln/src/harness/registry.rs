@@ -267,6 +267,10 @@ pub struct Registry {
     pub visuals: super::visuals::Visuals,
     /// Pages streamed from agents' machines, relayed to their viewers (`super::streams`).
     pub streams: super::streams::Relay,
+    /// Connections to ports of agents' machines, and the apps opened on people's devices over
+    /// them (`super::opened`).
+    pub ports: super::opened::Tunnels,
+    pub opened: super::opened::Openings,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -357,6 +361,8 @@ impl Registry {
             keeper,
             visuals,
             streams: super::streams::Relay::default(),
+            ports: super::opened::Tunnels::default(),
+            opened: super::opened::Openings::default(),
         }
     }
 
@@ -906,6 +912,7 @@ impl Registry {
         if gone {
             self.keeper.forget(id);
             self.visuals.forget(id);
+            self.opened.forget(id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -973,6 +980,7 @@ impl Registry {
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub fn machine_lost(&self, hub: &Hub, machine: &str) {
         self.streams.machine_lost(machine);
+        self.ports.machine_lost(machine);
         let mut infos = Vec::new();
         {
             let mut g = self.mirrors.lock();
@@ -1358,6 +1366,7 @@ impl Registry {
             self.keeper.forget(id);
             self.visuals.forget(id);
             self.streams.forget(hub, id).await;
+            self.opened.forget(id);
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }

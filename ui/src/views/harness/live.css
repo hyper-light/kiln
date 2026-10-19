@@ -162,3 +162,45 @@
   font-size: 12px;
   line-height: 1.5;
 }
+
+/* On the person's own device: a label, its two ways, and what's open there, each with End. */
+.lp-device {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.lp-device-what {
+  flex: 1 1 100%;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.lp-opened {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.lp-opened li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: #8f929b;
+  font-size: 12px;
+}
+.lp-opened code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #c9cbd3;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -35,6 +35,7 @@ pub mod kinds;
 pub mod lineage;
 pub mod model;
 pub mod moving;
+pub mod opened;
 pub mod ops;
 pub mod pause;
 pub mod registry;
