@@ -1259,6 +1259,14 @@ fn ops() -> Vec<Op<'static>> {
             ..op("post", "/v1/firehose", "Kinesis Data Firehose's HTTP endpoint delivery (docs/observe.md §10.2)", "ingest", None, vec![("200", answer_of("taken (or taken before)", object(&[("requestId", string()), ("timestamp", integer()), ("errorMessage", string())], &["requestId", "timestamp"])))])
         },
         Op {
+            params: vec![
+                param("Content-Encoding", "header", true, json!({ "const": "snappy" }), "Snappy's block format"),
+                param("Authorization", "header", true, string(), "Bearer <the ingest token>, or Basic with it as the password (a runner's local receiver asks none)"),
+            ],
+            body: Some(json!({ "required": true, "content": { "application/x-protobuf": { "schema": { "type": "string", "format": "binary" } }, "application/x-protobuf;proto=io.prometheus.write.v2.Request": { "schema": { "type": "string", "format": "binary" } } }, "description": "remote write 1.0's prometheus.WriteRequest, or 2.0's io.prometheus.write.v2.Request" })),
+            ..op("post", "/api/v1/write", "Prometheus's remote write, 1.0 and 2.0 (docs/observe.md §8.5)", "ingest", None, vec![("204", answer("taken: 2.0's X-Prometheus-Remote-Write-Samples-Written says how many", None)), ("415", answer("a message of neither protocol", None))])
+        },
+        Op {
             params: vec![param("token", "query", true, string(), "observe's ingest token")],
             body: Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("message", object(&[("data", describe(string(), "base64: a Cloud Logging entry")), ("messageId", string()), ("attributes", map_of(string()))], &["data"])), ("subscription", string())], &["message"]) } } })),
             ..op("post", "/v1/pubsub", "A Pub/Sub push subscription's message: a Cloud Logging sink's entry (docs/observe.md §10.2)", "ingest", None, vec![("204", answer("taken (or taken before), acknowledged", None))])
@@ -1274,7 +1282,8 @@ pub const BASE: &str = "/api/observe/v1";
 pub fn document(version: &str) -> Value {
     let mut paths = Map::new();
     for o in ops() {
-        let full = if o.path.starts_with("/v1/") { o.path.to_owned() } else { format!("{BASE}{}", o.path) };
+        // What is sent in is at the root, where senders send it (`/v1/metrics`, `/api/v1/write`).
+        let full = if o.capability == "ingest" { o.path.to_owned() } else { format!("{BASE}{}", o.path) };
         let mut responses: Map<String, Value> = o.answers.into_iter().map(|(c, a)| (c.to_owned(), a)).collect();
         errors(&mut responses);
         let security = if o.capability == "ingest" { json!([{ "ingest": [] }]) } else { json!([{ "bearer": [] }, { "session": [] }]) };
@@ -1350,7 +1359,7 @@ mod tests {
             for (method, op) in item.as_object().into_iter().flatten() {
                 let cap = op.get("x-kiln-capability").and_then(Value::as_str).unwrap_or("");
                 if cap == "ingest" {
-                    anyhow::ensure!(path.starts_with("/v1/"), "{path}");
+                    anyhow::ensure!((path.starts_with("/v1/") || path == "/api/v1/write") && !path.starts_with(BASE), "{path}");
                     continue;
                 }
                 anyhow::ensure!(routes.iter().any(|(m, p)| m == method && p == path), "{method} {path} is described and not routed");

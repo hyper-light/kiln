@@ -28,6 +28,7 @@ pub mod monitor;
 pub mod otlp;
 pub mod outlier;
 pub mod prom;
+pub mod promwrite;
 pub mod query;
 pub mod rollup;
 pub mod slo;

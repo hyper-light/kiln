@@ -20,6 +20,7 @@ pub mod ingest;
 pub mod otlp;
 pub mod owner;
 pub mod pipeline;
+pub mod remote;
 pub mod scrape;
 pub mod slos;
 pub mod smtp;

@@ -233,6 +233,18 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
             return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
         }
+        // Prometheus's remote write (`crate::observe::remote`): the same token, as a bearer token
+        // or basic auth's password.
+        (&Method::POST, ["api", "v1", "write"]) => {
+            let ok = crate::observe::remote::token(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(&t, &hub.admin_token));
+            if !ok {
+                return Ok(srv::text(StatusCode::UNAUTHORIZED, "a remote write sends the ingest token: `authorization: credentials`, `bearer_token`, or basic auth's password"));
+            }
+            return Ok(match crate::observe::api::get() {
+                Some(o) => crate::observe::remote::answer(o, req).await,
+                None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+            });
+        }
         // OTLP/gRPC (`crate::observe::otlp::grpc`): the same token, as gRPC's metadata.
         (&Method::POST, [service, "Export"]) if crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).is_some() => {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));

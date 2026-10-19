@@ -266,6 +266,18 @@ impl Keys {
         Some(made)
     }
 
+    /// The key of `metric` with `tags` (sorted by key, each key once) and `kind`: found, or made
+    /// once in the receiver's life. `key` is room for its canonical bytes, kept by the caller.
+    /// None when no series can be so (a name too long, too many tags).
+    pub fn key(&self, metric: &str, tags: &[(&str, &str)], kind: Kind, key: &mut Vec<u8>) -> Option<SeriesKey> {
+        put_canonical_head(key, metric, tags.len());
+        for (k, v) in tags {
+            put_canonical_tag(key, k, v);
+        }
+        let h = key_hash(&self.hash, key, kind);
+        self.get_or_make(h, key, kind, || SeriesKey::new(metric, tags.iter().copied(), kind).ok())
+    }
+
     /// Keys kept now.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().unwrap_or_else(PoisonError::into_inner).table.len()).sum()

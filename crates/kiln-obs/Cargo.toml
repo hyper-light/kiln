@@ -70,6 +70,10 @@ name = "statsd"
 harness = false
 
 [[bench]]
+name = "promwrite"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 

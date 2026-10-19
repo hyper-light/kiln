@@ -590,12 +590,13 @@ impl crate::http::server::Handler for Local {
         match (req.method().clone(), req.uri().path()) {
             (Method::POST, "/v1/metrics") => answer(&self.o, Signal::Metrics, req).await,
             (Method::POST, "/v1/logs") => answer(&self.o, Signal::Logs, req).await,
+            (Method::POST, "/api/v1/write") => super::remote::answer(&self.o, req).await,
             (Method::POST, path) if grpc_signal(path).is_some() => match grpc_signal(path) {
                 Some(signal) => grpc(&self.o, signal, req).await,
                 None => grpc_answer(grpc_code::UNIMPLEMENTED, "an OTLP service: metrics or logs"),
             },
             (Method::GET, "/healthz") => srv::text(StatusCode::OK, "ok"),
-            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics or /v1/logs; OTLP/gRPC: the metrics and logs services' Export"),
+            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics or /v1/logs; OTLP/gRPC: the metrics and logs services' Export; Prometheus's remote write: POST /api/v1/write"),
         }
     }
 }
