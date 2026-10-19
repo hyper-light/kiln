@@ -239,7 +239,10 @@ fn write_plugin(dir: &std::path::Path) -> anyhow::Result<()> {
 pub fn plugin_dir() -> Option<&'static std::path::Path> {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = crate::config::default_data_dir().join("agents").join("kiln-plugin");
+        // Tests write a folder of their own: the machine's is what its real runner hands every
+        // agent it starts, and a test build's skills (a branch's) mustn't reach them.
+        let agents = if cfg!(test) { std::env::temp_dir().join(format!("kiln-test-agents-{}", std::process::id())) } else { crate::config::default_data_dir().join("agents") };
+        let dir = agents.join("kiln-plugin");
         match write_plugin(&dir) {
             Ok(()) => Some(dir),
             Err(e) => {
