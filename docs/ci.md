@@ -183,7 +183,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
-| W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches with an offline fallback |
+| W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); review UI and REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
@@ -2953,11 +2953,37 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   reach is answered with kiln's copy and a `Warning` saying so. Checked against a fake upstream
   with Docker's token challenge and a redirect to storage (`w12_ac02_pull_through`): the second
   pull asks the upstream for no blob.
+- *Done.* R04's caching proxies (`[[ci.registry.proxies]]`, `/_kiln/proxy/<name>/…`) for npm, PyPI
+  (PEP 503 and 691), crates.io's sparse index, Go's module proxy and checksum database, Maven
+  repositories, NuGet v3, RubyGems' compact index, and plain HTTP for the hosts named:
+  - every answer kept in the content-addressed store: packages served from kiln once kept, an
+    index asked again after `ttl`;
+  - an index's links written over to point at the proxy (npm's tarballs, PyPI's files, NuGet's
+    resources), crates.io's `config.json` kiln's own;
+  - readers: anyone signed in (a PAT, an agent's or a job's token, as Bearer, Basic or bare, as
+    Cargo sends it), anyone with `anonymous`;
+  - R05's private registries as upstreams (`upstream`, `files`, with a token or a user and
+    password);
+  - R06: an upstream out of reach answered from kiln's copy, with a `Warning`.
+  - Checked against a fake upstream for each (`w12_r04_proxies`), and AC03 with the real tools
+    against the public registries (`w12_ac03_installs_through_proxies`, with
+    `KILN_E2E_PROXIES=1`): npm, uv, cargo and go here, and Maven, RubyGems and NuGet (`mvn`,
+    `gem`, `dotnet restore`) in containers, each installing a fixture through kiln and again with
+    every upstream pointed nowhere.
+- *Done.* R03, jobs' registry credentials: a leg's Docker config asks `docker-credential-kiln`
+  (kiln's own binary, by that name, beside `kiln` on the leg's `PATH`) for each registry its `oci`
+  integrations name and for kiln's own; the helper answers when Docker asks, with the job's token
+  for kiln's registry, the integration's token for the rest, and short-lived credentials where
+  the registry federates (`federation = "aws"`: an AWS role's, then ECR's token;
+  `"gcp"`: Google's federated, or impersonated, token for Artifact Registry; `"azure"`: Entra's
+  token exchanged at ACR for its refresh token). Nothing is written down, and an ID token can't be
+  had after the leg. A leg on the host keeps the runner's own Docker logins; a job container never
+  sees them. Checked in a leg (`w12_r03_job_credentials`); the federated exchanges need the
+  clouds (AC04, user-assisted).
 - *Left.* R02's runners pulling through the mirrors by themselves (Docker's `registry-mirrors`,
-  containerd's `hosts.toml`, shards' settings, Firecracker's root file systems); R03, jobs'
-  OCI credentials (kiln's own registry by the job token, federation for ECR, Artifact Registry and
-  ACR, tokens for the rest); R04, the package registries' configuration, caching proxies and
-  publishing; R05, private registries as upstreams and targets; AC03 and AC04.
+  containerd's `hosts.toml`, shards' settings, Firecracker's root file systems); R04's first part
+  (each ecosystem's configuration files and variables written for jobs) and third
+  (`kiln/publish@v1`); R05's publish targets; AC04 (user-assisted).
 
 ### W13 Runners and executors
 

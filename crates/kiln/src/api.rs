@@ -175,6 +175,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
     // of its own (an upload streams for as long as it takes).
+    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
+        let h = Arc::clone(&hub);
+        return crate::rt::spawn(async move { crate::ci::registry::proxy::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
+    }
     if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
         let h = Arc::clone(&hub);
         return crate::rt::spawn(async move { crate::ci::registry::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));

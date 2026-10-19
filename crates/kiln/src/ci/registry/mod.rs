@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod mirror;
+pub mod proxy;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

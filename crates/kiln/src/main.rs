@@ -366,6 +366,19 @@ fn repo_path(file: &std::path::Path) -> String {
 }
 
 fn main() -> ExitCode {
+    // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
+    if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
+        let action = std::env::args().nth(1).unwrap_or_default();
+        kiln::rt::configure(kiln::rt::Profile::tool());
+        return match kiln::rt::block_on(async move { kiln::runner::credential::helper(&action).await }) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("docker-credential-kiln: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let cli = Cli::parse();
     // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
     // the server says only what goes wrong unless asked for more.

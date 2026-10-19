@@ -202,6 +202,40 @@ pub struct Registry {
     /// password_file = "/etc/kiln/dockerhub-token"
     /// ```
     pub mirrors: Vec<Mirror>,
+    /// `[[ci.registry.proxies]]`: caching proxies for package registries at
+    /// `/_kiln/proxy/<name>/…` (docs/ci.md W12-R04, R05, R06).
+    ///
+    /// ```toml
+    /// [[ci.registry.proxies]]
+    /// ecosystem = "npm"                 # pypi, crates, go, maven, nuget, rubygems, http
+    /// # upstream = "https://registry.npmjs.org"   (each ecosystem's public one by default; a private one's, R05)
+    /// # token_file = "…", or username + password_file: the upstream's credentials
+    /// ttl = 300                         # seconds an index is trusted before asking again
+    /// ```
+    pub proxies: Vec<Proxy>,
+}
+
+/// A package registry kiln proxies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Proxy {
+    /// `npm`, `pypi`, `crates`, `go`, `maven`, `nuget`, `rubygems`, `http`.
+    pub ecosystem: String,
+    /// The path it's under (`/_kiln/proxy/<name>/`); the ecosystem's name by default.
+    pub name: Option<String>,
+    /// The upstream (its index's, for PyPI and crates.io), when not the ecosystem's public one.
+    pub upstream: Option<String>,
+    /// Where the upstream keeps its packages, when elsewhere (PyPI's files, crates.io's crates).
+    pub files: Option<String>,
+    /// `http`: the hosts it may reach; Go: checksum databases besides `sum.golang.org`.
+    pub hosts: Vec<String>,
+    /// Anyone may read through it, without signing in.
+    pub anonymous: bool,
+    pub token_file: Option<std::path::PathBuf>,
+    pub username: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
+    /// Seconds an index is trusted (300).
+    pub ttl: Option<u64>,
 }
 
 /// A registry kiln pulls through.

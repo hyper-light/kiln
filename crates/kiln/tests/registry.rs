@@ -477,3 +477,80 @@ fn w12_r07_registry_package() -> anyhow::Result<()> {
     assert_eq!(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).map(Vec::len), Some(1), "{body}");
     Ok(())
 }
+
+/// Jobs' registry credentials (W12-R03): in a leg, Docker asks `docker-credential-kiln` (kiln's own
+/// binary on the leg's PATH) and gets the job's token for kiln's registry and the integration's for
+/// another; the leg's Docker config names kiln for each; a registry it has nothing for is "none".
+#[test]
+fn w12_r03_job_credentials() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".kiln"))?;
+    std::fs::write(repo.join("README.md"), "creds\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!("[[repos]]\nname = \"acme/creds\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    // The engine runs `.kiln/` workflows (v1 keeps them otherwise).
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let port = s.port;
+    let (st, body) = common::http(port, "POST", "/api/ci/integrations", &s.admin, Some(&json!({ "kind": "oci", "name": "ghcr", "config": { "registry": "ghcr.io", "username": "bot" }, "secret": "ghp_fake_secret", "scope": "server" })))?;
+    anyhow::ensure!((200..300).contains(&st), "the integration: {st} {body}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
+        if body.contains("acme/creds") && !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(
+        repo.join(".kiln/ci.yaml"),
+        r#"name: creds
+on: { push: {} }
+jobs:
+  creds:
+    runs-on: [self-hosted, local]
+    integrations: [ghcr]
+    steps:
+      - run: |
+          set -e
+          echo "$KILN_REGISTRY_HOST" | docker-credential-kiln get | grep -q '"Username":"kiln"'
+          echo own-ok
+          echo ghcr.io | docker-credential-kiln get | grep -q '"Username":"bot"'
+          echo ghcr.io | docker-credential-kiln get | grep -q '"Secret":"ghp_fake_secret"'
+          echo ghcr-ok
+          grep -q '"ghcr.io":"kiln"' "$DOCKER_CONFIG/config.json"
+          echo config-ok
+          if echo quay.io | docker-credential-kiln get; then exit 1; fi
+          echo none-ok
+"#,
+    )?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "creds"])?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let run = loop {
+        let (_, body) = common::http(port, "GET", "/api/ci/runs?repo=acme/creds&limit=5", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        if let Some(r) = v.get("runs").and_then(Value::as_array).and_then(|r| r.first()).filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).cloned() {
+            break r;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = common::http(port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..4 {
+        let (_, text) = common::http(port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("success"), "{run}\n{log}");
+    for said in ["own-ok", "ghcr-ok", "config-ok", "none-ok"] {
+        assert!(log.contains(said), "{said}: {log}");
+    }
+    assert!(!log.contains("ghp_fake_secret"), "the token is masked: {log}");
+    Ok(())
+}

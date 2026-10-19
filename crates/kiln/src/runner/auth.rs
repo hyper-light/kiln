@@ -297,6 +297,16 @@ pub fn place_binary(work: &Path) -> Option<PathBuf> {
         }
         std::fs::rename(&tmp, &dst).ok()?;
     }
+    // Docker's credential helper is the same binary by another name (W12-R03).
+    let helper = dir.join(if cfg!(windows) { "docker-credential-kiln.exe" } else { "docker-credential-kiln" });
+    let same = matches!((std::fs::metadata(&dst), std::fs::metadata(&helper)), (Ok(x), Ok(y)) if x.len() == y.len() && x.modified().ok() <= y.modified().ok());
+    if !same {
+        let tmp = dir.join(format!(".helper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::hard_link(&dst, &tmp).is_ok() || std::fs::copy(&dst, &tmp).is_ok() {
+            let _ = std::fs::rename(&tmp, &helper);
+        }
+    }
     Some(dir)
 }
 

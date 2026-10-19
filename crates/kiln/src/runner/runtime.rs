@@ -712,6 +712,17 @@ impl Leg {
         if serde_json::to_vec(&a.integrations).ok().is_some_and(|b| super::auth::write_private(&list, &b).is_ok()) {
             st.env.insert("KILN_INTEGRATIONS".into(), list.to_string_lossy().into_owned());
         }
+        // Docker asks kiln for registries' credentials when it needs them (W12-R03): the leg's
+        // `oci` integrations', and kiln's own registry's (the job's token, which ends with the leg).
+        let own = crate::githost::host_of(&a.runtime.facade_url);
+        let docker = dir.join("docker");
+        // The runner's own logins stay for a leg on the host; a job container never sees them.
+        let base = if map.is_none() { super::credential::runner_config() } else { None };
+        let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
+        if std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+            st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
+            st.env.insert("KILN_REGISTRY_HOST".into(), own);
+        }
         true
     }
 
