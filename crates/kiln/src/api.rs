@@ -397,6 +397,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "join-requests", id, "deny"]) => deny_join(&hub, id).await,
         (&Method::DELETE, ["api", "agents", name]) => forget_agent(&hub, name).await,
+        // What's wrong with a runner, and repairs to it (`crate::doctor`, docs/releases.md).
+        (&Method::GET, ["api", "agents", name, "diagnose"]) => crate::doctor::diagnose(&hub, name).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "agents", name, "repair"]) => {
+            let name = (*name).to_owned();
+            let ask: crate::doctor::Ask = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            crate::doctor::repair(&hub, &name, &ask).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+        }
         (&Method::POST, ["api", "agents", name, "drain"]) => {
             let name = (*name).to_owned();
             drain_agent(&hub, &name, req).await
