@@ -227,6 +227,21 @@ impl<'a> BitReader<'a> {
         Ok(self.read(1)? == 1)
     }
 
+    /// Takes the zero bits that come next, up to `max` of them, and says how many: what the word
+    /// holds once loaded (a run longer is taken a word at a time by calling again).
+    #[inline]
+    pub fn take_zeros(&mut self, max: u32) -> u32 {
+        if self.avail <= 56 {
+            self.refill();
+        }
+        let n = self.acc.leading_zeros().min(self.avail).min(max);
+        if n > 0 {
+            self.acc = if n >= 64 { 0 } else { self.acc << n };
+            self.avail -= n;
+        }
+        n
+    }
+
     /// Bits left to read.
     pub fn remaining(&self) -> u64 {
         (self.head.len() as u64)

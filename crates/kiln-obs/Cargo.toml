@@ -58,6 +58,10 @@ name = "logmetrics"
 harness = false
 
 [[bench]]
+name = "wide"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 

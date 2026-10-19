@@ -293,7 +293,9 @@ impl<'a> ChunkRef<'a> {
         Ok(())
     }
 
-    /// Appends every sample to `ts` and `values`, the columns a query works on.
+    /// Appends every sample to `ts` and `values`, the columns a query works on. A run of samples
+    /// that repeat the one before (its interval and its value: a scrape of a gauge that holds,
+    /// two zero bits each) is taken a word at a time, not a sample.
     pub fn decode_into(&self, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
         let n = self.count as usize;
         ts.reserve(n);
@@ -302,6 +304,16 @@ impl<'a> ChunkRef<'a> {
         while let Some((t, v)) = d.next_sample()? {
             ts.push(t);
             values.push(v);
+            let (k, step) = d.repeats();
+            if k > 0 {
+                let v = f64::from_bits(d.v);
+                let mut t = t;
+                for _ in 0..k {
+                    t += step;
+                    ts.push(t);
+                    values.push(v);
+                }
+            }
         }
         Ok(())
     }
@@ -318,11 +330,13 @@ pub struct Decoder<'a> {
     v: u64,
     window: (u32, u32),
     failed: bool,
+    /// [`Decoder::repeats`] took the next sample's first bit (a delta of delta 0).
+    pending_dod_zero: bool,
 }
 
 impl<'a> Decoder<'a> {
     pub fn new(chunk: ChunkRef<'a>) -> Self {
-        Self { r: BitReader::new(chunk.bits), left: chunk.count, started: false, t: 0, delta: 0, v: 0, window: (0, 0), failed: false }
+        Self { r: BitReader::new(chunk.bits), left: chunk.count, started: false, t: 0, delta: 0, v: 0, window: (0, 0), failed: false, pending_dod_zero: false }
     }
 
     /// The next sample, none after the last; an error ends the chunk.
@@ -363,8 +377,39 @@ impl<'a> Decoder<'a> {
         Ok((self.t, f64::from_bits(self.v)))
     }
 
+    /// The samples next that repeat the last one read (a delta of delta 0 and a value unchanged:
+    /// `00`, two bits each), taken: how many, and the interval between them. None while the
+    /// interval is not positive (such a sample is an error, which [`Decoder::step`] says).
+    #[inline]
+    fn repeats(&mut self) -> (u32, i64) {
+        let step = self.delta as i64;
+        if !self.started || self.left == 0 || step <= 0 || self.failed {
+            return (0, 0);
+        }
+        let mut k = 0u32;
+        loop {
+            let zeros = self.r.take_zeros(self.left.saturating_mul(2).min(64));
+            // An odd zero is the next sample's first bit (a delta of delta 0, then a value changed):
+            // given back by stepping a sample's time and leaving its value to `step`, as it would.
+            let pairs = zeros / 2;
+            k += pairs;
+            self.left -= pairs;
+            self.t = self.t.wrapping_add(step.wrapping_mul(i64::from(pairs)));
+            if zeros % 2 == 1 {
+                self.pending_dod_zero = true;
+                return (k, step);
+            }
+            if zeros < 64 || self.left == 0 {
+                return (k, step);
+            }
+        }
+    }
+
     #[inline]
     fn read_dod(&mut self) -> Result<i64, DecodeError> {
+        if std::mem::take(&mut self.pending_dod_zero) {
+            return Ok(0);
+        }
         if !self.r.read_bit()? {
             return Ok(0);
         }
@@ -393,6 +438,65 @@ impl Iterator for Decoder<'_> {
 mod tests {
     use super::*;
     use crate::testkit::Rng;
+
+    /// Runs of samples that repeat the one before (two zero bits each), of every length and at
+    /// every place, between changes of interval and value: decoded a word at a time, as decoded a
+    /// sample at a time, to the bit.
+    #[test]
+    fn runs_of_repeats_decode_as_sample_by_sample() {
+        let mut rng = Rng::new(17);
+        for round in 0..400 {
+            let mut samples = Vec::new();
+            let (mut t, mut step, mut v) = (1_000i64, 1 + rng.below(30) as i64, 1.0f64);
+            let n = 1 + rng.below(600) as usize;
+            while samples.len() < n {
+                match rng.below(8) {
+                    // A run of repeats, of a length around the word's 32 pairs.
+                    0..=3 => {
+                        for _ in 0..[1, 2, 31, 32, 33, 63, 64, 65, 100][rng.below(9) as usize] {
+                            t += step;
+                            samples.push((t, v));
+                        }
+                    }
+                    4 => {
+                        step += 1 + rng.below(5) as i64;
+                        t += step;
+                        samples.push((t, v));
+                    }
+                    5 => {
+                        v = (rng.below(1000) as f64) / 7.0;
+                        t += step;
+                        samples.push((t, v));
+                    }
+                    6 => {
+                        t += step;
+                        v += 1.0;
+                        samples.push((t, v));
+                    }
+                    _ => {
+                        // A value changed at the same interval: a dod of 0, then a value's bits.
+                        t += step;
+                        v = -v;
+                        samples.push((t, v));
+                    }
+                }
+            }
+            samples.truncate(n);
+            let mut e = Encoder::new();
+            for &(t, v) in &samples {
+                e.push(t, v).unwrap();
+            }
+            let chunk = e.finish();
+            let (mut ts, mut vs) = (Vec::new(), Vec::new());
+            chunk.as_ref().decode_into(&mut ts, &mut vs).unwrap();
+            let one: Vec<(i64, f64)> = chunk.as_ref().iter().map(Result::unwrap).collect();
+            assert_eq!(ts.len(), samples.len(), "round {round}");
+            for (i, ((t, v), (ot, ov))) in ts.iter().zip(&vs).zip(&one).enumerate() {
+                assert!(*t == *ot && v.to_bits() == ov.to_bits(), "round {round}, sample {i}: {t} {v} against {ot} {ov}");
+                assert!(*t == samples[i].0 && v.to_bits() == samples[i].1.to_bits(), "round {round}, sample {i}");
+            }
+        }
+    }
 
     fn round_trip(samples: &[(i64, f64)]) -> Chunk {
         let mut e = Encoder::new();

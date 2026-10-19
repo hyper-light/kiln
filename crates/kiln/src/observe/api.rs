@@ -899,7 +899,16 @@ struct QueryBody {
 }
 
 async fn query(body: QueryBody) -> Result<Response, Fail> {
-    reading(move |s| {
+    // What a query waits for, said with what it took: a thread to read on, then the store (held by
+    // a write, or a cut).
+    let asked = std::time::Instant::now();
+    let store = shared()?;
+    crate::rt::blocking(move || {
+        let queued = asked.elapsed();
+        let s = store.read().unwrap_or_else(PoisonError::into_inner);
+        let waited = asked.elapsed() - queued;
+        let s = &*s;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let started = std::time::Instant::now();
         let mut r = QueryRequest::new(&body.query, body.from, body.to);
         // A forecast() forecasts past its series' last point, to the range's end.
@@ -921,6 +930,8 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
                     "heatmap": { "rows": rows, "counts": h.counts, "distribution": h.distribution },
                     "applied": s.applied(),
                     "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    "queued_ms": ms(queued),
+                    "waited_ms": ms(waited),
                 }),
             ));
         }
@@ -958,10 +969,13 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
                 "scanned": { "series": a.scanned_series, "samples": a.scanned_samples },
                 "applied": s.applied(),
                 "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "queued_ms": ms(queued),
+                "waited_ms": ms(waited),
             }),
         ))
     })
     .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
 }
 
 #[derive(Debug, Deserialize)]

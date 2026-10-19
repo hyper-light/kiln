@@ -172,7 +172,11 @@ impl StateMachine for Machine {
             Err(e) => return Err(self.failed("a snapshot that is no store's image", e)),
         };
         let at_point = Point { index: at.index, term: at.term };
+        // As every change of the store's files: the manifest lock first (`crate::store::cut_shared`).
+        let lock = self.read().manifest_lock();
+        let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let installed = self.write().install(&self.staging, &image, at_point, membership_of(configuration));
+        drop(held);
         if let Err(e) = installed {
             return Err(self.failed("an image could not be installed", e));
         }
@@ -189,7 +193,8 @@ impl StateMachine for Machine {
 
     fn persist(&mut self) -> Result<(), Fatal> {
         let at = Point { index: self.applied.index, term: self.applied.term };
-        let cut = self.write().cut(at);
+        // Its files written beside queries: a query waits for no disk.
+        let cut = crate::store::cut_shared(&self.store, at);
         match cut {
             Ok(_) => Ok(()),
             Err(e) => Err(self.failed("the store could not be cut", e)),

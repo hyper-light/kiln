@@ -26,7 +26,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. Next: a dashboard query's p99 in a long run (2.2 s, against 0.7 s in its first ten minutes); merges that join their inputs' rollups rather than make them anew | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
 
@@ -198,6 +198,18 @@ decoded and packed anew. Maintenance runs on a thread of its own, told of every 
 takes a merge in only if its inputs are still there. A manifest (rewritten by rename) lists the live
 blocks and the log point the head was cut at; files wholly past retention are deleted, a block more
 than half past it rewritten.
+
+**Files changed beside queries.** A query holds the store shared; applying holds it alone, and a
+writer waiting holds every new reader back (Rust's lock prefers writers, as most do). So nothing
+writes a file under the exclusive hold: a cut writes its block and logs file, syncs them and saves
+the manifest under a shared hold (the group's thread is the one cutting, so nothing applies
+meanwhile, and the head it reads stays as it read it), then takes them in under an exclusive hold
+that only moves the head's chunks out and the files in; a merge saves its manifest with no hold at
+all and deletes its inputs after; so do expired files. Each change of the files holds the manifest
+lock throughout, taken before the store's own and never while holding it: one change at a time,
+and none waiting for the store's exclusive hold while another reads it to write (`cut_shared`,
+`commit_shared`, `drop_expired_shared`; a test runs them against a reader, a maintenance thread and
+a cutting one, and opens the files again after).
 
 ### 4.6 Logs and events
 
@@ -1816,6 +1828,33 @@ for each of its windows): 0.2 ms each ten seconds. A dense one costs its records
 a second, five metrics take some 4–5% of a core. Of that (perf), a third is checking each row's
 text is UTF-8 as it is read, the rest reading rows and evaluating the searches; a distribution's
 allocations are its series' keys, a window's, not a record's.
+
+### 12.19 A dashboard's widest query
+
+The soak's slowest dashboard query (§13) was its own reading, not a wait: with each query's time
+told apart (`queued_ms`, `waited_ms` and `took_ms` in its answer), a 20-minute soak's
+`sum:load.v{*} by {host}` took p50 648 ms and p99 1.17 s, its slowest hundredth waiting 0.00 ms for
+the store and 0.12 for a thread; the one-series query's slowest waited 4.3 ms. It reads 4,000 series
+written 50 times a second over 15 minutes: 180 M samples. `cargo bench -p kiln-obs --bench wide`
+builds that store (cut each minute, merged as maintenance merges) and times the query, median of
+nine, 2026-10-19 on this machine (32 threads, load average 39–150 from other sessions):
+
+| | median | a sample |
+| --- | --- | --- |
+| before | 1,527 ms | 8.5 ns |
+| a run of repeated samples decoded a word at a time | 508 ms | 2.8 ns |
+| and its series read on helper threads | 74 ms | 0.41 ns |
+
+A sample that repeats the one before (its interval and its value: a regular scrape of a gauge that
+holds) is two zero bits; a run of them is counted with one leading-zeros instruction and its samples
+written in a loop (`ChunkRef::decode_into`; a test holds it to the sample-by-sample decoder on runs
+of every length at every place, to the bit). Then perf put the time in the decoder (31% stepping,
+21% reading values, 12% in its loop), and the series are independent: a query reads them on its own
+thread while that is quick (2 ms), then takes helper threads, half the machine's cores less one
+shared by every query, and reads the rest a round at a time (64 series a thread), each round's values
+added into their groups in the series' fingerprints' order, as one thread adds them: the same bits on
+any number of threads (a test of seven queries on 1, 2, 3 and 7 threads, sums twelve orders of
+magnitude apart).
 
 ## 13. Scenarios
 

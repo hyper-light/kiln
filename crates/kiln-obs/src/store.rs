@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use hashbrown::HashTable;
 
@@ -102,6 +102,8 @@ pub enum StoreError {
     LogFile(#[from] crate::logs::file::LogFileError),
     #[error("{0}: not staged as the image names it")]
     Staged(String),
+    #[error("the store changed while its cut was written")]
+    Moved,
 }
 
 /// What applying batches did, counted.
@@ -233,6 +235,10 @@ pub struct Store {
     touched: Option<Arc<Touched>>,
     /// Whether [`Store::read_rolled`] reads rollups (always, but to measure or check against them).
     read_rollups: bool,
+    /// Held by whoever changes the manifest (a cut, a merge taken in, files expired, an install)
+    /// from reading the store to taking the change in: they write their files under a shared hold
+    /// of the store (or none), one at a time. Taken before the store's own lock, never after.
+    manifest_lock: Arc<Mutex<()>>,
 }
 
 impl Default for Store {
@@ -268,6 +274,35 @@ impl<'a> SeriesRef<'a> {
     pub fn tag(&self, key: &str) -> Option<&'a str> {
         self.tags().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
+}
+
+/// Files wholly older than the durable cutoff, and the manifest without them.
+#[derive(Debug)]
+struct Expired {
+    dir: PathBuf,
+    manifest: Manifest,
+    blocks: Vec<String>,
+    logs: Vec<String>,
+}
+
+impl Expired {
+    fn files(&self) -> Vec<PathBuf> {
+        self.logs.iter().chain(&self.blocks).map(|f| self.dir.join(f)).collect()
+    }
+}
+
+/// A cut written ([`Store::write_cut`]), to be taken in ([`Store::install_cut`]).
+#[derive(Debug)]
+pub struct CutWritten {
+    /// The store as it was written from: what was applied, and its installs.
+    applied: u64,
+    epoch: u64,
+    manifest: Manifest,
+    block: Option<OpenBlock>,
+    logs: Option<HeldFile>,
+    /// The series whose samples the block holds.
+    series: Vec<u32>,
+    done: Maintained,
 }
 
 /// What a cut, a compaction or a retention pass did.
@@ -492,6 +527,7 @@ impl Store {
             publishing: false,
             touched: None,
             read_rollups: true,
+            manifest_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -868,26 +904,28 @@ impl Store {
         Ok(())
     }
 
+    /// Who changes the manifest holds this, from reading the store to taking the change in, and
+    /// takes it before the store's own lock.
+    pub fn manifest_lock(&self) -> Arc<Mutex<()>> {
+        self.manifest_lock.clone()
+    }
+
     /// Writes the head into files, durably, and records that everything up to `at` (the log point
     /// of the last entry applied) is durable, with the replicated state there; the head is emptied.
     /// A head with nothing in it writes no file and still records `at`. If a file cannot be
-    /// written, the head is kept.
+    /// written, the head is kept (nothing of it was taken). Under the caller's hold of the store; a
+    /// cut beside queries is [`Store::write_cut`] then [`Store::install_cut`].
     pub fn cut(&mut self, at: Point) -> Result<Maintained, StoreError> {
+        let w = self.write_cut(at)?;
+        self.install_cut(w)
+    }
+
+    /// A cut's files written, and the manifest naming them saved, from the store as it is (a
+    /// shared hold: queries go on). Nothing of the store changes until [`Store::install_cut`]; the
+    /// caller holds [`Store::manifest_lock`] from before this until after that, and nothing applies
+    /// meanwhile (the group's thread is the one cutting).
+    pub fn write_cut(&self, at: Point) -> Result<CutWritten, StoreError> {
         let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
-        // Take every series' head; put it back if anything fails.
-        let mut taken: Vec<(u32, Vec<Chunk>)> = Vec::new();
-        for (id, h) in self.head.iter_mut().enumerate() {
-            if h.span().is_some() {
-                match h.drain_chunks() {
-                    Ok(c) => taken.push((id as u32, c)),
-                    Err(e) => {
-                        restore(&mut self.head, taken);
-                        return Err(e.into());
-                    }
-                }
-            }
-        }
-        let mut done = Maintained::default();
         let mut manifest = self.manifest.clone();
         manifest.durable = at;
         manifest.cutoff = self.cutoff;
@@ -895,66 +933,88 @@ impl Store {
         manifest.max_series = self.max_series;
         manifest.sessions.clone_from(&self.sessions);
         manifest.conf.clone_from(&self.conf);
-        // Logs first: a file of their own, listed with the blocks in the same manifest.
-        let mut new_logs = None;
-        if self.logs.unwritten_rows() > 0 {
-            let seq = manifest.next_seq;
-            let file = manifest::logs_file(seq);
-            match self.logs.cut(&dir.join(&file)) {
-                Ok(Some(log)) => {
-                    done.bytes_written += log.bytes;
-                    manifest.next_seq = seq + 1;
-                    manifest.logs.push(BlockEntry { seq, file: file.clone() });
-                    new_logs = Some(HeldFile { seq, file, log });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    restore(&mut self.head, taken);
-                    return Err(e.into());
+        let mut w = CutWritten { applied: self.applied, epoch: self.epoch, manifest, block: None, logs: None, series: Vec::new(), done: Maintained::default() };
+        let mut written: Vec<PathBuf> = Vec::new();
+        let made = (|| -> Result<(), StoreError> {
+            // Logs first: a file of their own, listed with the blocks in the same manifest.
+            if self.logs.unwritten_rows() > 0 {
+                let seq = w.manifest.next_seq;
+                let file = manifest::logs_file(seq);
+                written.push(dir.join(&file));
+                if let Some(log) = self.logs.write_unwritten(&dir.join(&file))? {
+                    w.done.bytes_written += log.bytes;
+                    w.manifest.next_seq = seq + 1;
+                    w.manifest.logs.push(BlockEntry { seq, file: file.clone() });
+                    w.logs = Some(HeldFile { seq, file, log });
                 }
             }
-        }
-        let mut new_block = None;
-        if !taken.is_empty() {
-            let seq = manifest.next_seq;
-            let file = manifest::block_file(seq);
-            let written = {
-                let series: Vec<SeriesData<'_>> = taken
-                    .iter()
-                    .filter_map(|(id, chunks)| {
-                        let info = self.index.info(*id)?;
-                        // A cut writes no rollups (it decodes nothing, under the store's hold): the
-                        // first merge to take its block makes them.
-                        Some(SeriesData { fp: self.index.fp(*id)?, kind: info.kind, key: self.index.key(*id)?, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect(), rollups: &[] })
-                    })
-                    .collect();
-                block::write(&dir.join(&file), series)
-            };
-            let block = match written {
-                Ok(b) => b,
-                Err(e) => {
-                    restore(&mut self.head, taken);
-                    return Err(e.into());
+            let mut borrowed: Vec<(u32, &[Chunk])> = Vec::new();
+            let mut made: Vec<(u32, Vec<Chunk>)> = Vec::new();
+            for (id, h) in self.head.iter().enumerate() {
+                if h.span().is_some() {
+                    let (closed, new) = h.cut_chunks()?;
+                    borrowed.push((id as u32, closed));
+                    made.push((id as u32, new));
                 }
-            };
-            done.blocks_written = 1;
-            done.bytes_written += block.bytes;
-            manifest.next_seq = seq + 1;
-            manifest.blocks.push(BlockEntry { seq, file: file.clone() });
-            new_block = Some(OpenBlock { seq, file, block });
-        }
-        if let Err(e) = manifest::sync_dir(&dir).map_err(io_err(&dir)).and_then(|()| manifest.save(&dir).map_err(StoreError::from)) {
-            restore(&mut self.head, taken);
+            }
+            if borrowed.is_empty() {
+                return Ok(());
+            }
+            let seq = w.manifest.next_seq;
+            let file = manifest::block_file(seq);
+            let series: Vec<SeriesData<'_>> = borrowed
+                .iter()
+                .zip(&made)
+                .filter_map(|((id, closed), (_, new))| {
+                    let info = self.index.info(*id)?;
+                    // A cut writes no rollups (it decodes nothing it need not): the first merge
+                    // to take its block makes them.
+                    let chunks = closed.iter().chain(new).map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect();
+                    Some(SeriesData { fp: self.index.fp(*id)?, kind: info.kind, key: self.index.key(*id)?, chunks, rollups: &[] })
+                })
+                .collect();
+            written.push(dir.join(&file));
+            let block = block::write(&dir.join(&file), series)?;
+            w.series = borrowed.iter().map(|(id, _)| *id).collect();
+            w.done.blocks_written = 1;
+            w.done.bytes_written += block.bytes;
+            w.manifest.next_seq = seq + 1;
+            w.manifest.blocks.push(BlockEntry { seq, file: file.clone() });
+            w.block = Some(OpenBlock { seq, file, block });
+            Ok(())
+        })()
+        .and_then(|()| manifest::sync_dir(&dir).map_err(io_err(&dir)))
+        .and_then(|()| w.manifest.save(&dir).map_err(StoreError::from));
+        if let Err(e) = made {
+            for p in &written {
+                let _ = remove_if_there(p);
+            }
             return Err(e);
         }
-        self.manifest = manifest;
-        if let Some(b) = new_block {
+        Ok(w)
+    }
+
+    /// Takes in a cut [`Store::write_cut`] wrote (an exclusive hold, brief: no file is written):
+    /// the head's samples and the logs' rows it wrote leave memory, its files are read from. Refused
+    /// ([`StoreError::Moved`]) if anything was applied since: then its files are listed by a
+    /// manifest that this store's next one replaces, and are deleted as the store next opens.
+    pub fn install_cut(&mut self, w: CutWritten) -> Result<Maintained, StoreError> {
+        if w.applied != self.applied || w.epoch != self.epoch {
+            return Err(StoreError::Moved);
+        }
+        for id in &w.series {
+            if let Some(h) = self.head.get_mut(*id as usize) {
+                h.clear();
+            }
+        }
+        self.manifest = w.manifest;
+        if let Some(b) = w.block {
             self.blocks.push(b);
         }
-        if let Some(l) = new_logs {
-            self.logs.files.push(l);
+        if let Some(l) = w.logs {
+            self.logs.written(l);
         }
-        Ok(done)
+        Ok(w.done)
     }
 
     /// Compacts blocks by the logarithmic method (Bentley and Saxe, "Decomposable searching
@@ -1010,65 +1070,103 @@ impl Store {
     /// Takes a built rewrite in: its block in its inputs' place, the manifest saved, the inputs
     /// deleted, if the store still holds every input; else (an install replaced the store, or the
     /// inputs went) its file is deleted. Under the caller's hold of the store, and quick: the
-    /// building was done apart.
+    /// building was done apart ([`commit_shared`] saves the manifest and deletes the files apart
+    /// too).
     pub fn commit(&mut self, built: Built) -> Result<Maintained, StoreError> {
-        let Built { rewrite: r, block } = built;
-        let held = r.epoch == self.epoch && r.from.iter().all(|(seq, f)| self.blocks.iter().any(|b| b.seq == *seq && b.file == *f));
-        let path = r.dir.join(&r.file);
-        if !held {
-            drop(block);
+        let Some(manifest) = self.commit_manifest(&built) else {
+            let path = built.rewrite.dir.join(&built.rewrite.file);
+            drop(built);
             remove_if_there(&path)?;
             return Ok(Maintained::default());
+        };
+        let dir = built.rewrite.dir.clone();
+        manifest::sync_dir(&dir).map_err(io_err(&dir))?;
+        manifest.save(&dir)?;
+        let (done, gone) = self.take_commit(built, manifest)?;
+        for p in gone {
+            remove_if_there(&p)?;
         }
-        let bytes = block.bytes;
-        let empty = block.is_empty();
+        Ok(done)
+    }
+
+    /// The manifest a rewrite's block makes, in its inputs' place: none if the store no longer
+    /// holds every input (an install replaced it, or the inputs went).
+    fn commit_manifest(&self, built: &Built) -> Option<Manifest> {
+        let r = &built.rewrite;
+        let held = r.epoch == self.epoch && r.from.iter().all(|(seq, f)| self.blocks.iter().any(|b| b.seq == *seq && b.file == *f));
+        if !held {
+            return None;
+        }
         let mut manifest = self.manifest.clone();
         manifest.blocks.retain(|e| !r.from.iter().any(|(_, f)| *f == e.file));
-        if !empty {
+        if !built.block.is_empty() {
             manifest.blocks.push(BlockEntry { seq: r.seq, file: r.file.clone() });
             manifest.blocks.sort_by_key(|e| e.seq);
         }
-        manifest::sync_dir(&r.dir).map_err(io_err(&r.dir))?;
-        manifest.save(&r.dir)?;
+        Some(manifest)
+    }
+
+    /// A rewrite taken in, `saved` (its manifest) durable already: the files to delete after (its
+    /// inputs', and its own if it holds nothing).
+    fn take_commit(&mut self, built: Built, saved: Manifest) -> Result<(Maintained, Vec<PathBuf>), StoreError> {
+        let Built { rewrite: r, block } = built;
+        let held = r.epoch == self.epoch && r.from.iter().all(|(seq, f)| self.blocks.iter().any(|b| b.seq == *seq && b.file == *f));
+        if !held {
+            return Err(StoreError::Moved);
+        }
+        let bytes = block.bytes;
+        let empty = block.is_empty();
+        let mut manifest = saved;
         // The manifest's numbering went on while this was built: keep what this store reserved.
         manifest.next_seq = manifest.next_seq.max(self.manifest.next_seq);
         self.manifest = manifest;
         self.blocks.retain(|b| !r.from.iter().any(|(_, f)| *f == b.file));
+        let mut gone: Vec<PathBuf> = r.from.iter().map(|(_, f)| r.dir.join(f)).collect();
         if empty {
             drop(block);
-            remove_if_there(&path)?;
+            gone.push(r.dir.join(&r.file));
         } else {
             let at = self.blocks.partition_point(|x| x.seq < r.seq);
             self.blocks.insert(at, OpenBlock { seq: r.seq, file: r.file.clone(), block });
         }
-        for (_, f) in &r.from {
-            remove_if_there(&r.dir.join(f))?;
-        }
-        Ok(Maintained { blocks_written: u64::from(!empty), blocks_removed: r.from.len() as u64, bytes_written: if empty { 0 } else { bytes }, series_dropped: 0 })
+        Ok((Maintained { blocks_written: u64::from(!empty), blocks_removed: r.from.len() as u64, bytes_written: if empty { 0 } else { bytes }, series_dropped: 0 }, gone))
     }
 
     /// Deletes the files wholly older than the durable cutoff (quick: no file is rewritten). The
     /// index is the cutoff's already ([`Store::retain_logical`]); only the files change.
     pub fn drop_expired(&mut self) -> Result<Maintained, StoreError> {
-        let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
+        let Some(e) = self.expired() else { return Ok(Maintained::default()) };
+        e.manifest.save(&e.dir)?;
+        let done = self.take_expired(&e);
+        for f in e.files() {
+            remove_if_there(&f)?;
+        }
+        Ok(done)
+    }
+
+    /// The files wholly older than the durable cutoff, and the manifest without them; none if none.
+    fn expired(&self) -> Option<Expired> {
+        let dir = self.dir.clone()?;
         let cutoff = self.manifest.cutoff;
-        let mut done = Maintained::default();
-        let logs_gone = self.logs.retain(self.manifest.logs_cutoff.saturating_mul(1_000_000));
-        let gone: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
-        if logs_gone.is_empty() && gone.is_empty() {
-            return Ok(done);
+        let logs = self.logs.expired(self.manifest.logs_cutoff.saturating_mul(1_000_000));
+        let blocks: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
+        if logs.is_empty() && blocks.is_empty() {
+            return None;
         }
         let mut manifest = self.manifest.clone();
-        manifest.logs.retain(|e| !logs_gone.contains(&e.file));
-        manifest.blocks.retain(|e| !gone.contains(&e.file));
-        manifest.save(&dir)?;
+        manifest.logs.retain(|e| !logs.contains(&e.file));
+        manifest.blocks.retain(|e| !blocks.contains(&e.file));
+        Some(Expired { dir, manifest, blocks, logs })
+    }
+
+    /// Expired files taken out, their manifest durable already.
+    fn take_expired(&mut self, e: &Expired) -> Maintained {
+        self.logs.drop_files(&e.logs);
+        self.blocks.retain(|b| !e.blocks.contains(&b.file));
+        let mut manifest = e.manifest.clone();
+        manifest.next_seq = manifest.next_seq.max(self.manifest.next_seq);
         self.manifest = manifest;
-        self.blocks.retain(|b| !gone.contains(&b.file));
-        for f in logs_gone.iter().chain(&gone) {
-            remove_if_there(&dir.join(f))?;
-        }
-        done.blocks_removed = (logs_gone.len() + gone.len()) as u64;
-        Ok(done)
+        Maintained { blocks_removed: (e.logs.len() + e.blocks.len()) as u64, ..Maintained::default() }
     }
 
     /// Deletes what the durable cutoff left behind: files wholly older are removed, and a block
@@ -1169,10 +1267,11 @@ impl Store {
         for e in self.manifest.blocks.iter().chain(&self.manifest.logs) {
             remove_if_there(&dir.join(&e.file))?;
         }
-        let (epoch, feed, touched) = (self.epoch + 1, self.feed.take(), self.touched.take());
+        let (epoch, feed, touched, lock) = (self.epoch + 1, self.feed.take(), self.touched.take(), self.manifest_lock.clone());
         *self = Self::open(&dir, self.hash)?;
         self.epoch = epoch;
         self.feed = feed;
+        self.manifest_lock = lock;
         if let Some(t) = &touched {
             t.everything();
         }
@@ -1527,14 +1626,6 @@ pub struct Roll<'c> {
     pub cols: &'c [Col],
 }
 
-fn restore(head: &mut [HeadSeries], taken: Vec<(u32, Vec<Chunk>)>) {
-    for (id, chunks) in taken {
-        if let Some(h) = head.get_mut(id as usize) {
-            h.restore(chunks);
-        }
-    }
-}
-
 /// Merges sorted parts (oldest write first) into `ts` and `values`: at a time, the last part's
 /// sample.
 fn merge_parts(parts: Vec<(Vec<i64>, Vec<f64>)>, ts: &mut Vec<i64>, values: &mut Vec<f64>) {
@@ -1624,6 +1715,82 @@ fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64, mut windows: Option<&mut B
         n += 1;
     }
     Ok((kept, n, ahead))
+}
+
+fn read_store(store: &RwLock<Store>) -> RwLockReadGuard<'_, Store> {
+    store.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_store(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+    store.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+// The store's files changed beside queries (`docs/observe.md` §4.5). A cut, a rewrite taken in and
+// files expired each write their files and save the manifest under a shared hold of the store, or
+// none, and take the change in under an exclusive hold that writes nothing: a query never waits on
+// the disk. Each holds the manifest lock throughout, taken before the store's own and never while
+// holding it: one change of the files at a time, and no thread waits for the store's exclusive hold
+// while another holds a shared one to write (a waiting writer would hold every new reader back).
+
+/// A cut ([`Store::cut`]) beside queries, by the one thread that applies (nothing changes the
+/// head meanwhile): its files written and its manifest saved under a shared hold, taken in under
+/// an exclusive one.
+pub fn cut_shared(store: &RwLock<Store>, at: Point) -> Result<Maintained, StoreError> {
+    let lock = read_store(store).manifest_lock();
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let written = read_store(store).write_cut(at)?;
+    let taken = write_store(store).install_cut(written);
+    match taken {
+        // Something applied meanwhile (not as the group's thread cuts): cut under the hold.
+        Err(StoreError::Moved) => write_store(store).cut(at),
+        done => done,
+    }
+}
+
+/// The rewrite maintenance makes next (a merge, or a block retention halves), its file reserved;
+/// built apart ([`Rewrite::build`]) and taken in by [`commit_shared`].
+pub fn plan_shared(store: &RwLock<Store>) -> Option<Rewrite> {
+    let lock = read_store(store).manifest_lock();
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = write_store(store);
+    s.plan_merge().or_else(|| s.plan_retention())
+}
+
+/// A rewrite built apart, taken in beside queries ([`Store::commit`]): its manifest saved with no
+/// hold of the store, taken in under an exclusive one, its inputs deleted after.
+pub fn commit_shared(store: &RwLock<Store>, built: Built) -> Result<Maintained, StoreError> {
+    let lock = read_store(store).manifest_lock();
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let manifest = read_store(store).commit_manifest(&built);
+    let dir = built.rewrite.dir.clone();
+    let Some(manifest) = manifest else {
+        let path = dir.join(&built.rewrite.file);
+        drop(built);
+        remove_if_there(&path)?;
+        return Ok(Maintained::default());
+    };
+    manifest::sync_dir(&dir).map_err(io_err(&dir))?;
+    manifest.save(&dir)?;
+    let (done, gone) = write_store(store).take_commit(built, manifest)?;
+    for p in gone {
+        remove_if_there(&p)?;
+    }
+    Ok(done)
+}
+
+/// Files wholly older than the durable cutoff deleted beside queries ([`Store::drop_expired`]):
+/// the manifest without them saved with no hold of the store, taken in under an exclusive one, the
+/// files deleted after.
+pub fn drop_expired_shared(store: &RwLock<Store>) -> Result<Maintained, StoreError> {
+    let lock = read_store(store).manifest_lock();
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(e) = read_store(store).expired() else { return Ok(Maintained::default()) };
+    e.manifest.save(&e.dir)?;
+    let done = write_store(store).take_expired(&e);
+    for f in e.files() {
+        remove_if_there(&f)?;
+    }
+    Ok(done)
 }
 
 #[cfg(test)]

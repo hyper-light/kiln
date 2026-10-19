@@ -43,6 +43,16 @@ struct Conn {
     s: Option<BufReader<TcpStream>>,
 }
 
+/// A dashboard query read in the soak: when, which, how long in all, and where that went.
+struct Read {
+    at_s: f64,
+    which: usize,
+    us: u64,
+    queued_us: u64,
+    waited_us: u64,
+    took_us: u64,
+}
+
 struct Answered {
     code: u16,
     retry_after: Option<u64>,
@@ -857,16 +867,20 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     // A dashboard: one series and every host, over the last 15 minutes, every 2 s.
     let reader = {
         let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
-        std::thread::spawn(move || -> (Vec<u64>, Vec<String>) {
+        std::thread::spawn(move || -> (Vec<Read>, Vec<String>) {
             let (mut took, mut errors) = (Vec::new(), Vec::new());
             let mut conn = Conn::new(port);
             while !stop.load(Ordering::Relaxed) {
                 let now = common::now_ms();
-                for q in ["avg:load.v{host:load-0,s:7}", "sum:load.v{*} by {host}"] {
+                for (which, q) in ["avg:load.v{host:load-0,s:7}", "sum:load.v{*} by {host}"].into_iter().enumerate() {
                     let body = serde_json::to_vec(&json!({ "query": q, "from": now - 900_000, "to": now })).unwrap_or_default();
                     let t = Instant::now();
                     match conn.send("/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body) {
-                        Ok(a) if a.code == 200 => took.push(t.elapsed().as_micros() as u64),
+                        Ok(a) if a.code == 200 => {
+                            let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or_default();
+                            let us = |k: &str| (at(&v, &[k]).as_f64().unwrap_or(0.0) * 1000.0) as u64;
+                            took.push(Read { at_s: started.elapsed().as_secs_f64(), which, us: t.elapsed().as_micros() as u64, queued_us: us("queued_ms"), waited_us: us("waited_ms"), took_us: us("took_ms") });
+                        }
                         Ok(a) => errors.push(format!("{q}: {}", a.code)),
                         Err(e) => errors.push(format!("{q}: {e}")),
                     }
@@ -910,7 +924,7 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
         all.late += s.late;
     }
     let (posted, log_errors) = logs.join().map_err(|_| anyhow::anyhow!("the log sender panicked"))?;
-    let (mut read, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
+    let (read, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
     anyhow::ensure!(all.errors.is_empty() && log_errors.is_empty() && read_errors.is_empty(), "errors: {:?} {:?} {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), log_errors.iter().take(5).collect::<Vec<_>>(), read_errors.iter().take(5).collect::<Vec<_>>(), f.logs());
     // Every point and record taken, stored once.
     let settled = Instant::now();
@@ -938,8 +952,32 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     anyhow::ensure!(dropped == 0, "{dropped} dropped for room after being taken");
     let (index, digest) = f.verify(2)?;
     all.latencies_us.sort_unstable();
-    read.sort_unstable();
     let ms = |us: u64| us as f64 / 1000.0;
+    // Where a query's time went, its slowest hundredth apart: a thread to read on, the store, the
+    // reading, or the rest (the request's way there and back).
+    for (which, name) in [(0, "one series"), (1, "by host")] {
+        let mut mine: Vec<&Read> = read.iter().filter(|r| r.which == which).collect();
+        mine.sort_unstable_by_key(|r| r.us);
+        let slow = mine.get(mine.len() * 99 / 100..).unwrap_or(&[]);
+        let med = |f: fn(&Read) -> u64| {
+            let mut v: Vec<u64> = slow.iter().map(|r| f(r)).collect();
+            v.sort_unstable();
+            v.get(v.len() / 2).copied().unwrap_or(0)
+        };
+        let lat: Vec<u64> = mine.iter().map(|r| r.us).collect();
+        eprintln!(
+            "  {name:<10} p50 {:.2} ms, p99 {:.2} ms, most {:.2} ms; its slowest hundredth (median): queued {:.2}, waited for the store {:.2}, read {:.2} ms; at {:?} s",
+            ms(pct(&lat, 0.5)),
+            ms(pct(&lat, 0.99)),
+            ms(pct(&lat, 1.0)),
+            ms(med(|r| r.queued_us)),
+            ms(med(|r| r.waited_us)),
+            ms(med(|r| r.took_us)),
+            slow.iter().rev().take(8).map(|r| r.at_s.round() as u64).collect::<Vec<_>>()
+        );
+    }
+    let mut read: Vec<u64> = read.iter().map(|r| r.us).collect();
+    read.sort_unstable();
     eprintln!("  taken      {} points ({:.0} a second), {} refused (503, sent again), the senders {} times a second behind; {posted} log records", all.taken, all.taken as f64 / ran.as_secs_f64(), all.refused, all.late);
     eprintln!("  a request  p50 {:.2} ms, p99 {:.2} ms; a dashboard query p50 {:.2} ms, p99 {:.2} ms", ms(pct(&all.latencies_us, 0.5)), ms(pct(&all.latencies_us, 0.99)), ms(pct(&read, 0.5)), ms(pct(&read, 0.99)));
     eprintln!("  where      the server's {} (of {:.0} MiB anonymous); the runner's {} (of {:.0})", anon_by_mapping(server_pid), rss(server_pid).1, anon_by_mapping(runner_pid), rss(runner_pid).1);

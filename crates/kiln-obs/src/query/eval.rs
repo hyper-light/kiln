@@ -1353,22 +1353,12 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
     let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
     let mut group_tags: Vec<Vec<(String, String)>> = Vec::new();
     let mut acc: Vec<Acc> = Vec::new();
-    let (mut ts, mut vs) = (Vec::new(), Vec::new());
-    let mut buckets = vec![f64::NAN; grid.n];
-    let (from, end) = (spans.start(0), spans.start(grid.n));
-    // `.weighted()`: a gauge series' samples a bucket, then its weights; its interval, the median
-    // gap between its samples (learned, so a series reporting every 10 s and one every 60 s weigh
-    // alike over a bucket they both covered). One with too few samples to tell takes the query's,
-    // the median of the others', once they are known.
-    let mut counts = if q.weighted { vec![0.0; grid.n] } else { Vec::new() };
-    let (mut gaps, mut intervals) = if q.weighted { (Vec::with_capacity(INTERVAL_GAPS), Vec::with_capacity(ids.len())) } else { (Vec::new(), Vec::new()) };
-    let mut pending: Vec<(usize, usize, f64, f64)> = Vec::new();
-    // A grid of whole windows of a tier is read window by window (`crate::rollup`): from rollups
-    // where a block holds them.
-    let tier = if q.weighted { None } else { tier_for(spans) };
-    let (mut rolled, mut window_n) = (rolled_for(tier, from, end, q), Vec::new());
+    let mut group_of: Vec<usize> = Vec::with_capacity(ids.len());
     for &id in &ids {
-        let Some(s) = store.series(id) else { continue };
+        let Some(s) = store.series(id) else {
+            group_of.push(usize::MAX);
+            continue;
+        };
         key.clear();
         key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
         let g = match groups.get(&key) {
@@ -1384,38 +1374,56 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
                 g
             }
         };
-        ts.clear();
-        vs.clear();
-        // A counter's increase into the first bucket needs the sample before it.
-        let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
-        let weighted = q.weighted && s.kind() == Kind::Gauge;
-        if let Some(width) = tier.filter(|_| !weighted) {
-            rolled.clear();
-            let roll = Roll { width, from, to: end, kind: s.kind(), cols: columns_for(s.kind(), q) };
-            store.read_rolled(id, from.saturating_sub(lookback), end.saturating_sub(1), &roll, scratch, &mut ts, &mut vs, &mut rolled)?;
-            scanned.0 += 1;
-            scanned.1 += ts.len() as u64 + rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>();
-            rollup_windows(s.kind(), q, spans, width, &ts, &vs, &rolled, &mut buckets, &mut window_n);
-        } else {
+        group_of.push(g);
+    }
+    let (from, end) = (spans.start(0), spans.start(grid.n));
+    // A grid of whole windows of a tier is read window by window (`crate::rollup`): from rollups
+    // where a block holds them.
+    let tier = if q.weighted { None } else { tier_for(spans) };
+    let mut pending: Vec<(usize, usize, f64, f64)> = Vec::new();
+    let mut intervals = Vec::new();
+    if q.weighted {
+        // `.weighted()`: a gauge series' samples a bucket, then its weights; its interval, the median
+        // gap between its samples (learned, so a series reporting every 10 s and one every 60 s weigh
+        // alike over a bucket they both covered). One with too few samples to tell takes the query's,
+        // the median of the others', once they are known.
+        let mut counts = vec![0.0; grid.n];
+        let mut gaps = Vec::with_capacity(INTERVAL_GAPS);
+        intervals.reserve(ids.len());
+        let (mut ts, mut vs) = (Vec::new(), Vec::new());
+        let mut buckets = vec![f64::NAN; grid.n];
+        for (&id, &g) in ids.iter().zip(&group_of) {
+            let Some(s) = store.series(id) else { continue };
+            ts.clear();
+            vs.clear();
+            // A counter's increase into the first bucket needs the sample before it.
+            let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
+            let weighted = s.kind() == Kind::Gauge;
             store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
             scanned.0 += 1;
             scanned.1 += ts.len() as u64;
             rollup(s.kind(), q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
-        }
-        let Some(a) = acc.get_mut(g) else { continue };
-        if !weighted {
-            a.add(&buckets, None);
-            continue;
-        }
-        match interval_ms(&ts, &vs, &mut gaps) {
-            Some(d) => {
-                intervals.push(d);
-                weigh(&mut counts, d, spans);
-                a.add(&buckets, Some(&counts));
+            let Some(a) = acc.get_mut(g) else { continue };
+            if !weighted {
+                a.add(&buckets, None);
+                continue;
             }
-            // Under two samples: one bucket at the most.
-            None => pending.extend(buckets.iter().zip(&counts).enumerate().filter(|(_, (v, _))| !v.is_nan()).map(|(i, (&v, &c))| (g, i, v, c))),
+            match interval_ms(&ts, &vs, &mut gaps) {
+                Some(d) => {
+                    intervals.push(d);
+                    weigh(&mut counts, d, spans);
+                    a.add(&buckets, Some(&counts));
+                }
+                // Under two samples: one bucket at the most.
+                None => pending.extend(buckets.iter().zip(&counts).enumerate().filter(|(_, (v, _))| !v.is_nan()).map(|(i, (&v, &c))| (g, i, v, c))),
+            }
         }
+    } else {
+        let at = Reading { store, q, grid, spans, tier, from, end };
+        let mut reader = Reader::new(&at, std::mem::take(scratch));
+        let read = read_groups(&at, &ids, &group_of, &mut acc, &mut reader, scanned);
+        *scratch = reader.scratch;
+        read?;
     }
     if !pending.is_empty() {
         let d = if intervals.is_empty() {
@@ -1442,6 +1450,177 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
     }
     out.sort_by(|a, b| a.tags.cmp(&b.tags));
     Ok(out)
+}
+
+/// What every series of a query is read at: its store, its query, its grid and the range read.
+#[derive(Clone, Copy)]
+struct Reading<'a> {
+    store: &'a Store,
+    q: &'a MetricQuery,
+    grid: Grid,
+    spans: Spans<'a>,
+    tier: Option<i64>,
+    from: i64,
+    end: i64,
+}
+
+/// What a thread reading series holds, reused series to series.
+struct Reader {
+    scratch: Scratch,
+    ts: Vec<i64>,
+    vs: Vec<f64>,
+    buckets: Vec<f64>,
+    rolled: Rolled,
+    window_n: Vec<f64>,
+}
+
+impl Reader {
+    fn new(at: &Reading<'_>, scratch: Scratch) -> Self {
+        Self { scratch, ts: Vec::new(), vs: Vec::new(), buckets: vec![f64::NAN; at.grid.n], rolled: rolled_for(at.tier, at.from, at.end, at.q), window_n: Vec::new() }
+    }
+
+    /// Series `id`'s values on the grid, into `self.buckets`: the samples it read, or none if the
+    /// store holds no such series.
+    fn read(&mut self, at: &Reading<'_>, id: u32) -> Result<Option<u64>, QueryError> {
+        let Some(s) = at.store.series(id) else { return Ok(None) };
+        self.ts.clear();
+        self.vs.clear();
+        // A counter's increase into the first bucket needs the sample before it.
+        let lookback = if s.kind() == Kind::Counter { at.grid.step } else { 0 };
+        if let Some(width) = at.tier {
+            self.rolled.clear();
+            let roll = Roll { width, from: at.from, to: at.end, kind: s.kind(), cols: columns_for(s.kind(), at.q) };
+            at.store.read_rolled(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &roll, &mut self.scratch, &mut self.ts, &mut self.vs, &mut self.rolled)?;
+            rollup_windows(s.kind(), at.q, at.spans, width, &self.ts, &self.vs, &self.rolled, &mut self.buckets, &mut self.window_n);
+            Ok(Some(self.ts.len() as u64 + self.rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>()))
+        } else {
+            at.store.read_with(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &mut self.scratch, &mut self.ts, &mut self.vs)?;
+            rollup(s.kind(), at.q, at.spans, &self.ts, &self.vs, &mut self.buckets, None);
+            Ok(Some(self.ts.len() as u64))
+        }
+    }
+}
+
+/// How long a query reads its series on its own thread before it asks for helpers: one that is
+/// done by then does without them (a thread costs some tens of microseconds to start).
+const ALONE: std::time::Duration = std::time::Duration::from_millis(2);
+/// Series a thread reads a round, at the most, before what was read is added in: what a round of
+/// many threads holds is bounded (`grid.n` values a series).
+const ROUND: usize = 64;
+
+/// Helper threads queries may read on beside their own, taken and given back: half the machine's
+/// cores, less one, shared by every query at once.
+fn helpers_free() -> &'static std::sync::atomic::AtomicUsize {
+    static FREE: std::sync::OnceLock<std::sync::atomic::AtomicUsize> = std::sync::OnceLock::new();
+    FREE.get_or_init(|| std::sync::atomic::AtomicUsize::new(std::thread::available_parallelism().map_or(1, std::num::NonZero::get).div_ceil(2).saturating_sub(1)))
+}
+
+/// Helpers taken, given back as they go.
+struct Helpers(usize);
+
+impl Helpers {
+    fn take(want: usize) -> Self {
+        use std::sync::atomic::Ordering;
+        let free = helpers_free();
+        let got = free.try_update(Ordering::AcqRel, Ordering::Acquire, |f| Some(f - f.min(want))).map_or(0, |f| f.min(want));
+        Self(got)
+    }
+}
+
+impl Drop for Helpers {
+    fn drop(&mut self) {
+        helpers_free().fetch_add(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The threads every query reads on, when a test says so.
+#[cfg(test)]
+fn forced_threads() -> Option<usize> {
+    tests::threads()
+}
+
+#[cfg(not(test))]
+fn forced_threads() -> Option<usize> {
+    None
+}
+
+/// Every series of `ids` (in their fingerprints' order) read, and its values added into its
+/// group's (`group_of`) in that order, as one thread would add them: the same bits however they
+/// were read. On this thread alone while it is quick ([`ALONE`]); then, helpers free, a round at a
+/// time on as many threads, each round's values added in order after it.
+fn read_groups(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc], reader: &mut Reader, scanned: &mut (u64, u64)) -> Result<(), QueryError> {
+    let started = std::time::Instant::now();
+    let n = at.grid.n;
+    let mut helpers: Option<Helpers> = None;
+    let mut i = 0;
+    while i < ids.len() {
+        let left = ids.len() - i;
+        let forced = forced_threads();
+        if helpers.is_none() && forced.is_none() && left > ROUND && started.elapsed() >= ALONE {
+            helpers = Some(Helpers::take(left.div_ceil(ROUND) - 1));
+        }
+        let workers = forced.unwrap_or_else(|| helpers.as_ref().map_or(0, |h| h.0) + 1);
+        if workers == 1 {
+            let (Some(&id), Some(&g)) = (ids.get(i), group_of.get(i)) else { break };
+            if let Some(samples) = reader.read(at, id)? {
+                scanned.0 += 1;
+                scanned.1 += samples;
+                if let Some(a) = acc.get_mut(g) {
+                    a.add(&reader.buckets, None);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        let round = left.min(workers * ROUND);
+        let Some(part_ids) = ids.get(i..i + round) else { break };
+        let per = round.div_ceil(workers);
+        // Each part: its series' values, whether each was there, and the samples read.
+        type Part = Result<(Vec<f64>, Vec<bool>, u64), QueryError>;
+        let read_part = |r: &mut Reader, part: &[u32]| -> Part {
+            let mut values = Vec::with_capacity(part.len() * n);
+            let mut there = Vec::with_capacity(part.len());
+            let mut samples = 0;
+            for &id in part {
+                match r.read(at, id)? {
+                    Some(k) => {
+                        samples += k;
+                        values.extend_from_slice(&r.buckets);
+                        there.push(true);
+                    }
+                    None => {
+                        values.resize(values.len() + n, f64::NAN);
+                        there.push(false);
+                    }
+                }
+            }
+            Ok((values, there, samples))
+        };
+        let parts: Vec<Part> = std::thread::scope(|scope| {
+            let mut chunks = part_ids.chunks(per);
+            let mine = chunks.next().unwrap_or(&[]);
+            let handles: Vec<_> = chunks.map(|c| scope.spawn(move || read_part(&mut Reader::new(at, Scratch::default()), c))).collect();
+            let mut out = vec![read_part(reader, mine)];
+            out.extend(handles.into_iter().map(|h| h.join().unwrap_or(Err(QueryError::Invalid("a thread reading series failed".into())))));
+            out
+        });
+        let mut k = i;
+        for part in parts {
+            let (values, there, samples) = part?;
+            scanned.1 += samples;
+            for (series, &present) in values.chunks(n.max(1)).zip(&there) {
+                if present {
+                    scanned.0 += 1;
+                    if let Some(a) = group_of.get(k).and_then(|&g| acc.get_mut(g)) {
+                        a.add(series, None);
+                    }
+                }
+                k += 1;
+            }
+        }
+        i += round;
+    }
+    Ok(())
 }
 
 /// Gaps [`interval_ms`] reads at the most, spread over the series: a median of 64 has a standard
@@ -2298,6 +2477,61 @@ fn pointwise(f: Func, x: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// Threads every query reads its series on (a test's: none said, as the store chooses).
+    static THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub(super) fn threads() -> Option<usize> {
+        match THREADS.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Queries over many series read on one thread and on several (as many as a round holds, and
+    /// rounds after rounds): the same answers to the bit, the values summed in one order.
+    #[test]
+    fn a_query_read_on_many_threads_answers_as_on_one_to_the_bit() {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut rng = crate::testkit::Rng::new(29);
+        let mut b = Builder::new();
+        for i in 0..700u32 {
+            let host = format!("h{}", i % 5);
+            let kind = [Kind::Gauge, Kind::Count, Kind::Counter][i as usize % 3];
+            let k = SeriesKey::new(["a", "b", "c"][i as usize % 3], [("host", host.as_str()), ("s", i.to_string().as_str())], kind).unwrap();
+            b.define(&k);
+            let mut c = 0.0;
+            // Values whose sums depend on their order: twelve orders of magnitude apart.
+            let mut pts = Vec::new();
+            for j in 0..400i64 {
+                if rng.below(9) == 0 {
+                    continue;
+                }
+                c += rng.f64() * 1e6;
+                pts.push((j * 9_000, if kind == Kind::Counter { c } else { rng.f64() * 10f64.powi(rng.below(12) as i32) }));
+            }
+            b.run(k.fp, pts);
+        }
+        s.apply(&b.finish()).unwrap();
+        let queries = ["sum:a{*} by {host}", "avg:a{*}", "sum:b{*} by {host}.as_count()", "sum:c{*} by {host}.as_rate()", "max:a{*} by {host}", "p90:a{*}", "sum:a{*} by {host}.rollup(sum, 300)"];
+        for q in queries {
+            let mut r = Request::new(q, 0, 3_600_000);
+            r.step = Some(if q.contains("300") { 300_000 } else { 30_000 });
+            THREADS.store(1, std::sync::atomic::Ordering::SeqCst);
+            let one = eval(&s, &r).unwrap();
+            for threads in [2usize, 3, 7] {
+                THREADS.store(threads, std::sync::atomic::Ordering::SeqCst);
+                let many = eval(&s, &r).unwrap();
+                assert_eq!(many.series.len(), one.series.len(), "{q}");
+                for (a, b) in many.series.iter().zip(&one.series) {
+                    assert_eq!(a.tags, b.tags, "{q}");
+                    assert_eq!(a.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{q} on {threads} threads");
+                }
+                assert_eq!((many.scanned_series, many.scanned_samples), (one.scanned_series, one.scanned_samples), "{q}");
+            }
+        }
+        THREADS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
     use super::*;
     use crate::batch::{Builder, SeriesKey};
     use crate::query::calendar::{civil_from_days, days_from_civil};

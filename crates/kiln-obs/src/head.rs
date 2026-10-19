@@ -184,24 +184,36 @@ impl HeadSeries {
         first.zip(last)
     }
 
-    /// Takes the series' samples as chunks in time order that do not overlap (late writes merged
-    /// in first), leaving the series empty: what a cut writes to a block.
-    pub fn drain_chunks(&mut self) -> Result<Vec<Chunk>, DecodeError> {
+    /// The series' samples as chunks in time order that do not overlap (late writes merged in),
+    /// the series left as it is (a cut writes them under a shared hold, then clears it): its
+    /// closed chunks borrowed, and those made anew (the open one finished, or every one when late
+    /// writes are merged in).
+    pub fn cut_chunks(&self) -> Result<(&[Chunk], Vec<Chunk>), DecodeError> {
         if self.late.is_some() {
-            self.rewrite()?;
+            let (mut ts, mut vs) = (Vec::new(), Vec::new());
+            self.read(i64::MIN, i64::MAX, &mut ts, &mut vs)?;
+            let mut made = Vec::with_capacity(ts.len().div_ceil(CHUNK_SAMPLES as usize));
+            let mut open = Encoder::with_capacity(chunk_capacity());
+            for (t, v) in ts.into_iter().zip(vs) {
+                if open.count() >= CHUNK_SAMPLES {
+                    made.push(std::mem::replace(&mut open, Encoder::with_capacity(chunk_capacity())).finish());
+                }
+                let _ = open.push(t, v);
+            }
+            if open.count() > 0 {
+                made.push(open.finish());
+            }
+            return Ok((&[], made));
         }
-        let mut chunks = std::mem::take(&mut self.closed);
-        let open = std::mem::take(&mut self.open);
-        if open.count() > 0 {
-            chunks.push(open.finish());
-        }
-        Ok(chunks)
+        let open = if self.open.count() > 0 { vec![self.open.clone().finish()] } else { Vec::new() };
+        Ok((&self.closed, open))
     }
 
-    /// Puts back what [`HeadSeries::drain_chunks`] took (a cut that failed to write).
-    pub fn restore(&mut self, chunks: Vec<Chunk>) {
-        self.closed = chunks;
+    /// Empties the series: what a cut wrote ([`HeadSeries::cut_chunks`]) is in its block now.
+    pub fn clear(&mut self) {
+        self.closed = Vec::new();
         self.open = Encoder::new();
+        self.late = None;
     }
 
     /// Samples held (late ones that correct a held time counted once each).
@@ -304,6 +316,38 @@ mod tests {
         vs.clear();
         s.read(2395, 2405, &mut ts, &mut vs).unwrap();
         assert_eq!((ts, vs), (vec![2400], vec![240.0]));
+    }
+
+    /// What a cut writes of a series: its samples in time order, chunks that do not overlap, late
+    /// writes merged in; the series as it was until it is cleared.
+    #[test]
+    fn a_cut_s_chunks_are_the_series_in_order_and_leave_it_as_it_was() {
+        let mut rng = Rng::new(11);
+        for late in [0usize, 7, 300] {
+            let mut s = HeadSeries::default();
+            for i in 0..700i64 {
+                s.append(i * 10, i as f64).unwrap();
+            }
+            for _ in 0..late {
+                let t = rng.below(7_000) as i64 + 5;
+                s.append(t, -1.0).unwrap();
+            }
+            let (mut want_t, mut want_v) = (Vec::new(), Vec::new());
+            s.read(i64::MIN, i64::MAX, &mut want_t, &mut want_v).unwrap();
+            let before = (s.chunks(), s.samples());
+            let (closed, made) = s.cut_chunks().unwrap();
+            let (mut ts, mut vs) = (Vec::new(), Vec::new());
+            let mut prev_last = i64::MIN;
+            for c in closed.iter().chain(&made) {
+                assert!(c.first > prev_last, "chunks overlap: {} after {prev_last}", c.first);
+                prev_last = c.last;
+                c.as_ref().decode_range_into((c.first, c.last), i64::MIN, i64::MAX, &mut ts, &mut vs).unwrap();
+            }
+            assert_eq!((&ts, vs.iter().map(|v| v.to_bits()).collect::<Vec<_>>()), (&want_t, want_v.iter().map(|v| v.to_bits()).collect::<Vec<_>>()), "{late} late");
+            assert_eq!((s.chunks(), s.samples()), before, "the series untouched");
+            s.clear();
+            assert_eq!((s.chunks(), s.samples(), s.span()), (0, 0, None));
+        }
     }
 
     #[test]

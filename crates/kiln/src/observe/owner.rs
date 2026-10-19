@@ -1570,15 +1570,13 @@ fn maintain(store: &Shared, rx: &Receiver<()>, dir: &Path) {
             }
             while rx.try_recv().is_ok() {}
             loop {
-                let plan = {
-                    let mut s = store.write().unwrap_or_else(PoisonError::into_inner);
-                    tracing::debug!(blocks = ?s.block_list().iter().rev().take(4).collect::<Vec<_>>(), "observe's maintenance looks");
-                    if let Err(e) = s.drop_expired() {
-                        tracing::warn!(error = %e, "observe's expired files were not deleted");
-                    }
-                    s.plan_merge().or_else(|| s.plan_retention())
-                };
-                let Some(plan) = plan else { break };
+                // Each change of the files beside queries (`kiln_obs::store::cut_shared`): written
+                // with no exclusive hold of the store, taken in under a brief one.
+                tracing::debug!(blocks = ?store.read().unwrap_or_else(PoisonError::into_inner).block_list().iter().rev().take(4).collect::<Vec<_>>(), "observe's maintenance looks");
+                if let Err(e) = kiln_obs::store::drop_expired_shared(store) {
+                    tracing::warn!(error = %e, "observe's expired files were not deleted");
+                }
+                let Some(plan) = kiln_obs::store::plan_shared(store) else { break };
                 // A rewrite writes its block before its inputs go: only with room for it.
                 let inputs = plan.input_bytes();
                 if super::disk_free(dir).is_some_and(|f| f < inputs.saturating_add(DISK_MARGIN)) {
@@ -1587,7 +1585,7 @@ fn maintain(store: &Shared, rx: &Receiver<()>, dir: &Path) {
                 }
                 tracing::debug!(inputs, "observe's rewrite planned");
                 match plan.build() {
-                    Ok(built) => match store.write().unwrap_or_else(PoisonError::into_inner).commit(built) {
+                    Ok(built) => match kiln_obs::store::commit_shared(store, built) {
                         Ok(done) => tracing::debug!(?done, "observe's rewrite taken in"),
                         Err(e) => {
                             tracing::warn!(error = %e, "observe's rewritten block was not taken in");

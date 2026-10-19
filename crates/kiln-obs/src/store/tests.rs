@@ -902,6 +902,76 @@ fn a_maintenance_thread_rewrites_while_the_store_applies_and_cuts() {
     assert_eq!(view(&shared.read().unwrap()), view(&c));
 }
 
+/// The files changed beside queries (`cut_shared`, `plan_shared`, `commit_shared`,
+/// `drop_expired_shared`): one thread applies and cuts as the group's does, another merges,
+/// rewrites and expires as maintenance does, two read throughout as queries do. Every view is the
+/// reference store's, and so is the store opened again from its files with the entries after its
+/// durable point applied.
+#[test]
+fn files_changed_beside_queries_answer_as_one_store_and_open_again_alike() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, RwLock};
+    let entries = stream(23, 900);
+    let d = tempfile::tempdir().unwrap();
+    let shared = Arc::new(RwLock::new(Store::open(d.path(), Keyed::with_keys(1, 1)).unwrap()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
+    let maintenance = {
+        let (shared, stop) = (shared.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut taken = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                crate::store::drop_expired_shared(&shared).unwrap();
+                match crate::store::plan_shared(&shared) {
+                    Some(p) => {
+                        if let Ok(built) = p.build() {
+                            taken += crate::store::commit_shared(&shared, built).unwrap().blocks_removed;
+                        }
+                    }
+                    None => std::thread::yield_now(),
+                }
+            }
+            taken
+        })
+    };
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (shared, stop, reads) = (shared.clone(), stop.clone(), reads.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let s = shared.read().unwrap();
+                    crate::query::eval::eval(&s, &crate::query::eval::Request::new("sum:m0{*} by {host}", 0, 1_000_000)).unwrap();
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    let mut c = Store::new(Keyed::with_keys(2, 2));
+    for i in 0..entries.len() {
+        apply_at(&mut c, &entries, i, i + 1);
+        apply_at(&mut shared.write().unwrap(), &entries, i, i + 1);
+        if i % 5 == 4 {
+            crate::store::cut_shared(&shared, Point { index: i as u64 + 1, term: 1 }).unwrap();
+        }
+        if i % 150 == 149 {
+            assert_eq!(view(&shared.read().unwrap()), view(&c), "after entry {}", i + 1);
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let taken = maintenance.join().unwrap();
+    for r in readers {
+        r.join().unwrap();
+    }
+    assert!(taken > 0 && reads.load(Ordering::Relaxed) > 0, "rewrites taken in ({taken}) and reads made");
+    assert_eq!(view(&shared.read().unwrap()), view(&c));
+    // Opened again from its files: the durable point's state, then the entries after it.
+    let durable = shared.read().unwrap().durable().index;
+    drop(shared);
+    let mut again = Store::open(d.path(), Keyed::with_keys(3, 3)).unwrap();
+    apply_at(&mut again, &entries, durable as usize, entries.len());
+    assert_eq!(view(&again), view(&c), "opened again at {durable}");
+}
+
 /// Cuts as a busy group makes them, a big one and then a small one (a compaction's, then a
 /// snapshot's), and the logarithmic method's merges after each: the blocks stay a handful, each
 /// more than twice the next newer, however long it goes on. (Merging only the newest pair stalled

@@ -85,13 +85,18 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
 
 /// Writes `blocks` to `path`, durably; returns it open.
 pub fn write(path: &Path, blocks: &[LogBlock]) -> Result<LogFile, LogFileError> {
+    write_refs(path, &blocks.iter().collect::<Vec<_>>())
+}
+
+/// As [`write`], of blocks held elsewhere.
+pub fn write_refs(path: &Path, blocks: &[&LogBlock]) -> Result<LogFile, LogFileError> {
     let mut out = Vec::with_capacity(HEADER + blocks.iter().map(|b| b.text.len() + b.summary_bytes()).sum::<usize>() + FOOTER);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT.to_le_bytes());
     let mut index = Vec::new();
     varint::put(&mut index, blocks.len() as u64);
     let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
-    for b in blocks {
+    for &b in blocks {
         let summary_off = out.len() as u64;
         let mut summary = Vec::new();
         let stripped = LogBlock { text: Vec::new(), ..b.clone() };

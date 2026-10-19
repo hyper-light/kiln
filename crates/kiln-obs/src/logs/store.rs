@@ -91,6 +91,37 @@ impl LogStore {
         Ok(Some(f))
     }
 
+    /// Writes every unwritten row to `path` (the head sealed as a copy), the store left as it is
+    /// (a cut writing under a shared hold); none if there was nothing. [`LogStore::written`] takes
+    /// the file in after.
+    pub fn write_unwritten(&self, path: &Path) -> Result<Option<LogFile>, LogStoreError> {
+        let head = if self.head.is_empty() {
+            None
+        } else {
+            let mut refs: Vec<RecordRef<'_>> = Vec::new();
+            for (raw, n) in &self.head {
+                let mut rows = Rows::new(raw, *n as usize);
+                while let Some(r) = rows.next_row()? {
+                    refs.push(r);
+                }
+            }
+            Some(LogBlock::seal(&refs))
+        };
+        let blocks: Vec<&LogBlock> = self.sealed.iter().chain(head.as_ref()).collect();
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(super::file::write_refs(path, &blocks)?))
+    }
+
+    /// The file [`LogStore::write_unwritten`] wrote, taken in: the rows it holds leave memory.
+    pub fn written(&mut self, file: HeldFile) {
+        self.head.clear();
+        self.head_bytes = 0;
+        self.sealed.clear();
+        self.files.push(file);
+    }
+
     /// Rows held in memory (head and sealed blocks not yet written).
     pub fn unwritten_rows(&self) -> u64 {
         self.head.iter().map(|h| u64::from(h.1)).sum::<u64>() + self.sealed.iter().map(|b| u64::from(b.rows)).sum::<u64>()
@@ -106,9 +137,19 @@ impl LogStore {
 
     /// Drops files wholly older than `cutoff` (ns); their names, for the caller to delete.
     pub fn retain(&mut self, cutoff: i64) -> Vec<String> {
-        let gone: Vec<String> = self.files.iter().filter(|f| f.log.max_ts < cutoff).map(|f| f.file.clone()).collect();
-        self.files.retain(|f| f.log.max_ts >= cutoff);
+        let gone = self.expired(cutoff);
+        self.drop_files(&gone);
         gone
+    }
+
+    /// The names of the files wholly older than `cutoff` (ns).
+    pub fn expired(&self, cutoff: i64) -> Vec<String> {
+        self.files.iter().filter(|f| f.log.max_ts < cutoff).map(|f| f.file.clone()).collect()
+    }
+
+    /// Files named no longer read (their manifest durable without them).
+    pub fn drop_files(&mut self, names: &[String]) {
+        self.files.retain(|f| !names.contains(&f.file));
     }
 
     /// The newest `limit` records in `[from, to]` (ns) that `search` matches.
