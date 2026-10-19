@@ -136,6 +136,20 @@ pub const KINDS: &[KindInfo] = &[
         secret: None,
         built: true,
     },
+    // CD providers (docs/deploy-api.md §8.3): an Argo CD instance kiln deploys through.
+    KindInfo {
+        kind: "argocd",
+        title: "Argo CD",
+        category: "cd",
+        mode: Mode::Token,
+        fields: &[
+            f("url", true, "its API server: https://argocd.example.com"),
+            f("namespace", false, "where its Applications live (argocd)"),
+            f("ca", false, "the PEM of the CA its certificate is signed by, when it isn't a public one"),
+        ],
+        secret: Some("an account's API token (argocd account generate-token --account <name>)"),
+        built: true,
+    },
     KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
     // Chat, paging and webhooks: where notifications go (docs/ci.md W11-R06, W19-R06).
     KindInfo { kind: "slack", title: "Slack", category: "notify", mode: Mode::Token, fields: &[f("channel", false, "the channel a bot token posts to when a rule names none (#ci)")], secret: Some("incoming webhook URL, or a bot token (xoxb-…)"), built: true },
@@ -484,6 +498,7 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
                 Ok(None) => Err("no token stored".into()),
                 Err(e) => Err(format!("{e:#}")),
             },
+            "argocd" => crate::deploy::argocd::verify(hub, &i.name).await,
             other => Err(format!("no check for {other} yet")),
         }
     };

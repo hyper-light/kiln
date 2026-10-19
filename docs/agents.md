@@ -241,7 +241,7 @@ console picks) and are answered with a `reply` update to that client.
 | `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
-| `move_on_limit` | `on` | at a limit, go on on another machine with room (`state.move_on_limit`) |
+| `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
 | `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too |
 
 ### Questions
@@ -360,10 +360,11 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
   text, at}`: the turn the limit cut off), `checkpoint?` (`{git_ref, commit, at}`), `tries`,
   `checking?`, `next_check?`. `pause_at?` — its stop point (percent). `manual_resume` — pauses end
   only when a person resumes them. `move_on_limit` — at a limit it goes on on another machine with
-  room.
+  room; `move_plan` (`{to?, kind?, model?}`, always sent by runners that take one) — where and in
+  what, as a person chose.
 
-`Info` (the lists) carries `limits`, `account`, `plan`, `left_behind`, `pause`, `pause_at` and
-`move_on_limit` too.
+`Info` (the lists) carries `limits`, `account`, `plan`, `left_behind`, `pause`, `pause_at`,
+`move_on_limit` and `move_plan` too.
 
 ## Usage limits: pause and resume
 
@@ -400,16 +401,28 @@ turn (`harness/pause.rs`):
   in one turn): at its next step, the command or edit under way finishing first. The turn it
   stopped goes on from there, first, once the limit resets. A turn waiting on you (an approval)
   is left to you. Off by default.
-- **Go on elsewhere.** With `move_on_limit` on (the usage badge, the agent's Settings, or the
-  paused line above the composer; off by default, a conversation at a time), a pause sends the
-  agent to another of your machines instead of waiting (`harness/elsewhere.rs`): one that is
+- **Go on elsewhere.** With `move_on_limit` on ("At a limit" under the usage badge and in the
+  agent's Settings: wait for the reset, go on wherever has room, or go on on a machine you pick,
+  then the harness and model there; off by default, a conversation at a time), a pause sends the
+  agent to another of your machines instead of waiting (`harness/elsewhere.rs`). A machine and a
+  harness chosen are the only ones it goes to; otherwise kiln picks one that is
   connected, takes sessions over (reach), and has the same harness signed in to another account,
   one kiln doesn't know to be as full. Failing that, another harness its conversation can be
   carried into (Claude Code ⇄ Codex), signed in with room, with the first model it lists there.
   Its own harness comes first, then a machine with a copy of its repository, then the emptiest
   account; a repository not there yet is copied over and kept in step. It moves as a move you ask
   for does (`docs/reach.md` §8), and goes on there unpaused, the cut-off turn first. With nowhere
-  to go its timeline says why, and kiln looks again every few minutes.
+  to go its timeline says why, and kiln looks again every few minutes. A runner that doesn't
+  take a choice (a kiln from before it) leaves it as it was, and the page says so after a few
+  seconds, with the way to upgrade it; one from before a machine could be chosen offers only
+  "wherever has room".
+- **Go on now.** The paused line above the composer: resume now, resume at the reset or not, or
+  go on now: here in another harness (Claude Code ⇄ Codex), or on another machine that takes
+  agents over, in its own harness or one its conversation can be carried into, with the model
+  chosen; the turn the limit cut off goes on there. What you do there that its runner doesn't do
+  (an older kiln: it stops again at its stop point as it resumes, or leaves a command it doesn't
+  know) is said after a few seconds, with the way to upgrade it, and at a stop point with what
+  works on it: resuming with the stop point off.
 - **Restarts.** A pause, its timer, its stop point and going on elsewhere are kept with the session
   on its machine (the runner's `harness.json`, the server's `local.json`) and go on after a restart.
 - **Queued meanwhile.** While it is paused the composer queues (its words and button say so), and

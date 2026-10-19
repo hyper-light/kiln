@@ -1073,6 +1073,7 @@ impl Registry {
                         last_turn: None,
                         keep_off: false,
                         move_on_limit: false,
+                        move_plan: Default::default(),
                         pause_at: None,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));

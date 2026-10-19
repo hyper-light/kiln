@@ -311,6 +311,33 @@ pub async fn resolve(registry: &Registry, reference: &Reference) -> anyhow::Resu
     Ok(Some(Resolved { digest, media_type, platforms }))
 }
 
+/// A repository's tags, as far as ten pages of a thousand go.
+pub async fn tags(registry: &Registry, repository: &str) -> anyhow::Result<Vec<String>> {
+    let scope = format!("repository:{repository}:pull");
+    let mut path = format!("/v2/{repository}/tags/list?n=1000");
+    let mut all = Vec::new();
+    for _ in 0..10 {
+        let resp = call(registry, Method::Get, &path, &scope).await?;
+        anyhow::ensure!(resp.is_success(), "{} answered {} for {repository}'s tags", registry.name, resp.status());
+        let next = resp.header("link").and_then(|l| next_page(l, &registry.base));
+        let v: serde_json::Value = serde_json::from_slice(&resp.bytes(MANIFEST_LIMIT).await?).context("the tag list doesn't read")?;
+        all.extend(v.get("tags").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).map(str::to_owned));
+        match next {
+            Some(n) => path = n,
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+/// The next page a `Link` header points at (`</v2/acme/web/tags/list?last=x&n=1000>; rel="next"`),
+/// as a path on the registry.
+fn next_page(link: &str, base: &str) -> Option<String> {
+    let target = link.split(',').find(|l| l.contains("rel=\"next\""))?.split(';').next()?.trim().strip_prefix('<')?.strip_suffix('>')?;
+    let path = target.strip_prefix(base).unwrap_or(target);
+    path.starts_with('/').then(|| path.to_owned())
+}
+
 /// The platforms an index lists, skipping attestation manifests (`unknown/unknown`).
 pub fn platforms_of(index: &[u8]) -> Vec<String> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(index) else { return Vec::new() };
@@ -362,6 +389,15 @@ pub fn docker_config(registry: &Registry) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tag_list_s_next_page_is_a_path_on_the_registry() {
+        let base = "https://ghcr.io";
+        assert_eq!(next_page(r#"</v2/acme/web/tags/list?last=1.2&n=1000>; rel="next""#, base).as_deref(), Some("/v2/acme/web/tags/list?last=1.2&n=1000"));
+        assert_eq!(next_page(r#"<https://ghcr.io/v2/acme/web/tags/list?last=1.2>; rel="next""#, base).as_deref(), Some("/v2/acme/web/tags/list?last=1.2"));
+        assert_eq!(next_page(r#"<https://elsewhere.example/v2/x>; rel="next""#, base), None, "never another host");
+        assert_eq!(next_page(r#"</v2/acme/web/tags/list?last=1.2>; rel="prev""#, base), None);
+    }
 
     #[test]
     fn references_normalize_as_docker_does() -> anyhow::Result<()> {

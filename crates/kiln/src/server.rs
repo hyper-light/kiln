@@ -140,6 +140,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("land-queue", h => crate::ci::land::run_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
+            child!("deploy", h => crate::deploy::run(h));
         }
         child!("sync", h => h.sync_loop());
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
