@@ -1,23 +1,57 @@
 /**
  * Agents and the agents they started (docs/agents.md, "Agents that run agents"). In Mission
  * control a parent's children sit under it, indented, folding in the page's flow; a child that
- * needs you keeps its own place at the top, naming its parent. Ending a parent offers to end
- * what it started too.
+ * needs you keeps its own place at the top, naming its parent. A plan run's agents (one per step)
+ * sit under the run ("Plan: … · 2 of 3 met"). Ending a parent offers to end what it started too.
  */
 import * as React from "react";
 import "./family.css";
 import { ChevronRight } from "lucide-react";
+import { Link } from "@/lib/router";
 import { harnessApi, type AgentInfo } from "@/api/harness";
+import { plansApi, runHref, type PlanRunBrief } from "@/api/plans";
 import { useLocalStorage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { agentLabel } from "./derive";
 
-/** A row of the list and the rows that go under it. */
+/** A row of the list and the rows that go under it; or a plan run and its agents. */
 export interface Family<T> {
   row: T;
   kids: Family<T>[];
   /** A child shown on its own (it needs you, or its parent isn't in the list): its parent's name. */
   of?: string;
+  /** A plan run's group (`row` is its first agent's). */
+  run?: PlanRunBrief;
+}
+
+/**
+ * Each level's agents of one plan run under that run, where its first agent was; one of them that
+ * needs you keeps its place, naming the run.
+ */
+function byRun<T extends { a: AgentInfo; stand: string }>(list: Family<T>[], runs: PlanRunBrief[]): Family<T>[] {
+  const out: Family<T>[] = [];
+  const groups = new Map<string, Family<T>>();
+  for (const f of list) {
+    const kids = byRun(f.kids, runs);
+    const node = { ...f, kids };
+    const run = runs.find((r) => r.id === f.row.a.plan_run);
+    if (!run) {
+      out.push(node);
+      continue;
+    }
+    if (f.row.stand === "needs") {
+      out.push({ ...node, of: node.of ?? `the plan ${run.title}` });
+      continue;
+    }
+    let g = groups.get(run.id);
+    if (!g) {
+      g = { row: f.row, kids: [], run };
+      groups.set(run.id, g);
+      out.push(g);
+    }
+    g.kids.push(node);
+  }
+  return out;
 }
 
 /**
@@ -62,6 +96,26 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
   const toggle = (id: string) => setFolded(folded.includes(id) ? folded.filter((x) => x !== id) : [...folded, id]);
   const out = (list: Family<T>[]): React.ReactNode =>
     list.map((f) => {
+      if (f.run) {
+        const run = f.run;
+        const open = !folded.includes(run.id);
+        return (
+          <li key={`run-${run.id}`} className="fam fam-run">
+            <div className="fam-run-head">
+              <button type="button" className="fam-fold fam-run-fold" aria-expanded={open} aria-label={open ? "Fold the run's agents" : "Show the run's agents"} onClick={() => toggle(run.id)}>
+                <ChevronRight size={13} className="fam-chev" aria-hidden="true" />
+              </button>
+              <Link to={runHref(run.id)} className="fam-run-link">
+                Plan: {run.title}
+              </Link>
+              <span className="fam-stand">
+                {run.met} of {run.total} met{run.state !== "running" ? `, ${run.state}` : ""}
+              </span>
+            </div>
+            {open && <ul className="ms-list fam-kids">{out(f.kids)}</ul>}
+          </li>
+        );
+      }
       const id = f.row.a.id;
       const open = !folded.includes(id);
       return (
@@ -81,6 +135,23 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
       );
     });
   return <>{out(items)}</>;
+}
+
+/** The plan runs whose agents the list shows (a done run's agents may still be listed). */
+function WithRuns<T extends { a: AgentInfo; stand: string }>({ rows, all, render }: { rows: T[]; all: AgentInfo[]; render: (row: T, of?: string) => React.ReactNode }) {
+  const runs = useSuspenseResource("plans/runs/recent", (s) => plansApi.agentRuns(false, s), { on: ["harness", "harness_closed"], pollMs: 15_000 }).data.runs;
+  return <Families items={byRun(families(rows, all), runs)} render={render} />;
+}
+
+/** The list as families, a plan run's agents under the run. */
+export function AgentFamilies<T extends { a: AgentInfo; stand: string }>({ rows, all, render }: { rows: T[]; all: AgentInfo[]; render: (row: T, of?: string) => React.ReactNode }) {
+  const plain = <Families items={families(rows, all)} render={render} />;
+  if (!rows.some((r) => r.a.plan_run)) return plain;
+  return (
+    <React.Suspense fallback={plain}>
+      <WithRuns rows={rows} all={all} render={render} />
+    </React.Suspense>
+  );
 }
 
 /** An agent's live children, as the server knows them (theirs too). */

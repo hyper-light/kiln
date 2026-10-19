@@ -44,6 +44,33 @@
 .fam-kids > .fam:last-child {
   border-bottom: 0;
 }
+/* A plan run: its title (its page), how many of its steps are met, its agents under it. */
+.fam-run-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 8px 12px 26px;
+}
+.fam-run-fold {
+  padding: 4px;
+}
+.fam-run-link {
+  min-width: 0;
+  overflow: hidden;
+  color: #ededee;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fam-run-link:hover {
+  color: #ffffff;
+}
+.fam-run-head .fam-stand {
+  flex: none;
+  font-size: 13px;
+}
+
 /* A child shown on its own (it needs you): whose it is. */
 .ms-of {
   margin-left: 10px;
@@ -54,6 +81,9 @@
 @container (max-width: 760px) {
   .fam-fold {
     padding-left: 12px;
+  }
+  .fam-run-head {
+    padding-left: 6px;
   }
   .fam-kids {
     margin-left: 14px;

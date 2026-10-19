@@ -29,7 +29,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { Families, families } from "./family";
+import { AgentFamilies } from "./family";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 
@@ -500,7 +500,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           </div>
           {live.length > 0 ? (
             <ul className="ms-list">
-              <Families items={families(live, list)} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
+              <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
             </ul>
           ) : filtered && ended.length === 0 ? (
             <p className="ms-quiet">
