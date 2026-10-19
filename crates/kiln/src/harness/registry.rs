@@ -272,6 +272,8 @@ pub struct Registry {
     pub visuals: super::visuals::Visuals,
     /// Pages streamed from agents' machines, relayed to their viewers (`super::streams`).
     pub streams: super::streams::Relay,
+    /// Streams to their viewers over WebRTC, when the server has it (`super::webrtc`).
+    pub webrtc: super::webrtc::Webrtc,
     /// Connections to ports of agents' machines, and the apps opened on people's devices over
     /// them (`super::opened`).
     pub ports: super::opened::Tunnels,
@@ -368,6 +370,7 @@ impl Registry {
             keeper,
             visuals,
             streams: super::streams::Relay::default(),
+            webrtc: super::webrtc::Webrtc::default(),
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
         }

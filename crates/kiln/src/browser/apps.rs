@@ -156,6 +156,8 @@ pub async fn serve(dir: &Path, session: &str, cwd: &Path, root: Option<u32>, jso
     let q: Value = serde_json::from_str(json).unwrap_or_default();
     match q.get("op").and_then(Value::as_str) {
         Some("look") => {
+            // What they open, they open at once: the conversation's browser is started now.
+            super::stream::streams().warm(dir, session);
             let (s, c) = (session.to_owned(), cwd.to_path_buf());
             crate::rt::blocking(move || look(&s, &c, root)).await.unwrap_or_else(|e| json!({"error": format!("{e:#}")}))
         }

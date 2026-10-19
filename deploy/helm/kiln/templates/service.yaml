@@ -70,4 +70,14 @@ spec:
       {{- if .Values.externalService.nodePorts.quic }}
       nodePort: {{ .Values.externalService.nodePorts.quic }}
       {{- end }}
+    {{- if .Values.ports.webrtc }}
+    # WebRTC to live pages' viewers (docs/previews.md, "WebRTC").
+    - name: webrtc
+      port: {{ .Values.ports.webrtc }}
+      targetPort: webrtc
+      protocol: UDP
+      {{- if .Values.externalService.nodePorts.webrtc }}
+      nodePort: {{ .Values.externalService.nodePorts.webrtc }}
+      {{- end }}
+    {{- end }}
 {{- end }}
