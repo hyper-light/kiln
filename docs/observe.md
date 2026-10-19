@@ -3,7 +3,7 @@
 kiln watches what it runs without Grafana, Prometheus or a SaaS: one engine, inside the kiln binary,
 that stores metrics, logs and events in a columnar store replicated across runners with hyper-raft,
 answers a query language in milliseconds on any replica, evaluates monitors and notifies Slack,
-Discord, PagerDuty, Teams or a webhook, and draws dashboards in kiln's UI. It takes OpenTelemetry
+Discord, Teams, PagerDuty, Opsgenie, email or a webhook, and draws dashboards in kiln's UI. It takes OpenTelemetry
 (OTLP) from anything, and kiln CI, kiln CD, GitHub and the clouds (AWS, GCP, Azure) feed it too.
 
 This document is the design and the record: what is built, how it is measured, and why each number
@@ -26,7 +26,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1032,11 +1032,30 @@ status `canceled`); one canceled or ended is forgotten after 30 days. `<observe>
 Notifications (`crate::observe::notify`), each in its service's format: Slack (incoming webhook,
 Block Kit in a colored attachment), Discord (webhook embeds, within its limits), Microsoft Teams
 (an Adaptive Card, what Workflows webhooks take), PagerDuty (Events API v2: trigger while
-alerting, resolve on recovery, one dedup key a monitor's group), and generic webhooks (kiln's JSON
-signed HMAC-SHA256 over the body, `X-Kiln-Signature`, as GitHub signs its own). Delivered off a
-bounded queue, tried again with doubling backoff on errors, 429s (after `Retry-After`) and 5xx;
-each delivery an event and a count. Integrations are named (`PUT /api/observe/v1/integrations/
-<name>`), their secrets never shown, and testable.
+alerting, resolve on recovery, one dedup key a monitor's group), Opsgenie (the Alert API v2,
+`GenieKey`: an alert created while alerting, its priority the monitor's, else P3 and a warning's P4;
+closed on recovery by the same alias as PagerDuty's dedup key; its limits kept: a message of 130
+characters, 20 tags of 50), email, and generic webhooks (kiln's JSON signed HMAC-SHA256 over the
+body, `X-Kiln-Signature`, as GitHub signs its own). Delivered off a bounded queue, tried again with
+doubling backoff on errors, 429s (after `Retry-After`) and 5xx; each delivery an event and a count.
+Integrations are named (`PUT /api/observe/v1/integrations/<name>`), checked as they are kept, their
+secrets never shown, and testable.
+
+**Email** (`crate::observe::smtp`): through the SMTP relay a site already has (RFC 5321), reached
+with STARTTLS (RFC 3207, 587 unless said), TLS from the first byte (RFC 8314, 465) or neither (25,
+a relay on its own network), its certificate checked against the public roots or a CA given (PEM),
+logged in with AUTH PLAIN (RFC 4616) or LOGIN when it asks. A reply is read whole (its continued
+lines); a 4xx is tried again, a 5xx is not, and either is said in the relay's words, as is a
+certificate not trusted (not tried again either). What the relay sends between STARTTLS's 220 and
+the handshake is refused, not read as if it had come over TLS (CVE-2011-0411's plaintext
+injection). The message (RFC 5322, MIME): `multipart/alternative` of text and HTML, each base64 (no
+line past 76 characters, so none is a lone `.`; the data dot-stuffed besides), its subject the
+notice's title, an encoded word (RFC 2047) when it is not ASCII, `Auto-Submitted: auto-generated`
+(RFC 3834: no robot answers it), and one `References` a monitor's group, so its alert and its
+recovery are one thread. Every header's value is refused if it holds a line break, and an address
+with one is refused when the integration is kept: a monitor's name or a recipient cannot add a
+`Bcc`. The HTML escapes everything it shows. 50 recipients at the most; addresses not ASCII only
+to a relay that says `SMTPUTF8`.
 
 Sources: GitHub's webhooks (§8), and the clouds (§10.1).
 
@@ -1265,7 +1284,8 @@ time range and the search in the address (a page is a link).
   read it (reading, failing, no files), what it reads, its records and how far behind it is;
   added and edited in a form that tests the source on the server (the files it matches, how the
   newest one's last lines read, the rules applied) before it is kept.
-- **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
+- **Integrations**: added (Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay,
+  webhooks, signed), tested, removed;
   each one's mention to copy. The clouds kiln reads: each one's state, what it reads (its logs too:
   log groups, a filter, workspaces, an Azure namespace's event hubs), its credentials and its last
   pull (series, and the log records it took; how many events its hubs are behind); added and edited
@@ -2035,11 +2055,20 @@ not; format 2 still read.
 
 Also live: OTLP/JSON gzip to the server (a wrong token refused, a malformed body refused) and
 protobuf to a runner's receiver, which arrive and replicate; a CI pipeline run on a runner from a
-`file://` repository, its job's count, duration and event found; a monitor that alerts five
+`file://` repository, its job's count, duration and event found; a monitor that alerts six
 integrations (services in the test) each in its format, a webhook refused once and delivered on
 its second try with its signature checked, a recovery that resolves PagerDuty's incident by the
-same key, and muted, a change of state with nothing said; GitHub's webhooks and posted events,
-searched and counted.
+same key and closes Opsgenie's alert by it (its key sent, never shown), and muted, a change of
+state with nothing said; GitHub's webhooks and posted events, searched and counted.
+
+**Email** (`crates/kiln/tests/observe_email.rs`; Docker): Mailpit as the relay, requiring STARTTLS
+and a login, its certificate signed by a CA the test makes (rcgen) and the integration is given; a
+monitor whose name and message hold `<`, `>` and `&` alerts and recovers: two messages to both
+recipients, the text without mentions and with the value and threshold, the HTML escaped, both
+`Auto-Submitted`, one `References` (the alert's thread); each delivery an event, its relay's 250. A
+CA that is not the relay's and a wrong password each fail once, said (TLS; 535) and not tried
+again; a plain relay without a login takes the test notice; an address holding a line break is
+refused when kept (400), and the password and CA are never shown. 2026-10-19: passes (33 s).
 
 **Anomalies** (`observe_live.rs`): ten days of a daily cycle every five minutes, two hosts, one's
 last point a spike, posted to a server: `anomalies(…, 'robust', 3)` over the last six hours bands
@@ -2077,7 +2106,11 @@ added, tested (the receiver checks the signature) and removed; an Azure integrat
 (nothing answering at their endpoint): its row failing with the hub's error and what it reads, the
 form showing metrics not read, its namespace and hubs and the connection string kept, a hub added
 (the connection string, endpoint and TLS kept), the connection string given up for the
-integration's credentials, removed (2026-10-19: passes in Chromium and WebKit as a phone). Each makes its own records and checks through the API,
+integration's credentials, removed (2026-10-19: passes in Chromium and WebKit as a phone); an email
+integration added from the form (its recipients, sender, relay, security and port) and tested, an
+SMTP sink in the scenario sent the test's message to both recipients, and an Opsgenie one added
+(its key never shown) and tested, its Alert API hearing the key, both removed (2026-10-19: passes
+in Chromium and WebKit as a phone). Each makes its own records and checks through the API,
 not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a

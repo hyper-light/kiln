@@ -343,12 +343,13 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
         ("ops-t", json!({ "kind": "teams", "url": mock.url("/teams") })),
         ("oncall", json!({ "kind": "pagerduty", "routing_key": "R0UT1NGKEY", "url": mock.url("/pagerduty") })),
         ("deploys", json!({ "kind": "webhook", "url": mock.url("/hook"), "secret": "s3cret" })),
+        ("ops-g", json!({ "kind": "opsgenie", "api_key": "G3N13K3Y", "url": mock.url("/opsgenie") })),
     ] {
         let (code, b) = f.request("PUT", &format!("/api/observe/v1/integrations/{name}"), Some(&body))?;
         anyhow::ensure!(code == 204, "integration {name}: {code} {}", String::from_utf8_lossy(&b));
     }
     let listed = f.call("GET", "/api/observe/v1/integrations", None)?;
-    anyhow::ensure!(!listed.to_string().contains("R0UT1NGKEY") && !listed.to_string().contains("s3cret"), "secrets are never shown: {listed}");
+    anyhow::ensure!(!listed.to_string().contains("R0UT1NGKEY") && !listed.to_string().contains("s3cret") && !listed.to_string().contains("G3N13K3Y"), "secrets are never shown: {listed}");
     let bad = f.call("POST", "/api/observe/v1/monitors/validate", Some(&json!({ "query": "avg(last_5m):avg:x{*}" })))?;
     anyhow::ensure!(at(&bad, &["ok"]).as_bool() == Some(false), "a query without a comparison: {bad}");
     let m = f.call(
@@ -357,7 +358,7 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
         Some(&json!({
             "name": "e2e temp high",
             "query": "last(last_1m):max:e2e.temp{*} by {host} > 100",
-            "message": "{{#is_alert}}temp on {{host.name}} is {{value}} @slack-ops @discord-ops-d @teams-ops-t @pagerduty-oncall @webhook-deploys{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @slack-ops @pagerduty-oncall @webhook-deploys{{/is_recovery}}",
+            "message": "{{#is_alert}}temp on {{host.name}} is {{value}} @slack-ops @discord-ops-d @teams-ops-t @pagerduty-oncall @webhook-deploys @opsgenie-ops-g{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @slack-ops @pagerduty-oncall @webhook-deploys @opsgenie-ops-g{{/is_recovery}}",
             "options": { "every": 10, "thresholds": { "critical": 100 } },
             "tags": ["team:e2e"],
         })),
@@ -370,7 +371,7 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
     // Hot: every integration hears of it.
     hot(&f, 150.0)?;
     let start = Instant::now();
-    while ["/slack", "/discord", "/teams", "/pagerduty", "/hook"].iter().any(|p| mock.at(p).is_empty()) {
+    while ["/slack", "/discord", "/teams", "/pagerduty", "/hook", "/opsgenie/v2/alerts"].iter().any(|p| mock.at(p).is_empty()) {
         anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "not every integration heard: {:?}\n{}", mock.got.lock().map(|g| g.iter().map(|x| x.path.clone()).collect::<Vec<_>>()).unwrap_or_default(), f.logs());
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -382,6 +383,11 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
     let pd = mock.at("/pagerduty").first().map(Got::json).unwrap_or_default();
     anyhow::ensure!(at(&pd, &["event_action"]) == "trigger" && at(&pd, &["routing_key"]) == "R0UT1NGKEY" && at(&pd, &["payload", "severity"]) == "critical" && at(&pd, &["payload", "source"]) == "a", "pagerduty: {pd}");
     let dedup = at(&pd, &["dedup_key"]).as_str().unwrap_or("").to_owned();
+    // Opsgenie: an alert by its key, aliased as PagerDuty's incident is keyed.
+    let og = mock.at("/opsgenie/v2/alerts").first().cloned().ok_or_else(|| anyhow::anyhow!("opsgenie"))?;
+    anyhow::ensure!(og.header("authorization") == Some("GenieKey G3N13K3Y"), "opsgenie's key: {:?}", og.header("authorization"));
+    let ogj = og.json();
+    anyhow::ensure!(at(&ogj, &["alias"]).as_str() == Some(dedup.as_str()) && at(&ogj, &["priority"]) == "P3" && at(&ogj, &["message"]).as_str().is_some_and(|m| m.starts_with("[Triggered] e2e temp high")), "opsgenie: {ogj}");
     // The webhook: refused once, delivered on the second try, signed.
     let start = Instant::now();
     while mock.at("/hook").len() < 2 {
@@ -403,6 +409,13 @@ fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() 
     }
     let resolve = mock.at("/pagerduty").into_iter().map(|g| g.json()).find(|v| at(v, &["event_action"]) == "resolve").unwrap_or_default();
     anyhow::ensure!(at(&resolve, &["dedup_key"]).as_str() == Some(dedup.as_str()), "resolve: {resolve}");
+    // And Opsgenie's alert closed by its alias.
+    let close = format!("/opsgenie/v2/alerts/{dedup}/close?identifierType=alias");
+    let start = Instant::now();
+    while mock.at(&close).is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "opsgenie's alert never closed: {:?}", mock.got.lock().map(|g| g.iter().map(|x| x.path.clone()).collect::<Vec<_>>()).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(100));
+    }
     anyhow::ensure!(mock.at("/slack").iter().any(|g| at(&g.json(), &["text"]).as_str().is_some_and(|t| t.contains("[Recovered]"))), "slack hears the recovery");
     anyhow::ensure!(mock.at("/discord").len() == 1, "discord is not named for recoveries");
     // Muted: it still changes state (an event), and says nothing.
@@ -1607,10 +1620,17 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     check("POST", &format!("{base}/slos"), &format!("{base}/slos"), Some(json!({ "name": "bad", "type": "ratio", "target": 100.0, "timeframe": "7d" })), 400)?;
     check("DELETE", &format!("{base}/slos/{sid}"), &spath, None, 204)?;
     // Integrations, scrapes and clouds as they are listed and kept (their tests reach outside).
-    check("PUT", &format!("{base}/integrations/hook"), &format!("{base}/integrations/{{name}}"), Some(json!({ "kind": "webhook", "url": "https://example.invalid/hook", "secret": "s" })), 204)?;
+    let ipath = format!("{base}/integrations/{{name}}");
+    check("PUT", &format!("{base}/integrations/hook"), &ipath, Some(json!({ "kind": "webhook", "url": "https://example.invalid/hook", "secret": "s" })), 204)?;
+    check("PUT", &format!("{base}/integrations/og"), &ipath, Some(json!({ "kind": "opsgenie", "api_key": "G3N13", "url": "https://api.eu.opsgenie.com" })), 204)?;
+    let mail = json!({ "kind": "email", "to": ["oncall@example.com"], "from": "kiln@example.com", "host": "smtp.example.invalid", "security": "tls", "username": "u", "password": "hunter2" });
+    check("PUT", &format!("{base}/integrations/mail"), &ipath, Some(mail), 204)?;
+    check("PUT", &format!("{base}/integrations/bad"), &ipath, Some(json!({ "kind": "email", "to": [], "from": "kiln@example.com", "host": "h" })), 400)?;
     let listed = check("GET", &format!("{base}/integrations"), &format!("{base}/integrations"), None, 200)?;
-    anyhow::ensure!(!listed.to_string().contains("\"s\""), "a secret is not shown: {listed}");
-    check("DELETE", &format!("{base}/integrations/hook"), &format!("{base}/integrations/{{name}}"), None, 204)?;
+    anyhow::ensure!(!listed.to_string().contains("\"s\"") && !listed.to_string().contains("G3N13") && !listed.to_string().contains("hunter2"), "a secret is not shown: {listed}");
+    for name in ["hook", "og", "mail"] {
+        check("DELETE", &format!("{base}/integrations/{name}"), &ipath, None, 204)?;
+    }
     check("PUT", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), Some(json!({ "url": "http://127.0.0.1:9/metrics", "every_s": 60 })), 204)?;
     check("GET", &format!("{base}/scrapes"), &format!("{base}/scrapes"), None, 200)?;
     check("DELETE", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), None, 204)?;

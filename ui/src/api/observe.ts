@@ -218,7 +218,10 @@ export interface MonitorCheck {
 /** What a monitor is made of, as it is sent. */
 export type MonitorIn = Pick<Monitor, "name" | "query" | "message" | "tags" | "priority" | "options"> & { type?: string };
 
-export type IntegrationKind = "slack" | "discord" | "teams" | "pagerduty" | "webhook";
+export type IntegrationKind = "slack" | "discord" | "teams" | "pagerduty" | "webhook" | "opsgenie" | "email";
+
+/** How an SMTP relay is reached: STARTTLS (587), TLS from the first byte (465), or neither (25). */
+export type SmtpSecurity = "starttls" | "tls" | "none";
 
 /** An integration as the API shows it: its secrets left out. */
 export interface Integration {
@@ -226,10 +229,22 @@ export interface Integration {
   kind: IntegrationKind;
   url?: string;
   signed?: boolean;
+  /** An email's recipients, sender and relay. */
+  to?: string[];
+  from?: string;
+  host?: string;
+  port?: number;
+  security?: SmtpSecurity;
+  username?: string;
 }
 
 /** An integration as it is sent: whole. */
-export type IntegrationIn = { kind: "slack" | "discord" | "teams"; url: string } | { kind: "pagerduty"; routing_key: string; url?: string } | { kind: "webhook"; url: string; secret?: string };
+export type IntegrationIn =
+  | { kind: "slack" | "discord" | "teams"; url: string }
+  | { kind: "pagerduty"; routing_key: string; url?: string }
+  | { kind: "webhook"; url: string; secret?: string }
+  | { kind: "opsgenie"; api_key: string; url?: string }
+  | { kind: "email"; to: string[]; from: string; host: string; port?: number; security?: SmtpSecurity; username?: string; password?: string; ca?: string };
 
 export type CloudKind = "aws" | "gcp" | "azure";
 

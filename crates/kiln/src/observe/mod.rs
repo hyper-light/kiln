@@ -22,6 +22,7 @@ pub mod owner;
 pub mod pipeline;
 pub mod scrape;
 pub mod slos;
+pub mod smtp;
 pub mod spans;
 pub mod wire;
 

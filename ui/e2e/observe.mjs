@@ -628,6 +628,108 @@ const scenarios = {
     }
   },
 
+  /** Opsgenie and email integrations added from the form, each tested: an SMTP relay (a sink here)
+   * is sent the test's message, to both recipients; Opsgenie's Alert API hears an alert with the
+   * key given; then both removed. */
+  async "Opsgenie and email integrations are added from the form and tested"() {
+    const http = await import("node:http");
+    const net = await import("node:net");
+    const heard = [];
+    const og = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        heard.push({ path: req.url, auth: req.headers.authorization, body });
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end('{"result":"Request will be processed"}');
+      });
+    });
+    await new Promise((r) => og.listen(0, "127.0.0.1", r));
+    // An SMTP relay's least: a greeting, EHLO, MAIL, RCPT, DATA up to the lone dot, QUIT.
+    const mails = [];
+    const sink = net.createServer((s) => {
+      let buf = "";
+      let data = null;
+      s.on("error", () => {});
+      s.write("220 sink ESMTP\r\n");
+      s.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        for (;;) {
+          if (data !== null) {
+            const end = buf.indexOf("\r\n.\r\n");
+            if (end < 0) return;
+            mails.push(data + buf.slice(0, end));
+            buf = buf.slice(end + 5);
+            data = null;
+            s.write("250 2.0.0 queued\r\n");
+            continue;
+          }
+          const nl = buf.indexOf("\r\n");
+          if (nl < 0) return;
+          const verb = buf.slice(0, 4).toUpperCase();
+          buf = buf.slice(nl + 2);
+          if (verb === "EHLO") s.write("250-sink\r\n250 8BITMIME\r\n");
+          else if (verb === "DATA") {
+            data = "";
+            s.write("354 go ahead\r\n");
+          } else if (verb === "QUIT") {
+            s.end("221 bye\r\n");
+            return;
+          } else s.write("250 ok\r\n");
+        }
+      });
+    });
+    await new Promise((r) => sink.listen(0, "127.0.0.1", r));
+    const mail = `e2e-mail-${run}`;
+    const genie = `e2e-og-${run}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    try {
+      await page.goto(`${BASE}/observe/integrations`);
+      await page.getByRole("button", { name: "Add integration", exact: true }).click();
+      const add = page.getByRole("dialog");
+      await add.getByLabel("Kind", { exact: true }).selectOption("email");
+      await fillIn(add.getByLabel("Name", { exact: true }), mail);
+      await fillIn(add.getByLabel("To", { exact: true }), "oncall@example.com, sre@example.com");
+      await fillIn(add.getByLabel("From", { exact: true }), "kiln@example.com");
+      await fillIn(add.getByLabel("SMTP relay", { exact: true }), "127.0.0.1");
+      await add.getByLabel("Security", { exact: true }).selectOption("none");
+      await fillIn(add.getByLabel("Port (optional)"), String(sink.address().port));
+      await add.getByRole("button", { name: "Add", exact: true }).click();
+      const row = rowOf(mail);
+      await row.waitFor();
+      await until("where it sends", async () => /oncall@example.com, sre@example.com via 127.0.0.1/.test((await row.textContent()) ?? ""));
+      await row.getByRole("button", { name: "Test", exact: true }).click();
+      await until("the relay sent the test", async () => mails.some((m) => m.includes("Subject: [Triggered] A test from kiln")), 30_000);
+      const m = mails.find((x) => x.includes("Subject: [Triggered] A test from kiln")) ?? "";
+      expect(/\r\nTo: oncall@example.com, sre@example.com\r\n/.test(m) && /\r\nAuto-Submitted: auto-generated\r\n/.test(m), `the message: ${m.slice(0, 600)}`);
+
+      await page.getByRole("button", { name: "Add integration", exact: true }).click();
+      const add2 = page.getByRole("dialog");
+      await add2.getByLabel("Kind", { exact: true }).selectOption("opsgenie");
+      await fillIn(add2.getByLabel("Name", { exact: true }), genie);
+      await fillIn(add2.getByLabel("API key", { exact: true }), `G3N13-${run}`);
+      await fillIn(add2.getByLabel("API URL (optional)"), `http://127.0.0.1:${og.address().port}`);
+      await add2.getByRole("button", { name: "Add", exact: true }).click();
+      const grow = rowOf(genie);
+      await grow.waitFor();
+      const listed = (await api("GET", "/api/observe/v1/integrations")).body.integrations;
+      expect(!JSON.stringify(listed).includes(`G3N13-${run}`), "the key is never shown");
+      await grow.getByRole("button", { name: "Test", exact: true }).click();
+      await until("opsgenie heard an alert with the key", async () => heard.some((h) => h.path === "/v2/alerts" && h.auth === `GenieKey G3N13-${run}`), 30_000);
+      for (const n of [mail, genie]) {
+        await rowOf(n)
+          .getByRole("button", { name: `Remove ${n}`, exact: true })
+          .click();
+        await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+        await until(`${n} gone`, async () => !(await api("GET", "/api/observe/v1/integrations")).body.integrations.some((i) => i.name === n));
+      }
+    } finally {
+      og.close();
+      sink.close();
+      for (const n of [mail, genie]) await api("DELETE", `/api/observe/v1/integrations/${n}`);
+    }
+  },
+
   /** An Azure integration's event hubs: its stream's failing shown in its row (nothing answers at
    * its endpoint), its hubs and kept connection string in the form, a hub added, the connection
    * string given up for the integration's credentials, and removed. */

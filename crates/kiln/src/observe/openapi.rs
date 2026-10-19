@@ -369,13 +369,46 @@ fn schemas() -> Map<String, Value> {
             object(&[("kind", one_of(&["slack", "discord", "teams"])), ("url", string())], &["kind", "url"]),
             object(&[("kind", one_of(&["pagerduty"])), ("routing_key", string()), ("url", string())], &["kind", "routing_key"]),
             object(&[("kind", one_of(&["webhook"])), ("url", string()), ("secret", describe(string(), "signs each delivery (HMAC-SHA256)"))], &["kind", "url"]),
+            object(&[("kind", one_of(&["opsgenie"])), ("api_key", describe(string(), "an API integration's key (GenieKey)")), ("url", describe(string(), "https://api.opsgenie.com unless said (EU: https://api.eu.opsgenie.com)"))], &["kind", "api_key"]),
+            object(
+                &[
+                    ("kind", one_of(&["email"])),
+                    ("to", describe(array(string()), "1 to 50 addresses")),
+                    ("from", string()),
+                    ("host", describe(string(), "the SMTP relay")),
+                    ("port", describe(integer(), "587 for starttls, 465 for tls, 25 for none, unless said")),
+                    ("security", one_of(&["starttls", "tls", "none"])),
+                    ("username", string()),
+                    ("password", string()),
+                    ("ca", describe(string(), "the CA (PEM) the relay's certificate is signed by, when not a public one")),
+                ],
+                &["kind", "to", "from", "host"],
+            ),
         ] }),
     );
     put(
         "Integration",
         describe(
-            object(&[("name", string()), ("kind", one_of(&["slack", "discord", "teams", "pagerduty", "webhook"])), ("url", string()), ("routing_key", string()), ("signed", boolean())], &["name", "kind"]),
-            "as shown: a webhook URL's host alone, a routing key \"…\", whether a webhook signs",
+            object(
+                &[
+                    ("name", string()),
+                    ("kind", one_of(&["slack", "discord", "teams", "pagerduty", "webhook", "opsgenie", "email"])),
+                    ("url", string()),
+                    ("routing_key", string()),
+                    ("api_key", string()),
+                    ("signed", boolean()),
+                    ("to", array(string())),
+                    ("from", string()),
+                    ("host", string()),
+                    ("port", integer()),
+                    ("security", one_of(&["starttls", "tls", "none"])),
+                    ("username", string()),
+                    ("password", string()),
+                    ("ca", string()),
+                ],
+                &["name", "kind"],
+            ),
+            "as shown: a webhook URL's host alone, keys and passwords \"…\", whether a webhook signs",
         ),
     );
     put(

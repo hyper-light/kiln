@@ -11,6 +11,10 @@
 //! - Microsoft Teams: an Adaptive Card (1.4) message, what a Workflows webhook takes;
 //! - PagerDuty: Events API v2 (`/v2/enqueue`): `trigger` while alerting, `resolve` when it
 //!   recovers, on one dedup key a monitor's group, so one incident follows it;
+//! - Opsgenie: the Alert API (v2): an alert created while alerting (`GenieKey`; its priority the
+//!   monitor's, else P3, a warning's P4), closed when it recovers, by one alias a monitor's group;
+//! - email: through an SMTP relay (`super::smtp`), to its recipients, a message of text and HTML,
+//!   a monitor's group's messages one thread (`References`);
 //! - a generic webhook: kiln's own JSON, signed with HMAC-SHA256 over the body
 //!   (`X-Kiln-Signature: sha256=<hex>`), as GitHub signs its webhooks.
 //!
@@ -36,6 +40,8 @@ const BACKOFF: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// PagerDuty's Events API (v2), unless an integration says another (its EU region's, or a test's).
 pub const PAGERDUTY_EVENTS: &str = "https://events.pagerduty.com/v2/enqueue";
+/// Opsgenie's API, unless an integration says another (`https://api.eu.opsgenie.com`, a test's).
+pub const OPSGENIE: &str = "https://api.opsgenie.com";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -53,6 +59,28 @@ pub enum Integration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
     },
+    Opsgenie {
+        api_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    Email {
+        to: Vec<String>,
+        from: String,
+        /// The SMTP relay, and how it is reached (`super::smtp`).
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        #[serde(default)]
+        security: super::smtp::Security,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        /// The CA (PEM) the relay's certificate is signed by, when not a public one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca: Option<String>,
+    },
 }
 
 impl Integration {
@@ -63,6 +91,33 @@ impl Integration {
             Self::Teams { .. } => "teams",
             Self::Pagerduty { .. } => "pagerduty",
             Self::Webhook { .. } => "webhook",
+            Self::Opsgenie { .. } => "opsgenie",
+            Self::Email { .. } => "email",
+        }
+    }
+
+    /// Whether it can be kept: an email's addresses and relay, an Opsgenie key.
+    pub fn check(&self) -> Result<(), String> {
+        match self {
+            Self::Email { to, from, host, ca, .. } => {
+                if to.is_empty() || to.len() > super::smtp::RECIPIENTS {
+                    return Err(format!("an email integration has 1 to {} recipients", super::smtp::RECIPIENTS));
+                }
+                if let Some(bad) = to.iter().chain([from]).find(|a| !super::smtp::valid_address(a)) {
+                    return Err(format!("{bad:?}: an address as local@domain"));
+                }
+                if host.is_empty() || host.len() > 253 || host.contains(|c: char| c.is_whitespace() || c.is_control() || c == '/') {
+                    return Err(format!("{host:?}: the relay's host"));
+                }
+                if let Some(pem) = ca
+                    && crate::http::tls::ClientTls::new(crate::http::client::Roots::Pem(pem.as_bytes().to_vec()), None).is_err()
+                {
+                    return Err("ca: a CA's certificates, PEM".into());
+                }
+                Ok(())
+            }
+            Self::Opsgenie { api_key, .. } if api_key.trim().is_empty() => Err("an Opsgenie integration's api_key".into()),
+            _ => Ok(()),
         }
     }
 
@@ -73,6 +128,22 @@ impl Integration {
             Self::Slack { url } | Self::Discord { url } | Self::Teams { url } => json!({ "kind": self.kind(), "url": format!("{}/…", host(url)) }),
             Self::Pagerduty { url, .. } => json!({ "kind": "pagerduty", "routing_key": "…", "url": url }),
             Self::Webhook { url, secret } => json!({ "kind": "webhook", "url": url, "signed": secret.is_some() }),
+            Self::Opsgenie { url, .. } => json!({ "kind": "opsgenie", "api_key": "…", "url": url }),
+            Self::Email { to, from, host, port, security, username, password, ca } => {
+                let mut v = json!({ "kind": "email", "to": to, "from": from, "host": host, "port": port.unwrap_or(security.port()), "security": security });
+                if let Some(o) = v.as_object_mut() {
+                    if let Some(u) = username {
+                        o.insert("username".into(), json!(u));
+                    }
+                    if password.is_some() {
+                        o.insert("password".into(), json!("…"));
+                    }
+                    if ca.is_some() {
+                        o.insert("ca".into(), json!("…"));
+                    }
+                }
+                v
+            }
         }
     }
 }
@@ -105,6 +176,7 @@ impl Integrations {
 
     pub fn put(&self, name: &str, i: Integration) -> anyhow::Result<()> {
         anyhow::ensure!(!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)), "an integration's name is letters, digits, '-', '_' and '.'");
+        i.check().map_err(anyhow::Error::msg)?;
         let mut all = lock(&self.all);
         all.insert(name.to_owned(), i);
         save_private(&self.path, &serde_json::to_vec_pretty(&*all)?)
@@ -286,6 +358,40 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             });
             (url.clone().unwrap_or_else(|| PAGERDUTY_EVENTS.to_owned()), serde_json::to_vec(&body).unwrap_or_default(), json_headers)
         }
+        Integration::Opsgenie { api_key, url } => {
+            let base = url.as_deref().unwrap_or(OPSGENIE).trim_end_matches('/');
+            let alias = dedup_key(n);
+            let mut headers = json_headers;
+            headers.push(("authorization".into(), format!("GenieKey {api_key}")));
+            if n.state == "OK" {
+                let body = json!({ "source": "kiln", "user": "kiln", "note": clip(&format!("{}: {}", n.title(), n.body()), 25_000) });
+                return (format!("{base}/v2/alerts/{alias}/close?identifierType=alias"), serde_json::to_vec(&body).unwrap_or_default(), headers);
+            }
+            // The monitor's priority, else Opsgenie's own default (P3), a warning's lower.
+            let priority = n.priority.filter(|p| (1..=5).contains(p)).map_or_else(|| if n.state == "ALERT" { "P3".to_owned() } else { "P4".to_owned() }, |p| format!("P{p}"));
+            let mut details = serde_json::Map::new();
+            details.insert("monitor_id".into(), json!(n.monitor_id));
+            details.insert("state".into(), json!(n.state));
+            details.insert("value".into(), json!(n.value_text()));
+            details.insert("threshold".into(), json!(n.threshold.to_string()));
+            details.insert("link".into(), json!(n.link));
+            for (k, v) in &n.group {
+                details.insert(clip(k, 100), json!(clip(v, 500)));
+            }
+            let body = json!({
+                "message": clip(&n.title(), 130),
+                "alias": alias,
+                "description": clip(&format!("{}\n\nvalue {} · threshold {}\n{}", n.body(), n.value_text(), n.threshold, n.link), 15_000),
+                "tags": n.tags.iter().take(20).map(|t| clip(t, 50)).collect::<Vec<_>>(),
+                "details": details,
+                "entity": clip(if group.is_empty() { &n.monitor } else { &group }, 512),
+                "source": "kiln",
+                "priority": priority,
+            });
+            (format!("{base}/v2/alerts"), serde_json::to_vec(&body).unwrap_or_default(), headers)
+        }
+        // Not over HTTP: `deliver_email`.
+        Integration::Email { .. } => (String::new(), Vec::new(), Vec::new()),
         Integration::Webhook { url, secret } => {
             let body = serde_json::to_vec(&json!({ "event": "monitor.transition", "notice": n })).unwrap_or_default();
             let mut headers = json_headers;
@@ -297,6 +403,51 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             (url.clone(), body, headers)
         }
     }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A notice as an email: its subject the title; its text and HTML the message, the value, the
+/// threshold, the group and a link; a monitor's group's messages one thread, by a `References`
+/// they share.
+pub fn email(n: &Notice, to: &[String], from: &str) -> super::smtp::Mail {
+    let (_, color, _) = n.color();
+    let mut facts = vec![("Value".to_owned(), n.value_text()), ("Threshold".to_owned(), n.threshold.to_string())];
+    facts.extend(n.group.iter().cloned());
+    let text = format!("{}\n\n{}\n\n{}\n\nOpen in kiln: {}\n", n.title(), n.body(), facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"), n.link);
+    let rows: String = facts
+        .iter()
+        .map(|(k, v)| format!("<tr><td style=\"padding:2px 16px 2px 0;color:#6b6f76\">{}</td><td style=\"padding:2px 0\">{}</td></tr>", html_escape(k), html_escape(v)))
+        .collect();
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0;padding:24px;background:#f6f7f9;font:14px/1.5 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:#1c1d21\">\
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #e4e5e7;border-radius:8px\"><tr>\
+<td style=\"padding:20px 24px;border-left:4px solid {color};border-radius:8px\">\
+<div style=\"font-size:18px;font-weight:600\">{title}</div>\
+<div style=\"margin-top:12px;white-space:pre-wrap\">{body}</div>\
+<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:16px;font-size:13px\">{rows}</table>\
+<div style=\"margin-top:20px\"><a href=\"{link}\" style=\"color:#1c1d21;font-weight:600\">Open in kiln</a></div>\
+</td></tr></table></body></html>",
+        title = html_escape(&n.title()),
+        body = html_escape(&n.body()),
+        link = html_escape(&n.link),
+    );
+    let domain = from.rsplit_once('@').map_or("kiln", |(_, d)| d);
+    let headers = vec![("References".to_owned(), format!("<{}@{domain}>", dedup_key(n))), ("X-Kiln-Monitor".to_owned(), n.monitor_id.chars().filter(|c| !c.is_control()).collect()), ("X-Kiln-State".to_owned(), n.state.to_owned())];
+    super::smtp::Mail { from: from.to_owned(), to: to.to_vec(), subject: n.title(), text, html, headers }
 }
 
 /// One incident a monitor's group, whatever its state: PagerDuty folds every trigger into it and
@@ -343,7 +494,39 @@ impl Notifier {
     }
 }
 
+/// An email's delivery: tried again on what the relay says is transient, not on what it refuses.
+async fn deliver_email(job: &Job) -> (bool, String) {
+    let Integration::Email { to, from, host, port, security, username, password, ca } = &job.integration else { return (false, "not an email integration".into()) };
+    let relay = super::smtp::Relay { host: host.clone(), port: port.unwrap_or(security.port()), security: *security, username: username.clone(), password: password.clone(), ca: ca.clone() };
+    let mail = email(&job.notice, to, from);
+    let mut wait = BACKOFF;
+    let mut outcome = String::new();
+    for attempt in 1..=TRIES {
+        match super::smtp::send(&relay, &mail, crate::util::now_ms()).await {
+            Ok(said) => return (true, if attempt == 1 { said } else { format!("{said} on try {attempt}") }),
+            Err(super::smtp::Failure::Permanent(m)) => return (false, m),
+            Err(super::smtp::Failure::Transient(m)) => outcome = m,
+        }
+        if attempt < TRIES {
+            crate::rt::sleep(wait).await;
+            wait = wait.saturating_mul(2);
+        }
+    }
+    (false, outcome)
+}
+
 async fn deliver(http: &Client, job: Job) {
+    let (delivered, outcome) = match &job.integration {
+        Integration::Email { .. } => deliver_email(&job).await,
+        _ => deliver_http(http, &job).await,
+    };
+    if !delivered {
+        tracing::warn!(integration = %job.name, outcome = %outcome, "a monitor's notification was not delivered");
+    }
+    record_delivery(&job, delivered, &outcome);
+}
+
+async fn deliver_http(http: &Client, job: &Job) -> (bool, String) {
     let (url, body, headers) = request(&job.integration, &job.notice);
     let mut wait = BACKOFF;
     let mut outcome = String::new();
@@ -377,10 +560,11 @@ async fn deliver(http: &Client, job: Job) {
             wait = wait.saturating_mul(2);
         }
     }
-    if !delivered {
-        tracing::warn!(integration = %job.name, outcome = %outcome, "a monitor's notification was not delivered");
-    }
-    // The delivery's record: an event, and a count by integration and result.
+    (delivered, outcome)
+}
+
+/// The delivery's record: an event, and a count by integration and result.
+fn record_delivery(job: &Job, delivered: bool, outcome: &str) {
     if let Some(o) = super::api::get() {
         let result = if delivered { "delivered" } else { "failed" };
         let ts = crate::util::now_ms();
@@ -456,6 +640,61 @@ mod tests {
         let (_, body, _) = request(&Integration::Teams { url: "https://x".into() }, &n);
         let v: Value = serde_json::from_slice(&body)?;
         anyhow::ensure!(at(&v, &["attachments", "0", "content", "type"]) == "AdaptiveCard");
+        // Opsgenie: an alert by alias while alerting, the monitor's priority; closed by it.
+        let og = Integration::Opsgenie { api_key: "G3N13".into(), url: None };
+        let (url, body, headers) = request(&og, &n);
+        let v: Value = serde_json::from_slice(&body)?;
+        anyhow::ensure!(url == "https://api.opsgenie.com/v2/alerts" && headers.contains(&("authorization".to_owned(), "GenieKey G3N13".to_owned())), "{url} {headers:?}");
+        anyhow::ensure!(at(&v, &["alias"]).as_str() == Some(dedup_key(&n).as_str()) && at(&v, &["priority"]) == "P1" && at(&v, &["details", "host"]) == "web-1" && at(&v, &["entity"]) == "host:web-1", "{v}");
+        anyhow::ensure!(at(&v, &["message"]).as_str().is_some_and(|m| m.chars().count() <= 130 && m.starts_with("[Triggered] CPU high")), "{v}");
+        let warn = Notice { priority: None, ..notice("WARN") };
+        let (_, body, _) = request(&og, &warn);
+        anyhow::ensure!(at(&serde_json::from_slice(&body)?, &["priority"]) == "P4", "a warning without a priority is P4");
+        let (url, _, _) = request(&Integration::Opsgenie { api_key: "G3N13".into(), url: Some("https://api.eu.opsgenie.com/".into()) }, &notice("OK"));
+        anyhow::ensure!(url == format!("https://api.eu.opsgenie.com/v2/alerts/{}/close?identifierType=alias", dedup_key(&n)), "{url}");
         Ok(())
+    }
+
+    /// An email: its subject the title, the message without mentions, its facts and link; its HTML
+    /// escaped; a group's messages one thread.
+    #[test]
+    fn a_notice_is_an_email_of_text_and_escaped_html() {
+        let mut n = notice("ALERT");
+        n.message = "disk <script>alert(1)</script> & more @email-ops".into();
+        let m = email(&n, &["ops@example.com".into()], "kiln@alerts.example.com");
+        assert_eq!(m.subject, "[Triggered] CPU high on host:web-1");
+        assert!(m.text.contains("disk <script>alert(1)</script> & more") && !m.text.contains("@email-ops") && m.text.contains("Threshold: 90") && m.text.contains("host: web-1"), "{}", m.text);
+        assert!(m.text.ends_with("Open in kiln: https://kiln.example/observe/monitors/m1\n"), "{}", m.text);
+        assert!(m.html.contains("disk &lt;script&gt;alert(1)&lt;/script&gt; &amp; more") && !m.html.contains("<script>"), "{}", m.html);
+        assert!(m.html.contains("border-left:4px solid #E01E5A") && m.html.contains("href=\"https://kiln.example/observe/monitors/m1\""), "{}", m.html);
+        let thread = format!("<{}@alerts.example.com>", dedup_key(&n));
+        assert!(m.headers.contains(&("References".to_owned(), thread.clone())));
+        let ok = email(&notice("OK"), &["ops@example.com".into()], "kiln@alerts.example.com");
+        assert!(ok.headers.contains(&("References".to_owned(), thread)), "its recovery in the same thread");
+    }
+
+    #[test]
+    fn an_integration_is_checked_before_it_is_kept() {
+        let mail = |to: Vec<&str>, from: &str, host: &str| Integration::Email { to: to.into_iter().map(str::to_owned).collect(), from: from.into(), host: host.into(), port: None, security: super::super::smtp::Security::Starttls, username: None, password: None, ca: None };
+        assert_eq!(mail(vec!["ops@example.com"], "kiln@example.com", "smtp.example.com").check(), Ok(()));
+        assert!(mail(vec![], "kiln@example.com", "smtp.example.com").check().is_err());
+        assert!(mail(vec!["ops@example.com\r\nBcc: x@y.z"], "kiln@example.com", "smtp.example.com").check().is_err());
+        assert!(mail(vec!["ops@example.com"], "kiln", "smtp.example.com").check().is_err());
+        assert!(mail(vec!["ops@example.com"], "kiln@example.com", "smtp example").check().is_err());
+        assert!(Integration::Opsgenie { api_key: " ".into(), url: None }.check().is_err());
+        let shown = mail(vec!["ops@example.com"], "kiln@example.com", "smtp.example.com").redacted();
+        assert_eq!(at(&shown, &["port"]), 587);
+        let secret = Integration::Email {
+            to: vec!["ops@example.com".into()],
+            from: "kiln@example.com".into(),
+            host: "h".into(),
+            port: Some(2525),
+            security: super::super::smtp::Security::None,
+            username: Some("u".into()),
+            password: Some("hunter2".into()),
+            ca: None,
+        };
+        let shown = secret.redacted();
+        assert!(!shown.to_string().contains("hunter2") && at(&shown, &["password"]) == "…" && at(&shown, &["port"]) == 2525, "{shown}");
     }
 }
