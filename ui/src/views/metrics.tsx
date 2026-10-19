@@ -41,7 +41,7 @@ export default function Metrics() {
             </Button>
           ) : (
             <Button asChild variant="ghost">
-              <Link to="/settings">
+              <Link to="/settings#integrations.grafana">
                 <Settings /> Link Grafana
               </Link>
             </Button>

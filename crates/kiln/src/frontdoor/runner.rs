@@ -778,7 +778,7 @@ mod tests {
     use crate::frontdoor::{Cert, Dns, Https};
 
     fn free_port() -> anyhow::Result<u16> {
-        Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+        Ok(crate::frontdoor::test_port()?)
     }
 
     /// The whole runner side, on loopback and high ports: settings in, listeners up, a CSR out;
@@ -806,7 +806,10 @@ mod tests {
             let st = fd.status();
             assert_eq!(st.settings, settings.fingerprint());
             assert_eq!(st.dns.state, State::On, "{:?}", st.dns);
-            assert!(st.dns.on.contains(&format!("127.0.0.1:{dns_port}")), "{:?}", st.dns.on);
+            // Loopback on Linux; the wildcard elsewhere (macOS lets a user bind low ports only
+            // there: `netinfo::dns_binds`).
+            let listening = if cfg!(target_os = "linux") { format!("127.0.0.1:{dns_port}") } else { format!("0.0.0.0:{dns_port}") };
+            assert!(st.dns.on.contains(&listening), "{:?}", st.dns.on);
             assert_eq!(st.https.state, State::Waiting, "no certificate yet");
             assert_eq!(st.cert.state, State::Waiting);
             let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;

@@ -201,15 +201,21 @@ if (PAUSED) {
     text: "Paused: You've hit your session limit · resets 10:30pm (America/Los_Angeles). Queued messages and goals wait; it goes on by itself once the limit resets.",
   });
 }
+/** MOCK_STOP_POINT=1: paused at its stop point for the weekly limit, not at the session limit. */
+const STOP_POINT = process.env.MOCK_STOP_POINT === "1";
+/** When it paused (an old runner's stop point pauses it again as it resumes), and whether a resume took. */
+let pauseSince = LIVE_AT + 7_000;
+let resumed = false;
+let stopOff = false;
 const pause = (): State["pause"] =>
-  PAUSED
+  PAUSED && !resumed
     ? {
-        reason: "limit",
-        window: "five_hour",
-        label: "Session",
-        said: "You've hit your session limit · resets 10:30pm (America/Los_Angeles)",
+        reason: STOP_POINT ? "threshold" : "limit",
+        window: STOP_POINT ? "seven_day" : "five_hour",
+        label: STOP_POINT ? "Weekly" : "Session",
+        said: STOP_POINT ? "Weekly 95% used: its stop point" : "You've hit your session limit · resets 10:30pm (America/Los_Angeles)",
         until: PAUSED_UNTIL,
-        since: LIVE_AT + 7_000,
+        since: pauseSince,
         auto: true,
         by: "harness",
         cut: { message: "L-u-live", text: "Is the client still cancel-safe?", at: LIVE_AT + 7_000 },
@@ -236,12 +242,17 @@ let offlineUntil = Date.now() + Number(process.env.MOCK_OFFLINE_MS ?? 0);
 const offline = () => Date.now() < offlineUntil;
 let pauseAt: number | undefined;
 let moveOn = false;
+/** Where it goes on at a limit (`State.move_plan`). */
+let movePlan: { to?: string; kind?: string; model?: string } = {};
+/** Its runner from before agents went on elsewhere (MOCK_OLD_RUNNER=1): its state says nothing of it. */
+const OLD_RUNNER = process.env.MOCK_OLD_RUNNER === "1";
 
 const info: AgentInfo = {
   id: ID,
   kind: "claude",
   kind_name: "Claude Code",
-  target: "local",
+  // MOCK_LONG_TARGET=agent:<name>: on one of the machines (it can move); else on the server.
+  target: process.env.MOCK_LONG_TARGET ?? "local",
   name: "Retry storm",
   cwd: "/home/ada/src/kiln",
   created_at: T0,
@@ -276,7 +287,7 @@ const meta: Meta = {
     { name: "login", description: "Sign in to Claude Code on this machine", group: "Account", args: "none", route: { kind: "view", view: "login" } },
   ],
   agents: [],
-  features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments"],
+  features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments", "switch_harness"],
 };
 
 let activity = "Running cargo test";
@@ -291,7 +302,7 @@ let lastTurn: State["last_turn"];
 const state = (): State => ({
   status: offline() ? "disconnected" : running ? "running" : "idle",
   pause_at: pauseAt,
-  move_on_limit: moveOn || undefined,
+  ...(OLD_RUNNER ? {} : { move_on_limit: moveOn, move_plan: { ...movePlan } }),
   doing: running ? doing : undefined,
   turn_started: running ? turnStarted : undefined,
   last_turn: running ? undefined : lastTurn,
@@ -326,7 +337,8 @@ const send = (ws: WebSocket, u: unknown) => {
   const was = had.get(ws) as Record<string, unknown> | undefined;
   const f = u as { t?: string; state?: Record<string, unknown> };
   if (was && f.t === "state" && f.state) {
-    const now = f.state;
+    // As it goes over the wire: a field left undefined isn't there.
+    const now = JSON.parse(JSON.stringify(f.state)) as Record<string, unknown>;
     had.set(ws, now);
     const set = Object.fromEntries(Object.entries(now).filter(([k, v]) => JSON.stringify(was[k]) !== JSON.stringify(v)));
     const gone = Object.keys(was).filter((k) => !(k in now));
@@ -488,7 +500,7 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
   };
   go(0);
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; on?: boolean };
+    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; on?: boolean; to?: string; kind?: string };
     try {
       c = JSON.parse(raw.toString()) as typeof c;
     } catch {
@@ -499,8 +511,25 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
       send(ws, { t: "error", error: "its machine is away" });
       return;
     }
-    if (c.type === "pause_at") pauseAt = c.percent ?? undefined;
-    else if (c.type === "move_on_limit") moveOn = Boolean(c.on);
+    if (c.type === "pause_at") {
+      pauseAt = c.percent ?? undefined;
+      if (c.percent === null) stopOff = true;
+    } else if (c.type === "resume" && PAUSED) {
+      // A runner from before a stop point could be resumed past: it stops again at once, unless
+      // the stop point is off. A newer one goes on.
+      if (OLD_RUNNER && STOP_POINT && !stopOff)
+        setTimeout(() => {
+          pauseSince = Date.now();
+          broadcast({ t: "state", state: state() });
+        }, 600);
+      else if (!OLD_RUNNER || stopOff) {
+        resumed = true;
+        broadcast({ t: "state", state: state() });
+      }
+    } else if (c.type === "move_on_limit" && !OLD_RUNNER) {
+      moveOn = Boolean(c.on);
+      movePlan = moveOn ? { ...(c.to ? { to: c.to } : {}), ...(c.kind ? { kind: c.kind } : {}), ...(c.model ? { model: c.model } : {}) } : {};
+    }
     else if (c.type === "set_mode" && c.mode) info.mode = c.mode;
     else if (c.type === "set_model" && c.model) info.model = c.model;
     else if (c.type === "set_effort" && c.effort) effort = c.effort;
