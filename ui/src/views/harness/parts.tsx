@@ -117,18 +117,27 @@ export const Prose = React.memo(function Prose({ text, className, ev }: { text: 
 
 /** Output a command printed: the end matters most, so long output opens at its tail. */
 export function Output({ text, truncated, error }: { text: string; truncated?: boolean; error?: boolean }) {
-  // At its tail when it shows, and again as more comes.
+  // At its tail when it shows, and while following as more comes.
+  const following = React.useRef(true);
   const ref = React.useCallback(
     (el: HTMLPreElement | null) => {
       void text;
-      if (el) el.scrollTop = el.scrollHeight;
+      if (el && following.current) el.scrollTop = el.scrollHeight;
     },
     [text],
   );
   return (
     <div className="hx-pre-wrap">
       {text && <CopyBlock text={text} />}
-      <pre ref={ref} className="hx-out" data-error={error || undefined}>
+      <pre
+        ref={ref}
+        className="hx-out"
+        data-error={error || undefined}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
+        }}
+      >
         {truncated && <span className="hx-out-cut">… earlier output omitted …{"\n"}</span>}
         {text || " "}
       </pre>

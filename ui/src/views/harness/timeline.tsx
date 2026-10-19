@@ -832,7 +832,7 @@ export const Timeline = React.memo(function Timeline({
   const anchored = anchor ? turns.findIndex((t) => t.key === anchor) : -1;
   const tilled = till ? turns.findIndex((t) => t.key === till) : -1;
   const from = anchored >= 0 ? anchored : Math.max(0, turns.length - WINDOW);
-  const to = tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length;
+  const to = Math.min(from + MOST, tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length);
   /** A window around turn `i`, when it isn't in the page. */
   const around = (i: number) => {
     if (i < 0 || (i >= from && i < to)) return;
