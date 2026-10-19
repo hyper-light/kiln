@@ -347,6 +347,44 @@ async fn deliver(hub: &Arc<Hub>, d: &store::Device, body: &[u8], urgency: &'stat
 mod tests {
     use super::*;
 
+    /// The watch's lock is held only for `heard`, `due` and `closed`, never across a wait: from
+    /// many threads at once (as the event loop and the settling timers take it), each finishes.
+    #[test]
+    fn the_watch_is_never_held_across_a_wait() -> anyhow::Result<()> {
+        use crate::harness::model::{Status, ToolKind};
+        use crate::harness::session::{ApprovalBrief, Info};
+        let svc = Arc::new(Service::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in 0..4u64 {
+            let (svc, tx) = (Arc::clone(&svc), tx.clone());
+            std::thread::spawn(move || {
+                let mut said = 0;
+                for i in 0..400u64 {
+                    let id = format!("ag{}", i % 5);
+                    let approvals = if i % 3 == 0 { vec![ApprovalBrief { id: format!("a{t}-{i}"), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: i64::try_from(i).unwrap_or(0) }] } else { Vec::new() };
+                    let status = if approvals.is_empty() { Status::Running } else { Status::Waiting };
+                    let due = svc.watch.lock().heard(Info { id: id.clone(), status, approvals, ..Info::default() });
+                    if let Some(d) = due
+                        && svc.watch.lock().due(&d.agent, d.seq).is_some()
+                    {
+                        said += 1;
+                    }
+                    if i % 97 == 0 {
+                        svc.watch.lock().closed(&id);
+                    }
+                    let _ = svc.watch.lock().infos().count();
+                }
+                let _ = tx.send(said);
+            });
+        }
+        let mut said = 0;
+        for _ in 0..4 {
+            said += rx.recv_timeout(Duration::from_secs(30)).map_err(|_| anyhow::anyhow!("a thread never finished: the watch's lock was held"))?;
+        }
+        assert!(said > 0, "approvals were said");
+        Ok(())
+    }
+
     #[test]
     fn the_contact_is_said_or_the_public_url_or_a_placeholder() {
         let mut p = Push::default();
