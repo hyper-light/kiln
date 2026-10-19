@@ -118,7 +118,7 @@ nobody sees or removes another person's.
 |---|---|
 | `GET /api/push` | `{enabled, available, why, public_key, kinds, muted, reached}`: whether push works here (`why` says why not), the key to subscribe with, the kinds a device can hear, the agents you muted, and whether the server reached the push services when it last looked |
 | `GET /api/push/subscriptions` | `{devices}`: your devices, each `{id, endpoint, device, hears, created_at, last_ok_at, last_error, last_error_at}` |
-| `POST /api/push/subscriptions` | `{subscription, device, hears?, replaces?}`: a browser's subscription (`PushSubscription.toJSON()`), its name, and what it hears (all kinds when absent). The same endpoint again is the same device. `replaces`: the endpoint it takes over from (its name and kinds go on) |
+| `POST /api/push/subscriptions` | `{subscription, device, hears?, replaces?}`: a browser's subscription (`PushSubscription.toJSON()`), its name, and what it hears (all kinds when absent). The same endpoint again is the same device. `replaces`: the endpoint it takes over from (its name and kinds go on). At most 20 devices each (409 beyond) |
 | `DELETE /api/push/subscriptions/:id` | forgets one of your devices |
 | `POST /api/push/test` | `{id?}`: a test to your devices (or one), each tried once: `{sent, results: [{id, device, ok, error?}]}` |
 | `PUT /api/push/mutes/:agent` | mutes an agent for you |

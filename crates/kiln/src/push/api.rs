@@ -87,14 +87,18 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &Method, rest: &[&st
             let d = hub
                 .store
                 .call(move |c| {
+                    if !store::room_for(c, &p, &n.subscription.endpoint)? && before.is_none() {
+                        return Ok(None);
+                    }
                     let d = store::upsert(c, &p, &n, &name, &hears, crate::util::now_unix())?;
                     if let Some(b) = before.filter(|b| b.id != d.id) {
                         store::remove(c, &p, &b.id)?;
                     }
-                    Ok(d)
+                    Ok(Some(d))
                 })
                 .await
-                .map_err(store_err)?;
+                .map_err(store_err)?
+                .ok_or_else(|| (StatusCode::CONFLICT, format!("you have {} devices already, the most there may be: remove one first", store::MAX_DEVICES)))?;
             hub.store.audit(caller.name.clone(), "push.device".into(), format!("{label} hears {}", d.hears.join(", "))).await;
             hub.emit(&json!({ "type": "push" }));
             Ok(srv::json(StatusCode::CREATED, &d))

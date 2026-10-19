@@ -20,6 +20,8 @@ pub const KINDS: &[(&str, &str, &str)] = &[
 const MAX_ENDPOINT: usize = 2048;
 /// The longest device name.
 const MAX_NAME: usize = 80;
+/// The most devices one person has: each note is a request to each of them.
+pub const MAX_DEVICES: usize = 20;
 
 /// One device a person turned notifications on for.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -152,6 +154,12 @@ pub fn upsert(c: &Connection, principal: &str, n: &NewDevice, name: &str, hears:
         params![crate::util::new_id(), principal, endpoint, n.subscription.keys.p256dh.trim(), n.subscription.keys.auth.trim(), name, hears, now],
     )?;
     Ok(c.query_row(&format!("SELECT {COLUMNS} FROM push_subscriptions WHERE endpoint = ?1"), [endpoint], row)?)
+}
+
+/// Whether `principal` may add a device with `endpoint` (one they have already is always fine).
+pub fn room_for(c: &Connection, principal: &str, endpoint: &str) -> anyhow::Result<bool> {
+    let have: i64 = c.query_row("SELECT COUNT(*) FROM push_subscriptions WHERE principal = ?1 AND endpoint != ?2", [principal, endpoint.trim()], |r| r.get(0))?;
+    Ok(usize::try_from(have).unwrap_or(usize::MAX) < MAX_DEVICES)
 }
 
 /// `principal`'s devices, oldest first.
@@ -314,6 +322,13 @@ mod tests {
             delivered(c, &a.id, 500)?;
             let d = get(c, "owner", &a.id)?.ok_or_else(|| anyhow::anyhow!("gone"))?;
             assert_eq!((d.last_ok_at, d.last_error), (Some(500), None));
+            // Twenty devices each, at most; one already there may always come again.
+            for n in 0..MAX_DEVICES {
+                upsert(c, "user:u2", &browser(&format!("https://fcm.googleapis.com/many/{n}"))?, "Chrome", &["agent.finished".to_owned()], 1)?;
+            }
+            assert!(!room_for(c, "user:u2", "https://fcm.googleapis.com/many/new")?);
+            assert!(room_for(c, "user:u2", "https://fcm.googleapis.com/many/3")?);
+            assert!(room_for(c, "owner", "https://fcm.googleapis.com/many/new")?);
             assert!(drop_endpoint(c, "https://web.push.apple.com/one")?);
             assert!(list(c, "owner")?.is_empty());
             // Mutes are each person's.
