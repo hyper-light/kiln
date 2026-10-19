@@ -50,10 +50,21 @@ function StoppingControl({ stopAt, onForce, unavailable }: { stopAt: number; onF
   return <TurnControl tone={unavailable ? "disconnected" : "stopped"} label={stuck ? "Still running" : "Stopping…"} action={stuck ? "Force stop" : undefined} onClick={stuck ? onForce : undefined} />;
 }
 
-/** The clock updates independently of the header and keeps enough room for hours. */
+/** The turn's clock, a stopwatch: it ticks on its own (the header doesn't render for it) while a
+ *  turn runs, and keeps room for hours. */
 function TurnTime({ started }: { started: number }) {
   const now = useClock(1000);
   return <span className="ag-turn-time" title="Time in this turn" aria-label={`Time in this turn: ${formatThought((now - started) / 1000)}`}>{formatThought((now - started) / 1000)}</span>;
+}
+
+/** Between turns the clock stops where the last one ended. */
+function TurnTook({ ms }: { ms: number }) {
+  const took = formatThought(Math.max(0, ms) / 1000);
+  return (
+    <span className="ag-turn-time" data-stopped="" title="How long the last turn took" aria-label={`The last turn took ${took}`}>
+      {took}
+    </span>
+  );
 }
 
 export function AgentHeader({
@@ -72,7 +83,10 @@ export function AgentHeader({
   stopAt,
   onStop,
   onForceStop,
+  lastTurnFrom,
 }: {
+  /** When the last turn began (`lastTurnFrom`), for the stopped clock between turns. */
+  lastTurnFrom?: number | null;
   /** Find in the conversation. */
   onFind?: () => void;
   /** When a stop was asked of the turn under way (`useStopAt`), or null. */
@@ -205,7 +219,11 @@ export function AgentHeader({
         </div>
       </div>
       <div className="ag-clock-row">
-        {running && state?.turn_started != null && <TurnTime started={state.turn_started} />}
+        {running && state?.turn_started != null ? (
+          <TurnTime started={state.turn_started} />
+        ) : state?.last_turn && lastTurnFrom != null ? (
+          <TurnTook ms={state.last_turn.at - lastTurnFrom} />
+        ) : null}
       </div>
       {switchTarget ? (
         <React.Suspense fallback={<RunSettings {...line} />}>

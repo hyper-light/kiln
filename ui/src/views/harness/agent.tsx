@@ -12,7 +12,7 @@ import "./harness.css";
 import "./console.css";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import { harnessApi, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
+import { harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loading } from "@/components/ui/loading";
@@ -358,6 +358,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
   const meta = useSession(store, (s) => s.meta);
   const conn = useSession(store, (s) => s.conn);
   const stopAt = useStopAt(store);
+  const lastFrom = useSession(store, lastTurnFrom);
   const status = state?.status ?? info?.status ?? "starting";
   const actions = useAgentActions(
     {
@@ -394,6 +395,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
         stopAt={stopAt}
         onStop={() => store.stop()}
         onForceStop={() => store.stop(true)}
+        lastTurnFrom={lastFrom}
       />
       {actions.dialogs}
     </>
