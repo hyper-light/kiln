@@ -2229,6 +2229,20 @@ ms; a dashboard query p50 16.5 ms, p99 2.16 s, against 8.5 ms and 693 ms over th
 minutes (the ten-minute run's): what a query waits for in a long run (a cut's hold, a merge's
 blocks) is the next thing measured.
 
+Measured (§12.19), it was no wait. Twenty minutes each, 2026-10-19, the same machine, its other load
+varying (12 to 29 of 32 cores idle):
+
+| | by host p50 | by host p99 | one series' slowest: waited for the store | a dashboard query p99 | a request p99 |
+| --- | --- | --- | --- | --- | --- |
+| before | 648 ms | 1,172 ms | 4.3 ms | 1,147 ms | 0.99 ms |
+| files written beside queries (§4.5) | 800 ms | 1,606 ms | 0.00 ms | 1,573 ms | 1.16 ms |
+| and repeats decoded a word at a time, series read on helpers | 71 ms | 421 ms | 0.00 ms | 307 ms | 4.46 ms |
+
+Every run stored every point and record once, its replicas agreeing, its memory level. The last
+run's request p99 rose (4.5 ms against 1.0): the machine was the busiest of the three (12 cores idle,
+2 GB of memory free), and a wide query now takes helper threads in bursts; which of the two it was is
+measured next, on a quiet machine.
+
 What floods leave (§12.11) is a high-water mark, not a leak: after one, the server held some 300 MiB
 more than before, most of it in the C library's per-thread arenas (32 of them, from
 `/proc/<pid>/smaps`), while its store held under 15 MiB; `GLIBC_TUNABLES=glibc.malloc.arena_max=2`
