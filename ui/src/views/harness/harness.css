@@ -871,6 +871,7 @@ textarea.hx-input {
   display: flex;
   flex: none;
   gap: 10px;
+  margin-left: auto;
 }
 .hx-cmd-why {
   padding: 0 10px 8px 25px;
@@ -889,7 +890,7 @@ textarea.hx-input {
 }
 .hx-where {
   display: inline-flex;
-  flex: none;
+  flex: 0 1 auto;
   align-items: center;
   gap: 3px;
   max-width: min(45%, 260px);
@@ -1856,6 +1857,15 @@ textarea.hx-input {
   .hx-work {
     padding-left: 8px;
     margin-left: 2px;
+  }
+  .hx-step-head,
+  .hx-cmd[data-remote] .hx-cmd-head {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .hx-cmd[data-remote] .hx-cmd-line {
+    flex-basis: 100%;
+    order: -1;
   }
   .hx-step-body {
     padding: 4px 4px 10px 8px;
