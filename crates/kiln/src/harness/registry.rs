@@ -9,6 +9,8 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::core::{MAX_EVENTS, Update};
+use super::files;
+use super::kept::{Job, Keeper, Kept};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
@@ -108,8 +110,9 @@ impl Mirror {
         }
     }
 
-    /// The frames that bring a new viewer to the current state.
-    fn snapshot(&self) -> Vec<String> {
+    /// The frames that bring a new viewer to the current state; `files`, what's kept of the files
+    /// its messages mention (`Keeper::frame`), goes ahead of the events.
+    fn snapshot(&self, files: Option<String>) -> Vec<String> {
         let mut out = vec![json!({"t": "open", "info": self.info}).to_string()];
         if !self.meta.is_null() {
             out.push(json!({"t": "meta", "meta": self.meta}).to_string());
@@ -120,6 +123,7 @@ impl Mirror {
         if !self.changes.is_null() {
             out.push(json!({"t": "changes", "files": self.changes}).to_string());
         }
+        out.extend(files);
         let mut batch: Vec<&Value> = Vec::new();
         let mut size = 0usize;
         for e in &self.events {
@@ -257,6 +261,8 @@ pub struct Registry {
     /// The mirrors to ask for their copy as they connect: the store was found empty at start
     /// while the server had mirrors (it was lost, the rest wasn't).
     restore_auto: Mutex<Vec<String>>,
+    /// Files finished messages mention, kept so they still show after they go (`super::kept`).
+    pub keeper: Keeper,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -322,6 +328,7 @@ impl Registry {
             tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
         }
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
+        let keeper = Keeper::new(&dir);
         Self {
             mirrors: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
@@ -342,6 +349,7 @@ impl Registry {
             scanner: Arc::new(Mutex::new(None)),
             restore: Mutex::new(Restore::Idle),
             restore_auto: Mutex::new(restore_auto),
+            keeper,
         }
     }
 
@@ -595,6 +603,8 @@ impl Registry {
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
         RESTORED.call_once(|| {
+            // Files finished messages mention, kept as they come.
+            crate::rt::spawn(Keeper::run(hub.clone()));
             hub.harness.local.restore_from(hub.harness.convo.as_ref());
             // The server's own sessions' harness records, followed into its store.
             if let Some(st) = &hub.harness.convo {
@@ -740,6 +750,8 @@ impl Registry {
     pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let mut changed: Option<Info> = None;
         let mut gone = false;
+        // Finished messages' mentions of files, to keep once the mirrors are let go.
+        let mut jobs: Vec<Job> = Vec::new();
         let mut save_names = false;
         // The account's other sessions, which pause too (`hold_account`).
         let mut hold: Option<(Command, Vec<(String, Location)>)> = None;
@@ -845,6 +857,9 @@ impl Registry {
                 Update::Changes { files } => m.changes = serde_json::to_value(files).unwrap_or(Value::Null),
                 Update::Events { events } => {
                     for e in events {
+                        if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
+                            jobs.push(job);
+                        }
                         if let Ok(v) = serde_json::to_value(e) {
                             m.upsert(v);
                         }
@@ -875,10 +890,14 @@ impl Registry {
         if let Some((c, targets)) = hold {
             self.hold_account(hub, &c, targets);
         }
+        for job in jobs {
+            self.keeper.enqueue(job);
+        }
         if save_names {
             self.save_names();
         }
         if gone {
+            self.keeper.forget(id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -988,14 +1007,42 @@ impl Registry {
 
     /// Join a session's stream. None when there is no such session.
     pub fn attach(&self, id: &str) -> Option<Attachment> {
+        // What's kept is read before the mirrors are locked: the first time, off disk.
+        let files = self.keeper.frame(id);
         let g = self.mirrors.lock();
         let m = g.get(id)?;
-        Some(Attachment { frames: m.snapshot(), live: m.out.subscribe() })
+        Some(Attachment { frames: m.snapshot(files), live: m.out.subscribe() })
     }
 
     /// Catch-up frames for a viewer that fell behind.
     pub fn frames(&self, id: &str) -> Option<Vec<String>> {
-        self.mirrors.lock().get(id).map(Mirror::snapshot)
+        let files = self.keeper.frame(id);
+        self.mirrors.lock().get(id).map(|m| m.snapshot(files))
+    }
+
+    /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
+    pub fn files_added(&self, id: &str, added: &[Kept]) {
+        if let Some(m) = self.mirrors.lock().get(id) {
+            m.out.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
+        }
+    }
+
+    /// Where a session runs, when one of its messages mentions `path` (a relative mention, in its
+    /// folder): a viewer may read that file from its machine, and no other.
+    pub fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
+        let listed = self.keeper.lists_path(id, path);
+        let g = self.mirrors.lock();
+        let m = g.get(id)?;
+        let cwd = &m.info.cwd;
+        let said = || {
+            m.events
+                .iter()
+                .rev()
+                .filter(|e| matches!(e.get("kind").and_then(Value::as_str), Some("user" | "assistant")))
+                .filter_map(|e| e.get("text").and_then(Value::as_str))
+                .any(|t| files::mentioned(t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
+        };
+        (listed || said()).then(|| m.location.clone())
     }
 
     /// Start sessions on `target`. Sessions on machines are named here and appear at once
@@ -1299,6 +1346,7 @@ impl Registry {
             if let Some(m) = self.mirrors.lock().remove(id) {
                 m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
             }
+            self.keeper.forget(id);
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
@@ -1325,6 +1373,17 @@ impl Registry {
         let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
         Some((m.state.clone(), reply, m.changes.clone()))
     }
+}
+
+/// A finished message's mentions of files, to keep (`super::kept`): what the person or the agent
+/// said, never a tool's input or output.
+fn mentions(id: &str, cwd: &str, location: &Location, e: &super::model::Event) -> Option<Job> {
+    let text = match &e.body {
+        super::model::Body::User { text, .. } | super::model::Body::Assistant { text, streaming: false } => text,
+        _ => return None,
+    };
+    let paths: Vec<String> = files::mentioned(text).iter().filter_map(|p| files::resolve(p, cwd)).collect();
+    (!paths.is_empty()).then(|| Job { session: id.to_owned(), seq: e.seq, paths, location: location.clone() })
 }
 
 fn default_name(kind: &str) -> String {

@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import type { Element, ElementContent, Root, RootContent } from "hast";
-import Markdown, { type Components } from "react-markdown";
+import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CopyBlock } from "@/components/ui/copy-block";
 
@@ -61,6 +61,71 @@ function labelTables() {
 const REMARK = [remarkGfm];
 const REHYPE = [labelTables];
 
+/* ------------------------------------------------------------------ files on the agent's machine */
+
+/** How a conversation shows a file one of its messages mentions (`views/harness/files.tsx`):
+ *  `image` when the message shows it (`![…](…)`), else a link or a path in its words. */
+export type LocalFile = React.ComponentType<{ path: string; image: boolean; children?: React.ReactNode }>;
+
+/** Whether a link points at a file (a path, a `file:` address) rather than the web. */
+export function isLocalHref(href: string): boolean {
+  if (!href || href.startsWith("#") || href.startsWith("?") || href.startsWith("//")) return false;
+  return /^file:/i.test(href) || !/^[a-z][a-z0-9+.-]*:/i.test(href);
+}
+
+/** A file link's path, decoded. */
+export function hrefPath(href: string): string {
+  const raw = href.replace(/^file:\/\/(localhost)?/i, "").split(/[?#]/)[0] ?? "";
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** Files of the kinds people show (pictures, recordings, sounds, documents): a full path to one in
+ *  the words or in code is taken for a mention (as the server's `crate::harness::files::mentioned`),
+ *  so prose about `/api/...` routes isn't. */
+const SHOWN = "png|jpe?g|gif|webp|avif|heic|svg|bmp|mp4|webm|mov|mkv|mp3|wav|ogg|oga|flac|m4a|aac|pdf|log|md|csv";
+const SHOWN_PATH = new RegExp(`^(?:~/|/(?!/))\\S*\\.(?:${SHOWN})$`, "i");
+const PATH_IN_WORDS = new RegExp(`(^|[\\s(\\[{"'<*_])((?:~/|/(?!/))[^\\s()\\[\\]{}"'<>\`]*\\.(?:${SHOWN}))(?=$|[\\s)\\]}"'>,.;:!?*_])`, "gi");
+
+type MdNode = { type: string; value?: string; url?: string; children?: MdNode[] };
+
+function linksIn(value: string): MdNode[] {
+  const out: MdNode[] = [];
+  let last = 0;
+  for (const m of value.matchAll(PATH_IN_WORDS)) {
+    const start = (m.index ?? 0) + (m[1] ?? "").length;
+    const path = m[2] ?? "";
+    if (start > last) out.push({ type: "text", value: value.slice(last, start) });
+    out.push({ type: "link", url: path, children: [{ type: "text", value: path }] });
+    last = start + path.length;
+  }
+  if (out.length === 0) return [{ type: "text", value }];
+  if (last < value.length) out.push({ type: "text", value: value.slice(last) });
+  return out;
+}
+
+/** Paths to files people show, in the words or as code, become links (to the file). */
+function remarkPaths() {
+  const walk = (n: MdNode) => {
+    if (!n.children) return;
+    n.children = n.children.flatMap((c): MdNode[] => {
+      if (["link", "linkReference", "code", "html", "definition", "image", "imageReference"].includes(c.type)) return [c];
+      if (c.type === "inlineCode" && c.value && SHOWN_PATH.test(c.value)) return [{ type: "link", url: c.value, children: [c] }];
+      if (c.type === "text" && c.value) return linksIn(c.value);
+      walk(c);
+      return [c];
+    });
+  };
+  return (tree: MdNode) => walk(tree);
+}
+
+const REMARK_FILES = [remarkGfm, remarkPaths];
+/** `file:` addresses stay (to be shown as files); everything else as react-markdown has it. */
+const keepFiles = (url: string) => (/^file:/i.test(url) ? url : defaultUrlTransform(url));
+
 const heading =
   (level: number) =>
   ({ children }: { children?: React.ReactNode }) => (
@@ -69,12 +134,14 @@ const heading =
     </p>
   );
 
+const WebLink: NonNullable<Components["a"]> = ({ href, children }) => (
+  <a href={href} target="_blank" rel="noopener noreferrer">
+    {children}
+  </a>
+);
+
 const MARKDOWN: Components = {
-  a: ({ href, children }) => (
-    <a href={href} target="_blank" rel="noopener noreferrer">
-      {children}
-    </a>
-  ),
+  a: WebLink,
   h1: heading(1),
   h2: heading(2),
   h3: heading(3),
@@ -106,7 +173,48 @@ const MARKDOWN: Components = {
   ),
 };
 
-export function MarkdownBody({ text }: { text: string }) {
+/** The components with files shown by `File` (one set per `File`, so they stay the same). */
+const withFiles = new WeakMap<LocalFile, Components>();
+function componentsFor(File: LocalFile): Components {
+  let c = withFiles.get(File);
+  if (!c) {
+    c = {
+      ...MARKDOWN,
+      a: (props) =>
+        typeof props.href === "string" && isLocalHref(props.href) ? (
+          <File path={hrefPath(props.href)} image={false}>
+            {props.children}
+          </File>
+        ) : (
+          <a href={props.href} target="_blank" rel="noopener noreferrer">
+            {props.children}
+          </a>
+        ),
+      img: ({ src, alt }) =>
+        typeof src === "string" && isLocalHref(src) ? (
+          <File path={hrefPath(src)} image>
+            {alt}
+          </File>
+        ) : (
+          <a href={typeof src === "string" ? src : undefined} target="_blank" rel="noopener noreferrer">
+            {alt || "image"}
+          </a>
+        ),
+    };
+    withFiles.set(File, c);
+  }
+  return c;
+}
+
+/** `files`: how a conversation shows the files its message mentions (none: paths stay words). */
+export function MarkdownBody({ text, files }: { text: string; files?: LocalFile }) {
+  if (files) {
+    return (
+      <Markdown remarkPlugins={REMARK_FILES} rehypePlugins={REHYPE} components={componentsFor(files)} urlTransform={keepFiles}>
+        {text}
+      </Markdown>
+    );
+  }
   return (
     <Markdown remarkPlugins={REMARK} rehypePlugins={REHYPE} components={MARKDOWN}>
       {text}

@@ -619,6 +619,34 @@ A tool call reads `pending` while it is asked about (an approval in `state.appro
 `tool_id`) or while it waits its turn behind one; `running` once it is under way. MCP calls name
 their `server` and `tool_short`; skill calls their `skill`.
 
+## Files in messages
+
+A file a message mentions shows in the conversation: what the agent or the person wrote, never
+what a tool read or printed. Pictures and recordings show in place, their space taken before they
+load so nothing moves; sounds, PDFs, text and logs show as a chip that opens in place.
+
+- **Mentioned:** a full path (`/tmp/shot.png`, `~/rec/flow.webm`) or a `file://` address in a
+  Markdown image or link, or a path in the session's folder in one; and, in code or among the
+  words, full paths to pictures, recordings, sounds and documents (so prose about `/api/...`
+  routes isn't taken for files).
+- **Read on its machine:** the server asks the runner holding the session (`CAP_FILES`;
+  `ServerMsg::HarnessFileRead`, answered on lane 7 in pieces of a megabyte, out of the way of
+  jobs' logs, terminals and the conversation feed). A runner from before this can't, and the
+  console says to upgrade it. The server's own sessions are read in place.
+- **Kept:** once a message is done, the server keeps a copy of each file it mentions, by content,
+  in `<data>/harness/files/`, so it still shows after the file is moved, changed or deleted, each
+  message showing the file as it was then. Up to 64 MiB a file, 512 MiB a conversation and 4 GiB
+  in all; past those a file is read from its machine when someone looks. A closed conversation's
+  copies go.
+- **Never:** anything that looks like a secret (keys, `.env` files, credentials, kiln's own
+  config, `/proc`), nor types a person can't look at.
+- **API:** `GET /api/harness/sessions/:id/files/:sha` (a kept copy, cached for good) and
+  `GET /api/harness/sessions/:id/file?path=` (read now, and only a path one of its messages
+  mentions); both take `Range`. Viewers hear what's kept as `{"t":"files","files":[...]}`, sent
+  ahead of the events when they attach.
+
+kiln's MCP instructions tell agents to show files this way.
+
 ## Notes per harness
 
 - **Claude Code** reads its MCP configuration when it starts: after `mcp_add` / `mcp_remove`

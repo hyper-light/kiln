@@ -38,7 +38,8 @@ impl Owned {
             | ServerMsg::HarnessCmd { session, .. }
             | ServerMsg::HarnessClose { session }
             | ServerMsg::HarnessPackage { session, .. }
-            | ServerMsg::HarnessRelease { session } => Some(Self::Agent(session.clone())),
+            | ServerMsg::HarnessRelease { session }
+            | ServerMsg::HarnessFileRead { session, .. } => Some(Self::Agent(session.clone())),
             ServerMsg::Assign(a) => Some(Self::Job(a.job_id.clone())),
             // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
             ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),
