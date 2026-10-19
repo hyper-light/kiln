@@ -22,6 +22,7 @@ pub mod dns;
 pub mod exec;
 pub mod fleet;
 pub mod frontdoor;
+pub mod githost;
 pub mod gitops;
 pub mod harness;
 pub mod host;

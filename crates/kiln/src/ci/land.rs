@@ -747,6 +747,15 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
         hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk} at {tip}: entry {} by {}", repo.name, e.id, e.enqueued_by)).await;
     }
     tracing::info!(repo = %repo.name, %trunk, %tip, diffs = all.len(), "landed");
+    // For whoever follows lands (deploy's releases of origin `git`, docs/deploy-api.md).
+    let mut names = Vec::new();
+    for id in &all {
+        if let Ok(Some(d)) = diffs::find(hub, id).await {
+            names.push(d.name);
+        }
+    }
+    let by: Vec<&str> = batch.iter().map(|e| e.enqueued_by.as_str()).collect();
+    hub.emit(&json!({ "type": "landed", "repo": repo.id, "repo_name": repo.name, "trunk": trunk, "tip": tip, "diffs": names, "by": by }));
     super::hosting::mirror_trunk(hub, repo, path, trunk);
     // The trunk's push runs (the poller sees it now).
     hub.gitops_kick.notify();

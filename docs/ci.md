@@ -38,6 +38,7 @@
   - [W20 Agents: MCP code mode, skills, attachments, experiments](#w20-agents-mcp-code-mode-skills-attachments-experiments)
   - [W21 UI](#w21-ui)
   - [W22 Conformance, end-to-end and performance testing](#w22-conformance-end-to-end-and-performance-testing)
+  - [W23 CI providers](#w23-ci-providers)
 - [4. API, events, CLI and MCP reference](#4-api-events-cli-and-mcp-reference)
 - [5. Milestones and the order of work](#5-milestones-and-the-order-of-work)
 - [Appendix A. GitHub Actions compatibility matrix](#appendix-a-github-actions-compatibility-matrix)
@@ -184,7 +185,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); review UI, App, REST rest left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); review UI and REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -193,6 +194,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal) |
+| W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface with kiln's and GitHub's sides (the App) |
 
 ---
 
@@ -3267,7 +3269,9 @@ adapts [review.md](review.md), which it replaces.
 
 **Requirements: GitHub-hosted repositories**
 
-- **W14-R10 GitHub App** (optional, `[ci.github] app_id, private_key_file`): installation tokens
+- **W14-R10 GitHub App** (optional, `[ci.github] app_id, private_key_file`, or made in one step by
+  GitHub's App manifest flow): the GitHub git host's credential (deploy-api.md §7, W23-P5), which
+  KilnCI uses for repositories that stay on GitHub. Installation tokens
   for `GITHUB_TOKEN` when a repository uses `github_api: github` (W14-R12); commit statuses and
   check runs for every kiln run (today's optional token path, generalized); App webhooks as an
   event source (W03); pull request metadata; comments; landing pull requests with the chosen
@@ -3331,8 +3335,9 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: native hosting, stacked diffs, change requests, review, policy and the
-land queue are built; the review UI, the App and the facade's REST half are left.
+**Progress.** In progress: native hosting, stacked diffs, change requests, review, policy, the
+land queue and the GitHub App are built; the review UI and the rest of the facade's REST half are
+left.
 
 - *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
   - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
@@ -3396,6 +3401,25 @@ land queue are built; the review UI, the App and the facade's REST half are left
     `{ message, diff }` patches, applied onto the trunk in a temporary index, given Change-Ids,
     and submitted as a push is.
   - Checked end to end (`w14_r05_suggestions_mirror_signing`).
+- *Done.* R10 and R12, the GitHub App (`crates/kiln/src/githost/github.rs`, `web.rs`), as the
+  GitHub git host's credential (W23-P5):
+  - from `[ci.github]` (app id, private key, webhook secret; `api_url` and `web_url` for
+    Enterprise Server), or made in one step by GitHub's App manifest flow
+    (`POST /api/ci/github/app/manifest`, GitHub's callback at `/api/ci/github/app/callback`; its key
+    and secrets sealed in the store); `GET /api/ci/github/app` says which, and where to install it;
+  - RS256 JWTs, installation tokens limited to one repository and the permissions each call needs,
+    kept until shortly before they expire;
+  - a check run for every KilnCI run of a repository on GitHub, made when it's queued, done with its
+    conclusion, a new one for each attempt, caught up every minute;
+  - the App's webhook (`/api/hooks/github/app`, signed): GitHub's Re-run reruns kiln's run, a
+    check suite's reruns its failed legs, the rest reach the workflows as GitHub's events do;
+  - `github_api: github` (R12): the job's `GITHUB_TOKEN` is an installation token with the job's
+    permissions, and `GITHUB_SERVER_URL`, `GITHUB_API_URL` and the `github` context are GitHub's;
+  - the git-host calls deploy-api.md §7 needs: read, commit through the Git Data API (moved only as a
+    fast-forward of what it was made on), push with a lease, pull requests and their state,
+    statuses, deployments, push webhooks, repositories from templates.
+  - Checked against a fake GitHub API and `git daemon` (`w14_r10_github_app`); W14-AC07 against
+    GitHub itself waits for an App and a test repository from the user.
 - *Done.* R04's change requests, in `crates/kiln/src/ci/cr.rs`: a branch reviewed against a
   trunk as a whole (`CR4`, numbered with the diffs):
   - opened by pushing `refs/for/<trunk>/branch/<name>` (`kiln cr open [branch]`, `-o title=`)
@@ -3492,7 +3516,6 @@ land queue are built; the review UI, the App and the facade's REST half are left
   - the rest of R11's REST subset and GraphQL;
   - replies by email or chat (R05, with W11-R06);
   - R06's diffs UI and the review pages (with W21);
-  - the App (R10);
   - AC05 to AC07.
 
 ### W15 Environments and deployments
@@ -4766,6 +4789,124 @@ and AC02.
   way for legs to read github.com's API (W18's egress proxy).
 
 ---
+
+### W23 CI providers
+
+**Scope.** CI is a provider choice, as CD is ([deploy-api.md](deploy-api.md) §8: KilnCD or Argo
+CD). A repository's CI runs on **KilnCI**, the engine W01 to W22 build (GitHub Actions compatible,
+independent of GitHub), or on **GitHub Actions**, **GitLab CI/CD** or **Bitbucket Pipelines**,
+which kiln drives through their APIs. Whatever the provider, kiln's UI, API, CLI and MCP show and
+act on the same things:
+- runs, jobs, logs, reruns, cancels, dispatches, artifacts, approvals;
+- through the repository's git host (deploy-api.md §7: kiln, GitHub, GitLab, Bitbucket), pull
+  requests, reviews, comments and checks.
+
+**Decisions.** As the user set them, 2026-10-18:
+
+| # | Decision |
+| --- | --- |
+| P1 | CI is a provider choice, like CD: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines |
+| P2 | KilnCI is independent: full GitHub Actions compatibility (W01 to W22), no dependency on GitHub; GitHub is at most an identity provider (sign in, OIDC) and a git host |
+| P3 | GitHub Actions, GitLab and Bitbucket are API integrations: kiln shows and acts on their CI, and on their pull requests, reviews and comments, in its own UI |
+| P4 | One contract for every provider (R01): the UI, API, CLI and MCP don't change with the provider |
+| P5 | Git hosts are deploy-api.md §7's one interface, shared with CD and built once; GitHub's App is the GitHub host's credential, not KilnCI's (W14-R10) |
+| P6 | SSO with GitHub, GitLab and Bitbucket: sign-in, organization limits, and membership mapped to kiln's groups (R08) |
+
+**Requirements**
+
+- **W23-R01 The contract.** Every provider answers the same calls:
+
+  | Call | What it does |
+  | --- | --- |
+  | `runs(repo, filter)` / `run(id)` | runs (workflow runs, pipelines) with their status, event, ref, commit, actor, times, link |
+  | `watch(repo)` | changes as they happen: the provider's webhooks, then polling |
+  | `jobs(run)` | jobs with their steps, status, runner, times |
+  | `logs(job)` | a job's log, streamed while it runs where the provider allows |
+  | `rerun(run, all \| failed \| job)` / `cancel(run)` | as the provider offers them |
+  | `dispatch(workflow, ref, inputs)` | a manual run with inputs (`workflow_dispatch`, a pipeline with variables, a custom pipeline) |
+  | `artifacts(run)` | list and download |
+  | `approve(run, environment, approve \| reject, comment)` | a deployment waiting for review |
+  | `workflows(repo)` | the CI files, checked (W02 for GitHub's YAML; GitLab's CI lint) |
+  | `checks(sha)` | every provider's results for a commit, together |
+
+- **W23-R02 KilnCI** is the engine of W01 to W22 behind the contract, in process.
+- **W23-R03 GitHub Actions**, through GitHub's REST API with the GitHub host's credentials (an
+  App installation, or a fine-grained token):
+  - workflow runs, their jobs and steps;
+  - logs (the job's log, followed while it runs);
+  - rerun (all, failed jobs, one job), cancel, `workflow_dispatch`;
+  - artifacts;
+  - pending deployment reviews;
+  - webhooks: `workflow_run`, `workflow_job`, `check_run`, `deployment_review`.
+
+  GitHub.com and GitHub Enterprise Server.
+- **W23-R04 GitLab CI/CD**, through GitLab's API with the GitLab host's credentials:
+  - pipelines, their jobs and job traces;
+  - retry, cancel, play (manual jobs), new pipelines with variables;
+  - job artifacts;
+  - protected environments' deployment approvals;
+  - webhooks: pipeline, job and deployment events;
+  - `.gitlab-ci.yml` checked with GitLab's CI lint.
+
+  GitLab.com and self-managed GitLab.
+- **W23-R05 Bitbucket Pipelines**, through Bitbucket Cloud's API with the Bitbucket host's
+  credentials:
+  - pipelines, their steps and step logs;
+  - rerun (failed steps or all), stop, custom pipelines with variables;
+  - deployments and environments;
+  - webhooks for builds and commit statuses.
+- **W23-R06 Pull requests on every host** in kiln's review pages (W14-R05, R06, W21): GitHub pull
+  requests, GitLab merge requests and Bitbucket pull requests, as kiln's own diffs and change
+  requests are shown:
+  - the conversation, and threads on lines;
+  - reviews: approve, request changes, comment;
+  - merging by the host's methods (merge, squash, rebase or fast-forward);
+  - every provider's checks;
+  - kiln's inbox includes them.
+- **W23-R07 Choosing.** Per repository (kiln's settings, or `.kiln/config.yaml` `ci.provider`).
+  The default is KilnCI for repositories kiln hosts, and the host's own CI for repositories on
+  GitHub, GitLab or Bitbucket that have its CI files. Several may run on one repository (KilnCI
+  running `.github/workflows` beside GitHub Actions, say) when the user chooses so.
+- **W23-R08 SSO** with GitHub, GitLab and Bitbucket (asked 2026-10-18), beside kiln's own sign-in
+  (W10):
+  - sign in with each (OAuth 2; GitLab's OIDC), GitHub.com and Enterprise Server, GitLab.com and
+    self-managed, Bitbucket Cloud;
+  - people matched to kiln users by their verified email or a linked account, or made on their
+    first sign-in when the server allows it;
+  - sign-in limited to chosen GitHub organizations, GitLab groups or Bitbucket workspaces;
+  - membership mapped to kiln's groups and grants (W10-R02): a GitHub team, a GitLab group or a
+    Bitbucket workspace gives roles in scopes (`developer@org:acme`), checked again on each sign-in
+    and as membership changes;
+  - one who signs in this way, or connects their account later, acts on the host as themselves:
+    comments, reviews and merges made from kiln are theirs, not the App's.
+- **W23-R09 One model.** A provider's runs map to kiln's runs, jobs and steps (W05's states), the
+  provider's own words kept beside them, with links back to the provider's pages; KilnCI's
+  features (insights, compare, log search, notifications) cover every provider's runs where the
+  data allows, and say where it doesn't.
+
+**Acceptance criteria**
+
+- **W23-AC01 Contract.** The same API calls list, follow, rerun and cancel a run on each provider,
+  against fakes of each API built from their documented shapes. *Integration test.*
+- **W23-AC02 Providers.** Against test repositories on GitHub, GitLab and Bitbucket, each
+  provider's run in kiln:
+  - its jobs and logs, live;
+  - rerun failed, cancel, dispatch;
+  - an approval given from kiln.
+
+  *E2E, user-assisted.*
+- **W23-AC03 Pull requests.** A GitHub pull request, a GitLab merge request and a Bitbucket pull
+  request reviewed from kiln's UI: comments on lines, an approval, a merge by each allowed method.
+  *E2E, user-assisted.*
+
+**Interfaces.** Uses deploy-api.md §7's git hosts (shared with CD), W10's identity, W11's
+credentials, W14's review pages, W19's insights and notifications, and W21.
+
+**Progress.** In progress: `crate::githost` (one interface over kiln's own git server and GitHub,
+agreed with the deploy-api work, which codes against it), with kiln's and GitHub's sides built (W14-R10).
+Left: the provider contract and its four providers (R01 to R05), pull requests on every host in the
+review pages (R06), choosing (R07), SSO (R08), the model (R09), GitLab's and Bitbucket's hosts, and
+AC01 to AC03.
 
 ## 4. API, events, CLI and MCP reference
 

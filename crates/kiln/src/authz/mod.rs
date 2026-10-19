@@ -16,6 +16,7 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod tokens;
 
 use std::collections::HashMap;
 
@@ -49,6 +50,7 @@ pub const CAPABILITIES: &[&str] = &[
     "environments.deploy",
     "environments.manage",
     "diffs.read",
+    "git.read",
     "diffs.submit",
     "diffs.review",
     "diffs.land",

@@ -55,6 +55,17 @@ pub struct Ci {
     /// it: a host (`hooks.corp`, `hooks.corp:8443`, `*.corp`), an address, or a network
     /// (`10.0.0.0/8`).
     pub allow_private_targets: Vec<String>,
+    /// `[ci.github]`: the GitHub App kiln acts through on GitHub (docs/ci.md W14-R10, W23): its
+    /// id and private key, or none (the App the manifest flow made, kept in the store).
+    ///
+    /// ```toml
+    /// [ci.github]
+    /// app_id = 123456
+    /// private_key_file = "/etc/kiln/github-app.pem"
+    /// webhook_secret_file = "/etc/kiln/github-webhook-secret"
+    /// # GitHub Enterprise Server: api_url = "https://ghe.example.com/api/v3", web_url = "https://ghe.example.com"
+    /// ```
+    pub github: GithubApp,
     /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
     ///
     /// ```toml
@@ -66,6 +77,25 @@ pub struct Ci {
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// The GitHub App's settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubApp {
+    pub app_id: Option<u64>,
+    pub private_key_file: Option<std::path::PathBuf>,
+    pub webhook_secret_file: Option<std::path::PathBuf>,
+    /// GitHub's REST API.
+    pub api_url: String,
+    /// GitHub's web origin: repositories there are GitHub's.
+    pub web_url: String,
+}
+
+impl Default for GithubApp {
+    fn default() -> Self {
+        GithubApp { app_id: None, private_key_file: None, webhook_secret_file: None, api_url: "https://api.github.com".into(), web_url: "https://github.com".into() }
+    }
 }
 
 /// How landed commits are signed.

@@ -86,6 +86,13 @@ fn git_path(seg: &[&str]) -> bool {
 pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
     match (&method, rest) {
+        // W14-R10: the GitHub App, and making one by GitHub's manifest flow.
+        (&Method::GET, ["github", "app"]) => crate::githost::web::show(hub).await,
+        (&Method::POST, ["github", "app", "manifest"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 20).await.unwrap_or(serde_json::Value::Null);
+            crate::githost::web::start(hub, &by, &body).await
+        }
         // W02: workflows.
         (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
         // W04-R29: a plan without a run.
