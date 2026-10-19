@@ -18,6 +18,7 @@
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
 //! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
+//! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment |
 //!
 //! A release, rollback or cancel asked for with an `Idempotency-Key` header (or
 //! `idempotency_key`) is the same one when asked for again.
@@ -224,6 +225,12 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             ask.idempotency_key = ask.idempotency_key.or(key);
             created(&boxed(|| flow::release(&d, &who, ask)).await?)
         }
+        (&Method::POST, ["fleets"]) => {
+            let mut f: flow::FleetAsk = body(req.into_body()).await?;
+            f.idempotency_key = f.idempotency_key.or(key);
+            created(&boxed(|| flow::fleet(&d, &who, f)).await?)
+        }
+        (&Method::GET, ["fleets", id]) => ok(&boxed(|| flow::fleet_status(&d, id)).await?),
         (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
         (&Method::POST, ["releases", id, verdict @ ("approve" | "reject")]) => {
             let (id, note) = (release_id(id)?, body::<Note>(req.into_body()).await?.note);

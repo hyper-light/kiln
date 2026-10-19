@@ -131,7 +131,7 @@ enum DeployCmd {
         #[arg(long, visible_alias = "to")]
         env: String,
     },
-    /// The manifests it renders (on Argo CD, those `--version` would).
+    /// The manifests it renders (or those `--version` would).
     Manifests {
         app: String,
         #[arg(long, visible_alias = "to")]
@@ -139,7 +139,7 @@ enum DeployCmd {
         #[arg(long)]
         version: Option<String>,
     },
-    /// What a sync would change (on Argo CD, what deploying `--version` would).
+    /// What a sync would change (or what deploying `--version` would).
     Diff {
         app: String,
         #[arg(long, visible_alias = "to")]
@@ -162,6 +162,31 @@ enum DeployCmd {
         container: Option<String>,
         #[arg(long, default_value_t = 200)]
         tail: u32,
+    },
+    /// A fleet change: one version, or values set (`--set path=value`), released to many apps of
+    /// an environment at once (those given, or of a template, a project or an owner; all registered
+    /// there when none is), each through its gates. With `--show <id>`, how one stands.
+    Fleet {
+        #[arg(long, visible_alias = "to")]
+        env: Option<String>,
+        #[arg(long = "app")]
+        apps: Vec<String>,
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, conflicts_with = "set")]
+        version: Option<String>,
+        /// `path=value` in each app's values: `image.pullPolicy=Always`, `replicaCount=2`.
+        #[arg(long = "set")]
+        set: Vec<String>,
+        /// Asked again with the same key, the same fleet change.
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long, conflicts_with_all = ["env", "version", "set"])]
+        show: Option<String>,
     },
     /// Delivery metrics (DORA's four keys) from the releases: of an app, an environment, or all.
     Metrics {
@@ -525,6 +550,36 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
+        Some(DeployCmd::Fleet { env, apps, template, project, owner, version, set, key, show }) => {
+            let v = match show {
+                Some(id) => api.call(Method::Get, &format!("/fleets/{}", enc(&id)), None).await?,
+                None => {
+                    let env = env.context("--env: the environment the fleet change goes to")?;
+                    let mut sets = serde_json::Map::new();
+                    for kv in &set {
+                        let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set path=value"))?;
+                        sets.insert(k.to_owned(), json!(v));
+                    }
+                    let body = json!({ "environment": env, "apps": apps, "template": template, "project": project, "owner": owner, "version": version, "set": sets, "idempotency_key": key });
+                    api.call(Method::Post, "/fleets", Some(body)).await?
+                }
+            };
+            api.print(&v, |v| {
+                println!("fleet change {} in {}", s(v, "fleet"), s(v, "environment"));
+                for r in v.get("releases").and_then(Value::as_array).into_iter().flatten() {
+                    match r.get("release") {
+                        Some(rel) => println!("{}  {}", s(rel, "app"), line(rel)),
+                        None if r.get("error").is_some() => println!("{}  not released: {}", s(r, "app"), s(r, "error")),
+                        None => println!("{}", line(r)),
+                    }
+                }
+                if let Some(states) = v.get("states").and_then(Value::as_object) {
+                    let parts: Vec<String> = states.iter().map(|(k, n)| format!("{n} {k}")).collect();
+                    println!("{}{}", parts.join(", "), if v.get("done").and_then(Value::as_bool) == Some(true) { " · done" } else { "" });
+                }
+            });
+            return Ok(());
+        }
         Some(DeployCmd::Metrics { app, env, days }) => {
             let mut q = vec![format!("days={days}")];
             q.extend(app.map(|a| format!("app={}", enc(&a))));

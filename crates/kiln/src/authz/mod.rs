@@ -394,6 +394,7 @@ pub static ROUTES: &[Rule] = &[
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
     r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/fleets", "environments.deploy", At::Server),
     r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
