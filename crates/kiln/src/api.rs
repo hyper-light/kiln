@@ -245,6 +245,18 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
             });
         }
+        // Datadog's Agent (`crate::observe::ddagent`) at Datadog's own paths, its API key the same
+        // token: what Datadog answers a key that is not one.
+        (_, segs) if crate::observe::ddagent::is_datadog(segs) => {
+            let ok = crate::observe::ddagent::api_key(&req).is_some_and(|k| crate::observe::api::ingest_allowed(&k, &hub.admin_token));
+            if !ok {
+                return Ok(srv::json(StatusCode::FORBIDDEN, &serde_json::json!({ "errors": ["Forbidden", "API key is missing or invalid"] })));
+            }
+            return Ok(match crate::observe::api::get() {
+                Some(o) => crate::observe::ddagent::answer(o, segs, req).await,
+                None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+            });
+        }
         // OTLP/gRPC (`crate::observe::otlp::grpc`): the same token, as gRPC's metadata.
         (&Method::POST, [service, "Export"]) if crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).is_some() => {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));

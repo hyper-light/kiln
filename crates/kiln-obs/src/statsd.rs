@@ -870,61 +870,74 @@ impl Aggregator {
         !self.out.samples.is_empty()
     }
 
-    fn tagged(&self, raw: &str, attrs: &mut Vec<(String, String)>) -> (String, Option<String>) {
-        let mut service = String::new();
-        let mut host = None;
-        for (k, v) in tag_pairs(raw).chain(self.s.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
-            match k {
-                "host" => host = host.or_else(|| Some(v.to_owned())),
-                "service" if service.is_empty() => service = v.to_owned(),
-                k if internal(k) => {}
-                _ => {}
-            }
-            if k != "host" && !internal(k) && !attrs.iter().any(|(x, _)| x == k) {
-                attrs.push((k.to_owned(), v.to_owned()));
-            }
-        }
-        (service, host)
-    }
-
     /// An event as kiln's events are (`source:kiln.event`), as the events API makes one.
     pub fn event_record(&self, e: &Event<'_>, now_ms: i64) -> Record {
-        let severity = match e.alert {
-            Some("error") => 17,
-            Some("warning") => 13,
-            _ => 9,
-        };
-        let mut attrs: Vec<(String, String)> = vec![("event.type".into(), "custom".into()), ("title".into(), e.title.clone().into_owned()), ("alert_type".into(), e.alert.unwrap_or("info").to_owned())];
-        if let Some(k) = e.key {
-            attrs.push(("aggregation_key".into(), k.to_owned()));
-        }
-        if let Some(p) = e.priority {
-            attrs.push(("priority".into(), p.to_owned()));
-        }
-        let (service, tag_host) = self.tagged(e.tags, &mut attrs);
-        attrs.push(("event.source".into(), e.source.unwrap_or("dogstatsd").to_owned()));
-        let message = if e.text.is_empty() { e.title.clone().into_owned() } else { format!("{}\n\n{}", e.title, e.text) };
-        let host = e.host.map(str::to_owned).or(tag_host).unwrap_or_else(|| self.s.host.clone());
-        let ts_ms = e.ts.map_or(now_ms, |s| s.saturating_mul(1000));
-        Record { ts: ts_ms.saturating_mul(1_000_000), severity, service, host, source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }
+        event_to_record(e, &self.s.host, &self.s.tags, now_ms)
     }
 
-    /// A service check as a log record (`source:service_check`): its name, its status (OK info,
-    /// WARNING a warning, CRITICAL an error, UNKNOWN unspecified), its message and tags.
+    /// A service check as a log record ([`check_to_record`]).
     pub fn check_record(&self, c: &Check<'_>, now_ms: i64) -> Record {
-        let (severity, status) = match c.status {
-            0 => (9, "ok"),
-            1 => (13, "warning"),
-            2 => (17, "critical"),
-            _ => (0, "unknown"),
-        };
-        let mut attrs: Vec<(String, String)> = vec![("check".into(), c.name.to_owned()), ("check_status".into(), status.to_owned())];
-        let (service, tag_host) = self.tagged(c.tags, &mut attrs);
-        let message = c.message.as_deref().map_or_else(|| format!("{} is {}", c.name, status.to_ascii_uppercase()), str::to_owned);
-        let host = c.host.map(str::to_owned).or(tag_host).unwrap_or_else(|| self.s.host.clone());
-        let ts_ms = c.ts.map_or(now_ms, |s| s.saturating_mul(1000));
-        Record { ts: ts_ms.saturating_mul(1_000_000), severity, service, host, source: "service_check".into(), message, attrs, trace_id: None, span_id: None }
+        check_to_record(c, &self.s.host, &self.s.tags, now_ms)
     }
+}
+
+/// What a message's tags (then `extra`'s, on keys it has not) give its record: its service (a
+/// `service:` tag's), its host (a `host:` tag's), the rest attributes.
+fn tagged(raw: &str, extra: &[(String, String)], attrs: &mut Vec<(String, String)>) -> (String, Option<String>) {
+    let mut service = String::new();
+    let mut host = None;
+    for (k, v) in tag_pairs(raw).chain(extra.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        match k {
+            "host" => host = host.or_else(|| Some(v.to_owned())),
+            "service" if service.is_empty() => service = v.to_owned(),
+            _ => {}
+        }
+        if k != "host" && !internal(k) && !attrs.iter().any(|(x, _)| x == k) {
+            attrs.push((k.to_owned(), v.to_owned()));
+        }
+    }
+    (service, host)
+}
+
+/// An event as kiln's events are (`source:kiln.event`), as the events API makes one: of `host`
+/// unless it says its own, `extra` among its tags.
+pub fn event_to_record(e: &Event<'_>, host: &str, extra: &[(String, String)], now_ms: i64) -> Record {
+    let severity = match e.alert {
+        Some("error") => 17,
+        Some("warning") => 13,
+        _ => 9,
+    };
+    let mut attrs: Vec<(String, String)> = vec![("event.type".into(), "custom".into()), ("title".into(), e.title.clone().into_owned()), ("alert_type".into(), e.alert.unwrap_or("info").to_owned())];
+    if let Some(k) = e.key {
+        attrs.push(("aggregation_key".into(), k.to_owned()));
+    }
+    if let Some(p) = e.priority {
+        attrs.push(("priority".into(), p.to_owned()));
+    }
+    let (service, tag_host) = tagged(e.tags, extra, &mut attrs);
+    attrs.push(("event.source".into(), e.source.unwrap_or("dogstatsd").to_owned()));
+    let message = if e.text.is_empty() { e.title.clone().into_owned() } else { format!("{}\n\n{}", e.title, e.text) };
+    let host = e.host.filter(|h| !h.is_empty()).map(str::to_owned).or(tag_host).unwrap_or_else(|| host.to_owned());
+    let ts_ms = e.ts.map_or(now_ms, |s| s.saturating_mul(1000));
+    Record { ts: ts_ms.saturating_mul(1_000_000), severity, service, host, source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }
+}
+
+/// A service check as a log record (`source:service_check`): its name, its status (OK info,
+/// WARNING a warning, CRITICAL an error, UNKNOWN unspecified), its message and tags; of `host`
+/// unless it says its own.
+pub fn check_to_record(c: &Check<'_>, host: &str, extra: &[(String, String)], now_ms: i64) -> Record {
+    let (severity, status) = match c.status {
+        0 => (9, "ok"),
+        1 => (13, "warning"),
+        2 => (17, "critical"),
+        _ => (0, "unknown"),
+    };
+    let mut attrs: Vec<(String, String)> = vec![("check".into(), c.name.to_owned()), ("check_status".into(), status.to_owned())];
+    let (service, tag_host) = tagged(c.tags, extra, &mut attrs);
+    let message = c.message.as_deref().filter(|m| !m.is_empty()).map_or_else(|| format!("{} is {}", c.name, status.to_ascii_uppercase()), str::to_owned);
+    let host = c.host.filter(|h| !h.is_empty()).map(str::to_owned).or(tag_host).unwrap_or_else(|| host.to_owned());
+    let ts_ms = c.ts.map_or(now_ms, |s| s.saturating_mul(1000));
+    Record { ts: ts_ms.saturating_mul(1_000_000), severity, service, host, source: "service_check".into(), message, attrs, trace_id: None, span_id: None }
 }
 
 /// Context `c`'s bucket written (and a count's zeros after it, up to `upto` and as long as it is

@@ -6,6 +6,7 @@ pub mod api;
 pub mod cloud;
 pub mod collect;
 pub mod dashboards;
+pub mod ddagent;
 pub mod downtimes;
 pub mod github;
 pub mod host;

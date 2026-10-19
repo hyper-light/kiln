@@ -17,7 +17,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7), described in OpenAPI 3.1 and held to what its routes answer; Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
-| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events; DogStatsD on every machine (§8.4: Datadog's protocol over UDP and Unix sockets, aggregated as its Agent aggregates, checked live with Datadog's own client; 5 M messages a second a listener, §12.20); Prometheus's remote write 1.0 and 2.0 on the server and every runner (§8.5, checked live against Prometheus 3.7, sample for sample; §12.21) | done |
+| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events; DogStatsD on every machine (§8.4: Datadog's protocol over UDP and Unix sockets, aggregated as its Agent aggregates, checked live with Datadog's own client; 5 M messages a second a listener, §12.20); Prometheus's remote write 1.0 and 2.0 on the server and every runner (§8.5, checked live against Prometheus 3.7, sample for sample; §12.21); Datadog's Agent at Datadog's own paths (§8.6: its metrics, sketches, service checks, events and logs, zstd read by kiln's own decoder; checked live against Agent 7.84) | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
@@ -612,6 +612,7 @@ time, sent again until answered; §5), from:
   (`POST /v1/pubsub`, a Cloud Logging sink's entries), with the ingest token.
 - **Prometheus's remote write** (§8.5, `POST /api/v1/write`), with the ingest token, and on every
   runner's local receiver.
+- **Datadog's Agent** (§8.6), at Datadog's own paths, its API key the ingest token.
 
 - **Clouds**: AWS CloudWatch, Google Cloud Monitoring and Azure Monitor, pulled (§10.1).
 - **Prometheus's scrapes** (`crate::observe::scrape`): an exporter's `/metrics` read as a
@@ -918,6 +919,32 @@ queries and alerts where they were, kiln's beside them.
   skipped; native histograms and exemplars are counted, not yet taken. Its series' keys are found
   in the receivers' shared cache after their first time, as OTLP's are; what a request decodes to
   is an OTLP request's shape, taken under the same admission.
+
+### 8.6 Datadog's Agent
+
+An Agent fleet writes to kiln as to Datadog: pointed at it (`dd_url: http://<kiln>:7070`,
+`logs_config.logs_dd_url: <kiln>:7070` with `logs_no_ssl` and `force_use_http`), or to kiln beside
+Datadog (`additional_endpoints`, and its logs'), its API key observe's ingest token. What it
+submits arrives as Datadog shows it, and with it the hundreds of integrations its checks are
+(`crate::observe::ddagent`, `kiln_obs::ddagent`). What an Agent 7.84 sends was recorded first (a
+capturing endpoint in kiln's place), and the live scenario (§13) runs that Agent:
+
+| Datadog's path | what it is | taken as |
+| --- | --- | --- |
+| `POST /api/v2/series` | its metrics, protobuf (`MetricPayload`) | series: its tags (a key once: its first value), `host` and `device` from its resources; a gauge a gauge, a count a count, a rate (DogStatsD's counts, a histogram's `.count`) the count it was, its value times its interval, as kiln's own DogStatsD writes it (§8.4) |
+| `POST /api/v1/series` | the same, JSON (older Agents) | the same |
+| `POST /api/beta/sketches` | distributions' sketches (`SketchPayload`) | kiln's distributions (§4.4): each bin at its value (the Agent's γ = 1 + 1/64, a key the logarithm rounded to the even and offset by 1338: values 1, 10, 100, 1000, 0.5 and −3 sent through an Agent came back as keys 1338, 1487, 1635, 1784, 1293 and −1409) counted into kiln's buckets, its count, sum, least and most exact |
+| `POST /api/v1/check_run` | service checks | records as DogStatsD's are (`source:service_check`) |
+| `POST /intake/` | events, and host metadata | kiln's events (`source:kiln.event`, `@event.source` the source's name); the metadata passed over |
+| `POST /api/v2/logs` | its logs, JSON | records, `ddtags` and any other field attributes (nested keys joined by dots, as Datadog's intake reads them) |
+| `GET /api/v1/validate` | whether its key is one | `{"valid": true}`, or 403 as Datadog answers |
+
+Bodies come zstd-compressed (the Agent's default; RFC 8878, kiln's own decoder, `kiln_obs::zstd`:
+its literals' Huffman tables, its sequences' FSE tables, repeat offsets, the content's checksum;
+safe, bounded at 64 MiB, read back to the byte against the reference CLI at every level and
+fuzzed), deflate or gzip. Anything else under Datadog's paths (its metadata, its other products'
+intakes) is answered 202 and passed over, so an Agent neither retries nor complains; a node behind
+answers 503 and the Agent keeps its payload and sends it again.
 
 ## 9. Monitors
 
@@ -2230,6 +2257,23 @@ reader gives back what it compressed), the receiver's keys made by the requests 
 Each sample here is a series of its own (the costly case: its labels read, sorted and its key
 found); one core takes some 2.5 million samples a second this way.
 
+### 12.22 Zstandard
+
+`cargo bench -p kiln-obs --bench zstd`: frames the reference CLI (zstd 1.5.7) wrote, unzipped into a
+buffer kept from one to the next, beside the reference's own decompression (`zstd -b`) of the same
+content (fedora, 2026-10-19):
+
+| frame | content | kiln, MB/s | the reference, MB/s | allocations | page faults |
+| --- | --- | --- | --- | --- | --- |
+| text, two blocks, level 3 with its checksum | 179,250 | 901 | 3,748 | 33 | 0 |
+| the same, level 19 | 179,250 | 1,320 | 3,789 | 38 | 0 |
+| the same, --fast=5 | 179,250 | 653 | — | 19 | 0 |
+| binary, level 3 | 34,608 | 5,032 | 12,024 | 10 | 0 |
+
+A quarter of the reference's speed, written for safety first: a few KB of an Agent's payload is
+microseconds. Its bits are read a field at a time; a container kept between reads, and tables kept
+from one frame to the next, are what would close the gap.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -2484,6 +2528,15 @@ raw samples) is in kiln at its time with its value, to the bit, all three ways; 
 handler's requests counted as `.as_count()` counts them (one a scrape); the handler's p99 read from
 its histogram's buckets; its counter a counter and its gauge a gauge in the metrics summary. No
 token is 401, a body that is not Snappy 400, JSON 415. 2026-10-19: passes (95 s).
+
+**Datadog's Agent** (`crates/kiln/tests/observe_ddagent.rs`; Docker): a kiln server, and Datadog's
+Agent 7.84.4 pointed at it (its metrics' and its logs' URLs, its API key the ingest token). Its own
+checks' metrics arrive of its hostname (`system.load.1`, `system.cpu.user`) and its own service
+check (`datadog.agent.up`); through its DogStatsD, 30 counts come out of `.as_count()` as 30, a
+gauge's last value, 30 distribution values their count exactly and their median within the
+sketches' bounds, an event of its host with its tags, a service check a record (`status:error`); a
+file it tails, its five lines records of its service and source, `filename` among their
+attributes. A key that is not one: 403, as Datadog answers. 2026-10-19: passes (71 s).
 
 **Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
 KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and

@@ -1266,6 +1266,14 @@ fn ops() -> Vec<Op<'static>> {
             body: Some(json!({ "required": true, "content": { "application/x-protobuf": { "schema": { "type": "string", "format": "binary" } }, "application/x-protobuf;proto=io.prometheus.write.v2.Request": { "schema": { "type": "string", "format": "binary" } } }, "description": "remote write 1.0's prometheus.WriteRequest, or 2.0's io.prometheus.write.v2.Request" })),
             ..op("post", "/api/v1/write", "Prometheus's remote write, 1.0 and 2.0 (docs/observe.md §8.5)", "ingest", None, vec![("204", answer("taken: 2.0's X-Prometheus-Remote-Write-Samples-Written says how many", None)), ("415", answer("a message of neither protocol", None))])
         },
+        // Datadog's Agent (docs/observe.md §8.6), at Datadog's own paths, its API key the ingest token.
+        Op { params: dd_key(), body: Some(dd_body("a MetricPayload (agent-payload), zstd, deflate or gzip")), ..op("post", "/api/v2/series", "Datadog's Agent's metrics", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op { params: dd_key(), body: Some(dd_body("Datadog's v1 series, JSON")), ..op("post", "/api/v1/series", "Datadog's Agent's metrics, v1", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op { params: dd_key(), body: Some(dd_body("a SketchPayload (agent-payload)")), ..op("post", "/api/beta/sketches", "Datadog's Agent's distributions' sketches", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op { params: dd_key(), body: Some(dd_body("service checks' runs, JSON")), ..op("post", "/api/v1/check_run", "Datadog's Agent's service checks", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op { params: dd_key(), body: Some(dd_body("events by source, and host metadata (passed over), JSON")), ..op("post", "/intake/", "Datadog's Agent's events", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op { params: dd_key(), body: Some(dd_body("log records, JSON")), ..op("post", "/api/v2/logs", "Datadog's Agent's logs", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op { params: dd_key(), ..op("get", "/api/v1/validate", "Whether a Datadog API key is one", "ingest", None, vec![("200", answer_of("valid", object(&[("valid", boolean())], &["valid"]))), ("403", answer("not one", None))]) },
         Op {
             params: vec![param("token", "query", true, string(), "observe's ingest token")],
             body: Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("message", object(&[("data", describe(string(), "base64: a Cloud Logging entry")), ("messageId", string()), ("attributes", map_of(string()))], &["data"])), ("subscription", string())], &["message"]) } } })),
@@ -1273,6 +1281,15 @@ fn ops() -> Vec<Op<'static>> {
         },
     ]);
     v
+}
+
+/// Datadog's API key, as its Agent sends it.
+fn dd_key() -> Vec<Value> {
+    vec![param("DD-API-KEY", "header", false, string(), "observe's ingest token (or ?api_key=)"), param("Content-Encoding", "header", false, json!({ "enum": ["zstd", "deflate", "gzip"] }), "as the Agent compresses")]
+}
+
+fn dd_body(what: &str) -> Value {
+    json!({ "required": true, "content": { "application/x-protobuf": { "schema": { "type": "string", "format": "binary" } }, "application/json": { "schema": any() } }, "description": what })
 }
 
 /// The root of the paths under `/api/observe/v1`.
@@ -1359,7 +1376,7 @@ mod tests {
             for (method, op) in item.as_object().into_iter().flatten() {
                 let cap = op.get("x-kiln-capability").and_then(Value::as_str).unwrap_or("");
                 if cap == "ingest" {
-                    anyhow::ensure!((path.starts_with("/v1/") || path == "/api/v1/write") && !path.starts_with(BASE), "{path}");
+                    anyhow::ensure!(["/v1/", "/api/v1/", "/api/v2/", "/api/beta/", "/intake/"].iter().any(|p| path.starts_with(p)) && !path.starts_with(BASE), "{path}");
                     continue;
                 }
                 anyhow::ensure!(routes.iter().any(|(m, p)| m == method && p == path), "{method} {path} is described and not routed");
