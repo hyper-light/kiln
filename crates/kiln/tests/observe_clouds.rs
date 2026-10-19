@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use common::{Fleet, at};
+use common::{Fleet, at, raw};
 use serde_json::{Value, json};
 
 // ------------------------------------------------------------------------------------ services
@@ -1120,6 +1120,93 @@ fn each_cloud_s_logs_are_stored_once_each_though_every_pull_reads_its_lookback()
     let taken = read(&f, "sum:kiln.cloud.records{*} by {integration}.as_count()", t0 - 60_000, now_ms() + 60_000)?;
     let total = |name: &str| taken.iter().find(|(t, _)| t.get("integration").map(String::as_str) == Some(name)).map_or(0.0, |(_, v)| v.values().sum::<f64>());
     anyhow::ensure!(total("prod") == 35.0 && total("gcp-main") == 21.0 && total("azure-main") == 16.0, "{taken:?}");
+    Ok(())
+}
+
+fn gz(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// A Firehose delivery as Kinesis Data Firehose sends one: its records base64, the body gzip'd,
+/// its id, its stream's ARN and its common attributes in its headers.
+fn firehose(f: &Fleet, key: &str, request: &str, records: &[Vec<u8>]) -> anyhow::Result<(u16, Value)> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let body = json!({ "requestId": request, "timestamp": now_ms(), "records": records.iter().map(|r| json!({ "data": b64.encode(r) })).collect::<Vec<_>>() });
+    let headers = format!(
+        "X-Amz-Firehose-Request-Id: {request}\r\nX-Amz-Firehose-Source-Arn: arn:aws:firehose:eu-west-1:123456789012:deliverystream/kiln\r\nX-Amz-Firehose-Access-Key: {key}\r\nX-Amz-Firehose-Common-Attributes: {{\"commonAttributes\":{{\"team\":\"pay\"}}}}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n"
+    );
+    let (code, answer) = raw(f.http, "POST", "/v1/firehose", &headers, &gz(body.to_string().as_bytes()))?;
+    Ok((code, serde_json::from_slice(&answer).unwrap_or(Value::Null)))
+}
+
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn the_clouds_pushes_are_taken_once_each_as_their_pulls_name_them() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let t = now_ms().div_euclid(60_000) * 60_000 - 600_000;
+    // A metric stream's JSON: two instances' CPU, five minutes, the sum and count of each minute.
+    let mut lines = String::new();
+    for m in 0..5i64 {
+        for (i, base) in [("i-1", 10.0), ("i-2", 40.0)] {
+            let count = 5.0;
+            let sum = (base + m as f64) * count;
+            lines.push_str(&json!({ "metric_stream_name": "kiln", "account_id": "123456789012", "region": "eu-west-1", "namespace": "AWS/EC2", "metric_name": "CPUUtilization", "dimensions": { "InstanceId": i }, "timestamp": t + m * 60_000, "value": { "max": base + m as f64 + 5.0, "min": base, "sum": sum, "count": count }, "unit": "Percent" }).to_string());
+            lines.push('\n');
+        }
+    }
+    let events: Vec<Value> = (0..6i64).map(|i| json!({ "id": format!("ev{i}"), "timestamp": t + i * 1000, "message": if i == 2 { "[ERROR] card declined".to_owned() } else { format!("[INFO] charge {i}") } })).collect();
+    let logs = json!({ "messageType": "DATA_MESSAGE", "owner": "123456789012", "logGroup": "/aws/lambda/checkout", "logStream": "2026/10/18/[$LATEST]a", "subscriptionFilters": ["kiln"], "logEvents": events });
+    let control = json!({ "messageType": "CONTROL_MESSAGE", "owner": "CloudwatchLogs", "logGroup": "", "logStream": "", "subscriptionFilters": [], "logEvents": [{ "id": "", "timestamp": t, "message": "CWL CONTROL MESSAGE: Checking health of destination Firehose." }] });
+    let delivery = [lines.into_bytes(), gz(logs.to_string().as_bytes()), gz(control.to_string().as_bytes())];
+
+    // Its key must be the ingest token; the answer is Firehose's, its id echoed.
+    let (code, answer) = firehose(&f, "not-the-token", "req-0", &delivery)?;
+    anyhow::ensure!(code == 401 && answer["requestId"] == "req-0" && answer["errorMessage"].as_str().is_some_and(|m| m.contains("ingest token")), "{code} {answer}");
+    let (code, answer) = firehose(&f, &ingest, "req-1", &delivery)?;
+    anyhow::ensure!(code == 200 && answer["requestId"] == "req-1" && answer["timestamp"].as_i64().is_some() && answer.get("errorMessage").is_none(), "{code} {answer}");
+    // Sent again (Firehose retries what it did not hear back of): taken once.
+    let (code, answer) = firehose(&f, &ingest, "req-1", &delivery)?;
+    anyhow::ensure!(code == 200 && answer["requestId"] == "req-1", "{code} {answer}");
+    // Another delivery with an event already taken (CloudWatch Logs delivers at least once): once.
+    let again = json!({ "messageType": "DATA_MESSAGE", "owner": "123456789012", "logGroup": "/aws/lambda/checkout", "logStream": "2026/10/18/[$LATEST]a", "subscriptionFilters": ["kiln"], "logEvents": [events[0].clone(), { "id": "ev9", "timestamp": t + 9_000, "message": "[INFO] charge 9" }] });
+    let (code, _) = firehose(&f, &ingest, "req-2", &[gz(again.to_string().as_bytes())])?;
+    anyhow::ensure!(code == 200);
+
+    // The pulls' names: the average the name itself, the sums and counts counts, the extremes gauges.
+    let (from, to) = (t, t + 300_000);
+    expect(&f, "avg:aws.ec2.cpuutilization{instanceid:i-1,region:eu-west-1,aws_account:123456789012,team:pay}", from, to, |m| 10.0 + ((m - t) / 60_000) as f64)?;
+    expect(&f, "avg:aws.ec2.cpuutilization{instanceid:i-2}", from, to, |m| 40.0 + ((m - t) / 60_000) as f64)?;
+    expect(&f, "sum:aws.ec2.cpuutilization.samplecount{instanceid:i-2}.as_count()", from, to, |_| 5.0)?;
+    expect(&f, "max:aws.ec2.cpuutilization.maximum{instanceid:i-1}", from, to, |m| 15.0 + ((m - t) / 60_000) as f64)?;
+    let checkout = records(&f, "source:lambda service:checkout", t - 60_000, 7)?;
+    anyhow::ensure!(checkout.len() == 7, "six events and the new one, each once: {} {checkout:#?}", checkout.len());
+    anyhow::ensure!(checkout.iter().all(|r| r["attributes"]["region"] == "eu-west-1" && r["attributes"]["aws_account"] == "123456789012" && r["attributes"]["team"] == "pay"), "{checkout:#?}");
+    anyhow::ensure!(records(&f, "source:lambda status:error", t - 60_000, 1)?.len() == 1);
+
+    // Pub/Sub: a Cloud Logging sink's entry, pushed twice (at least once); a wrong token refused.
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let entry = json!({ "logName": "projects/proj-e2e/logs/run.googleapis.com%2Fstdout", "insertId": "p1", "timestamp": rfc3339(t + 30_000), "severity": "ERROR", "textPayload": "pushed", "resource": { "type": "cloud_run_revision", "labels": { "service_name": "web" } } });
+    let push = json!({ "message": { "data": b64.encode(entry.to_string()), "messageId": "m-1", "publishTime": rfc3339(t + 31_000) }, "subscription": "projects/proj-e2e/subscriptions/kiln" });
+    let send = |token: &str| raw(f.http, "POST", &format!("/v1/pubsub?token={token}"), "Content-Type: application/json\r\n", push.to_string().as_bytes()).map(|(c, _)| c);
+    anyhow::ensure!(send("wrong")? == 401);
+    anyhow::ensure!(send(&ingest)? == 204 && send(&ingest)? == 204, "acknowledged, both times");
+    let web = records(&f, "source:gcp.cloud_run_revision service:web", t - 60_000, 1)?;
+    std::thread::sleep(Duration::from_secs(2));
+    let web_after = records(&f, "source:gcp.cloud_run_revision service:web", t - 60_000, 2)?;
+    anyhow::ensure!(web.len() == 1 && web_after.len() == 1 && web_after[0]["status"] == "error" && web_after[0]["message"] == "pushed", "{web_after:#?}");
+
+    // kiln's own count of the pushes: what was taken, sent again and refused (added up, written
+    // every 15 s).
+    std::thread::sleep(Duration::from_secs(16));
+    let counted = read(&f, "sum:kiln.cloud.push.records{*} by {via}.as_count()", t - 60_000, now_ms() + 60_000)?;
+    let total = |via: &str| counted.iter().find(|(tags, _)| tags.get("via").map(String::as_str) == Some(via)).map_or(0.0, |(_, v)| v.values().sum::<f64>());
+    anyhow::ensure!(total("firehose") == 7.0 && total("pubsub") == 1.0, "{counted:?}");
+    let again = read(&f, "sum:kiln.cloud.push.again{*} by {via}.as_count()", t - 60_000, now_ms() + 60_000)?;
+    let total = |via: &str| again.iter().find(|(tags, _)| tags.get("via").map(String::as_str) == Some(via)).map_or(0.0, |(_, v)| v.values().sum::<f64>());
+    anyhow::ensure!(total("firehose") == 1.0 && total("pubsub") == 1.0, "{again:?}");
     Ok(())
 }
 

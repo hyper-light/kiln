@@ -820,7 +820,7 @@ fn absorb(name: &str, read: Read, s: &Series, tags: &[(String, String)], budget:
 }
 
 /// A log entry's record (the module's doc says how), its id; none without a time.
-fn record_of(project: &str, e: &Value, tags: &[(String, String)]) -> Option<(u64, Record)> {
+pub(super) fn record_of(project: &str, e: &Value, tags: &[(String, String)]) -> Option<(u64, Record)> {
     let at = e.get("timestamp").and_then(Value::as_str)?;
     let ts = super::parse_time_ns(at)?;
     let str_of = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_owned();

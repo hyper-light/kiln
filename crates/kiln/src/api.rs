@@ -233,6 +233,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
             return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
         }
+        // The clouds' pushes (`crate::observe::cloud::push`), with the ingest token or the admin's:
+        // Firehose sends it as its access key, a Pub/Sub push subscription in its endpoint's query.
+        (&Method::POST, ["v1", "firehose"]) => {
+            let ok = req.headers().get("x-amz-firehose-access-key").and_then(|v| v.to_str().ok()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::cloud::push::firehose(req, ok).await);
+        }
+        (&Method::POST, ["v1", "pubsub"]) => {
+            let ok = srv::query(&req).get("token").is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::cloud::push::pubsub(req, ok).await);
+        }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),

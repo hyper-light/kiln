@@ -22,6 +22,7 @@
 pub mod aws;
 pub mod azure;
 pub mod gcp;
+pub mod push;
 pub mod sigv4;
 
 use std::collections::{BTreeMap, HashMap};

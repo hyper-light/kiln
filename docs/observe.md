@@ -21,7 +21,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); next: CloudWatch Metric Streams and the clouds' pushes (Firehose, Pub/Sub) | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -552,6 +552,9 @@ time, sent again until answered; §5), from:
   releases, deployments, issues; events and counts.
 - **The API**: Datadog's v1 series (`POST series`), log intake (`POST logs`) and events (`POST
   events`).
+- **The clouds' pushes** (§10.2): Kinesis Data Firehose's HTTP endpoint (`POST /v1/firehose`,
+  CloudWatch Metric Streams and CloudWatch Logs' subscriptions) and Pub/Sub's push subscriptions
+  (`POST /v1/pubsub`, a Cloud Logging sink's entries), with the ingest token.
 
 - **Clouds**: AWS CloudWatch, Google Cloud Monitoring and Azure Monitor, pulled (§10.1).
 - **Prometheus's scrapes** (`crate::observe::scrape`): an exporter's `/metrics` read as a
@@ -814,6 +817,37 @@ to its integration and field; `clouds.json` is written owner-only (0600) in one 
 never shown (`"…"`). A secret that does not open (the master key changed) leaves its integration
 failing, saying so, until it is given again. Credentials are got again 5 min before they expire;
 a page's `nextLink` elsewhere than Resource Manager is not followed (the token goes nowhere else).
+
+### 10.2 The clouds' pushes
+
+`crate::observe::cloud::push`: what a cloud sends kiln, where a pull would ask (a pull every
+interval reads a stream's last minutes again; a push is each minute as it is, at a stream's scale).
+Both take observe's ingest token (or the admin's), each in its own place:
+
+- **Kinesis Data Firehose**, an HTTP endpoint destination (`https://<kiln>/v1/firehose`, its access
+  key the ingest token, `Content-Encoding` gzip or not, its common attributes tags of everything it
+  brings): **CloudWatch Metric Streams** in their JSON output format, each record's lines a
+  minute's statistics of a metric, named and tagged as the pull names them (`aws.<namespace>.
+  <metric>`: `.sum` and `.samplecount` counts, the average `sum / count` the name itself,
+  `.maximum`, `.minimum` and the percentiles asked gauges; `region`, `aws_account`, each dimension);
+  and **CloudWatch Logs' subscriptions**, each record a gzip'd message of a group's events, as the
+  pull makes records (the account `aws_account`, the region the delivery stream's), a
+  `CONTROL_MESSAGE` (its check that the destination is there) taken and dropped. Its answer is
+  Firehose's (`requestId` echoed, `timestamp`, `errorMessage` when not taken: 401 for a wrong key,
+  503 while observe is busy, which Firehose sends again). A record of no shape kiln reads (Metric
+  Streams' OpenTelemetry format, a log's message alone after Firehose's own extraction) is counted
+  and not read.
+- **Pub/Sub push subscriptions** (`https://<kiln>/v1/pubsub?token=<the ingest token>`), a Cloud
+  Logging sink's topic: each message a log entry, read as the pull reads entries; answered 204 (an
+  acknowledgement), and 503 while observe is busy (Pub/Sub sends it again). A message that is no
+  log entry is acknowledged and counted, not sent again forever.
+
+Both deliver at least once. A Firehose request (its id), a Pub/Sub message (its subscription and
+id) and a log record (its cloud's id, as the pull keeps it) taken are kept for two hours, Firehose's
+longest retry, in the pull loop's bounded set (§10.1): sent again, they are answered as taken and
+not taken again (points need it not: the store keeps one value a time). kiln counts the pushes
+(`kiln.cloud.push.points`, `.records`, `.again`, `.refused`, `.skipped`, by `via`), added up and
+written every 15 s: a count a push at its own time would keep one of two pushes at one millisecond.
 
 ## 11. UI
 
@@ -1671,8 +1705,15 @@ token. Their figures are functions of the minute, so what is stored is checked m
   pull once; Datadog's names (`source:lambda service:checkout`, the group and stream, the region and
   the integration's tags), levels from each cloud's own or the message's (five errors of thirty),
   a JSON payload's values and its trace and span, Application Insights' levels; `kiln.cloud.records`
-  the same counts.
-2026-10-18: all pass (243 s).
+  the same counts;
+- the clouds' pushes, sent as the clouds send them: a Firehose delivery (gzip'd, its stream's ARN
+  and common attributes in its headers) of a metric stream's five minutes of two instances' CPU, a
+  CloudWatch Logs subscription's six events and its health check; a wrong key refused in Firehose's
+  words, the request's id echoed; the same delivery sent again, and another with an event already
+  taken: every series as the pull names it (the average, the counts, the extremes) and every event
+  once (seven); a Pub/Sub push of a Cloud Logging entry sent twice, taken once; a wrong token
+  refused; kiln's counts of what was taken and sent again.
+2026-10-18: all pass (243 s; the pushes 99 s).
 
 **Distributions** (`observe_live.rs`): three hosts' latencies posted as Datadog's distribution
 points (2,000 each, log-normal), a fourth's as an OTLP exponential histogram (delta, 3,000) and a

@@ -232,7 +232,7 @@ fn domain(region: &str) -> &'static str {
 }
 
 /// A statistic's suffix: `Maximum` → `maximum`, `p99.9` → `p99_9`, `TM(10%:90%)` → `tm_10_90`.
-fn suffix(stat: &str) -> String {
+pub(super) fn suffix(stat: &str) -> String {
     super::lower(stat)
 }
 
@@ -241,7 +241,7 @@ fn kind_of(stat: &str) -> Kind {
 }
 
 /// A metric's name: `aws.<namespace>.<metric>`.
-fn metric_name(namespace: &str, metric: &str) -> String {
+pub(super) fn metric_name(namespace: &str, metric: &str) -> String {
     format!("aws.{}.{}", super::lower(namespace.strip_prefix("AWS/").unwrap_or(namespace)), super::snake(metric))
 }
 
@@ -314,18 +314,18 @@ struct EventsOut {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Event {
+pub(super) struct Event {
     #[serde(default)]
-    event_id: String,
+    pub(super) event_id: String,
     #[serde(default)]
-    log_stream_name: String,
-    timestamp: i64,
+    pub(super) log_stream_name: String,
+    pub(super) timestamp: i64,
     #[serde(default)]
-    message: String,
+    pub(super) message: String,
 }
 
 /// An event's record (the module's doc says how), its id.
-fn record_of(region: &str, group: &str, e: Event, tags: &[(String, String)]) -> (u64, Record) {
+pub(super) fn record_of(region: &str, group: &str, e: Event, tags: &[(String, String)]) -> (u64, Record) {
     let id = super::id_of(&["aws", region, group, &e.event_id]);
     let mut parts = group.split('/').filter(|p| !p.is_empty());
     let source = match (group.starts_with("/aws/"), parts.nth(1)) {
