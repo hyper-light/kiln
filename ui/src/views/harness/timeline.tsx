@@ -979,6 +979,7 @@ export const Timeline = React.memo(function Timeline({
   const findNow = find?.now ?? null;
   const shown = React.useRef(0);
   const grows = findQ ? events : null;
+  const holds = reading.current ? turns : null;
   const marks = React.useCallback(
     (flow: HTMLDivElement | null) => {
       const root = flow?.parentElement;
@@ -986,7 +987,7 @@ export const Timeline = React.memo(function Timeline({
       // Marked again as the conversation grows, while finding.
       void grows;
       // A bounded window can move without changing height (so no resize is reported).
-      void turns;
+      void holds;
       void from;
       void to;
       restore();
@@ -1002,7 +1003,7 @@ export const Timeline = React.memo(function Timeline({
       }
       return () => void mark(flow, "", null);
     },
-    [findQ, findNow, grows, turns, from, to, read, restore],
+    [findQ, findNow, grows, holds, from, to, read, restore],
   );
   const running = state?.status === "running";
   const tasks = state?.tasks ?? NO_TASKS;
