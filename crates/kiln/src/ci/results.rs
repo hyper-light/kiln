@@ -227,6 +227,37 @@ async fn flakiness(hub: &Hub, repo: &str, branch: &str, cases: Vec<String>) -> a
     Ok(by.into_iter().map(|(k, seen)| (k, results::flaky(&seen, WINDOW, FLIP_RATE))).collect())
 }
 
+/// The tests a run was flaky on, by name (W16-R04's first rule, on its own results): a tool's
+/// retry passed them, or one attempt of a leg failed them and another passed them.
+pub async fn flaky_in_run(hub: &Hub, run: &str) -> anyhow::Result<Vec<String>> {
+    let r = run.to_owned();
+    let rows: Vec<(String, String, String, i64)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT k.suite || ' ' || k.name, t.leg_key, t.outcome, t.retried FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1")?;
+            let rows = st.query_map([&r], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await?;
+    // (passed, failed) per test and leg; a retry's pass is flaky at once.
+    let mut seen: BTreeMap<(String, String), (bool, bool)> = BTreeMap::new();
+    let mut flaky: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (name, leg, outcome, retried) in rows {
+        let name = name.trim().to_owned();
+        let e = seen.entry((name.clone(), leg)).or_default();
+        match outcome.as_str() {
+            "passed" if retried > 0 => {
+                flaky.insert(name);
+            }
+            "passed" => e.0 = true,
+            "failed" | "error" => e.1 = true,
+            _ => {}
+        }
+    }
+    flaky.extend(seen.into_iter().filter(|(_, (p, f))| *p && *f).map(|((name, _), _)| name));
+    Ok(flaky.into_iter().collect())
+}
+
 fn flaky_json(f: Option<&Flakiness>) -> Value {
     match f {
         Some(Flakiness::Flaky { why }) => json!({ "class": "flaky", "why": why }),

@@ -247,7 +247,8 @@ pub struct Collected {
     pub bytes: u64,
 }
 
-/// Removes objects nothing refers to (no cache entry, artifact or release asset), and then chunks that
+/// Removes objects nothing refers to (no cache entry, artifact, release asset, test report,
+/// registry blob, proxied file or action tarball), and then chunks that
 /// no remaining object uses. Anything younger than an hour stays, since an upload in progress
 /// may be about to refer to it.
 pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
@@ -264,7 +265,8 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
                    AND digest NOT IN (SELECT object FROM ci_release_assets)
                    AND digest NOT IN (SELECT object FROM test_reports)
                    AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)
-                   AND digest NOT IN (SELECT digest FROM proxy_cache)",
+                   AND digest NOT IN (SELECT digest FROM proxy_cache)
+                   AND digest NOT IN (SELECT object FROM ci_action_tarballs)",
                 params![now - grace],
             )?;
             let mut used = HashSet::new();

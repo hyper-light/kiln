@@ -37,6 +37,11 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("run.succeeded", "a run succeeded"),
     ("run.cancelled", "a run was cancelled"),
     ("approval.waiting", "a run waits for a reviewer to deploy to an environment"),
+    ("deploy.succeeded", "a job deployed to an environment"),
+    ("deploy.failed", "a job's deployment to an environment failed"),
+    ("leg.flaky", "a run had flaky tests: a retry passed them, or an attempt failed them and another passed them"),
+    ("land.ejected", "diffs were taken out of the land queue, and why"),
+    ("runner.offline", "a runner went away and hasn't come back for two minutes"),
     ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),
     // An agent's notes (docs/agentic.md N2, `crate::push`), as people's devices get them.
     ("agent.needs_you", "an agent waits on a person: an approval, a question or a plan"),

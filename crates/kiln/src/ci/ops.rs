@@ -24,7 +24,9 @@ pub struct Op {
     pub read_only: bool,
     pub destructive: bool,
     pub input: fn() -> Value,
-    /// The route it is: method, path under `/api/ci`, query.
+    /// The routes' prefix under `/api`: `ci` for CI's own, empty for the rest (`/api/diffs/…`).
+    base: &'static str,
+    /// The route it is: method, path under `/api/<base>`, query.
     route: fn(&Value) -> Result<(Method, Vec<String>, HashMap<String, String>), Fail>,
     run: fn(Cx, Value) -> Fut,
 }
@@ -83,9 +85,30 @@ fn by(cx: &Cx) -> String {
 
 macro_rules! op {
     ($name:literal, $summary:literal, ro: $ro:expr, destructive: $d:expr, input: $input:expr, route: $route:expr, run: $run:expr) => {
-        Op { name: $name, summary: $summary, read_only: $ro, destructive: $d, input: $input, route: $route, run: |cx, v| Box::pin($run(cx, v)) }
+        Op { name: $name, summary: $summary, read_only: $ro, destructive: $d, input: $input, base: "ci", route: $route, run: |cx, v| Box::pin($run(cx, v)) }
+    };
+    // One whose route is outside `/api/ci`.
+    ($name:literal, $summary:literal, base: $base:literal, ro: $ro:expr, destructive: $d:expr, input: $input:expr, route: $route:expr, run: $run:expr) => {
+        Op { name: $name, summary: $summary, read_only: $ro, destructive: $d, input: $input, base: $base, route: $route, run: |cx, v| Box::pin($run(cx, v)) }
     };
 }
+
+fn internal(e: anyhow::Error) -> Fail {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+/// A diff route (W14), as its HTTP route answers.
+async fn diffs(cx: &Cx, method: Method, segs: &[&str], q: &HashMap<String, String>, body: &Value) -> Out {
+    answer(super::diffs::route(&cx.hub, &method, segs, q, &cx.caller, body).await).await
+}
+
+/// A secret or variable scope (`repo:acme/app`, `env:acme/app:production`, …).
+async fn scope_of(cx: &Cx, v: &Value) -> Result<super::secrets::Scope, Fail> {
+    super::secrets::parse_scope(&cx.hub, &text(v, "scope")?).await.map_err(bad)
+}
+
+const DIFF: &str = "The diff: `D12`.";
+const SCOPE: &str = "Where: `server`, `org:<owner>`, `repo:<owner/name>`, `workflow:<repo>:<path>` or `env:<repo>:<environment>`.";
 
 fn path(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
@@ -226,6 +249,249 @@ pub fn ops() -> &'static [Op] {
                 }), &["repo", "path"]),
                 route: |_| Ok((Method::POST, path(&["plan-preview"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::preview::of(&cx.hub, Some(&cx.caller), v).await).await }),
+            op!("ci.runs.rerun_failed", "A new attempt of a finished run with only its failed and cancelled jobs, and the jobs that need them; the rest keep their results.", ro: false, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "debug": {"type": "boolean"}, "keep_failed": {"type": "integer", "description": "Minutes a failed leg is kept to look into (W17-R02)."}}), &["run"]),
+                route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let mut body = v.clone();
+                    if let Some(o) = body.as_object_mut() {
+                        o.insert("mode".into(), json!("failed"));
+                    }
+                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body).await).await
+                }),
+            op!("ci.runs.rerun_job", "A new attempt of a finished run with one job and the jobs that need it.", ro: false, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "job": {"type": "string", "description": "The job's id."}, "debug": {"type": "boolean"}, "keep_failed": {"type": "integer"}}), &["run", "job"]),
+                route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let mut body = v.clone();
+                    if let Some(o) = body.as_object_mut() {
+                        o.insert("mode".into(), json!("job"));
+                    }
+                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body).await).await
+                }),
+            op!("ci.artifacts.list", "A run's artifacts: names, sizes, digests, expiry.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "artifacts"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::part(&cx.hub, &text(&v, "run")?, "artifacts", &HashMap::new()).await).await }),
+            op!("ci.tests.run", "A run's test results, failures first: each with its message, place, trace, and flaky and quarantined marks.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "attempt": {"type": "string", "description": "An attempt's number, or `all`; the latest when left out."}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "tests"]), query(v, &["attempt"]))),
+                run: |cx: Cx, v: Value| async move { let run = text(&v, "run")?; answer(super::results::of(&cx.hub, Some(run.as_str()), None, &query(&v, &["attempt"])).await).await }),
+            op!("ci.tests.leg", "One leg's test results, failures first.", ro: true, destructive: false,
+                input: || schema(json!({"leg": {"type": "string", "description": LEG}}), &["leg"]),
+                route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "tests"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let leg = text(&v, "leg")?; answer(super::results::of(&cx.hub, None, Some(leg.as_str()), &HashMap::new()).await).await }),
+            op!("ci.tests.repo", "A repository's tests over its recent runs: the most failing, the slowest or the flakiest, with history.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "sort": {"type": "string", "enum": ["failing", "slowest", "flaky"]}, "branch": {"type": "string"}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "tests"]), query(v, &["sort", "branch", "days"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::results::repo(&cx.hub, &text(&v, "repo")?, &query(&v, &["sort", "branch", "days"])).await).await }),
+            op!("ci.metrics.run", "A run's benchmark metrics, each against its baseline: the change and its 95% interval, or no clear difference.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "metrics"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::results::run_metrics(&cx.hub, &text(&v, "run")?).await).await }),
+            op!("ci.metrics.repo", "A metric's values over time in a repository, by runner fingerprint.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string", "description": "The metric's name."}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "metrics"]), query(v, &["name"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::results::repo_metrics(&cx.hub, &text(&v, "repo")?, &query(&v, &["name"])).await).await }),
+            op!("ci.runners.list", "The runners: connected or not, labels, facts, what each is running, slots.", base: "", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["agents"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { Ok(serde_json::to_value(cx.hub.agent_list().await).unwrap_or(Value::Null)) }),
+            op!("ci.pools.list", "The executor pools: kind, image, how many executors are starting, idle and busy.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["pools"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::pools::list(&cx.hub, None).await).await }),
+            op!("ci.images.list", "The runner images a repository may use: names, digests, platforms, where built.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["images"]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::images::list(&cx.hub, &query(&v, &["repo"])).await).await }),
+            op!("ci.images.validate", "Check a runner image's definition as the editor does: a Dockerfile by kiln's parser and lints (hadolint's codes), with each finding's line.", ro: true, destructive: false,
+                input: || schema(json!({"content": {"type": "string"}, "path": {"type": "string", "description": "e.g. `.kiln/images/web/Dockerfile`."}, "kind": {"type": "string", "enum": ["dockerfile", "agentfile"]}}), &["content"]),
+                route: |_| Ok((Method::POST, path(&["images", "validate"]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { answer(super::images::validate_value(&v).await).await }),
+            op!("ci.images.propose", "Propose a runner image's definition for a repository as a diff (`.kiln/images/<name>/Dockerfile` or `Agentfile`), never a direct write: a Dockerfile with errors isn't proposed.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string"}, "kind": {"type": "string", "enum": ["dockerfile", "agentfile"]}, "content": {"type": "string"}, "draft": {"type": "boolean"}, "reviewers": {"type": "array", "items": {"type": "string"}}}), &["repo", "name", "content"]),
+                route: |v| Ok((Method::POST, path(&["images"]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::images::propose(&cx.hub, &query(&v, &["repo"]), &cx.caller, &v).await).await }),
+            op!("ci.routing.rules", "The routing rules that send legs to runners (W05-R21), in the order they're tried.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["routing", "rules"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::routing::get(&cx.hub).await).await }),
+            op!("ci.routing.explain", "Where a leg with these needs would go: each runner against its constraints, and the rules that apply.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "runs_on": {"description": "A job's `runs-on`."}, "requires": {"type": "array", "items": {"type": "string"}}}), &[]),
+                route: |_| Ok((Method::POST, path(&["routing", "explain"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::routing::explain(&cx.hub, v).await).await }),
+            op!("ci.secrets.list", "A scope's secret names, with when each was set and last used (never their values).", ro: true, destructive: false,
+                input: || schema(json!({"scope": {"type": "string", "description": SCOPE}}), &["scope"]),
+                route: |v| Ok((Method::GET, path(&["secrets"]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move { let scope = scope_of(&cx, &v).await?; Ok(json!({ "scope": text(&v, "scope")?, "secrets": super::secrets::list(&cx.hub, &scope).await.map_err(internal)? })) }),
+            op!("ci.secrets.set", "Set a secret in a scope (its value is stored encrypted and never shown again).", ro: false, destructive: true,
+                input: || schema(json!({"scope": {"type": "string", "description": SCOPE}, "name": {"type": "string"}, "value": {"type": "string"}}), &["scope", "name", "value"]),
+                route: |v| Ok((Method::PUT, path(&["secrets", &text(v, "name")?]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move {
+                    let scope = scope_of(&cx, &v).await?;
+                    super::secrets::set(&cx.hub, &scope, &text(&v, "name")?, &text(&v, "value")?, &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    Ok(json!({ "set": true }))
+                }),
+            op!("ci.variables.list", "A scope's variables, with their values.", ro: true, destructive: false,
+                input: || schema(json!({"scope": {"type": "string", "description": SCOPE}}), &["scope"]),
+                route: |v| Ok((Method::GET, path(&["variables"]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move { let scope = scope_of(&cx, &v).await?; Ok(json!({ "scope": text(&v, "scope")?, "variables": super::secrets::list_vars(&cx.hub, &scope).await.map_err(internal)? })) }),
+            op!("ci.variables.set", "Set a variable in a scope.", ro: false, destructive: false,
+                input: || schema(json!({"scope": {"type": "string", "description": SCOPE}, "name": {"type": "string"}, "value": {"type": "string"}}), &["scope", "name", "value"]),
+                route: |v| Ok((Method::PUT, path(&["variables", &text(v, "name")?]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move {
+                    let scope = scope_of(&cx, &v).await?;
+                    super::secrets::set_var(&cx.hub, &scope, &text(&v, "name")?, &text(&v, "value")?, &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    Ok(json!({ "set": true }))
+                }),
+            op!("ci.integrations.list", "The integrations jobs and deployments use: kind, name, scope, what they're for (never their secrets).", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["integrations"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { Ok(json!({ "integrations": super::integrations::list(&cx.hub).await.map_err(internal)? })) }),
+            op!("ci.integrations.verify", "Check an integration works: its credentials, or a federated exchange as a repository's job (and environment) would make it.", ro: false, destructive: false,
+                input: || schema(json!({"integration": {"type": "string", "description": "Its name."}, "repository": {"type": "string", "description": REPO}, "environment": {"type": "string"}}), &["integration"]),
+                route: |v| Ok((Method::POST, path(&["integrations", &text(v, "integration")?, "verify"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let as_: super::integrations::VerifyAs = serde_json::from_value(json!({ "repository": v.get("repository"), "environment": v.get("environment") })).unwrap_or_default();
+                    let r = Box::pin(super::integrations::verify(&cx.hub, &text(&v, "integration")?, &as_)).await.map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+                    Ok(match r {
+                        Ok(message) => json!({ "ok": true, "message": message }),
+                        Err(error) => json!({ "ok": false, "error": error }),
+                    })
+                }),
+            op!("ci.environments.list", "A repository's environments: protection (reviewers, wait timer, branches, windows), concurrency limit, URL, latest deployment.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["environments"]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::environments::route(&cx.hub, &Method::GET, &[], &query(&v, &["repo"]), Value::Null, Some(&cx.caller)).await).await }),
+            op!("ci.environments.save", "Make an environment in kiln, or change one made here: its protection, URL and concurrency limit (`.kiln/environments.yaml`'s are changed by a diff).", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "name": {"type": "string"},
+                    "protection": {"type": "object", "description": "`reviewers`, `prevent-self-review`, `wait-timer`, `branches`, `tags`, `windows`."},
+                    "url": {"type": "string"}, "concurrency": {"type": "integer", "minimum": 1}
+                }), &["repo", "name"]),
+                route: |v| Ok((Method::PUT, path(&["environments", &text(v, "name")?]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { let name = text(&v, "name")?; answer(super::environments::route(&cx.hub, &Method::PUT, &[name.as_str()], &query(&v, &["repo"]), v.clone(), Some(&cx.caller)).await).await }),
+            op!("ci.insights.repos", "Insights (W19-R01): every repository's runs, failures, durations and costs; or one repository's, by workflow.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]),
+                route: |v| Ok((Method::GET, match v.get("repo").and_then(Value::as_str) { Some(r) => path(&["insights", "repos", r]), None => path(&["insights", "repos"]) }, query(v, &["days"]))),
+                run: |cx: Cx, v: Value| async move {
+                    let repo = v.get("repo").and_then(Value::as_str).map(str::to_owned);
+                    let rest: Vec<&str> = match &repo { Some(r) => vec!["repos", r.as_str()], None => vec!["repos"] };
+                    answer(super::insights::route(&cx.hub, &rest, &query(&v, &["days"])).await).await
+                }),
+            op!("ci.insights.workflows", "A repository's workflows' insights: the critical path, slowest jobs and steps, cache hit rates, queue time, flakiness.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["insights", "workflows", &text(v, "repo")?]), query(v, &["days"]))),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; answer(super::insights::route(&cx.hub, &["workflows", repo.as_str()], &query(&v, &["days"])).await).await }),
+            op!("ci.insights.runners", "Runners' insights: utilization, queue time and failures by runner.", ro: true, destructive: false,
+                input: || schema(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]),
+                route: |v| Ok((Method::GET, path(&["insights", "runners"]), query(v, &["days"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::insights::route(&cx.hub, &["runners"], &query(&v, &["days"])).await).await }),
+            op!("ci.diffs.list", "A repository's diffs (W14): `open` (the default), a state, or `all`; by author.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "state": {"type": "string"}, "author": {"type": "string"}, "limit": {"type": "integer"}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "diffs"]), query(v, &["state", "author", "limit"]))),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; diffs(&cx, Method::GET, &["repos", repo.as_str(), "diffs"], &query(&v, &["state", "author", "limit"]), &Value::Null).await }),
+            op!("ci.diffs.get", "A diff: its versions, state, reviewers, stack and runs.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str()], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.threads", "A diff's comment threads: where each is (version, file, side, lines), its comments, and whether it's resolved.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "comments"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "comments"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.readiness", "What keeps a diff from landing (reviews, checks, policy), or that it's ready.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "land"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "land"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.comment", "Comment on a diff: on the whole, or on a file's lines (`file`, `line` or `start_line`/`end_line`, `side`), with an optional suggestion; a draft until published.", base: "", ro: false, destructive: false,
+                input: || schema(json!({
+                    "diff": {"type": "string", "description": DIFF}, "body": {"type": "string"}, "file": {"type": "string"}, "line": {"type": "integer"},
+                    "start_line": {"type": "integer"}, "end_line": {"type": "integer"}, "side": {"type": "string", "enum": ["new", "old"]},
+                    "suggestion": {"type": "string", "description": "Replacement text for the lines."}, "version": {"type": "integer"}, "publish": {"type": "boolean"}
+                }), &["diff", "body"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "comments"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "comments"], &HashMap::new(), &v).await }),
+            op!("ci.diffs.reply", "Reply in a diff's thread.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "thread": {"type": "string"}, "body": {"type": "string"}, "publish": {"type": "boolean"}}), &["diff", "thread", "body"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "comments"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "comments"], &HashMap::new(), &v).await }),
+            op!("ci.diffs.resolve", "Resolve a comment's thread, or open it again.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"comment": {"type": "string", "description": "The thread's first comment's id."}, "state": {"type": "string", "enum": ["resolved", "open"]}}), &["comment"]),
+                route: |v| Ok((Method::PATCH, path(&["comments", &text(v, "comment")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let c = text(&v, "comment")?;
+                    let state = v.get("state").and_then(Value::as_str).unwrap_or("resolved");
+                    diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &json!({ "state": state })).await
+                }),
+            op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "action": {"type": "string", "enum": ["accept", "request_changes", "comment", "resign"]}, "body": {"type": "string"}}), &["diff", "action"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "review"], &HashMap::new(), &v).await }),
+            op!("ci.diffs.submit_patch", "Submit commits as diffs without git: patches (`git format-patch`'s mbox, or a list) onto the trunk, each a diff or a new version of its diff (by Change-Id).", base: "", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "mbox": {"type": "string"}, "patches": {"type": "array"}, "trunk": {"type": "string"}}), &["repo"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "submit"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", repo.as_str(), "submit"], &HashMap::new(), &v).await }),
+            op!("ci.diffs.land", "Land a diff (with the diffs below it) through the land queue, by a strategy: `stack`, `stack-squash` or `ff-only` (the trunk's default when left out).", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "strategy": {"type": "string", "enum": ["stack", "stack-squash", "ff-only"]}}), &["diff"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "land"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "land"], &HashMap::new(), &v).await }),
+            op!("ci.workflows.edit", "Propose a workflow's new text as a diff, never a direct write: checked first (refused with its errors), then a diff on the trunk that lands through review. Validate and preview it before, and watch its run after.", base: "", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "path": {"type": "string", "description": "The workflow's path, e.g. `.github/workflows/ci.yml`."},
+                    "content": {"type": "string", "description": "Its whole new text."}, "title": {"type": "string", "description": "The diff's title (`Edit <path>` when left out)."},
+                    "draft": {"type": "boolean"}, "reviewers": {"type": "array", "items": {"type": "string"}}, "topic": {"type": "string"}
+                }), &["repo", "path", "content"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "submit"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let (repo, file, content) = (text(&v, "repo")?, text(&v, "path")?, text(&v, "content")?);
+                    let (f, c) = (file.clone(), content.clone());
+                    let checked = crate::rt::blocking(move || kiln_ci::wf::check(&f, &c, None)).await.map_err(internal)?;
+                    let errors: Vec<String> = checked.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&file)).collect();
+                    if !errors.is_empty() {
+                        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't proposed:\n{}", errors.join("\n"))));
+                    }
+                    let title = v.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()).map_or_else(|| format!("Edit {file}"), str::to_owned);
+                    let mut out = super::diffs::propose_file(&cx.hub, &repo, &cx.caller, &file, &title, &v, move |_| Ok(content)).await?;
+                    if let Some(o) = out.as_object_mut() {
+                        o.insert("diagnostics".into(), serde_json::to_value(&checked.diagnostics).unwrap_or(Value::Null));
+                    }
+                    Ok(out)
+                }),
+            op!("ci.tests.propose_quarantine", "Propose quarantining a test (W16-R05) as a diff adding it to the trunk's `.kiln/quarantine.yaml`: under `quarantine: enforce`, its failures alone then let a step pass, with a warning. It lands through review.", base: "", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "test": {"type": "string", "description": "suite.name, suite::name, the name, or the id; `*` matches any run of characters."},
+                    "reason": {"type": "string"}, "issue": {"type": "string", "description": "Where it's tracked."}, "until": {"type": "string", "description": "The last day it applies, YYYY-MM-DD."},
+                    "draft": {"type": "boolean"}, "reviewers": {"type": "array", "items": {"type": "string"}}
+                }), &["repo", "test", "reason"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "submit"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let (repo, test, reason) = (text(&v, "repo")?, text(&v, "test")?, text(&v, "reason")?);
+                    let entry = kiln_ci::results::quarantine::Entry { test: test.clone(), reason, issue: v.get("issue").and_then(Value::as_str).map(str::to_owned), until: v.get("until").and_then(Value::as_str).map(str::to_owned) };
+                    let title = format!("Quarantine {test}");
+                    super::diffs::propose_file(&cx.hub, &repo, &cx.caller, ".kiln/quarantine.yaml", &title, &v, move |old| {
+                        let mut text = old.unwrap_or_default();
+                        let had = kiln_ci::results::quarantine::parse(&text)?;
+                        if had.iter().any(|e| e.test == entry.test) {
+                            return Err(format!("`{}` is in .kiln/quarantine.yaml already", entry.test));
+                        }
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        // As people write it: a scalar quoted only when YAML needs it, and no
+                        // empty keys.
+                        let scalar = |x: &str| serde_yaml::to_string(x).map(|y| y.trim_end().to_owned()).map_err(|e| e.to_string());
+                        text.push_str(&format!("- test: {}\n  reason: {}\n", scalar(&entry.test)?, scalar(&entry.reason)?));
+                        for (k, x) in [("issue", &entry.issue), ("until", &entry.until)] {
+                            if let Some(x) = x {
+                                text.push_str(&format!("  {k}: {}\n", scalar(x)?));
+                            }
+                        }
+                        kiln_ci::results::quarantine::parse(&text)?;
+                        Ok(text)
+                    })
+                    .await
+                }),
             op!("ci.caches.list", "A repository's caches: keys, sizes, scopes, last use.", ro: true, destructive: false,
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "caches"]), HashMap::new())),
@@ -238,9 +504,15 @@ pub fn ops() -> &'static [Op] {
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let op = ops().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
     let (method, rest, q) = (op.route)(&input)?;
-    let path = format!("/api/ci/{}", rest.join("/"));
+    // The route's segments as the HTTP layer has them once decoded: a repository's name
+    // (`acme/app`) is one segment, as `acme%2Fapp` is in the path.
+    let mut segs: Vec<&str> = vec!["api"];
+    if !op.base.is_empty() {
+        segs.push(op.base);
+    }
+    segs.extend(rest.iter().map(String::as_str));
+    let path = format!("/{}", segs.iter().map(|s| s.replace('/', "%2F")).collect::<Vec<_>>().join("/"));
     let run = async {
-        let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         crate::authz::gate::check(&cx.hub, &cx.caller, &method, &segs, &q).await?;
         (op.run)(cx.clone(), input).await
     };
@@ -262,12 +534,15 @@ mod tests {
     /// Every operation is a route of the table, with a capability of its own (W20-R01).
     #[test]
     fn w20_r01_each_operation_is_a_route() {
-        let probe = json!({"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error"});
+        let probe = json!({"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept"});
         for op in ops() {
             let route = (op.route)(&probe);
             assert!(route.is_ok(), "{}", op.name);
             let Ok((method, rest, _)) = route else { continue };
-            let mut segs = vec!["api", "ci"];
+            let mut segs = vec!["api"];
+            if !op.base.is_empty() {
+                segs.push(op.base);
+            }
             segs.extend(rest.iter().map(String::as_str));
             let rule = crate::authz::rule(&method, &segs);
             assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, segs.join("/"));

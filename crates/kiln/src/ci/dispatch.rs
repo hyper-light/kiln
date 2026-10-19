@@ -989,7 +989,7 @@ impl Dispatch {
         let base = self.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
         let server_url = urls.map_or_else(|| base.clone(), |(web, _)| web.clone());
         let default_branch = s.event.payload.pointer("/repository/default_branch").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-        let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch, private: false, server_url };
+        let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch, private: false, server_url, created_at: s.repo.created_at };
         let run = kiln_ci::trigger::context::RunFacts {
             run_id: u64::try_from(rowid).unwrap_or(0),
             run_number: u64::try_from(number).unwrap_or(0),
@@ -1895,6 +1895,12 @@ impl Dispatch {
             };
             if let Err(e) = super::environments::status(&self.hub, d, state, l.env_url.clone(), None, "github-actions[bot]").await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a deployment's status could not be recorded");
+            }
+            // W19-R06: `deploy.succeeded` or `deploy.failed`.
+            if matches!(c, PlanC::Success | PlanC::Failure | PlanC::TimedOut)
+                && let Some(env) = l.spec.environment.as_ref().map(|e| e.name.clone())
+            {
+                crate::rt::spawn(super::notify::deployed(Arc::clone(&self.hub), l.run.clone(), env, c == PlanC::Success));
             }
         }
         runs::finish_leg(&self.hub, leg, status_of(c), c.result(), outputs, reason).await?;

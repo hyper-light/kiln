@@ -89,8 +89,21 @@ pub fn start_with(dir: &Path, o: &Options<'_>, https: bool) -> anyhow::Result<Se
     start_env(dir, o, https, &[])
 }
 
-/// `start_with`, the server's environment given `env` too.
+/// `start_with`, the server's environment given `env` too. A port picked here can be taken before
+/// the server binds it (tests run side by side): then the server exits, or another test's server
+/// answers on it and refuses this one's token. Either way it starts again, on new ports.
 pub fn start_env(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Server> {
+    let mut why = String::new();
+    for _ in 0..3 {
+        match start_once(dir, o, https, env)? {
+            Ok(server) => return Ok(server),
+            Err(w) => why = w,
+        }
+    }
+    anyhow::bail!("the server didn't start: {why}")
+}
+
+fn start_once(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -115,9 +128,7 @@ work_dir = "{work}"
 [kubernetes]
 enabled = false
 
-[terminal]
-enabled = false
-
+{terminal}
 [discovery]
 enabled = false
 announce = false
@@ -140,6 +151,8 @@ enabled = true
         extra = o.extra,
         // CD stays off unless a test turns it on with a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") { "" } else { "[cd]\nenabled = false\n" },
+        // So do terminals (its own runner's, and into legs: docs/ci.md W17-R01).
+        terminal = if o.extra.contains("[terminal]") { "" } else { "[terminal]\nenabled = false\n" },
     );
     let cfg = dir.join("kiln.toml");
     std::fs::write(&cfg, config)?;
@@ -157,11 +170,22 @@ enabled = true
     let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        if let Some(status) = server.child.try_wait()? {
+            return Ok(Err(format!("it exited ({status}) on ports {port} and {quic}")));
+        }
         if let Ok(t) = std::fs::read_to_string(data.join("admin.token"))
             && let Ok((200, _)) = http(port, "GET", "/healthz", "", None)
         {
-            server.admin = t.trim().to_owned();
-            return Ok(server);
+            let t = t.trim().to_owned();
+            // This server, not another test's on the same port.
+            match http(port, "GET", "/api/repos", &t, None) {
+                Ok((200, _)) => {
+                    server.admin = t;
+                    return Ok(Ok(server));
+                }
+                Ok((401, _)) => return Ok(Err(format!("another server answers on port {port}"))),
+                _ => {}
+            }
         }
         anyhow::ensure!(Instant::now() < deadline, "the server didn't start");
         std::thread::sleep(Duration::from_millis(200));

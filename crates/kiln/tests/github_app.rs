@@ -192,6 +192,11 @@ jobs:
           echo "server: $GITHUB_SERVER_URL"
 "#,
     )?;
+    // And one the App's events run (W03).
+    std::fs::write(
+        work.join(".github/workflows/triage.yml"),
+        "name: triage\non:\n  issues:\n    types: [opened]\njobs:\n  t:\n    runs-on: local\n    steps:\n      - run: test \"${{ github.event.issue.number }}\" = 5\n",
+    )?;
     git(&work, &["init", "-q"])?;
     git(&work, &["add", "."])?;
     git(&work, &["commit", "-qm", "first"])?;
@@ -278,6 +283,37 @@ jobs:
         let posts = checks(&calls).iter().filter(|(m, _, _)| m == "POST").count();
         Ok((posts <= posts_before).then(|| format!("{:?}", checks(&calls))))
     })?;
+
+    // W03: the App's other events reach the workflows as GitHub's do, once per delivery: an issue
+    // opened runs `on: issues` at the default branch; an issue edited, and the same delivery
+    // again, don't.
+    let deliver = |event: &str, id: &str, body: &Value| -> anyhow::Result<String> {
+        let body = body.to_string();
+        let sig = format!("sha256={}", kiln::util::hmac_hex(b"s3cret", body.as_bytes()));
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", s.port))?;
+        write!(conn, "POST /api/hooks/github/app HTTP/1.1\r\nHost: x\r\nX-GitHub-Event: {event}\r\nX-GitHub-Delivery: {id}\r\nX-Hub-Signature-256: {sig}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+        let mut answer = String::new();
+        conn.read_to_string(&mut answer)?;
+        Ok(answer)
+    };
+    let issue = |action: &str| json!({ "action": action, "issue": { "number": 5, "title": "Broken", "state": "open", "user": { "login": "octocat" } }, "repository": { "full_name": "acme/app", "default_branch": "main" }, "sender": { "login": "octocat" } });
+    for (id, action) in [("app-issue-1", "opened"), ("app-issue-1", "opened"), ("app-issue-2", "edited")] {
+        let answer = deliver("issues", id, &issue(action))?;
+        assert!(answer.starts_with("HTTP/1.1 202"), "{answer}");
+    }
+    let triage = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme%2Fapp", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        Ok(v.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("event") == Some(&json!("issues"))).cloned().collect())
+    };
+    until(240, "the issue's run succeeds", || {
+        let runs = triage()?;
+        Ok((!runs.iter().any(|r| r.get("conclusion") == Some(&json!("success")))).then(|| format!("{runs:?}\n{}", s.log())))
+    })?;
+    let runs = triage()?;
+    assert_eq!(runs.len(), 1, "one run for the opened issue, none for its redelivery or an edit: {runs:?}");
+    let run = runs.first().cloned().unwrap_or_default();
+    assert!(run.get("workflow").and_then(Value::as_str).is_some_and(|w| w.ends_with("triage.yml")) && run.get("branch") == Some(&json!("main")), "{run}");
 
     // W23-R03: acme/gha's CI is GitHub Actions'. Its runs come into kiln, logs, reruns, cancels
     // and dispatches go to GitHub.

@@ -109,6 +109,7 @@ pub async fn facts(hub: &Hub, repo: &Repo) -> Facts {
         default_branch: default_branch.clone(),
         private: false,
         server_url: if repo.clone_url.contains("github.com") { "https://github.com".into() } else { hub.cfg.server.public_url.trim_end_matches('/').to_owned() },
+        created_at: repo.created_at,
     };
     Facts { repo: ctx_repo, default_branch, mirror }
 }

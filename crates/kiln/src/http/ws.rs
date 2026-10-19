@@ -167,6 +167,12 @@ pub type ClientSocket = async_tungstenite::WebSocketStream<ClientIo>;
 /// checked), masked frames, fragments, ping / pong and close. One message (and one frame) may hold
 /// up to `max_message` bytes; a server that sends more is disconnected.
 pub async fn connect(tls: &ClientTls, url: &str, max_message: usize) -> anyhow::Result<ClientSocket> {
+    connect_with(tls, url, &[], max_message).await
+}
+
+/// [`connect`], with `headers` on the handshake (an `authorization`, say).
+pub async fn connect_with(tls: &ClientTls, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<ClientSocket> {
+    use tungstenite::client::IntoClientRequest as _;
     let uri: http::Uri = url.parse().map_err(|e| anyhow::anyhow!("bad url {url}: {e}"))?;
     let secure = match uri.scheme_str() {
         Some("wss" | "https") => true,
@@ -188,7 +194,11 @@ pub async fn connect(tls: &ClientTls, url: &str, max_message: usize) -> anyhow::
         ClientIo::Plain(RtFuturesIo::new(tcp))
     };
     let target = format!("{}://{authority}{path}", if secure { "wss" } else { "ws" });
-    let (ws, _) = async_tungstenite::client_async_with_config(target, io, Some(limits(max_message)))
+    let mut request = target.into_client_request().map_err(|e| anyhow::anyhow!("WebSocket request to {url}: {e}"))?;
+    for (k, v) in headers {
+        request.headers_mut().insert(http::HeaderName::from_bytes(k.as_bytes())?, http::HeaderValue::from_str(v)?);
+    }
+    let (ws, _) = async_tungstenite::client_async_with_config(request, io, Some(limits(max_message)))
         .await
         .map_err(|e| anyhow::anyhow!("WebSocket handshake with {url}: {e}"))?;
     Ok(ws)

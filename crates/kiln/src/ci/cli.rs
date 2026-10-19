@@ -110,6 +110,12 @@ impl Api {
         &self.url
     }
 
+    /// A WebSocket to `path` (from `/api`), as this caller.
+    pub(crate) async fn websocket(&self, path: &str) -> Result<crate::http::ws::ClientSocket> {
+        let auth = format!("Bearer {}", self.token);
+        self.client.websocket_with(&format!("{}{path}", self.url), &[("authorization", auth.as_str())], 16 << 20).await
+    }
+
     /// A CI route (`/api/ci<path>`).
     pub(crate) async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         self.call_api(method, &format!("/api/ci{path}"), body).await
@@ -957,6 +963,9 @@ pub struct DebugArgs {
 
 #[derive(clap::Subcommand)]
 enum DebugCmd {
+    /// A terminal in a running or kept leg (its workspace and environment, or its container),
+    /// here: until its shell ends, or Ctrl-] leaves it.
+    Terminal { leg: String },
     /// Keep a kept leg longer: MINUTES from now (default 30).
     Keep {
         leg: String,
@@ -985,10 +994,142 @@ enum DebugCmd {
     },
 }
 
+/// This terminal held raw while a remote one has it (Unix); as it was again when dropped.
+struct RawMode(#[cfg(unix)] Option<rustix::termios::Termios>);
+
+impl RawMode {
+    #[cfg(unix)]
+    fn enter() -> RawMode {
+        let stdin = std::io::stdin();
+        let Ok(was) = rustix::termios::tcgetattr(&stdin) else { return RawMode(None) };
+        let mut raw = was.clone();
+        raw.make_raw();
+        if rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &raw).is_err() {
+            return RawMode(None);
+        }
+        RawMode(Some(was))
+    }
+
+    /// (Windows' console stays as it is: lines go when Enter is pressed.)
+    #[cfg(not(unix))]
+    fn enter() -> RawMode {
+        RawMode()
+    }
+
+    #[cfg(unix)]
+    fn restore(&self) {
+        if let Some(was) = &self.0 {
+            let _ = rustix::termios::tcsetattr(std::io::stdin(), rustix::termios::OptionalActions::Now, was);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn restore(&self) {}
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// This terminal's size (columns, rows); 120 by 40 when it has none.
+fn term_size() -> (u16, u16) {
+    #[cfg(unix)]
+    if let Ok(w) = rustix::termios::tcgetwinsize(std::io::stdout())
+        && w.ws_col > 0
+        && w.ws_row > 0
+    {
+        return (w.ws_col, w.ws_row);
+    }
+    (120, 40)
+}
+
+/// The next keys typed, while there's input to read.
+async fn next_key(typed: &async_channel::Receiver<Vec<u8>>, typing: bool) -> Option<Vec<u8>> {
+    if typing { typed.recv().await.ok() } else { futures::future::pending().await }
+}
+
+/// `kiln debug terminal <leg>` (W17-R01): a terminal in a running or kept leg, in this one, raw
+/// (on Unix) and following this window's size, until the shell there ends or Ctrl-] leaves it.
+async fn terminal(api: &Api, leg: &str) -> Result<()> {
+    use crate::http::ws::Message;
+    use futures::{FutureExt as _, StreamExt as _};
+    use std::io::Write as _;
+    let (cols, rows) = term_size();
+    let socket = api.websocket(&format!("/api/ci/legs/{}/terminal?cols={cols}&rows={rows}", enc(leg))).await?;
+    let (mut tx, mut rx) = socket.split();
+    let raw = RawMode::enter();
+    eprint!("[kiln] a terminal in {leg}; Ctrl-] leaves it\r\n");
+    // Keys, read on a thread of their own.
+    let (keys, typed) = async_channel::bounded::<Vec<u8>>(16);
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 || keys.send_blocking(buf.get(..n).unwrap_or_default().to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out = std::io::stdout();
+    let (mut size, mut tick) = ((cols, rows), crate::rt::Interval::new(Duration::from_millis(500)));
+    let (mut ended, mut typing): (Option<String>, bool) = (None, true);
+    loop {
+        futures::select_biased! {
+            m = rx.next().fuse() => match m {
+                Some(Ok(Message::Binary(b))) => {
+                    out.write_all(&b)?;
+                    out.flush()?;
+                }
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(t.as_str()).unwrap_or_default();
+                    match v.get("type").and_then(Value::as_str).unwrap_or_default() {
+                        "exit" => {
+                            ended = Some(format!("its shell exited ({})", v.get("code").map_or_else(|| "?".to_owned(), Value::to_string)));
+                            break;
+                        }
+                        "error" | "missing" => {
+                            ended = Some(v.get("message").and_then(Value::as_str).unwrap_or("the terminal is gone").to_owned());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(e)) => {
+                    ended = Some(e.to_string());
+                    break;
+                }
+                Some(Ok(_)) => {}
+            },
+            k = next_key(&typed, typing).fuse() => match k {
+                // Ctrl-] leaves; the session there goes on until it ends.
+                Some(bytes) if bytes.contains(&0x1d) => break,
+                Some(bytes) => tx.send(Message::binary(bytes)).await?,
+                // The input ended (a pipe): what was sent runs on until the shell exits.
+                None => typing = false,
+            },
+            () = tick.tick().fuse() => {
+                let now = term_size();
+                if now != size {
+                    size = now;
+                    tx.send(Message::text(json!({ "type": "resize", "cols": now.0, "rows": now.1 }).to_string())).await?;
+                }
+            },
+        }
+    }
+    drop(raw);
+    let _ = tx.close(None).await;
+    eprintln!("\r\n[kiln] {}", ended.as_deref().unwrap_or("left the terminal"));
+    Ok(())
+}
+
 /// `kiln debug`.
 pub async fn debug(args: DebugArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     match args.cmd {
+        DebugCmd::Terminal { leg } => terminal(&api, &leg).await?,
         DebugCmd::Keep { leg, minutes } => {
             let v = api.call(Method::Post, &format!("/legs/{}/keep", enc(&leg)), Some(json!({ "minutes": minutes }))).await?;
             println!("{leg} kept until {}", when(v.get("kept_until").and_then(Value::as_i64)));

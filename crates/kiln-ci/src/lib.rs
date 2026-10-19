@@ -25,6 +25,7 @@
 
 pub mod attest;
 pub mod compare;
+pub mod dockerfile;
 pub mod env;
 pub mod expr;
 pub mod facts;

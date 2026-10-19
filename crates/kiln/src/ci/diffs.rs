@@ -156,7 +156,9 @@ pub(crate) fn new_change_id() -> String {
 /// message, diff, author?, date? }] | mbox: "<git format-patch output>", draft?, reviewers?,
 /// topic?, message? }`. The patches become commits on the trunk's tip, given Change-Ids where
 /// they lack one, and are submitted as a push to `refs/for/<trunk>` is.
-pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+/// A submission's repository (one kiln hosts, the caller allowed to submit to it), its path, its
+/// trunk (the body's `trunk`, else its default branch) and the trunk's tip.
+async fn trunk_tip(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, body: &Value) -> Result<(Repo, String, String, String), Fail> {
     let repos = hub.store.repos().await.map_err(fail)?;
     let repo = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
     if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) {
@@ -166,24 +168,12 @@ pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, bod
     let p = path.to_string_lossy().into_owned();
     let head = gitops::run_git(hub, &["-C", &p, "symbolic-ref", "--short", "HEAD"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_else(|_| "main".into());
     let trunk = body.get("trunk").and_then(Value::as_str).map_or(head, str::to_owned);
-    let patches: Vec<review::Patch> = match (body.get("mbox").and_then(Value::as_str), body.get("patches")) {
-        (Some(m), _) => review::parse_mbox(m),
-        (None, Some(list)) => serde_json::from_value(list.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("`patches`: {e}")))?,
-        (None, None) => Vec::new(),
-    };
-    if patches.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "nothing to submit: give `patches` or `mbox`".into()));
-    }
     let tip = gitops::run_git(hub, &["-C", &p, "rev-parse", "--verify", &format!("refs/heads/{trunk}^{{commit}}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, format!("{trunk} has no commits yet")))?;
-    let (name, kind) = author_of(&caller.name, Some(caller.kind));
-    let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
-    let mut parent = tip;
-    for (i, patch) in patches.iter().enumerate() {
-        let tree = tree_with(hub, &p, &parent, Edit::Apply(&patch.diff)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("patch {} doesn't apply: {e}", i + 1)))?;
-        let message = if patch.message.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, format!("patch {} has no message", i + 1))) } else { review::with_change_id(&patch.message, &new_change_id()) };
-        let author = patch.author.clone().unwrap_or_else(|| me.clone());
-        parent = make_commit(hub, &p, &tree, &parent, (&author, patch.date.as_deref()), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    }
+    Ok((repo, p, trunk, tip))
+}
+
+/// A submission's push options, from a body's `draft`, `reviewers`, `topic` and `message`.
+fn push_options(body: &Value) -> kiln_ci::review::Options {
     let mut given: Vec<String> = Vec::new();
     if body.get("draft").and_then(Value::as_bool) == Some(true) {
         given.push("draft".into());
@@ -196,8 +186,55 @@ pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, bod
             given.push(format!("{k}={v}"));
         }
     }
-    let options = review::options(&given);
-    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &parent, pushed_by: &caller.name, author: (name, kind), options }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    review::options(&given)
+}
+
+/// A diff that changes one file on the trunk (W20-R02's proposals: a workflow edited, a test
+/// quarantined), never a direct write. `change` makes the file's new text from its text at the
+/// trunk's tip (`None` when it isn't there); the commit, titled `title`, is submitted as
+/// `submit_patches`'s are.
+pub async fn propose_file(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, file: &str, title: &str, body: &Value, change: impl FnOnce(Option<String>) -> Result<String, String>) -> Result<Value, Fail> {
+    let file = file.trim_start_matches("./");
+    if file.is_empty() || file.starts_with('/') || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+        return Err((StatusCode::BAD_REQUEST, format!("`{file}` isn't a path in the repository")));
+    }
+    let (repo, p, trunk, tip) = trunk_tip(hub, repo_key, caller, body).await?;
+    let old = gitops::run_git(hub, &["-C", &p, "show", &format!("{tip}:{file}")], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).into_owned());
+    let new = change(old.clone()).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    if old.as_deref() == Some(new.as_str()) {
+        return Err((StatusCode::CONFLICT, format!("{file} is already so on {trunk}: nothing to propose")));
+    }
+    let listing = gitops::run_git(hub, &["-C", &p, "ls-tree", &tip, "--", file], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+    let mode = listing.split_whitespace().next().unwrap_or("100644").to_owned();
+    let tree = tree_with(hub, &p, &tip, Edit::Put { file, mode: &mode, content: new.into_bytes() }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let (name, kind) = author_of(&caller.name, Some(caller.kind));
+    let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
+    let message = review::with_change_id(&format!("{title}\n"), &new_change_id());
+    let sha = make_commit(hub, &p, &tree, &tip, (&me, None), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &sha, pushed_by: &caller.name, author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(json!({ "diffs": out }))
+}
+
+pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let patches: Vec<review::Patch> = match (body.get("mbox").and_then(Value::as_str), body.get("patches")) {
+        (Some(m), _) => review::parse_mbox(m),
+        (None, Some(list)) => serde_json::from_value(list.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("`patches`: {e}")))?,
+        (None, None) => Vec::new(),
+    };
+    let (repo, p, trunk, tip) = trunk_tip(hub, repo_key, caller, body).await?;
+    if patches.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "nothing to submit: give `patches` or `mbox`".into()));
+    }
+    let (name, kind) = author_of(&caller.name, Some(caller.kind));
+    let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
+    let mut parent = tip;
+    for (i, patch) in patches.iter().enumerate() {
+        let tree = tree_with(hub, &p, &parent, Edit::Apply(&patch.diff)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("patch {} doesn't apply: {e}", i + 1)))?;
+        let message = if patch.message.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, format!("patch {} has no message", i + 1))) } else { review::with_change_id(&patch.message, &new_change_id()) };
+        let author = patch.author.clone().unwrap_or_else(|| me.clone());
+        parent = make_commit(hub, &p, &tree, &parent, (&author, patch.date.as_deref()), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &parent, pushed_by: &caller.name, author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     Ok(json!({ "diffs": out }))
 }
 
@@ -476,6 +513,8 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         labels: Some(f.labels.clone()),
         head: Side { branch: f.branch.clone().unwrap_or_else(|| format!("D{}", f.number)), sha: f.sha.clone(), repo: ctx.clone() },
         base: Side { branch: trunk.to_owned(), sha: base_sha.to_owned(), repo: ctx.clone() },
+        created_at: None,
+        updated_at: None,
     };
     let mut e = Event {
         name: "pull_request".into(),

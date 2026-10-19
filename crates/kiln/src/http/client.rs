@@ -111,7 +111,12 @@ impl Client {
     /// Open a WebSocket (`ws(s)://`, or `http(s)://` for the same) trusting this client's roots;
     /// see [`super::ws::connect`].
     pub async fn websocket(&self, url: &str, max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
-        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect(&self.tls, url, max_message)).await {
+        self.websocket_with(url, &[], max_message).await
+    }
+
+    /// [`Self::websocket`], with `headers` on the handshake.
+    pub async fn websocket_with(&self, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
+        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect_with(&self.tls, url, headers, max_message)).await {
             Ok(r) => r,
             Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
         }

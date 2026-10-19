@@ -181,6 +181,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         // W02: workflows.
         (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
+        // W13-R11: an image's definition, checked; or proposed for the repository ("Save to repo").
+        (&Method::POST, ["images", "validate"]) => super::images::validate(req.into_body()).await,
+        (&Method::POST, ["images"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::images::propose(hub, q, &caller, &body).await
+        }
         // W04-R29: a plan without a run.
         (&Method::POST, ["plan-preview"]) => {
             let caller = req.extensions().get::<crate::authz::Caller>().cloned();

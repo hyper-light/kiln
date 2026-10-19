@@ -38,6 +38,11 @@ pub const EVENTS: &[&str] = &[
     "run.succeeded",
     "run.cancelled",
     "approval.waiting",
+    "deploy.succeeded",
+    "deploy.failed",
+    "leg.flaky",
+    "land.ejected",
+    "runner.offline",
     "agent.needs_you",
     "agent.finished",
     "agent.stopped",
@@ -52,6 +57,10 @@ pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.
 /// The events about a release deployed by API (`crate::deploy`): the server's rules take them, a
 /// repository's can't, and each goes to the app's own channels as well.
 pub const RELEASE_EVENTS: &[&str] = &["release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
+/// The events about a runner: the server's rules take them, a repository's can't.
+pub const RUNNER_EVENTS: &[&str] = &["runner.offline"];
+/// How long a runner is gone before `runner.offline` is said of it.
+const OFFLINE_AFTER: Duration = Duration::from_secs(120);
 /// How long a release's event, once sent through a channel, isn't sent through it again.
 const RELEASE_ONCE: i64 = 90 * 86_400;
 /// The integration kinds that are channels.
@@ -92,6 +101,9 @@ impl Rule {
         }
         if !server && let Some(e) = self.on.iter().find(|e| AGENT_EVENTS.contains(&e.as_str())) {
             return Err(format!("`{e}` is about an agent, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml)"));
+        }
+        if !server && let Some(e) = self.on.iter().find(|e| RUNNER_EVENTS.contains(&e.as_str())) {
+            return Err(format!("`{e}` is about a runner, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml)"));
         }
         if !server && let Some(e) = self.on.iter().find(|e| RELEASE_EVENTS.contains(&e.as_str())) {
             return Err(format!("`{e}` is about a release, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml), and an app's own channels"));
@@ -171,7 +183,7 @@ pub struct Subject {
 
 impl Subject {
     fn run_value(&self) -> Value {
-        json!({ "repo": self.repo, "id": self.run, "number": self.number, "workflow": self.workflow, "name": self.name, "branch": self.branch, "sha": self.sha, "actor": self.actor, "conclusion": self.conclusion, "url": self.url })
+        json!({ "repo": self.repo, "id": self.run, "number": self.number, "workflow": self.workflow, "name": self.name, "branch": self.branch, "sha": self.sha, "message": self.message, "actor": self.actor, "conclusion": self.conclusion, "url": self.url })
     }
 }
 
@@ -193,6 +205,10 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         let line = if s.run.is_empty() { s.url.clone() } else { format!("{} · {} · {}", s.repo, s.branch, s.url) };
         return (s.name.clone(), line);
     }
+    // A land queue's entry: its diffs, why, and where they are.
+    if event == "land.ejected" {
+        return (format!("⏏ {} left the land queue of {}", s.name, s.branch), format!("{} · {} · {}", s.repo, s.message, s.url));
+    }
     let what = if s.name.is_empty() { s.workflow.clone() } else { s.name.clone() };
     let title = match event {
         "run.failed" => format!("✗ {what} #{} failed on {}", s.number, s.branch),
@@ -201,6 +217,9 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         "run.cancelled" => format!("◌ {what} #{} was cancelled on {}", s.number, s.branch),
         "approval.waiting" if s.environments.is_empty() => format!("⏸ {what} #{} waits for a maintainer's approval to run (an outside contributor's)", s.number),
         "approval.waiting" => format!("⏸ {what} #{} waits for approval to deploy to {}", s.number, s.environments.join(", ")),
+        "deploy.succeeded" => format!("✓ {what} #{} deployed to {}", s.number, s.environments.join(", ")),
+        "deploy.failed" => format!("✗ {what} #{} failed to deploy to {}", s.number, s.environments.join(", ")),
+        "leg.flaky" => format!("≈ {what} #{} had flaky tests on {}", s.number, s.branch),
         other => format!("{other}: {what} #{}", s.number),
     };
     let first = s.message.lines().next().unwrap_or_default();
@@ -227,7 +246,10 @@ impl Msg {
     fn of_run(event: &str, s: &Subject) -> Msg {
         let (title, line) = message(event, s);
         let webhook = json!({ "event": event, "title": title, "text": line, "run": s.run_value(), "environments": s.environments });
-        Msg { title, line, url: s.url.clone(), what: "the run", dedup: format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch), resolve: matches!(event, "run.fixed" | "run.succeeded"), webhook }
+        // A deployment's incident is the environment's; a run's, its workflow's on its branch.
+        let dedup = if event.starts_with("deploy.") { format!("kiln:{}:deploy:{}", s.repo, s.environments.join(",")) } else { format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch) };
+        let what = if event == "land.ejected" { "the diff" } else { "the run" };
+        Msg { title, line, url: s.url.clone(), what, dedup, resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"), webhook }
     }
 
     /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`.
@@ -495,16 +517,21 @@ pub async fn agent_event(hub: Arc<Hub>, ev: Value) {
     }
 }
 
-/// Whether `rule` takes a release's `event`: `where` reads `release` (its `id`, `app`,
-/// `environment`, `kind`, `version`, `state`, `requested_by`, `message`, `approvers`).
-fn takes_release(rule: &Rule, event: &str, release: &Value) -> bool {
+/// Whether `rule` takes `event`, its `where` reading `value` as the context `name`.
+fn takes_ctx(rule: &Rule, event: &str, name: &'static str, value: &Value) -> bool {
     if !rule.on.iter().any(|e| e == event) {
         return false;
     }
     let Some(c) = &rule.cond else { return true };
     let Ok(cond) = kiln_ci::expr::Condition::parse(c, &kiln_ci::expr::ParseOptions::permissive(kiln_ci::expr::Dialect::Kiln)) else { return false };
-    let cx = kiln_ci::expr::MapContexts::default().with("release", kiln_ci::expr::Value::from_json(release));
+    let cx = kiln_ci::expr::MapContexts::default().with(name, kiln_ci::expr::Value::from_json(value));
     kiln_ci::expr::eval_condition(&cond, &cx, &mut kiln_ci::expr::Budget::default()).unwrap_or(false)
+}
+
+/// Whether `rule` takes a release's `event`: `where` reads `release` (its `id`, `app`,
+/// `environment`, `kind`, `version`, `state`, `requested_by`, `message`, `approvers`).
+fn takes_release(rule: &Rule, event: &str, release: &Value) -> bool {
+    takes_ctx(rule, event, "release", release)
 }
 
 /// A channel an app names for its release messages: `kind:target`, or a bare `#channel`, which is
@@ -579,6 +606,103 @@ pub async fn run_finished(hub: Arc<Hub>, run: String) {
     };
     for e in events {
         emit(&hub, &repo, e, &s).await;
+    }
+    // W16-R04 in the run itself: tests a retry passed, or that an attempt failed and another
+    // passed (`leg.flaky`, the tests named in the message).
+    match super::results::flaky_in_run(&hub, &run).await {
+        Ok(tests) if !tests.is_empty() => {
+            let shown: Vec<&str> = tests.iter().take(10).map(String::as_str).collect();
+            let more = if tests.len() > shown.len() { format!(" and {} more", tests.len() - shown.len()) } else { String::new() };
+            let s = Subject { message: format!("flaky: {}{more}", shown.join(", ")), ..s };
+            emit(&hub, &repo, "leg.flaky", &s).await;
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(run = %run, error = %format!("{e:#}"), "a run's flaky tests couldn't be read"),
+    }
+}
+
+/// A deployment ended (W19-R06): `deploy.succeeded` or `deploy.failed`, about its run and
+/// environment.
+pub async fn deployed(hub: Arc<Hub>, run: String, environment: String, succeeded: bool) {
+    let Ok(Some((repo, mut s))) = subject(&hub, &run).await else { return };
+    s.environments = vec![environment];
+    emit(&hub, &repo, if succeeded { "deploy.succeeded" } else { "deploy.failed" }, &s).await;
+}
+
+/// A land queue's entry was ejected (W19-R06): `land.ejected`, about its diffs (`D12 title`, the
+/// first's link), with why.
+pub async fn land_ejected(hub: Arc<Hub>, diffs: Vec<String>, reason: String) {
+    let mut found = Vec::new();
+    for id in &diffs {
+        if let Ok(Some(d)) = super::diffs::find(&hub, id).await {
+            found.push(d);
+        }
+    }
+    let Some(first) = found.first() else { return };
+    let Some(repo) = hub.store.repos().await.ok().and_then(|r| r.into_iter().find(|r| r.name == first.repo)) else { return };
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
+    let s = Subject {
+        repo: repo.name.clone(),
+        name: format!("{} ({})", names.join(", "), first.title),
+        branch: first.trunk.clone(),
+        message: reason,
+        actor: first.author.clone(),
+        conclusion: "ejected".into(),
+        url: format!("{base}/diffs/{}", first.name),
+        github: json!({ "repository": repo.name, "ref": format!("refs/heads/{}", first.trunk), "ref_name": first.trunk }),
+        ..Subject::default()
+    };
+    emit(&hub, &repo, "land.ejected", &s).await;
+}
+
+/// Runners told of as offline, until they're back.
+static OFFLINE: parking_lot::Mutex<Option<std::collections::HashSet<String>>> = parking_lot::Mutex::new(None);
+
+/// Runners (not pods or outposts) gone past `OFFLINE_AFTER`: `runner.offline` for each, once
+/// each time it goes. Called as the scheduler sweeps.
+pub fn runners_gone(hub: &Arc<Hub>) {
+    let gone: Vec<(String, u64)> = hub
+        .agents
+        .lock()
+        .values()
+        .filter(|a| !a.connected && !a.ephemeral && !a.outpost && a.lost_at.is_some_and(|t| t.elapsed() > OFFLINE_AFTER))
+        .map(|a| (a.name.clone(), a.lost_at.map_or(0, |t| t.elapsed().as_secs())))
+        .collect();
+    let mut told = OFFLINE.lock();
+    let told = told.get_or_insert_with(std::collections::HashSet::new);
+    // Those back since are told of again when they next go.
+    told.retain(|n| gone.iter().any(|(g, _)| g == n));
+    for (name, secs) in gone {
+        if told.insert(name.clone()) {
+            crate::rt::spawn(runner_offline(Arc::clone(hub), name, secs));
+        }
+    }
+}
+
+/// A runner went away and hasn't come back (W19-R06): `runner.offline`, through the server's
+/// rules that take it (`where` reads `runner`: its `name`, `labels` and `gone_for` seconds), and
+/// to the server's webhook subscribers.
+pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
+    let labels = hub.agents.lock().get(&name).map(|a| a.labels.clone()).unwrap_or_default();
+    let runner = json!({ "name": name, "labels": labels, "gone_for": gone_for });
+    hub.emit(&json!({ "type": "runner.offline", "runner": runner }));
+    let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
+    let title = format!("⚠ runner {name} is offline");
+    let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
+    let m = Msg { title: title.clone(), line: line.clone(), url, what: "the runner", dedup: format!("kiln:runner:{name}"), resolve: false, webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }) };
+    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+        if rule.check(true).is_err() || !takes_ctx(rule, "runner.offline", "runner", &runner) {
+            continue;
+        }
+        let rule_name = format!("server#{}", n + 1);
+        for spec in &rule.to {
+            let key = format!("{rule_name}\u{0}{spec}\u{0}runner.offline\u{0}{name}");
+            if throttled(&hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
+                continue;
+            }
+            deliver(&hub, None, &rule_name, "runner.offline", &format!("runner:{name}"), &m, spec).await;
+        }
     }
 }
 
@@ -718,5 +842,27 @@ mod tests {
         assert_eq!((landed.title.as_str(), landed.resolve), ("✓ web a rollback to 1.4.1 landed in production", true));
         assert_eq!(app_channel("#deploys"), "slack:#deploys", "a bare channel is Slack's");
         assert_eq!(app_channel("teams:ops"), "teams:ops");
+    }
+
+    /// W19-R06's other events: a deployment's end, a land queue's ejection, a runner gone. A
+    /// repository's rules may take the first two; only the server's take `runner.offline`.
+    #[test]
+    fn w19_r06_deploy_land_and_runner_events() {
+        let s = Subject { environments: vec!["production".into()], ..subject() };
+        assert_eq!(message("deploy.succeeded", &s).0, "✓ CI #7 deployed to production");
+        assert_eq!(message("deploy.failed", &s).0, "✗ CI #7 failed to deploy to production");
+        let (failed, fixed) = (Msg::of_run("deploy.failed", &s), Msg::of_run("deploy.succeeded", &s));
+        assert_eq!((failed.dedup.as_str(), failed.resolve, fixed.resolve), ("kiln:acme/app:deploy:production", false, true), "one incident per environment, resolved by the next success");
+        let flaky = Subject { message: "flaky: calc adds, calc divides".into(), ..subject() };
+        assert_eq!(message("leg.flaky", &flaky), ("≈ CI #7 had flaky tests on main".to_owned(), "acme/app · 01234567 flaky: calc adds, calc divides · ada · https://kiln.example/runs/r1".to_owned()));
+        let ejected = Subject { repo: "acme/app".into(), name: "D12, D13 (the parser fix)".into(), branch: "main".into(), message: "needs rebase: conflicts in src/a.rs".into(), url: "https://kiln.example/diffs/D12".into(), ..Subject::default() };
+        assert_eq!(message("land.ejected", &ejected), ("⏏ D12, D13 (the parser fix) left the land queue of main".to_owned(), "acme/app · needs rebase: conflicts in src/a.rs · https://kiln.example/diffs/D12".to_owned()));
+        assert_eq!(Msg::of_run("land.ejected", &ejected).what, "the diff");
+        assert!(parse_rules("- on: [deploy.failed, land.ejected]\n  to: slack:#ci\n").is_ok());
+        assert!(parse_rules("- on: runner.offline\n  to: slack:#ops\n").is_err(), "a repository's rules can't take runner.offline");
+        let rule = Rule { on: vec!["runner.offline".into()], cond: Some("contains(runner.labels, 'gpu')".into()), to: vec!["pagerduty:ops".into()], throttle: None };
+        assert!(rule.check(true).is_ok());
+        assert!(takes_ctx(&rule, "runner.offline", "runner", &json!({ "name": "metal-1", "labels": ["linux", "gpu"], "gone_for": 180 })));
+        assert!(!takes_ctx(&rule, "runner.offline", "runner", &json!({ "name": "metal-2", "labels": ["linux"], "gone_for": 180 })));
     }
 }

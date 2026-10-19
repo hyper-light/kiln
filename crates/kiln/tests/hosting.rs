@@ -1602,7 +1602,8 @@ fn w03_r09_native_activity_and_kiln_events() -> anyhow::Result<()> {
     let wanted = [
         ("pull_request", "pr ready_for_review label= from= merged="),
         ("pull_request", "pr edited label= from=First title"),
-        ("pull_request", "pr labeled label=ci:full from= merged= labels=ci:full"),
+        // `merged` is in every pull request event's payload, as on GitHub.
+        ("pull_request", "pr labeled label=ci:full from= merged=false labels=ci:full"),
         ("pull_request", "pr unlabeled label=ci:full"),
         ("pull_request", "pr closed label= from= merged=false"),
         ("pull_request", "pr reopened"),
@@ -2156,6 +2157,252 @@ fn w09_ac07_environment_secrets_after_approval() -> anyhow::Result<()> {
     assert!(log.contains("has it, 19 characters"), "approved, it got the secret: {log}");
     let (_, listed) = http(s.port, "GET", scope, &s.admin, None)?;
     assert!(used(&listed)?, "its use recorded: {listed}");
+    Ok(())
+}
+
+/// A local receiver for webhooks: each request's body, as it comes.
+fn receiver() -> anyhow::Result<(u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>)> {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep = std::sync::Arc::clone(&got);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            // The headers, then as much body as they say.
+            let body = loop {
+                let Ok(n) = stream.read(&mut chunk) else { break None };
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                    if rest.len() >= len {
+                        break Some(rest.to_owned());
+                    }
+                }
+            };
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            if let (Some(b), Ok(mut g)) = (body, keep.lock()) {
+                g.push(b);
+            }
+        }
+    });
+    Ok((port, got))
+}
+
+/// W19-R06's other events reach a channel: a job's failed deployment sends `deploy.failed`, and
+/// a run whose report has a test a retry passed sends `leg.flaky` (a webhook here).
+#[test]
+fn w19_r06_deploy_failed_and_leg_flaky_reach_a_channel() -> anyhow::Result<()> {
+    let (hook, got) = receiver()?;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\nallow_private_targets = [\"127.0.0.1\"]", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/ci/integrations", &s.admin, Some(&json!({ "kind": "webhook", "name": "hook", "config": { "url": format!("http://127.0.0.1:{hook}/hook") }, "secret": "s3cret", "scope": "server" })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/told", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "told\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/told.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/notify.yaml"), "- on: [deploy.failed, leg.flaky]\n  to: webhook:hook\n")?;
+    std::fs::write(
+        work.join(".kiln/told.yaml"),
+        r#"on: push
+jobs:
+  ship:
+    runs-on: local
+    checkout: false
+    environment: staging
+    steps:
+      - run: exit 1
+  tests:
+    runs-on: local
+    checkout: false
+    steps:
+      - test-results: { path: report.xml }
+        run: |
+          printf '%s' '<?xml version="1.0"?><testsuite name="calc" tests="1"><testcase classname="calc" name="adds"><flakyFailure message="boom" type="AssertionError"/></testcase></testsuite>' > report.xml
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "told"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(180, "deploy.failed and leg.flaky at the webhook", || {
+        let seen = got.lock().map(|g| g.clone()).unwrap_or_default();
+        let has = |e: &str| seen.iter().any(|b| b.contains(&format!("\"event\":\"{e}\"")));
+        Ok((!(has("deploy.failed") && has("leg.flaky"))).then(|| format!("{seen:?}\n{}", s.log())))
+    })?;
+    let seen = got.lock().map(|g| g.clone()).unwrap_or_default();
+    let flaky = seen.iter().find(|b| b.contains("\"event\":\"leg.flaky\"")).cloned().unwrap_or_default();
+    assert!(flaky.contains("calc adds"), "{flaky}");
+    let failed = seen.iter().find(|b| b.contains("\"event\":\"deploy.failed\"")).cloned().unwrap_or_default();
+    assert!(failed.contains("staging"), "{failed}");
+    Ok(())
+}
+
+/// W20-R02 over MCP, as an agent uses it: a broken workflow edit is refused with its errors; a
+/// good one, and a test's quarantine, become diffs (never writes to the trunk); the diffs are
+/// listed and commented on; a secret is set and only its name comes back; an environment is saved
+/// and listed; the runners are there to read.
+#[test]
+fn w20_r02_operations_over_mcp() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/agentic", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/agentic.git", s.admin, s.port);
+    must(git(&home, dir.path(), &["clone", "-q", &url, "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/ci.yml"), "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - run: echo a\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "push")?;
+    let trunk = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let mcp = |tool: &str, args: Value| -> anyhow::Result<(bool, String)> {
+        let (st, body) = http(s.port, "POST", "/api/mcp", &s.admin, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": args } })))?;
+        anyhow::ensure!(st == 200, "{tool}: {st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let failed = v.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(true);
+        Ok((failed, v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default().to_owned()))
+    };
+    // A broken edit is refused, with why; a good one is a diff.
+    let (failed, out) = mcp("ci_workflows_edit", json!({ "repo": "acme/agentic", "path": ".github/workflows/ci.yml", "content": "on: push\njobs:\n  a:\n    steps: []\n" }))?;
+    assert!(failed && out.contains("has errors"), "{out}");
+    let (failed, out) = mcp("ci_workflows_edit", json!({ "repo": "acme/agentic", "path": ".github/workflows/ci.yml", "content": "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - run: echo b\n", "title": "Say b" }))?;
+    assert!(!failed && out.contains("D1"), "{out}");
+    let (failed, out) = mcp("ci_tests_propose_quarantine", json!({ "repo": "acme/agentic", "test": "calc::adds", "reason": "races the clock", "until": "2030-01-01" }))?;
+    assert!(!failed && out.contains("D2"), "{out}");
+    // Proposals, not writes: the trunk is where it was, and each diff's commit has the change.
+    must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
+    assert_eq!(must(git(&home, &work, &["rev-parse", "origin/main"]), "rev-parse")?.trim(), trunk, "the trunk didn't move");
+    must(git(&home, &work, &["fetch", "-q", "origin", "refs/kiln/diffs/D2/v1"]), "fetch D2")?;
+    let quarantine = must(git(&home, &work, &["show", "FETCH_HEAD:.kiln/quarantine.yaml"]), "show")?;
+    assert!(quarantine.contains("calc::adds") && quarantine.contains("races the clock") && quarantine.contains("2030-01-01") && !quarantine.contains("issue"), "{quarantine}");
+    let (failed, out) = mcp("ci_tests_propose_quarantine", json!({ "repo": "acme/agentic", "test": "calc::adds", "reason": "again", "until": "soon" }))?;
+    assert!(failed && out.contains("until"), "a bad entry isn't proposed: {out}");
+    let (_, listed) = mcp("ci_diffs_list", json!({ "repo": "acme/agentic" }))?;
+    assert!(listed.contains("Say b") && listed.contains("Quarantine calc::adds"), "{listed}");
+    let (failed, out) = mcp("ci_diffs_comment", json!({ "diff": "D1", "body": "looks right", "publish": true }))?;
+    assert!(!failed, "{out}");
+    let (_, threads) = mcp("ci_diffs_threads", json!({ "diff": "D1" }))?;
+    assert!(threads.contains("looks right"), "{threads}");
+    // Secrets: only names come back.
+    let (failed, out) = mcp("ci_secrets_set", json!({ "scope": "repo:acme/agentic", "name": "DEPLOY_TOKEN", "value": "sekrit-value-31337" }))?;
+    assert!(!failed, "{out}");
+    let (_, names) = mcp("ci_secrets_list", json!({ "scope": "repo:acme/agentic" }))?;
+    assert!(names.contains("DEPLOY_TOKEN") && !names.contains("sekrit-value-31337"), "{names}");
+    let (failed, out) = mcp("ci_environments_save", json!({ "repo": "acme/agentic", "name": "staging", "concurrency": 2 }))?;
+    assert!(!failed, "{out}");
+    let (_, envs) = mcp("ci_environments_list", json!({ "repo": "acme/agentic" }))?;
+    assert!(envs.contains("\"staging\"") && envs.contains("\"concurrency\":2"), "{envs}");
+    let (failed, runners) = mcp("ci_runners_list", json!({}))?;
+    assert!(!failed && runners.contains("local"), "{runners}");
+    // A runner image: checked as the editor checks it, and proposed as a diff once it's sound.
+    let (failed, found) = mcp("ci_images_validate", json!({ "content": "FROM ubuntu\nRUN apt-get install curl\n" }))?;
+    assert!(!failed && found.contains("DL3006") && found.contains("DL3014"), "{found}");
+    let (failed, out) = mcp("ci_images_propose", json!({ "repo": "acme/agentic", "name": "bad", "content": "RUN echo\n" }))?;
+    assert!(failed && out.contains("KDF1002"), "a Dockerfile with errors isn't proposed: {out}");
+    let sound = "FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*\n";
+    let (failed, out) = mcp("ci_images_propose", json!({ "repo": "acme/agentic", "name": "web", "content": sound }))?;
+    assert!(!failed && out.contains("D3"), "{out}");
+    must(git(&home, &work, &["fetch", "-q", "origin", "refs/kiln/diffs/D3/v1"]), "fetch D3")?;
+    assert_eq!(must(git(&home, &work, &["show", "FETCH_HEAD:.kiln/images/web/Dockerfile"]), "show")?, sound);
+    Ok(())
+}
+
+/// W17-R01's terminal from the CLI: `kiln debug terminal <leg>` into a running leg, with its input
+/// piped (so the terminal here isn't made raw): a command runs in the leg's environment, and the
+/// terminal ends when its shell does.
+#[test]
+fn w17_r01_kiln_debug_terminal() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir()?;
+    // The server's own runner opens terminals into legs as its `[terminal]` switch says, in its
+    // shell (`sh` here: a login shell may greet a home it hasn't seen with questions).
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "[terminal]\nenabled = true\nshell = \"sh\"\n" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/held", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "held\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/held.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/hold.yaml"), "on: push\njobs:\n  hold:\n    runs-on: local\n    checkout: false\n    env:\n      SECRET_WORD: plums\n    steps:\n      - run: sleep 120\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "hold"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    // The leg, once it runs.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (run, leg) = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/held&limit=5", &s.admin, None)?;
+        let run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if !run.is_empty() {
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+            let d: Value = serde_json::from_str(&detail)?;
+            if d.pointer("/legs/0/status").and_then(Value::as_str) == Some("running") {
+                break (run, d.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned());
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the leg never ran: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+        .args(["debug", "terminal", &leg])
+        .env("HOME", &home)
+        .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))
+        .env("KILN_ADMIN_TOKEN", &s.admin)
+        .env_remove("KILN_CONFIG")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(b"echo word-is-$SECRET_WORD-$((6*7))\nexit\n")?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait()?.is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            anyhow::bail!("the terminal didn't end with its shell\n{}", s.log());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let o = child.wait_with_output()?;
+    let (out, err) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert!(o.status.success(), "{out}\n{err}");
+    assert!(out.contains("word-is-plums-42"), "the command ran in the leg's environment: {out}\n{err}");
+    assert!(err.contains("its shell exited"), "{err}");
+    let _ = http(s.port, "POST", &format!("/api/ci/runs/{run}/cancel"), &s.admin, Some(&json!({})));
     Ok(())
 }
 

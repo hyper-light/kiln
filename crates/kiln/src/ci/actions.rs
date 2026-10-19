@@ -89,13 +89,37 @@ pub(crate) fn mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
     hub.cfg.data("actions").join(format!("{owner}__{repo}.git"))
 }
 
+/// Where a tarball was kept before the store kept them: it moves in when it's first asked for.
 fn tarball_path(hub: &Hub, owner: &str, repo: &str, sha: &str) -> PathBuf {
     hub.cfg.data("actions").join("tar").join(format!("{owner}__{repo}")).join(format!("{sha}.tar.gz"))
 }
 
-/// A `kiln://` action's tarball, apart from GitHub's of the same name.
+/// A `kiln://` action's tarball, apart from GitHub's of the same name (as `tarball_path`).
 fn native_tarball_path(hub: &Hub, owner: &str, repo: &str, sha: &str) -> PathBuf {
     hub.cfg.data("actions").join("tar").join("kiln").join(format!("{owner}__{repo}")).join(format!("{sha}.tar.gz"))
+}
+
+/// The store's object for a tarball's key, when it holds one.
+async fn stored_tarball(hub: &Hub, key: &str) -> anyhow::Result<Option<super::services::cas::Object>> {
+    let k = key.to_owned();
+    let digest: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT object FROM ci_action_tarballs WHERE key = ?1", [&k], |r| r.get(0)).optional()?)).await?;
+    match digest {
+        Some(d) => super::services::cas::object(hub, &d).await,
+        None => Ok(None),
+    }
+}
+
+/// `file` into the store as the tarball of `key`.
+async fn keep_tarball(hub: &Hub, key: &str, file: &std::path::Path) -> anyhow::Result<super::services::cas::Object> {
+    let obj = super::services::cas::put_file(hub, file).await?;
+    let (k, d) = (key.to_owned(), obj.digest.clone());
+    hub.store
+        .call(move |c| {
+            c.execute("INSERT INTO ci_action_tarballs (key, object, created_at) VALUES (?1, ?2, ?3) ON CONFLICT (key) DO UPDATE SET object = excluded.object", rusqlite::params![k, d, crate::util::now_unix()])?;
+            Ok(())
+        })
+        .await?;
+    Ok(obj)
 }
 
 fn steps_uses(steps: &[Step], out: &mut Vec<String>) {
@@ -364,7 +388,8 @@ async fn metadata(hub: &Hub, r: &Remote, sha: &str) -> Option<String> {
 
 /// `GET /_kiln/actions/<owner>/<repo>/<sha>.tar.gz`, for a leg's token (W07-R03). With
 /// `?path=`, a `$/` action: that directory of the leg's own repository at the commit, from the
-/// repository's mirror (W07-R01).
+/// repository's mirror (W07-R01). Tarballs are made once, by `git archive`, and kept in the store
+/// (W08), where versions of an action share their chunks.
 pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Response, Fail> {
     // `kiln/<owner>/<repo>/<sha>.tar.gz`: a `kiln://` action, one of kiln's own repositories.
     let (native, rest) = match rest {
@@ -389,7 +414,7 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
             return Err((StatusCode::FORBIDDEN, "a `kiln://` action is its owner's repositories' to use".into()));
         }
     }
-    let (path, mirror_dir, args) = match &own {
+    let (path, key, mirror_dir, args) = match &own {
         Some(p) => {
             if p.split('/').any(|s| s == ".." || s == ".git") {
                 return Err((StatusCode::NOT_FOUND, "no such action".into()));
@@ -402,30 +427,46 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
             let file = tarball_path(hub, owner, repo, &format!("{sha}-{}", digest.get(..16).unwrap_or(&digest)));
             let p = p.trim_matches('/').to_owned();
             let args = if p.is_empty() { vec![sha.to_owned()] } else { vec![sha.to_owned(), "--".to_owned(), p] };
-            (file, gitops::mirror_path(hub, &mine.name), args)
+            (file, format!("own/{owner}__{repo}/{sha}-{}", digest.get(..16).unwrap_or(&digest)), gitops::mirror_path(hub, &mine.name), args)
         }
-        None if native => (native_tarball_path(hub, owner, repo, sha), Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native: true }.mirror(hub), vec![sha.to_owned()]),
-        None => (tarball_path(hub, owner, repo, sha), mirror(hub, owner, repo), vec![sha.to_owned()]),
+        None if native => (
+            native_tarball_path(hub, owner, repo, sha),
+            format!("kiln/{owner}__{repo}/{sha}"),
+            Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native: true }.mirror(hub),
+            vec![sha.to_owned()],
+        ),
+        None => (tarball_path(hub, owner, repo, sha), format!("gh/{owner}__{repo}/{sha}"), mirror(hub, owner, repo), vec![sha.to_owned()]),
     };
-    if !path.exists() {
-        let d = mirror_dir.to_string_lossy().to_string();
-        let mut git = vec!["-C", &d, "archive", "--format=tar.gz"];
-        git.extend(args.iter().map(String::as_str));
-        let out = gitops::run_git(hub, &git, GIT_TIMEOUT).await.map_err(|e| (StatusCode::NOT_FOUND, format!("action not mirrored: {e:#}")))?;
-        let p = path.clone();
-        crate::rt::blocking(move || -> std::io::Result<()> {
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let tmp = p.with_extension("partial");
-            std::fs::write(&tmp, out)?;
-            std::fs::rename(tmp, p)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    let rx = crate::rt::file_source(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let obj = match stored_tarball(hub, &key).await.map_err(internal)? {
+        Some(o) => o,
+        // One kept before the store held them moves in; else git makes it.
+        None if path.is_file() => {
+            let o = keep_tarball(hub, &key, &path).await.map_err(internal)?;
+            let _ = std::fs::remove_file(&path);
+            o
+        }
+        None => {
+            let d = mirror_dir.to_string_lossy().to_string();
+            let mut git = vec!["-C", &d, "archive", "--format=tar.gz"];
+            git.extend(args.iter().map(String::as_str));
+            let out = gitops::run_git(hub, &git, GIT_TIMEOUT).await.map_err(|e| (StatusCode::NOT_FOUND, format!("action not mirrored: {e:#}")))?;
+            let staging = super::services::cas::staging(hub);
+            let tmp = staging.join(format!("action-{}.tar.gz", crate::util::new_id()));
+            let t = tmp.clone();
+            crate::rt::blocking(move || -> std::io::Result<()> {
+                std::fs::create_dir_all(&staging)?;
+                std::fs::write(&t, out)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let kept = keep_tarball(hub, &key, &tmp).await;
+            let _ = std::fs::remove_file(&tmp);
+            kept.map_err(internal)?
+        }
+    };
+    let rx = super::services::cas::read(hub, &obj, 0, obj.size);
     Ok(srv::response(StatusCode::OK, "application/gzip", srv::channel_body(rx)))
 }
 

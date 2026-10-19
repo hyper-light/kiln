@@ -168,13 +168,14 @@ async fn queue_event(hub: &Hub, ids: &[String], action: &str, reason: Option<&st
 
 /// Takes an entry out of the queue, saying why (`code`: GitHub's reason, for `dequeued`); its
 /// diffs go back to their review state.
-async fn eject(hub: &Hub, e: &Entry, reason: &str, code: &str) -> anyhow::Result<()> {
+async fn eject(hub: &Arc<Hub>, e: &Entry, reason: &str, code: &str) -> anyhow::Result<()> {
     let (id, why) = (e.id.clone(), reason.to_owned());
     hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()]).map(|_| ())?)).await?;
     set_diff_state(hub, &e.diffs, State::Accepted).await?;
     hub.store.audit("kiln".into(), "queue.eject".into(), format!("{}: {reason}", e.id)).await;
     tell(hub, e, "ejected", Some(reason)).await;
     queue_event(hub, &e.diffs, "dequeued", Some(code), "kiln").await;
+    crate::rt::spawn(super::notify::land_ejected(Arc::clone(hub), e.diffs.clone(), reason.to_owned()));
     tracing::info!(entry = %e.id, %reason, "ejected from the land queue");
     Ok(())
 }
@@ -550,15 +551,27 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
     }
 }
 
-/// The candidate's `land` and `merge_group` events.
-fn candidate_events(repo: &Repo, trunk: &str, base: &str, tip: &str, batch: &str, names: &[String]) -> (Event, Event) {
+/// A commit as payloads describe it: its tree, message, and who and when.
+async fn commit_of(hub: &Hub, path: &str, sha: &str) -> kiln_ci::trigger::context::Commit {
+    use kiln_ci::trigger::context::{Commit, Person};
+    let o = gitops::run_git(hub, &["-C", path, "show", "-s", "--format=%T%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%B", sha], LS_REMOTE_TIMEOUT).await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&o).into_owned();
+    let f: Vec<&str> = text.splitn(7, '\0').collect();
+    let get = |i: usize| f.get(i).copied().unwrap_or_default().trim_end_matches('\n').to_owned();
+    let person = |name: String, email: String| Person { name, email, username: None };
+    Commit { id: sha.to_owned(), tree_id: get(0), message: get(6), timestamp: get(3), author: person(get(1), get(2)), committer: person(get(4), get(5)) }
+}
+
+/// The candidate's `land` and `merge_group` events: GitHub's payload, with kiln's own part
+/// (`kiln.land`).
+fn candidate_events(ctx: &kiln_ci::trigger::context::Repo, repo: &Repo, trunk: &str, base: &str, tip: &kiln_ci::trigger::context::Commit, batch: &str, names: &[String]) -> (Event, Event) {
     let head_ref = format!("refs/kiln/land/{trunk}/{batch}");
-    let payload = json!({
-        "action": "checks_requested",
-        "merge_group": { "head_sha": tip, "head_ref": head_ref, "base_sha": base, "base_ref": format!("refs/heads/{trunk}"), "head_commit": { "id": tip } },
-        "repository": { "full_name": repo.name, "name": repo.name.rsplit('/').next().unwrap_or(&repo.name), "default_branch": trunk },
-        "kiln": { "land": { "trunk": trunk, "batch": batch, "diffs": names } },
-    });
+    let kiln = kiln_ci::trigger::context::Person { name: "kiln".into(), email: String::new(), username: Some("kiln[bot]".into()) };
+    let mut payload = kiln_ci::trigger::context::merge_group(ctx, trunk, base, tip, &head_ref, &kiln);
+    if let Some(p) = payload.as_object_mut() {
+        p.insert("kiln".into(), json!({ "land": { "trunk": trunk, "batch": batch, "diffs": names } }));
+    }
+    let tip = tip.id.as_str();
     let mg = Event { name: "merge_group".into(), action: "checks_requested".into(), repo: repo.name.clone(), git_ref: head_ref.clone(), sha: tip.to_owned(), base_ref: Some(trunk.to_owned()), actor: "kiln".into(), trusted: true, source: Source::Native, payload, ..Event::default() };
     let landing = Event { name: "land".into(), action: String::new(), ..mg.clone() };
     (mg, landing)
@@ -718,7 +731,9 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
             }
         }
     }
-    let events = candidate_events(repo, trunk, &base, &tip, &batch, &names);
+    let ctx = super::events::facts(hub, repo).await.repo;
+    let head = commit_of(hub, &path, &tip).await;
+    let events = candidate_events(&ctx, repo, trunk, &base, &head, &batch, &names);
     let started = start_checks(hub, repo, &events).await.unwrap_or_else(|e| {
         tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the candidate's workflows didn't start");
         Vec::new()
