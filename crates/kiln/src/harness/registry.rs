@@ -200,6 +200,24 @@ const UPLOADS_MAX: usize = 512 << 20;
 /// Pieces a file is sent to a machine in (lane frames are bounded).
 const FILE_CHUNK: usize = 512 * 1024;
 
+/// Restoring the conversation store from a mirror's copy of it (`docs/conversations.md`,
+/// "Mirrors"): `GET /api/conversations/restore`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Restore {
+    Idle,
+    /// `from` was asked for its copy.
+    Asked { from: String, at: i64 },
+    /// `from` is sending its copy `store`.
+    Copying { from: String, store: String, at: i64 },
+    /// Done: `sessions` came back.
+    Done { from: String, sessions: usize, at: i64 },
+    Failed { from: String, error: String, at: i64 },
+}
+
+/// A mirror asked for its copy that hasn't begun sending it after this long isn't answering.
+const RESTORE_ANSWER_MS: i64 = 120_000;
+
 pub struct Registry {
     mirrors: Mutex<HashMap<String, Mirror>>,
     uploads: Mutex<HashMap<String, Upload>>,
@@ -234,6 +252,11 @@ pub struct Registry {
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
     /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
     epochs: Mutex<HashMap<String, u64>>,
+    /// Restoring the conversation store from a mirror's copy of it.
+    restore: Mutex<Restore>,
+    /// The mirrors to ask for their copy as they connect: the store was found empty at start
+    /// while the server had mirrors (it was lost, the rest wasn't).
+    restore_auto: Mutex<Vec<String>>,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -289,6 +312,13 @@ impl Registry {
             }
             None => (None, None),
         };
+        let restore_auto = match (&copies, &convo) {
+            (Some(m), Some(st)) if st.is_empty().unwrap_or(false) => m.chosen_machines(),
+            _ => Vec::new(),
+        };
+        if !restore_auto.is_empty() {
+            tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
+        }
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
@@ -308,6 +338,97 @@ impl Registry {
             epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
+            restore: Mutex::new(Restore::Idle),
+            restore_auto: Mutex::new(restore_auto),
+        }
+    }
+
+    /// Where restoring the conversation store from a mirror's copy stands.
+    pub fn restore_view(&self) -> Restore {
+        let mut r = self.restore.lock();
+        if let Restore::Asked { from, at } = &*r
+            && crate::util::now_ms() - at > RESTORE_ANSWER_MS
+        {
+            *r = Restore::Failed { from: from.clone(), error: "no answer: its kiln may be too old to send its copy back".into(), at: crate::util::now_ms() };
+        }
+        r.clone()
+    }
+
+    /// Ask `machine`, a mirror, for its copy of the conversation store, to restore this one from:
+    /// what the copy brings fills in what the store lacks (`docs/conversations.md`, "Mirrors").
+    pub fn restore_from(&self, hub: &Arc<Hub>, machine: &str) -> anyhow::Result<()> {
+        let st = self.convo.as_ref().ok_or_else(|| anyhow::anyhow!("the conversation store is off"))?;
+        anyhow::ensure!(self.feed.is_some(), "this server takes no conversation feeds");
+        let peer = hub.instances.lock().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{machine} isn't connected, or keeps no conversation store"))?;
+        if matches!(self.restore_view(), Restore::Asked { .. } | Restore::Copying { .. }) {
+            anyhow::bail!("a restore is already under way");
+        }
+        *self.restore.lock() = Restore::Asked { from: machine.to_owned(), at: crate::util::now_ms() };
+        self.restore_auto.lock().clear();
+        tracing::info!(%machine, "asked a mirror for its copy of the conversation store, to restore this one from");
+        let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Restore { store: st.id().to_owned() });
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json, data: Vec::new() }) {
+                h.net.send(peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Mirror `machine` begins sending back its copy `store`: whether it was asked for.
+    pub fn restore_accepts(&self, machine: &str, store: &str) -> bool {
+        let mut r = self.restore.lock();
+        match &*r {
+            Restore::Asked { from, .. } if from == machine => {
+                *r = Restore::Copying { from: machine.to_owned(), store: store.to_owned(), at: crate::util::now_ms() };
+                true
+            }
+            // Said again (it asks again after a silence).
+            Restore::Copying { from, store: s, .. } => from == machine && s == store,
+            _ => false,
+        }
+    }
+
+    /// Mirror `machine` has sent back its copy `store` whole (an empty `store`: it has none):
+    /// the sessions it brought back are listed, away, on the machines they ran on.
+    pub fn restore_done(&self, hub: &Arc<Hub>, machine: &str, store: &str) {
+        let state = self.restore.lock().clone();
+        match state {
+            Restore::Asked { from, .. } if from == machine && store.is_empty() => {
+                *self.restore.lock() = Restore::Failed { from, error: format!("{machine} keeps no copy of the conversation store"), at: crate::util::now_ms() };
+            }
+            Restore::Copying { from, store: s, .. } if from == machine && s == store => {
+                let (h, st) = (Arc::clone(hub), self.convo.clone());
+                crate::rt::spawn(async move {
+                    let ended = match st {
+                        Some(st) => crate::rt::blocking(move || st.end_copy()).await.and_then(|r| r),
+                        None => Err(anyhow::anyhow!("the conversation store is off")),
+                    };
+                    let at = crate::util::now_ms();
+                    match ended {
+                        Ok(sessions) => {
+                            tracing::info!(machine = %from, sessions, "the conversation store was restored from a mirror's copy");
+                            Self::list_away(&h).await;
+                            *h.harness.restore.lock() = Restore::Done { from, sessions, at };
+                        }
+                        Err(e) => *h.harness.restore.lock() = Restore::Failed { from, error: format!("{e:#}"), at },
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Runner `machine` keeping a store connected: asked for its copy when the store was found
+    /// empty at start and it is one of the server's mirrors.
+    pub fn restore_due(&self, hub: &Arc<Hub>, machine: &str) {
+        let due = self.restore_auto.lock().iter().any(|m| m == machine);
+        if due
+            && matches!(self.restore_view(), Restore::Idle)
+            && let Err(e) = self.restore_from(hub, machine)
+        {
+            tracing::warn!(%machine, error = %format!("{e:#}"), "couldn't ask a mirror for its copy of the conversation store");
         }
     }
 
@@ -442,27 +563,32 @@ impl Registry {
         }
     }
 
+    /// Lists the sessions of machines that are away, from the store (the last month's): after a
+    /// start, and after a restore from a mirror's copy.
+    pub async fn list_away(hub: &Arc<Hub>) {
+        let Some(st) = hub.harness.convo.clone() else { return };
+        const AWAY_DAYS: i64 = 30;
+        const AWAY_EVENTS: usize = 200;
+        let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
+        let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+            let mut out = Vec::new();
+            for u in st.unended(since)? {
+                let events = st.events(&u.id, None, AWAY_EVENTS)?;
+                out.push((u, events));
+            }
+            Ok(out)
+        })
+        .await;
+        match read {
+            Ok(Ok(away)) => hub.harness.restore_away(hub, away),
+            Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
+        }
+    }
+
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
         static RESTORED: std::sync::Once = std::sync::Once::new();
-        // Sessions of machines that are away: listed from the store (the last month's).
-        if let Some(st) = hub.harness.convo.clone() {
-            const AWAY_DAYS: i64 = 30;
-            const AWAY_EVENTS: usize = 200;
-            let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
-            let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
-                let mut out = Vec::new();
-                for u in st.unended(since)? {
-                    let events = st.events(&u.id, None, AWAY_EVENTS)?;
-                    out.push((u, events));
-                }
-                Ok(out)
-            })
-            .await;
-            match read {
-                Ok(Ok(away)) => hub.harness.restore_away(&hub, away),
-                Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
-            }
-        }
+        // Sessions of machines that are away: listed from the store.
+        Self::list_away(&hub).await;
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
@@ -950,6 +1076,7 @@ impl Registry {
                         last_turn: None,
                         keep_off: false,
                         move_on_limit: false,
+                        move_plan: Default::default(),
                         pause_at: None,
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),

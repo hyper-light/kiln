@@ -318,6 +318,19 @@ export interface State {
   manual_resume?: boolean;
   /** At a limit it goes on on another machine whose harness is signed in to an account with room. */
   move_on_limit?: boolean;
+  /** Where it goes on then, as a person chose (sent by runners that take one, empty or not). */
+  move_plan?: MovePlan;
+}
+
+/**
+ * Where an agent goes on at a usage limit (`State.move_plan`): a machine (`agent:<name>`), and a
+ * harness and model there. What isn't said kiln picks: whichever has room, its own harness or one
+ * its conversation can be carried into.
+ */
+export interface MovePlan {
+  to?: string;
+  kind?: string;
+  model?: string;
 }
 
 /** Why a session waits for a usage limit, and until when (`State.pause`). */
@@ -577,6 +590,8 @@ export interface AgentInfo {
   keep_off?: boolean;
   /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
   move_on_limit?: boolean;
+  /** Where it goes on then (as `State.move_plan`). */
+  move_plan?: MovePlan;
   /** Where it pauses as its limits fill (as `State.pause_at`). */
   pause_at?: number;
   cost_usd: number;
@@ -705,8 +720,8 @@ export type Command =
   | { type: "auto_resume"; on: boolean }
   /** Pause once a limit is this full (null: only when one is reached). */
   | { type: "pause_at"; percent: number | null }
-  /** Whether at a limit it goes on on another machine with room. */
-  | { type: "move_on_limit"; on: boolean };
+  /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
+  | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
 export type Update =
   | { t: "open"; info: AgentInfo }
@@ -785,7 +800,8 @@ export const harnessApi = {
   children: (id: string) => call<{ children: AgentChild[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/children`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
-  move: (id: string, to: string, now = false) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now }),
+  move: (id: string, to: string, now = false, kind?: string, model?: string) =>
+    call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),

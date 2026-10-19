@@ -47,6 +47,8 @@ pub enum Kind {
     Pat,
     Agent,
     Job,
+    /// Someone from a peered cluster, by its grant (`crate::peers`).
+    Peer,
 }
 
 /// A request's caller.
@@ -78,6 +80,26 @@ impl Caller {
     /// A caller with these rights, for tests and for checks made on someone's behalf.
     pub fn with(kind: Kind, name: &str, rights: Option<Rights>, limit: Option<Rights>) -> Caller {
         Caller { kind, name: name.to_owned(), user: None, token: None, agent: None, rights, limit }
+    }
+
+    /// Someone from a peered cluster, with `role` on this whole server (`crate::peers::caller`).
+    pub fn peer(name: &str, role: &str) -> Caller {
+        let rights = Rights { grants: vec![Grant { what: role.to_owned(), scope: Scope::Server, deny: false }], custom: HashMap::new() };
+        Caller { kind: Kind::Peer, name: name.to_owned(), user: None, token: None, rights: Some(rights), limit: None }
+    }
+
+    /// The highest built-in role it holds on the whole server (the owner: admin), which is the
+    /// most it may carry into a peered cluster; `None`: none on the whole server.
+    pub fn server_role(&self) -> Option<&'static str> {
+        let best = |r: &Rights| crate::peers::codes::ROLES.iter().rev().copied().find(|role| r.grants.iter().any(|g| !g.deny && g.what == *role && g.scope == Scope::Server));
+        let mine = match &self.rights {
+            Some(r) => best(r)?,
+            None => "admin",
+        };
+        match &self.limit {
+            Some(l) => crate::peers::codes::lower(mine, best(l)?),
+            None => Some(mine),
+        }
     }
 
     /// Whether it may do everything: the owner, or an owner's token without a grant of its own.
@@ -123,6 +145,11 @@ impl Caller {
 /// The caller of a request the owner didn't make: a token, or a user's session. `None`: nobody
 /// kiln knows (or a token that is revoked or expired).
 pub async fn caller(hub: &Hub, bearer: Option<&str>, session: Option<&str>) -> Option<Caller> {
+    // Someone a peered cluster forwards: its grant comes as the session (or a bearer token).
+    let peer = crate::peers::codes::GRANT_PREFIX;
+    if let Some(g) = bearer.map(str::trim).filter(|t| t.starts_with(peer)).or_else(|| session.filter(|s| s.starts_with(peer))) {
+        return crate::peers::caller(hub, g);
+    }
     if let Some(t) = bearer.map(str::trim) {
         if t.starts_with(PAT_PREFIX) || t.starts_with(AGENT_PREFIX) {
             return token(hub, t).await;

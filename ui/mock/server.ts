@@ -21,6 +21,8 @@ import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, 
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
 import { handlePages } from "./pages.ts";
+import { handleSettings } from "./settings.ts";
+import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import {
@@ -1255,6 +1257,7 @@ const server = http.createServer(async (req, res) => {
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
+    if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -1577,6 +1580,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
+    if (await handleSettings(req, res, url, { json, err, body })) return;
     if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
 
     return err(res, 404, `no route for ${m} ${p}`);

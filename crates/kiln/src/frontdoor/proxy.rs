@@ -92,6 +92,21 @@ pub struct Shared {
     pub open: AtomicUsize,
     /// The upstream speaks HTTP/2 (last asked): browsers are offered it.
     pub h2: AtomicBool,
+    /// The clusters this one is peered with: a connection for one's address (`peer-<slug>.…`)
+    /// is forwarded from here, not passed to the upstream.
+    pub peers: RwLock<Option<Arc<crate::peers::forward::Forwarder>>>,
+}
+
+/// Serves one peered cluster's address on a front-door connection.
+struct PeerDoor {
+    forwarder: Arc<crate::peers::forward::Forwarder>,
+    slug: String,
+}
+
+impl srv::Handler for PeerDoor {
+    async fn handle(self: Arc<Self>, req: Request) -> Response {
+        self.forwarder.serve(&self.slug, req, true).await
+    }
 }
 
 /// A running listener: it stops, with its connections, when dropped.
@@ -245,6 +260,7 @@ pub async fn speaks_h2(upstream: &Upstream) -> bool {
 
 /// One connection: the TLS handshake, the upstream connection, then the pipe.
 async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result<()> {
+    let remote = tcp.peer_addr().ok();
     let tls = shared.tls.read().clone().context("no certificate yet")?;
     let upstream = shared.upstream.read().clone().context("no upstream")?;
     let offer: &[&[u8]] = if shared.h2.load(Ordering::Relaxed) { &[H2, HTTP11] } else { &[HTTP11] };
@@ -255,6 +271,20 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     // The browser's protocol passes through as it is: HTTP/2 needs an upstream that speaks it.
     let h2 = client.alpn_protocol() == Some(H2);
     shared.served.fetch_add(1, Ordering::Relaxed);
+    // A peered cluster's address: forwarded from this machine, request by request.
+    let peer = client.server_name().map(str::to_ascii_lowercase).and_then(|sni| {
+        let f = shared.peers.read().clone()?;
+        let slug = f.slug_of_host(&sni)?.to_owned();
+        Some(Arc::new(PeerDoor { forwarder: f, slug }))
+    });
+    if let Some(door) = peer {
+        if h2 {
+            srv::serve_h2(client, door, remote, true).await;
+        } else {
+            srv::serve_connection_with(client, door, remote, true).await;
+        }
+        return Ok(());
+    }
     let up = crate::rt::timeout(CONNECT, crate::http::io::connect(&upstream.host, upstream.port))
         .await
         .with_context(|| format!("{} did not answer", upstream.url))??;
@@ -563,7 +593,7 @@ mod tests {
             *r.primary.write() = "kiln.test".into();
             r.https_port.store(443, Ordering::Relaxed);
             *r.ca_der.write() = pki.ca_der.clone();
-            let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+            let port = crate::frontdoor::test_port()?;
             let _l = listen_redirect(port, &r)?;
             let client = crate::http::client::Client::public()?;
             // By address (127.0.0.1) or by a name (localhost, not one of the front door's).
@@ -692,7 +722,7 @@ mod tests {
         crate::rt::block_on(async {
             assert!(speaks_h2(&Upstream::parse(&format!("http://{}", upstream(true)?), &[])?).await);
             assert!(!speaks_h2(&Upstream::parse(&format!("http://{}", upstream(false)?), &[])?).await);
-            let closed = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?;
+            let closed = SocketAddr::from((Ipv4Addr::LOCALHOST, crate::frontdoor::test_port()?));
             assert!(!speaks_h2(&Upstream::parse(&format!("http://{closed}"), &[])?).await);
             Ok(())
         })
@@ -713,7 +743,7 @@ mod tests {
                 let shared = Arc::new(Shared::default());
                 *shared.tls.write() = Some(ServerTls::from_pem(&cert, &key)?);
                 *shared.upstream.write() = Some(Upstream::parse(&format!("http://{}", upstream(h2_upstream)?), &[])?);
-                let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+                let port = crate::frontdoor::test_port()?;
                 let _l = listen_https(port, &shared)?;
                 // Asked at once.
                 let until = Instant::now() + Duration::from_secs(5);

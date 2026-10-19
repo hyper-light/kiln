@@ -1,9 +1,10 @@
-//! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]), CI's
-//! ([`crate::ci::ops`]) and kiln's own: agents' ([`crate::harness::ops`]), plans'
-//! ([`crate::plans::ops`]) and goal stacks' ([`crate::goals::ops`]). Each has its name, summary,
-//! input schema and whether it changes anything. The MCP tools and code mode's `kiln.*` are this
-//! list. Each operation is checked against the route table as its HTTP route is, so a caller may
-//! do through them exactly what it may do over HTTP.
+//! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]), releases by
+//! API ([`crate::deploy::ops`]), CI's ([`crate::ci::ops`]) and kiln's own: agents'
+//! ([`crate::harness::ops`]), plans' ([`crate::plans::ops`]) and goal stacks'
+//! ([`crate::goals::ops`]). Each has its name, summary, input schema and whether it changes
+//! anything. The MCP tools and code mode's `kiln.*` are this list. Each operation is checked
+//! against the route table as its HTTP route is, so a caller may do through them exactly what it
+//! may do over HTTP.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -78,11 +79,12 @@ pub fn all(hub: &Hub) -> Vec<Info> {
     listed(hub.cfg.cd.enabled)
 }
 
-/// CI's operations, deployments' with `cd`, and kiln's own.
+/// CI's operations, deployments' and releases' with `cd`, and kiln's own.
 pub fn listed(cd: bool) -> Vec<Info> {
     let mut out: Vec<Info> = Vec::new();
     if cd {
         out.extend(crate::cd::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
+        out.extend(crate::deploy::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     }
     out.extend(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
@@ -94,6 +96,9 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = if input.is_null() { json!({}) } else { input };
     if name.starts_with("ci.") {
         return crate::ci::ops::call(cx, name, input).await;
+    }
+    if name.starts_with("deploy.") {
+        return crate::deploy::ops::call(cx, name, input).await;
     }
     if let Some(op) = own().iter().find(|o| o.name == name) {
         let (method, segs) = (op.route)(&input)?;

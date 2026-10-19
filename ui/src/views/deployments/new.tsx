@@ -288,7 +288,7 @@ function Builder() {
         {provider && !provider.built && (
           <p className="cd-new-note">
             {provider.title} is in kiln's plan and not built yet: kiln deploys to it once it is. Its accounts can be added in{" "}
-            <Link to="/settings">Settings → Deployments</Link> now.
+            <Link to="/settings#deployments.accounts">Settings → Deployments</Link> now.
           </p>
         )}
         {provider?.built && (
@@ -302,7 +302,7 @@ function Builder() {
               />
             ) : (
               <p className="cd-new-note">
-                No {provider.integration_title ?? provider.integration} account yet. <Link to="/settings">Add one in Settings → Deployments</Link>, then come back.
+                No {provider.integration_title ?? provider.integration} account yet. <Link to="/settings#deployments.accounts">Add one in Settings → Deployments</Link>, then come back.
               </p>
             )}
             {provider.place.map((k) => (

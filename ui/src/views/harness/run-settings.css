@@ -12,16 +12,21 @@
   max-width: 100%;
 }
 .rs-top {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16ch;
   align-items: center;
-  min-width: 0;
-  max-width: 100%;
+  column-gap: 8px;
+  width: 100%;
+  max-width: 440px;
+  min-height: 28px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
 }
-.rs-line {
+.rs-line,
+.rs-extra {
   display: flex;
   align-items: center;
   min-width: 0;
-  max-width: 100%;
   height: 28px;
   margin: 0;
   color: #c9cbd1;
@@ -32,10 +37,34 @@
   text-transform: uppercase;
   white-space: nowrap;
 }
+/* Width depends only on the viewport, never the selected names or whether effort is available. */
+.rs-values {
+  display: grid;
+  grid-template-columns: 8ch 14px minmax(0, 1fr) 14px 8ch;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+}
+.rs-extra {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr);
+  gap: 8px;
+}
+.rs-divider,
 .rs-sep {
-  flex: none;
   color: #6d7078;
-  white-space: pre;
+  text-align: center;
+}
+.rs-value-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Small phones reserve a second line for usage. Name changes never trigger wrapping. */
+@container (max-width: 340px) {
+  .rs-top { grid-template-columns: minmax(0, 1fr); grid-template-rows: 28px 28px; }
+  .rs-extra { width: 16ch; grid-template-columns: minmax(0, 1fr); }
+  .rs-divider { display: none; }
 }
 .rs-v {
   position: relative;
@@ -50,6 +79,7 @@
   letter-spacing: inherit;
   text-overflow: ellipsis;
   text-transform: inherit;
+  text-align: left;
   white-space: nowrap;
 }
 button.rs-v {
@@ -393,26 +423,25 @@ button.rs-v:focus-visible {
   max-width: 100%;
 }
 
-/* "· UNDO" at the end of the line: the line always has room for it. */
+/* Undo uses the clock row above; appearing or disappearing cannot move the selectors. */
 .rs-after {
+  position: absolute;
+  top: -20px;
+  right: 0;
   display: inline-flex;
-  flex: none;
-  align-items: baseline;
+  height: 18px;
+  align-items: center;
   animation: rs-fade 0.12s ease-out;
 }
-.rs-after > .rs-dot {
-  margin-left: 7px;
-  color: #6d7078;
-}
 .rs-undo {
-  padding: 6px 7px;
+  padding: 0 4px;
 }
 .rs-undo:focus-visible {
   outline-offset: -2px;
 }
 .rs-undo::before {
   position: absolute;
-  inset: -4px 0 -8px;
+  inset: -12px 0 0;
   content: "";
 }
 .rs-sr {

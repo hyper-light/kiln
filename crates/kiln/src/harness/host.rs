@@ -54,6 +54,8 @@ pub struct Saved {
     manual_resume: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     move_on_limit: bool,
+    #[serde(default, skip_serializing_if = "super::model::MovePlan::is_empty")]
+    move_plan: super::model::MovePlan,
     /// A turn of its was under way, and hadn't ended, when this runner last saved it: a restart
     /// (an upgrade, the system stopping the runner, a crash) cut it short, and started again it
     /// is told to go on with it.
@@ -90,6 +92,7 @@ fn record(s: &Session) -> Saved {
         pause_at: st.pause_at,
         manual_resume: st.manual_resume,
         move_on_limit: st.move_on_limit,
+        move_plan: st.move_plan.clone(),
         cut: s.turn_open.load(Ordering::Relaxed),
         harness: ran.0,
         ran: ran.1,
@@ -583,6 +586,7 @@ impl Host {
             core.state.pause_at = s.pause_at;
             core.state.manual_resume = s.manual_resume;
             core.state.move_on_limit = s.move_on_limit;
+            core.state.move_plan = s.move_plan;
             // The turn the restart cut short goes on first, in kiln's words, with what it started
             // that still runs.
             if cut {
@@ -829,6 +833,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         last_turn: None,
         keep_off: false,
         move_on_limit: false,
+        move_plan: Default::default(),
         pause_at: None,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),

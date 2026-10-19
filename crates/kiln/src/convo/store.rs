@@ -34,11 +34,11 @@ const SQUEEZE_BATCH: usize = 2000;
 const SQUEEZE_EVERY: Duration = Duration::from_millis(200);
 /// This often, while the writer has nothing else to do, it looks after the file: the records of
 /// sessions that ended long enough ago go, this many lines at a time (as often as compressing
-/// goes); then the file is made compact if that and compressing left enough of it free.
+/// goes). It never makes the file compact by itself ([`Engine::compact`]): copying a store of
+/// several GB holds the writer for minutes and takes more memory than a server may have (on the
+/// first server, it was killed for it over and over).
 const LOOK_EVERY: Duration = Duration::from_secs(3600);
 const PRUNE_BATCH: usize = 2000;
-/// Free pages that make compacting worth it (and a third of the file).
-const COMPACT_MIN_FREE: u64 = 256 << 20;
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -123,6 +123,9 @@ pub struct Took {
     pub applied: usize,
     /// Rows of a session's former writer (a lower epoch than the one it has), left out.
     pub fenced: usize,
+    /// Rows of a copy ([`Engine::take_copy`]) of sessions this store has from elsewhere, or of
+    /// what the copy dropped, left out.
+    pub left: usize,
     /// The batch didn't follow what it had (`rev` says what it has): nothing was taken.
     pub gap: bool,
 }
@@ -157,6 +160,18 @@ pub trait Engine: Send + 'static {
     /// Compress the next `limit` record lines kept before lines were compressed, if any are left:
     /// whether more are.
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool>;
+    /// Take a batch of a mirror's copy of this store, sent back to restore it (it follows number
+    /// `from` of the copy): the sessions it brings that this store has nothing of come back as
+    /// they were, where their rows say they run; a session this store has anything of from
+    /// elsewhere (its machine's own feed) keeps what it has, and takes the session over if it
+    /// comes while the copy is being taken.
+    fn take_copy(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took>;
+    /// A copy has been taken whole: how many sessions it brought back.
+    fn end_copy(&mut self) -> anyhow::Result<usize>;
+    /// Whether the store holds no session at all (made just now, or lost and made again).
+    fn is_empty(&mut self) -> anyhow::Result<bool>;
+    /// The last number the store gave a write.
+    fn top(&mut self) -> u64;
     /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
     /// how many went (0: none are left). Their events stay.
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
@@ -281,6 +296,34 @@ impl Store {
         })
     }
 
+    /// Take a batch of a mirror's copy of this store ([`Engine::take_copy`]). Blocking.
+    pub fn take_copy(&self, peer: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
+        let p = peer.to_owned();
+        let w = self.watchers.clone();
+        self.run(move |e| {
+            let took = e.take_copy(&p, from, &batch)?;
+            if took.applied > 0 {
+                notify(&w);
+            }
+            Ok(took)
+        })
+    }
+
+    /// A copy has been taken whole: how many sessions it brought back. Blocking.
+    pub fn end_copy(&self) -> anyhow::Result<usize> {
+        self.run(|e| e.end_copy())
+    }
+
+    /// Whether the store holds no session at all. Blocking.
+    pub fn is_empty(&self) -> anyhow::Result<bool> {
+        self.run(|e| e.is_empty())
+    }
+
+    /// The last number the store gave a write. Blocking.
+    pub fn top(&self) -> anyhow::Result<u64> {
+        self.run(|e| Ok(e.top()))
+    }
+
     /// Through where this store has `peer`'s feed. Blocking.
     pub fn peer(&self, peer: &str) -> anyhow::Result<u64> {
         let p = peer.to_owned();
@@ -350,8 +393,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
     // Looking after the file while nothing else waits, once compressing is done and then every
-    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go, then the
-    // file is made compact if enough of it is free.
+    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go.
     let (mut looking, mut pruned, mut look_at) = (false, 0usize, Instant::now());
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
@@ -404,17 +446,6 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                                 tracing::info!(lines = pruned, days = keep_closed.map_or(0, |k| k.as_secs() / 86_400), "conversation store: the records of sessions that ended long ago were let go");
                             }
                             (looking, pruned, look_at) = (false, 0, Instant::now() + LOOK_EVERY);
-                            engine = match engine.compact(COMPACT_MIN_FREE) {
-                                Ok((e, Some((before, after)))) => {
-                                    tracing::info!(before, after, "conversation store: its file was made compact");
-                                    e
-                                }
-                                Ok((e, None)) => e,
-                                Err(e) => {
-                                    tracing::error!(error = %format!("{e:#}"), "conversation store: the compact file couldn't be opened; the store stops until kiln starts again, which finishes it");
-                                    return;
-                                }
-                            };
                         }
                         Ok(n) => (looking, pruned) = (true, pruned.saturating_add(n)),
                         Err(e) => {
@@ -453,6 +484,13 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
     let dir = tempfile::tempdir()?;
     let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), None)?;
     Ok((dir, store))
+}
+
+/// A store whose writer has stopped: everything asked of it fails at once, for tests.
+#[cfg(test)]
+pub fn stopped() -> Store {
+    let (tx, _) = mpsc::sync_channel(1);
+    Store { tx, id: "stopped".into(), dropped: Arc::default(), watchers: Arc::default() }
 }
 
 #[cfg(test)]

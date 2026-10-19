@@ -83,6 +83,11 @@ impl Mirrors {
         (Arc::new(Self { store, want, first, file, chosen: Mutex::new(chosen), feeds: Mutex::new(HashMap::new()), out }), rx)
     }
 
+    /// The machines picked to keep a copy (`mirrors.json`).
+    pub fn chosen_machines(&self) -> Vec<String> {
+        self.chosen.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|c| c.machine.clone()).collect()
+    }
+
     /// The store the mirrors keep a copy of: messages about it are theirs.
     pub fn store_id(&self) -> &str {
         self.store.id()

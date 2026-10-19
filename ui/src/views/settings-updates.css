@@ -1,0 +1,344 @@
+/* ------------------------------------------------------------------ */
+/* Settings → Updates: the server, the runners, their logs, binaries.  */
+/* Sizes from the settings scale (components/ui/settings.css).         */
+/* ------------------------------------------------------------------ */
+
+@layer components {
+.upd-sub {
+  margin: 0;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.upd-dim {
+  color: #7f8794;
+}
+/* A binary not built from the commit the server runs. */
+.upd-behind {
+  color: #d8c8b0;
+}
+.upd-note {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin: 10px 0 0;
+  color: #b9c2cf;
+  font-size: var(--st-small);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.upd-note > .dot {
+  transform: translateY(-1px);
+}
+.upd-note[data-tone="queued"] {
+  color: #dde2e8;
+}
+.upd-note[data-tone="timed_out"],
+.upd-note[data-tone="error"] {
+  color: #d8c8b0;
+}
+.st-group-body > .upd-job {
+  margin-top: 10px;
+}
+
+/* ---------------------------- runners ---------------------------- */
+
+.upd-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-bottom: 6px;
+}
+.upd-bulk-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--st-control);
+  margin-right: auto;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  cursor: pointer;
+}
+.upd-policy {
+  flex: 0 1 180px;
+  min-width: 0;
+}
+.upd-runners {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.upd-runner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px 0;
+  border-top: 1px solid rgb(255 255 255 / 4%);
+}
+.upd-runner-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.upd-name {
+  overflow: hidden;
+  color: var(--st-bright);
+  font-size: var(--st-body);
+  font-weight: 450;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upd-meta {
+  color: var(--st-muted);
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+  overflow-wrap: anywhere;
+}
+.upd-state {
+  flex-shrink: 0;
+  color: #9aa3b1;
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+}
+.upd-state[data-tone="succeeded"] {
+  color: #a8c9bc;
+}
+.upd-state[data-tone="queued"] {
+  color: #d2dce8;
+}
+.upd-state[data-tone="running"] {
+  color: #c9bde3;
+}
+.upd-state[data-tone="cancelled"] {
+  color: #7f8794;
+}
+.upd-state[data-tone="failed"] {
+  color: #d1aaad;
+}
+/* Under the name: its build, what it does next, what can be done. */
+.upd-runner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding-left: 42px;
+}
+.upd-runner-build {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin: 0;
+}
+.upd-build {
+  color: #c7d0dc;
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+  overflow-wrap: anywhere;
+}
+.upd-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.upd-ways {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.upd-procs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 8px 12px;
+  list-style: none;
+  border: 1px solid rgb(203 182 154 / 22%);
+  border-radius: 8px;
+  background: rgb(203 182 154 / 3%);
+  color: #c8cad0;
+  font-size: var(--st-small);
+}
+.upd-procs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+}
+.upd-procs .mono {
+  font-size: var(--st-small);
+}
+@media (max-width: 640px) {
+  .upd-runner-body {
+    padding-left: 0;
+  }
+}
+
+/* ---------------------------- an upgrade's log ---------------------------- */
+
+.upd-job {
+  overflow: hidden;
+  min-width: 0;
+  border: 1px solid #262c35;
+  border-radius: 8px;
+  background: #07080a;
+}
+.upd-job[data-state="failed"] {
+  border-color: rgb(209 170 173 / 32%);
+}
+.upd-job-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: var(--st-control);
+  padding: 4px 12px;
+  color: #cdd4de;
+  font-size: var(--st-small);
+  text-align: left;
+}
+.upd-job-head:hover {
+  background: rgb(255 255 255 / 3%);
+}
+.upd-job-head:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 80%);
+  outline-offset: -2px;
+}
+.upd-job-head .mono {
+  font-size: var(--st-small);
+}
+.upd-log {
+  overflow: auto;
+  max-height: 240px;
+  margin: 0;
+  padding: 10px 12px 12px;
+  border-top: 1px solid #1d2229;
+  color: #b7c0cc;
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.upd-err {
+  margin: 0;
+  padding: 0 12px 10px;
+  color: #d1aaad;
+  font-size: var(--st-small);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+/* Under a job kiln stopped waiting for. */
+.upd-job-note {
+  margin: 0;
+  padding: 0 12px 10px;
+}
+.upd-link {
+  color: #d6dbe2;
+  text-decoration: underline;
+  text-decoration-color: rgb(214 219 226 / 40%);
+  text-underline-offset: 2px;
+}
+.upd-link:hover {
+  text-decoration-color: currentColor;
+}
+.upd-link:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 80%);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ---------------------------- confirming ---------------------------- */
+
+.upd-confirm {
+  margin: 10px 0 2px;
+}
+.upd-confirm p {
+  margin: 0;
+}
+.upd-confirm-title {
+  color: var(--color-foreground);
+  font-weight: 500;
+}
+.upd-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  list-style: disc;
+  color: #b9c2cf;
+  font-size: var(--st-small);
+  line-height: 1.6;
+}
+.upd-plan li::marker {
+  color: #6f7682;
+}
+.upd-plan code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 5%);
+  color: #d6dbe2;
+  overflow-wrap: anywhere;
+}
+.upd-plan + p {
+  color: #aab3c1;
+  font-size: var(--st-small);
+  line-height: 1.6;
+}
+
+/* ---------------------------- waits, binaries ---------------------------- */
+
+.upd-waits-acts {
+  margin-top: 10px;
+}
+.upd-err-inline {
+  color: #d1aaad;
+  font-size: var(--st-small);
+  line-height: 1.5;
+}
+.upd-bins-lead {
+  margin: 0 0 10px;
+}
+.upd-build-every {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 12px;
+}
+.upd-build-every .upd-note {
+  flex: 1 1 260px;
+  margin: 0;
+}
+.upd-bin-target {
+  font-family: var(--font-mono);
+  font-size: var(--st-small);
+}
+.upd-bins {
+  margin-bottom: 12px;
+}
+.upd-bins .st-note {
+  margin-top: 2px;
+}
+.upd-upload {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.upd-platform {
+  flex: 0 1 260px;
+  min-width: 0;
+}
+}
