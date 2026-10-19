@@ -110,8 +110,9 @@ impl Kind {
                     (Some((kiln, sock, prefer)), _) => {
                         p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(kiln, sock, *prefer, session));
                     }
+                    // Its own token: kiln knows which agent calls, and whom it acts for.
                     (_, Some(kit)) => {
-                        p.arg("--mcp-config").arg(&kit.claude_mcp_config);
+                        p.arg("--mcp-config").arg(kit.config_for(session));
                     }
                     _ => {}
                 }

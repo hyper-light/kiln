@@ -27,10 +27,63 @@ use crate::hub::Hub;
 /// `--mcp-config` file holding a token of their own) and kiln's skills (as a Claude Code plugin
 /// directory).
 pub struct Kit {
-    /// The MCP config file (0600: it holds the token).
+    /// The MCP config file every agent here could share (0600: it holds the token).
     pub claude_mcp_config: std::path::PathBuf,
     /// The plugin directory with kiln's skills.
     pub plugin_dir: std::path::PathBuf,
+    /// Where this machine reaches the server's MCP endpoint.
+    url: String,
+    /// What its tokens are made with.
+    key: String,
+    /// Where each agent's own config is kept.
+    dir: std::path::PathBuf,
+}
+
+impl Kit {
+    /// Agent session `session`'s own MCP config (0600): a token that is that agent, so kiln knows
+    /// which agent calls (`Caller::agent`) and whom it acts for. The shared one if it can't be
+    /// written.
+    pub fn config_for(&self, session: &str) -> std::path::PathBuf {
+        match self.write_for(session) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%session, error = %format!("{e:#}"), "an agent's own MCP config couldn't be written: it shares the machine's");
+                self.claude_mcp_config.clone()
+            }
+        }
+    }
+
+    fn write_for(&self, session: &str) -> anyhow::Result<std::path::PathBuf> {
+        let safe: String = session.chars().filter(char::is_ascii_alphanumeric).take(64).collect();
+        anyhow::ensure!(!safe.is_empty(), "no session");
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!("{safe}.json"));
+        let body = json!({"mcpServers": {"kiln": {"type": "http", "url": format!("{}/api/mcp", self.url.trim_end_matches('/')),
+            "headers": {"Authorization": format!("Bearer {}", session_token(&self.key, &safe))}}}});
+        write_private(&path, &serde_json::to_vec_pretty(&body)?)?;
+        Ok(path)
+    }
+}
+
+/// `bytes` as `path`, readable by this user alone, whole or not at all.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The label of an agent session's own MCP token.
+const SESSION_LABEL: &str = "session-";
+
+/// Agent session `session`'s own MCP token: calls with it are that agent's.
+pub fn session_token(admin_token: &str, session: &str) -> String {
+    token(admin_token, &format!("{SESSION_LABEL}{session}"))
 }
 
 static KIT: std::sync::OnceLock<Kit> = std::sync::OnceLock::new();
@@ -49,15 +102,8 @@ pub fn init_kit(hub: &Hub, local_url: &str) -> anyhow::Result<()> {
     let config = dir.join("kiln-mcp.json");
     let body = json!({"mcpServers": {"kiln": {"type": "http", "url": format!("{}/api/mcp", local_url.trim_end_matches('/')),
         "headers": {"Authorization": format!("Bearer {}", token(&hub.admin_token, "local-agents"))}}}});
-    let tmp = config.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&body)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &config)?;
-    let _ = KIT.set(Kit { claude_mcp_config: config, plugin_dir: plugin });
+    write_private(&config, &serde_json::to_vec_pretty(&body)?)?;
+    let _ = KIT.set(Kit { claude_mcp_config: config, plugin_dir: plugin, url: local_url.to_owned(), key: hub.admin_token.clone(), dir: dir.join("mcp") });
     Ok(())
 }
 
@@ -65,6 +111,34 @@ pub fn init_kit(hub: &Hub, local_url: &str) -> anyhow::Result<()> {
 /// started it.
 pub fn opener_key(id: &str) -> String {
     format!("agents/opener/{id}")
+}
+
+/// The caller agent session `session` is (one kiln runs, on `runner` or the server): it acts for
+/// whoever started it (the owner on a kiln nobody else signs in to), audited as
+/// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
+pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
+    let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
+        Some(o) => o,
+        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
+        None => return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned()),
+    };
+    let short: String = session.chars().take(8).collect();
+    let name = runner.map_or_else(|| format!("agent:{short}"), |r| format!("agent:{short}@{r}"));
+    let Some(mut caller) = crate::authz::gate::agent_for(hub, &name, &opener).await else {
+        return Err("whoever started this agent can't sign in here any more".to_owned());
+    };
+    caller.agent = Some(session.to_owned());
+    Ok(caller)
+}
+
+/// The caller an MCP token of an agent session is (`session_token`), when `actor` is one: that
+/// agent, if kiln still runs it. `None`: another kind of MCP token.
+pub async fn token_caller(hub: &Hub, actor: &str) -> Option<Result<Caller, String>> {
+    let session = actor.strip_prefix("agent:")?.strip_prefix(SESSION_LABEL)?;
+    if hub.harness.info(session).is_none() {
+        return Some(Err(format!("kiln doesn't run agent {} any more: its MCP token ended with it", session.chars().take(8).collect::<String>())));
+    }
+    Some(session_caller(hub, session, None).await)
 }
 
 /// The most an answer to a runner may be (it goes over the runner's control lane).
@@ -84,14 +158,9 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
     if session.is_empty() || !hub.harness.located_on(session, runner) {
         return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
     }
-    let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
-        Some(o) => o,
-        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
-        None => return json!({"error": "kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents"}),
-    };
-    let short: String = session.chars().take(8).collect();
-    let Some(caller) = crate::authz::gate::agent_for(hub, &format!("agent:{short}@{runner}"), &opener).await else {
-        return json!({"error": "whoever started this agent can't sign in here any more"});
+    let caller = match session_caller(hub, session, Some(runner)).await {
+        Ok(c) => c,
+        Err(e) => return json!({"error": e}),
     };
     let answer = match ask.get("op").and_then(Value::as_str) {
         Some("registry") => {
@@ -149,12 +218,15 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 /// The skills extension's identifier (SEP-2640).
 const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
 
-const INSTRUCTIONS: &str = "kiln builds, tests and deploys code. CI is under `kiln.ci`: runs, their legs and logs, \
+const INSTRUCTIONS: &str = "kiln builds, tests and deploys code, and runs coding agents. CI is under `kiln.ci`: runs, their legs and logs, \
 workflows (validate and plan before proposing), reruns, approvals, and failed legs kept to look into (`ci.legs.exec` runs \
 a command in one, `ci.legs.rerun_step` reruns a step there). Deployments (GitOps CD) are under `kiln.cd`: apps, their \
-sync and health, resources and why they differ, diffs, history, syncs, clusters. Prefer code_run: one program can list, \
-filter and act on a whole fleet and return only what matters. code_search shows the operations and their inputs. \
-The skills (kiln-ci-diagnose, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration) say how to use them.";
+sync and health, resources and why they differ, diffs, history, syncs, clusters. Agents are under `kiln.agents`: start \
+agents for parts of the work on any machine (`agents_start`), wait for them (`agents_wait`) and read what they concluded \
+(`agents_result`); what they ask a person stays a person's to answer. Plans and goal stacks are under `kiln.plans` and \
+`kiln.goals`. Prefer code_run: one program can list, filter and act on a whole fleet and return only what matters. \
+code_search shows the operations and their inputs. The skills (kiln-agents, kiln-ci-diagnose, kiln-deploy, kiln-diagnose, \
+kiln-apps, kiln-argocd-migration) say how to use them.";
 
 /// An MCP token for `label` (an agent session, an attachment): `kiln_mcp_<label>_<hmac>`.
 pub fn token(admin_token: &str, label: &str) -> String {

@@ -1179,6 +1179,20 @@ impl Registry {
     pub fn state(&self, id: &str) -> Option<State> {
         self.mirrors.lock().get(id).and_then(|m| serde_json::from_value(m.state.clone()).ok())
     }
+
+    /// A session as lists show it.
+    pub fn info(&self, id: &str) -> Option<Info> {
+        self.mirrors.lock().get(id).map(|m| m.info.clone())
+    }
+
+    /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
+    /// last reported, its last reply on its main thread (an `assistant` event) and its changeset.
+    pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
+        let g = self.mirrors.lock();
+        let m = g.get(id)?;
+        let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
+        Some((m.state.clone(), reply, m.changes.clone()))
+    }
 }
 
 fn default_name(kind: &str) -> String {

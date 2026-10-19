@@ -1,12 +1,13 @@
-//! The goal stack operations (`goals.*`), in kiln's one operation table (`cd::ops`): the MCP tools
-//! agents call (to line up goals for themselves or another agent) and code mode's `kiln.goals.*`.
-//! The console's `/api/harness/sessions/:id/goals` routes call the same functions.
+//! The goal stack operations (`goals.*`), in kiln's one operation table (`crate::ops::own`): the
+//! MCP tools agents call (to line up goals for themselves or another agent) and code mode's
+//! `kiln.goals.*`. Each is one of the console's `/api/harness/sessions/:id/goals` routes, which call
+//! the same functions.
 
-use http::StatusCode;
+use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::{Action, Error, Given};
-use crate::cd::ops::{Cx, Fail, Op, Out};
+use crate::ops::{Cx, Fail, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -42,7 +43,7 @@ async fn add(cx: Cx, v: Value) -> Out {
     }
     let start = v.get("start").and_then(Value::as_bool).unwrap_or(true);
     let s = super::add(&cx.hub, &agent, goals, start).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "goals.add".into(), agent).await;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.add".into(), agent).await;
     json_of(&s)
 }
 
@@ -50,7 +51,7 @@ async fn set(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     let given: Vec<Given> = serde_json::from_value(v.get("goals").cloned().unwrap_or_else(|| json!([]))).map_err(|e| (StatusCode::BAD_REQUEST, format!("`goals`: {e}")))?;
     let s = super::set(&cx.hub, &agent, given).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "goals.set".into(), agent).await;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.set".into(), agent).await;
     json_of(&s)
 }
 
@@ -58,7 +59,7 @@ async fn control(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     let action: Action = serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start, pause, skip or clear".into()))?;
     let s = super::control(&cx.hub, &agent, action).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
     json_of(&s)
 }
 
@@ -71,6 +72,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -88,6 +90,7 @@ pub fn list_ops() -> Vec<Op> {
                     &["agent", "goals"],
                 )
             },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(add(cx, v)),
         },
         Op {
@@ -104,6 +107,7 @@ pub fn list_ops() -> Vec<Op> {
                     &["agent", "goals"],
                 )
             },
+            route: |v| Ok((Method::PUT, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(set(cx, v)),
         },
         Op {
@@ -112,6 +116,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "action": {"type": "string", "enum": ["start", "pause", "skip", "clear"]}}), &["agent", "action"]),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", v.get("action").and_then(Value::as_str).unwrap_or("start")]))),
             run: |cx, v| Box::pin(control(cx, v)),
         },
     ]

@@ -1,9 +1,12 @@
-//! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]) and CI's
-//! ([`crate::ci::ops`]), each with its name, summary, input schema and whether it changes
-//! anything. The MCP tools and code mode's `kiln.*` are this list. Each operation is checked
-//! against the route table as its HTTP route is, so a caller may do through them exactly what it
-//! may do over HTTP.
+//! Every operation, once (docs/ci.md W20-R01): deployments' ([`crate::cd::ops`]), CI's
+//! ([`crate::ci::ops`]) and kiln's own: agents' ([`crate::harness::ops`]), plans'
+//! ([`crate::plans::ops`]) and goal stacks' ([`crate::goals::ops`]). Each has its name, summary,
+//! input schema and whether it changes anything. The MCP tools and code mode's `kiln.*` are this
+//! list. Each operation is checked against the route table as its HTTP route is, so a caller may
+//! do through them exactly what it may do over HTTP.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
@@ -16,6 +19,7 @@ use crate::hub::Hub;
 pub type Fail = (StatusCode, String);
 /// An operation's answer.
 pub type Out = Result<Value, Fail>;
+pub(crate) type Fut = Pin<Box<dyn Future<Output = Out> + Send>>;
 
 /// Who calls.
 #[derive(Clone)]
@@ -34,18 +38,54 @@ pub struct Info {
     pub input: fn() -> Value,
 }
 
-/// Every operation this server has: CI's, and deployments' when they're on.
+/// One of kiln's own operations (agents, plans, goal stacks): what it is, the HTTP route it is
+/// (method and path, for the route table and the audit trail), and what it does.
+pub struct Op {
+    /// Its name, dotted (`agents.start`).
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub input: fn() -> Value,
+    /// Its route, from the input: method and path segments (`["api", "harness", "agents"]`).
+    pub route: fn(&Value) -> Result<(Method, Vec<String>), Fail>,
+    pub run: fn(Cx, Value) -> Fut,
+}
+
+/// A string field of an input, required.
+pub fn text(v: &Value, k: &str) -> Result<String, Fail> {
+    v.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}` is required")))
+}
+
+/// An input's JSON Schema: an object with these properties.
+pub fn schema(props: Value, required: &[&str]) -> Value {
+    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+}
+
+/// A route's path, as segments.
+pub fn path(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// kiln's own operations: agents', plans' and goal stacks', in the order they're listed.
+pub fn own() -> &'static [Op] {
+    static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
+    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).collect())
+}
+
+/// Every operation this server has: CI's, deployments' when they're on, and kiln's own.
 pub fn all(hub: &Hub) -> Vec<Info> {
     listed(hub.cfg.cd.enabled)
 }
 
-/// CI's operations, and deployments' with `cd`.
+/// CI's operations, deployments' with `cd`, and kiln's own.
 pub fn listed(cd: bool) -> Vec<Info> {
     let mut out: Vec<Info> = Vec::new();
     if cd {
         out.extend(crate::cd::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     }
     out.extend(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
+    out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     out
 }
 
@@ -54,6 +94,24 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = if input.is_null() { json!({}) } else { input };
     if name.starts_with("ci.") {
         return crate::ci::ops::call(cx, name, input).await;
+    }
+    if let Some(op) = own().iter().find(|o| o.name == name) {
+        let (method, segs) = (op.route)(&input)?;
+        let path = format!("/{}", segs.join("/"));
+        let run = async {
+            let s: Vec<&str> = segs.iter().map(String::as_str).collect();
+            crate::authz::gate::check(&cx.hub, &cx.caller, &method, &s, &Default::default()).await?;
+            (op.run)(cx.clone(), input).await
+        };
+        if op.read_only {
+            return run.await;
+        }
+        // A change is audited as its route's would be (docs/ci.md W19-R05): one row.
+        return crate::audit::request(&cx.hub, crate::audit::Req { caller: &cx.caller, method: &method, path: &path, q: &Default::default(), ip: None }, run, |r: &Out| match r {
+            Ok(_) => 200,
+            Err((s, _)) => s.as_u16(),
+        })
+        .await;
     }
     let op = crate::cd::ops::ops().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
     // Deployments' routes: reading needs runs.read, the rest environments.deploy.
@@ -73,4 +131,38 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
         Err((s, _)) => s.as_u16(),
     })
     .await
+}
+
+/// Runs one of kiln's own operations for its HTTP route, which the route table has let through
+/// and the audit trail records already.
+pub async fn run_own(cx: Cx, name: &str, input: Value) -> Out {
+    let op = own().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
+    (op.run)(cx, input).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each of kiln's own operations is a route the table names (none falls through to the
+    /// administrators' `settings.manage`), and reads exactly when its route is a GET.
+    #[test]
+    fn kiln_s_own_operations_are_routes_of_the_table() {
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"]});
+        assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
+        for op in own() {
+            let route = (op.route)(&probe);
+            assert!(route.is_ok(), "{}", op.name);
+            let Ok((method, segs)) = route else { continue };
+            let s: Vec<&str> = segs.iter().map(String::as_str).collect();
+            let rule = crate::authz::rule(&method, &s);
+            assert_ne!(rule.pattern, crate::authz::UNNAMED.pattern, "{} ({method} /{}) has a rule of its own", op.name, s.join("/"));
+            assert_eq!(rule.capability, "agents.run", "{}: agents, plans and goals need agents.run", op.name);
+            assert_eq!(op.read_only, method == Method::GET, "{}: read-only exactly when its route reads", op.name);
+            assert!((op.input)().get("type").is_some(), "{}", op.name);
+        }
+        // Listed whether deployments are on or not.
+        assert!(listed(false).iter().any(|o| o.name == "agents.wait"));
+        assert!(listed(false).iter().any(|o| o.name == "plans.create"));
+    }
 }

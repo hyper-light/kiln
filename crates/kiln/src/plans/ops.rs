@@ -1,12 +1,13 @@
-//! The plans operations (`plans.*`), in kiln's one operation table (`cd::ops`): the MCP tools
-//! agents call (`plans_create` to keep the plan they made, `plans_get` to take one up) and code
-//! mode's `kiln.plans.*`. The console's `/api/plans` routes call the same functions.
+//! The plans operations (`plans.*`), in kiln's one operation table (`crate::ops::own`): the MCP
+//! tools agents call (`plans_create` to keep the plan they made, `plans_get` to take one up) and
+//! code mode's `kiln.plans.*`. Each is one of the console's `/api/plans` routes, which call the
+//! same functions.
 
-use http::StatusCode;
+use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::{Error, Mode, New, Patch, Target};
-use crate::cd::ops::{Cx, Fail, Op, Out};
+use crate::ops::{Cx, Fail, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -50,23 +51,23 @@ async fn get(cx: Cx, v: Value) -> Out {
 
 async fn create(cx: Cx, v: Value) -> Out {
     let n: New = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let p = super::create(&cx.hub, n, &cx.actor).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "plan.create".into(), p.title.clone()).await;
+    let p = super::create(&cx.hub, n, &cx.caller.name).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.create".into(), p.title.clone()).await;
     json_of(&p)
 }
 
 async fn update(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let patch: Patch = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let p = super::update(&cx.hub, &id, patch, &cx.actor).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "plan.update".into(), format!("{} (v{})", p.title, p.version)).await;
+    let p = super::update(&cx.hub, &id, patch, &cx.caller.name).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.update".into(), format!("{} (v{})", p.title, p.version)).await;
     json_of(&p)
 }
 
 async fn delete(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     super::delete(&cx.hub, &id).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "plan.delete".into(), id).await;
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.delete".into(), id).await;
     Ok(json!({"deleted": true}))
 }
 
@@ -85,8 +86,8 @@ async fn run(cx: Cx, v: Value) -> Out {
         }
         (None, None) => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
     };
-    let ran = super::run(&cx.hub, &id, target, mode, &cx.actor).await.map_err(fail)?;
-    cx.hub.store.audit(cx.actor.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
+    let ran = super::run(&cx.hub, &id, target, mode, &cx.caller.name).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
     json_of(&ran)
 }
 
@@ -99,6 +100,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: || schema(json!({"q": {"type": "string"}, "tag": {"type": "string"}}), &[]),
+            route: |_| Ok((Method::GET, path(&["api", "plans"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },
         Op {
@@ -107,6 +109,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: || schema(json!({"id": {"type": "string", "description": ID}}), &["id"]),
+            route: |v| Ok((Method::GET, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -126,6 +129,7 @@ pub fn list_ops() -> Vec<Op> {
                     &[],
                 )
             },
+            route: |_| Ok((Method::POST, path(&["api", "plans"]))),
             run: |cx, v| Box::pin(create(cx, v)),
         },
         Op {
@@ -134,6 +138,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, its acceptance criteria and its tests.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": criteria_schema(), "testing": {"type": "array", "description": "Tests: each a scenario and the criteria it passes by.", "items": {"type": "object", "properties": {"scenario": {"type": "string"}, "criteria": criteria_schema()}}}}, "required": ["title"]}}, "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
+            route: |v| Ok((Method::PATCH, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(update(cx, v)),
         },
         Op {
@@ -142,6 +147,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: || schema(json!({"id": {"type": "string", "description": ID}}), &["id"]),
+            route: |v| Ok((Method::GET, path(&["api", "plans", &id_of(v)?, "versions"]))),
             run: |cx, v| Box::pin(versions(cx, v)),
         },
         Op {
@@ -160,6 +166,7 @@ pub fn list_ops() -> Vec<Op> {
                     &["id"],
                 )
             },
+            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "run"]))),
             run: |cx, v| Box::pin(run(cx, v)),
         },
         Op {
@@ -168,6 +175,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: || schema(json!({"id": {"type": "string", "description": ID}}), &["id"]),
+            route: |v| Ok((Method::DELETE, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(delete(cx, v)),
         },
     ]

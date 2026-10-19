@@ -174,11 +174,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             // The owner, by the admin token, its session or an MCP token kiln minted; else a
             // user's session or token, whose operations the route table judges one by one.
             let caller = match crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers())) {
-                Some(actor) => {
-                    let mut c = crate::authz::Caller::owner();
-                    c.name = actor;
-                    Some(c)
-                }
+                // An agent session's own token: that agent, acting for whoever started it.
+                Some(actor) => match crate::mcp::token_caller(&hub, &actor).await {
+                    Some(Ok(c)) => Some(c),
+                    Some(Err(why)) => return Err(err(StatusCode::UNAUTHORIZED, why)),
+                    None => {
+                        let mut c = crate::authz::Caller::owner();
+                        c.name = actor;
+                        Some(c)
+                    }
+                },
                 None => caller_of(&hub, req.headers()).await,
             };
             return match caller {
@@ -463,6 +468,23 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
+        // Agents that run agents (`agents.*`, docs/agents.md): each operation is its route.
+        (&Method::GET, ["api", "harness", "agents"]) => own_op(&hub, &caller, "agents.list", query_value(&q)).await,
+        (&Method::POST, ["api", "harness", "agents"]) => {
+            let body = body_value(req).await?;
+            own_op(&hub, &caller, "agents.start", body).await
+        }
+        (&Method::GET, ["api", "harness", "agents", "wait"]) => own_op(&hub, &caller, "agents.wait", query_value(&q)).await,
+        (&Method::GET, ["api", "harness", "agents", id]) => own_op(&hub, &caller, "agents.get", json!({ "agent": id })).await,
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => own_op(&hub, &caller, &format!("agents.{what}"), json!({ "agent": id })).await,
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop")]) => {
+            let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            own_op(&hub, &caller, &name, body).await
+        }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
         (&Method::POST, ["api", "harness", "sessions"]) => harness_open(&hub, req).await,
@@ -2867,6 +2889,31 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     }
     let b = crate::harness::screen::open(hub, id, o).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::CREATED, &b))
+}
+
+/// One of kiln's own operations (agents, plans, goal stacks) as its HTTP route, which the route
+/// table let through (and the audit trail records): `crate::ops::own`.
+async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
+    let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
+    crate::ops::run_own(cx, name, input).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+}
+
+/// A query as an operation's input: each parameter a string.
+fn query_value(q: &HashMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(q.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
+}
+
+/// A request's JSON body as an operation's input (none: `{}`).
+async fn body_value(req: Request) -> Result<serde_json::Value, ApiError> {
+    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(err(StatusCode::BAD_REQUEST, "the body is a JSON object")),
+        Err(e) => Err(err(StatusCode::BAD_REQUEST, format!("the body isn't JSON: {e}"))),
+    }
 }
 
 #[derive(Deserialize)]
