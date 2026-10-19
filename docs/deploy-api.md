@@ -201,10 +201,12 @@ ships.
 ### 3.5 Secrets per app
 
 An app's secrets for an environment (a database password, an API key) come from kiln's secrets
-service and reach what runs without ever passing through git. Agreed 2026-10-19, as the first
-piece of a larger one: a just-in-time secrets service (AWS Secrets Manager's scale, Vault's
-controls) that will take over the storage and issuing. The code is cut so that cutover swaps one
-backend: the API, `kiln`, the UI, delivery and audit stay as they are.
+service and reach what runs without ever passing through git. The service is part of kiln, in its
+one binary like everything else: no other process, port, store or dependency to run. Agreed
+2026-10-19, as the first piece of a larger one: just-in-time secrets (AWS Secrets Manager's
+scale, Vault's controls), which will take over the storage and issuing, inside kiln too. The code
+is cut so that cutover swaps one backend module: the API, `kiln`, the UI, delivery and audit stay
+as they are.
 
 - **The service** (`crate::secrets`): a scope (today an app in an environment), its secrets by
   name, their versions, who set each and when, and every read of their values. Names are
@@ -221,8 +223,9 @@ backend: the API, `kiln`, the UI, delivery and audit stay as they are.
     (the secret store's, W09), each ciphertext bound to its scope, name and version; `rotate`
     re-seals every value under a new data key. Each read for a delivery is recorded (who, why,
     which versions).
-  - **The JIT secrets service** (later): the same calls over its API; leases come back with
-    `resolve`, and delivery renews them before they expire.
+  - **Just-in-time secrets** (later, `secrets::jit`, a module of kiln's binary like the rest):
+    the same calls; leases (credentials kiln issues for a while, from a database's or a cloud's
+    own) come back with `resolve`, and delivery renews them before they expire.
 - **Who.** People with `secrets.manage` set and delete; anyone who reads deployments lists names
   and versions; values are never read back through the API. Agents list names and versions,
   and never set or delete (the service's one policy check, `Secrets::may`, where Vault-like
@@ -248,11 +251,14 @@ backend: the API, `kiln`, the UI, delivery and audit stay as they are.
   key of it, a volume) is marked with the versions (`kiln.dev/secrets`), so its pods roll when a
   release delivers new ones. kiln-base's `kilnSecrets: true` reads it as env (optional: an app
   without secrets has none).
-- **On Argo CD.** Argo CD renders from git alone, so the Secret can't be added at render: the
-  External Secrets Operator with kiln as its webhook provider (the chart carries an
-  ExternalSecret; the operator fetches values from kiln with a token scoped to that app and
-  environment), or Sealed Secrets (kiln seals each value with the cluster's key and commits the
-  SealedSecret: git holds only ciphertext). Not built yet.
+- **On Argo CD.** Argo CD renders from git alone, so the Secret can't be added at render. kiln
+  applies it itself, as nothing else needs installing: where kiln reaches the cluster (a KilnCD
+  cluster of the same server), each release writes `<app>-kiln` into the app's namespace before
+  its commit reaches Argo CD, labelled so Argo CD neither tracks nor prunes it, and the pods read
+  it as on KilnCD. Where kiln can't reach the cluster, the External Secrets Operator with kiln as
+  its webhook provider (an ExternalSecret in the chart, a token scoped to that app and
+  environment) or Sealed Secrets (ciphertext in git) are the fallbacks, each a component to
+  install. Not built yet.
 - **A change is a release.** Setting or deleting a secret asks for a secrets release (a config
   release that keeps the version and values: "secrets: DB_PASSWORD v4") where something runs on
   KilnCD, so the environment's gates, history and audit apply. A release still waiting takes the

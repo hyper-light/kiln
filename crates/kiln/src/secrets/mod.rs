@@ -4,8 +4,8 @@
 //! Callers (`/api/deploy`, `kiln`, delivery through KilnCD) talk to [`Secrets`]: the policy is
 //! here, the same whatever keeps the values (names, sizes, limits, who may, agents never setting
 //! or reading values, the audit). What keeps them is a [`Backend`]: [`kiln`] today (versions
-//! sealed in kiln's own store); a just-in-time secrets service later, swapped in here without the
-//! callers changing.
+//! sealed in kiln's own store); just-in-time secrets later, swapped in here without the callers
+//! changing. Every backend is a module of kiln's one binary: no other process or store.
 
 pub mod kiln;
 
@@ -243,8 +243,8 @@ pub struct Secrets {
     backend: Arc<dyn Backend>,
 }
 
-/// The service over the backend this server keeps secrets in: kiln's own, until the JIT secrets
-/// service (its client, made once, would be what this picks up).
+/// The service over the backend this server keeps secrets in: kiln's own, until just-in-time
+/// secrets (another module of this binary, picked here).
 pub fn of(hub: &Arc<Hub>) -> Secrets {
     Secrets { hub: Arc::clone(hub), backend: Arc::new(kiln::KilnBackend::new(Arc::clone(hub))) }
 }
