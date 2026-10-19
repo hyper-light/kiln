@@ -19,7 +19,7 @@ import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
 import { useRes } from "@/lib/data";
-import { DEPLOY_EVENTS, environmentsRes, ReleaseState } from "./index";
+import { DEPLOY_EVENTS, environmentsRes, ReleaseState, templatesRes } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
@@ -350,6 +350,108 @@ function Settings({ a, registered }: { a: App; registered: string[] }) {
   );
 }
 
+/** How it deploys: its template, and its package (a Helm chart, or a path in git) with the values
+ * each release sets. A change reaches each environment with its next release there. */
+function Deploys({ a }: { a: App }) {
+  const templates = useRes(templatesRes).data;
+  const p = a.package;
+  const [template, setTemplate] = React.useState(a.template ?? "");
+  const [kind, setKind] = React.useState<"helm" | "git">(p.kind === "git" ? "git" : "helm");
+  const [repo, setRepo] = React.useState(p.kind === "platform" ? "" : p.repo);
+  const [chart, setChart] = React.useState(p.kind === "helm" ? p.chart : "");
+  const [chartVersion, setChartVersion] = React.useState(p.kind === "helm" ? (p.chart_version ?? "") : "");
+  const [path, setPath] = React.useState(p.kind === "git" ? p.path : "");
+  const [set, setSet] = React.useState(
+    Object.entries((p.kind === "platform" ? undefined : p.set) ?? {})
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n"),
+  );
+  const [busy, setBusy] = React.useState(false);
+  if (p.kind === "platform") {
+    return (
+      <Panel eyebrow="How it deploys" title={`To ${p.provider}`} description="Its definition changes by API or kiln app set; each environment takes it with its next release.">
+        <p className="rel-quiet">From template {a.template ?? "none"}.</p>
+      </Panel>
+    );
+  }
+  const lines = set
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const wrong = lines.find((l) => !l.includes("=")) ? "Each value is name=value, one a line." : !repo.trim() || (kind === "helm" && !chart.trim()) ? "Its repository, and a chart's name." : null;
+  const save = async () => {
+    const values = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
+    const pkg: AppPatch["package"] =
+      kind === "helm"
+        ? { kind: "helm", repo: repo.trim(), chart: chart.trim(), chart_version: chartVersion.trim() || undefined, set: values }
+        : { kind: "git", repo: repo.trim(), path: path.trim(), set: values };
+    setBusy(true);
+    try {
+      await deployApi.patchApp(a.name, { template, package: pkg });
+      toast({ title: `${a.name} deploys anew`, description: "Each environment takes it with its next release.", tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (e) {
+      toast({ title: "Not changed", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Panel eyebrow="How it deploys" title="Its package" description="A change reaches each environment with its next release there.">
+      <div className="cd-new-grid">
+        <SelectField label="Template" value={template} onChange={setTemplate} options={[{ value: "", label: "None" }, ...templates.map((t) => ({ value: t.name, label: t.name }))]} />
+        <Segmented
+          label="What it deploys"
+          value={kind}
+          onChange={setKind}
+          options={[
+            { value: "helm", label: "A Helm chart" },
+            { value: "git", label: "A path in git" },
+          ]}
+        />
+      </div>
+      <div className="cd-new-grid">
+        <TextField label={kind === "helm" ? "Chart repository" : "Git repository"} value={repo} spellCheck={false} onChange={(e) => setRepo(e.target.value)} />
+        {kind === "helm" ? (
+          <>
+            <TextField label="Chart" value={chart} spellCheck={false} onChange={(e) => setChart(e.target.value)} />
+            <TextField
+              label="Chart version"
+              placeholder="each release's"
+              value={chartVersion}
+              spellCheck={false}
+              onChange={(e) => setChartVersion(e.target.value)}
+              hint="Empty: each release's version."
+            />
+          </>
+        ) : (
+          <TextField label="Path" value={path} spellCheck={false} onChange={(e) => setPath(e.target.value)} hint="At each release's version." />
+        )}
+      </div>
+      <div className="rel-gap">
+        <label className="field-label" htmlFor={`set-${a.name}`}>
+          Values a release sets
+        </label>
+        <textarea
+          id={`set-${a.name}`}
+          className="rel-textarea"
+          rows={4}
+          spellCheck={false}
+          value={set}
+          onChange={(e) => setSet(e.target.value)}
+          placeholder={"image.tag=${{ release.artifacts.image.tag }}"}
+        />
+      </div>
+      {wrong && <p className="rel-msg">{wrong}</p>}
+      <div className="rel-settings-actions">
+        <Button size="sm" disabled={busy || !!wrong} onClick={() => void save()}>
+          Save
+        </Button>
+      </div>
+    </Panel>
+  );
+}
+
 /** A duration as people say it. */
 function took(secs: number | null | undefined) {
   if (secs === null || secs === undefined) return "—";
@@ -448,6 +550,9 @@ function AppView({ name }: { name: string }) {
           <Latest app={a.name} />
         </Loadable>
         <Settings key={JSON.stringify(a)} a={a} registered={envs} />
+        <Loadable label="its templates">
+          <Deploys key={JSON.stringify(a)} a={a} />
+        </Loadable>
       </div>
     </>
   );

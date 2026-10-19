@@ -477,3 +477,39 @@
 .rel-log {
   margin-top: 12px;
 }
+
+/* ---------------------------------------------------------------- an environment's settings */
+.rel-windows {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.rel-window {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.8fr) minmax(8rem, 1fr) minmax(5rem, 0.6fr) minmax(7rem, 0.8fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+.rel-window .field-label {
+  font-size: 10px;
+}
+@media (max-width: 720px) {
+  .rel-window {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.rel-settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px 24px;
+  margin-top: 16px;
+}
+.rel-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.rel-windows > button {
+  justify-self: start;
+}

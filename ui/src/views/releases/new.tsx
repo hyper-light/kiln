@@ -12,22 +12,20 @@
 import * as React from "react";
 import { Rocket } from "lucide-react";
 
-import { boardHref, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package, type Template } from "@/api/deploy";
+import { boardHref, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { reposRes, useRes, warm, type Res } from "@/lib/data";
+import { reposRes, useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { useNavigate } from "@/lib/router";
-import { DEPLOY_EVENTS, environmentsRes } from "./index";
+import { environmentsRes, templatesRes } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
-
-const templatesRes: Res<Template[]> = { key: "deploy/templates", fetch: (s) => deployApi.templates(s), opts: { on: DEPLOY_EVENTS } };
 
 /** A DNS label, as Kubernetes names things. */
 const LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
