@@ -352,8 +352,20 @@ async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Resul
         return kiln::agent::run(opts, shutdown).await;
     }
     let reg = kiln::sup::Registry::default();
+    // The agent sees shutdown itself and returns once it has wound down (its log sources' last
+    // writes answered, their places written down: a stop then repeats no record); the supervisor
+    // is told a moment later, to drop an agent that does not.
+    let held = Shutdown::new();
+    {
+        let (sd, held) = (shutdown.clone(), held.clone());
+        kiln::rt::spawn(async move {
+            sd.cancelled().await;
+            kiln::rt::sleep(std::time::Duration::from_secs(5)).await;
+            held.cancel();
+        });
+    }
     let sd = shutdown.clone();
-    let h = kiln::sup::spawn(&reg, "agent", shutdown, move || kiln::agent::run(opts.clone(), sd.clone()));
+    let h = kiln::sup::spawn(&reg, "agent", held, move || kiln::agent::run(opts.clone(), sd.clone()));
     let _ = h.await;
     if kiln::agent::handed_over() {
         return Err(kiln::reach::cli::ExitWith(kiln::supervise::HANDOVER_EXIT).into());

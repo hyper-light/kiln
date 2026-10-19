@@ -200,6 +200,21 @@ host_seconds = 3600
         Ok(())
     }
 
+    /// Stops runner `name` as an operator's stop does (SIGTERM), waiting for it to be gone.
+    pub fn stop_runner(&mut self, name: &str) {
+        if let Some(Some(mut p)) = self.runners.insert(name.to_owned(), None) {
+            let _ = Command::new("kill").args(["-TERM", &p.child.id().to_string()]).status();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(60) {
+                if matches!(p.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            p.kill();
+        }
+    }
+
     pub fn kill_runner(&mut self, name: &str) {
         if let Some(Some(mut p)) = self.runners.insert(name.to_owned(), None) {
             p.kill();

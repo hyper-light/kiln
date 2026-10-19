@@ -342,6 +342,68 @@ export interface ScrapeTest {
   took_ms?: number;
 }
 
+export type LogSourceKind = "file" | "kubernetes" | "docker" | "journald";
+export type LogRuleKind = "exclude_at_match" | "include_at_match" | "mask_sequences" | "multi_line";
+
+/** Datadog's processing rules, in their order (a multi_line rule first). */
+export interface LogRule {
+  type: LogRuleKind;
+  name?: string;
+  pattern: string;
+  replace_placeholder?: string;
+}
+
+/** Logs machines collect (docs/observe.md §8.1): files by their globs, a node's pods' or Docker's containers' logs, or the systemd journal. `on` as a scrape target's. */
+export interface LogSourceIn {
+  type: LogSourceKind;
+  paths?: string[];
+  exclude?: string[];
+  format?: "auto" | "text" | "json" | "cri" | "docker";
+  start?: "end" | "beginning";
+  encoding?: "utf-8" | "utf-16le" | "utf-16be";
+  units?: string[];
+  service?: string;
+  source?: string;
+  tags?: string[];
+  rules?: LogRule[];
+  on?: string;
+}
+
+/** How a machine's reading of a source goes, its counts since `since_ms` (when its process began reading). */
+export interface LogSourceState {
+  since_ms: number | null;
+  files: number;
+  over_limit: number;
+  bytes: number;
+  records: number;
+  in_flight: number;
+  excluded: number;
+  truncated: number;
+  lag_bytes: number;
+  last_ms: number | null;
+  error: string | null;
+  errors: number;
+}
+
+export type LogSource = LogSourceIn & {
+  name: string;
+  format: NonNullable<LogSourceIn["format"]>;
+  start: NonNullable<LogSourceIn["start"]>;
+  on: string;
+  machines: { machine: string; state: LogSourceState }[];
+};
+
+/** What a source reads on the server: the files it matches and the records of the newest one's last lines, nothing written. */
+export interface LogSourceTest {
+  ok: boolean;
+  files: { path: string; bytes: number }[];
+  matched: number;
+  records: { ts_ns: number; status: string; service: string; host: string; source: string; message: string; attributes: Record<string, string> }[];
+  excluded: number;
+  error?: string | null;
+  took_ms: number;
+}
+
 /** An SLO as it is sent (docs/observe.md §9.2): a ratio of good events to total, or time slices meeting a condition. */
 export interface SloIn {
   name: string;
@@ -493,6 +555,10 @@ export const observeApi = {
   putScrape: (name: string, t: ScrapeIn) => request<void>("PUT", `${BASE}/scrapes/${enc(name)}`, t),
   deleteScrape: (name: string) => request<void>("DELETE", `${BASE}/scrapes/${enc(name)}`),
   testScrape: (name: string, t: ScrapeIn) => request<ScrapeTest>("POST", `${BASE}/scrapes/${enc(name)}/test`, t),
+  logSources: (signal?: AbortSignal) => request<{ log_sources: LogSource[] }>("GET", `${BASE}/log_sources`, undefined, { signal }).then((r) => r.log_sources),
+  putLogSource: (name: string, s: LogSourceIn) => request<void>("PUT", `${BASE}/log_sources/${enc(name)}`, s),
+  deleteLogSource: (name: string) => request<void>("DELETE", `${BASE}/log_sources/${enc(name)}`),
+  testLogSource: (name: string, s: LogSourceIn) => request<LogSourceTest>("POST", `${BASE}/log_sources/${enc(name)}/test`, s),
   dashboards: (signal?: AbortSignal) => request<{ dashboards: DashboardSummary[] }>("GET", `${BASE}/dashboards`, undefined, { signal }).then((r) => r.dashboards),
   dashboard: (id: string, signal?: AbortSignal) => request<Dashboard>("GET", `${BASE}/dashboards/${enc(id)}`, undefined, { signal }),
   createDashboard: (d: Omit<Dashboard, "id" | "builtin" | "created" | "modified">) => request<Dashboard>("POST", `${BASE}/dashboards`, d),

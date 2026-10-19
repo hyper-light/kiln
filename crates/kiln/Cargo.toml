@@ -23,6 +23,9 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 glob = "0.3.4"
+# Logs collected (observe::collect): lines found, processing rules. Both already in the tree (kiln-obs).
+memchr = "2.8.3"
+regex = "1"
 hex = "0.4.3"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
@@ -87,3 +90,9 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Allocations and page faults counted (benches/collect.rs), as kiln-obs's benches count them.
+hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+
+[[bench]]
+name = "collect"
+harness = false

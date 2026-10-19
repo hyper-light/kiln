@@ -192,6 +192,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "scrapes did not start: no HTTPS client"),
         }
+        // Logs collected: the sources kept here, the server's own read here, each runner told its
+        // own.
+        let sources = std::sync::Arc::new(crate::observe::collect::Sources::open(&cfg.data("observe")));
+        let all = sources.list();
+        crate::observe::collect::start(crate::observe::collect::SERVER, &crate::os::hostname(), &cfg.data("observe"), shutdown.clone()).set(&all);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_log_sources(all);
+        }
+        crate::observe::api::set_log_sources(sources);
         match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
             Ok(t) => crate::observe::api::set_ingest_token(t),
             Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),
@@ -311,6 +320,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     shutdown.cancelled().await;
     tracing::info!("shutting down");
+    // Log sources write their places down once their last records are written (a moment).
+    if let Some(c) = crate::observe::collect::get().cloned() {
+        let _ = crate::rt::blocking(move || c.stop_within(Duration::from_secs(3))).await;
+    }
     hub.disconnect_all().await;
     // Lets the close frames go out and in-flight responses finish.
     crate::rt::sleep(Duration::from_millis(300)).await;

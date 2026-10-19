@@ -179,15 +179,15 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Scrape) => voi
   );
 }
 
-/** Who reads a target: the server, every machine its own, or one of the machines. */
-function ReadBy({ value, onChange, machines }: { value: string; onChange: (v: string) => void; machines: string[] }) {
+/** Who reads a target (or a log source): the server, every machine its own, or one of the machines. */
+export function ReadBy({ value, onChange, machines }: { value: string; onChange: (v: string) => void; machines: string[] }) {
   const options = [{ value: SERVER, label: "The server" }, { value: EVERY, label: "Every machine, each its own" }, ...machines.map((m) => ({ value: m, label: m }))];
   if (!options.some((o) => o.value === value)) options.push({ value, label: value });
   return <SelectField label="Read by" value={value} onChange={onChange} options={options} />;
 }
 
 /** [`ReadBy`] with the runners the group knows, once they are read. */
-function ReadByMachines({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+export function ReadByMachines({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const machines = useRes(statusRes).data.machines.map((m) => m.machine);
   return <ReadBy value={value} onChange={onChange} machines={machines} />;
 }

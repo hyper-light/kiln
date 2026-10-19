@@ -67,6 +67,8 @@ pub enum Msg {
     /// Server → runner: the scrape targets this machine reads (`super::scrape`), all of them each
     /// time, sent when it connects and when they change.
     Scrapes { targets: Vec<(String, super::scrape::Target)> },
+    /// Server → runner: the log sources this machine reads (`super::collect`), as scrape targets.
+    LogSources { sources: Vec<(String, super::collect::Source)> },
 }
 
 /// What a write came to, as its sender needs it.
@@ -129,6 +131,8 @@ pub struct Status {
     pub at: i64,
     /// How each scrape target it reads goes.
     pub scrapes: Vec<(String, super::scrape::State)>,
+    /// How each log source it reads goes.
+    pub collect: Vec<(String, super::collect::State)>,
 }
 
 pub fn encode(msg: &Msg) -> String {

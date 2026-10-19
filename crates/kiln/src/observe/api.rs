@@ -81,6 +81,28 @@ fn scrapes() -> Result<&'static std::sync::Arc<super::scrape::Targets>, Fail> {
     SCRAPES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "scrape targets are kept by the server"))
 }
 
+/// The server's log sources, once it started.
+static LOG_SOURCES: OnceLock<std::sync::Arc<super::collect::Sources>> = OnceLock::new();
+
+pub fn set_log_sources(s: std::sync::Arc<super::collect::Sources>) {
+    let _ = LOG_SOURCES.set(s);
+}
+
+fn log_sources() -> Result<&'static std::sync::Arc<super::collect::Sources>, Fail> {
+    LOG_SOURCES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log sources are kept by the server"))
+}
+
+/// The sources now, applied: the server's own read from now, each runner told its own.
+fn apply_log_sources(s: &super::collect::Sources) {
+    let all = s.list();
+    if let Some(c) = super::collect::get() {
+        c.set(&all);
+    }
+    if let Some(o) = get() {
+        o.set_log_sources(all);
+    }
+}
+
 /// The targets now, applied: the server's own read from now, each runner told its own.
 fn apply_scrapes(t: &super::scrape::Targets) {
     let all = t.list();
@@ -452,6 +474,62 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 }
                 Err(e) => json!({ "ok": false, "error": format!("{e:#}"), "took_ms": t0.elapsed().as_millis() as u64 }),
             };
+            Ok(srv::json(StatusCode::OK, &answer))
+        }
+        (&Method::GET, ["log_sources"]) => {
+            // Each source, and how each machine that reads it goes: the server's own here, a
+            // runner's from its last status.
+            let mut by_source: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+            for (name, st) in super::collect::get().map(|c| c.states()).unwrap_or_default() {
+                by_source.entry(name).or_default().push(json!({ "machine": super::collect::SERVER, "state": st }));
+            }
+            if let Some(o) = get() {
+                for m in o.view().machines {
+                    for (name, st) in m.status.map(|s| s.collect).unwrap_or_default() {
+                        by_source.entry(name).or_default().push(json!({ "machine": m.machine, "state": st }));
+                    }
+                }
+            }
+            let list: Vec<Value> = log_sources()?
+                .list()
+                .into_iter()
+                .map(|(name, s)| {
+                    let mut v = serde_json::to_value(&s).unwrap_or(Value::Null);
+                    if let Value::Object(o) = &mut v {
+                        o.insert("name".into(), Value::from(name.clone()));
+                        o.insert("machines".into(), Value::from(by_source.remove(&name).unwrap_or_default()));
+                    }
+                    v
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "log_sources": list })))
+        }
+        (&Method::PUT, ["log_sources", name]) => {
+            let name = (*name).to_owned();
+            let s: super::collect::Source = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = log_sources()?;
+            store.put(&name, s).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_log_sources(store);
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::DELETE, ["log_sources", name]) => {
+            let store = log_sources()?;
+            match store.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+                true => {
+                    apply_log_sources(store);
+                    Ok(srv::status(StatusCode::NO_CONTENT))
+                }
+                false => Err(fail(StatusCode::NOT_FOUND, "no such log source")),
+            }
+        }
+        (&Method::POST, ["log_sources", name, "test"]) => {
+            // The source given, or the kept one, read on the server: what it matches here and the
+            // records of its newest file's last lines, nothing written.
+            let name = (*name).to_owned();
+            let given: Option<super::collect::Source> = read_json::<Value>(req.into_body(), QUERY_BODY).await.ok().filter(|v| v.as_object().is_some_and(|o| !o.is_empty())).and_then(|v| serde_json::from_value(v).ok());
+            let s = given.or_else(|| log_sources().ok().and_then(|l| l.get(&name))).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such log source"))?;
+            let host = crate::os::hostname();
+            let answer = crate::rt::blocking(move || super::collect::test(&name, &s, &host)).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &answer))
         }
         (&Method::GET, ["clouds"]) => Ok(srv::json(StatusCode::OK, &json!({ "clouds": clouds()?.list() }))),

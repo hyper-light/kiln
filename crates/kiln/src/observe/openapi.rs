@@ -413,6 +413,72 @@ fn schemas() -> Map<String, Value> {
             &["ok", "took_ms"],
         ),
     );
+    let rule = object(
+        &[
+            ("type", one_of(&["exclude_at_match", "include_at_match", "mask_sequences", "multi_line"])),
+            ("name", string()),
+            ("pattern", describe(string(), "a regular expression (Rust's regex: no look-around)")),
+            ("replace_placeholder", describe(string(), "what a mask_sequences rule puts where its pattern matched")),
+        ],
+        &["type", "pattern"],
+    );
+    let source_fields = [
+        ("type", describe(one_of(&["file", "kubernetes", "docker", "journald"]), "files by their globs; a Kubernetes node's pods' logs; Docker's json-file logs; the systemd journal")),
+        ("paths", describe(array(string()), "a file source's globs (/var/log/app/*.log); Kubernetes' and Docker's their own unless given")),
+        ("exclude", describe(array(string()), "globs of paths not read")),
+        ("format", one_of(&["auto", "text", "json", "cri", "docker"])),
+        ("start", describe(one_of(&["end", "beginning"]), "where a file there when the source starts, with no place kept, is read from")),
+        ("encoding", one_of(&["utf-8", "utf-16le", "utf-16be"])),
+        ("units", describe(array(string()), "the journal's units read (every unit when none)")),
+        ("service", string()),
+        ("source", string()),
+        ("tags", array(string())),
+        ("rules", array(rule)),
+        ("on", describe(string(), "`server`, a runner's name, or `*`: every machine, each its own")),
+    ];
+    put("LogSourceIn", object(&source_fields, &["type"]));
+    let source_state = object(
+        &[
+            ("since_ms", nullable(integer())),
+            ("files", integer()),
+            ("over_limit", integer()),
+            ("bytes", integer()),
+            ("records", integer()),
+            ("in_flight", integer()),
+            ("excluded", integer()),
+            ("truncated", integer()),
+            ("lag_bytes", integer()),
+            ("last_ms", nullable(integer())),
+            ("error", nullable(string())),
+            ("errors", integer()),
+        ],
+        &["files", "records", "errors"],
+    );
+    let mut listed: Vec<(&str, Value)> = source_fields.to_vec();
+    listed.push(("name", string()));
+    listed.push(("machines", array(object(&[("machine", string()), ("state", source_state)], &["machine", "state"]))));
+    put("LogSource", object(&listed, &["name", "type", "format", "start", "encoding", "tags", "rules", "on", "machines"]));
+    put(
+        "LogSourceTest",
+        object(
+            &[
+                ("ok", boolean()),
+                ("files", array(object(&[("path", string()), ("bytes", integer())], &["path", "bytes"]))),
+                ("matched", integer()),
+                (
+                    "records",
+                    array(object(
+                        &[("ts_ns", integer()), ("status", string()), ("service", string()), ("host", string()), ("source", string()), ("message", string()), ("attributes", map_of(string()))],
+                        &["ts_ns", "status", "service", "host", "source", "message", "attributes"],
+                    )),
+                ),
+                ("excluded", integer()),
+                ("error", nullable(string())),
+                ("took_ms", integer()),
+            ],
+            &["ok", "files", "matched", "records", "excluded", "took_ms"],
+        ),
+    );
     let common = [
         ("interval_s", describe(integer(), "seconds between pulls (300)")),
         ("lookback_s", describe(integer(), "seconds a pull reads back (three intervals)")),
@@ -736,6 +802,10 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: vec![name()], ..op("put", "/scrapes/{name}", "Makes or changes a scrape target", "observe.manage", Some(body("ScrapeIn")), vec![no_content()]) },
         Op { params: vec![name()], ..op("delete", "/scrapes/{name}", "Removes a scrape target", "observe.manage", None, vec![no_content()]) },
         Op { params: vec![name()], ..op("post", "/scrapes/{name}/test", "Reads a target once from the server (the one given, or the kept one), nothing written", "observe.manage", Some(json!({ "required": false, "content": { "application/json": { "schema": schema("ScrapeIn") } } })), vec![ok("ScrapeTest")]) },
+        op("get", "/log_sources", "Lists the logs machines collect (files, containers' logs, the journal), each machine's state of them", "observe.read", None, vec![("200", answer_of("the sources", object(&[("log_sources", array(schema("LogSource")))], &["log_sources"])))]),
+        Op { params: vec![name()], ..op("put", "/log_sources/{name}", "Makes or changes a log source: what the machines it names read from now", "observe.manage", Some(body("LogSourceIn")), vec![no_content()]) },
+        Op { params: vec![name()], ..op("delete", "/log_sources/{name}", "Removes a log source", "observe.manage", None, vec![no_content()]) },
+        Op { params: vec![name()], ..op("post", "/log_sources/{name}/test", "What a source (the one given, or the kept one) reads on the server: the files it matches and the records of the newest one's last lines, nothing written", "observe.manage", Some(json!({ "required": false, "content": { "application/json": { "schema": schema("LogSourceIn") } } })), vec![ok("LogSourceTest")]) },
         op("get", "/clouds", "Lists cloud integrations, each its status, their secrets \"…\"", "observe.read", None, vec![("200", answer_of("the clouds", object(&[("clouds", array(schema("Cloud")))], &["clouds"])))]),
         Op { params: vec![name()], ..op("put", "/clouds/{name}", "Makes or changes a cloud integration (a secret left out, or \"…\", is the kept one)", "observe.manage", Some(body("CloudIn")), vec![no_content()]) },
         Op { params: vec![name()], ..op("delete", "/clouds/{name}", "Removes a cloud integration", "observe.manage", None, vec![no_content()]) },
@@ -804,7 +874,7 @@ pub fn document(version: &str) -> Value {
         "info": {
             "title": "kiln observe",
             "version": version,
-            "description": "Observe's API (docs/observe.md §7): metric queries, log search and analytics, events, monitors, dashboards, integrations, clouds, scrapes, and what is sent in. Times are ms since the epoch unless said (`_ns`: nanoseconds).",
+            "description": "Observe's API (docs/observe.md §7): metric queries, log search and analytics, events, monitors, dashboards, integrations, clouds, scrapes, log sources, and what is sent in. Times are ms since the epoch unless said (`_ns`: nanoseconds).",
         },
         "components": {
             "securitySchemes": {

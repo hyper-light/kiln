@@ -18,6 +18,7 @@ import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Clouds } from "./clouds";
+import { LogSources } from "./logsources";
 import { Scrapes } from "./scrapes";
 import { ObserveNav, integrationsRes } from "./parts";
 
@@ -39,7 +40,7 @@ export default function Integrations() {
         index={8}
         label="Observe"
         title="Integrations"
-        lead="Where monitors' messages go, and the clouds and Prometheus endpoints whose metrics kiln reads. Mention one in a monitor's message as @kind-name: it is told when a group alerts, warns, stops having data, and recovers."
+        lead="Where monitors' messages go; the clouds and Prometheus endpoints whose metrics kiln reads; and the logs its machines collect. Mention an integration in a monitor's message as @kind-name: it is told when a group alerts, warns, stops having data, and recovers."
         actions={
           <Button onClick={() => setAdding(true)}>
             <Plus /> Add integration
@@ -54,6 +55,7 @@ export default function Integrations() {
       {adding && <AddDialog onClose={() => setAdding(false)} />}
       <Clouds />
       <Scrapes />
+      <LogSources />
     </div>
   );
 }

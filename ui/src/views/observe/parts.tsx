@@ -19,6 +19,7 @@ import {
   type Scrape,
   type HeatmapAnswer,
   type Slo,
+  type LogSource,
 } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
@@ -422,6 +423,7 @@ export const sloRes = (id: string): Res<Slo> => ({ key: `observe/slo/${id}`, fet
 export const integrationsRes: Res<Integration[]> = { key: "observe/integrations", fetch: (s) => observeApi.integrations(s) };
 export const cloudsRes: Res<Cloud[]> = { key: "observe/clouds", fetch: (s) => observeApi.clouds(s), opts: { pollMs: 10_000 } };
 export const scrapesRes: Res<Scrape[]> = { key: "observe/scrapes", fetch: (s) => observeApi.scrapes(s), opts: { pollMs: 10_000 } };
+export const logSourcesRes: Res<LogSource[]> = { key: "observe/log_sources", fetch: (s) => observeApi.logSources(s), opts: { pollMs: 10_000 } };
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };
 export const dashboardRes = (id: string): Res<Dashboard> => ({ key: `observe/dashboard/${id}`, fetch: (s) => observeApi.dashboard(id, s) });
 export const tagValuesRes = (tag: string): Res<string[]> => ({ key: `observe/tags/${tag}`, fetch: (s) => observeApi.tagValues(tag, s).then((r) => r.values), opts: { pollMs: 300_000 } });

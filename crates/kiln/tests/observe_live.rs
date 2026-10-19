@@ -1425,6 +1425,18 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     check("PUT", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), Some(json!({ "url": "http://127.0.0.1:9/metrics", "every_s": 60 })), 204)?;
     check("GET", &format!("{base}/scrapes"), &format!("{base}/scrapes"), None, 200)?;
     check("DELETE", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), None, 204)?;
+    // A log source of the server's own, its file read: tried, kept, listed, removed.
+    let logs = f.root.path().join("conform-logs");
+    std::fs::create_dir_all(&logs)?;
+    std::fs::write(logs.join("a.log"), "{\"level\":\"warn\",\"msg\":\"one\"}\nplain two\n")?;
+    let source = json!({ "type": "file", "paths": [format!("{}/*.log", logs.display())], "start": "beginning", "rules": [{ "type": "exclude_at_match", "pattern": "never" }] });
+    let tried = check("POST", &format!("{base}/log_sources/app/test"), &format!("{base}/log_sources/{{name}}/test"), Some(source.clone()), 200)?;
+    anyhow::ensure!(at(&tried, &["matched"]) == 1 && at(&tried, &["records"]).as_array().is_some_and(|r| r.len() == 2), "{tried:#}");
+    check("PUT", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), Some(source), 204)?;
+    check("PUT", &format!("{base}/log_sources/bad"), &format!("{base}/log_sources/{{name}}"), Some(json!({ "type": "file", "paths": ["relative/*.log"] })), 400)?;
+    check("GET", &format!("{base}/log_sources"), &format!("{base}/log_sources"), None, 200)?;
+    check("DELETE", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), None, 204)?;
+    check("DELETE", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), None, 404)?;
     check("PUT", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), Some(json!({ "kind": "aws", "regions": ["us-east-1"], "paused": true, "log_groups": ["/aws/lambda/*"] })), 204)?;
     check("GET", &format!("{base}/clouds"), &format!("{base}/clouds"), None, 200)?;
     check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 204)?;

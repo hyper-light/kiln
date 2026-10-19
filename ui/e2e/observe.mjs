@@ -6,6 +6,7 @@
 //   PLAYWRIGHT_CORE=/path/to/node_modules/playwright-core/index.mjs \
 //   [BROWSER=chromium|webkit] [PHONE=1] [ONLY=<part of a scenario's name>] [SHOTS=<folder>] \
 //   [RECEIVER=http://127.0.0.1:17199 RECEIVED=<the jsonl it keeps what it is sent in>] \
+//   [LOGS_DIR=<a folder this script writes in and the server reads>] \
 //   node ui/e2e/observe.mjs
 //
 // The server needs observe's data to look at: metrics of `app.latency.p95` by `service` and logs
@@ -57,7 +58,11 @@ const problems = [];
 // WebKit says a same-origin request a navigation cancelled failed "due to access control checks":
 // no request here crosses origins, so that is never a fault of the page's.
 page.on("pageerror", (e) => !/due to access control checks/.test(e.message) && problems.push(`pageerror: ${e.message}`));
-page.on("console", (m) => m.type() === "error" && !m.text().startsWith("Failed to load resource") && problems.push(`console: ${m.text()}`));
+// And a fetch a navigation (a reload) cancelled "Load failed": the page goes, its requests with it.
+page.on(
+  "console",
+  (m) => m.type() === "error" && !m.text().startsWith("Failed to load resource") && !(which === "webkit" && m.text() === "TypeError: Load failed") && problems.push(`console: ${m.text()}`),
+);
 page.on("response", (r) => r.status() >= 400 && problems.push(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(BASE, "")}`));
 // The page's loads and navigations, said when a scenario fails (a reload loses what was typed).
 const navs = [];
@@ -619,6 +624,59 @@ const scenarios = {
     } finally {
       cw.close();
       for (const n of [name, `${name}-g`]) await api("DELETE", `/api/observe/v1/clouds/${n}`);
+    }
+  },
+
+  /** A log source added from the form: tried on the server (its file matched, its last lines read
+   * as records, a token masked), kept, read (its records found by a search, once each, masked), and
+   * removed. */
+  async "a log source is tried, added, collected and removed"() {
+    const dir = process.env.LOGS_DIR;
+    if (!dir) return "skipped: no LOGS_DIR";
+    const folder = `${dir}/${run}`;
+    fs.mkdirSync(folder, { recursive: true });
+    const lines = Array.from({ length: 30 }, (_, i) => `${JSON.stringify({ level: i % 10 === 0 ? "error" : "info", msg: `checkout ${i} token=abc${i}`, seq: i })}\n`);
+    fs.writeFileSync(`${folder}/app.log`, lines.join(""));
+    const name = `e2e-logs-${run}`;
+    try {
+      await page.goto(`${BASE}/observe/integrations`);
+      await page.getByRole("button", { name: "Add log source", exact: true }).click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Name", { exact: true }), name);
+      await fillIn(d.getByLabel("Paths", { exact: true }), `${folder}/*.log`);
+      await d.getByLabel("Start", { exact: true }).selectOption("beginning");
+      await d.getByRole("button", { name: "Add a rule", exact: true }).click();
+      await d.getByLabel("Rule 1", { exact: true }).selectOption("mask_sequences");
+      await fillIn(d.getByLabel("Rule 1's pattern", { exact: true }), "token=[a-z0-9]+");
+      await fillIn(d.getByLabel("Rule 1's mask", { exact: true }), "token=[masked]");
+      await d.getByRole("button", { name: "Test", exact: true }).click();
+      const said = d.getByRole("status");
+      await said.getByText(/matches 1 file/).waitFor();
+      await said.getByText("checkout 29 token=[masked]", { exact: false }).waitFor();
+      await d.getByRole("button", { name: "Add", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      const row = page.getByRole("row").filter({ hasText: name });
+      await row.waitFor();
+      // The server reads it at once: every line a record, once, masked.
+      const found = await until(
+        "its records stored",
+        async () => {
+          const r = await api("POST", "/api/observe/v1/logs/search", { query: `service:${name}`, from: Date.now() - 3_600_000, to: Date.now() + 60_000, limit: 100 });
+          return r.body?.records?.length === 30 ? r.body.records : null;
+        },
+        30_000,
+      );
+      expect(found.every((r) => /token=\[masked\]$/.test(r.message)) && found.filter((r) => r.status === "error").length === 3, `its records: ${JSON.stringify(found.slice(0, 2))}`);
+      expect(new Set(found.map((r) => r.attributes.seq)).size === 30, "each line once");
+      await until("its row says it reads", async () => /Reading/.test((await row.textContent()) ?? ""), 30_000);
+      await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until("its row gone", async () => (await page.getByRole("row").filter({ hasText: name }).count()) === 0);
+      const left = await api("GET", "/api/observe/v1/log_sources");
+      expect(!left.body.log_sources.some((s) => s.name === name), "removed on the server");
+    } finally {
+      await api("DELETE", `/api/observe/v1/log_sources/${name}`);
+      fs.rmSync(folder, { recursive: true, force: true });
     }
   },
 

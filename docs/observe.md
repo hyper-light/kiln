@@ -22,6 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
+| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor; Datadog's processing rules; each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations), Windows' Event Log and macOS's unified log | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); next: Metric Streams' OpenTelemetry format, Event Hubs for Azure's | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
@@ -493,8 +494,9 @@ same search syntax.
 Under `/api/observe/v1/` (all JSON; the UI uses nothing else), each route under a capability of
 kiln's (docs/access.md): every GET, and every query, search and check asked by POST, needs
 `observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
-developer's); integrations, clouds, scrape targets and the store's operations need `observe.manage` (a
-maintainer's), but their listings, `observe.read` (their secrets are never in them).
+developer's); integrations, clouds, scrape targets, log sources (they read machines' files) and the
+store's operations need `observe.manage` (a maintainer's), but their listings, `observe.read` (their
+secrets are never in them).
 
 **`GET openapi.json`** is the API described (`crate::observe::openapi`, OpenAPI 3.1): every route
 here and every one that takes what is sent in (OTLP, Firehose, Pub/Sub), each with what it takes
@@ -525,6 +527,7 @@ its schema (§13). Built:
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
+| `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind, the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 
@@ -594,8 +597,10 @@ time, sent again until answered; §5), from:
   `result` failed or rolled back. A layer of kiln's subscriber with its own filter: `KILN_LOG`
   does not hide these spans from observe, nor do they reach the log.
 
-To come: Prometheus endpoints scraped; CloudWatch Metric Streams taken (Firehose's HTTP endpoint
-delivery of OTLP).
+- **Logs collected on every machine** (§8.1): files, containers' logs and the journal, as a source
+  says.
+
+To come: CloudWatch Metric Streams' OpenTelemetry format (its JSON is taken, §10.2).
 
 **Taking what comes, and refusing** (`crate::observe::owner`, `crate::observe::ingest`): a request
 is answered 200 only once its points have room, taken where it is answered (an atomic reservation
@@ -614,6 +619,71 @@ A decoded OTLP request is its series' keys once and its samples flat, each with 
 the batcher keeps what waits the same way, one buffer, sorted by series with a counting sort when a
 write is cut. A series' key is made (checked, sorted, fingerprinted) once in a node's life: a
 sharded cache of keys by their canonical bytes, shared (`Arc`) with every write that holds one.
+
+### 8.1 Logs collected
+
+kiln's machines collect logs as Datadog's Agent does (`crate::observe::collect`): the server keeps
+the sources (`<observe>/log_sources.json`) and tells each runner those it reads on observe's lane,
+as it tells scrape targets; each machine reads each of its sources on a thread of its own and says
+how it goes in its status. A source is:
+
+- its **type**: `file` (globs, `**` across folders, less those it leaves out), `kubernetes` (every
+  pod's container log on the node, `/var/log/pods/*/*/*.log` unless given: each record its pod's
+  namespace, name and uid, its container's name and restarts, its service the container's), `docker`
+  (Docker's json-file logs, `/var/lib/docker/containers/*/*-json.log`: the container's id, and from
+  its `config.v2.json` where kiln may read it, its name, image and Compose service), or `journald`
+  (the systemd journal, its units or every one);
+- how its lines read: `auto` (a line that is a JSON object is one, else text), `text`, `json`,
+  `cri` (`<time> <stream> <P|F> <text>`, a long line's parts joined) or `docker` (the same in JSON),
+  in UTF-8 or UTF-16; where a file there when the source starts, with no place kept, is read from
+  (`end`, unless `beginning`; a file that appears later is read from its start);
+- what its records are: `service` (else a container's, else the source's name), `source` (else its
+  type), tags as attributes;
+- Datadog's processing rules, in their order: `exclude_at_match`, `include_at_match`,
+  `mask_sequences` (a token, a card's number, replaced), and `multi_line` (a record starts at a
+  line that matches, a stack trace one record);
+- the machine that reads it: the server, a runner, or every machine its own.
+
+A JSON line's message, level (a name, pino's numbers, syslog's), time (RFC 3339, or seconds,
+milliseconds, microseconds or nanoseconds since the epoch, told apart by their size), trace and
+span are its record's; its other fields its attributes, nested keys joined by dots. A text line's
+level is read from its first words as a log pipeline's status remapper reads it; its time is when it
+was read. A time more than a minute ahead of the machine's clock is taken as now (one without a zone
+read as UTC on a machine west of it).
+
+**Each line once.** A line's place (a file's offset, the journal's cursor) is kept only once the
+write that holds its record is applied by the group (`crate::observe::ingest::Ack`: the batcher
+gives it when the write holding the last of an offer's records is answered), and written down a
+second at most after. A refused offer (no room) is offered again, and nothing more is read until it
+is taken. So a machine that stops (SIGTERM) waits a moment for its last writes and repeats nothing,
+and one killed repeats at most what was written in its last second, and loses nothing it read
+(Vector's end-to-end acknowledgements; Datadog's Agent and Fluent Bit keep their places the same
+way). A runner keeps its loop up for those last writes, three seconds at the most: the supervisor is
+told of a shutdown five seconds after the runner, so it does not drop the runner first.
+
+**Files** are known by their identity (device and inode on Unix; elsewhere the creation time, which
+a rename keeps) and by their leading bytes (a hash of the first KiB, kept with the place), looked
+at every 10 s (Datadog's `file_scan_period`), each file read as it grows, a MiB a round at most so
+one busy file does not starve the rest, 500 open at once at most (the most recently written first):
+
+- **renamed** (logrotate's `create`): read to its end and closed once it has not grown for 30 s;
+  the new file at the path read from its start;
+- **truncated or rewritten in place** (logrotate's `copytruncate`; its size under what was read, or
+  its leading bytes not what they were): read again from its start; and its **copy**, whose leading
+  bytes are the truncated file's, read from where the original had been read to, so nothing is read
+  twice and the lines written between the copy and the truncation are not lost;
+- **deleted** while read: read to its end;
+- a line without its newline is taken once its file has not grown for 5 s; a line longer than 256
+  KiB (Datadog's Agent's bound) is cut into records that long, each said to be cut; a multi-line
+  record is taken once no line came for a second (the Agent's aggregation timeout).
+
+**The journal** is read through `journalctl --output=json --follow --all`, from just after the
+cursor of the last record written (Fluent Bit's and Vector's journald sources read it so); its
+entries' severity is their syslog priority's (OpenTelemetry's mapping), their service the syslog
+identifier or unit, with the unit, process and boot as attributes. Where there is no journal (macOS,
+Windows, a container without systemd's) its status says so.
+
+A source reads what kiln's process may read on each machine that reads it: a maintainer's to give.
 
 ## 9. Monitors
 
@@ -951,6 +1021,10 @@ time range and the search in the address (a page is a link).
   from zero, cannot); and the monitors that alert on it, the workbook's two for its timeframe added
   in a click while none reads its burn rate. Made and edited in a form: good events over all, or
   time slices of a query meeting a condition.
+- **Logs kiln collects** (Integrations' fourth part): each source's state over the machines that
+  read it (reading, failing, no files), what it reads, its records and how far behind it is;
+  added and edited in a form that tests the source on the server (the files it matches, how the
+  newest one's last lines read, the rules applied) before it is kept.
 - **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
   each one's mention to copy. The clouds kiln reads: each one's state, what it reads (its logs too:
   log groups, a filter, workspaces), its credentials and its last pull (series, and the log records
@@ -1584,6 +1658,28 @@ samples is what would take that back. The rollups first came from a series' samp
 (16 bytes a sample); built as the chunks are read instead, the most heap a merge holds over the 30
 days' writing fell from 6.1 MB to 4.2 MB (counted by hyper-measure, the same either run).
 
+### 12.17 Logs collected
+
+`cargo bench -p kiln --bench collect` (`KOBS_LINES`, 300,000 lines a file): a file written, then
+read whole by the collector's own code on one thread (its writes answered at once), the median of
+three reads, allocations and page faults of one. 2026-10-18, AMD Ryzen 9 9950X3D2, Linux 7.2.9, a
+machine other sessions share (rates over runs given as a range):
+
+| | lines a second | MB a second | allocations a line | bytes a line |
+| --- | --- | --- | --- | --- |
+| text (an nginx access log) | 2.9–3.1 M | 405–444 | 9.0 | 571 |
+| JSON lines | 680–767 k | 129–145 | 36 | 2,417 |
+| CRI, JSON in it | 657–709 k | 150–162 | 39 | 2,718 |
+| Java stack traces, `multi_line` (10 lines a record) | 11.9–12.2 M | 612–630 | 2.2 | 156 |
+| the access log, an exclude and a mask | 2.5–2.9 M | 353–409 | 9.1 | 681 |
+
+A busy node writes some thousands of lines a second; one core reads hundreds of thousands. A text
+line's nine allocations are its record's strings (its text, service, host, source, the file's path
+and the tags, each a `String` of `kiln_obs`'s `Record`); a JSON line's thirty-six are mostly
+serde_json's tree of it: its fields moved into the record rather than copied took 46 to 37, the
+record's attributes sized once 37 to 36. Next: a streaming JSON reader (no tree), and records handed
+to the batcher encoded, as rows (no strings a record at all).
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -1787,6 +1883,24 @@ deletion refused while they read it; its target lowered to 99.4 and its warning 
 sixth of its budget left; then deleted, and gone from the list. A time-slice SLO made from the
 form, minutes of a latency the last twelve of 120 over 300 ms: 108 met, 90%, breached against 95,
 its budget spent twice over (−100%). 2026-10-18: both pass in Chromium and in WebKit as a phone.
+
+**Logs collected** (`observe_collect.rs`): a server and a runner; a source of the runner's files,
+its lines JSON, each numbered, every tenth a health check a rule leaves out, a token in each a rule
+masks; 500 lines there before it, read from the beginning as it says; then the file renamed
+(logrotate's `create`) with lines written to both the old and the new, copied and truncated
+(logrotate's `copytruncate`), and 4,000 lines written at 2,000 a second while the runner is stopped
+(SIGTERM) and started, then 4,000 more while it is killed (SIGKILL) and started. Every line's records
+counted by its number: none lost, none of those left out stored, none repeated through the renaming,
+the copy and the stop; the kill repeats what was written in its last second (0 to 477 of the 4,000
+over six runs). A record as stored: masked, its level, its host, its file's path, the source's tag.
+2026-10-18: passes (each run 2 min). Then a pod's CRI log (a long line in parts, then JSON on
+stderr), a Docker container's json-file log (its name, image and Compose service from its config)
+and the journal through a stand-in for `journalctl` that keeps cursors as the real one does: the
+parts joined, the records named as their pods and containers are, the journal's levels its
+priorities'; the runner stopped, an entry more meanwhile, and started: read from after its cursor,
+none twice. Passes. In a browser: a source added from the form, tried on the server first (its file
+matched, its last lines read, a token masked), its records found by a search once each, its row
+saying it reads, then removed; in Chromium and in WebKit as a phone.
 
 **The API as its document says** (`observe_live.rs`): a server; points, a distribution, records
 and an event posted; then every route that answers without a service outside, each asked as a

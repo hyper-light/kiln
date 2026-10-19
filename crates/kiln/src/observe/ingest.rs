@@ -21,6 +21,8 @@
 //! interval, exporters are told to come back (503) rather than queued behind it.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kiln_obs::batch::{Builder, SeriesKey};
@@ -53,9 +55,30 @@ const ENTRY_BUDGET: usize = kiln_obs::group::ENTRY_BYTES - kiln_obs::command::WR
 pub const WAITING_POINTS: usize = 4 << 20;
 pub const WAITING_LOG_BYTES: usize = 64 << 20;
 
+/// What a sender of log records waits on to know they are written: done once the write holding
+/// the last of them is answered (applied by the group, or refused for good), so a reader of a
+/// source it can read again (a file) moves its place only past what is kept, and a crash repeats
+/// what was in flight rather than losing it.
+#[derive(Debug, Clone, Default)]
+pub struct Ack(Arc<AtomicBool>);
+
+impl Ack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn done(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// A write out: its place, its entry, when it was sent, and what it holds of each series (its
 /// points, a range of `points`, to send again with their definitions if the group does not know
-/// them). Kept, buffers and all, for the next write once answered.
+/// them), and the acks its answer gives. Kept, buffers and all, for the next write once answered.
 #[derive(Default)]
 struct Out {
     seq: u64,
@@ -64,6 +87,7 @@ struct Out {
     series: Vec<(SeriesKey, std::ops::Range<usize>)>,
     points: Vec<(i64, f64)>,
     defines: Vec<u64>,
+    acks: Vec<Ack>,
 }
 
 /// A buffer kept for reuse past what it holds, halved when it holds a quarter of its room: a burst
@@ -87,6 +111,11 @@ pub struct Batcher {
     waiting_points: usize,
     logs: VecDeque<Record>,
     log_bytes: usize,
+    /// Records ever queued and ever cut into a write; the acks waiting, each with the count of
+    /// records queued when it came (it is given once a write takes the count's last).
+    logs_in: u64,
+    logs_cut: u64,
+    acks: VecDeque<(u64, Ack)>,
     first_waiting: Option<Instant>,
     out: Option<Out>,
     /// The last write answered: its buffers, for the next.
@@ -130,6 +159,9 @@ impl Batcher {
             waiting_points: 0,
             logs: VecDeque::new(),
             log_bytes: 0,
+            logs_in: 0,
+            logs_cut: 0,
+            acks: VecDeque::new(),
             first_waiting: None,
             out: None,
             spare: Out::default(),
@@ -248,7 +280,20 @@ impl Batcher {
             }
             self.log_bytes += n;
             self.logs.push_back(r);
+            self.logs_in += 1;
             self.first_waiting.get_or_insert(now);
+        }
+    }
+
+    /// Records with an ack given once the write holding the last of them is answered: with every
+    /// record queued before them answered too (writes go one at a time, in order); at once when
+    /// nothing is waiting or out.
+    pub fn logs_acked(&mut self, records: Vec<Record>, ack: Ack, now: Instant) {
+        self.logs(records, now);
+        if self.logs_cut >= self.logs_in && self.out.is_none() && self.acks.is_empty() {
+            ack.set();
+        } else {
+            self.acks.push_back((self.logs_in, ack));
         }
     }
 
@@ -398,6 +443,7 @@ impl Batcher {
         }
         if !take.is_empty() {
             self.builder.logs(&take);
+            self.logs_cut += take.len() as u64;
         }
         if self.points.is_empty() && self.logs.is_empty() {
             self.first_waiting = None;
@@ -408,6 +454,13 @@ impl Batcher {
         if self.builder.items() == 0 {
             self.spare = out;
             return;
+        }
+        // The acks whose records this write holds the last of go with it.
+        out.acks.clear();
+        while self.acks.front().is_some_and(|(at, _)| *at <= self.logs_cut) {
+            if let Some((_, a)) = self.acks.pop_front() {
+                out.acks.push(a);
+            }
         }
         self.seq += 1;
         out.seq = self.seq;
@@ -451,6 +504,17 @@ impl Batcher {
         // Refused and past the bound: those points go, counted; so do those too far ahead.
         self.dropped += (outcome.refused.len() + outcome.over_limit.len()) as u64;
         self.ahead += outcome.ahead;
+        // Its records' answer is final either way: kept, or refused for good (sending them again
+        // would be refused again).
+        for a in out.acks.drain(..) {
+            a.set();
+        }
+        // An ack that came while this write was out, of records it or an earlier one held.
+        while self.acks.front().is_some_and(|(at, _)| *at <= self.logs_cut) {
+            if let Some((_, a)) = self.acks.pop_front() {
+                a.set();
+            }
+        }
         // Its buffers for the next write (its entry went to whoever sent it).
         out.entry = Vec::new();
         settle(&mut out.points);
@@ -506,6 +570,53 @@ mod tests {
             defs += usize::from(matches!(item, kiln_obs::batch::Item::Def { .. }));
         }
         anyhow::ensure!(defs == 0, "{defs} definitions");
+        Ok(())
+    }
+
+    #[test]
+    fn an_ack_is_given_once_the_write_holding_its_last_record_is_answered_and_not_before() -> anyhow::Result<()> {
+        let mut b = Batcher::new(7);
+        let t0 = Instant::now();
+        let rec = |i: usize, size: usize| Record { ts: i as i64, message: format!("{i} {}", "x".repeat(size)), ..Record::default() };
+        // Three batches; the second some two and a half writes' worth.
+        let acks = [Ack::new(), Ack::new(), Ack::new()];
+        let ends = [10u64, 60, 61];
+        b.logs_acked((0..10).map(|i| rec(i, 10)).collect(), acks[0].clone(), t0);
+        b.logs_acked((10..60).map(|i| rec(i, ENTRY_BUDGET / 20)).collect(), acks[1].clone(), t0);
+        b.logs_acked((60..61).map(|i| rec(i, 10)).collect(), acks[2].clone(), t0);
+        let mut store = Store::new(Keyed::new());
+        let (mut index, mut t) = (0, t0);
+        // Each ack's index and the records stored when it was given.
+        let mut given: Vec<(usize, u64)> = Vec::new();
+        while let Some((seq, entry)) = b.poll(t + FLUSH, 0) {
+            index += 1;
+            let o = applied(&mut store, index, &entry)?;
+            let before: Vec<bool> = acks.iter().map(Ack::done).collect();
+            anyhow::ensure!(before.iter().zip(&ends).all(|(&done, &end)| !done || store.totals().logs >= end), "an ack before its records were stored");
+            b.answered(seq, &o, t);
+            for (i, a) in acks.iter().enumerate() {
+                if a.done() && !before.get(i).copied().unwrap_or(true) {
+                    given.push((i, store.totals().logs));
+                }
+            }
+            t += FLUSH;
+        }
+        anyhow::ensure!(index >= 3, "the records went in several writes: {index}");
+        anyhow::ensure!(given.iter().map(|g| g.0).collect::<Vec<_>>() == vec![0, 1, 2], "each given, in order: {given:?}");
+        anyhow::ensure!(given.iter().all(|&(i, stored)| ends.get(i).is_some_and(|&end| stored >= end)), "each once its records were stored: {given:?}");
+        // Nothing waiting or out: given at once.
+        let now = Ack::new();
+        b.logs_acked(Vec::new(), now.clone(), t);
+        anyhow::ensure!(now.done());
+        // A write out: an ack of nothing waits for it.
+        let (held, after) = (Ack::new(), Ack::new());
+        b.logs_acked(vec![rec(61, 10)], held.clone(), t);
+        let (seq, entry) = b.poll(t + FLUSH, 0).ok_or_else(|| anyhow::anyhow!("a write"))?;
+        b.logs_acked(Vec::new(), after.clone(), t);
+        anyhow::ensure!(!held.done() && !after.done(), "given before the write was answered");
+        let o = applied(&mut store, index + 1, &entry)?;
+        b.answered(seq, &o, t);
+        anyhow::ensure!(held.done() && after.done());
         Ok(())
     }
 

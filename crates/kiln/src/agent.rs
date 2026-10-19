@@ -119,6 +119,16 @@ fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
+/// Shutdown, or (lingering, shutdown already said) the next 50 ms tick, to look again whether the
+/// loop may end.
+async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
+    if lingering {
+        crate::rt::sleep(Duration::from_millis(50)).await;
+    } else {
+        shutdown.cancelled().await;
+    }
+}
+
 async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     if let Some((ca, leaf)) = &o.credentials {
         return Ok((ca.clone(), leaf.clone(), None));
@@ -742,6 +752,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::api::set_global(obs.clone());
         // Prometheus's scrapes of the targets the server says this machine reads.
         crate::observe::scrape::start(&name, &name, http.clone(), shutdown.clone());
+        // The logs the server says this machine collects (its files, its journal).
+        crate::observe::collect::start(&name, &name, &o.state_dir.join("observe"), shutdown.clone());
         // This machine's own figures, as the server's are.
         let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
         crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
@@ -860,6 +872,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut retire_at: Option<Instant> = None;
     let mut retire_span: Option<tracing::Span> = None;
     let mut retire_job: Option<String> = None;
+    // Shutting down, until when the loop runs on: the log sources' last writes come back over its
+    // connection before they write their places down (a stop then repeats no record).
+    let mut lingering: Option<Instant> = None;
     #[cfg(unix)]
     let mut moved: std::collections::HashSet<crate::instances::Owned> = std::collections::HashSet::new();
     #[cfg(unix)]
@@ -961,6 +976,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     };
 
     loop {
+        if let Some(until) = lingering
+            && (crate::observe::collect::get().is_none_or(|c| c.stopped()) || Instant::now() >= until)
+        {
+            return Ok(());
+        }
         // Ephemeral agents leave once their one job is done and everything is delivered.
         if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() {
             tracing::info!("ephemeral agent finished its job; exiting");
@@ -985,7 +1005,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             return Ok(());
         }
         let ev = futures::select_biased! {
-            () = shutdown.cancelled().fuse() => Ev::Shutdown,
+            () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
@@ -1006,10 +1026,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         };
         match ev {
             Ev::Shutdown => {
+                if lingering.is_some() {
+                    continue;
+                }
                 for r in jobs.values() {
                     r.cancel.cancel();
                 }
-                return Ok(());
+                match crate::observe::collect::get() {
+                    Some(c) if !c.stopped() => {
+                        c.stop_signal();
+                        lingering = Some(Instant::now() + Duration::from_secs(3));
+                    }
+                    _ => return Ok(()),
+                }
             }
             #[cfg(not(unix))]
             Ev::Bg(b) => match b {},

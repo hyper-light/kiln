@@ -175,6 +175,8 @@ enum Input {
     /// Samples as a request decoded them: keys once, samples flat.
     Samples(kiln_obs::otlp::metrics::Decoded),
     Logs(Vec<Record>),
+    /// Log records whose sender waits to know they are written (a file's reader).
+    LogsAcked(Vec<Record>, super::ingest::Ack),
     Staged { generation: u64, msg: Box<Message>, ok: bool },
     Fetched { generation: u64, done: u64, of: u64 },
     /// Cut the store and compact the log now, keeping nothing (an operator's, or a test's).
@@ -184,6 +186,8 @@ enum Input {
     Verified { at: u64, digest: u64 },
     /// The server's scrape targets, all of them: each runner is told those it reads.
     Scrapes(Vec<(String, super::scrape::Target)>),
+    /// The server's log sources, all of them: as scrape targets.
+    LogSources(Vec<(String, super::collect::Source)>),
 }
 
 /// What a node has taken to write and not yet cut into a write, against the batcher's bound: taken
@@ -409,6 +413,11 @@ impl Observe {
         let _ = self.tx.send(Input::Scrapes(all));
     }
 
+    /// The server's log sources now: each runner is told those it reads, now and when it connects.
+    pub fn set_log_sources(&self, all: Vec<(String, super::collect::Source)>) {
+        let _ = self.tx.send(Input::LogSources(all));
+    }
+
     /// Log records of kiln's own (its events): taken up to the bound itself, else refused and
     /// counted as dropped.
     pub fn log(&self, records: Vec<Record>) {
@@ -421,22 +430,42 @@ impl Observe {
         self.log_within(records, WAITING_LOG_BYTES as u64 / 4 * 3, false)
     }
 
+    /// Log records read from a source that can be read again (a file, the journal): as
+    /// [`Observe::offer_logs`], and `ack` given once they are written, so the reader moves its
+    /// place past them only then. Refused, they come back and the ack is never given: the reader
+    /// offers them again.
+    pub fn offer_logs_acked(&self, records: Vec<Record>, ack: super::ingest::Ack) -> Result<(), Vec<Record>> {
+        self.log_within_acked(records, WAITING_LOG_BYTES as u64 / 4 * 3, false, Some(ack))
+    }
+
     fn log_within(&self, records: Vec<Record>, max: u64, count: bool) -> bool {
-        if records.is_empty() {
-            return true;
+        self.log_within_acked(records, max, count, None).is_ok()
+    }
+
+    fn log_within_acked(&self, records: Vec<Record>, max: u64, count: bool, ack: Option<super::ingest::Ack>) -> Result<(), Vec<Record>> {
+        if records.is_empty() && ack.is_none() {
+            return Ok(());
         }
         let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
         let a = &self.admission;
-        if (!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max) {
+        if !records.is_empty() && ((!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max)) {
             if count {
                 a.refused.fetch_add(records.len() as u64, Ordering::Relaxed);
             }
-            return false;
+            return Err(records);
         }
-        if self.tx.send(Input::Logs(records)).is_err() {
+        let input = match ack {
+            Some(ack) => Input::LogsAcked(records, ack),
+            None => Input::Logs(records),
+        };
+        if let Err(e) = self.tx.send(input) {
             a.left_log_bytes.fetch_add(n, Ordering::AcqRel);
+            return Err(match e.0 {
+                Input::Logs(r) | Input::LogsAcked(r, _) => r,
+                _ => Vec::new(),
+            });
         }
-        true
+        Ok(())
     }
 
     /// Cuts the store and compacts the group's log now, keeping nothing: a member behind takes an
@@ -566,6 +595,7 @@ struct Owner {
     batcher: Batcher,
     /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
     scrapes: Vec<(String, super::scrape::Target)>,
+    log_sources: Vec<(String, super::collect::Source)>,
     joiner: Joiner,
     part: u64,
     error: Option<String>,
@@ -632,6 +662,7 @@ impl Owner {
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
             scrapes: Vec::new(),
+            log_sources: Vec::new(),
             joiner: Joiner::default(),
             part: 0,
             error: None,
@@ -824,7 +855,15 @@ impl Owner {
                     self.send_scrapes(&machine);
                 }
             }
+            Input::LogSources(all) => {
+                self.log_sources = all;
+                let up: Vec<String> = self.up.iter().cloned().collect();
+                for machine in up {
+                    self.send_log_sources(&machine);
+                }
+            }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
+            Input::LogsAcked(records, ack) => self.batcher.logs_acked(records, ack, Instant::now()),
             Input::Staged { generation, msg, ok } => {
                 if self.fetching.as_ref().is_some_and(|f| f.generation == generation) {
                     self.fetching = None;
@@ -883,12 +922,19 @@ impl Owner {
         };
         self.send(machine, Msg::Member { member, token, group: self.members.group.clone() }, Vec::new());
         self.send_scrapes(machine);
+        self.send_log_sources(machine);
     }
 
     /// Tells `machine` the scrape targets it reads.
     fn send_scrapes(&mut self, machine: &str) {
         let targets: Vec<(String, super::scrape::Target)> = self.scrapes.iter().filter(|(_, t)| t.read_by(machine)).cloned().collect();
         self.send(machine, Msg::Scrapes { targets }, Vec::new());
+    }
+
+    /// Tells `machine` the log sources it reads.
+    fn send_log_sources(&mut self, machine: &str) {
+        let sources: Vec<(String, super::collect::Source)> = self.log_sources.iter().filter(|(_, s)| s.read_by(machine)).cloned().collect();
+        self.send(machine, Msg::LogSources { sources }, Vec::new());
     }
 
     fn member_of(&self, machine: &str) -> Option<u64> {
@@ -936,7 +982,7 @@ impl Owner {
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
             }
-            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } => {}
+            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } | Msg::LogSources { .. } => {}
         }
     }
 
@@ -1047,6 +1093,11 @@ impl Owner {
             Msg::Scrapes { targets } => {
                 if let Some(s) = super::scrape::get() {
                     s.set(&targets);
+                }
+            }
+            Msg::LogSources { sources } => {
+                if let Some(c) = super::collect::get() {
+                    c.set(&sources);
                 }
             }
             Msg::Write { .. } | Msg::Status(_) => {}
@@ -1293,6 +1344,7 @@ impl Owner {
         }
         s.disk_bytes = self.dir_bytes;
         s.scrapes = super::scrape::get().map(|s| s.states()).unwrap_or_default();
+        s.collect = super::collect::get().map(|c| c.states()).unwrap_or_default();
         s
     }
 
