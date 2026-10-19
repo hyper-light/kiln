@@ -28,7 +28,6 @@ import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
-import { StateWord } from "./parts";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
@@ -546,12 +545,9 @@ function AgentLoading() {
               </Link>
             </p>
             <h1 className="ag-title hx-ghost">Agent</h1>
-            <div className="ag-turn-row hx-ghost" aria-hidden="true" />
-            <div className="ag-state hx-ghost" aria-hidden="true">
-              <StateWord a={{ status: "starting", approvals: [] }} />
-            </div>
           </div>
         </div>
+        <div className="ag-clock-row" aria-hidden="true" />
         <div className="ag-run rs-tuner" aria-hidden="true">
           <div className="rs-top">
             <p className="rs-line" />

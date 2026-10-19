@@ -1,6 +1,6 @@
 /**
  * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
- * the agent's name, a line of state, round controls; then how it runs — permissions, model, effort —
+ * the agent's name, state on the stop control's border; then how it runs — permissions, model, effort —
  * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
  */
 import * as React from "react";
@@ -8,74 +8,52 @@ import { Link, useNavigate } from "@/lib/router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
 import { useSuspenseResource } from "@/lib/resource";
-import { useNow } from "@/lib/hooks";
-import { relativeTime } from "@/lib/format";
-import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
-import { useListener } from "./dom";
+import { agentLabel, hasOwnName, modelLabel } from "./derive";
+import { useClock, useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
 import { AtLimit } from "./elsewhere";
-import { LimitBadge, UsagePanel } from "./limits";
-import { machineName, StateWord } from "./parts";
+import { LimitBadge, topLimit, UsagePanel } from "./limits";
+import { machineName } from "./parts";
 import { RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
-import { Optic, PrismLabel, formatThought } from "./signals";
+import { formatThought } from "./signals";
 import "./console.css";
 
-/** A turn under way, said plainly: for how long, at what effort, and what it's doing, so a long
- *  think doesn't look like nothing happening. Once a stop is asked it says so, and if the turn goes
- *  on regardless it offers to force it. It has a row of its own, there between turns too (saying
- *  when the last one ended), so nothing moves as a turn starts, ticks, thinks or ends. */
-function TurnLine({ state, activity, stopAt, onForce }: { state: State | null; activity?: string; stopAt: number | null; onForce?: () => void }) {
-  const now = useNow();
-  const doing = state?.doing || activity || "Working";
-  const thinking = /^think/i.test(doing);
-  const started = state?.turn_started;
-  const stuck = stopAt != null && now - stopAt > FORCE_STOP_AFTER_MS;
+type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
+
+function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null): { tone: BorderState; label: string } {
+  if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
+  if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
+  if (status === "exited") return { tone: "stopped", label: "Stopped" };
+  if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "ready", label: "Waiting for you" };
+  if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
+  if (status === "running") return { tone: "active", label: "Working" };
+  if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
+  return { tone: "ready", label: "Ready" };
+}
+
+/** State lives on the existing button's border. Its shape, icon and hit area never animate. */
+function TurnControl({ tone, label, action, onClick, restart = false }: { tone: BorderState; label: string; action?: string; onClick?: () => void; restart?: boolean }) {
   return (
-    <span className="ag-turn">
-      <Optic state={state?.status === "waiting" ? "waiting" : thinking ? "thinking" : "tool"} />
-      {started != null && <span className="ag-turn-meta ag-turn-time">{formatThought((now - started) / 1000)}</span>}
-      {state?.effort && <span className="ag-turn-meta ag-turn-effort">{state.effort} effort</span>}
-      {(state?.kept ?? 0) > 0 && <span className="ag-turn-meta ag-turn-kept">kept going ×{state?.kept}</span>}
-      <PrismLabel live className="ag-turn-what">
-        {stopAt == null ? doing : stuck ? "Still running" : "Stopping…"}
-      </PrismLabel>
-      {stuck && onForce && (
-        <button type="button" className="ag-turn-force" onClick={onForce}>
-          Force stop
-        </button>
-      )}
-    </span>
+    <>
+      <RoundButton className="ag-turn-control" data-state={tone} label={action ? `${label} · ${action}` : label} disabled={!onClick} onClick={onClick}>
+        {restart ? <RotateCcw size={15} aria-hidden="true" /> : <Pause size={15} aria-hidden="true" />}
+      </RoundButton>
+      <span className="sr-only" role="status">{label}</span>
+    </>
   );
 }
 
-/** How a turn ended, in words, when it didn't simply finish. */
-const ENDED: Record<string, string> = {
-  cut: "stopped part-way",
-  stopped: "stopped by you",
-  limit: "stopped at a limit",
-  refused: "the model wouldn't go on",
-  blocked: "not allowed to go on",
-};
+/** Only a pending stop needs to tick; once it stalls, the same button offers a force stop. */
+function StoppingControl({ stopAt, onForce, unavailable }: { stopAt: number; onForce: () => void; unavailable: boolean }) {
+  const stuck = useClock(1000) - stopAt > FORCE_STOP_AFTER_MS;
+  return <TurnControl tone={unavailable ? "disconnected" : "stopped"} label={stuck ? "Still running" : "Stopping…"} action={stuck ? "Force stop" : undefined} onClick={stuck ? onForce : undefined} />;
+}
 
-/** Between turns: when the last one ended, and how if it didn't simply finish. */
-function LastTurn({ state, status }: { state: State | null; status: Status }) {
-  const now = useNow();
-  const t = state?.last_turn;
-  // An existing conversation resumes; only a new one starts.
-  if (status === "starting") return <span className="ag-turn ag-turn-idle ag-turn-meta">{state?.harness_session ? "Resuming…" : "Starting…"}</span>;
-  if (!t) return null;
-  const ago = relativeTime(t.at / 1000, now);
-  const how = ENDED[t.how];
-  return (
-    <span className="ag-turn ag-turn-idle">
-      <span className="ag-turn-meta ag-turn-effort">
-        Last turn ended {ago === "now" ? "just now" : ago}
-        {how && `, ${how}`}
-      </span>
-      {(t.kept ?? 0) > 0 && <span className="ag-turn-meta ag-turn-kept">· kept going ×{t.kept}</span>}
-    </span>
-  );
+/** The clock updates independently of the header and keeps enough room for hours. */
+function TurnTime({ started }: { started: number }) {
+  const now = useClock(1000);
+  return <span className="ag-turn-time" title="Time in this turn" aria-label={`Time in this turn: ${formatThought((now - started) / 1000)}`}>{formatThought((now - started) / 1000)}</span>;
 }
 
 export function AgentHeader({
@@ -119,14 +97,16 @@ export function AgentHeader({
   const navigate = useNavigate();
   const features = meta?.features ?? [];
   const running = status === "running" || status === "waiting";
-  const activity = state?.activity ?? info?.activity;
-  const cost = state?.usage?.cost_usd ?? info?.cost_usd ?? 0;
   const plan = state?.plan ?? info?.plan;
-  const approvals = state?.approvals ?? [];
+  const unavailable = status === "disconnected" || conn !== "open";
+  const signal = turnSignal(status, conn, state, info);
+  // Stop can use HTTP while its socket reconnects; keep that escape available.
+  const canStop = running && features.includes("interrupt");
+  const canRestart = status === "exited" && features.includes("resume");
   const left = state?.left_behind ?? info?.left_behind ?? 0;
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
   // Settings always: kiln's own (usage limits) are there whatever the harness offers.
-  const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
+  const extra = [...(left > 0 && onBackground ? [{ label: `${left} left running…`, onSelect: onBackground }] : []), ...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
   // Codex takes a new permission mode, model or effort from its next turn.
   const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
   // How it runs, as one line; with the other harnesses' models on its machine where it can go on in them.
@@ -151,6 +131,8 @@ export function AgentHeader({
   const limits = state?.limits ?? info?.limits ?? [];
   const [usage, setUsage] = React.useState(false);
   const usageId = React.useId();
+  const top = topLimit(limits);
+  line.trailing = top?.used_percent != null ? <LimitBadge className="rs-v" limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} /> : undefined;
   useListener<KeyboardEvent>(
     document,
     "keydown",
@@ -176,7 +158,7 @@ export function AgentHeader({
             <span aria-hidden="true">·</span>
           </>
         )}
-        {info && <span>{machineName(info.target)}</span>}
+        {info && <span title={cwd}>{machineName(info.target)}</span>}
       </p>
       {/* The name and the buttons on one row, centred on each other. */}
       <div className="ag-top">
@@ -198,19 +180,8 @@ export function AgentHeader({
           )}
         </div>
         <div className="ag-actions">
-          {running && features.includes("interrupt") && (
-            <RoundButton
-              label={stopAt != null ? "Stopping…" : "Stop the current turn"}
-              disabled={stopAt != null}
-              onClick={onStop}
-            >
-              <Pause size={15} aria-hidden="true" />
-            </RoundButton>
-          )}
-          {status === "exited" && features.includes("resume") && (
-            <RoundButton label="Restart" onClick={() => send({ type: "restart" })}>
-              <RotateCcw size={15} aria-hidden="true" />
-            </RoundButton>
+          {canStop && stopAt != null ? <StoppingControl stopAt={stopAt} onForce={onForceStop} unavailable={unavailable} /> : (
+            <TurnControl {...signal} action={canStop ? "Stop the current turn" : canRestart ? "Restart" : undefined} onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : undefined} restart={canRestart} />
           )}
           {onFind && (
             <RoundButton label="Find in the conversation (Ctrl F)" onClick={onFind}>
@@ -233,25 +204,16 @@ export function AgentHeader({
           )}
         </div>
       </div>
-      <div className="ag-turn-row">{running ? <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} /> : <LastTurn state={state} status={status} />}</div>
-      <div className="ag-state">
-        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause, harness_session: state?.harness_session ?? info?.harness_session }} />
-        <span className="ag-cwd ag-wide-only" title={cwd}>
-          {tildify(cwd)}
-        </span>
-        {cost > 0 && (
-          <span className="ag-cost ag-wide-only" title={costText(cost, plan).title}>
-            {costText(cost, plan).text}
-          </span>
-        )}
-        {left > 0 && (
-          <button type="button" className="ag-left" onClick={onBackground}>
-            {left} left running
-          </button>
-        )}
-        <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
-        {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
+      <div className="ag-clock-row">
+        {running && state?.turn_started != null && <TurnTime started={state.turn_started} />}
       </div>
+      {switchTarget ? (
+        <React.Suspense fallback={<RunSettings {...line} />}>
+          <RunSettingsElsewhere {...line} target={switchTarget} />
+        </React.Suspense>
+      ) : (
+        <RunSettings {...line} />
+      )}
       {usage && limits.length > 0 && (
         <UsagePanel
           id={usageId}
@@ -271,13 +233,6 @@ export function AgentHeader({
             onUsage();
           }}
         />
-      )}
-      {switchTarget ? (
-        <React.Suspense fallback={<RunSettings {...line} />}>
-          <RunSettingsElsewhere {...line} target={switchTarget} />
-        </React.Suspense>
-      ) : (
-        <RunSettings {...line} />
       )}
     </header>
   );
