@@ -422,13 +422,14 @@ deployment, read a push webhook, and create a repository from a template.
 
 **When a release is done.** The provider reports, on every target of the environment, the release's
 commit, synced and healthy, steady for `watch.settle` (default 30 s). **When it failed**: a sync
-failed after its retries, health stayed Degraded past its grace, or `watch.timeout` passed. A
-provider that can't be reached leaves the release `delivering`, retried with backoff until the
-timeout. **When it was refused**: the provider can't make anything of it (Argo CD answers `4xx` to
-its Application, or reports a `ComparisonError`; KilnCD can't read its sources or render them) for
-`watch.refused` (default 60 s, room for a passing trouble to clear). The release fails, its commit
-is reverted, and the provider is handed what git says then: what ran before runs on. A release the
-provider never held before the timeout is reverted the same way.
+failed after its retries, or it didn't land within `watch.timeout` (health that stays Degraded, pods
+that never start). A provider that can't be reached leaves the release `delivering`, retried with
+backoff until the timeout. **When it was refused**: the provider can't make anything of it (Argo CD
+answers `4xx` to its Application, or reports a `ComparisonError`; KilnCD can't read its sources or
+render them) for `watch.refused` (default 60 s, room for a passing trouble to clear). **However it
+fails**, its commit is reverted and the provider is handed what git says then: what ran before runs
+on (and a provider that couldn't be reached takes it once it answers). A commit kiln didn't make
+(a release of origin `git`) stays: git is its author's.
 
 ### 8.2 KilnCD
 
@@ -720,7 +721,8 @@ kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's route
 | --- | --- |
 | The commit landed, the record didn't (a crash between them) | `release.json` carries the release number: kiln finds the commit and completes the record |
 | Someone pushed in between | the commit is redone on the new head, keeping their changes |
-| The provider can't be reached | the release stays `delivering`, retried with backoff until its timeout; then it fails, and if the provider never held it, its commit is reverted |
+| The provider can't be reached | the release stays `delivering`, retried with backoff until its timeout; then it fails and its commit is reverted, which the provider takes once it answers |
+| A release's sync fails, or it doesn't land within `watch.timeout` (Degraded, pods that never start) | it fails, its commit is reverted and the provider handed what ran before |
 | The provider refuses the release (its chart doesn't render, its spec is invalid) | after `watch.refused` the release fails, its commit is reverted and the provider handed what ran before |
 | A version that isn't in its registry | refused before it is recorded (`422`), with the newest versions there |
 | The server restarts mid-release | the watch item's lease lapses and a server takes it again |

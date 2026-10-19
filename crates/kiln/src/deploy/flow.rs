@@ -1283,9 +1283,12 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + settle.clamp(1, 5)).await?;
                 }
+                // Each way a release fails puts back what ran before (§8.1): its commit is
+                // reverted, and the provider handed what git says then.
                 Ok((Landed::Failed(why), view)) => {
                     r.provider = view;
-                    finish(d, r, State::Failed, Some(why)).await?;
+                    let undone = give_back(d, &r, &why).await;
+                    finish(d, r, State::Failed, Some(format!("{why}; {undone}"))).await?;
                 }
                 Ok((Landed::Refused(why), mut view)) => {
                     let since = r.provider.get("refused_at").and_then(Value::as_i64).unwrap_or(now);
@@ -1303,7 +1306,9 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
                 Ok((Landed::No, view)) if now - committed_at > timeout => {
                     r.provider = view;
-                    finish(d, r, State::Failed, Some(format!("it didn't land within {}s (watch.timeout_secs)", timeout))).await?;
+                    let why = format!("it didn't land within {timeout}s (watch.timeout_secs)");
+                    let undone = give_back(d, &r, &why).await;
+                    finish(d, r, State::Failed, Some(format!("{why}; {undone}"))).await?;
                 }
                 Ok((Landed::No, view)) => {
                     r.provider = view;
@@ -1316,7 +1321,12 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     let undone = give_back(d, &r, &format!("it never reached the provider: {e}")).await;
                     finish(d, r, State::Failed, Some(format!("it never reached the provider within {timeout}s: {e}; {undone}"))).await?;
                 }
-                Err(e) if now - committed_at > timeout => finish(d, r, State::Failed, Some(e)).await?,
+                // It held it, and can't be asked since: git goes back, and so does the provider
+                // once it answers again.
+                Err(e) if now - committed_at > timeout => {
+                    let undone = give_back(d, &r, &format!("the provider couldn't be asked: {e}")).await;
+                    finish(d, r, State::Failed, Some(format!("the provider couldn't be asked within {timeout}s: {e}; {undone}"))).await?;
+                }
                 Err(e) => {
                     r.message = Some(e);
                     store::update_release(st, &r, State::Delivering).await?;
@@ -1639,8 +1649,8 @@ async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
     undo(d, r, why).await
 }
 
-/// Puts git and the provider back after a release that won't land (refused, or cancelled while
-/// delivering): its commit is reverted, and the provider handed what git says then. Nothing is
+/// Puts git and the provider back after a release that won't land (failed, refused, or cancelled
+/// while delivering): its commit is reverted, and the provider handed what git says then. Nothing is
 /// deleted on the way: a registration git says is disabled keeps its objects. What was done, as
 /// the release's message says it.
 async fn undo(d: &Deploy, r: &Release, why: &str) -> String {

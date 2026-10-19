@@ -662,7 +662,8 @@ fn artifact(spec: &str) -> Result<(String, Value)> {
     Ok((name.to_owned(), json!({ "repository": repository, "tag": tag, "digest": digest })))
 }
 
-fn line(r: &Value) -> String {
+/// What a release does, in a few words: `deploy 1.4.2`, `secrets: DB_PASSWORD v4`.
+fn what(r: &Value) -> String {
     let what = match s(r, "kind") {
         "deploy" => format!("deploy {}", s(r, "version")),
         "rollback" => format!("rollback to {}{}", s(r, "version"), r.get("rollback_of").and_then(Value::as_i64).map(|t| format!(" (release {t})")).unwrap_or_default()),
@@ -670,10 +671,14 @@ fn line(r: &Value) -> String {
         k => k.to_owned(),
     };
     // A release that took on secrets' changes while it waited says so.
-    let what = match s(r, "secrets") {
+    match s(r, "secrets") {
         x if x.is_empty() || what.starts_with("secrets:") => what,
         x => format!("{what} (and secrets: {x})"),
-    };
+    }
+}
+
+fn line(r: &Value) -> String {
+    let what = what(r);
     let commit = s(r, "commit").get(..12).unwrap_or("");
     let msg = s(r, "message");
     format!(
@@ -720,7 +725,7 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             let v = api.call(Method::Get, &format!("/apps/{}/environments/{}", enc(&app), enc(&env)), None).await?;
             api.print(&v, |v| {
                 let running = v.get("running").filter(|r| !r.is_null());
-                println!("{app} in {env}: {}", running.map_or_else(|| "nothing released yet".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), s(r, "version"))));
+                println!("{app} in {env}: {}", running.map_or_else(|| "nothing released yet".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), what(r))));
                 if let Some(f) = v.get("in_flight").filter(|r| !r.is_null()) {
                     println!("in flight: {}", line(f));
                 }
@@ -982,7 +987,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 }
                 for e in v.get("environments").and_then(Value::as_array).into_iter().flatten() {
                     let env = e.pointer("/registration/environment").and_then(Value::as_str).unwrap_or("");
-                    let running = e.get("running").filter(|r| !r.is_null()).map_or_else(|| "nothing released".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), s(r, "version")));
+                    let running = e.get("running").filter(|r| !r.is_null()).map_or_else(|| "nothing released".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), what(r)));
                     println!("  {env:<12} {running}");
                 }
             });
