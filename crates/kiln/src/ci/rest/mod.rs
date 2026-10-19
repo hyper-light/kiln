@@ -158,6 +158,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::GET, ["code-scanning", "analyses"]) => scanning::analyses(&s, &q).await,
             (&Method::GET, ["code-scanning", "alerts"]) => scanning::alerts(&s, None, &q).await,
             (&Method::GET, ["code-scanning", "alerts", n]) => scanning::alerts(&s, Some(n), &q).await,
+            // codeql-action's status reports (how each step of it went): taken, as GitHub takes them.
+            (&Method::PUT, ["code-scanning", "analysis", "status"]) => Ok(srv::status(StatusCode::NO_CONTENT)),
             // codeql-action's feature flags: none here, so its defaults.
             (&Method::GET, ["code-scanning", "codeql", "features"]) => Ok(srv::json(StatusCode::OK, &json!({}))),
             // W18-R02: GitHub's attestations API.

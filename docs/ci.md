@@ -193,7 +193,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI) |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
 ---
@@ -5012,9 +5012,15 @@ and AC02.
 
   Measuring run creation found a git read on every run start, for reusable calls the workflow
   didn't make. It's skipped now, which cut the p99 from 44 ms to 9 ms in a debug build.
+- *AC09* (`crates/kiln/tests/mixed_fleet.rs`): a server at this version with its own runner, and
+  a runner built from `main` before the CI work (`KILN_OLD_BIN`: kiln 0.1.0 of edc9ae8, no
+  `CAP_CI2`). The old runner enrolls and connects as it did then. Its v1 job (`runs-on: [old]`)
+  runs on it and succeeds. The engine's leg only the old runner's labels match waits with
+  `capability`, naming it, and never fails; the leg the new runner can take runs there and
+  succeeds. It passed on 2026-10-19.
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03 to AC06 and AC09; the rest of F-21; an authenticated
-  way for legs to read github.com's API (W18's egress proxy).
+  with test tenants (W11-AC03); AC03 to AC06; the rest of F-21; an authenticated way for legs to
+  read github.com's API (W18's egress proxy).
 
 ---
 

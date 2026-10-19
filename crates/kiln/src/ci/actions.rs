@@ -218,7 +218,10 @@ pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
             let p = parent.to_path_buf();
             crate::rt::blocking(move || std::fs::create_dir_all(p)).await??;
         }
-        gitops::run_git(hub, &["clone", "--bare", "--quiet", &url, &d], GIT_TIMEOUT).await?;
+        // Treeless: every commit, and a commit's trees and files only when one is read (its
+        // `action.yml`, its tarball). An action repository that keeps its built code in every
+        // commit (codeql-action) mirrors in seconds, not minutes.
+        gitops::run_git(hub, &["clone", "--bare", "--quiet", "--filter=tree:0", &url, &d], GIT_TIMEOUT).await?;
     }
     let full_sha = r.git_ref.len() == 40 && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
     let fetched = if full_sha {

@@ -114,13 +114,13 @@ fn w22_ac09_mixed_fleet() -> anyhow::Result<()> {
                 found = Some(job.clone());
             }
         }
-        if let Some(job) = found.filter(|j| j.get("status").and_then(Value::as_str).is_some_and(|st| matches!(st, "success" | "failed" | "cancelled"))) {
+        if let Some(job) = found.filter(|j| j.get("status").and_then(Value::as_str).is_some_and(|st| matches!(st, "succeeded" | "failed" | "cancelled" | "timed_out"))) {
             break job;
         }
         anyhow::ensure!(Instant::now() < deadline, "the v1 job didn't finish: {runs}\n--- old runner:\n{}\n--- server:\n{}", old_log(), s.log());
         std::thread::sleep(Duration::from_millis(500));
     };
-    assert_eq!(v1.get("status").and_then(Value::as_str), Some("success"), "{v1}\n{}", old_log());
+    assert_eq!(v1.get("status").and_then(Value::as_str), Some("succeeded"), "{v1}\n{}", old_log());
     assert_eq!(v1.get("agent").and_then(Value::as_str), Some("old-runner"), "{v1}");
     // The engine: on-new ran on the new runner; old-only waits for a newer kiln on the old one.
     let deadline = Instant::now() + Duration::from_secs(300);

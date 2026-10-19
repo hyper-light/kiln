@@ -91,11 +91,12 @@ def family_reason(name, text):
     if name.startswith("pages_"):
         return "publishes to GitHub Pages (configure-pages, deploy-pages): kiln has no Pages (W14)"
     if name.startswith("code-scanning_"):
-        if "upload-sarif" in text or "codeql-action" in text:
-            return "uploads SARIF to GitHub code scanning: not in kiln's facade yet (W14)"
         secrets = sorted(set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text)) - {"GITHUB_TOKEN"})
         if secrets:
             return "needs an account (" + ", ".join(secrets) + ")"
+        # Their SARIF goes to kiln's facade, as to GitHub's code scanning (W14).
+        if "upload-sarif" in text or "codeql-action" in text:
+            return None
         return "needs GitHub's dependency graph or security APIs: not in kiln's facade yet (W14)"
     runs_on = " ".join(re.findall(r"runs-on:\s*(.+)", text))
     if "ubuntu" not in runs_on and "${{" not in runs_on:
