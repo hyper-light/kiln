@@ -168,6 +168,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         let secure = is_secure(&hub, &req);
         return Ok(f.serve(&slug, req, secure).await);
     }
+    // A peered cluster under this one's own address (`/.kiln-peer/<slug>/`, kiln reached by
+    // address): its API forwarded, its pages this cluster's app (in the browser) drawing it.
+    if let Some((f, slug, page)) = crate::peers::route_path(&hub, &req) {
+        if page {
+            return Ok(crate::ui::shell(&req));
+        }
+        let secure = is_secure(&hub, &req);
+        return Ok(f.serve_path(&slug, req, secure).await);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let seg = segments(&path);
@@ -589,7 +598,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "agents", "wait"]) => own_op(&hub, &caller, "agents.wait", query_value(&q)).await,
         (&Method::GET, ["api", "harness", "agents", id]) => own_op(&hub, &caller, "agents.get", json!({ "agent": id })).await,
         (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => own_op(&hub, &caller, &format!("agents.{what}"), json!({ "agent": id })).await,
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop")]) => {
+        (&Method::GET, ["api", "harness", "changes"]) => own_op(&hub, &caller, "agents.changes", query_value(&q)).await,
+        (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => own_op(&hub, &caller, "agents.workspace", json!({ "agent": id })).await,
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             let mut body = body_value(req).await?;
             if let Some(o) = body.as_object_mut() {
@@ -598,6 +609,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             own_op(&hub, &caller, &name, body).await
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
+        (&Method::GET, ["api", "harness", "workspaces"]) => Ok(harness_workspaces(&hub).await),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
         (&Method::POST, ["api", "harness", "sessions"]) => harness_open(&hub, req).await,
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
@@ -2109,10 +2121,10 @@ fn join_info(hub: &Hub) -> Response {
             "token": token,
             "server": url,
             "quic": hub.cfg.server.quic_advertise,
-            "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,bench"),
-            "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels macos"),
+            "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,bench"),
+            "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels macos"),
             "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'windows'"),
-            "manual": format!("kiln agent --server {url} --token {token} --labels baremetal,bench"),
+            "manual": format!("kiln agent --server {url} --token={token} --labels baremetal,bench"),
             // No token: the machine asks to join and an admin approves it (verification code).
             "join": format!("curl -fsSL {url}/install.sh | sh -s -- --join"),
             "join_manual": format!("kiln join --server {url}"),
@@ -2121,8 +2133,8 @@ fn join_info(hub: &Hub) -> Response {
             // One line per OS that downloads kiln from this server and installs the agent with the
             // join token (`install.sh` passes `--token`/`--labels` to `kiln install --agent`).
             "install": {
-                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,linux"),
-                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,macos"),
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,linux"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,macos"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'baremetal,windows'"),
             },
             // The join token is kept in <data>/join.token and does not expire.
@@ -2144,8 +2156,8 @@ fn outpost_invite(hub: &Hub) -> Response {
             "token": token,
             "expires_at": expires_at,
             "commands": {
-                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
-                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token={token}"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token={token}"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost -Token '{token}'"),
             },
             "ask": {
@@ -3234,6 +3246,22 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
 // ------------------------------------------------------------------ agent sessions (kiln-native)
 
 /// The harnesses each machine offers; `?target=` narrows it to one ("local", "agent:<name>").
+/// Where agents can have workspaces of their own (docs/agentic.md, W), by target (`local`,
+/// `agent:<name>`): `{available, why_not?, mount?}` for the server and each connected runner.
+async fn harness_workspaces(hub: &Hub) -> Response {
+    let mut out = serde_json::Map::new();
+    let mut targets = vec!["local".to_owned()];
+    targets.extend(hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
+    for t in targets {
+        let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
+            Ok(()) => json!({"available": true}),
+            Err(why) => json!({"available": false, "why_not": why}),
+        };
+        out.insert(t, v);
+    }
+    srv::json(StatusCode::OK, &serde_json::Value::Object(out))
+}
+
 fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     let all = hub.harness.kinds();
     match q.get("target") {
@@ -3419,6 +3447,16 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     // `plans.run`), never what's asked.
     body.spec.parent = None;
     body.spec.plan_run = None;
+    // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
+    // machine that can make one: one that can't would let it work in the folder itself, unasked.
+    match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
+        None | Some("folder") => body.spec.workspace = None,
+        Some("volume") => {
+            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|why| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+            body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
+        }
+        Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("a workspace is \"folder\" or \"volume\", not {other:?}"))),
+    }
     // Agents run programs as the machine's user, like terminals: the same switch governs both.
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
@@ -3647,6 +3685,12 @@ async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
 /// stream's chunks (binary, as its runner sent them: `crate::browser::stream::frame`) and events
 /// (text, JSON); it sends `{"input": [...]}` (what its person does) and `{"control": {...}}`
 /// (resize, pause, keyframe, go, reload, back, forward).
+///
+/// With the server's WebRTC on (`crate::harness::webrtc`) it's told `{"webrtc": {"can": true}}`,
+/// and may send `{"webrtc": {"offer": sdp}}`, answered `{"webrtc": {"answer": sdp}}` (or
+/// `{"error"}`); once its peer shows the stream it sends `{"webrtc": {"playing": true}}` and the
+/// chunks go to the peer alone, until it says `{"playing": false}` or `{"close": true}`, or the
+/// peer goes (`{"webrtc": {"gone": why}}`).
 fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
     let me = person(&req);
     let live = hub.harness.streams.get(sid).filter(|l| l.session == id && l.for_whom(me.as_deref())).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
@@ -3662,34 +3706,116 @@ fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
 
 async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, socket: ws::WebSocket) -> anyhow::Result<()> {
     use crate::harness::streams::ToViewer;
+    use crate::harness::webrtc::{Peer, Said};
     use futures::FutureExt as _;
+    /// A key frame asked for a peer's loss at most this often.
+    const KEY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    enum Next {
+        Socket(Option<Result<Message, tungstenite::Error>>),
+        Said(Option<Said>),
+        Stream(Result<ToViewer, async_channel::RecvError>),
+    }
     let (mut tx, mut rx) = socket.split();
     let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
+    let rtc = &hub.harness.webrtc;
+    // The viewer's WebRTC peer, and whether it shows the stream (its chunks then go there alone).
+    let mut peer: Option<Peer> = None;
+    let mut playing = false;
+    let mut keyed: Option<std::time::Instant> = None;
     let r: anyhow::Result<()> = async {
+        if rtc.on() {
+            tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
+        }
         loop {
-            futures::select_biased! {
-                m = rx.next().fuse() => match m {
-                    Some(Ok(Message::Text(t))) => {
-                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
-                        if let Some(events) = v.get("input").filter(|e| e.is_array()) {
-                            live.input(&hub, events).await;
-                        }
-                        if let Some(c) = v.get("control").filter(|c| c.is_object()) {
-                            live.control(&hub, c).await;
-                        }
+            let next = {
+                let said = async {
+                    match &peer {
+                        Some(p) => p.said.recv().await.ok(),
+                        None => futures::future::pending().await,
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                    _ => {}
-                },
-                m = from_stream.recv().fuse() => match m {
-                    Ok(ToViewer::Chunk(b)) => tx.send(ws::binary(b)).await?,
-                    Ok(ToViewer::Event(e)) => tx.send(ws::text(e)).await?,
-                    Err(_) => return Ok(()),
-                },
+                };
+                futures::select_biased! {
+                    m = rx.next().fuse() => Next::Socket(m),
+                    s = said.fuse() => Next::Said(s),
+                    m = from_stream.recv().fuse() => Next::Stream(m),
+                }
+            };
+            match next {
+                Next::Socket(Some(Ok(Message::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
+                    if let Some(events) = v.get("input").filter(|e| e.is_array()) {
+                        live.input(&hub, events).await;
+                    }
+                    if let Some(c) = v.get("control").filter(|c| c.is_object()) {
+                        live.control(&hub, c).await;
+                    }
+                    let Some(w) = v.get("webrtc") else { continue };
+                    let was = playing;
+                    if let Some(sdp) = w.get("offer").and_then(serde_json::Value::as_str) {
+                        // A new peer, in place of one there was.
+                        peer = None;
+                        playing = false;
+                        let said = match rtc.offer(&live.codec(), sdp) {
+                            Ok((p, answer)) => {
+                                peer = Some(p);
+                                serde_json::json!({"webrtc": {"answer": answer}})
+                            }
+                            Err(e) => serde_json::json!({"webrtc": {"error": format!("{e:#}")}}),
+                        };
+                        tx.send(ws::text(said.to_string())).await?;
+                    }
+                    if let Some(on) = w.get("playing").and_then(serde_json::Value::as_bool) {
+                        playing = on && peer.is_some();
+                    }
+                    if w.get("close").and_then(serde_json::Value::as_bool) == Some(true) {
+                        peer = None;
+                        playing = false;
+                    }
+                    // Back on this socket: its decoder starts again from a key frame.
+                    if was && !playing {
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                }
+                Next::Socket(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => return Ok(()),
+                Next::Socket(_) => {}
+                // Connected, it starts from a key frame; one lost, a key frame mends it.
+                Next::Said(Some(Said::Connected)) => {
+                    keyed = Some(std::time::Instant::now());
+                    live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                }
+                Next::Said(Some(Said::Keyframe)) => {
+                    if keyed.is_none_or(|k| k.elapsed() >= KEY_EVERY) {
+                        keyed = Some(std::time::Instant::now());
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                }
+                Next::Said(gone) => {
+                    let why = match gone {
+                        Some(Said::Gone(why)) => why,
+                        _ => "WebRTC stopped on this server".to_owned(),
+                    };
+                    peer = None;
+                    if playing {
+                        playing = false;
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                    tx.send(ws::text(serde_json::json!({"webrtc": {"gone": why}}).to_string())).await?;
+                }
+                Next::Stream(Ok(ToViewer::Chunk(b))) => {
+                    if let Some(p) = &peer {
+                        p.chunk(&b);
+                    }
+                    if !playing {
+                        tx.send(ws::binary(b)).await?;
+                    }
+                }
+                Next::Stream(Ok(ToViewer::Event(e))) => tx.send(ws::text(e)).await?,
+                Next::Stream(Err(_)) => return Ok(()),
             }
         }
     }
     .await;
+    drop(peer);
     hub.harness.streams.leave(&hub, &live, me).await;
     r
 }

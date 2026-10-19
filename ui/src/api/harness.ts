@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { wsUrl } from "@/api/client";
+import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import type { TerminalSessionInfo } from "./types";
 
@@ -650,6 +651,25 @@ export interface AgentInfo {
   plan_run?: string;
   /** Started without its harness's skip-every-check mode (an agent it starts can't have it either). */
   no_bypass?: boolean;
+  /** Its workspace of its own: a Slates volume over `over` (its repository's top), once made. */
+  workspace?: { kind: string; over?: string; sub?: string; made?: { volume: string; name: string; mount: string } };
+}
+
+/** What writing an agent's workspace back to its folder would do (`agents.land` without a landing). */
+export interface LandingPlan {
+  plan: {
+    grant_required: boolean;
+    landing?: number;
+    manifest?: string;
+    summary?: { by_action: { action: string; count: number }[]; bytes: number; filtered_out: number };
+    conflicts?: string[];
+    outcome?: unknown;
+  };
+  /** Left out, from the top: git's own directory. */
+  excludes: string[];
+  /** Whether this machine's Slates can take a person's go-ahead from kiln (not on Linux yet), and why not. */
+  can_write: boolean;
+  why_not?: string;
 }
 
 /** An agent's children that still run (and theirs), as `agents.children` gives them. */
@@ -705,7 +725,12 @@ export interface Spec {
   effort?: string;
   /** Commands on other runners (kiln reach): unset, it may use any; "off", only its own machine; else where it prefers them (a runner, or `linux/x86_64`). */
   reach?: string;
+  /** Where it works: its folder itself (none), or a Slates volume of its own laid over the folder (`volume`). */
+  workspace?: { kind: "volume" };
 }
+
+/** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
+export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
 
 export type Command =
   | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
@@ -806,10 +831,25 @@ export interface Listening {
   agents: boolean;
 }
 
-/** What a person may open live from a session (`GET .../preview`). */
+/** A device a live page can be laid out as (`crate::browser::devices`). */
+export interface Device {
+  name: string;
+  width: number;
+  height: number;
+  scale: number;
+  mobile: boolean;
+  agent?: string;
+}
+
+/** What a person may open live from a session (`GET .../preview`): its machine's ports, its
+ *  project's app, the engines it has, the devices kiln knows. */
 export interface PreviewLook {
   ports: Listening[];
   app: { configured: boolean; start?: string; port?: number; path?: string; running?: string | null; error?: string };
+  engines?: { chromium?: boolean; firefox?: boolean; webkit?: boolean; ios?: boolean };
+  devices?: Device[];
+  /** The machine's system (`macos`, `linux`, `windows`). */
+  platform?: string;
 }
 
 /** A live page of a session, as the server relays it (`crate::harness::streams::Live::view`). */
@@ -817,7 +857,7 @@ export interface StreamView {
   id: string;
   session: string;
   machine: string;
-  spec: { url?: string; title?: string; profile?: string };
+  spec: { url?: string; title?: string; profile?: string; engine?: string; device?: string };
   by: string;
   at: number;
   viewers: number;
@@ -852,7 +892,7 @@ export interface Recording {
 }
 
 /** Where a recording's file is read (`video`, `inputs`, `test`). */
-export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => `/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`;
+export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => apiPath(`/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`);
 
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
@@ -863,7 +903,7 @@ export const harnessApi = {
   /** Its live pages. */
   streams: (id: string) => call<StreamView[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/streams`),
   /** Open a live page: an address, or (`start`) the project's app; in a profile. */
-  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
+  openStream: (id: string, body: { url?: string; start?: boolean; profile?: string; engine?: string; device?: string; width?: number; height?: number; scale?: number; mobile?: boolean; title?: string }) =>
     call<StreamView>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/streams`, body),
   closeStream: (id: string, stream: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}/streams/${stream}`),
   /** Open the app on a port of its machine on this person's own device: a link to follow there. */
@@ -875,6 +915,14 @@ export const harnessApi = {
   recordings: (id: string) => call<Recording[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/recordings`),
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
+  /** Where agents can have workspaces of their own (Slates volumes), by target. */
+  workspaces: () => call<WorkspacesAvailable>("GET", "/api/harness/workspaces"),
+  /** An agent's workspace of its own, and the files under it changed on disk since it changed them. */
+  workspace: (id: string) => call<{ workspace: AgentInfo["workspace"] | null; drift: string[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/workspace`),
+  /** What writing its workspace to its folder would do. */
+  planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
+  /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
+  land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),

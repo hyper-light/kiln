@@ -17,14 +17,10 @@
 pub mod codes;
 pub mod forward;
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
-use futures::FutureExt as _;
 use http::StatusCode;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -38,10 +34,6 @@ pub const CHALLENGE_TTL: i64 = 30 * 60;
 /// How long a grant lasts: a frame opened from the picker gets a new one.
 pub const GRANT_TTL: i64 = 8 * 3600;
 const KV_PREFIX: &str = "peers:";
-/// Peers' ports on the server (kiln reached by address): this far above its HTTP port, at most
-/// [`PORTS`] of them.
-const PORT_OFFSET: u16 = 100;
-const PORTS: u16 = 100;
 const BODY_LIMIT: usize = 64 << 10;
 
 fn fail(code: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
@@ -85,11 +77,9 @@ pub struct Peer {
     /// Out: its CA (DER, base64url), from its response.
     #[serde(default)]
     pub ca: String,
-    /// Out: its name in addresses (`peer-<slug>.<domain>`) and its port on the server.
+    /// Out: its name in addresses: `peer-<slug>.<domain>`, `/.kiln-peer/<slug>/`.
     #[serde(default)]
     pub slug: String,
-    #[serde(default)]
-    pub port: u16,
     pub created_at: i64,
     #[serde(default)]
     pub created_by: String,
@@ -120,7 +110,7 @@ impl Peer {
         };
         json!({
             "id": self.id, "name": self.name, "direction": self.direction, "url": self.url, "role": self.role,
-            "slug": self.slug, "port": self.port, "state": state,
+            "slug": self.slug, "state": state,
             "fingerprint": self.public().map(|k| codes::fingerprint(&k)),
             "created_at": self.created_at, "created_by": self.created_by,
             "peered_at": (self.peered_at > 0).then_some(self.peered_at),
@@ -134,8 +124,6 @@ impl Peer {
 pub struct Peers {
     list: RwLock<Vec<Peer>>,
     forwarder: RwLock<Option<Arc<forward::Forwarder>>>,
-    /// Peers' listeners on the server, by port: the peer's slug, and what stops it.
-    listeners: Mutex<HashMap<u16, (String, crate::rt::Shutdown)>>,
 }
 
 impl Peers {
@@ -158,9 +146,16 @@ pub fn key(hub: &Hub) -> anyhow::Result<&'static codes::Key> {
     Ok(K.get_or_init(|| k))
 }
 
-/// This cluster's name in the codes it makes.
-fn our_name() -> String {
-    crate::os::hostname()
+/// This cluster's name, as the picker and the codes it makes say it: the host of its public
+/// address (`kiln.home`, `192.168.1.77`), else its machine's name. Not a pod's name, which a
+/// cluster in Kubernetes changes with every deploy.
+fn our_name(hub: &Hub) -> String {
+    let url = hub.cfg.server.public_url.trim();
+    let host = url.parse::<http::Uri>().ok().and_then(|u| u.host().map(|h| h.trim_start_matches('[').trim_end_matches(']').to_owned()));
+    match host {
+        Some(h) if !h.is_empty() && h != "localhost" && h != "127.0.0.1" && h != "::1" && h != "0.0.0.0" => h,
+        _ => crate::os::hostname(),
+    }
 }
 
 /// Load what the store keeps, then make it so: forwarders, listeners, runners told.
@@ -180,15 +175,14 @@ pub fn table(hub: &Hub) -> forward::Table {
         .all()
         .into_iter()
         .filter(|p| p.direction == Direction::Out && p.active())
-        .map(|p| forward::Route { kid: p.kid(), slug: p.slug, name: p.name, url: p.url, ca: p.ca, port: p.port })
+        .map(|p| forward::Route { kid: p.kid(), slug: p.slug, name: p.name, url: p.url, ca: p.ca })
         .collect();
     forward::Table { key: codes::encode_key(k.public()), kid: k.id(), peers }
 }
 
-/// After a change: the server's forwarder and listeners, every runner's front door, the UI.
+/// After a change: the server's forwarder, every runner's front door, the UI.
 async fn refresh(hub: &Arc<Hub>) {
     *hub.peered.forwarder.write() = Some(Arc::new(forward::Forwarder::new(table(hub))));
-    listen(hub);
     for r in hub.front_doors.runners() {
         crate::frontdoor::control::push(hub, &r, None, None).await;
     }
@@ -246,17 +240,6 @@ fn slug_for(name: &str, peers: &[Peer]) -> String {
     slug
 }
 
-/// The server's HTTP listener's address.
-fn http_addr(hub: &Hub) -> SocketAddr {
-    hub.cfg.server.http_addr.parse().unwrap_or(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 7070)))
-}
-
-/// The first port above the HTTP port's band no other peer has.
-fn free_port(hub: &Hub, peers: &[Peer]) -> u16 {
-    let base = http_addr(hub).port().saturating_add(PORT_OFFSET);
-    (base..base.saturating_add(PORTS)).find(|p| !peers.iter().any(|x| x.port == *p)).unwrap_or(0)
-}
-
 #[derive(Deserialize)]
 struct Register {
     name: String,
@@ -269,12 +252,11 @@ pub async fn register(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
     let (name, url) = (checked_name(&asked.name)?, checked_url(&asked.url)?);
     let k = key(hub).map_err(internal)?;
     let now = crate::util::now_unix();
-    let ch = codes::Challenge::new(&our_name(), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
+    let ch = codes::Challenge::new(&our_name(hub), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
     let peers = hub.peered.all();
     let p = Peer {
         id: crate::util::new_id(),
         slug: slug_for(&name, &peers),
-        port: free_port(hub, &peers),
         name,
         direction: Direction::Out,
         url,
@@ -302,7 +284,7 @@ pub async fn rechallenge(hub: &Arc<Hub>, actor: &str, id: &str) -> Answer {
     }
     let k = key(hub).map_err(internal)?;
     let now = crate::util::now_unix();
-    let ch = codes::Challenge::new(&our_name(), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
+    let ch = codes::Challenge::new(&our_name(hub), k, &hub.cfg.server.public_url, now, CHALLENGE_TTL).map_err(internal)?;
     p.nonce.clone_from(&ch.c);
     p.expires_at = ch.x;
     save(hub, &p).await?;
@@ -378,12 +360,11 @@ pub async fn authorize(hub: &Arc<Hub>, actor: &str, req: Request) -> Answer {
         role: role.to_owned(),
         ca: String::new(),
         slug: String::new(),
-        port: 0,
         created_at: now,
         created_by: actor.to_owned(),
         peered_at: now,
     };
-    let response = codes::Response::answer(&ch, &our_name(), k, role, &hub.pki.ca_der).and_then(|r| r.encode()).map_err(internal)?;
+    let response = codes::Response::answer(&ch, &our_name(hub), k, role, &hub.pki.ca_der).and_then(|r| r.encode()).map_err(internal)?;
     save(hub, &p).await?;
     hub.store.audit(actor.to_owned(), "peer.authorize".into(), format!("{} ({}) as {role}", p.name, p.public().map(|k| codes::fingerprint(&k)).unwrap_or_default())).await;
     hub.emit(&json!({ "type": "peers" }));
@@ -432,7 +413,7 @@ pub async fn list(hub: &Hub) -> Answer {
     Ok(srv::json(
         StatusCode::OK,
         &json!({
-            "name": our_name(), "fingerprint": codes::fingerprint(k.public()), "roles": codes::ROLES,
+            "name": our_name(hub), "fingerprint": codes::fingerprint(k.public()), "roles": codes::ROLES,
             "peers": peers.iter().map(|p| p.view(now)).collect::<Vec<_>>(),
         }),
     ))
@@ -441,7 +422,7 @@ pub async fn list(hub: &Hub) -> Answer {
 /// `GET /api/peers/open`: the clusters someone signed in here may open (the picker's list).
 pub fn openable(hub: &Hub) -> Answer {
     let peers: Vec<_> = hub.peered.all().into_iter().filter(|p| p.direction == Direction::Out && p.active()).map(|p| json!({ "id": p.id, "name": p.name, "slug": p.slug })).collect();
-    Ok(srv::json(StatusCode::OK, &json!({ "name": our_name(), "peers": peers })))
+    Ok(srv::json(StatusCode::OK, &json!({ "name": our_name(hub), "peers": peers })))
 }
 
 /// `POST /api/peers/:id/frame`: where to open a peer, for the person asking, from the address
@@ -453,11 +434,11 @@ pub fn frame(hub: &Hub, caller: &crate::authz::Caller, id: &str, host: &str, sec
         return Err(fail(StatusCode::CONFLICT, "It isn't peered yet."));
     }
     let role = caller.server_role().ok_or_else(|| fail(StatusCode::FORBIDDEN, "Opening a peered cluster takes a role on this whole cluster."))?;
-    let origin = origin_for(hub, &p, host, secure).map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    let (origin, action) = origin_for(hub, &p, host, secure).map_err(|e| fail(StatusCode::CONFLICT, e))?;
     let k = key(hub).map_err(internal)?;
     let g = codes::Grant { i: k.id(), a: p.kid(), s: caller.user.clone().unwrap_or_else(|| "owner".to_owned()), n: caller.name.clone(), r: role.to_owned(), e: crate::util::now_unix() + GRANT_TTL };
     let grant = g.sign(k).map_err(internal)?;
-    Ok(srv::json(StatusCode::OK, &json!({ "origin": origin, "action": format!("{origin}{}", forward::ENTER), "grant": grant, "expires_at": g.e })))
+    Ok(srv::json(StatusCode::OK, &json!({ "origin": origin, "action": action, "grant": grant, "expires_at": g.e })))
 }
 
 /// `host` without its port, and the port (IPv6 literals keep their brackets).
@@ -482,24 +463,38 @@ fn front_door_domain(hub: &Hub, host: &str) -> Option<String> {
     hub.front_doors.snapshot().into_iter().map(|(_, s, _)| s.domain.trim().to_ascii_lowercase()).find(|d| !d.is_empty() && (host == *d || host.ends_with(&format!(".{d}"))))
 }
 
-/// Where the browser that reached this cluster at `host` opens peer `p`: `peer-<slug>.<domain>`
-/// for a front door's domain (the same site as the page, so the frame keeps its cookie), else
-/// its port on the server, on the same host (a site doesn't count ports). Not `peer-<slug>.localhost`
-/// for `localhost`: browsers take each `*.localhost` name for a site of its own.
-fn origin_for(hub: &Hub, p: &Peer, host: &str, secure: bool) -> Result<String, String> {
+/// Where the browser that reached this cluster at `host` opens peer `p`, and where it posts the
+/// grant: `peer-<slug>.<domain>` for a front door's domain (the same site as the page, so the frame
+/// keeps its cookie; every runner's front door forwards it itself), else under this cluster's own
+/// address, `/.kiln-peer/<slug>/`, through whatever reaches it (one port, behind any forward).
+/// Not `peer-<slug>.localhost` for `localhost`: browsers take each `*.localhost` name for a site
+/// of its own.
+fn origin_for(hub: &Hub, p: &Peer, host: &str, secure: bool) -> Result<(String, String), String> {
     let (name, port) = split_host(host);
-    let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+    if name.is_empty() {
+        return Err("The request named no address to open it at.".into());
+    }
     let lower = name.to_ascii_lowercase();
     if let Some(domain) = front_door_domain(hub, &lower) {
-        return Ok(format!("https://{}{}.{domain}{port}", forward::LABEL, p.slug));
+        let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+        let origin = format!("https://{}{}.{domain}{port}", forward::LABEL, p.slug);
+        let action = format!("{origin}{}", forward::ENTER);
+        return Ok((origin, action));
     }
-    if secure {
-        return Err("This page is on HTTPS at an address without a front door's domain: open kiln at a runner's front-door domain to open peered clusters.".into());
-    }
-    if p.port == 0 {
-        return Err("This peer has no port on the server: open kiln at a runner's front-door domain.".into());
-    }
-    Ok(format!("http://{name}:{}", p.port))
+    let origin = format!("{}://{}", if secure { "https" } else { "http" }, host.trim());
+    let action = format!("{origin}{}{}/enter", forward::PATH, p.slug);
+    Ok((origin, action))
+}
+
+/// The peer a request under this cluster's own address is for (`/.kiln-peer/<slug>/…`), and
+/// whether it asks for a page: this cluster's app, which draws the peer from its API there
+/// (`ui/src/lib/peer-base.ts`), rather than the peer's API or the way in.
+pub fn route_path(hub: &Hub, req: &Request) -> Option<(Arc<forward::Forwarder>, String, bool)> {
+    let f = hub.peered.forwarder()?;
+    let (slug, tail) = f.slug_of_path(req.uri().path())?;
+    let page = matches!(*req.method(), http::Method::GET | http::Method::HEAD) && tail != "/enter" && tail != "/api" && !tail.starts_with("/api/");
+    let slug = slug.to_owned();
+    Some((f, slug, page))
 }
 
 /// The peer a request to the server's own listener is for: `peer-<slug>.<a front door's domain>`
@@ -531,82 +526,11 @@ pub fn caller(hub: &Hub, token: &str) -> Option<crate::authz::Caller> {
     Some(crate::authz::Caller::peer(&format!("peer:{}:{}", peer.name, g.n), role))
 }
 
-// ------------------------------------------------------------------ peers' ports on the server
-
-struct PortHandler {
-    hub: Arc<Hub>,
-    slug: String,
-}
-
-impl srv::Handler for PortHandler {
-    async fn handle(self: Arc<Self>, req: Request) -> Response {
-        match self.hub.peered.forwarder() {
-            Some(f) => f.serve(&self.slug, req, false).await,
-            None => srv::text(StatusCode::NOT_FOUND, "no such peered cluster here"),
-        }
-    }
-}
-
-/// Each peer our people open gets a port on the server, for kiln reached by address (no
-/// front-door domain to put `peer-<slug>.` under): started, and stopped when it ends.
-fn listen(hub: &Arc<Hub>) {
-    let want: HashMap<u16, String> = hub.peered.all().into_iter().filter(|p| p.direction == Direction::Out && p.active() && p.port != 0).map(|p| (p.port, p.slug)).collect();
-    let ip: IpAddr = http_addr(hub).ip();
-    let mut g = hub.peered.listeners.lock();
-    g.retain(|port, (slug, stop)| {
-        let keep = want.get(port) == Some(slug);
-        if !keep {
-            stop.cancel();
-        }
-        keep
-    });
-    for (port, slug) in want {
-        if g.contains_key(&port) {
-            continue;
-        }
-        let std_listener = match std::net::TcpListener::bind((ip, port)) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(port, peer = %slug, error = %e, "a peered cluster's port can't be opened; it opens at a front-door domain only");
-                continue;
-            }
-        };
-        let stop = crate::rt::Shutdown::new();
-        let (sd, handler) = (stop.clone(), Arc::new(PortHandler { hub: Arc::clone(hub), slug: slug.clone() }));
-        crate::rt::spawn(async move {
-            let listener = match hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128) {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(port, error = %e, "can't hand a peered cluster's port to the runtime");
-                    return;
-                }
-            };
-            loop {
-                let accepted = futures::select_biased! {
-                    () = sd.cancelled().fuse() => return,
-                    r = listener.accept().fuse() => r,
-                };
-                match accepted {
-                    Ok(stream) => {
-                        let (h, remote) = (Arc::clone(&handler), stream.peer_addr().ok());
-                        crate::rt::spawn_spread(async move {
-                            crate::http::server::serve_accepted(stream, h, remote, None).await;
-                        });
-                    }
-                    Err(_) => crate::rt::sleep(Duration::from_millis(100)).await,
-                }
-            }
-        });
-        tracing::info!(port, peer = %slug, "peered cluster's port open");
-        g.insert(port, (slug, stop));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn out(slug: &str, port: u16) -> Peer {
+    fn out(slug: &str) -> Peer {
         Peer {
             id: slug.into(),
             name: slug.into(),
@@ -618,7 +542,6 @@ mod tests {
             role: String::new(),
             ca: String::new(),
             slug: slug.into(),
-            port,
             created_at: 0,
             created_by: String::new(),
             peered_at: 0,
@@ -627,7 +550,7 @@ mod tests {
 
     #[test]
     fn names_become_addresses_once_each() {
-        let peers = vec![out("work", 7170)];
+        let peers = vec![out("work")];
         assert_eq!(slug_for("Work", &peers), "work-2");
         assert_eq!(slug_for("  ACME  Corp / EU ", &peers), "acme-corp-eu");
         assert_eq!(slug_for("ü!!", &peers), "cluster");

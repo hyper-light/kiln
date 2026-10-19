@@ -137,6 +137,34 @@ export interface RunStep {
   tries: number;
 }
 
+/** A met step's commit in its run's stack (docs/agentic.md P4). */
+export interface StackStep {
+  n: number;
+  /** `made`: its commit is in the stack; `nothing`: its agent changed no files; `failed`: its files go up with the next step's; `elsewhere`: its agent worked in another folder. */
+  state: "made" | "nothing" | "failed" | "elsewhere";
+  /** `D12`, `#34`; none until it is open. */
+  change: string | null;
+  /** Its page, or where to open it. */
+  url: string;
+  sha: string | null;
+  branch: string | null;
+  files: string[];
+  pushed: boolean;
+  error: string | null;
+}
+
+/** What a run's met steps are in review: one diff per step, each on the one before. */
+export interface RunStack {
+  /** Why the run has no stack (its folder isn't in a git repository, …). */
+  off: string | null;
+  /** `kiln`, `github`, `gitlab`, `bitbucket`, `git` (a remote kiln has no integration with) or `local` (no remote). */
+  provider: string;
+  repo: string | null;
+  trunk: string;
+  base: string | null;
+  steps: StackStep[];
+}
+
 /** A run of one agent per step, as it stands. */
 export interface PlanRunView {
   id: string;
@@ -152,6 +180,8 @@ export interface PlanRunView {
   steps: RunStep[];
   met: number;
   total: number;
+  /** Its met steps in review; none until a step is met. */
+  stack: RunStack | null;
 }
 
 /** A run of one agent per step, as lists show it. */

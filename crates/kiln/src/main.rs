@@ -221,7 +221,7 @@ struct ServerArgs {
     #[arg(long, env = "KILN_URL")]
     url: Option<String>,
     /// The server's admin token.
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
 }
 
@@ -241,7 +241,7 @@ struct OutpostArgs {
     /// join, as `kiln join` does: it shows a verification code, and an admin approves it (Runners ->
     /// Add machines) once the codes match. Once it has its certificate it runs on that, and needs
     /// neither again.
-    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
     /// Its name in kiln (default: this machine's hostname).
     #[arg(long, env = "KILN_AGENT_NAME")]
@@ -261,7 +261,7 @@ struct AgentArgs {
     /// QUIC address (host:port); defaults to what the server advertised at enrollment.
     #[arg(long, env = "KILN_QUIC")]
     quic: Option<String>,
-    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[arg(long, env = "KILN_AGENT_NAME")]
     name: Option<String>,
@@ -340,12 +340,18 @@ fn shutdown_on_signals(token: Shutdown) {
 /// [`kiln::supervise::HANDOVER_EXIT`], so the supervisor starts that binary at once.
 async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if opts.ephemeral {
-        return kiln::agent::run(opts, shutdown).await;
+        let r = kiln::agent::run(opts, shutdown).await;
+        kiln::browser::driven::stop_all().await;
+        return r;
     }
     let reg = kiln::sup::Registry::default();
     let sd = shutdown.clone();
     let h = kiln::sup::spawn(&reg, "agent", shutdown, move || kiln::agent::run(opts.clone(), sd.clone()));
     let _ = h.await;
+    // The supervisor drops the runner's loop as it stops (that loop's own shutdown never runs):
+    // the other engines' browsers it drove (Firefox, a WebDriver) stop here, or they'd outlive it.
+    // Chromium's go with their pipes.
+    kiln::browser::driven::stop_all().await;
     if kiln::agent::handed_over() {
         return Err(kiln::reach::cli::ExitWith(kiln::supervise::HANDOVER_EXIT).into());
     }
@@ -365,7 +371,35 @@ fn repo_path(file: &std::path::Path) -> String {
     at.and_then(|i| s.get(i + 1..)).unwrap_or(s.trim_start_matches('/')).trim_start_matches("./").to_owned()
 }
 
+/// The stack each thread of the runtime gets ([`kiln::rt`]): its shards run kiln's async work, whose
+/// futures nest deep, a debug build's deepest of all (verifying a webhook and `kiln workflow run`
+/// overflowed the 2 MiB a thread gets by default). Reserved, not used: pages are touched as needed.
+const THREAD_STACK: usize = 16 << 20;
+
+/// Threads spawned without a size of their own, the runtime's shards among them, get
+/// [`THREAD_STACK`]. Std reads `RUST_MIN_STACK` once, at the first spawn: it is set, read by a
+/// thread spawned and joined at once, then taken out again, so what kiln starts (agents, builds)
+/// sees the environment it was given. A value someone set stays as they set it.
+fn thread_stacks() {
+    if std::env::var_os("RUST_MIN_STACK").is_some() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: the first thing main does, while this process has one thread: nothing else reads or
+    // writes the environment meanwhile.
+    unsafe {
+        std::env::set_var("RUST_MIN_STACK", THREAD_STACK.to_string());
+    }
+    let _ = std::thread::spawn(|| {}).join();
+    #[allow(unsafe_code)]
+    // SAFETY: the thread above has ended: one thread again, as above.
+    unsafe {
+        std::env::remove_var("RUST_MIN_STACK");
+    }
+}
+
 fn main() -> ExitCode {
+    thread_stacks();
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();
@@ -787,5 +821,20 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&serde_json::to_string_pretty(&v)?);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    /// A token may begin with `-` (base64url): `--token <it>` takes it as the value, not a flag.
+    #[test]
+    fn a_token_that_begins_with_a_dash_is_taken_as_the_token() {
+        for args in [&["kiln", "agent", "--server", "http://x:7070", "--token", "-Hq3_z"][..], &["kiln", "outpost", "--server", "http://x:7070", "--token", "-Hq3_z"][..]] {
+            assert!(super::Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        assert!(super::Cli::try_parse_from(["kiln", "install", "--agent", "--server", "http://x:7070", "--token", "-Hq3_z"]).is_ok());
+        assert!(super::Cli::try_parse_from(["kiln", "cd", "--token", "-Hq3_z", "apps"]).is_ok());
     }
 }

@@ -272,10 +272,16 @@ pub struct Registry {
     pub visuals: super::visuals::Visuals,
     /// Pages streamed from agents' machines, relayed to their viewers (`super::streams`).
     pub streams: super::streams::Relay,
+    /// Streams to their viewers over WebRTC, when the server has it (`super::webrtc`).
+    pub webrtc: super::webrtc::Webrtc,
     /// Connections to ports of agents' machines, and the apps opened on people's devices over
     /// them (`super::opened`).
     pub ports: super::opened::Tunnels,
     pub opened: super::opened::Openings,
+    /// Tests: what every session started here runs instead of its harness (a program that isn't
+    /// there, so no harness ever starts, whatever this machine has installed).
+    #[cfg(test)]
+    test_program: Mutex<Option<String>>,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -341,6 +347,8 @@ impl Registry {
             tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
         }
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
+        // The server's own agents' workspaces of their own are kept beside their record.
+        crate::workspace::slates::init(&dir);
         let keeper = Keeper::new(&dir);
         let visuals = super::visuals::Visuals::new(&dir);
         Self {
@@ -366,9 +374,18 @@ impl Registry {
             keeper,
             visuals,
             streams: super::streams::Relay::default(),
+            webrtc: super::webrtc::Webrtc::default(),
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
+            #[cfg(test)]
+            test_program: Mutex::new(None),
         }
+    }
+
+    /// Tests: sessions started here from now on run `program` instead of their harness.
+    #[cfg(test)]
+    pub fn set_test_program(&self, program: &str) {
+        *self.test_program.lock() = Some(program.to_owned());
     }
 
     /// Where restoring the conversation store from a mirror's copy stands.
@@ -1079,6 +1096,10 @@ impl Registry {
         let mut out = Vec::new();
         for i in 0..count {
             let mut spec = spec.clone();
+            #[cfg(test)]
+            if spec.program.is_none() {
+                spec.program.clone_from(&self.test_program.lock());
+            }
             if count > 1 {
                 spec.name = Some(format!("{} {}", spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| default_name(&spec.kind)), i + 1));
             }
@@ -1094,7 +1115,10 @@ impl Registry {
                             spec.env = env;
                         }
                     }
-                    let s = self.local.open(None, spec)?;
+                    // A workspace of its own first: a volume over its folder, mounted, its folder in it.
+                    let id = crate::util::new_id();
+                    crate::workspace::prepare(&mut spec, &id).await.map_err(|e| e.context("its workspace"))?;
+                    let s = self.local.open(Some(id), spec)?;
                     let mut info = s.info();
                     info.target = loc.target();
                     // Seed the mirror so the session lists before its first update arrives.
@@ -1156,6 +1180,7 @@ impl Registry {
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),
                         no_bypass: !spec.allow_bypass,
+                        workspace: spec.workspace.clone(),
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);
@@ -1401,6 +1426,12 @@ impl Registry {
         let m = g.get(id)?;
         let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
         Some((m.state.clone(), reply, m.changes.clone()))
+    }
+
+    /// Tests: session `id`'s changeset, as its machine would report it.
+    #[cfg(test)]
+    pub fn set_changes(&self, id: &str, files: Value) -> bool {
+        self.mirrors.lock().get_mut(id).map(|m| m.changes = files).is_some()
     }
 }
 

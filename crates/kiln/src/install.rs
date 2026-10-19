@@ -61,7 +61,7 @@ pub struct InstallArgs {
     #[arg(long, env = "KILN_QUIC")]
     pub quic: Option<String>,
     /// Agent: join token (consumed during install; never stored in the boot command).
-    #[arg(long, env = "KILN_JOIN_TOKEN")]
+    #[arg(long, env = "KILN_JOIN_TOKEN", allow_hyphen_values = true)]
     pub token: Option<String>,
     #[arg(long)]
     pub name: Option<String>,

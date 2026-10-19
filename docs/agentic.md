@@ -27,10 +27,10 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 |---|---|---|---|
 | N | Notifications and a phone-first Mission Control | — | done: N1–N3 (docs/notifications.md); an iPhone check by a person is left |
 | O | Agents that run agents | — | built: O1–O5 (docs/agents.md, "Agents that run agents"), tested on a hub in process; O-AC1 with real harnesses across two machines not run yet |
-| P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P3 for steps in order (parallel steps run one at a time until workspaces exist, and say so); P4 waits on C |
+| P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P4 for steps in order: each met step's work goes up as one diff on the step before's, so the run ends as a stack (P-AC1, tested in process against kiln's own git hosting). Parallel steps run one at a time and say so: side by side they need workspaces of their own, held with Slates |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R3 and R5 (docs/releases.md, "Diagnosing and repairing a runner"); R4, a runner doctor that wakes by itself, waits on attachments (ci.md W20-R08) |
-| W | Workspaces: Slates volumes, then Shards microVMs | — (Shards: its networking and file device) | designing |
-| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | C5 built: the review UI (Repositories → Review: the inbox, a diff or change request's page, stacks, the land queue); C1–C4 wait on agent authorship and review events reaching main (ci.md W14, branch ci-actions) |
+| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes; Linux landing: its issuer surface), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk on a person's go-ahead where Slates takes one from kiln: macOS). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents, moving an agent with a volume to another machine (refused, saying why), installing Slates from kiln's releases, workspaces on Windows (no mount there yet), writing to disk on Linux (Slates' issuer surface). W8 waits on Shards |
+| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). Agents reply in threads once review operations agents can call exist (W14's, being built); until then they answer with a new version |
 | K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | coordinating |
 
 ## N: Notifications
@@ -147,6 +147,18 @@ Mission Control groups the run's agents under it ("Plan: retry rework · 3 of 5 
 The run ends as one change request, or as a stack with one diff per step when the steps ran in
 order (C1).
 
+Built, for steps in order (docs/agents.md, "Change requests from agents"): as each step is met,
+the files its agent changed become one commit on the step before's, made beside the folder (C1's
+scratch index), and go up for review at once. On a repository kiln hosts, each is pushed to
+`refs/for/<trunk>` (topic `plan-<run>`) with its own agent's token, so each diff's author is the
+agent that did its step and kiln links them as a stack; elsewhere, a branch per step with each
+pull request onto the one before. A step that changed nothing has no diff; one whose commit
+couldn't be made hands its files on to the next. What review and CI say to a step's agent waits
+until the run ends (the next step works in the same folder); then `agents.change` from that
+agent makes a new version of its own diff and makes the steps above again on it, or says why it
+can't (its change touches what a step above changed too). Merging steps that ran side by side
+into one workspace (W5) is held with Slates.
+
 **Acceptance.** P-AC1: a three-step plan runs as three agents in order, each starting once the
 step before is met, and ends as a stack of three diffs.
 
@@ -184,34 +196,67 @@ would restart a runner with live shells is refused until a person confirms.
 
 ## W: Workspaces
 
-**W1 Slates on every runner.** kiln's release pipeline builds Slates for every platform beside
-kiln; runners install it beside kiln and supervise `slates anchor`. Runner facts say whether Slates
-works there and how it mounts (macOS: NFS on loopback; Linux: FUSE with `fusermount3`; Windows:
-WinFsp, limited).
+kiln is the harness Slates leaves room for: Slates owns the bytes (overlays, witnesses, drift,
+merging, landing under a person's grant); kiln owns the agents, their identity, review, history and
+the place a person says yes (Slates' SLATES_DESIGN.md §1.3, §4.13).
 
-**W2 New agents choose.** `workspace`: the folder itself, or **its own Slates volume** (the default
-where Slates works and the folder is a git repository). Several agents on one folder each get a
-volume.
+**W1 Slates on every machine.** A runner finds Slates (the binary kiln installed under its state
+directory, else `slates` on `PATH`) and keeps one instance, `kiln`, for all the machine's runner
+processes. The instance's anchor starts apart from the runner: its own systemd user unit on Linux,
+its own process group elsewhere, so restarting or upgrading the runner never ends it (a volume
+lives in the anchor's memory). A new instance gets its one-node group (`slates bootstrap root`).
+Runner facts say whether workspaces work there and why not (`workspaces`: Slates installed, a
+mount it can make: FUSE through `fusermount3` on Linux, NFS on loopback on macOS; Windows has none
+yet), and `GET /api/harness/workspaces` says it for every machine. Building Slates for every
+platform beside kiln (the release pipeline, fleet self-builds) is still to come: today a person
+installs it (`cargo install --path crates/cli` in a Slates checkout puts `slates` on `PATH`).
 
-**W3 How.** Per folder per machine, one **green** volume based on the folder (`--base`). Each
-agent gets a **work** volume from the green's current version, mounted under kiln's data, as its
-harness's folder. It sees a normal directory: git, cargo, npm and its editor work there.
+**W2 New agents choose.** `workspace`: `folder` (the folder itself, still the default) or
+`volume` (**its own Slates volume**), in New agents and `agents.start`, only where the machine can
+make one; a machine that can't says why. Several agents on one folder each get their own.
 
-**W4 Changes** are the work volume's own record, shown in the Changes tab as today.
+**W3 How.** On the agent's machine, before its harness starts: an **overlay volume** laid over its
+folder's repository (`slates volume create --base <top>`), mounted under the runner's state
+directory (`workspaces/kiln-<id>`), its harness's folder the same place in the volume as the one
+asked for. What the agent hasn't touched is read from the folder as it is now; what it changes
+(edits, build output, git's own writes) is held in the volume alone, so the folder and other
+agents never see it. Ended for good, the agent's volume goes with it.
 
-**W5 Merging.** **Merge** (the Changes tab, `kiln.workspace.submit`, or a plan run's step being
-met) submits the work volume: merged (the green's new version), already there, or conflicts as
-files and byte ranges. Conflicts show in Changes and go to the agent to fix and merge again. A work
-volume moves onto the green's newest version with **Catch up** (`rebase`).
+*Why not one base per folder, pinned and cloned, as first planned:* Slates (c8d6adb4) refuses a
+clone of an overlay's snapshot (`ContentUnavailable`, pinned or not), and pinned files count as
+diverged, so every pinned file shows up in a landing's plan as a replacement. So each agent gets
+its own unpinned overlay: instant to make, memory only for what it changes, and a file it changed
+that then changes on disk is reported as drift (`agents.workspace`).
 
-**W6 Writing to disk.** **Write to disk** shows what the landing would write; the person's click is
-the grant (kiln runs `slates grant` on the machine; nothing an agent calls can). A file changed on
-disk since is refused, and said so. Most work never needs it: it goes to review from the volume
-(C1).
+**W4 Changes** are its harness's as today; its change request (C1) takes everything that changed in
+its volume, its commands' changes too, since nothing else writes there.
 
-**W7 Moves and restarts.** A volume outlives the runner's restarts (Slates keeps it). An agent
-moving to another machine takes its volume (a snapshot cloned there; Slates' fleet replication once
-it is beyond limited).
+**W5 Merging** agents' work into one volume (Slates' greens and work volumes, byte-exact conflicts,
+rebase) waits on Slates: a work volume isn't a mountable volume yet (Slates' GAP-A9-14), so an agent
+can't run its tools in one. Until then work merges where it always has: as change requests, through
+review and the land queue (C).
+
+**W6 Writing to disk.** **Write to disk…** in its Changes (`agents.land`) shows Slates' plan first:
+what it would create, replace and delete (git's own directory left out), and any file changed in
+the folder since the agent changed it, in which case
+nothing is written until they agree. On a person's go-ahead kiln gives Slates the grant for exactly
+that plan and lands it; no agent can (refused by kind, whatever it asks). Slates holds a plan only
+while the command that made it runs (a client's departure abandons it, AUD-29-07), so kiln plans
+again at the go-ahead and grants only when the new plan's manifest is the one the person saw; if
+anything changed, nothing is written and the new plan is shown instead. Slates' command line
+leaves out one path per landing (each `--exclude` keeps its last value, though its wire format
+takes several), so kiln leaves out `.git` and writes only when the plan's files are no more than
+git sees changed in the workspace; when the agent's build output or dependencies (what git
+ignores) would be written too, its work goes up for review instead, until Slates' command line
+takes several. Slates takes a grant from
+kiln where its anchor's segment has a name kiln can pass on (macOS, Windows). On Linux it doesn't
+yet: the segment is a descriptor only the anchor's own children hold (Slates' GAP-A9-10), so the
+plan says so, and the work goes up as a change request instead.
+
+**W7 Moves and restarts.** A volume outlives the runner's restarts (its anchor runs apart). A
+machine's restart loses it: Slates keeps volumes in memory. An agent with a volume doesn't move to
+another machine yet (refused, saying why); that waits on a snapshot of an overlay that can be
+cloned, or shipped, elsewhere.
 
 **W8 Shards, next.** `isolation: "shards"` runs the harness in a microVM built from an image (an
 Agentfile, W21-R01), its folder the agent's Slates volume, its network what kiln allows. Shards
@@ -221,11 +266,14 @@ are still to come in Shards. Until then New agents shows Shards with why it isn'
 ## C: From changes to landed
 
 **C1 Into review.** **Open change request** in an agent's Changes (or the agent itself, through
-`kiln.ci.diffs.submit_patch` or the change-request operations): its work, from its volume or
-folder, committed on `agents/<name>` and pushed to kiln's git as a change request (W14-R04), or as a
-stack (W14-R03). The author is `agent:<id>`, on behalf of its person. For a repository whose
-provider is elsewhere (GitHub, GitLab, Bitbucket), a branch pushed there and a pull request opened
-through that provider.
+`agents.change`): its work, from its volume or folder, committed on `agents/<name>` and pushed to
+kiln's git as a change request (W14-R04). The author is `agent:<id>`, on behalf of its person.
+For a repository whose provider is elsewhere (GitHub, GitLab, Bitbucket), a branch pushed there
+and a pull request opened through that provider. Built: the commit is made beside the folder (a
+scratch index from its last commit, with the agent's files), so a person's branch, index, working
+tree and own edits are never touched; where kiln has no integration with the provider, the branch
+is pushed with the machine's credentials and the change's link opens the pull request. A plan
+run's steps go up as a stack, one diff per step (P4).
 
 **C2 CI comes back to the agent.** The checks on its change show in its Changes; a failure goes to
 the agent as a message with the failure excerpt (W20-R10's bundle) when its person allows it

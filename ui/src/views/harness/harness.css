@@ -1617,6 +1617,80 @@ textarea.hx-input {
   overscroll-behavior: contain;
   padding: 14px;
 }
+.hx-change-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid #1f2126;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #dfe3ea;
+}
+.hx-change-bar[data-state="landed"] {
+  border-color: rgb(166 205 180 / 24%);
+}
+.hx-change-what {
+  flex: 1;
+  min-width: 12ch;
+}
+.hx-change-what a:hover {
+  text-decoration: underline;
+}
+.hx-ws-bar {
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+}
+.hx-ws-bar > * {
+  min-width: 0;
+}
+.hx-ws-head {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+}
+.hx-ws-head .hx-change-what {
+  min-width: 0;
+}
+/* What a workspace is wraps rather than being cut: it's the line that says what this is. */
+.hx-ws-head .hx-change-sub {
+  white-space: normal;
+}
+.hx-ws-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 6px 6px 26px;
+}
+.hx-ws-conflicts {
+  margin: 0;
+  padding-left: 16px;
+  list-style: disc;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.hx-ws-actions {
+  display: flex;
+  gap: 8px;
+}
+.hx-change-sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+.hx-change-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #b4b5ba;
+}
 .hx-files {
   display: flex;
   flex-direction: column;

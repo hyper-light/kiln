@@ -219,13 +219,30 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    quick. It goes where the repository is under the runner's home (`~/Projects/kiln` stays
    `~/Projects/kiln`), beside a folder of it already there, never over it. An agent in any other
    folder moves without its files (the timeline says so); where that folder isn't on the other
-   machine, it works in its home folder.
+   machine, it works in its home folder. *Go on elsewhere at a limit* never moves one: its work
+   would be left behind.
 2. **The turn** (`harness/session.rs`, on the runner it is on). A move waits for the turn under way
    to end; kiln's queue holds what is sent meanwhile. Then the harness ends, its record complete.
    **Move now** doesn't wait: once the other runner is ready (its copy of the repository made), the
    turn is interrupted, and the other runner picks it up first thing — the conversation, the
    interrupted reply included, and a message saying it moved (`move {"now": true}`).
-3. **The hand-over** (`harness/moving.rs`). The runner packs the session — the harness's own record
+3. **Its files, then its repository** (`harness/session.rs`, `harness/gitstate.rs`). Once the
+   harness has ended, the runner looks at the folder at once (sync otherwise looks every 2 s) and
+   waits until its last changes are in the sync log: their contents on the server, the log having
+   brought them back. Where its copy then stands in the log (an index) goes with the package. Then
+   the repository besides its files, which sync doesn't carry: every branch (commits pushed nowhere
+   included), the tags, the stash, what is staged and where HEAD is, with the commits the other
+   machine lacks (its tips, asked over reach) as a git bundle. Then the files git ignores, which
+   sync leaves alone (`.env`, local settings, keys, a local database), but not what a build makes
+   again (`node_modules`, `target`, `.venv`, `dist` and the like), each with its permissions. An
+   agent working in a git worktree inside the repository (`.claude/worktrees/x`) carries that
+   worktree instead (`harness/worktree.rs`): the commit its HEAD is at, what differs from it
+   (changed, staged, new and deleted files) and the files git ignores there. It doesn't move while
+   a merge, rebase, cherry-pick, revert or bisect is under way (git keeps those in `.git` alone),
+   with more than 128 MB of commits or 64 MB of ignored files to carry (16 MB a file), with files
+   too big for sync, or from a repository of its own nested inside the synced one (or a
+   submodule): the timeline says why, and it goes on where it is.
+4. **The hand-over** (`harness/moving.rs`). The runner packs the session — the harness's own record
    (Claude Code's transcript as it is; Codex's conversation as a new thread's history, as a switch of
    harness carries it; for ACP agents and Antigravity, whose own records kiln doesn't keep, the
    conversation in words from kiln's timeline, given with the first message the harness gets there),
@@ -233,10 +250,22 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    it over a reach link: end to end encrypted, in pieces within a window, started over if the link
    drops (`Ask::Adopt`, `Say::AdoptGot`, `Say::Adopted`). A package in words is version 2 of the
    format; the others stay version 1, which older runners take.
-4. **The take-over** (the other runner). It puts the record where its harness looks for it, starts the
+5. **The take-over** (the other runner). It puts the record where its harness looks for it, starts the
    session under the same id with its timeline as it was, and says so; the server follows the session
    there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
-   it over says why, and the session goes on where it was.
+   it over says why, and the session goes on where it was. The agent starts only once its folder there
+   has taken the sync log as far as it stood on the other machine ("Waiting for its folder's last
+   changes"; messages sent meanwhile wait, and a restart waits again), so it never starts on files
+   older than the ones it left. Then its repository is put as it was, touching no file of the working
+   tree: branches made, or moved on where they were behind; one with other commits there keeps them,
+   beside it (`<name>.before-move` for the branch HEAD is on, `<name>.from-<machine>` for another);
+   stash entries stored; the index read from what was staged; HEAD pointed where it was. The files
+   git ignores are written where they're missing, their permissions kept; one that differs there
+   stays, and the one that came goes beside it (`<name>.from-<machine>`), which git there is told to
+   ignore (`info/exclude`), so it's never committed nor synced. A worktree is made from the
+   repository's copy at its commit, the differences written over it, its HEAD and index put as they
+   were; one there already (the agent coming back) keeps what changed in it, stashed. What couldn't
+   come is said, and stays on the machine it left: nothing is deleted on either side.
 
 **Into another harness.** `move {"to": …, "kind": "codex", "model": "…"}` moves it to a runner that
 has that harness instead of its own, the conversation carried over as a switch of harness carries it
@@ -251,6 +280,15 @@ is how *Go on elsewhere at a limit* works ([agents.md](agents.md), "Usage limits
 the server picks the machine (its own harness signed in to another account with room first, then
 another harness it can be carried into) and moves it. Measured on one machine with two runners and
 two accounts: paused at its stop point, on the other runner 2.5 s later, the turn going on there.
+
+**Its work comes whole.** Checked end to end with two runners and a fake agent that works on files
+(`~/.cache/kiln-moves-lab`): told to move in the middle of a turn that writes a file at its very end,
+with a read queued behind it, the agent's first turn on the other machine reads that last write, 0.3 s
+after it was made; without the wait, the same read found the file as it was before. Its untracked
+file, its edit to a tracked one, a commit pushed nowhere, a branch, a stash entry and a staged file
+came too, and `git status` read the same on both machines. Every answer the agent gave stays in the
+timeline: a harness started again (a restart, a move) names what it says anew, rather than over what
+it said before.
 
 Measured on one machine with two runners, each with a home of its own: an idle agent moves in 1.6 s;
 one in a git repository in 6.9 s the first time (5.3 s of it copying the repository over, uncommitted

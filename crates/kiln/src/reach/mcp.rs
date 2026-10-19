@@ -232,10 +232,12 @@ fn base_tools() -> Value {
         },
         {
             "name": "show_live",
-            "description": "Show the person a page live in the conversation, running here on this machine: your dev server (http://localhost:5173), a page that needs this machine's files, network or GPU, or any site. Its picture and sound stream to them while they look, at their screen's size, and what they do in it (taps, typing, scrolling) goes to it. For a page you wrote that runs on its own, use show_page instead. The answer says which stream it is.",
+            "description": "Show the person a page live in the conversation, running here on this machine: your dev server (http://localhost:5173), a page that needs this machine's files, network or GPU, or any site. Its picture and sound stream to them while they look, at their screen's size, and what they do in it (taps, typing, scrolling) goes to it. For a page you wrote that runs on its own, use show_page instead. The answer says which stream it is. To test it in another engine, say engine: firefox (this machine's Firefox) or webkit (Safari on a Mac); to see it as a device does, say device (its window, density, touch and user agent the device's).",
             "inputSchema": {"type": "object", "properties": {
                 "url": {"type": "string", "description": "Its address: on this machine (http://localhost:3000) or on the web."},
-                "title": {"type": "string", "description": "A few words for it."}
+                "title": {"type": "string", "description": "A few words for it."},
+                "engine": {"type": "string", "enum": ["chromium", "firefox", "webkit"], "description": "The engine it runs in (chromium by default)."},
+                "device": {"type": "string", "enum": ["iPhone 15", "iPhone SE", "Pixel 8", "iPad Air", "Laptop", "Desktop"], "description": "A device it's laid out as (by default, as the person's screen is)."}
             }, "required": ["url"]},
             "annotations": {"readOnlyHint": false, "openWorldHint": true},
         },
@@ -553,7 +555,7 @@ impl Server {
         let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
         let url = s("url").ok_or_else(|| anyhow::anyhow!("which page? Give its address"))?;
         let title = s("title").unwrap_or_else(|| url.clone());
-        let opened = self.ask(json!({"op": "stream", "do": "open", "url": url, "title": title}))?;
+        let opened = self.ask(json!({"op": "stream", "do": "open", "url": url, "title": title, "engine": s("engine"), "device": s("device")}))?;
         match (opened.get("ok"), opened.get("error").and_then(Value::as_str)) {
             (Some(v), _) => Ok(json!({"kiln_stream": v})),
             (None, Some(e)) if e.contains("unknown") => anyhow::bail!("this kiln server doesn't stream pages yet: upgrade it"),
@@ -596,7 +598,7 @@ impl Server {
         };
         let id = page.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
         let page = if heights.is_array() {
-            match self.ask(json!({"op": "page", "do": "measured", "id": id, "heights": heights})) {
+            match self.ask(json!({"op": "page", "do": "measured", "id": id, "heights": heights, "engines": seen.get("engines").cloned().unwrap_or(Value::Null)})) {
                 Ok(a) => a.get("ok").cloned().unwrap_or(page),
                 Err(_) => page,
             }
@@ -958,6 +960,11 @@ mod tests {
         assert_eq!(names.get(..6), Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]));
         assert!(names.contains(&"agents_start") && names.contains(&"agents_wait") && names.contains(&"agents_result"), "agents' tools too: {names:?}");
         assert_eq!(names.get(6..10), Some(&["preview_page", "show_page", "show_live", "use_live"][..]), "then pages: {names:?}");
+        // show_live offers the devices and engines kiln knows.
+        let live = t.as_array().into_iter().flatten().find(|t| t.get("name") == Some(&json!("show_live"))).cloned().unwrap_or_default();
+        let devices: Vec<&str> = crate::browser::devices::DEVICES.iter().map(|d| d.name).collect();
+        assert_eq!(live.pointer("/inputSchema/properties/device/enum"), Some(&json!(devices)));
+        assert_eq!(live.pointer("/inputSchema/properties/engine/enum"), Some(&json!(["chromium", "firefox", "webkit"])));
         assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
         assert_eq!(agent_op("run"), None);
         assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));

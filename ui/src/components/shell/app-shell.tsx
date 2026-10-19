@@ -6,7 +6,7 @@ import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Me, Status } from "@/api/types";
 import { Brand } from "./brand";
-import { ClusterBar, ClusterFrames, ClusterPicker, useClusters } from "./clusters";
+import { ClusterFrames, ClusterPicker, useClusters, useImmersed } from "./clusters";
 import { ConnectionIndicator } from "./connection";
 import { CommandPalette, setPaletteOpen, usePalette } from "./command-palette";
 import { MotionToggle } from "./motion";
@@ -126,6 +126,8 @@ export function AppShell({ me }: { me: Me | null }) {
   const paletteOpen = usePalette((s) => s.open);
   // A peered cluster is shown: its frame fills the page, this cluster's stays loaded underneath.
   const away = useClusters((s) => s.shown !== null);
+  // That cluster's page has the picker in its own header: one header, not two.
+  const immersed = useImmersed();
   useRunFailureToasts();
 
   return (
@@ -133,7 +135,7 @@ export function AppShell({ me }: { me: Me | null }) {
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <header className="site-header">
+      <header className="site-header" hidden={immersed}>
         {/* The same on every page (the terminal's too), so nothing in it moves between pages. */}
         <div className="header-inner container-console">
           <Link
@@ -156,7 +158,7 @@ export function AppShell({ me }: { me: Me | null }) {
               </NavLink>
             ))}
           </nav>
-          <div className="ml-auto flex items-center gap-1.5">
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
             <UpdateNotice />
             <ConnectionIndicator />
             <button
@@ -230,9 +232,6 @@ export function AppShell({ me }: { me: Me | null }) {
             </nav>
           </div>
         )}
-        <React.Suspense fallback={null}>
-          <ClusterBar />
-        </React.Suspense>
         <CommandPalette />
       </header>
 

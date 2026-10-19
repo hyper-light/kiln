@@ -14,4 +14,12 @@ globalThis.kiln = {
     }
     return await chrome.runtime.sendMessage({ kind: "start", stream, mediaId, opts });
   },
+  // A stream whose pictures kiln brings (another engine's page, taken as it changes): encoded in
+  // the offscreen document as a captured tab's are.
+  async pushed(stream, opts) {
+    if (!(await chrome.offscreen.hasDocument())) {
+      await chrome.offscreen.createDocument({ url: "offscreen.html", reasons: ["USER_MEDIA", "AUDIO_PLAYBACK"], justification: "kiln streams a page it shows" });
+    }
+    return await chrome.runtime.sendMessage({ kind: "pushed", stream, opts });
+  },
 };

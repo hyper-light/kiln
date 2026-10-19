@@ -25,9 +25,12 @@
   background: #0c0d10;
 }
 .lv-canvas {
+  position: relative;
   display: block;
   width: 100%;
   height: 100%;
+  /* The page whole within the frame: as the frame's own size, or a device's window letterboxed. */
+  object-fit: contain;
   outline: none;
   /* The page scrolls and zooms itself: the conversation doesn't take its gestures. */
   touch-action: none;
@@ -35,6 +38,16 @@
 }
 .lv-canvas:focus-visible {
   box-shadow: inset 0 0 0 2px #bab0e3;
+}
+/* WebRTC's picture (live.tsx `Viewing`), under the canvas: that takes what's done in the page,
+   and is clear while this is what's seen. */
+.lv-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
 }
 /* The viewer's own field for the page's (live.tsx `shape`): in the address's place while it's
    typed in; out of sight otherwise, yet there to take the focus in a tap's own gesture. */
@@ -132,6 +145,11 @@
 }
 .lp-profile {
   flex: 1 1 160px;
+  min-width: 0;
+}
+/* Engine and device, side by side. */
+.lp-half {
+  flex: 1 1 calc(50% - 5px);
   min-width: 0;
 }
 .lp-go {
