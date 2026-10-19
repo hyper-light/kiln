@@ -503,7 +503,8 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
 function Settings({ store, open, onOpenChange, send }: { store: SessionStore; open: boolean; onOpenChange: (o: boolean) => void; send: (c: Command) => void }) {
   const meta = useSession(store, (s) => s.meta);
   const state = useSession(store, (s) => s.state);
-  return <SettingsSheet open={open} onOpenChange={onOpenChange} meta={meta} state={state} send={send} />;
+  const info = useSession(store, (s) => s.info);
+  return <SettingsSheet open={open} onOpenChange={onOpenChange} agent={info} meta={meta} state={state} send={send} />;
 }
 
 /**

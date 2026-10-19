@@ -210,6 +210,9 @@ pub struct Info {
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
+    /// Where it goes on then (as `State::move_plan`).
+    #[serde(default, skip_serializing_if = "super::model::MovePlan::is_empty")]
+    pub move_plan: super::model::MovePlan,
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
@@ -267,6 +270,7 @@ impl Info {
         self.pause.clone_from(&s.pause);
         self.last_turn.clone_from(&s.last_turn);
         self.move_on_limit = s.move_on_limit;
+        self.move_plan.clone_from(&s.move_plan);
         self.pause_at = s.pause_at;
     }
 
@@ -721,6 +725,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         last_turn: None,
         keep_off: false,
         move_on_limit: false,
+        move_plan: Default::default(),
         pause_at: None,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
@@ -1900,9 +1905,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
-                            Command::MoveOnLimit { on } => {
+                            Command::MoveOnLimit { on, to, kind, model } => {
                                 let mut core = s.core.lock();
                                 core.state.move_on_limit = on;
+                                core.state.move_plan = if on { super::model::MovePlan { to, kind, model } } else { super::model::MovePlan::default() };
                                 core.touch_state();
                                 drop(core);
                                 on_change();
@@ -2298,6 +2304,7 @@ mod tests {
             last_turn: None,
             keep_off: false,
             move_on_limit: false,
+            move_plan: Default::default(),
             pause_at: None,
         };
         let before = i.clone();

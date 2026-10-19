@@ -2,7 +2,8 @@
 //! (`State::move_on_limit`; docs/agents.md, "Usage limits: pause and resume").
 //!
 //! When such a session pauses for a limit (reached, or its stop point), the server looks for
-//! another of your machines to take it over: connected and taking sessions over (reach), with the
+//! another of your machines to take it over (only the one, and the harness and model, a person
+//! chose, when they did: `State::move_plan`): connected and taking sessions over (reach), with the
 //! same harness signed in to another account, one kiln doesn't know to be as full. One that has the
 //! session's repository already comes first, then the emptiest account; else the repository is
 //! copied there and kept in step. The session moves there (`relocate`), and there its harness,
@@ -135,17 +136,28 @@ fn fullest(limits: &[&Limit], now: i64) -> f64 {
 async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
     use super::kinds::Kind;
     let Some(Location::Machine(from)) = hub.harness.location(&info.id) else { return Err("it runs on the kiln server, not on one of your machines".into()) };
-    let others: Vec<_> = hub.reach_directory().into_iter().filter(|r| r.name != from && r.connected).collect();
-    if others.is_empty() {
+    // Where a person said it goes on, if they did: that machine alone, that harness alone.
+    let plan = &info.move_plan;
+    let mut others: Vec<_> = hub.reach_directory().into_iter().filter(|r| r.name != from && r.connected).collect();
+    if let Some(m) = plan.machine() {
+        others.retain(|r| r.name == m);
+        if others.is_empty() {
+            return Err(if m == from { format!("it runs on {m}, where you chose it to go on") } else { format!("{m}, where you chose it to go on, isn't connected") });
+        }
+    } else if others.is_empty() {
         return Err("no other machine of yours is connected".into());
     }
     // The harnesses it can go on in: its own, and those its conversation can be carried into.
     let carries = Kind::get(&info.kind).is_some_and(Kind::switchable);
-    let fits = |h: &str| h == info.kind || (carries && Kind::get(h).is_some_and(Kind::switchable));
+    let fits = |h: &str| (h == info.kind || (carries && Kind::get(h).is_some_and(Kind::switchable))) && plan.kind.as_deref().is_none_or(|k| k == h);
     let named = |h: &str| Kind::get(h).map_or_else(|| h.to_owned(), |k| k.name.to_owned());
     let with_one: Vec<_> = others.into_iter().filter(|r| r.harnesses.iter().any(|h| fits(h))).collect();
     if with_one.is_empty() {
-        return Err(format!("no other connected machine has {} installed{}", info.kind_name, if carries { ", or a harness it can go on in" } else { "" }));
+        let want = plan.kind.as_deref().map_or_else(|| if carries { format!("{} or a harness it can go on in", info.kind_name) } else { info.kind_name.clone() }, named);
+        return Err(match plan.machine() {
+            Some(m) => format!("{m}, where you chose it to go on, doesn't have {want} installed"),
+            None => format!("no other connected machine has {want} installed"),
+        });
     }
     let taking: Vec<_> = with_one.into_iter().filter(|r| r.reach && hub.instances.lock().newest_with(&r.name, crate::proto::CAP_REACH).is_some()).collect();
     if taking.is_empty() {
@@ -182,9 +194,12 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
                 why.push(format!("the account {} uses on {} is {}% used", named(h), r.name, used.round()));
                 continue;
             }
-            // Another harness: the first model it lists there (the newest of its family).
+            // Another harness: the model chosen for it, else the first it lists there (the newest
+            // of its family).
             let (kind, model) = if *h == info.kind {
                 (None, None)
+            } else if let Some(m) = plan.model.clone().filter(|_| plan.kind.as_deref() == Some(h.as_str())) {
+                (Some(h.clone()), Some(m))
             } else {
                 let first = kinds.get(&format!("agent:{}", r.name)).and_then(|ks| ks.iter().find(|k| k.id == *h)).and_then(|k| k.models.first()).map(|m| m.id.clone());
                 (Some(h.clone()), first)
@@ -215,6 +230,25 @@ mod tests {
 
     fn best(options: Vec<Choice>) -> Option<String> {
         rank(options).map(|c| c.name)
+    }
+
+    #[test]
+    fn a_plan_says_where_and_in_what_and_an_old_command_says_neither() -> anyhow::Result<()> {
+        use super::super::model::MovePlan;
+        let c: Command = serde_json::from_str(r#"{"type":"move_on_limit","on":true,"to":"agent:mac","kind":"codex","model":"gpt-6.1"}"#)?;
+        let Command::MoveOnLimit { on, to, kind, model } = c else { anyhow::bail!("not a MoveOnLimit") };
+        let plan = MovePlan { to, kind, model };
+        assert!(on);
+        assert_eq!(plan.machine(), Some("mac"));
+        assert_eq!(plan.kind.as_deref(), Some("codex"));
+        // From before a plan could be given: on, and nothing said of where.
+        let c: Command = serde_json::from_str(r#"{"type":"move_on_limit","on":true}"#)?;
+        let Command::MoveOnLimit { to, kind, model, .. } = c else { anyhow::bail!("not a MoveOnLimit") };
+        assert!(MovePlan { to, kind, model }.is_empty());
+        // A state always says its plan (so a viewer knows its runner takes one), empty or not.
+        let v = serde_json::to_value(super::super::model::State::default())?;
+        assert_eq!(v.get("move_plan"), Some(&serde_json::json!({})));
+        Ok(())
     }
 
     #[test]
