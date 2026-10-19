@@ -292,6 +292,27 @@ enum AppCmd {
     /// Add (or replace) a template from a YAML or JSON file.
     TemplateAdd { file: PathBuf },
     TemplateRm { name: String },
+    /// An app's chart on kiln's base chart, written into a repository: charts/<app> (kiln-base
+    /// vendored in it) and deploy/<env>.yaml, each environment's values to start from. What's
+    /// there is kept unless `--force`; `--base` writes only kiln-base, as this kiln ships it.
+    Init {
+        app: String,
+        /// The repository to write into.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// The image it runs (`ghcr.io/acme/web`); each release gives its tag or digest.
+        #[arg(long)]
+        image: Option<String>,
+        /// The port it listens on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        #[arg(long = "env", default_values_t = ["staging".to_owned(), "production".to_owned()])]
+        environments: Vec<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, conflicts_with = "force")]
+        base: bool,
+    },
 }
 
 /// `kiln app create`: an app and how it is deployed.
@@ -737,8 +758,14 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
 
 /// Runs `kiln app`.
 pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
+    // Writes files where it's run: no server is asked.
+    if let AppCmd::Init { app, dir, image, port, environments, force, base } = &args.cmd {
+        return init(app, dir, image.as_deref(), *port, environments, *force, *base);
+    }
     let api = Api::new(cfg, &args.conn).await?;
     match args.cmd {
+        // Done above, before any server.
+        AppCmd::Init { .. } => {}
         AppCmd::List => {
             let v = api.call(Method::Get, "/apps", None).await?;
             api.print(&v, |v| {
@@ -934,6 +961,32 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 println!("environment {env} removed");
             }
         }
+    }
+    Ok(())
+}
+
+/// `kiln app init`: an app's chart on kiln's base chart, written into the repository at `dir`.
+fn init(app: &str, dir: &std::path::Path, image: Option<&str>, port: u16, environments: &[String], force: bool, base: bool) -> Result<()> {
+    let label = !app.is_empty() && app.len() <= 63 && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !app.starts_with('-') && !app.ends_with('-');
+    if !label {
+        bail!("{app:?}: an app's name is lowercase letters, digits and '-', as Kubernetes names things");
+    }
+    let image = image.map_or_else(|| format!("registry.example.com/{app}"), str::to_owned);
+    let files = super::init::files(&super::init::Init { app, image: &image, port, environments });
+    let base_dir = std::path::Path::new("charts").join(app).join("charts/kiln-base");
+    let chosen: Vec<(PathBuf, String)> = if base { files.into_iter().filter(|(p, _)| p.starts_with(&base_dir)).collect() } else { files };
+    let (wrote, kept) = super::init::write(dir, &chosen, force || base).with_context(|| format!("write into {}", dir.display()))?;
+    for p in &wrote {
+        println!("wrote {}", p.display());
+    }
+    for p in &kept {
+        println!("kept {} (it was there: --force writes over it)", p.display());
+    }
+    if !base {
+        println!(
+            "\nNext: commit it, then\n  kiln app create {app} --git-repo <this repository's URL> --path charts/{app} --set 'image.tag=${{{{ release.version }}}}'\n  kiln app register {app} --env {env}\n  kiln deploy {app} <a tag or commit your CI built> --to {env}",
+            env = environments.first().map_or("staging", String::as_str)
+        );
     }
     Ok(())
 }
