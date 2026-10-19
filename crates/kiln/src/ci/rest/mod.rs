@@ -33,6 +33,7 @@ use crate::hub::Hub;
 pub mod pulls;
 pub mod records;
 pub mod repos;
+pub mod scanning;
 
 /// The token's repository when `owner/repo` names it: a job's token reads its own only.
 async fn site<'a>(hub: &'a Hub, claims: &Job, owner: &str, repo: &str, origin: &str) -> Result<Option<repos::Site<'a>>, Fail> {
@@ -80,6 +81,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
         (&Method::GET, ["repos", _, _, "pulls", ..]) => Some(("pull-requests", Level::Read)),
         (&Method::POST, ["repos", _, _, "attestations"]) => Some(("attestations", Level::Write)),
+        (&Method::POST | &Method::PUT, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Write)),
+        (&Method::GET, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Read)),
         _ => None,
     };
     if let Some((scope, level)) = need
@@ -146,6 +149,17 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::GET, ["issues", n]) => pulls::issue(&s, n).await,
             (&Method::GET, ["issues", n, "comments"]) => pulls::issue_comments(&s, n, &claims, None).await,
             (&Method::POST, ["issues", n, "comments"]) => pulls::issue_comments(&s, n, &claims, Some(&body(req).await?)).await,
+            // Code scanning: SARIF uploads (codeql-action's and the public API's), alerts, analyses.
+            (&Method::PUT, ["code-scanning", "analysis"]) | (&Method::POST, ["code-scanning", "sarifs"]) => {
+                let b = srv::body_json(req.into_body(), 32 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+                scanning::upload(&s, &claims, &b).await
+            }
+            (&Method::GET, ["code-scanning", "sarifs", id]) => scanning::sarif(&s, id).await,
+            (&Method::GET, ["code-scanning", "analyses"]) => scanning::analyses(&s, &q).await,
+            (&Method::GET, ["code-scanning", "alerts"]) => scanning::alerts(&s, None, &q).await,
+            (&Method::GET, ["code-scanning", "alerts", n]) => scanning::alerts(&s, Some(n), &q).await,
+            // codeql-action's feature flags: none here, so its defaults.
+            (&Method::GET, ["code-scanning", "codeql", "features"]) => Ok(srv::json(StatusCode::OK, &json!({}))),
             // W18-R02: GitHub's attestations API.
             (&Method::GET, ["attestations", digest]) => crate::ci::attest::facade_list(hub, &s.repo.id, digest, q.get("predicate_type").map(String::as_str)).await,
             (&Method::POST, ["attestations"]) => crate::ci::attest::facade_create(hub, &claims, &body(req).await?).await,
@@ -160,6 +174,18 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             Ok(srv::json(StatusCode::OK, &json!({ "use_default": keys.is_none(), "include_claim_keys": keys.unwrap_or_default() })))
         }
         (&Method::GET, ["user"]) => Ok(repos::user(&origin)),
+        // What clients ask of a GitHub they don't know (codeql-action, the toolkit): no
+        // `X-GitHub-Enterprise-Version`, so they take kiln as github.com's API shape.
+        (&Method::GET, ["meta"]) => Ok(srv::json(StatusCode::OK, &json!({ "verifiable_password_authentication": false, "hooks": [], "web": [], "api": [], "git": [], "packages": [], "pages": [], "importer": [], "actions": [], "dependabot": [] }))),
+        // A run and its workflow, GitHub's shape (codeql-action reads its workflow's path).
+        (&Method::GET, ["repos", owner, repo, "actions", "runs", run]) => {
+            let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            run_object(hub, &origin, owner, repo, &repo_id, run).await
+        }
+        (&Method::GET, ["repos", owner, repo, "actions", "workflows", which]) => {
+            let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            workflow_object(hub, &origin, owner, repo, &repo_id, which).await
+        }
         (&Method::GET, ["rate_limit"]) => Ok(repos::rate_limit()),
         (&Method::GET, ["repos", owner, repo, "actions", "runs", run, "artifacts"]) => {
             let Some(r) = repo_run(hub, &claims, owner, repo, run).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
@@ -247,6 +273,75 @@ async fn not_implemented(hub: &Hub, claims: &Job, method: &Method, path: &str) -
     tracing::info!(leg = %claims.leg, route = %path, "facade route not implemented");
     let _ = runs::annotation(hub, &claims.leg, None, "warning", Some("GitHub API".into()), &format!("This job called GitHub's API at a route kiln doesn't implement yet ({method} {path}); it got 501."), None, None, None, None, None).await;
     Ok(message(StatusCode::NOT_IMPLEMENTED, &what))
+}
+
+/// A workflow's number in GitHub's API: stable, from its path.
+fn workflow_number(path: &str) -> u64 {
+    let d = <sha2::Sha256 as sha2::Digest>::digest(path.as_bytes());
+    u64::from(u32::from_be_bytes([d.first().copied().unwrap_or(0), d.get(1).copied().unwrap_or(0), d.get(2).copied().unwrap_or(0), d.get(3).copied().unwrap_or(0)] ) & 0x7fff_ffff)
+}
+
+/// `GET /repos/{o}/{r}/actions/runs/{run_id}`: the run, as GitHub shows one.
+async fn run_object(hub: &Hub, origin: &str, owner: &str, repo: &str, repo_id: &str, run: &str) -> Result<Response, Fail> {
+    let Ok(rowid) = run.parse::<i64>() else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    type Row = (i64, i64, String, String, String, String, String, String, Option<String>, i64, i64, Option<i64>, Option<i64>, Option<String>);
+    let rid = repo_id.to_owned();
+    let row: Option<Row> = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT rowid, number, COALESCE(workflow_id, ''), pipeline, event, branch, sha, status, conclusion, COALESCE(attempt, 1), created_at, started_at, finished_at, run_name
+                 FROM runs WHERE rowid = ?1 AND repo_id = ?2",
+                params![rowid, rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(internal)?;
+    let Some((id, number, path, name, event, branch, sha, status, conclusion, attempt, created, started, finished, run_name)) = row else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    let api = format!("{}/api/v3/repos/{owner}/{repo}", origin.trim_end_matches('/'));
+    let wf = workflow_number(&path);
+    let gh_status = match status.as_str() {
+        "queued" | "pending" | "waiting" => "queued",
+        "running" | "in_progress" => "in_progress",
+        _ if finished.is_some() => "completed",
+        _ => "in_progress",
+    };
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({
+            "id": id, "name": name, "display_title": run_name.unwrap_or_else(|| name.clone()), "run_number": number, "run_attempt": attempt, "event": event,
+            "status": gh_status, "conclusion": conclusion, "head_branch": branch, "head_sha": sha, "path": path, "workflow_id": wf,
+            "workflow_url": format!("{api}/actions/workflows/{wf}"), "url": format!("{api}/actions/runs/{id}"),
+            "html_url": format!("{}/{owner}/{repo}/actions/runs/{id}", origin.trim_end_matches('/')),
+            "created_at": rfc3339(created), "updated_at": rfc3339(finished.or(started).unwrap_or(created)), "run_started_at": rfc3339(started.unwrap_or(created)),
+            "pull_requests": [],
+        }),
+    ))
+}
+
+/// `GET /repos/{o}/{r}/actions/workflows/{id}` (its number, or its file's name).
+async fn workflow_object(hub: &Hub, origin: &str, owner: &str, repo: &str, repo_id: &str, which: &str) -> Result<Response, Fail> {
+    let rid = repo_id.to_owned();
+    let paths: Vec<(String, String, i64)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT workflow_id, MAX(pipeline), MIN(created_at) FROM runs WHERE repo_id = ?1 AND workflow_id IS NOT NULL GROUP BY workflow_id")?;
+            let rows = st.query_map([&rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    let found = paths.into_iter().find(|(p, _, _)| workflow_number(p).to_string() == which || p.rsplit('/').next() == Some(which) || p == which);
+    let Some((path, name, created)) = found else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+    let api = format!("{}/api/v3/repos/{owner}/{repo}", origin.trim_end_matches('/'));
+    let n = workflow_number(&path);
+    let html = format!("{}/{owner}/{repo}/blob/HEAD/{path}", origin.trim_end_matches('/'));
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({ "id": n, "node_id": format!("W_{n}"), "name": name, "path": path, "state": "active", "created_at": rfc3339(created), "updated_at": rfc3339(created), "url": format!("{api}/actions/workflows/{n}"), "html_url": html, "badge_url": format!("{api}/actions/workflows/{n}/badge.svg") }),
+    ))
 }
 
 /// The run (`runs.id`) a `run_id` names, when it is the token's repository's.

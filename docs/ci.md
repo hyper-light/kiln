@@ -5005,6 +5005,10 @@ and AC02.
   | An input's p99 / mean | 0.016 / 0.008 ms | < 50 / < 5 ms |
   | Expressions | 2.94 M evaluations/s | ≥ 1 M |
   | A 2,000-line workflow | 2.8 ms | < 20 ms |
+  | A run created, p99 (git stubbed) | 1.8 ms | < 500 ms |
+  | Log ingest, 16 legs at once | 2,530 MiB/s | ≥ 200 MiB/s |
+  | A live line's way, p99 (the server's part) | 0.18 ms | < 250 ms |
+  | A 1 GiB entry restored from the store | 7,962 MiB/s | ≥ 500 MiB/s |
 
   Measuring run creation found a git read on every run start, for reusable calls the workflow
   didn't make. It's skipped now, which cut the p99 from 44 ms to 9 ms in a debug build.
