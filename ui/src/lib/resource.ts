@@ -216,6 +216,10 @@ function take(e: Entry, ev: ServerEvent) {
     e.applying = 0;
     const news = e.news;
     e.news = [];
+    if (e.listeners.size === 0) {
+      e.stale = true;
+      return;
+    }
     let data = e.snap.data;
     for (const n of news) {
       const next = e.snap.has ? e.opts.apply?.(data, n) : undefined;
@@ -296,9 +300,14 @@ export function retryFailed() {
 }
 
 events.on((ev) => {
+  if (ev.type === "resync") {
+    for (const e of entries.values()) soon(e);
+    return;
+  }
   for (const e of entries.values()) {
     if (!e.opts.on?.includes(ev.type)) continue;
-    if (e.opts.apply) take(e, ev);
+    if (e.listeners.size === 0) e.stale = true;
+    else if (e.opts.apply) take(e, ev);
     else soon(e);
   }
 });

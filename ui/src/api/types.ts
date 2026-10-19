@@ -383,6 +383,7 @@ export interface NewRepo {
 /* ---------------------------- WebSocket frames ---------------------------- */
 
 export type ServerEvent =
+  | { type: "resync" }
   | { type: "run"; run: Run }
   | { type: "job"; job: Job }
   | { type: "agent"; agent: Agent }

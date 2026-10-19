@@ -96,3 +96,24 @@ await test("a previous connection's unpack cannot let text overtake a new snapsh
     globalThis.DecompressionStream = original;
   }
 });
+
+await test("cached resources do not process live events while nothing shows them", async () => {
+  const { preload } = await import("../src/lib/resource.ts");
+  const { events } = await import("../src/api/events.ts");
+  let reads = 0;
+  let applied = 0;
+  preload("test/idle", async () => { reads++; return 0; }, {
+    on: ["queue"],
+    apply: (value) => { applied++; return value + 1; },
+  });
+  await tick();
+  events.start();
+  try {
+    const ws = Socket.all.at(-1)!;
+    ws.frame({ type: "queue", queued: 1, running: 1 });
+    ws.frame({ type: "resync" });
+    await new Promise<void>((resolve) => setTimeout(resolve, 300));
+    assert.equal(reads, 1);
+    assert.equal(applied, 0);
+  } finally { events.stop(); }
+});
