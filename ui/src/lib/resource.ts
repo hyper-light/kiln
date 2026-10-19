@@ -239,7 +239,10 @@ function subscribe(e: Entry, l: () => void) {
   e.listeners.add(l);
   e.used = Date.now();
   if (e.listeners.size === 1) {
-    if (e.stale && !e.promise) void load(e);
+    if (e.stale) {
+      if (e.promise) e.later = true;
+      else void load(e);
+    }
     if (e.opts.pollMs && e.poll === null) {
       e.poll = window.setInterval(() => {
         if (!document.hidden && !e.promise) void load(e);
