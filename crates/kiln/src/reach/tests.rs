@@ -369,6 +369,18 @@ fn thousands_of_small_files_and_a_big_one_sync_without_stalling() -> anyhow::Res
 }
 
 #[test]
+fn a_run_on_another_machine_is_marked_as_one_from_its_start() {
+    use serde_json::json;
+    // Where it goes, as said; empty while kiln picks the best.
+    assert_eq!(super::remote("kiln", "run", &json!({"on": "macos", "command": "make"})).as_deref(), Some("macos"));
+    assert_eq!(super::remote("kiln-reach", "run", &json!({"command": "make"})).as_deref(), Some(""));
+    assert_eq!(super::remote("kiln_reach", "run", &json!({"on": " linux/amd64 "})).as_deref(), Some("linux/amd64"));
+    // Not a command elsewhere: another of its tools, or another server's `run`.
+    assert_eq!(super::remote("kiln", "runners", &json!({})), None);
+    assert_eq!(super::remote("github", "run", &json!({"on": "x"})), None);
+}
+
+#[test]
 fn the_timeline_shows_a_remote_run_as_a_command_with_where_it_ran() {
     use crate::harness::model::ToolKind;
     let input = serde_json::json!({"command": "cargo test", "on": "linux/amd64"});

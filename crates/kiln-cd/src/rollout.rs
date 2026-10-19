@@ -79,6 +79,9 @@ pub struct RolloutSpec {
     pub linear: Option<LinearSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blue_green: Option<BlueGreenSpec>,
+    /// All the traffic at once (the default), then checks that watch it for a window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_at_once: Option<AllAtOnceSpec>,
     /// Checks measured in the background, from a canary step to the end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<WatchSpec>,
@@ -189,6 +192,19 @@ pub struct BlueGreenSpec {
     /// Run the before checks together, not in order.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parallel: bool,
+}
+
+/// `all-at-once: { after, window }`: green takes all the traffic at once, as a Deployment's own
+/// rollout does, then the after checks watch it for `window`; a failure goes back to blue. For
+/// what can't run two versions side by side, as kiln's own server can't (one writer on its data).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AllAtOnceSpec {
+    #[serde(default, skip_serializing_if = "Names::is_empty")]
+    pub after: Names,
+    /// How long the after checks watch it (10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
 }
 
 /// A check (the deploy file's `checks:`): what it measures, how often, and its criteria. What
@@ -386,9 +402,9 @@ fn percent(v: &Value) -> Result<u8, String> {
 
 /// Compiles a rollout: its steps in order, every check named in `checks`.
 pub fn compile(spec: &RolloutSpec, checks: &BTreeMap<String, CheckSpec>) -> Result<Plan, String> {
-    let given = [spec.canary.is_some(), spec.linear.is_some(), spec.blue_green.is_some()].iter().filter(|x| **x).count();
+    let given = [spec.canary.is_some(), spec.linear.is_some(), spec.blue_green.is_some(), spec.all_at_once.is_some()].iter().filter(|x| **x).count();
     if given > 1 {
-        return Err("a rollout is one of canary, linear or blue-green".into());
+        return Err("a rollout is one of canary, linear, blue-green or all-at-once".into());
     }
     let dur = |s: &Option<String>, what: &str, default: u64| -> Result<u64, String> {
         match s {
@@ -465,6 +481,14 @@ pub fn compile(spec: &RolloutSpec, checks: &BTreeMap<String, CheckSpec>) -> Resu
             steps.push(Step::Watch { names: bg.after.list(), window_ms });
         }
         keep_ms = dur(&bg.keep, "keep", KEEP_MS)?;
+    } else if let Some(a) = &spec.all_at_once {
+        if spec.watch.is_some() {
+            return Err("an all-at-once rollout watches with after:, not watch:".into());
+        }
+        steps.push(Step::Weight { weight: 100 });
+        if !a.after.is_empty() {
+            steps.push(Step::Watch { names: a.after.list(), window_ms: dur(&a.window, "window", WINDOW_MS)? });
+        }
     }
     // Every rollout ends with all the traffic on green.
     if !steps.iter().any(|s| matches!(s, Step::Weight { weight: 100 })) {
@@ -674,6 +698,117 @@ impl CheckRun {
 /// Whether one of these checks can't tell, which stops them until a person decides.
 fn unclear(runs: &[CheckRun]) -> Option<&CheckRun> {
     runs.iter().find(|c| c.counts() && c.verdict == Some(Verdict::Inconclusive))
+}
+
+// ------------------------------------------------------------------ checks over a window
+
+/// Checks that watch a version for a window with nothing of a rollout around them: what the guard
+/// of kiln's own deploy measures once kiln's new pods are up (crates/kiln/src/cd/guard.rs), so the
+/// previous version comes back when one fails. Each check measures by its own timing and limits,
+/// as in a rollout, and one without a `count` measures until the window ends. A check that can't
+/// tell fails it, as an error does: nobody is there to decide. Dry runs are measured, and never
+/// decide.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub runs: Vec<CheckRun>,
+    pub started_ms: u64,
+    pub window_ms: u64,
+    /// The last id given to a measurement.
+    pub seq: u64,
+}
+
+/// Where a window stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Watched {
+    Watching,
+    /// Its end came and nothing counted against it.
+    Passed,
+    /// A check failed, erred or couldn't tell: which, and why.
+    Failed(String),
+}
+
+impl Window {
+    /// The checks `names` (each from `checks`) watching for `window_ms` from `now`. A check that
+    /// isn't defined, or whose spec is wrong, fails it at once.
+    pub fn new(names: &[String], checks: &BTreeMap<String, CheckSpec>, window_ms: u64, now: u64) -> Window {
+        let runs = names
+            .iter()
+            .map(|n| match checks.get(n).map(|c| c.timing(true)) {
+                Some(Ok(t)) => CheckRun::new(n, t, Against::Production, now),
+                Some(Err(e)) => CheckRun::broken(n, Against::Production, now, e),
+                None => CheckRun::broken(n, Against::Production, now, format!("no check named {n}")),
+            })
+            .collect();
+        Window { runs, started_ms: now, window_ms, seq: 0 }
+    }
+
+    /// The measurements due at `now`, each asked for: the check, its try (from 1), and the id its
+    /// answer carries.
+    pub fn due(&mut self, now: u64) -> Vec<(String, u32, u64)> {
+        let mut out = Vec::new();
+        if now >= self.started_ms + self.window_ms {
+            return out;
+        }
+        for c in self.runs.iter_mut().filter(|c| c.due(now)) {
+            self.seq += 1;
+            c.asked = Some(Ask { id: self.seq, at_ms: now });
+            out.push((c.name.clone(), c.tally.tries() + 1, self.seq));
+        }
+        out
+    }
+
+    /// A measurement came back. One for an ask that ended (it ran out of time) is ignored.
+    pub fn measured(&mut self, id: u64, m: Measurement, now: u64) {
+        if let Some(c) = self.runs.iter_mut().find(|c| c.asked.is_some_and(|a| a.id == id) && c.verdict.is_none()) {
+            c.record(now, m);
+        }
+    }
+
+    /// Where it stands at `now`: the worst verdict of a check that decides (failed, then erred,
+    /// then can't tell) fails it; at its end, it passed. A measurement asked for longer than its
+    /// timeout is an error (an approval's lapse would fail it).
+    pub fn verdict(&mut self, now: u64) -> Watched {
+        for c in self.runs.iter_mut() {
+            if let (Some(a), Some(t)) = (c.asked, c.timing.timeout_ms)
+                && c.verdict.is_none()
+                && now >= a.at_ms + t
+            {
+                let verdict = if c.timing.lapse_fails { Verdict::Fail } else { Verdict::Error };
+                c.record(now, Measurement { at_ms: now, verdict, value: Value::Null, message: format!("no answer within {}", span(t)) });
+            }
+        }
+        for v in [Verdict::Fail, Verdict::Error, Verdict::Inconclusive] {
+            if let Some(c) = self.runs.iter().find(|c| c.counts() && c.verdict == Some(v)) {
+                return Watched::Failed(format!("{}: {}", c.name, c.why));
+            }
+        }
+        if now >= self.started_ms + self.window_ms {
+            for c in self.runs.iter_mut() {
+                c.stop();
+            }
+            return Watched::Passed;
+        }
+        Watched::Watching
+    }
+
+    /// When it next needs looking at: a measurement due or out of time, or its end.
+    pub fn next_ms(&self) -> u64 {
+        let end = self.started_ms + self.window_ms;
+        self.runs
+            .iter()
+            .filter(|c| c.verdict.is_none())
+            .filter_map(|c| match (c.asked, c.timing.timeout_ms) {
+                (Some(a), Some(t)) => Some(a.at_ms + t),
+                (Some(_), None) => None,
+                (None, _) => Some(c.next_ms),
+            })
+            .fold(end, u64::min)
+    }
+
+    /// Each check's verdict, tally and why, as the record shows them.
+    pub fn summary(&self) -> Vec<Value> {
+        self.runs.iter().map(CheckRun::summary).collect()
+    }
 }
 
 // ------------------------------------------------------------------ the state machine
@@ -1898,5 +2033,99 @@ mod tests {
         let succeeded = s.r.log.iter().find(|e| e["event"] == "succeeded").and_then(|e| e["at_ms"].as_u64()).unwrap_or(0);
         assert!(succeeded >= 360_000 + 600_000, "a whole window after green got its traffic back ({succeeded})");
         Ok(())
+    }
+
+    /// All at once, then the after checks watch it; a failure in the window goes back to blue.
+    #[test]
+    fn all_at_once_then_watched() -> Result<(), String> {
+        let cs = "steady: { http: { url: x }, every: 10s }\nmemory: { http: { url: x }, every: 15s, failures: 1 }";
+        let rollout = "all-at-once: { after: [steady, memory], window: 5m }";
+        let plan = compile(&spec(rollout), &checks(cs))?;
+        assert_eq!(plan.steps, [Step::Weight { weight: 100 }, Step::Watch { names: vec!["steady".into(), "memory".into()], window_ms: 300_000 }]);
+        assert!(!plan.preview, "nothing runs beside blue");
+        let mut s = Sim::new(rollout, cs)?;
+        s.run(&mut |_, _| pass(), 400);
+        assert_eq!(s.moves(), [100]);
+        assert_eq!(s.r.state, State::Succeeded);
+        assert!(s.measured().iter().filter(|c| **c == "steady").count() >= 25, "measured through the window");
+        let mut s = Sim::new(rollout, cs)?;
+        s.run(&mut |c, n| if c == "steady" && n == 7 { fail("restarted 1 time") } else { pass() }, 400);
+        assert_eq!(s.moves(), [100, 0], "back to blue");
+        assert!(s.aborted("restarted 1 time"), "{:?}", s.r.state);
+        // A window of its own, and one strategy only.
+        let plan = compile(&spec("all-at-once: { after: steady }"), &checks(cs))?;
+        assert_eq!(plan.steps.get(1), Some(&Step::Watch { names: vec!["steady".into()], window_ms: WINDOW_MS }));
+        assert!(compile(&spec("all-at-once: {}\nblue-green: {}"), &checks(cs)).is_err_and(|e| e.contains("one of")));
+        assert!(compile(&spec("all-at-once: { after: nothing }"), &checks(cs)).is_err_and(|e| e.contains("no check named nothing")));
+        assert!(serde_yaml::from_str::<RolloutSpec>("all-at-once: { before: steady }").is_err(), "nothing runs before: there's no green beside blue");
+        Ok(())
+    }
+
+    /// A window of checks with no rollout around it, as the guard of kiln's own deploy measures.
+    #[test]
+    fn a_window_of_checks() {
+        let cs = checks(concat!(
+            "steady: { http: { url: x }, every: 10s }\n",
+            "commit: { http: { url: x }, count: 1 }\n",
+            "slow: { http: { url: x }, every: 30s, timeout: 5s }\n",
+            "trial: { http: { url: x }, every: 10s, dry-run: true }\n",
+        ));
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let run = |w: &mut Window, answer: &mut dyn FnMut(&str, u32) -> Option<Measurement>| -> (Watched, u64) {
+            let mut now = w.started_ms;
+            loop {
+                for (check, n, id) in w.due(now) {
+                    if let Some(m) = answer(&check, n) {
+                        w.measured(id, m, now);
+                    }
+                }
+                match w.verdict(now) {
+                    Watched::Watching => now = w.next_ms().max(now + 1),
+                    v => return (v, now),
+                }
+            }
+        };
+
+        // Nothing against them: it passes at its end, not before.
+        let mut w = Window::new(&names(&["steady", "commit", "trial"]), &cs, 120_000, 1_000);
+        let (v, at) = run(&mut w, &mut |c, _| if c == "trial" { fail("a dry run") } else { pass() });
+        assert_eq!(v, Watched::Passed);
+        assert_eq!(at, 121_000, "the whole window");
+        let s = w.summary();
+        assert!(s.iter().all(|c| c["verdict"] == "pass" || c["dry_run"] == true), "{s:?}");
+        let passed = |i: usize| s.get(i).and_then(|c| c.pointer("/tally/passed")).and_then(Value::as_u64);
+        assert!(passed(0).is_some_and(|n| n >= 12), "{s:?}");
+        assert_eq!(passed(1), Some(1), "a count of one is measured once");
+
+        // A failure fails it, then and there, saying which and why.
+        let mut w = Window::new(&names(&["steady", "commit"]), &cs, 600_000, 0);
+        let (v, at) = run(&mut w, &mut |c, n| if c == "steady" && n == 4 { fail("the server restarted") } else { pass() });
+        assert_eq!(v, Watched::Failed("steady: failed: the server restarted (failures: 1 of 0 tolerated)".into()));
+        assert_eq!(at, 30_000);
+
+        // Errors in a row (each tried again 10s on), and a measurement out of time.
+        let mut w = Window::new(&names(&["steady"]), &cs, 600_000, 0);
+        let (v, at) = run(&mut w, &mut |_, n| if n == 1 { pass() } else { says(Verdict::Error, "connection refused") });
+        assert!(matches!(&v, Watched::Failed(why) if why.contains("couldn't measure 5 times in a row: connection refused")), "{v:?}");
+        assert_eq!(at, 10_000 + 4 * 10_000);
+        let mut w = Window::new(&names(&["slow"]), &cs, 600_000, 0);
+        let (v, _) = run(&mut w, &mut |_, _| None);
+        assert!(matches!(&v, Watched::Failed(why) if why.contains("no answer within 5s")), "{v:?}");
+
+        // Nobody is there to decide what can't tell, nor a check that isn't defined.
+        let mut w = Window::new(&names(&["steady"]), &cs, 600_000, 0);
+        let (v, _) = run(&mut w, &mut |_, _| says(Verdict::Inconclusive, "neither holds"));
+        assert!(matches!(&v, Watched::Failed(why) if why.contains("can't tell")), "{v:?}");
+        let mut w = Window::new(&names(&["steady", "missing"]), &cs, 600_000, 0);
+        assert!(matches!(w.verdict(0), Watched::Failed(why) if why.contains("no check named missing")));
+
+        // A late answer, for an ask that ran out of time, is ignored.
+        let mut w = Window::new(&names(&["slow"]), &cs, 600_000, 0);
+        let asked = w.due(0);
+        assert_eq!(asked.len(), 1);
+        assert!(matches!(w.verdict(5_000), Watched::Watching), "one error is tried again");
+        let id = asked.first().map(|a| a.2).unwrap_or_default();
+        w.measured(id, Measurement { at_ms: 6_000, verdict: Verdict::Fail, value: Value::Null, message: "late".into() }, 6_000);
+        assert_eq!(w.runs.first().map(|r| r.tally.failed), Some(0));
     }
 }

@@ -349,6 +349,7 @@ mod tests {
             server: None,
             tool_short: None,
             skill: None,
+            runner: None,
         };
         let rows = of("a1", &Update::Events { events: vec![ev("t1", 3, Body::Tool(Box::new(tool))), ev("n1", 4, Body::Notice { level: Level::Warn, text: "Paused".into() })] }, 9);
         let Some(Row::Event(t)) = rows.first() else { anyhow::bail!("no tool row") };

@@ -148,6 +148,25 @@ for (let i = 1; i <= TURNS; i++) {
     started: at + 12_000,
     ended: at + 19_000,
   });
+  // Now and then the same tests on the Mac, through kiln reach: a command on another machine.
+  if (i % 4 === 1)
+    add({
+      id: `L-r${i}`,
+      at: at + 19_500,
+      kind: "tool",
+      tool_id: `tr${i}`,
+      name: "mcp__kiln__run",
+      tool: "shell",
+      title: "cargo test -p kiln http::client --target aarch64-apple-darwin",
+      detail: "on adas-macbook-pro-2.local",
+      runner: "adas-macbook-pro-2.local",
+      input: { on: "macos", command: "cargo test -p kiln http::client --target aarch64-apple-darwin" },
+      status: "done",
+      exit_code: 0,
+      output: `test http::client::retry_0 ... ok\ntest http::client::retry_1 ... ok\n\ntest result: ok. 2 passed`,
+      started: at + 19_500,
+      ended: at + 20_800,
+    });
   add({ id: `L-a${i}`, at: at + 21_000, kind: "assistant", text: answer(i) });
 }
 
@@ -185,6 +204,21 @@ add({
   input: {},
   status: "running",
   started: LIVE_AT + 3_000,
+});
+// And on Linux x86-64, while kiln picks the runner.
+add({
+  id: "L-r-live",
+  at: LIVE_AT + 3_500,
+  kind: "tool",
+  tool_id: "tr-live",
+  name: "mcp__kiln__run",
+  tool: "shell",
+  title: "cargo test -p kiln ws::reconnect --target x86_64-unknown-linux-musl",
+  detail: "on linux/amd64",
+  runner: "linux/amd64",
+  input: { on: "linux/amd64" },
+  status: "running",
+  started: LIVE_AT + 3_500,
 });
 let live = add({ id: "L-a-live", at: LIVE_AT + 5_000, kind: "assistant", text: "Working through the reconnect path:", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
 

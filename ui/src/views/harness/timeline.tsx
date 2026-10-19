@@ -5,7 +5,7 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, Check, ChevronRight, CircleAlert, Copy, CornerDownRight, Info, TriangleAlert } from "lucide-react";
+import { ArrowDown, ArrowUpRight, Check, ChevronRight, CircleAlert, Copy, CornerDownRight, Info, TriangleAlert } from "lucide-react";
 import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type SessionStore, type Task } from "@/api/harness";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -123,6 +123,29 @@ function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
   );
 }
 
+/** A command that ran (or runs) on another machine (kiln reach). */
+const elsewhere = (c: ToolEvent) => typeof c.runner === "string";
+
+/** Where it ran, as a chip: the runner, what it must be until one is picked, or "another runner". */
+function Where({ runner, title }: { runner: string; title?: string }) {
+  return (
+    <span className="hx-where" title={title ?? (runner ? `Ran on ${runner}, not this agent's machine` : "Runs on another runner")}>
+      <ArrowUpRight size={11} aria-hidden="true" />
+      <span className="hx-trunc">{runner || "another runner"}</span>
+    </span>
+  );
+}
+
+/**
+ * Where a step's commands ran, for its head: the machine when all ran there ("adacachy"), how many
+ * when only some did ("1 on adacachy"), and how many machines when several ("2 on 3 machines").
+ */
+function whereOfStep(calls: ToolEvent[], remote: string[]): string {
+  const n = calls.filter(elsewhere).length;
+  const machines = remote.length === 1 ? remote[0] || "another runner" : `${remote.length} machines`;
+  return n === calls.length && remote.length === 1 ? machines : `${n} on ${machines}`;
+}
+
 function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   const [open, setOpen] = React.useState(Boolean(initial));
   useRevealed(
@@ -133,16 +156,17 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   // Nothing to show while it runs without output yet: the dot and the clock say it's running.
   const out = c.output ? c.output : c.status === "running" ? null : "(no output)";
   return (
-    <div className="hx-cmd" data-failed={failed || undefined} data-ev={c.id}>
+    <div className="hx-cmd" data-failed={failed || undefined} data-remote={elsewhere(c) || undefined} data-ev={c.id}>
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
+        {typeof c.runner === "string" && <Where runner={c.runner} />}
         <code className="hx-cmd-line">{c.title}</code>
         <span className="hx-cmd-meta">
           {c.exit_code !== undefined && <span className={failed ? "hx-bad" : "hx-good"}>exit {c.exit_code}</span>}
           {c.status === "running" ? <Elapsed from={c.started} /> : c.ended ? <span className="hx-meta-num">{duration(c.ended - c.started)}</span> : null}
         </span>
       </button>
-      {c.detail && <div className="hx-cmd-why">{c.detail}</div>}
+      {c.detail && !(elsewhere(c) && c.detail === `on ${c.runner}`) && <div className="hx-cmd-why">{c.detail}</div>}
       {open && out !== null && <Output text={out} truncated={c.truncated} error={failed} />}
     </div>
   );
@@ -295,6 +319,8 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
+  // Commands run on other machines: where, in the step's head, so it shows folded too.
+  const remote = [...new Set(step.calls.filter(elsewhere).map((c) => c.runner ?? ""))];
   const subtitle =
     step.group === "shell" && step.calls.length === 1
       ? first?.title
@@ -312,13 +338,14 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
               : undefined;
 
   return (
-    <div className="hx-step" data-group={step.group} data-status={status} data-ev={step.calls.map((c) => c.id).join(" ")}>
+    <div className="hx-step" data-group={step.group} data-status={status} data-remote={remote.length > 0 || undefined} data-ev={step.calls.map((c) => c.id).join(" ")}>
       <button type="button" className="hx-step-head" aria-expanded={isOpen} onClick={() => setOpen(!isOpen)}>
         <span className="hx-step-icon">
           <ToolIcon kind={STEP_ICON[step.group]} size={13} />
         </span>
         <span className="hx-step-title">{stepSummary(step.group, step.calls)}</span>
         {subtitle && <span className="hx-step-sub">{subtitle}</span>}
+        {remote.length > 0 && <Where runner={whereOfStep(step.calls, remote)} title={remote.filter(Boolean).join(", ") || undefined} />}
         <span className="hx-step-end">
           {stats && (stats.add > 0 || stats.del > 0) && <DiffStat add={stats.add} del={stats.del} />}
           {status === "pending" && (asked ? <span className="hx-warn text-[11px]">waiting for you</span> : <span className="hx-dim text-[11px]">queued</span>)}

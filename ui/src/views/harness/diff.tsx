@@ -16,11 +16,11 @@ import "./diff.css";
 
 /* ------------------------------------------------------------------ model */
 
-type Kind = "ctx" | "del" | "add";
+export type Kind = "ctx" | "del" | "add";
 /** [start, end) of a run of changed characters in a line. */
-type Span = [number, number];
+export type Span = [number, number];
 
-interface Line {
+export interface Line {
   kind: Kind;
   /** Its number in the old file (unchanged and deleted lines) and in the new one (unchanged and added). */
   o: number | null;
@@ -33,15 +33,15 @@ interface Line {
 }
 
 /** One row of a change block side by side: a deletion's index, an addition's, or nothing. */
-type Pair = [number | null, number | null];
+export type Pair = [number | null, number | null];
 
 /**
  * A hunk is runs of unchanged lines around blocks of changes. A block's pairs line each deletion up
  * with the addition it became (or with nothing), the way the two sides show it side by side.
  */
-type Seg = { t: "ctx"; lines: Line[] } | { t: "chg"; dels: Line[]; adds: Line[]; pairs: Pair[] };
+export type Seg = { t: "ctx"; lines: Line[] } | { t: "chg"; dels: Line[]; adds: Line[]; pairs: Pair[] };
 
-interface HunkModel {
+export interface HunkModel {
   segs: Seg[];
   /** Where it sits in the file, for the hairline above it. */
   where: string;
@@ -249,7 +249,8 @@ function line(kind: Kind, o: number | null, n: number | null, text: string): Lin
   return { kind, o, n, text, hang: hangOf(text) };
 }
 
-function hunkOf(h: Hunk): HunkModel {
+/** A hunk as rows: its unchanged runs and its change blocks, each deletion paired with what it became (the review page reads it too). */
+export function hunkOf(h: Hunk): HunkModel {
   const segs: Seg[] = [];
   let o = h.old_start;
   let n = h.new_start;
