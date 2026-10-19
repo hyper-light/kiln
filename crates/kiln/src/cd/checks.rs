@@ -46,7 +46,7 @@ pub async fn measure(spec: &CheckSpec, rollout: &Value, timeout: Duration) -> Me
 
 /// A verdict by the check's criteria: `fail:` holding fails; `pass:` holding passes; with
 /// criteria and neither holding, it can't tell. Without criteria, the kind's default.
-fn judge(spec: &CheckSpec, result: &Value, rollout: &Value, default: (Verdict, String)) -> (Verdict, String) {
+pub(crate) fn judge(spec: &CheckSpec, result: &Value, rollout: &Value, default: (Verdict, String)) -> (Verdict, String) {
     if spec.pass.is_none() && spec.fail.is_none() {
         return default;
     }

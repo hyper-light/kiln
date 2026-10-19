@@ -47,6 +47,12 @@ pub fn describe(server: &str, tool: &str, input: &serde_json::Value) -> Option<(
     })
 }
 
+/// For a call of reach's `run`: where it goes, as said (a runner's name or what it must be, empty
+/// for the best), so the timeline shows it as a command on another machine from the start.
+pub fn remote(server: &str, tool: &str, input: &serde_json::Value) -> Option<String> {
+    (ours(server) && tool == "run").then(|| input.get("on").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_owned())
+}
+
 /// What a reach tool returned, as the timeline shows a command's result: its output, its exit
 /// code, and where it ran. `result` is the tool's answer (its JSON, as text or structured).
 pub struct Shown {

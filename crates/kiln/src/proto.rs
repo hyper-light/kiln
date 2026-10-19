@@ -138,6 +138,10 @@ pub enum AgentMsg {
     /// changes, and every 10 minutes. A machine on battery sleeps when it runs out, and its runner
     /// with it; the server says so first. Appended last: postcard encodes variants by index.
     Power { json: String },
+    /// The answer to a question the server asked by `req` ([`ServerMsg::Diagnose`],
+    /// [`ServerMsg::Repair`]): JSON, or `None` when there's nothing to say. Appended last: postcard
+    /// encodes variants by index.
+    Answer { req: u64, json: Option<String> },
     /// Answer to [`ServerMsg::HarnessFileRead`] (on [`LANE_FILES`]): `json` a
     /// [`crate::harness::files::Answer`] (the file's size, type and dimensions, or why it can't
     /// be read), `data` the bytes asked for. Only from runners announcing [`CAP_FILES`]. Appended
@@ -207,9 +211,12 @@ pub const CAP_REACH: u32 = 1 << 17;
 /// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
 /// observe and updates take (128, 256, 512).
 pub const CAP_CONVO: u32 = 1 << 19;
+/// [`AgentMsg::Build`] capability: the runner looks at its own machine and repairs it
+/// ([`ServerMsg::Diagnose`], [`ServerMsg::Repair`], `crate::doctor`).
+pub const CAP_DOCTOR: u32 = 1 << 21;
 /// [`AgentMsg::Build`] capability: the runner reads files for the people viewing its agent
 /// sessions ([`ServerMsg::HarnessFileRead`], answered on [`LANE_FILES`]).
-pub const CAP_FILES: u32 = 1 << 21;
+pub const CAP_FILES: u32 = 1 << 22;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -372,6 +379,14 @@ pub enum ServerMsg {
     /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
     /// by index.
     UpdateAvailable { commit: String, build: String, from: String },
+    /// Look at this machine and say what's wrong (JSON `crate::doctor::Machine`), answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_DOCTOR`]. Appended last: postcard
+    /// encodes variants by index.
+    Diagnose { req: u64 },
+    /// Make repair `action` on this machine (`crate::doctor::RUNNER_ACTIONS`), answered by
+    /// [`AgentMsg::Answer`] (`{message}` or `{error}`). Only to runners announcing [`CAP_DOCTOR`].
+    /// Appended last: postcard encodes variants by index.
+    Repair { req: u64, action: String },
     /// Read up to `len` bytes of `path` from `offset`, for whoever views agent session `session`
     /// (a file one of its messages mentions); answered by [`AgentMsg::HarnessFileData`]. Only to
     /// runners announcing [`CAP_FILES`]. Appended last: postcard encodes variants by index.
@@ -542,16 +557,32 @@ mod tests {
     }
 
     #[test]
+    fn a_diagnosis_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
+        for (i, m) in [ServerMsg::Diagnose { req: 7 }, ServerMsg::Repair { req: 8, action: "prune-versions".into() }].into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + i as u8), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
+        let answer = AgentMsg::Answer { req: 7, json: Some("{}".into()) };
+        let b = encode(&answer)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Answer comes right after Power");
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        Ok(())
+    }
+
+    #[test]
     fn reading_files_is_appended_after_every_older_variant() -> anyhow::Result<()> {
         let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
         let ask = ServerMsg::HarnessFileRead { req: 9, session: "s".into(), path: "/tmp/a.png".into(), offset: 1 << 20, len: 1 << 20 };
         let b = encode(&ask)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "HarnessFileRead comes right after UpdateAvailable");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 3), "HarnessFileRead comes right after Repair");
         assert_eq!(decode::<ServerMsg>(&b)?, ask);
         let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
         let answer = AgentMsg::HarnessFileData { req: 9, json: "{}".into(), data: vec![0x89, b'P', b'N', b'G'] };
         let b = encode(&answer)?;
-        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "HarnessFileData comes right after Power");
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 2), "HarnessFileData comes right after Answer");
         assert_eq!(decode::<AgentMsg>(&b)?, answer);
         let taken = CAP_UPGRADE
             | CAP_TAKEOVER
@@ -573,6 +604,7 @@ mod tests {
             | CAP_DOCKER_ROOTLESS
             | CAP_REACH
             | CAP_CONVO
+            | CAP_DOCTOR
             | 128;
         assert!(CAP_FILES.is_power_of_two() && CAP_FILES & taken == 0, "CAP_FILES is a bit of its own");
         let lanes = [LANE_CONTROL, LANE_TERM, LANE_LOGS, LANE_SYNC, LANE_REACH, 5, LANE_CONVO];

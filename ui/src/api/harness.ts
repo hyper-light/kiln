@@ -59,6 +59,8 @@ export interface ToolCall {
   tool_short?: string;
   /** Skill calls: which skill. */
   skill?: string;
+  /** A command run on another machine (kiln reach): the runner once picked, what it must be (`linux/amd64`) until then, "" while kiln picks the best. */
+  runner?: string;
 }
 
 export type Body =

@@ -165,6 +165,8 @@ pub struct Hub {
     pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
     pub generation: u64,
+    /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
+    pub runners_before: AtomicU64,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -251,6 +253,7 @@ impl Hub {
             launching: Mutex::new(HashMap::new()),
             started: Instant::now(),
             generation,
+            runners_before: AtomicU64::new(0),
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
@@ -574,6 +577,33 @@ impl Hub {
         self.file_requests.lock().remove(&req);
         match answer {
             Some(Ok(a)) => Ok(Some(a)),
+            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
+    /// Ask machine `machine` something by its newest runner process announcing `cap` (`msg` given
+    /// the question's number), and wait up to `wait` for its [`AgentMsg::Answer`]. `Ok(None)`: no
+    /// process of it announces `cap` (its kiln is too old); `Ok(Some(json))`: what it answered.
+    pub async fn ask_runner(&self, machine: &str, cap: u32, wait: Duration, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<Option<String>>> {
+        let peer = {
+            let inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            inst.newest_with(machine, cap)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&msg(req))?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(wait, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(json)) => Ok(Some(json)),
             Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
             None if !sent => anyhow::bail!("{machine} is not connected"),
             None => anyhow::bail!("{machine} did not answer in time"),
@@ -996,7 +1026,7 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
-            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } => {
+            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } | AgentMsg::Answer { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
                 }

@@ -776,7 +776,20 @@ mod tests {
         std::fs::copy("/bin/sh", &exe)?;
         // A child running `exe` that starts a process of its own.
         use std::os::unix::process::CommandExt as _;
-        let mut child = std::process::Command::new(&exe).args(["-c", "sleep 30 & wait"]).process_group(0).spawn()?;
+        let spawn = || std::process::Command::new(&exe).args(["-c", "sleep 30 & wait"]).process_group(0).spawn();
+        // A file just written can't be run while a process another test forks meanwhile still holds
+        // it open for writing (until that process runs its own program): try again then.
+        let mut started = spawn();
+        for _ in 0..100 {
+            match &started {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    started = spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut child = started?;
         let pid = child.id();
         // Until its sleep has started (a loaded machine may take a while).
         let until = |want: bool| {

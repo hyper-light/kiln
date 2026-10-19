@@ -756,6 +756,7 @@ fn tool_call(id: &str, name: &str, params: &Value, cwd: &str) -> ToolCall {
         server: None,
         tool_short: None,
         skill: None,
+        runner: None,
     }
 }
 
