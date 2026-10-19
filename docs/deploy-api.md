@@ -2,7 +2,8 @@
 
 > **Agreed 2026-10-18; being built on the `deploy-api` branch.** It sits on top of
 > [cd.md](cd.md), the CD engine, and [cd-targets.md](cd-targets.md), the platforms KilnCD deploys
-> to. The [status](#status) table says what runs.
+> to. The [status](#status) table says what runs; [deploy-quickstart.md](deploy-quickstart.md)
+> takes an app from nothing to production with what is built.
 
 kiln runs an application's whole life by API: create it, register it in environments, deploy
 versions, promote them, roll them back, change their configuration, operate them and retire them.
