@@ -188,6 +188,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             },
         };
     }
+
     // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
     // of its own (an upload streams for as long as it takes).
     if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
@@ -691,6 +692,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => harness_kept_file(&hub, id, sha, &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => harness_file(&hub, id, q.get("path").cloned(), &req).await,
+        // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
+        (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
+        (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => recording_file(&hub, id, rid, what, &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -986,9 +990,31 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
 /// read on its machine now: one that isn't kept (too big, past a budget, from before kiln kept
 /// files), in pieces as the viewer takes it.
 async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
-    use crate::harness::kept::piece;
     let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
     let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    serve_from(hub, id, location, path, req).await
+}
+
+/// `GET /api/harness/sessions/:id/recordings/:recording/:what` (`video`, `inputs`, `test`): a
+/// recording of one of its streams, from its machine (`crate::browser::record`); its log and its
+/// test as text to keep.
+async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &Request) -> R {
+    let rec = hub.harness.streams.recordings(id, person(req).as_deref()).into_iter().find(|r| r.id == rid).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such recording"))?;
+    let path = rec.file(what).ok_or_else(|| err(StatusCode::NOT_FOUND, "a recording's files are its video, inputs and test"))?.to_owned();
+    let mut r = serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?;
+    if what != "video" {
+        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().replace('"', "")).unwrap_or_default();
+        r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/plain; charset=utf-8"));
+        if let Ok(v) = header::HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+            r.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    Ok(r)
+}
+
+/// A file of session `id`'s machine (`location`), in ranges, as it reads it.
+async fn serve_from(hub: &Arc<Hub>, id: &str, location: crate::harness::registry::Location, path: String, req: &Request) -> R {
+    use crate::harness::kept::piece;
     // What it is, and how big, before the part asked for.
     let (answer, _) = piece(hub, &location, id, &path, 0, 0)
         .await

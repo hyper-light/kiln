@@ -8,11 +8,15 @@
  *
  * A field of the page's that takes text has one of the viewer's own to type in, made like it: its
  * keyboard (a tap on the field brings it up at once), its password manager's autofill, its Enter.
- * What's selected in the page copies to the viewer's clipboard.
+ * What's selected in the page copies to the viewer's clipboard. Record keeps it (its video, a log
+ * of what was done in it, and that as a test) on the agent's machine; each recording shows below.
  */
 import * as React from "react";
-import { ArrowLeft, ArrowRight, Copy, Keyboard, RotateCw, Volume2, VolumeX, X } from "lucide-react";
-import type { ToolCall } from "@/api/harness";
+import { ArrowLeft, ArrowRight, Circle, Copy, Keyboard, RotateCw, Square, Volume2, VolumeX, X } from "lucide-react";
+import { harnessApi, recordingUrl, type Recording, type ToolCall } from "@/api/harness";
+import { formatBytes } from "@/lib/format";
+import { useSuspenseResource } from "@/lib/resource";
+import { duration } from "./derive";
 import { Beam, PrismLabel } from "./signals";
 import { chunkOf, fieldAt, liveOf, modifiers, secret, shapeOf, type FieldPlace, type LiveStream, type PageField } from "./live-of";
 import "./page.css";
@@ -244,6 +248,9 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     if (el) el.value = KEEP;
   }, []);
   const tapped = React.useRef(0);
+  /** Recording it since (ms), and the recordings made while this was shown. */
+  const [recording, setRecording] = React.useState<number | null>(null);
+  const [recorded, setRecorded] = React.useState<Recording[]>([]);
   /** A copy asked of the page, answered by its `copied`. */
   const copying = React.useRef<((text: string) => void) | null>(null);
   const boxEl = React.useRef<HTMLDivElement | null>(null);
@@ -307,6 +314,10 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         }
         if (Array.isArray(e.fields)) places.current = e.fields as FieldPlace[];
         if (typeof e.selected === "boolean") setSelected(e.selected);
+        const rec = e.recording as { on?: boolean; at?: number } | undefined;
+        if (rec) setRecording(rec.on ? (rec.at ?? Date.now()) : null);
+        const done = e.recorded as Recording | undefined;
+        if (done?.id) setRecorded((l) => (l.some((r) => r.id === done.id) ? l : [...l, { ...done, stream: live.current.stream.id }]));
         const copied = e.copied as { text?: string } | undefined;
         if (copied && copying.current) {
           copying.current(copied.text ?? "");
@@ -507,7 +518,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           {title}
         </PrismLabel>
         <span className="pg-said" role="status">
-          {agentDid || word}
+          {recording !== null ? <Since at={recording} /> : agentDid || word}
         </span>
         <span className="pg-actions">
           {plays && (
@@ -525,6 +536,10 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
               Sound
             </button>
           )}
+          <button type="button" className="pg-action" aria-pressed={recording !== null} onClick={() => send({ control: { record: recording === null } })}>
+            {recording === null ? <Circle size={12} aria-hidden="true" /> : <Square size={12} aria-hidden="true" />}
+            {recording === null ? "Record" : "Stop"}
+          </button>
           {selected && (
             <button type="button" className="pg-action" onClick={copyOut}>
               <Copy size={12} aria-hidden="true" />
@@ -643,7 +658,56 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           </div>
         )}
       </div>
+      <React.Suspense fallback={null}>
+        <Recordings session={stream.session} stream={stream.id} more={recorded} />
+      </React.Suspense>
     </div>
+  );
+}
+
+/** How long it's been recording, said each second ("recording · 0:12"). */
+function Since({ at }: { at: number }) {
+  const tick = React.useCallback(
+    (el: HTMLSpanElement | null) => {
+      if (!el) return;
+      const say = () => (el.textContent = `recording · ${duration(Math.max(0, Date.now() - at))}`);
+      say();
+      const t = setInterval(say, 1000);
+      return () => clearInterval(t);
+    },
+    [at],
+  );
+  return <span ref={tick} className="lv-recording" />;
+}
+
+/** The recordings of a stream: each its length and size, to watch here, and its test and log to keep. */
+function Recordings({ session, stream, more }: { session: string; stream: string; more: Recording[] }) {
+  const listed = useSuspenseResource(`harness/recordings/${session}`, () => harnessApi.recordings(session).catch((): Recording[] => []), { pollMs: 60_000 });
+  const [watching, setWatching] = React.useState<string | null>(null);
+  const all = [...listed.data.filter((r) => r.stream === stream), ...more.filter((m) => !listed.data.some((r) => r.id === m.id))];
+  if (!all.length) return null;
+  return (
+    <ul className="lv-recs" aria-label="Recordings">
+      {all.map((r) => (
+        <li key={r.id}>
+          <div className="lv-rec">
+            <span className="lv-rec-what">
+              Recorded {duration(r.seconds * 1000)} · {formatBytes(r.bytes)}
+            </span>
+            <button type="button" className="pg-action" aria-pressed={watching === r.id} onClick={() => setWatching(watching === r.id ? null : r.id)}>
+              {watching === r.id ? "Hide" : "Watch"}
+            </button>
+            <a className="pg-action" href={recordingUrl(session, r.id, "test")} download>
+              Test
+            </a>
+            <a className="pg-action" href={recordingUrl(session, r.id, "inputs")} download>
+              Log
+            </a>
+          </div>
+          {watching === r.id && <video className="lv-rec-video" src={recordingUrl(session, r.id, "video")} controls playsInline preload="metadata" />}
+        </li>
+      ))}
+    </ul>
   );
 }
 

@@ -9,6 +9,7 @@
 
 pub mod apps;
 pub mod ports;
+pub mod record;
 pub mod cdp;
 pub mod install;
 pub mod page;

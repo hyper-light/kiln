@@ -2,7 +2,7 @@
 //! the UI, lines for the harness's stdin, previews to compute. Adapters mutate it; the brain that
 //! owns the process drains it. No I/O here, so adapters are tested by feeding lines.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +174,7 @@ pub struct Core {
     pub baselines: HashMap<String, Baseline>,
     /// Files whose cumulative change must be recomputed.
     pub change_jobs: Vec<ChangeJob>,
+    changing: HashSet<String>,
     /// The changeset: one entry per file that differs from its baseline (absolute path keys).
     changes: std::collections::BTreeMap<String, super::model::FileChange>,
     changes_dirty: bool,
@@ -235,6 +236,7 @@ impl Core {
             changed: Vec::new(),
             baselines: HashMap::new(),
             change_jobs: Vec::new(),
+            changing: HashSet::new(),
             changes: std::collections::BTreeMap::new(),
             changes_dirty: false,
             effects: Vec::new(),
@@ -387,11 +389,40 @@ impl Core {
         self.change_jobs.push(ChangeJob { abs: abs.to_owned(), rel: rel.to_owned(), baseline });
     }
 
+    /// Only one recomputation per file runs; later edits wait as its latest pending job.
+    pub fn take_change_jobs(&mut self) -> Vec<ChangeJob> {
+        self.change_jobs.extract_if(.., |j| !self.changing.contains(&j.abs)).collect()
+    }
+
+    pub fn start_change(&mut self, abs: &str) {
+        self.changing.insert(abs.to_owned());
+    }
+
     /// A file's cumulative change, recomputed (None: it is back to how it was), and its baseline
     /// when the recomputation had to work it out.
-    pub fn set_change(&mut self, abs: &str, change: Option<super::model::FileChange>, resolved: Option<Baseline>) {
+    pub fn set_change(&mut self, abs: &str, mut change: Option<super::model::FileChange>, resolved: Option<Baseline>) {
+        self.changing.remove(abs);
         if let Some(b) = resolved {
             self.baselines.insert(abs.to_owned(), b);
+        }
+        if let Some(next) = self.change_jobs.iter_mut().find(|j| j.abs == abs) {
+            if let Some(b) = self.baselines.get(abs) {
+                next.baseline.clone_from(b);
+            }
+            return;
+        }
+        if let Some(c) = change.as_mut() {
+            if let Some(before) = self.changes.get(abs) {
+                // Recomputing the same diff does not make it a newer change.
+                let at = c.at;
+                c.at = before.at;
+                if *c == *before {
+                    return;
+                }
+                c.at = at;
+            }
+        } else if !self.changes.contains_key(abs) {
+            return;
         }
         match change {
             Some(c) => {
@@ -508,9 +539,10 @@ impl Core {
         let Some(e) = usize::try_from(seq.saturating_sub(front)).ok().and_then(|p| self.events.get_mut(p)) else { return };
         match &mut e.body {
             Body::Assistant { text: t, .. } | Body::Thinking { text: t, .. } => {
-                if t.len() < super::model::TEXT_MAX {
-                    t.push_str(text);
+                if t.len() >= super::model::TEXT_MAX {
+                    return;
                 }
+                t.push_str(text);
             }
             _ => return,
         }
@@ -755,6 +787,25 @@ mod tests {
     }
 
     #[test]
+    fn streaming_deltas_stop_where_the_kept_text_stops() {
+        for body in [
+            Body::Assistant { text: "x".repeat(super::super::model::TEXT_MAX - 1), streaming: true },
+            Body::Thinking { text: "x".repeat(super::super::model::TEXT_MAX - 1), streaming: true, redacted: false },
+        ] {
+            let mut c = Core::new();
+            c.upsert("a", None, body);
+            c.take_out();
+            // Keep the existing whole-chunk boundary behavior, including multibyte text.
+            c.append("a", "é");
+            c.append("a", "discarded");
+            assert_eq!(c.take_out(), vec![Update::Stream { id: "a".into(), text: "é".into() }]);
+            assert!(c.get("a").is_some_and(|e| matches!(&e.body, Body::Assistant { text, .. } | Body::Thinking { text, .. } if text.len() == super::super::model::TEXT_MAX + 1 && text.ends_with('é'))));
+            c.append("a", "also discarded");
+            assert!(c.take_out().is_empty());
+        }
+    }
+
+    #[test]
     fn the_timeline_is_bounded_and_snapshots_batch() {
         let mut c = Core::new();
         for i in 0..(MAX_EVENTS + 10) {
@@ -788,6 +839,74 @@ mod tests {
         assert_eq!(c.take_out(), vec![Update::Stream { id: "three".into(), text: "?".into() }]);
         assert_eq!(c.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["one", "reply one", "three"]);
         assert!(c.get("three").is_some_and(|e| matches!(&e.body, Body::Assistant { text, .. } if text == "three!?")));
+    }
+
+    #[test]
+    fn changes_wait_for_the_same_file_and_keep_only_its_latest_job() {
+        use super::super::model::FileChange;
+        let mut c = Core::new();
+        let change = |added, at| FileChange {
+            path: "a.rs".into(), created: false, deleted: false, added, removed: 1,
+            hunks: Vec::new(), truncated: true, at,
+        };
+        let before = change(1, 1);
+        c.set_change("/a.rs", Some(before.clone()), None);
+        c.take_out();
+        c.note_baseline("/a.rs", Baseline::Reverse(Vec::new()));
+        c.want_change("/a.rs", "first.rs");
+        let jobs = c.take_change_jobs();
+        assert_eq!(jobs.len(), 1);
+        c.start_change("/a.rs");
+        c.want_change("/a.rs", "old.rs");
+        c.want_change("/a.rs", "latest.rs");
+        assert_eq!(c.change_jobs.len(), 1);
+        assert!(c.take_change_jobs().is_empty());
+        // Another file need not wait for this one.
+        c.note_baseline("/b.rs", Baseline::Absent);
+        c.want_change("/b.rs", "b.rs");
+        assert_eq!(c.take_change_jobs().iter().map(|j| j.abs.as_str()).collect::<Vec<_>>(), vec!["/b.rs"]);
+        // A superseded result can resolve the original baseline, but cannot replace the shown diff.
+        let baseline = Baseline::Text("original\n".into());
+        c.set_change("/a.rs", None, Some(baseline.clone()));
+        assert_eq!(c.changes(), vec![before]);
+        assert!(c.take_out().is_empty());
+        assert_eq!(c.take_change_jobs(), vec![ChangeJob { abs: "/a.rs".into(), rel: "latest.rs".into(), baseline }]);
+        c.start_change("/a.rs");
+        let latest = change(2, 3);
+        c.set_change("/a.rs", Some(latest.clone()), None);
+        assert_eq!(c.changes(), vec![latest]);
+        assert_eq!((c.state.files_changed, c.state.lines_added, c.state.lines_removed), (1, 2, 1));
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { .. })));
+    }
+
+    #[test]
+    fn unchanged_diffs_do_not_resend_the_changeset() {
+        use super::super::model::{FileChange, Hunk};
+        let mut c = Core::new();
+        c.take_out();
+        let first = FileChange {
+            path: "a.rs".into(), created: true, deleted: false, added: 1, removed: 0,
+            hunks: vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+one".into()] }],
+            truncated: false, at: 1,
+        };
+        c.set_change("/a.rs", Some(first.clone()), None);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.as_slice() == std::slice::from_ref(&first))));
+        let mut same = first.clone();
+        same.at = 2;
+        c.set_change("/a.rs", Some(same), Some(Baseline::Absent));
+        assert!(c.take_out().is_empty());
+        assert_eq!(c.baselines.get("/a.rs"), Some(&Baseline::Absent));
+        assert_eq!(c.changes(), vec![first.clone()]);
+        let mut changed = first;
+        changed.at = 3;
+        changed.hunks = vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+two".into()] }];
+        c.set_change("/a.rs", Some(changed.clone()), None);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.as_slice() == std::slice::from_ref(&changed))));
+        c.set_change("/a.rs", None, None);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.is_empty())));
+        assert_eq!((c.state.files_changed, c.state.lines_added, c.state.lines_removed), (0, 0, 0));
+        c.set_change("/a.rs", None, None);
+        assert!(c.take_out().is_empty());
     }
 
     #[test]

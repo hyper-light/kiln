@@ -15,8 +15,9 @@ import { Confirm, TextField } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
 import { toast } from "@/components/ui/toast";
 import { relativeTime } from "@/lib/format";
-import { useRes, warm, type Res } from "@/lib/data";
+import { upsert, useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
+import "./settings-deploy.css";
 
 const imagesRes: Res<CdImages> = {
   key: "cd/images",
@@ -33,15 +34,15 @@ const oidcRes: Res<OidcIssuer> = {
 
 /** What finds each group in Settings' search, besides its title. */
 const IMAGES = {
-  about: "Where each image kiln publishes lives: the local Docker of the machine that builds it (loaded into the cluster's nodes), or a registry, pushed by commit.",
+  about: "Publish images to the build machine's Docker or to a registry, tagged by commit.",
   words: "images image local docker registry repository publish pulled",
 };
 const REGISTRIES = {
-  about: "Container registries kiln resolves images in and pulls them from: Docker Hub, GHCR, Quay, one of your own. A public image needs none.",
+  about: "Credentials for pulling images and pushing pipeline builds. Public images can pull anonymously.",
   words: "registries registry docker hub ghcr quay token username verify add remove",
 };
 const ACCOUNTS = {
-  about: "The clouds and platforms kiln deploys to. AWS, Google Cloud and Azure trust kiln's own identity, so no key is kept for them; the others take a token, kept in kiln's secret store.",
+  about: "Accounts kiln deploys through. Clouds trust kiln's identity; other platforms use a stored token.",
   words: "accounts cloud aws gcp google azure oidc token platform verify add remove argo",
 };
 
@@ -75,6 +76,63 @@ function DeployHold() {
 
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+type Feedback = { text: string; tone: "succeeded" | "error" };
+
+function IntegrationStatus({ integration, pending, feedback, unavailable }: { integration: Integration; pending: "verify" | "remove" | null; feedback: Feedback | null; unavailable?: string }) {
+  const text = pending === "verify" ? "Verifying…" : pending === "remove" ? "Removing…" : feedback?.text ?? unavailable ?? integration.last_error ?? (integration.verified_at ? `Verified ${relativeTime(integration.verified_at)}` : "Not verified");
+  const tone = pending ? undefined : feedback?.tone ?? (unavailable ? undefined : integration.last_error ? "error" : integration.verified_at ? "succeeded" : undefined);
+  return <p className="dep-status" data-tone={tone} role={tone === "error" ? "alert" : "status"}>{text}</p>;
+}
+
+function useIntegrationActions(integration: Integration) {
+  const { setData } = useRes(integrationsRes);
+  const [pending, setPending] = React.useState<"verify" | "remove" | null>(null);
+  const [feedback, setFeedback] = React.useState<Feedback | null>(null);
+  const active = React.useRef(false);
+  const verify = async (as?: { repository?: string; environment?: string }) => {
+    if (active.current) return false;
+    active.current = true;
+    setPending("verify");
+    setFeedback(null);
+    try {
+      const result = await api.verifyIntegration(integration.name, as);
+      invalidate("ci/integrations");
+      const text = result.ok ? (result.message || "Verified just now") : (result.error || "Verification failed");
+      setFeedback({ text, tone: result.ok ? "succeeded" : "error" });
+      if (result.ok) toast({ title: `${integration.name} works`, description: result.message, tone: "succeeded" });
+      else toast.error(`${integration.name} didn't verify`, text);
+      return result.ok;
+    } catch (e) {
+      const text = `Couldn't verify: ${errorText(e)}`;
+      setFeedback({ text, tone: "error" });
+      toast.error(`Couldn't verify ${integration.name}`, errorText(e));
+      return false;
+    } finally {
+      active.current = false;
+      setPending(null);
+    }
+  };
+  const remove = async () => {
+    if (active.current) return;
+    active.current = true;
+    setPending("remove");
+    setFeedback(null);
+    try {
+      await api.deleteIntegration(integration.name);
+      setData((data) => ({ ...data, integrations: data.integrations.filter((item) => item.id !== integration.id) }));
+      invalidate("ci/integrations");
+      toast({ title: `${integration.name} removed`, tone: "info" });
+    } catch (e) {
+      setFeedback({ text: `Couldn't remove: ${errorText(e)}`, tone: "error" });
+      toast.error(`Couldn't remove ${integration.name}`, errorText(e));
+    } finally {
+      active.current = false;
+      setPending(null);
+    }
+  };
+  return { pending, feedback, verify, remove };
 }
 
 /** A field-styled select, its label above it (in a form), or beside it in a row (`bare`). */
@@ -142,10 +200,13 @@ function ImagesGroup() {
 }
 
 function ImageRow({ name, home, apps, registries }: { name: string; home: ImageHome; apps: string[]; registries: Integration[] }) {
+  const { setData } = useRes(imagesRes);
   const [kind, setKind] = React.useState<ImageHome["kind"]>(home.kind);
   const [repository, setRepository] = React.useState(home.kind === "registry" ? home.repository : "");
   const [integration, setIntegration] = React.useState(home.kind === "registry" ? (home.integration ?? "") : "");
   const [saving, setSaving] = React.useState(false);
+  const [problem, setProblem] = React.useState<string | null>(null);
+  const active = React.useRef(false);
   const id = React.useId();
   const draft: ImageHome =
     kind === "local"
@@ -167,67 +228,85 @@ function ImageRow({ name, home, apps, registries }: { name: string; home: ImageH
           },
     );
   const valid = kind === "local" || /^[a-z0-9.:-]+(\/[a-z0-9._-]+)+$/.test(repository.trim());
-  const save = async () => {
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!changed || !valid || active.current) return;
+    active.current = true;
     setSaving(true);
+    setProblem(null);
     try {
-      await api.setCdImage(name, draft);
+      const saved = await api.setCdImage(name, draft);
+      setData((data) => ({ ...data, images: { ...data.images, [name]: saved.images[name] ?? draft } }));
+      setRepository(repository.trim());
       invalidate("cd/images");
       toast({
         title: kind === "local" ? `${name} lives in the local Docker` : `${name} goes to ${repository.trim()}`,
         tone: "succeeded",
       });
     } catch (e) {
+      setProblem(errorText(e));
       toast.error(`Couldn't save where ${name} lives`, errorText(e));
     } finally {
+      active.current = false;
       setSaving(false);
     }
   };
   return (
-    <>
-      <SettingRow label={name} htmlFor={id} help={apps.length ? `Published for ${apps.join(", ")}` : "No app publishes it now"}>
-        <SelectField bare id={id} label={`Where ${name} lives`} value={kind} onChange={(v) => setKind(v as ImageHome["kind"])} className="st-wide">
-          <option value="local">Local Docker</option>
-          <option value="registry">A registry</option>
-        </SelectField>
-      </SettingRow>
-      {kind === "registry" && (
-        <div className="st-fields">
-          <TextField
-            label="Repository"
-            placeholder="docker.io/acme/kiln"
-            value={repository}
-            onChange={(e) => setRepository(e.target.value)}
-            hint={valid ? "Tagged by commit; no tag here" : "A repository like docker.io/acme/kiln, without a tag"}
-          />
-          <SelectField label="Pulled with" value={integration} onChange={setIntegration}>
-            <option value="">The registry's integration, or none (public)</option>
-            {registries.map((r) => (
-              <option key={r.name} value={r.name}>
-                {r.name} · {String(r.config.registry ?? "")}
-              </option>
-            ))}
+    <form className="dep-image" onSubmit={(e) => void save(e)} aria-label={`Publish ${name}`} aria-busy={saving}>
+      <fieldset disabled={saving} className="dep-fieldset">
+        <SettingRow label={name} htmlFor={id} help={apps.length ? `Published for ${apps.join(", ")}` : "No app publishes it now"}>
+          <SelectField bare id={id} label={`Where ${name} lives`} value={kind} onChange={(v) => setKind(v as ImageHome["kind"])} className="st-wide">
+            <option value="local">Local Docker</option>
+            <option value="registry">A registry</option>
           </SelectField>
-        </div>
-      )}
-      {changed && (
-        <div className="st-form-acts mt-3">
-          <Button size="xs" disabled={!valid || saving} onClick={() => void save()}>
-            <Check /> Save
-          </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            onClick={() => {
-              setKind(home.kind);
-              setRepository(home.kind === "registry" ? home.repository : "");
-              setIntegration(home.kind === "registry" ? (home.integration ?? "") : "");
-            }}
-          >
-            Undo
-          </Button>
-        </div>
-      )}
-    </>
+        </SettingRow>
+        {kind === "registry" && (
+          <div className="st-fields dep-image-fields">
+            <div>
+              <TextField
+                id={`${id}-repository`}
+                label="Repository"
+                placeholder="docker.io/acme/kiln"
+                value={repository}
+                onChange={(e) => setRepository(e.target.value)}
+                aria-invalid={!valid}
+                aria-describedby={`${id}-hint`}
+              />
+              <p className="st-note" id={`${id}-hint`}>{valid ? "Tagged by commit; leave the tag out" : "Use a repository like docker.io/acme/kiln, without a tag"}</p>
+            </div>
+            <SelectField label="Pulled with" value={integration} onChange={setIntegration}>
+              <option value="">The registry's integration, or none (public)</option>
+              {integration && !registries.some((r) => r.name === integration) && <option value={integration}>{integration} (removed)</option>}
+              {registries.map((r) => (
+                <option key={r.name} value={r.name}>
+                  {r.name} · {String(r.config.registry ?? "")}
+                </option>
+              ))}
+            </SelectField>
+          </div>
+        )}
+        {changed && (
+          <div className="st-form-acts dep-image-actions">
+            <Button type="submit" size="xs" disabled={!valid || saving}>
+              <Check /> {saving ? "Saving…" : "Save"}
+            </Button>
+            <Button
+              size="xs"
+              variant="ghost"
+              onClick={() => {
+                setKind(home.kind);
+                setRepository(home.kind === "registry" ? home.repository : "");
+                setIntegration(home.kind === "registry" ? (home.integration ?? "") : "");
+                setProblem(null);
+              }}
+            >
+              Undo
+            </Button>
+          </div>
+        )}
+      </fieldset>
+      {problem && <p className="dep-status" data-tone="error" role="alert">{problem}</p>}
+    </form>
   );
 }
 
@@ -267,69 +346,41 @@ function RegistriesGroup() {
 }
 
 function RegistryRow({ r }: { r: Integration }) {
-  const [busy, setBusy] = React.useState(false);
+  const { pending, feedback, verify, remove } = useIntegrationActions(r);
   const [removing, setRemoving] = React.useState(false);
-  const verify = async () => {
-    setBusy(true);
-    try {
-      const v = await api.verifyIntegration(r.name);
-      invalidate("ci/integrations");
-      if (v.ok)
-        toast({
-          title: `${r.name} works`,
-          description: v.message,
-          tone: "succeeded",
-        });
-      else toast.error(`${r.name} didn't verify`, v.error);
-    } catch (e) {
-      toast.error(`Couldn't verify ${r.name}`, errorText(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const remove = async () => {
-    try {
-      await api.deleteIntegration(r.name);
-      invalidate("ci/integrations");
-      toast({ title: `${r.name} removed`, tone: "info" });
-    } catch (e) {
-      toast.error(`Couldn't remove ${r.name}`, errorText(e));
-    }
-  };
   const user = typeof r.config.username === "string" && r.config.username ? r.config.username : null;
   return (
     <>
-      <div className="st-item">
-        <span className="st-item-name">{r.name}</span>
-        <span className="st-item-meta mono">{String(r.config.registry ?? "")}</span>
-        <span className="st-item-meta">
-          {user ? `as ${user}` : "anonymous"}
-          {r.has_secret ? " · with a token" : ""}
-        </span>
-        <span className="st-item-acts">
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void verify()}>
-            <RefreshCw /> <span className="max-sm:sr-only">Verify</span>
+      <div className="dep-row" aria-busy={pending !== null}>
+        <div className="dep-identity">
+          <span className="st-item-name">{r.name}</span>
+          <div className="dep-meta-row">
+            <span className="dep-meta mono">{String(r.config.registry ?? "")}</span>
+            <span className="dep-meta">{user ? `as ${user}` : "Anonymous"}{r.has_secret ? " · token stored" : ""}</span>
+          </div>
+          <IntegrationStatus integration={r} pending={pending} feedback={feedback} />
+        </div>
+        <div className="dep-actions">
+          <Button size="xs" variant="ghost" disabled={pending !== null || removing} onClick={() => void verify()} aria-label={`Verify ${r.name}`}>
+            <RefreshCw /> {pending === "verify" ? "Verifying…" : "Verify"}
           </Button>
-          <Button size="xs" variant="ghost-danger" onClick={() => setRemoving(true)}>
-            <Trash2 /> <span className="max-sm:sr-only">Remove</span>
+          <Button size="xs" variant="ghost-danger" disabled={pending !== null || removing} onClick={() => setRemoving(true)} aria-label={`Remove ${r.name}`}>
+            <Trash2 /> Remove
           </Button>
-        </span>
+        </div>
       </div>
-      <p className="st-note" data-tone={r.last_error ? "error" : undefined}>
-        {r.last_error ?? (r.verified_at ? `Verified ${relativeTime(r.verified_at)}` : "Not verified yet")}
-      </p>
       {removing && (
         <Confirm
-          className="mt-2"
+          className="dep-confirm"
           label={`Remove ${r.name}`}
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" onClick={() => void remove()}>
-                Remove
+              <Button size="xs" variant="danger" disabled={pending !== null} onClick={() => void remove()}>
+                {pending === "remove" ? "Removing…" : "Remove registry"}
               </Button>
-              <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
-                Keep it
+              <Button size="xs" variant="ghost" disabled={pending !== null} onClick={() => setRemoving(false)}>
+                Cancel
               </Button>
             </>
           }
@@ -342,25 +393,31 @@ function RegistryRow({ r }: { r: Integration }) {
 }
 
 function AddRegistry({ onDone }: { onDone: () => void }) {
+  const { setData } = useRes(integrationsRes);
   const [name, setName] = React.useState("");
   const [registry, setRegistry] = React.useState("docker.io");
   const [username, setUsername] = React.useState("");
   const [token, setToken] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [problem, setProblem] = React.useState<string | null>(null);
+  const active = React.useRef(false);
   const validName = /^[a-z0-9][a-z0-9-]{0,62}$/.test(name.trim());
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!validName || !registry.trim()) return;
+    if (!validName || !registry.trim() || active.current) return;
+    active.current = true;
     setBusy(true);
+    setProblem(null);
     try {
       const config: Record<string, string> = { registry: registry.trim() };
       if (username.trim()) config.username = username.trim();
-      await api.createIntegration({
+      const added = await api.createIntegration({
         kind: "oci",
         name: name.trim(),
         config,
         ...(token.trim() ? { secret: token.trim() } : {}),
       });
+      setData((data) => ({ ...data, integrations: upsert(data.integrations, added, (item) => item.id, false) }));
       invalidate("ci/integrations");
       toast({
         title: `${name.trim()} added`,
@@ -369,27 +426,33 @@ function AddRegistry({ onDone }: { onDone: () => void }) {
       });
       onDone();
     } catch (e2) {
+      setProblem(errorText(e2));
       toast.error("Couldn't add the registry", errorText(e2));
     } finally {
+      active.current = false;
       setBusy(false);
     }
   };
   return (
-    <form className="st-form" onSubmit={(e) => void submit(e)} autoComplete="off">
-      <div className="st-fields">
-        <TextField label="Name" placeholder="dockerhub" value={name} onChange={(e) => setName(e.target.value)} hint={name && !validName ? "Lower case letters, digits and -" : undefined} />
-        <TextField label="Registry" placeholder="docker.io" value={registry} onChange={(e) => setRegistry(e.target.value)} />
-        <TextField label="Username" placeholder="for a private registry (optional)" value={username} onChange={(e) => setUsername(e.target.value)} />
-        <TextField label="Token" type="password" placeholder="an access token (optional)" value={token} onChange={(e) => setToken(e.target.value)} />
-      </div>
-      <div className="st-form-acts">
-        <Button type="submit" size="xs" disabled={!validName || !registry.trim() || busy}>
-          <Plus /> Add
-        </Button>
-        <Button type="button" size="xs" variant="ghost" onClick={onDone}>
-          Cancel
-        </Button>
-      </div>
+    <form className="st-form dep-form" onSubmit={(e) => void submit(e)} autoComplete="off" aria-label="Add a registry" aria-busy={busy}>
+      <fieldset disabled={busy} className="dep-fieldset">
+        <legend className="dep-form-title">Add a registry</legend>
+        <div className="st-fields">
+          <TextField label="Name" placeholder="dockerhub" value={name} onChange={(e) => setName(e.target.value)} required aria-invalid={Boolean(name) && !validName} hint={name && !validName ? "Lower case letters, digits and -" : undefined} autoFocus />
+          <TextField label="Registry" placeholder="docker.io" value={registry} onChange={(e) => setRegistry(e.target.value)} required />
+          <TextField label="Username" placeholder="for a private registry (optional)" value={username} onChange={(e) => setUsername(e.target.value)} />
+          <TextField label="Token" type="password" placeholder="an access token (optional)" value={token} onChange={(e) => setToken(e.target.value)} />
+        </div>
+        {problem && <p className="dep-status" data-tone="error" role="alert">{problem}</p>}
+        <div className="st-form-acts dep-form-actions">
+          <Button type="submit" size="xs" disabled={!validName || !registry.trim() || busy}>
+            <Plus /> {busy ? "Adding…" : "Add registry"}
+          </Button>
+          <Button type="button" size="xs" variant="ghost" onClick={onDone}>
+            Cancel
+          </Button>
+        </div>
+      </fieldset>
     </form>
   );
 }
@@ -455,97 +518,69 @@ function AccountsGroup() {
 }
 
 function AccountRow({ a, kind }: { a: Integration; kind?: IntegrationKind }) {
-  const [busy, setBusy] = React.useState(false);
+  const { pending, feedback, verify, remove } = useIntegrationActions(a);
   const [removing, setRemoving] = React.useState(false);
   const [asking, setAsking] = React.useState(false);
   const [repository, setRepository] = React.useState("");
   const [environment, setEnvironment] = React.useState("");
+  const verifyId = React.useId();
   const federated = kind?.mode === "oidc";
-  const verify = async () => {
-    setBusy(true);
-    try {
-      const v = await api.verifyIntegration(
-        a.name,
-        federated
-          ? {
-              repository: repository.trim() || undefined,
-              environment: environment.trim() || undefined,
-            }
-          : undefined,
-      );
-      invalidate("ci/integrations");
-      if (v.ok)
-        toast({
-          title: `${a.name} works`,
-          description: v.message,
-          tone: "succeeded",
-        });
-      else toast.error(`${a.name} didn't verify`, v.error);
-    } catch (e) {
-      toast.error(`Couldn't verify ${a.name}`, errorText(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const remove = async () => {
-    try {
-      await api.deleteIntegration(a.name);
-      invalidate("ci/integrations");
-      toast({ title: `${a.name} removed`, tone: "info" });
-    } catch (e) {
-      toast.error(`Couldn't remove ${a.name}`, errorText(e));
-    }
-  };
   const summary = accountSummary(a);
   return (
     <>
-      <div className="st-item">
-        <span className="st-item-name">{a.name}</span>
-        <span className="st-item-meta">{kind?.title ?? a.kind}</span>
-        {summary && <span className="st-item-meta mono">{summary}</span>}
-        <span className="st-item-acts">
-          <Button size="xs" variant="ghost" disabled={busy || !kind?.built} aria-expanded={federated ? asking : undefined} onClick={() => (federated ? setAsking((x) => !x) : void verify())}>
-            <RefreshCw /> <span className="max-sm:sr-only">Verify</span>
+      <div className="dep-row" aria-busy={pending !== null}>
+        <div className="dep-identity">
+          <div className="dep-title"><span className="st-item-name">{a.name}</span><span className="dep-meta">{kind?.title ?? a.kind}</span></div>
+          {summary && <p className="dep-meta mono">{summary}</p>}
+          <IntegrationStatus integration={a} pending={pending} feedback={feedback} unavailable={!kind?.built ? `${kind?.title ?? a.kind} deployments aren't available yet` : undefined} />
+        </div>
+        <div className="dep-actions">
+          <Button size="xs" variant="ghost" disabled={pending !== null || !kind?.built || removing} aria-label={`Verify ${a.name}`} aria-expanded={federated ? asking : undefined} aria-controls={federated ? verifyId : undefined} onClick={() => (federated ? setAsking((x) => !x) : void verify())}>
+            <RefreshCw /> {pending === "verify" ? "Verifying…" : "Verify"}
           </Button>
-          <Button size="xs" variant="ghost-danger" onClick={() => setRemoving(true)}>
-            <Trash2 /> <span className="max-sm:sr-only">Remove</span>
+          <Button size="xs" variant="ghost-danger" disabled={pending !== null || removing} aria-label={`Remove ${a.name}`} onClick={() => { setRemoving(true); setAsking(false); }}>
+            <Trash2 /> Remove
           </Button>
-        </span>
+        </div>
       </div>
-      <p className="st-note" data-tone={kind?.built && a.last_error ? "error" : undefined}>
-        {!kind?.built ? `Kept for when kiln deploys to ${kind?.title ?? a.kind}: not built yet.` : (a.last_error ?? (a.verified_at ? `Verified ${relativeTime(a.verified_at)}` : "Not verified yet"))}
-      </p>
       {asking && federated && (
         <form
-          className="st-form mt-2"
+          id={verifyId}
+          className="st-form dep-form dep-verify"
+          aria-label={`Verify ${a.name}`}
+          aria-busy={pending !== null}
           onSubmit={(e) => {
             e.preventDefault();
-            void verify();
+            void verify({ repository: repository.trim() || undefined, environment: environment.trim() || undefined });
           }}
         >
-          <div className="st-fields">
-            <TextField label="As the repository" placeholder="kiln's first repository" value={repository} onChange={(e) => setRepository(e.target.value)} />
-            <TextField label="Environment" placeholder="production" value={environment} onChange={(e) => setEnvironment(e.target.value)} hint="The subject the trust policy names" />
-          </div>
-          <div className="st-form-acts">
-            <Button type="submit" size="xs" disabled={busy}>
-              <RefreshCw /> Verify
-            </Button>
-          </div>
+          <fieldset disabled={pending !== null} className="dep-fieldset">
+            <legend className="dep-form-title">Verify {a.name}</legend>
+            <div className="st-fields">
+              <TextField label="As the repository" placeholder="kiln's first repository" value={repository} onChange={(e) => setRepository(e.target.value)} autoFocus />
+              <TextField label="Environment" placeholder="production" value={environment} onChange={(e) => setEnvironment(e.target.value)} hint="The subject the trust policy names" />
+            </div>
+            <div className="st-form-acts dep-form-actions">
+              <Button type="submit" size="xs" disabled={pending !== null}>
+                <RefreshCw /> {pending === "verify" ? "Verifying…" : "Verify account"}
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>Cancel</Button>
+            </div>
+          </fieldset>
         </form>
       )}
       {removing && (
         <Confirm
-          className="mt-2"
+          className="dep-confirm"
           label={`Remove ${a.name}`}
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" onClick={() => void remove()}>
-                Remove
+              <Button size="xs" variant="danger" disabled={pending !== null} onClick={() => void remove()}>
+                {pending === "remove" ? "Removing…" : "Remove account"}
               </Button>
-              <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
-                Keep it
+              <Button size="xs" variant="ghost" disabled={pending !== null} onClick={() => setRemoving(false)}>
+                Cancel
               </Button>
             </>
           }
@@ -577,30 +612,36 @@ function TrustNote({ kind }: { kind: IntegrationKind }) {
 }
 
 function AddAccount({ kinds, onDone }: { kinds: IntegrationKind[]; onDone: () => void }) {
+  const { setData } = useRes(integrationsRes);
   const [kindName, setKindName] = React.useState(kinds.find((k) => k.built)?.kind ?? kinds[0]?.kind ?? "");
   const kind = kinds.find((k) => k.kind === kindName);
   const [name, setName] = React.useState("");
   const [config, setConfig] = React.useState<Record<string, string>>({});
   const [secret, setSecret] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [problem, setProblem] = React.useState<string | null>(null);
+  const active = React.useRef(false);
   const validName = /^[a-z0-9][a-z0-9-]{0,62}$/.test(name.trim());
   const missing = (kind?.fields ?? []).filter((f) => f.required && !(config[f.name] ?? "").trim());
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!kind || !validName || missing.length) return;
+    if (!kind || !validName || missing.length || active.current) return;
+    active.current = true;
     setBusy(true);
+    setProblem(null);
     try {
       const c: Record<string, string> = {};
       for (const f of kind.fields) {
         const v = (config[f.name] ?? "").trim();
         if (v) c[f.name] = v;
       }
-      await api.createIntegration({
+      const added = await api.createIntegration({
         kind: kind.kind,
         name: name.trim(),
         config: c,
         ...(secret.trim() ? { secret: secret.trim() } : {}),
       });
+      setData((data) => ({ ...data, integrations: upsert(data.integrations, added, (item) => item.id, false) }));
       invalidate("ci/integrations");
       toast({
         title: `${name.trim()} added`,
@@ -609,60 +650,86 @@ function AddAccount({ kinds, onDone }: { kinds: IntegrationKind[]; onDone: () =>
       });
       onDone();
     } catch (e2) {
+      setProblem(errorText(e2));
       toast.error("Couldn't add the account", errorText(e2));
     } finally {
+      active.current = false;
       setBusy(false);
     }
   };
   return (
-    <form className="st-form" onSubmit={(e) => void submit(e)} autoComplete="off">
-      <div className="st-fields">
-        <SelectField
-          label="Platform"
-          value={kindName}
-          onChange={(v) => {
-            setKindName(v);
-            setConfig({});
-          }}
-        >
-          {kinds.map((k) => (
-            <option key={k.kind} value={k.kind}>
-              {k.title}
-              {k.built ? "" : " (kept until built)"}
-            </option>
-          ))}
-        </SelectField>
-        <TextField
-          label="Name"
-          placeholder={`${kindName}-production`}
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          hint={name && !validName ? "Lower case letters, digits and -" : "How apps and environments name it"}
-        />
-        {kind?.fields.map((f) => (
+    <form className="st-form dep-form" onSubmit={(e) => void submit(e)} autoComplete="off" aria-label="Add an account" aria-busy={busy}>
+      <fieldset disabled={busy} className="dep-fieldset">
+        <legend className="dep-form-title">Add an account</legend>
+        <div className="st-fields">
+          <SelectField
+            label="Platform"
+            value={kindName}
+            onChange={(v) => {
+              setKindName(v);
+              setConfig({});
+              setSecret("");
+              setProblem(null);
+            }}
+          >
+            {kinds.map((k) => (
+              <option key={k.kind} value={k.kind}>
+                {k.title}
+                {k.built ? "" : " (kept until built)"}
+              </option>
+            ))}
+          </SelectField>
           <TextField
-            key={f.name}
-            label={`${f.name}${f.required ? "" : " (optional)"}`}
-            placeholder={f.help}
-            value={config[f.name] ?? ""}
-            onChange={(e) => setConfig((c) => ({ ...c, [f.name]: e.target.value }))}
+            label="Name"
+            placeholder={`${kindName}-production`}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+            aria-invalid={Boolean(name) && !validName}
+            hint={name && !validName ? "Lower case letters, digits and -" : "How apps and environments name it"}
           />
-        ))}
-        {kind?.secret && <TextField label={kind.secret} type="password" placeholder="kept in kiln's secret store, never shown again" value={secret} onChange={(e) => setSecret(e.target.value)} />}
-      </div>
-      {kind?.mode === "oidc" && (
-        <Loadable label="kiln's issuer" fallback={<Hold height={60} />}>
-          <TrustNote kind={kind} />
-        </Loadable>
-      )}
-      <div className="st-form-acts">
-        <Button type="submit" size="xs" disabled={!kind || !validName || missing.length > 0 || busy}>
-          <Plus /> Add
-        </Button>
-        <Button type="button" size="xs" variant="ghost" onClick={onDone}>
-          Cancel
-        </Button>
-      </div>
+          {kind?.fields.map((f) => (
+            <TextField
+              key={f.name}
+              label={`${accountFieldLabel(f.name)}${f.required ? "" : " (optional)"}`}
+              placeholder={f.help}
+              value={config[f.name] ?? ""}
+              onChange={(e) => setConfig((c) => ({ ...c, [f.name]: e.target.value }))}
+              required={f.required}
+            />
+          ))}
+          {kind?.secret && <TextField label={kind.secret} type="password" placeholder="kept in kiln's secret store, never shown again" value={secret} onChange={(e) => setSecret(e.target.value)} />}
+        </div>
+        {kind?.mode === "oidc" && (
+          <Loadable label="kiln's issuer" fallback={<Hold height={60} />}>
+            <TrustNote kind={kind} />
+          </Loadable>
+        )}
+        {problem && <p className="dep-status" data-tone="error" role="alert">{problem}</p>}
+        <div className="st-form-acts dep-form-actions">
+          <Button type="submit" size="xs" disabled={!kind || !validName || missing.length > 0 || busy}>
+            <Plus /> {busy ? "Adding…" : "Add account"}
+          </Button>
+          <Button type="button" size="xs" variant="ghost" onClick={onDone}>
+            Cancel
+          </Button>
+        </div>
+      </fieldset>
     </form>
   );
+}
+
+function accountFieldLabel(name: string): string {
+  const labels: Record<string, string> = {
+    role_arn: "Role ARN",
+    provider: "Identity provider",
+    service_account: "Service account",
+    tenant_id: "Tenant ID",
+    client_id: "Client ID",
+    account_id: "Account ID",
+    team_id: "Team ID",
+    org: "Organization",
+  };
+  const readable = name.replace(/_/g, " ");
+  return labels[name] ?? readable.charAt(0).toUpperCase() + readable.slice(1);
 }
