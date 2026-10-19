@@ -110,8 +110,9 @@ impl Kind {
                     (Some((kiln, sock, prefer)), _) => {
                         p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(kiln, sock, *prefer, session));
                     }
+                    // Its own token: kiln knows which agent calls, and whom it acts for.
                     (_, Some(kit)) => {
-                        p.arg("--mcp-config").arg(&kit.claude_mcp_config);
+                        p.arg("--mcp-config").arg(kit.config_for(session));
                     }
                     _ => {}
                 }
@@ -210,6 +211,11 @@ fn set_env(p: &mut Process, spec: &Spec) {
         if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
             p.env(k, v);
         }
+    }
+    // `kiln spawn` and `kiln agents` in its commands: what it starts are its children (the socket
+    // knows the agent by its process).
+    if let Some(sock) = super::socket::served() {
+        p.env("KILN_HARNESS_SOCK", sock);
     }
     for k in super::claude::SCRUB_ENV {
         p.env_remove(k);

@@ -193,7 +193,7 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     ensure_release_repo(d, &e.release_repo).await.map_err(bad)?;
     store::put_environment(&d.hub.store, &e).await.map_err(internal)?;
     // Its gates may have changed: what waits on them looks again now.
-    let held = store::releases(&d.hub.store, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, limit: 1000 }).await.map_err(internal)?;
+    let held = store::releases(&d.hub.store, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, version: None, limit: 1000 }).await.map_err(internal)?;
     let now = crate::util::now_unix();
     for r in held.iter().filter(|r| gates::holding(r.state)) {
         store::schedule(&d.hub.store, r.id, now).await.map_err(internal)?;
@@ -696,7 +696,7 @@ pub struct RollbackAsk {
 /// any rolled back from left out (as txst's rule).
 pub async fn candidates(d: &Deploy, app_name: &str, env_name: &str) -> Result<Vec<Release>, Fail> {
     let reg = registration(d, app_name, env_name).await?;
-    let all = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app_name.into()), environment: Some(env_name.into()), state: None, limit: 500 }).await.map_err(internal)?;
+    let all = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app_name.into()), environment: Some(env_name.into()), state: None, version: None, limit: 500 }).await.map_err(internal)?;
     Ok(all
         .into_iter()
         .filter(|r| matches!(r.state, State::Succeeded | State::Superseded) && Some(r.id) != reg.running && r.commit.is_some() && matches!(r.kind, Kind::Deploy | Kind::Rollback | Kind::Config))

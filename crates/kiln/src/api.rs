@@ -179,11 +179,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             // The owner, by the admin token, its session or an MCP token kiln minted; else a
             // user's session or token, whose operations the route table judges one by one.
             let caller = match crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers())) {
-                Some(actor) => {
-                    let mut c = crate::authz::Caller::owner();
-                    c.name = actor;
-                    Some(c)
-                }
+                // An agent session's own token: that agent, acting for whoever started it.
+                Some(actor) => match crate::mcp::token_caller(&hub, &actor).await {
+                    Some(Ok(c)) => Some(c),
+                    Some(Err(why)) => return Err(err(StatusCode::UNAUTHORIZED, why)),
+                    None => {
+                        let mut c = crate::authz::Caller::owner();
+                        c.name = actor;
+                        Some(c)
+                    }
+                },
                 None => caller_of(&hub, req.headers()).await,
             };
             return match caller {
@@ -321,6 +326,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "push", rest @ ..]) => crate::push::api::route(&hub, &caller, &method, rest, req).await.map_err(|(c, m)| err(c, m)),
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
@@ -448,6 +454,18 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
             }
         }
+        // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        (&Method::GET, ["api", "plans", "runs"]) => own_op(&hub, &caller, "plans.runs.list", query_value(&q)).await,
+        (&Method::GET, ["api", "plans", "runs", run]) => own_op(&hub, &caller, "plans.runs.get", json!({ "run": run })).await,
+        (&Method::POST, ["api", "plans", "runs", run, "stop"]) => own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run })).await,
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => own_op(&hub, &caller, "plans.runs.retry", json!({ "run": run, "step": n })).await,
+        // Taking a step over, and saying it's met, are a person's: no operation does them.
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let by = caller.name.clone();
+            let r = if *what == "take" { crate::plans::agents::take(&hub, run, n, &by).await } else { crate::plans::agents::met(&hub, run, n, &by).await };
+            r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
         (&Method::GET, ["api", "plans"]) => plans_list(&hub, &q).await,
         (&Method::POST, ["api", "plans"]) => plans_create(&hub, req).await,
         (&Method::GET, ["api", "plans", id]) => crate::plans::get(&hub, id).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
@@ -456,7 +474,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "plans", id, "versions"]) => crate::plans::versions(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::GET, ["api", "plans", id, "runs"]) => crate::plans::runs(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::POST, ["api", "plans", id, "restore"]) => plans_restore(&hub, id, req).await,
-        (&Method::POST, ["api", "plans", id, "run"]) => plans_run(&hub, id, req).await,
+        (&Method::POST, ["api", "plans", id, "run"]) => {
+            let id = (*id).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            own_op(&hub, &caller, "plans.run", body).await
+        }
         (&Method::POST, ["api", "plans", id, "share"]) => plans_share(&hub, id, req).await,
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
@@ -484,6 +509,23 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
+        // Agents that run agents (`agents.*`, docs/agents.md): each operation is its route.
+        (&Method::GET, ["api", "harness", "agents"]) => own_op(&hub, &caller, "agents.list", query_value(&q)).await,
+        (&Method::POST, ["api", "harness", "agents"]) => {
+            let body = body_value(req).await?;
+            own_op(&hub, &caller, "agents.start", body).await
+        }
+        (&Method::GET, ["api", "harness", "agents", "wait"]) => own_op(&hub, &caller, "agents.wait", query_value(&q)).await,
+        (&Method::GET, ["api", "harness", "agents", id]) => own_op(&hub, &caller, "agents.get", json!({ "agent": id })).await,
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => own_op(&hub, &caller, &format!("agents.{what}"), json!({ "agent": id })).await,
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop")]) => {
+            let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            own_op(&hub, &caller, &name, body).await
+        }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
         (&Method::POST, ["api", "harness", "sessions"]) => harness_open(&hub, req).await,
@@ -1010,37 +1052,6 @@ async fn plans_restore(hub: &Hub, id: &str, req: Request) -> R {
     let p = crate::plans::restore(hub, id, r.version, "admin").await.map_err(plan_err)?;
     hub.store.audit("admin".into(), "plan.restore".into(), format!("{} (v{} as v{})", p.title, r.version, p.version)).await;
     Ok(srv::json(StatusCode::OK, &p))
-}
-
-#[derive(Deserialize)]
-struct PlanRun {
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    new: Option<PlanRunNew>,
-    #[serde(default)]
-    mode: crate::plans::Mode,
-}
-
-#[derive(Deserialize)]
-struct PlanRunNew {
-    #[serde(default)]
-    target: Option<String>,
-    kind: String,
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-async fn plans_run(hub: &Hub, id: &str, req: Request) -> R {
-    let r: PlanRun = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let target = match (r.session, r.new) {
-        (Some(s), _) => crate::plans::Target::Session(s),
-        (None, Some(n)) => crate::plans::Target::New { target: n.target.unwrap_or_else(|| "local".into()), kind: n.kind, cwd: n.cwd },
-        (None, None) => return Err(err(StatusCode::BAD_REQUEST, "say where to run it: an agent (`session`) or a new one (`new`)")),
-    };
-    let ran = crate::plans::run(hub, id, target, r.mode, "admin").await.map_err(plan_err)?;
-    hub.store.audit("admin".into(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
-    Ok(srv::json(StatusCode::OK, &ran))
 }
 
 #[derive(Deserialize)]
@@ -2581,6 +2592,8 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
     if !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
     }
+    // Who opens it: `kiln spawn --on` and `kiln agents` in it act for them.
+    let opener = req.extensions().get::<crate::authz::Caller>().and_then(crate::authz::Caller::opener);
     let t: NewTerminal = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
@@ -2600,6 +2613,9 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
         }
         None => return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<machine>\"")),
     };
+    if let Some(o) = opener {
+        let _ = hub.store.kv_set(crate::mcp::terminal_opener_key(&session.id), o).await;
+    }
     Ok(srv::json(StatusCode::CREATED, &session.info()))
 }
 
@@ -2906,6 +2922,31 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     Ok(srv::json(StatusCode::CREATED, &b))
 }
 
+/// One of kiln's own operations (agents, plans, goal stacks) as its HTTP route, which the route
+/// table let through (and the audit trail records): `crate::ops::own`.
+async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
+    let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
+    crate::ops::run_own(cx, name, input).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+}
+
+/// A query as an operation's input: each parameter a string.
+fn query_value(q: &HashMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(q.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
+}
+
+/// A request's JSON body as an operation's input (none: `{}`).
+async fn body_value(req: Request) -> Result<serde_json::Value, ApiError> {
+    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(err(StatusCode::BAD_REQUEST, "the body is a JSON object")),
+        Err(e) => Err(err(StatusCode::BAD_REQUEST, format!("the body isn't JSON: {e}"))),
+    }
+}
+
 #[derive(Deserialize)]
 struct HarnessOpen {
     target: String,
@@ -2919,6 +2960,10 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
+    // Who started an agent, and the plan run it works for, are kiln's to say (`agents.start`,
+    // `plans.run`), never what's asked.
+    body.spec.parent = None;
+    body.spec.plan_run = None;
     // Agents run programs as the machine's user, like terminals: the same switch governs both.
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));

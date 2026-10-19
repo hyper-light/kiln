@@ -264,11 +264,6 @@ pub fn ops() -> &'static [Op] {
                 input: || obj_schema(json!({"name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "registry"]}, "repository": {"type": "string"}, "integration": {"type": "string"}}), &["name", "kind"]),
                 run: images_set),
         ]
-        .into_iter()
-        // Plans share the one table (crates/kiln/src/plans/ops.rs).
-        .chain(crate::plans::ops::list_ops())
-        .chain(crate::goals::ops::list_ops())
-        .collect()
     })
 }
 

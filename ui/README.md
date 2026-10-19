@@ -21,6 +21,7 @@ Set `KILN_URL=http://host:port` to point the dev proxy at a real server.
 - To turn auth off, set `MOCK_NO_AUTH=1`.
 - `PORT` (and `HOST`) move it off :7070, e.g. when a real kiln runs there; point the dev server at it with `KILN_URL=http://127.0.0.1:<port> npm run dev`.
 - If `dist/` exists, the mock serves it with SPA fallback, the same way the Rust binary does.
+- Notifications (`mock/push.ts`): `/api/push` keeps devices and mutes as the server does. It can't deliver a real push: what it would send is logged and kept at `GET /api/mock/push/outbox`. `MOCK_PUSH_FLEET=1` adds agents standing every way Mission control shows (two need you, one stopped, one paused, some working), for a list worth sorting on a phone.
 - Runners → Add machines: discovery hears runners, machines not set up yet, another server and its runner; machines ask to join (with codes), scans and probes find more, and an invited machine asks a few seconds later. `MOCK_SERVER_OS=linux|windows` changes the server's own DNS-SD (default `macos`, Bonjour), `MOCK_NETWORK=empty` leaves nothing else on the network, and a machine runs the one-liner `MOCK_AUTOJOIN_SECONDS` (30) after the page first asks for it (`MOCK_AUTOJOIN=0`: never).
 
 ## Layout

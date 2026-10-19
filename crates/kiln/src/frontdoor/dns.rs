@@ -407,8 +407,7 @@ mod tests {
     fn answers_forwards_and_refuses_over_udp_and_tcp() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let upstream = fake_upstream()?;
-            // A port free for both protocols that no other test's bind(0) lands on: one taken from
-            // bind(0) and bound again races them.
+            // A port free on both protocols, and no other test's, then listen there.
             let port = crate::frontdoor::test_port()?;
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             let sh = shared(DnsMode::Resolver, vec![upstream]);

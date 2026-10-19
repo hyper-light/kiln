@@ -633,7 +633,7 @@ a.ms-why:hover {
 }
 
 /* ---------------------------------------------------------------- how the list is shown, and messaging it */
-/* The filter field and the sort, side by side; stacked on a phone. */
+/* The filter field and the sort, side by side, on a phone too: there the sort gives way. */
 .ms-bar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 220px;
@@ -642,7 +642,13 @@ a.ms-why:hover {
 }
 @container (max-width: 760px) {
   .ms-bar {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 180px);
+  }
+}
+@container (max-width: 520px) {
+  .ms-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
+    gap: 8px;
   }
 }
 
@@ -838,4 +844,44 @@ a.ms-why:hover {
 }
 .ms-recover-none {
   color: #97999f;
+}
+
+/* ---------------------------------------------------------------- notifications, and a phone's page */
+/* One quiet line: notifications could be on here (push-offer.tsx). */
+.ms-offer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 14px;
+  margin: 0 0 8px;
+  padding: 0 4px;
+  color: #97999f;
+  font-size: 12.5px;
+  line-height: 20px;
+}
+.ms-offer .ms-link {
+  font-size: 12.5px;
+}
+.ms-offer-text {
+  min-width: 0;
+}
+.ms-offer-not {
+  color: #8f939e;
+}
+/* A phone's head is one line (PageIntro's `compact`), so the page starts higher. */
+@media (max-width: 640px) {
+  .ms-page {
+    padding-top: 16px;
+  }
+}
+/* On a phone the message box opens from the list's head, and folds back into it. */
+.ms-msg-open {
+  margin-left: auto;
+  font-size: 12.5px;
+}
+.ms-msg-open[aria-expanded="true"] .ms-chev {
+  transform: rotate(90deg);
+}
+.ms-listhead + .ms-msg {
+  margin: 4px 0 14px;
 }

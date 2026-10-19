@@ -132,6 +132,7 @@ function Palette() {
       { id: "p-overview", group: "Pages", label: "Overview", icon: <LayoutGrid size={15} />, run: () => go("/") },
       { id: "p-runs", group: "Pages", label: "Runs", icon: <Activity size={15} />, run: () => go("/runs") },
       { id: "p-deployments", group: "Pages", label: "Deployments", hint: "sync and health", icon: <Rocket size={15} />, run: () => go("/deployments") },
+      { id: "p-releases", group: "Pages", label: "Releases", hint: "apps across environments: deploy, promote, roll back, approve", icon: <Rocket size={15} />, run: () => go("/deployments/releases") },
       { id: "p-deploy-plans", group: "Pages", label: "Deploy plans", hint: "what a branch, commit or pull request would deploy", icon: <GitBranch size={15} />, run: () => go("/deployments/plans") },
       { id: "p-repos", group: "Pages", label: "Repositories", icon: <GitBranch size={15} />, run: () => go("/repos") },
       { id: "p-sync", group: "Pages", label: "Synced folders", hint: "in Repositories: folders kept the same on several machines", icon: <FolderSync size={15} />, run: () => go("/repos?show=synced") },

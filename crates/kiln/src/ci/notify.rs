@@ -4,7 +4,9 @@
 //!   `on` (events), `where` (an expression over `github` and `run`), `to` (channels) and
 //!   `throttle` (at most one message per channel, event, workflow and branch in that long).
 //! - **Events**: `run.failed`, `run.fixed` (the first success after failures on the same branch
-//!   and workflow), `run.succeeded`, `run.cancelled`, `approval.waiting`.
+//!   and workflow), `run.succeeded`, `run.cancelled`, `approval.waiting`; and an agent's
+//!   (docs/agentic.md N2): `agent.needs_you`, `agent.finished`, `agent.stopped`, `agent.paused`,
+//!   which only the server's rules take (an agent is no repository's), `where` reading `agent`.
 //! - **Channels** are `kind:target`: an integration of that kind (one named `target`, or the
 //!   first, with `target` as its channel or chat): `slack:#ci`, `discord:team-hook`,
 //!   `teams:ops`, `telegram:-1001234`, `pagerduty:oncall`, `opsgenie:ops`, `webhook:audit`.
@@ -27,7 +29,9 @@ use crate::hub::Hub;
 use crate::store::Repo;
 
 /// The events rules can name.
-pub const EVENTS: &[&str] = &["run.failed", "run.fixed", "run.succeeded", "run.cancelled", "approval.waiting"];
+pub const EVENTS: &[&str] = &["run.failed", "run.fixed", "run.succeeded", "run.cancelled", "approval.waiting", "agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
+/// The events about an agent (`crate::push`): the server's rules take them, a repository's can't.
+pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
 /// The integration kinds that are channels.
 pub const CHANNELS: &[&str] = &["slack", "discord", "teams", "telegram", "pagerduty", "opsgenie", "webhook"];
 
@@ -58,9 +62,14 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn check(&self) -> Result<(), String> {
+    /// Whether it's a rule kiln can follow: `server` for the server's own (`[[ci.notify]]`), which
+    /// alone may take agents' events.
+    fn check(&self, server: bool) -> Result<(), String> {
         if let Some(e) = self.on.iter().find(|e| !EVENTS.contains(&e.as_str())) {
             return Err(format!("`{e}` isn't an event kiln notifies of: {}", EVENTS.join(", ")));
+        }
+        if !server && let Some(e) = self.on.iter().find(|e| AGENT_EVENTS.contains(&e.as_str())) {
+            return Err(format!("`{e}` is about an agent, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml)"));
         }
         if self.to.is_empty() {
             return Err("a rule needs somewhere to send to (`to`)".into());
@@ -98,14 +107,14 @@ pub fn parse_rules(yaml: &str) -> Result<Vec<Rule>, String> {
     }
     let rules: Vec<Rule> = serde_yaml::from_str(yaml).map_err(|e| format!(".kiln/notify.yaml: {e}"))?;
     for (i, r) in rules.iter().enumerate() {
-        r.check().map_err(|e| format!(".kiln/notify.yaml, rule {}: {e}", i + 1))?;
+        r.check(false).map_err(|e| format!(".kiln/notify.yaml, rule {}: {e}", i + 1))?;
     }
     Ok(rules)
 }
 
 /// Every rule a repository's events go through: the server's, then trunk's.
 async fn rules_for(hub: &Hub, repo: &Repo) -> Vec<(String, Rule)> {
-    let mut out: Vec<(String, Rule)> = hub.cfg.ci.notify.iter().enumerate().filter(|(_, r)| r.check().is_ok()).map(|(i, r)| (format!("server#{}", i + 1), r.clone())).collect();
+    let mut out: Vec<(String, Rule)> = hub.cfg.ci.notify.iter().enumerate().filter(|(_, r)| r.check(true).is_ok()).map(|(i, r)| (format!("server#{}", i + 1), r.clone())).collect();
     if let Some((_, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/notify.yaml", ".kiln/notify.yml"]).await {
         match parse_rules(&String::from_utf8_lossy(&text)) {
             Ok(rules) => out.extend(rules.into_iter().enumerate().map(|(i, r)| (format!("{}#{}", repo.name, i + 1), r))),
@@ -174,6 +183,45 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     (title, format!("{} · {short} {first} · {} · {}", s.repo, s.actor, s.url))
 }
 
+/// What a channel is sent: the message, and what some channels need besides.
+struct Msg {
+    title: String,
+    line: String,
+    url: String,
+    /// What the link is to ("the run", "the agent").
+    what: &'static str,
+    /// One incident per thing it's about (PagerDuty, Opsgenie).
+    dedup: String,
+    /// It ends that incident.
+    resolve: bool,
+    /// A webhook channel's body.
+    webhook: Value,
+}
+
+impl Msg {
+    fn of_run(event: &str, s: &Subject) -> Msg {
+        let (title, line) = message(event, s);
+        let webhook = json!({ "event": event, "title": title, "text": line, "run": s.run_value(), "environments": s.environments });
+        Msg { title, line, url: s.url.clone(), what: "the run", dedup: format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch), resolve: matches!(event, "run.fixed" | "run.succeeded"), webhook }
+    }
+
+    /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`.
+    fn of_agent(event: &str, ev: &Value) -> Msg {
+        let get = |p: &str| ev.pointer(p).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (id, name, machine, text, url) = (get("/agent/id"), get("/agent/name"), get("/agent/machine"), get("/text"), get("/url"));
+        let title = match event {
+            "agent.needs_you" => format!("⏸ {name} needs you"),
+            "agent.finished" => format!("✓ {name} finished"),
+            "agent.stopped" => format!("✗ {name} stopped"),
+            "agent.paused" => format!("◌ {name} paused"),
+            other => format!("{other}: {name}"),
+        };
+        let line = format!("{text} · {machine} · {url}");
+        let webhook = json!({ "event": event, "title": title, "text": line, "agent": ev.get("agent").cloned().unwrap_or(Value::Null), "url": url });
+        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook }
+    }
+}
+
 /// Whether a message for `key` may go now, `throttle` seconds after the last; records it if so.
 async fn throttled(hub: &Hub, key: &str, throttle: Option<i64>) -> bool {
     let Some(t) = throttle.filter(|t| *t > 0) else { return false };
@@ -191,8 +239,9 @@ async fn throttled(hub: &Hub, key: &str, throttle: Option<i64>) -> bool {
         .unwrap_or(false)
 }
 
-/// The integration a channel names for `repo`, and the target in it (a Slack channel, a chat).
-async fn channel(hub: &Hub, repo: &Repo, spec: &str) -> Result<(Integration, Option<String>), String> {
+/// The integration a channel names for `repo` (`None`: for the server, as an agent's events
+/// are), and the target in it (a Slack channel, a chat).
+async fn channel(hub: &Hub, repo: Option<&Repo>, spec: &str) -> Result<(Integration, Option<String>), String> {
     let (kind, target) = spec.split_once(':').map_or((spec, ""), |(k, t)| (k, t));
     if kind == "inbox" || kind == "email" {
         return Err(format!("`{kind}` channels aren't built yet"));
@@ -201,11 +250,12 @@ async fn channel(hub: &Hub, repo: &Repo, spec: &str) -> Result<(Integration, Opt
         return Err(format!("`{kind}` isn't a channel: {} (each an integration)", CHANNELS.join(", ")));
     }
     let all = integrations::list(hub).await.map_err(|e| format!("{e:#}"))?;
-    let usable = |i: &&Integration| i.kind == kind && usable_by(i, repo);
+    let usable = |i: &&Integration| i.kind == kind && repo.map_or(i.scope == "server" || i.scope.is_empty(), |r| usable_by(i, r));
     if let Some(i) = all.iter().filter(usable).find(|i| i.name == target) {
         return Ok((i.clone(), None));
     }
-    let i = all.iter().find(usable).ok_or_else(|| format!("no {kind} integration {} may use", repo.name))?;
+    let who = repo.map_or_else(|| "the server".to_owned(), |r| r.name.clone());
+    let i = all.iter().find(usable).ok_or_else(|| format!("no {kind} integration {who} may use"))?;
     Ok((i.clone(), Some(target.to_owned()).filter(|t| !t.is_empty())))
 }
 
@@ -215,10 +265,10 @@ fn usable_by(i: &Integration, repo: &Repo) -> bool {
 }
 
 /// Sends one message through `i`.
-async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, s: &Subject) -> Result<(), String> {
+async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: &Msg) -> Result<(), String> {
     let client = crate::http::client::Client::public().map_err(|e| format!("{e:#}"))?;
     let secret = integrations::token(hub, i).await.map_err(|e| format!("{e:#}"))?;
-    let (title, line) = message(event, s);
+    let (title, line) = (m.title.clone(), m.line.clone());
     let text = format!("{title}\n{line}");
     let cfg = |k: &str| i.config.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.is_empty());
     let need = |what: &str| secret.clone().ok_or_else(|| format!("{} has no {what} stored", i.name));
@@ -243,17 +293,17 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, s: 
             (integrations::endpoint("telegram:api", || "https://api.telegram.org".into()) + &format!("/bot{}/sendMessage", need("bot token")?), json!({ "chat_id": chat, "text": text }), None)
         }
         "pagerduty" => {
-            // Failures trigger an incident a fix resolves: one per repository, workflow and branch.
-            let action = if matches!(event, "run.fixed" | "run.succeeded") { "resolve" } else { "trigger" };
-            let dedup = format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch);
-            (integrations::endpoint("pagerduty:events", || "https://events.pagerduty.com/v2/enqueue".into()), json!({ "routing_key": need("routing key")?, "event_action": action, "dedup_key": dedup, "payload": { "summary": title, "source": "kiln", "severity": "error", "custom_details": { "line": line } }, "links": [{ "href": s.url, "text": "the run" }] }), None)
+            // Failures trigger an incident a fix resolves: one per repository, workflow and branch
+            // (an agent's: one per agent, which finishing resolves).
+            let action = if m.resolve { "resolve" } else { "trigger" };
+            (integrations::endpoint("pagerduty:events", || "https://events.pagerduty.com/v2/enqueue".into()), json!({ "routing_key": need("routing key")?, "event_action": action, "dedup_key": m.dedup, "payload": { "summary": title, "source": "kiln", "severity": "error", "custom_details": { "line": line } }, "links": [{ "href": m.url, "text": m.what }] }), None)
         }
         "opsgenie" => (
             integrations::endpoint("opsgenie:alerts", || "https://api.opsgenie.com/v2/alerts".into()),
-            json!({ "message": title, "description": line, "alias": format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch), "source": "kiln" }),
+            json!({ "message": title, "description": line, "alias": m.dedup, "source": "kiln" }),
             Some(format!("GenieKey {}", need("API key")?)),
         ),
-        "webhook" => (cfg("url").ok_or("a webhook integration needs its `url`")?, json!({ "event": event, "title": title, "text": line, "run": s.run_value(), "environments": s.environments }), None),
+        "webhook" => (cfg("url").ok_or("a webhook integration needs its `url`")?, m.webhook.clone(), None),
         other => return Err(format!("`{other}` isn't a channel")),
     };
     let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
@@ -291,8 +341,9 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, s: 
     Ok(())
 }
 
-/// Delivers through `spec`, retrying (now, after 2 s, after 15 s), and records how it went.
-async fn deliver(hub: &Hub, repo: &Repo, rule: &str, event: &str, s: &Subject, spec: &str) {
+/// Delivers through `spec`, retrying (now, after 2 s, after 15 s), and records how it went (with
+/// what it's about: a run's id, or `agent:<id>`).
+async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about: &str, m: &Msg, spec: &str) {
     let mut attempts = 0;
     let result = match channel(hub, repo, spec).await {
         Err(e) => Err(e),
@@ -303,7 +354,7 @@ async fn deliver(hub: &Hub, repo: &Repo, rule: &str, event: &str, s: &Subject, s
                     crate::rt::sleep(Duration::from_secs(wait)).await;
                 }
                 attempts += 1;
-                last = send(hub, &i, target.as_deref(), event, s).await;
+                last = send(hub, &i, target.as_deref(), event, m).await;
                 if last.is_ok() {
                     break;
                 }
@@ -312,9 +363,9 @@ async fn deliver(hub: &Hub, repo: &Repo, rule: &str, event: &str, s: &Subject, s
         }
     };
     if let Err(e) = &result {
-        tracing::warn!(channel = spec, event, run = %s.run, error = %e, "a notification didn't go out");
+        tracing::warn!(channel = spec, event, about, error = %e, "a notification didn't go out");
     }
-    let (rule, event, run, spec, now) = (rule.to_owned(), event.to_owned(), s.run.clone(), spec.to_owned(), crate::util::now_unix());
+    let (rule, event, run, spec, now) = (rule.to_owned(), event.to_owned(), about.to_owned(), spec.to_owned(), crate::util::now_unix());
     let (status, error) = match result {
         Ok(()) => ("sent", None),
         Err(e) => ("failed", Some(e)),
@@ -338,7 +389,45 @@ pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
             if throttled(hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
                 continue;
             }
-            deliver(hub, repo, &name, event, s, spec).await;
+            deliver(hub, Some(repo), &name, event, &s.run, &Msg::of_run(event, s), spec).await;
+        }
+    }
+}
+
+/// Whether `rule` takes an agent's `event`: `where` reads `agent` (its `id`, `name`, `harness`,
+/// `harness_name`, `machine`, `cwd`, `opener`, and the note's `text`).
+fn takes_agent(rule: &Rule, event: &str, ev: &Value) -> bool {
+    if !rule.on.iter().any(|e| e == event) {
+        return false;
+    }
+    let Some(c) = &rule.cond else { return true };
+    let Ok(cond) = kiln_ci::expr::Condition::parse(c, &kiln_ci::expr::ParseOptions::permissive(kiln_ci::expr::Dialect::Kiln)) else { return false };
+    let mut agent = ev.get("agent").cloned().unwrap_or_else(|| json!({}));
+    if let Some(o) = agent.as_object_mut() {
+        o.insert("text".into(), ev.get("text").cloned().unwrap_or(Value::Null));
+        o.insert("event".into(), json!(event));
+    }
+    let cx = kiln_ci::expr::MapContexts::default().with("agent", kiln_ci::expr::Value::from_json(&agent));
+    kiln_ci::expr::eval_condition(&cond, &cx, &mut kiln_ci::expr::Budget::default()).unwrap_or(false)
+}
+
+/// An agent's event (docs/agentic.md N2, from `crate::push`), through every server rule that takes
+/// it: at most once per channel, event and agent in a rule's `throttle`.
+pub async fn agent_event(hub: Arc<Hub>, ev: Value) {
+    let Some(event) = ev.get("type").and_then(Value::as_str).filter(|e| AGENT_EVENTS.contains(e)).map(str::to_owned) else { return };
+    let id = ev.pointer("/agent/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let m = Msg::of_agent(&event, &ev);
+    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+        if rule.check(true).is_err() || !takes_agent(rule, &event, &ev) {
+            continue;
+        }
+        let name = format!("server#{}", n + 1);
+        for spec in &rule.to {
+            let key = format!("{name}\u{0}{spec}\u{0}{event}\u{0}agent:{id}");
+            if throttled(&hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
+                continue;
+            }
+            deliver(&hub, None, &name, &event, &format!("agent:{id}"), &m, spec).await;
         }
     }
 }
@@ -413,9 +502,10 @@ pub async fn from_leg(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
     s.name = text;
     s.number = 0;
     let mut sent = Vec::new();
+    let m = Msg::of_run("message", &s);
     for spec in &to {
-        let r = match channel(hub, &repo, spec).await {
-            Ok((i, target)) => send(hub, &i, target.as_deref(), "message", &s).await,
+        let r = match channel(hub, Some(&repo), spec).await {
+            Ok((i, target)) => send(hub, &i, target.as_deref(), "message", &m).await,
             Err(e) => Err(e),
         };
         sent.push(json!({ "to": spec, "ok": r.is_ok(), "error": r.err() }));
@@ -426,7 +516,7 @@ pub async fn from_leg(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
 /// Integration Verify for a channel: a test message.
 pub async fn verify(hub: &Hub, i: &Integration) -> Result<String, String> {
     let s = Subject { name: "kiln: a test message; this channel works".into(), url: hub.cfg.server.public_url.clone(), ..Subject::default() };
-    send(hub, i, None, "message", &s).await.map(|()| format!("sent a test message through {}", i.name))
+    send(hub, i, None, "message", &Msg::of_run("message", &s)).await.map(|()| format!("sent a test message through {}", i.name))
 }
 
 /// `GET /api/ci/notify/deliveries?run=&limit=`: what went out, newest first.
@@ -474,5 +564,30 @@ mod tests {
         assert_eq!(title, "✗ CI #7 failed on main");
         assert_eq!(line, "acme/app · 01234567 fix the parser · ada · https://kiln.example/runs/r1");
         assert_eq!(message("run.fixed", &s).0, "✓ CI #7 is fixed on main");
+    }
+
+    /// docs/agentic.md N2: an agent's notes through the server's rules, `where` reading `agent`.
+    #[test]
+    fn n2_agents_events_go_through_the_servers_rules() {
+        let ev = json!({ "type": "agent.needs_you", "agent": { "id": "ag1", "name": "Mantle", "harness": "claude", "machine": "metal-1", "cwd": "/src/kiln", "opener": "owner" }, "title": "Mantle", "text": "Asks: which database?", "url": "https://kiln.example/agents/ag1" });
+        let rule = |on: &str, cond: Option<&str>| Rule { on: vec![on.into()], cond: cond.map(str::to_owned), to: vec!["slack:#agents".into()], throttle: Some("5m".into()) };
+        assert!(takes_agent(&rule("agent.needs_you", None), "agent.needs_you", &ev));
+        assert!(!takes_agent(&rule("agent.finished", None), "agent.needs_you", &ev));
+        assert!(takes_agent(&rule("agent.needs_you", Some("agent.machine == 'metal-1' && agent.harness == 'claude'")), "agent.needs_you", &ev));
+        assert!(!takes_agent(&rule("agent.needs_you", Some("agent.machine == 'metal-2'")), "agent.needs_you", &ev));
+        assert!(takes_agent(&rule("agent.needs_you", Some("startsWith(agent.text, 'Asks')")), "agent.needs_you", &ev));
+        // A server rule may name them; a repository's may not.
+        assert!(rule("agent.paused", None).check(true).is_ok());
+        assert!(rule("agent.paused", None).check(false).is_err());
+        assert!(parse_rules("- on: agent.finished\n  to: slack:#x\n").is_err());
+        let m = Msg::of_agent("agent.needs_you", &ev);
+        assert_eq!(m.title, "⏸ Mantle needs you");
+        assert_eq!(m.line, "Asks: which database? · metal-1 · https://kiln.example/agents/ag1");
+        assert_eq!(m.dedup, "kiln:agent:ag1");
+        assert!(!m.resolve && Msg::of_agent("agent.finished", &ev).resolve);
+        assert_eq!(m.webhook.pointer("/agent/opener").and_then(Value::as_str), Some("owner"));
+        // A run's message is as it was.
+        let r = Msg::of_run("run.failed", &subject());
+        assert_eq!((r.title.as_str(), r.dedup.as_str(), r.resolve), ("✗ CI #7 failed on main", "kiln:acme/app:.github/workflows/ci.yml:main", false));
     }
 }
