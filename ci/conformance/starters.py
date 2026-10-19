@@ -54,8 +54,8 @@ NOT_RUN = {
     "ci_datadog-synthetics.yml": "runs Datadog Synthetic tests: needs a Datadog account",
     "ci_docker-publish.yml": "pushes to ghcr.io and signs with Sigstore: needs a registry account (W12 will host one)",
     "ci_gem-push.yml": "publishes to RubyGems and GitHub Packages on a release: needs accounts",
-    "ci_generator-generic-ossf-slsa3-publish.yml": "SLSA provenance through slsa-github-generator's reusable workflows: needs Sigstore and attestations (W18)",
-    "ci_go-ossf-slsa3-publish.yml": "SLSA provenance through slsa-github-generator's reusable workflows: needs Sigstore and attestations (W18)",
+    "ci_generator-generic-ossf-slsa3-publish.yml": "SLSA provenance through slsa-github-generator's reusable workflows: they sign through Sigstore's public instance, which trusts GitHub's ID tokens, not kiln's",
+    "ci_go-ossf-slsa3-publish.yml": "SLSA provenance through slsa-github-generator's reusable workflows: they sign through Sigstore's public instance, which trusts GitHub's ID tokens, not kiln's",
     "ci_gradle-publish.yml": "publishes to GitHub Packages on a release: needs a registry (W12)",
     "ci_laravel.yml": "tests a Laravel application: the fixture isn't one",
     "ci_maven-publish.yml": "publishes to GitHub Packages on a release: needs a registry (W12)",
@@ -65,9 +65,9 @@ NOT_RUN = {
     "ci_rubyonrails.yml": "tests a Rails application: the fixture isn't one",
     "ci_super-linter.yml": "every linter over the whole code base, in a multi-gigabyte image: not run",
     "ci_symfony.yml": "tests a Symfony application: the fixture isn't one",
-    "automation_greetings.yml": "comments on new issues and pull requests through GitHub's REST API: not in kiln's facade yet (W14)",
-    "automation_label.yml": "labels pull requests through GitHub's REST API: not in kiln's facade yet (W14)",
-    "automation_stale.yml": "closes stale issues through GitHub's REST API: not in kiln's facade yet (W14)",
+    "automation_greetings.yml": "greets new issues and pull requests (`issues`, `pull_request_target`): GitHub's issues are outside kiln (§1.3), and this run's pushes raise neither",
+    "automation_label.yml": "labels pull requests on `pull_request_target`, which this run's pushes don't raise: `actions/labeler` passes on a change request (W22-AC02)",
+    "automation_stale.yml": "closes stale issues and pull requests on a schedule: GitHub's issues are outside kiln (§1.3)",
     "automation_summary.yml": "summarizes issues with GitHub Models: needs an account",
     "code-scanning_clj-watson.yml": "reads GitHub's advisory database through github.com's GraphQL API: needs a token for GitHub itself",
     "code-scanning_detekt.yml": "asks github.com's GraphQL API for detekt's release (`gh api graphql`): needs a token for GitHub itself, which a kiln job's isn't",
@@ -114,7 +114,7 @@ def family_reason(name, text):
         cloud = name[len("deployments_"):-len(".yml")].split("-")[0]
         return f"deploys to {cloud}: needs a cloud account (W11-AC03)"
     if name.startswith("pages_"):
-        return "publishes to GitHub Pages (configure-pages, deploy-pages): kiln has no Pages (W14)"
+        return "publishes to GitHub Pages (configure-pages, deploy-pages): hosting Pages is outside kiln (§1.3)"
     if name.startswith("code-scanning_"):
         secrets = sorted(set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text)) - {"GITHUB_TOKEN"})
         if secrets:

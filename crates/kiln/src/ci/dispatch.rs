@@ -1596,6 +1596,10 @@ impl Dispatch {
                 proxies: self.hub.cfg.ci.registry.proxies.iter().filter(|p| p.jobs).map(|p| (p.ecosystem.clone(), format!("/_kiln/proxy/{}", p.name.clone().unwrap_or_else(|| p.ecosystem.clone())))).collect(),
                 // Images from the registries kiln mirrors come through it (W12-R02).
                 mirrors: self.hub.cfg.ci.registry.mirrors.iter().map(|m| (m.upstream.clone(), m.prefix())).collect(),
+                // Its certificate authority when it serves HTTPS (on its own port, or behind an
+                // `https://` address): GitHub Enterprise Server's clients go `https://` to the
+                // host they're given whatever its scheme (§2.6).
+                server_ca: (self.hub.cfg.server.https || self.hub.cfg.server.public_url.starts_with("https://")).then(|| self.hub.pki.ca_pem.clone()),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
             actions: r.actions.clone(),

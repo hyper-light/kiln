@@ -187,6 +187,12 @@ pub struct Runtime {
     /// The registries kiln mirrors (W12-R02): `(upstream, prefix)`; the runner pulls their images
     /// through kiln.
     pub mirrors: Vec<(String, String)>,
+    /// kiln's certificate authority (PEM), when the server serves HTTPS: legs trust it beside
+    /// their machine's roots (§2.6), since jobs reach the facade through the same front door and
+    /// certificate as everything else, and GitHub Enterprise Server's clients go `https://` to the
+    /// host they're given whatever its scheme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_ca: Option<String>,
 }
 
 /// A remote action, resolved (W07-R02).

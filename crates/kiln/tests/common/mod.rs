@@ -80,6 +80,12 @@ pub struct Options<'a> {
 
 /// A server of its own under `dir`, up and answering.
 pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_with(dir, o, false)
+}
+
+/// `start`, serving HTTPS too (on the same port) when `https`: its address is `https://`, the
+/// kiln CA's certificate.
+pub fn start_with(dir: &Path, o: &Options<'_>, https: bool) -> anyhow::Result<Server> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -87,10 +93,10 @@ pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
         r#"[server]
 http_addr = "127.0.0.1:{port}"
 quic_addr = "127.0.0.1:{quic}"
-public_url = "http://127.0.0.1:{port}"
+public_url = "{scheme}://127.0.0.1:{port}"
 quic_advertise = "127.0.0.1:{quic}"
 data_dir = "{data}"
-https = false
+https = {https}
 
 [gitops]
 auto_pipelines = false
@@ -125,6 +131,7 @@ enabled = true
 "#,
         data = data.display(),
         work = work.display(),
+        scheme = if https { "https" } else { "http" },
         agent = o.agent,
         ci = o.ci,
         extra = o.extra,

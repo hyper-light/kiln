@@ -352,6 +352,9 @@ struct State {
     /// What each step's pre step saved (`$GITHUB_STATE`), by the step's index: its main and post
     /// steps get it as `STATE_*`, as GitHub's do.
     pre_state: BTreeMap<u32, Vec<(String, String)>>,
+    /// The server's certificate authority and a bundle of it and this machine's roots, when the
+    /// leg reaches the server over HTTPS (§2.6): its tools trust them.
+    trust: Option<(PathBuf, PathBuf)>,
     /// The running step's, taken by its action.
     action_state: Vec<(String, String)>,
     /// The index the next pre or post step gets (after the job's own steps).
@@ -929,7 +932,44 @@ impl Leg {
         set("KILN_TOKEN", rt.github_token.clone());
         set("KILN_JOB", a.job_id.clone());
         set("KILN_RUN", a.run_id.clone());
+        // The server's own certificate authority beside the machine's roots (§2.6): Node adds
+        // it to its own; git, curl, Python and OpenSSL take the bundle. A job's own say wins.
+        if let Some((ca, bundle)) = &st.trust {
+            set("NODE_EXTRA_CA_CERTS", ca.to_string_lossy().into_owned());
+            for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"] {
+                set(k, bundle.to_string_lossy().into_owned());
+            }
+        }
         v
+    }
+
+    /// When the server serves HTTPS (it sent its certificate authority): that authority and a
+    /// bundle of it and this machine's roots, written in the leg's temp (mounted in its
+    /// containers), for its tools.
+    async fn server_trust(&self, l: &Layout) -> Option<(PathBuf, PathBuf)> {
+        let ca = self.a.runtime.server_ca.clone()?;
+        let dir = l.temp.join("_kiln_ca");
+        let (ca_file, bundle) = (dir.join("kiln-ca.pem"), dir.join("ca-bundle.pem"));
+        let (c, b) = (ca_file.clone(), bundle.clone());
+        let written = crate::rt::blocking(move || -> std::io::Result<()> {
+            use base64::Engine as _;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(&c, &ca)?;
+            let mut all = String::new();
+            for der in crate::http::roots::system() {
+                let text = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+                all.push_str("-----BEGIN CERTIFICATE-----\n");
+                for line in text.as_bytes().chunks(64) {
+                    all.push_str(&String::from_utf8_lossy(line));
+                    all.push('\n');
+                }
+                all.push_str("-----END CERTIFICATE-----\n");
+            }
+            all.push_str(&ca);
+            std::fs::write(&b, all)
+        })
+        .await;
+        matches!(written, Ok(Ok(()))).then_some((ca_file, bundle))
     }
 
     async fn run_inner(&self, tool_cache: PathBuf) -> anyhow::Result<Status> {
@@ -946,6 +986,7 @@ impl Leg {
             std::fs::write(temp.join("_github_workflow").join("event.json"), event)
         })
         .await??;
+        let trust = self.server_trust(&layout).await;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
         let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();
         masks.extend(a.masks.iter().cloned());
@@ -1010,6 +1051,7 @@ impl Leg {
             posts: Vec::new(),
             pre_state: BTreeMap::new(),
             action_state: Vec::new(),
+            trust,
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
             containers: None,

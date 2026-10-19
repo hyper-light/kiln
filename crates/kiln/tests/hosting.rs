@@ -1252,3 +1252,130 @@ jobs:
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+/// `pull_request_target` from a change request on a native repository (docs/ci.md W03-R08, A.6):
+/// the trunk's own workflow runs, at the trunk's tip, given the pull request; what the branch
+/// changed in that workflow doesn't run.
+#[test]
+fn w03_r08_native_pull_request_target() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/app") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    let workflow = |from: &str| format!("on: pull_request_target\njobs:\n  t:\n    runs-on: local\n    steps:\n      - run: echo \"target from {from} ref=$GITHUB_REF sha=$GITHUB_SHA pr=${{{{ github.event.pull_request.number }}}} head=${{{{ github.event.pull_request.head.ref }}}}\"\n");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/target.yml"), workflow("trunk"))?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "target"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the workflow")?;
+    let tip = must(git(&home, &work, &["rev-parse", "HEAD"]), "tip")?.trim().to_owned();
+    // A branch that changes the workflow, and a change request for it.
+    must(git(&home, &work, &["checkout", "-q", "-b", "feature"]), "branch")?;
+    std::fs::write(work.join(".github/workflows/target.yml"), workflow("branch"))?;
+    std::fs::write(work.join("change.txt"), "change\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "a change"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "feature"]), "the branch")?;
+    let (st, cr) = http(s.port, "POST", "/api/repos/acme%2Fapp/change-requests", &s.admin, Some(&json!({ "branch": "feature" })))?;
+    anyhow::ensure!(st == 200, "change request: {st} {cr}");
+    let number = serde_json::from_str::<Value>(&cr)?.get("change_request").and_then(Value::as_str).unwrap_or_default().trim_start_matches("CR").to_owned();
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        let run = v.get("runs").and_then(Value::as_array).and_then(|r| r.iter().find(|r| text(r, "event") == "pull_request_target")).cloned();
+        if let Some(r) = run.filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let id = text(&r, "id").to_owned();
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
+            assert_eq!(text(&r, "conclusion"), "success", "{r}\n{log}\n{}", s.log());
+            assert!(log.contains(&format!("target from trunk ref=refs/heads/main sha={tip} pr={number} head=feature")), "{log}");
+            assert!(!log.contains("target from branch"), "the branch's workflow never runs this way: {log}");
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no pull_request_target run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The facade over HTTPS (docs/ci.md §2.6): a server whose address is `https://`, its certificate
+/// the kiln CA's. A job's tools trust it beside the machine's roots: curl to the API, git to the
+/// repository, and Node's `fetch`, as `create-pull-request` and `actions-gh-pages` reach GitHub
+/// Enterprise Server's `https://` API and git.
+#[test]
+fn w14_r11_facade_over_https() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = common::start_with(dir.path(), &Options { agent: true, ..Options::default() }, true)?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((!(body.contains("acme/app") && !body.contains("\"last_polled_at\":null"))).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(
+        work.join(".github/workflows/tls.yml"),
+        r#"on: push
+jobs:
+  tls:
+    runs-on: local
+    steps:
+      - env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # GitHub Enterprise Server's clients go https:// to the host they're given, whatever
+          # its scheme, as create-pull-request does.
+          host="${GITHUB_SERVER_URL#*://}"
+          curl -sf -H "Authorization: Bearer $TOKEN" "https://$host/api/v3/repos/$GITHUB_REPOSITORY" | grep -q '"full_name"'
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" ls-remote "https://$host/$GITHUB_REPOSITORY.git" HEAD | grep -q HEAD
+          if command -v node > /dev/null; then
+            node -e 'fetch("https://" + process.env.GITHUB_SERVER_URL.split("://")[1] + "/api/v3/meta", { headers: { authorization: "Bearer " + process.env.TOKEN } }).then(r => { if (!r.ok) process.exit(1); console.log("node fetched") }, e => { console.error(e.cause || e); process.exit(1) })'
+          fi
+          echo "tls trusted"
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "tls"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:main"]), "the workflow")?;
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        let run = v.get("runs").and_then(Value::as_array).and_then(|r| r.first()).cloned();
+        if let Some(r) = run.filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let id = text(&r, "id").to_owned();
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
+            assert_eq!(text(&r, "conclusion"), "success", "{r}\n{log}\n{}", s.log());
+            assert!(log.contains("tls trusted"), "{log}");
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}

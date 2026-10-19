@@ -498,6 +498,23 @@ pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, 
             super::events::start(hub, repo, e, l, &f.message, &author.0, Value::Null).await?;
         }
     }
+    target(hub, repo, trunk, &pr, &f.message, &author.0).await
+}
+
+/// `pull_request_target` beside a pull request's `pull_request` (W03-R08): the trunk's own
+/// workflows, as the trunk is now, trusted and given the same pull request, as GitHub raises it.
+/// What the pull request's branch changed in its workflows never runs this way.
+async fn target(hub: &Hub, repo: &Repo, trunk: &str, pr: &Event, message: &str, author: &str) -> anyhow::Result<()> {
+    let dir = super::hosting::native_path(hub, repo).unwrap_or_else(|| gitops::mirror_path(hub, &repo.name));
+    let spec = format!("refs/heads/{trunk}^{{commit}}");
+    let tip = gitops::run_git(hub, &["-C", &dir.to_string_lossy(), "rev-parse", "--verify", "--quiet", &spec], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|s| s.len() == 40);
+    let Some(tip) = tip else { return Ok(()) };
+    let _ = gitops::ensure_commit(hub, repo, &tip).await;
+    let e = Event { name: "pull_request_target".into(), git_ref: format!("refs/heads/{trunk}"), sha: tip.clone(), trusted: true, ..pr.clone() };
+    let commit = super::load::load(hub, repo, &tip).await?;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+        super::events::start(hub, repo, &e, l, message, author, Value::Null).await?;
+    }
     Ok(())
 }
 
@@ -566,7 +583,7 @@ pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool) -> an
     for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
         super::events::start(hub, repo, &e, l, &d.title, &d.author, Value::Null).await?;
     }
-    Ok(())
+    target(hub, repo, &d.trunk, &e, &d.title, &d.author).await
 }
 
 // ------------------------------------------------------------------ reads

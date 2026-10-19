@@ -174,7 +174,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
-| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
+| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native `pull_request_target`; the other native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
@@ -193,7 +193,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
 ---
@@ -1179,9 +1179,16 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
     - `workflow_run` after each run;
     - an `issue_comment` delivery, and its redelivery doing nothing;
     - a push both delivered and polled, running once.
+- *Done.* Native `pull_request_target` (R08, A.6): a diff's or change request's new version, and
+  its close, raise it beside `pull_request`. The trunk's own workflows run, as the trunk is now
+  (`GITHUB_SHA` its tip, `GITHUB_REF` the trunk), trusted and given the pull request. What the
+  pull request's branch changed in its workflows never runs this way. Checked end to end
+  (`w03_r08_native_pull_request_target`: a branch that rewrites the workflow, whose rewrite
+  doesn't run), and `actions/labeler@v5` labels a change request from it (W22-AC02).
 - *Left.*
   - The App's events (with W14-R10).
-  - kiln's native events (with W14, W15 and W20).
+  - kiln's other native events: `pull_request`'s other types, `pull_request_review` and its
+    comments, `issue_comment` (with W14, W15 and W20).
   - kiln dialect raising the `workflow_run` depth.
   - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05 as an integration
     test, AC07 to AC09.
@@ -3740,6 +3747,15 @@ is left.
     and deletes of jobs' own comments). A job writes as `github-actions[bot]`, an agent: its
     approval counts only where `agents-can-approve`; a comment on the whole pull request doesn't
     hold a land up. Checked with a real run (`w14_r11_pulls`);
+  - over HTTPS (§2.6): a server that serves it (`server.https`, or an `https://` address) sends
+    its certificate authority with each leg, and the leg's tools trust it beside the machine's
+    roots. Node adds it to its own (`NODE_EXTRA_CA_CERTS`); git, curl, Python and OpenSSL take a
+    bundle of the machine's roots and it (`GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`,
+    `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`). A job's own say wins. The server's certificate names
+    `host.docker.internal` too, which containers on its machine reach it by. GitHub Enterprise
+    Server's clients go `https://` to the host they're given whatever its scheme, as
+    `create-pull-request` and `actions-gh-pages` do, so this is what lets them run. Checked end to
+    end (`w14_r11_facade_over_https`: curl, git and Node over `https://`);
   - pull requests jobs open, as `create-pull-request` does: `POST /pulls` makes a change request
     for a branch the job pushed with its token (one open per branch and trunk, a second refused
     with 422), and `PATCH /pulls/{n}` changes its title or description, or closes it (abandoned)
@@ -5020,6 +5036,37 @@ and AC02.
     `GITHUB_API_URL` says, kiln's image has no conda, and there's no Windows runner here.
   - Repeated runs meet github.com's limit on anonymous API reads (setup-python sends its token
     only to github.com), which the harness marks.
+  - *2026-10-19*: code scanning on the facade brought the code-scanning starters in, 57 run.
+    After five passes, **39 of 57 pass, and each of the other 18 fails the same way on GitHub**
+    as written, each with its reason in the table. kiln's fixes on the way:
+    - job containers' and Docker actions' engine calls get ten minutes, not one;
+    - the runner image's conda, PowerShell, gh, pip and `~/.local/bin`;
+    - a Docker action's `runs.env` with its inputs;
+    - images made for GitHub's runner user;
+    - the workspace's parent (CodeQL's `../results`);
+    - codeql-action's newer features path and repository properties;
+    - what killed runners left behind, which had used up Docker's address pools.
+
+    The fixture gained what scanners look for: R for lintr, `file.yaml` for kubesec, ESLint's
+    `.eslintrc.js`, Conda's `environment.yml`. CodeQL runs on Python, its languages filled in
+    as GitHub fills them. The lab keeps its runner's tool cache between passes, as a runner does,
+    and gives its legs the machine's Docker, as GitHub's hosted runners have it. 115 aren't run,
+    each with its reason. Most need an account (68, the clouds among them) or macOS or Windows
+    (10). GitHub Pages, issues and Models are outside kiln (§1.3). SLSA's reusable workflows sign
+    through Sigstore's public instance, which trusts GitHub's ID tokens, not kiln's. Left to kiln:
+    the dependency graph's compare (5 starters).
+- *AC02, fourth batch* (2026-10-19), in the lab, the facade over HTTPS:
+  - `github/codeql-action/upload-sarif`: the code-scanning starters above.
+  - `peter-evans/create-pull-request@v7`: a branch pushed, a pull request opened, then updated
+    by the next run.
+  - `actions/labeler@v5`: on the change request's `pull_request_target`, labels from
+    `.github/labeler.yml`.
+  - `peaceiris/actions-gh-pages@v4`: `gh-pages` pushed.
+
+  That is 43 of F-21's 50. The seven left: five need accounts (codecov and the clouds' logins);
+  `attest-build-provenance` signs through a Sigstore (the public one, or GitHub's) that trusts
+  only GitHub's ID tokens; `setup-qemu-action` changes the kernel's binfmt and needs a
+  disposable runner (W13's microVMs).
 - *AC02, first batch* (16 actions, 2026-10-18):
   - Green: `setup-node`, `setup-go`, `setup-java`, `setup-uv`, `pnpm/action-setup`,
     `setup-bun`, `dtolnay/rust-toolchain`, `setup-terraform`, `docker/metadata-action`,
