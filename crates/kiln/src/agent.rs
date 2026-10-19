@@ -717,6 +717,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).
     let sync = (!o.ephemeral && !o.outpost).then(|| {
         let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
+        // An agent session moving between machines asks it where its folder stands.
+        crate::sync::runner::set_global(sync.clone());
         let up = up_tx.clone();
         crate::rt::spawn(async move {
             while let Ok(m) = said.recv().await {

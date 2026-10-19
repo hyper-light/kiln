@@ -6,7 +6,8 @@
 //! chose, when they did: `State::move_plan`): connected and taking sessions over (reach), with the
 //! same harness signed in to another account, one kiln doesn't know to be as full. One that has the
 //! session's repository already comes first, then the emptiest account; else the repository is
-//! copied there and kept in step. The session moves there (`relocate`), and there its harness,
+//! copied there and kept in step. A session whose folder isn't a repository kiln knows doesn't go:
+//! its files couldn't come along. The session moves there (`relocate`), and there its harness,
 //! signed in as someone else, ends the pause and goes on with the turn the limit cut off. With
 //! nowhere to go it waits for the reset where it is, its timeline says why, and kiln looks again
 //! every few minutes.
@@ -164,6 +165,11 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
         return Err(format!("the machines with {} don't take sessions over from others", info.kind_name));
     }
     let has_repo = repo_machines(hub, &from, &info.cwd).await;
+    // Its files must come along: a folder that isn't a repository kiln knows would be left behind,
+    // and the agent would go on without its work. A person can still move it (Move to…).
+    if has_repo.is_empty() {
+        return Err(format!("its folder, {}, isn't a git repository kiln knows on {from}, so its files couldn't come along", info.cwd));
+    }
     // As full as this, it would stop again there at once.
     let cap = info.pause_at.map_or(100.0, f64::from);
     let now = crate::util::now_ms();

@@ -331,6 +331,9 @@ pub struct Seed {
     /// Not a move: the session is started again here after a restart, its timeline and state
     /// taken from the conversation store (`crate::convo`).
     pub restored: bool,
+    /// Where its folder stood in the sync log on the machine it left: it goes on once the folder
+    /// here has taken the log that far.
+    pub synced: Option<crate::sync::runner::Mark>,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -691,6 +694,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         }
         core.upsert(&format!("harness-switch:moved-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
         items = sd.items;
+        core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
     begin(id, spec, kind, core, sink, on_change, files, items, None)
@@ -1529,6 +1533,226 @@ fn moving_note(s: &Session, text: &str) {
     s.core.lock().upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text: text.to_owned() });
 }
 
+/// How long a session leaving may take to get its folder's last changes into the sync log.
+const FILES_OUT_FOR: Duration = Duration::from_secs(600);
+/// How often a session leaving, or arriving, asks how its folder's copy stands.
+const FILES_EVERY: Duration = Duration::from_millis(250);
+
+/// Before a session leaves: its folder's last changes into its repo's sync log (looked at now,
+/// sent, their contents on the server, the log having brought them back), then where the copy
+/// stands, for the machine it goes to to take the log that far before it goes on there. None: its
+/// folder isn't a synced copy here. An error, and it doesn't leave: it would leave work behind.
+async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<crate::sync::runner::Mark>, String> {
+    let Some(sync) = crate::sync::runner::global() else { return Ok(None) };
+    let folder = std::path::Path::new(cwd);
+    let started = Instant::now();
+    let mut said = String::new();
+    loop {
+        let Some(looked) = sync.look_now(folder).await else { return Ok(None) };
+        let st = sync.standing(folder).await.unwrap_or_default();
+        if looked.looked && looked.proposed == 0 && st.unsent == 0 && st.behind == 0 {
+            left_behind(cwd, &st).await?;
+            return Ok(Some(crate::sync::runner::Mark { repo: looked.repo, index: st.reached }));
+        }
+        let why = match (&st.error, st.connected) {
+            (Some(e), _) => format!(" ({e})"),
+            (None, false) => " (this machine isn't connected to kiln)".to_owned(),
+            (None, true) => String::new(),
+        };
+        if started.elapsed() > FILES_OUT_FOR {
+            return Err(format!("its folder's last changes didn't reach kiln in {} minutes{why}, so they'd be left behind", FILES_OUT_FOR.as_secs() / 60));
+        }
+        let now = match st.unsent + looked.proposed {
+            0 => format!("Moving to {to}: its folder's last changes are being checked{why}"),
+            n => format!("Moving to {to}: sending its folder's last changes ({n} to go){why}"),
+        };
+        if now != said {
+            moving_note(s, &now);
+            said = now;
+        }
+        crate::rt::sleep(FILES_EVERY).await;
+    }
+}
+
+/// Before a session leaves: its repository besides its files ([`super::gitstate`]), less what the
+/// machine it goes to has. None: its folder isn't a git repository. An error, and it doesn't
+/// leave: a merge or rebase under way there, or more unpushed commits than a move carries.
+async fn git_out(s: &Session, cwd: &str, to: &str, there: &str) -> Result<Option<super::gitstate::GitState>, String> {
+    let c = cwd.to_owned();
+    let Some(root) = crate::rt::blocking(move || super::gitstate::root_of(std::path::Path::new(&c))).await.ok().flatten() else { return Ok(None) };
+    moving_note(s, &format!("Moving to {to}: its repository's branches, stash and what's staged"));
+    let theirs = match their_tips(to, there).await {
+        Some(t) => t,
+        // Not told: what was pushed, it likely has.
+        None => {
+            let r = root.clone();
+            crate::rt::blocking(move || super::gitstate::pushed(&r)).await.unwrap_or_default()
+        }
+    };
+    crate::rt::blocking(move || super::gitstate::capture(&root, &theirs)).await.map_err(|e| format!("{e:#}"))?.map(Some)
+}
+
+/// What the copy of the folder on machine `to` (at `there`) has at the tips of its refs, as it
+/// says over reach. None when it can't be asked.
+async fn their_tips(to: &str, there: &str) -> Option<Vec<String>> {
+    use crate::reach::wire::{RunSpec, Say, Stream};
+    let reach = crate::reach::node::global()?;
+    reach.connect(to).await.ok()?;
+    let spec = RunSpec {
+        command: "git for-each-ref --format='%(objectname)' && git rev-parse -q --verify HEAD; true".into(),
+        cwd: Some(there.to_owned()),
+        timeout_ms: Some(30_000),
+        ..RunSpec::default()
+    };
+    let (tx, rx) = async_channel::unbounded();
+    reach.run(to, spec, tx).await.ok()?;
+    let mut out = Vec::new();
+    let until = Instant::now() + Duration::from_secs(40);
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        match crate::rt::timeout(left, rx.recv()).await {
+            Ok(Ok(Say::Output { stream: Stream::Out, data, .. })) => out.extend(data),
+            Ok(Ok(Say::Exit { code: Some(0), .. })) => break,
+            Ok(Ok(Say::Exit { .. })) | Ok(Err(_)) | Err(_) => return None,
+            Ok(Ok(_)) => {}
+        }
+    }
+    let tips: Vec<String> = String::from_utf8_lossy(&out).lines().map(str::trim).filter(|l| l.len() >= 40 && l.chars().all(|c| c.is_ascii_hexdigit())).map(str::to_owned).collect();
+    Some(tips)
+}
+
+/// A moved session's repository put as it was on the machine it left, once its files are in:
+/// what [`super::gitstate::restore`] did, in its timeline.
+async fn git_in(s: &Session, sink: &Sink, files: &Files) {
+    let path = super::moving::moved_git(&files.dir);
+    let Ok(bytes) = std::fs::read(&path) else { return };
+    let cwd = s.core.lock().state.cwd.clone();
+    let said = crate::rt::blocking(move || -> Vec<String> {
+        let Ok(kept) = serde_json::from_slice::<super::moving::MovedGit>(&bytes) else { return vec!["Its repository's state from the machine it left couldn't be read".into()] };
+        match super::gitstate::root_of(std::path::Path::new(&cwd)) {
+            Some(root) => super::gitstate::restore(&root, &kept.state, &kept.from),
+            None => vec![format!("Its folder here, {cwd}, isn't a git repository, so its branches and stash stay on {}", kept.from)],
+        }
+    })
+    .await
+    .unwrap_or_default();
+    {
+        let mut core = s.core.lock();
+        for (i, text) in said.into_iter().enumerate() {
+            let level = if i == 0 { Level::Info } else { Level::Warn };
+            core.upsert(&format!("move-git-{}-{i}", Core::now()), None, super::model::Body::Notice { level, text });
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    flush(s, sink, None).await;
+}
+
+/// What of a session's folder sync doesn't carry, and would be left behind: then it doesn't move.
+/// A git worktree, or a repository of its own, inside the synced one (sync carries the outer one's
+/// files, never a nested repository's), and files too big for sync.
+async fn left_behind(cwd: &str, st: &crate::sync::runner::Standing) -> Result<(), String> {
+    let (c, copy) = (cwd.to_owned(), st.folder.clone());
+    let nested = crate::rt::blocking(move || {
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let copy = canon(std::path::Path::new(&copy));
+        super::gitstate::root_of(std::path::Path::new(&c)).map(|r| canon(&r)).filter(|r| *r != copy && r.starts_with(&copy))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(inner) = nested {
+        return Err(format!(
+            "its folder is in {}, a git worktree (or a repository of its own) inside {}: sync carries {}'s files and not its, so its work would be left behind. Commit and push it, or move it into the repository, and it moves",
+            inner.display(),
+            st.folder,
+            st.folder
+        ));
+    }
+    let here = std::path::Path::new(cwd);
+    let big: Vec<&String> = st.skipped.iter().filter(|p| std::path::Path::new(&st.folder).join(p).starts_with(here)).collect();
+    if !big.is_empty() {
+        let names: Vec<&str> = big.iter().take(5).map(|p| p.as_str()).collect();
+        return Err(format!(
+            "{} {} too big for sync to carry ({}{}), so {} be left behind: move {} out of the repository, or have git ignore {}, and it moves",
+            big.len(),
+            if big.len() == 1 { "file is" } else { "files are" },
+            names.join(", "),
+            if big.len() > 5 { ", …" } else { "" },
+            if big.len() == 1 { "it would" } else { "they would" },
+            if big.len() == 1 { "it" } else { "them" },
+            if big.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    Ok(())
+}
+
+/// How waiting for a moved session's files ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Arrived {
+    /// They're here (or can't be waited for): it goes on.
+    GoOn,
+    /// It was closed meanwhile, or (`let_go`) went on elsewhere.
+    End { let_go: bool },
+}
+
+/// A session that moved here goes on once its folder has taken its repo's sync log as far as the
+/// machine it left had it: it never starts on files older than the ones it left. Messages sent
+/// meanwhile wait in `carry`; closing it ends the wait.
+async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
+    let note = |text: String, level: Level| s.core.lock().upsert("move-files", None, super::model::Body::Notice { level, text });
+    let Some(sync) = crate::sync::runner::global() else {
+        note("This machine doesn't sync folders, so its folder here may not have its last changes".into(), Level::Warn);
+        return Arrived::GoOn;
+    };
+    let cwd = s.core.lock().state.cwd.clone();
+    let folder = std::path::Path::new(&cwd);
+    let started = Instant::now();
+    let mut said = String::new();
+    loop {
+        let now = match sync.standing(folder).await {
+            Some(st) if st.repo == mark.repo && st.reached >= mark.index => {
+                note(format!("Its folder's last changes are here (in {}s); it goes on", started.elapsed().as_secs()), Level::Info);
+                flush(s, sink, None).await;
+                return Arrived::GoOn;
+            }
+            Some(st) if st.repo != mark.repo => {
+                note(format!("Its folder here, {cwd}, is a copy of another repository, so it goes on without waiting for its files"), Level::Warn);
+                flush(s, sink, None).await;
+                return Arrived::GoOn;
+            }
+            Some(st) => {
+                let why = st.error.as_ref().map(|e| format!(" ({e})")).unwrap_or_default();
+                format!("Waiting for its folder's last changes to arrive: {} to take, {} files coming{why}. It goes on once they're here", st.behind.max(1), st.waiting)
+            }
+            None => "Waiting for its folder's last changes to arrive: this machine's copy of it isn't syncing yet. It goes on once they're here".to_owned(),
+        };
+        if now != said {
+            note(now.clone(), Level::Info);
+            flush(s, sink, None).await;
+            said = now;
+        }
+        let tick = crate::rt::sleep(Duration::from_secs(1)).fuse();
+        let msg = ctl_rx.recv().fuse();
+        futures::pin_mut!(tick, msg);
+        futures::select_biased! {
+            m = msg => match m {
+                Ok(Ctl::Cmd(c)) => match *c {
+                    Command::Moving { text } => moving_note(s, &text),
+                    c @ (Command::Send { .. } | Command::SkillRun { .. }) => carry.push(prepare(files, c).await),
+                    c => carry.push(c),
+                },
+                // No process to hand over: the next image starts it from its record.
+                Ok(Ctl::HandOver(reply)) => {
+                    let _ = reply.send(None);
+                }
+                Ok(Ctl::LetGo) => return Arrived::End { let_go: true },
+                Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
+            },
+            () = tick => {}
+        }
+    }
+}
+
 /// A move that couldn't be: the session goes on here, and the timeline says why.
 fn move_failed(s: &Session, mv: &Move, why: &str) {
     let mut core = s.core.lock();
@@ -1588,10 +1812,16 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             carry
         }
     };
+    // Its folder's last changes go first, so it goes on there from them; then its repository's
+    // state besides its files (only a synced folder's: there's a repository there to take it).
+    let synced = files_out(s, &from_cwd, &mv.to).await?;
+    let git = if synced.is_some() { git_out(s, &from_cwd, &mv.to, &mv.cwd).await? } else { None };
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
     pkg.picks_up = mv.picks_up || cut;
+    pkg.synced = synced;
+    pkg.git = git;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
     reach.adopt(&mv.to, &bytes).await
@@ -1641,6 +1871,26 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
+    // Moved here: on once its folder's last changes are (after a restart too: its state says so).
+    let arriving = s.core.lock().state.arriving.clone();
+    if let Some(mark) = arriving {
+        if let Arrived::End { let_go } = files_in(&s, &sink, &mark, &ctl_rx, &mut carry, &files).await {
+            if let_go {
+                (files.release)(&s.id);
+            } else {
+                let _ = sink.send((s.id.clone(), Update::Closed)).await;
+            }
+            on_change();
+            return;
+        }
+        {
+            let mut core = s.core.lock();
+            core.state.arriving = None;
+            core.touch_state();
+        }
+        // Its files in: its repository as it was there.
+        git_in(&s, &sink, &files).await;
+    }
     // A rewind: the harness starts again, continuing its session from this point.
     let mut rewind_to: Option<Option<String>> = None;
     // A switch to another harness, waiting for the turn under way to end; and the conversation

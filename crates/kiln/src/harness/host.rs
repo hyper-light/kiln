@@ -273,7 +273,15 @@ impl Host {
             pkg.spec.cwd = Some(cwd.clone());
         }
         let items = super::moving::install(&pkg, &cwd)?;
-        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false };
+        // Its repository's state, kept on disk until its files are here (a restart keeps it too).
+        if let Some(g) = pkg.git.take() {
+            let dir = self.files_dir.join(&pkg.id);
+            let kept = super::moving::MovedGit { from: pkg.from.clone(), state: g };
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(super::moving::moved_git(&dir), serde_json::to_vec(&kept).unwrap_or_default()))
+                .map_err(|e| format!("keeping its repository's state: {e}"))?;
+        }
+        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced };
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
@@ -734,7 +742,7 @@ fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Se
     if events.is_empty() {
         return None;
     }
-    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true })
+    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None })
 }
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.

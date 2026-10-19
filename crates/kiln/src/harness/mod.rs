@@ -28,6 +28,7 @@ pub mod diff;
 pub mod elicit;
 pub mod elsewhere;
 pub mod files;
+pub mod gitstate;
 pub mod handoff;
 pub mod host;
 pub mod kept;
