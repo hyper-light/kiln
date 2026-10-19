@@ -265,12 +265,16 @@ where
     anyhow::ensure!(!on_shard(), "block_on called from inside the runtime");
     rt()?;
     let (tx, mut rx) = hyper_rt::sync::oneshot::<anyhow::Result<T>>().map_err(|e| anyhow::anyhow!("oneshot: {e}"))?;
+    let started = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&started);
     spawn_boxed(Box::pin(async move {
+        s.store(true, Ordering::SeqCst);
         let _ = tx.send(fut.await);
     }));
     match rx.blocking_recv() {
         Ok(r) => r,
-        Err(_) => anyhow::bail!("the task ended without a result (it panicked or could not start)"),
+        Err(_) if started.load(Ordering::SeqCst) => anyhow::bail!("the task panicked"),
+        Err(_) => anyhow::bail!("the task never started: the runtime refused it (its arenas or control queues full)"),
     }
 }
 
