@@ -666,7 +666,8 @@ impl Dispatch {
             self.hub.emit_run(&id).await;
             return Ok(());
         }
-        let github = self.github_context(&s, number, rowid, &name);
+        let urls = github_api(&self.hub, &s.repo).await.map(|(app, _)| (app.web.clone(), app.api.clone()));
+        let github = self.github_context(&s, number, rowid, &name, urls.as_ref());
         let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
         // The `vars` context (W09-R09): every scope but environments', which legs add, and what
         // the run was given (W17-R06) over them.
@@ -827,7 +828,8 @@ impl Dispatch {
     /// runners connected now.
     async fn preview(&mut self, s: &Start) -> serde_json::Value {
         let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
-        let github = self.github_context(s, 0, 0, &name);
+        let urls = github_api(&self.hub, &s.repo).await.map(|(app, _)| (app.web.clone(), app.api.clone()));
+        let github = self.github_context(s, 0, 0, &name, urls.as_ref());
         let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
         let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
         let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
@@ -878,11 +880,12 @@ impl Dispatch {
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
 
-    /// The `github` context (W03-R07, W06-R03), with GitHub's URLs for repositories hosted there.
-    fn github_context(&self, s: &Start, number: i64, rowid: i64, name: &str) -> serde_json::Value {
+    /// The `github` context (W03-R07, W06-R03), with GitHub's URLs for repositories hosted there
+    /// whose jobs act on GitHub (`github_api: github`, W14-R12; `urls`: its web and API origins).
+    fn github_context(&self, s: &Start, number: i64, rowid: i64, name: &str, urls: Option<&(String, String)>) -> serde_json::Value {
         // The code host is kiln's facade; each runner sees it at its own address of the server.
         let base = self.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-        let server_url = base.clone();
+        let server_url = urls.map_or_else(|| base.clone(), |(web, _)| web.clone());
         let default_branch = s.event.payload.pointer("/repository/default_branch").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
         let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch, private: false, server_url };
         let run = kiln_ci::trigger::context::RunFacts {
@@ -892,8 +895,8 @@ impl Dispatch {
             workflow: name.to_owned(),
             workflow_ref: format!("{}/{}@{}", s.repo.name, s.path, s.event.git_ref),
             workflow_sha: s.event.sha.clone(),
-            api_url: format!("{base}/api/v3"),
-            graphql_url: format!("{base}/api/graphql"),
+            api_url: urls.map_or_else(|| format!("{base}/api/v3"), |(_, api)| api.clone()),
+            graphql_url: urls.map_or_else(|| format!("{base}/api/graphql"), |(_, api)| graphql_of(api)),
             retention_days: 90,
             actor_id: 0,
             triggering_actor: String::new(),
@@ -1234,6 +1237,23 @@ impl Dispatch {
         // GITHUB_TOKEN: a job token with the job's permissions, revoked when the attempt ends
         // (W10-R03, R04).
         let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
+        // `github_api: github` (W14-R12): the jobs of a repository on GitHub that act on GitHub
+        // itself get an installation token of the App, limited to the job's permissions and the
+        // repository, as GITHUB_TOKEN, and GitHub's URLs.
+        let on_github = github_api(&self.hub, &r.repo).await;
+        let job_token = match &on_github {
+            Some((app, name)) => match app.token(name, &crate::githost::github::permissions_of(&l.spec.permissions.0)).await {
+                Ok(t) => t,
+                Err(e) => {
+                    runs::annotation(&self.hub, leg, None, "error", Some("github_api".into()), &format!("`github_api: github`: no GitHub token for the job: {e:#}"), None, None, None, None, None).await?;
+                    let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
+                    let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
+                    Box::pin(self.commands(cmds)).await;
+                    return Ok(());
+                }
+            },
+            None => job_token,
+        };
         let (secrets, used_ids, vars, unmade) = self.leg_secrets(l, r, &job_token).await;
         // Brokered secrets that couldn't be made (W09-R08): the leg goes on without them, told why.
         for why in &unmade {
@@ -1248,6 +1268,11 @@ impl Dispatch {
             let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
             Box::pin(self.commands(cmds)).await;
             return Ok(());
+        }
+        if let Some((app, _)) = &on_github {
+            a.runtime.facade_url = app.web.clone();
+            a.runtime.api_url = app.api.clone();
+            a.runtime.graphql_url = graphql_of(&app.api);
         }
         // Its integrations (W11-R03); one it may not use fails it before it starts.
         match self.leg_integrations(l, r, a.runtime.id_token_url.is_some()).await {
@@ -1485,6 +1510,11 @@ impl Dispatch {
                 graphql_url: "/api/graphql".into(),
                 github_token: job_token,
                 cache_mode: Some(cache_mode.as_str().into()),
+                registry_url: "/".into(),
+                // The package proxies jobs go through by themselves (W12-R04).
+                proxies: self.hub.cfg.ci.registry.proxies.iter().filter(|p| p.jobs).map(|p| (p.ecosystem.clone(), format!("/_kiln/proxy/{}", p.name.clone().unwrap_or_else(|| p.ecosystem.clone())))).collect(),
+                // Images from the registries kiln mirrors come through it (W12-R02).
+                mirrors: self.hub.cfg.ci.registry.mirrors.iter().map(|m| (m.upstream.clone(), m.prefix())).collect(),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
             actions: r.actions.clone(),
@@ -1565,6 +1595,12 @@ impl Dispatch {
             JobEventV2::Attest { idx, nonce, subjects, provenance, sbom } => {
                 if let Err(e) = super::attest::reported(&self.hub, leg, idx, &nonce, subjects, provenance, sbom).await {
                     tracing::warn!(leg, error = %format!("{e:#}"), "attestations could not be made");
+                }
+            }
+            // W13-R11: an image the leg built into kiln's registry, registered for pools and rules.
+            JobEventV2::ImageBuilt { name, reference, digest, platforms, .. } => {
+                if let Err(e) = super::images::built(&self.hub, leg, &name, &reference, &digest, &platforms).await {
+                    tracing::warn!(leg, error = %format!("{e:#}"), "a built image could not be registered");
                 }
             }
             JobEventV2::Group { .. } | JobEventV2::Mask { .. } | JobEventV2::TestReport { .. } => {}
@@ -2041,4 +2077,24 @@ fn run_path(github: &serde_json::Value) -> String {
     let r = github.get("workflow_ref").and_then(serde_json::Value::as_str).unwrap_or_default();
     let repo = github.get("repository").and_then(serde_json::Value::as_str).unwrap_or_default();
     r.strip_prefix(repo).map(|x| x.trim_start_matches('/')).and_then(|x| x.rsplit_once('@')).map(|(p, _)| p.to_owned()).unwrap_or_default()
+}
+
+/// A repository on GitHub whose jobs act on GitHub itself (`github_api: github`, W14-R12): the App
+/// they act through, and the repository's name there.
+async fn github_api(hub: &Hub, repo: &crate::store::Repo) -> Option<(Arc<crate::githost::github::App>, String)> {
+    let mode = super::repo_config::load(hub, repo).await.github_api;
+    if mode.as_ref().and_then(serde_yaml::Value::as_str) != Some("github") {
+        return None;
+    }
+    let app = crate::githost::github::app(hub).await?;
+    let name = app.name_of(repo)?;
+    Some((app, name))
+}
+
+/// GitHub's GraphQL endpoint beside its REST API (`/api/v3` → `/api/graphql` on Enterprise Server).
+fn graphql_of(api: &str) -> String {
+    match api.trim_end_matches('/').strip_suffix("/v3") {
+        Some(base) => format!("{base}/graphql"),
+        None => format!("{}/graphql", api.trim_end_matches('/')),
+    }
 }

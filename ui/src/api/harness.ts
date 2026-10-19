@@ -1031,6 +1031,8 @@ const ENDED_RETRY_MS = 10_000;
 const LINGER_MS = 30_000;
 /** Conversations kept in memory once left (the latest ones). */
 const KEEP = 8;
+/** Match the server mirror's rolling event window (harness/core.rs and registry.rs). */
+const MAX_EVENTS = 4000;
 /**
  * The browser unpacks gzip itself (every current one does): a session's snapshot comes packed, a
  * long conversation's history in a tenth of the bytes.
@@ -1313,7 +1315,7 @@ export class SessionStore {
         })
         .catch(() => undefined)
         .finally(() => {
-          this.unpacking -= 1;
+          if (this.ws === ws) this.unpacking -= 1;
         });
     };
     ws.onclose = () => {
@@ -1640,7 +1642,12 @@ export class SessionStore {
   private flush() {
     if (!this.dirty) return;
     this.dirty = false;
-    const events = this.ordered();
+    let events = this.ordered();
+    if (events.length > MAX_EVENTS + MAX_EVENTS / 4) {
+      for (const e of events.slice(0, -MAX_EVENTS)) this.byId.delete(e.id);
+      events = events.slice(-MAX_EVENTS);
+      this.pos = new Map(events.map((e, i) => [e.id, i]));
+    }
     if (events !== this.snap.events) this.snap = { ...this.snap, events };
     this.listeners.forEach((l) => l());
   }

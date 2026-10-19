@@ -572,6 +572,7 @@ const TurnView = React.memo(function TurnView({
   meta,
   onCommand,
   agentLabel,
+  reading,
 }: {
   /** Who answers (the harness's name), over the agent's side of the turn. */
   agentLabel?: string;
@@ -585,17 +586,21 @@ const TurnView = React.memo(function TurnView({
   onOpenTask?: (t: string) => void;
   meta?: Meta | null;
   onCommand?: (c: Command) => void;
+  /** The part being read stays in the window while the turn grows. */
+  reading: string | null;
 }) {
-  const edits = React.useMemo(() => changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))), [turn]);
+  const edits = React.useMemo(() => (turn.outcome ? changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))) : []), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
   // A turn of hundreds of steps shows its latest; the rest are a tap away (and there for a match
   // you find in them).
   const findNow = React.useContext(FindNowContext);
   const [allSteps, setAllSteps] = React.useState(false);
-  const hidden = allSteps ? 0 : Math.max(0, turn.items.length - STEPS_WINDOW);
-  const sought = hidden > 0 && findNow !== null && turn.items.slice(0, hidden).some((it) => itemHolds(it, findNow.id));
-  const items = hidden > 0 && !sought ? turn.items.slice(hidden) : turn.items;
+  const at = reading ? turn.items.findIndex((it) => itemHolds(it, reading)) : -1;
+  const hidden = allSteps ? 0 : Math.max(0, Math.min(turn.items.length - STEPS_WINDOW, at < 0 ? Infinity : at));
+  const end = allSteps ? turn.items.length : hidden + STEPS_WINDOW;
+  const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
+  const items = sought ? turn.items : turn.items.slice(hidden, end);
   if (turn.divider) {
     return (
       <section className="hx-turn hx-turn-switch">
@@ -710,6 +715,10 @@ function useKeeper(key: string) {
     s.end = s.tail && s.root.scrollHeight - s.root.scrollTop - s.root.clientHeight < END_PX;
     s.at = s.end ? null : firstInView(s.root);
   }, []);
+  const restore = React.useCallback(() => {
+    const s = k.current;
+    if (s.root && s.at) goTo(s.root, s.at);
+  }, []);
   const save = React.useCallback(() => {
     const s = k.current;
     window.clearTimeout(s.saving);
@@ -762,6 +771,7 @@ function useKeeper(key: string) {
     const s = k.current;
     window.clearTimeout(s.saving);
     s.saving = window.setTimeout(save, 250);
+    return s.at?.id ?? null;
   };
   /** At the end, following what comes. */
   const atEnd = React.useCallback(() => k.current.end, []);
@@ -789,7 +799,7 @@ function useKeeper(key: string) {
     const el = e.target instanceof Element ? e.target.closest<HTMLElement>(PARTS) : null;
     k.current.touched = el && root ? { el, h: el.offsetHeight, offset: el.getBoundingClientRect().top - root.getBoundingClientRect().top, t: performance.now() } : null;
   };
-  return { ref, onScroll, onTouch, read, atEnd, atBottom, setTail, toEnd };
+  return { ref, onScroll, onTouch, read, restore, atEnd, atBottom, setTail, toEnd };
 }
 
 /**
@@ -876,7 +886,8 @@ export const Timeline = React.memo(function Timeline({
   const [kept] = React.useState(() => new Map<string, Turn>());
   const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
   const keeper = useKeeper(placeKey(agent, parent));
-  const { read, atEnd, setTail, toEnd } = keeper;
+  const { read, restore, atEnd, setTail, toEnd } = keeper;
+  const [reading, setReading] = React.useState<string | null>(null);
   // The turns in the page (`WINDOW` at a time, `MOST` at most): from the one `anchor` names (null:
   // the latest), through the one `till` names (null: the end). Read back, the window stays put as
   // more comes; gone far back (your place from last time, a match you find), it's a window there,
@@ -886,7 +897,7 @@ export const Timeline = React.memo(function Timeline({
   const anchored = anchor ? turns.findIndex((t) => t.key === anchor) : -1;
   const tilled = till ? turns.findIndex((t) => t.key === till) : -1;
   const from = anchored >= 0 ? anchored : Math.max(0, turns.length - WINDOW);
-  const to = tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length;
+  const to = Math.min(from + MOST, tilled >= 0 ? Math.max(from + 1, tilled + 1) : turns.length);
   /** A window around turn `i`, when it isn't in the page. */
   const around = (i: number) => {
     if (i < 0 || (i >= from && i < to)) return;
@@ -948,7 +959,7 @@ export const Timeline = React.memo(function Timeline({
     return () => io.disconnect();
   }, []);
   const onScroll = () => {
-    keeper.onScroll();
+    setReading(keeper.onScroll());
     // Back at the end: the page holds the latest turns again, and follows them. Read back, it stays put.
     if (atEnd()) {
       if (anchor !== null) setAnchor(null);
@@ -958,6 +969,7 @@ export const Timeline = React.memo(function Timeline({
   const latest = () => {
     setAnchor(null);
     setTill(null);
+    setReading(null);
     toEnd();
   };
   // Find: every match marked in place (again as the conversation grows), and the one shown brought
@@ -966,12 +978,15 @@ export const Timeline = React.memo(function Timeline({
   const findNow = find?.now ?? null;
   const shown = React.useRef(0);
   const grows = findQ ? events : null;
+  const holds = reading ? turns : null;
   const marks = React.useCallback(
     (flow: HTMLDivElement | null) => {
       const root = flow?.parentElement;
       if (!flow || !root) return;
       // Marked again as the conversation grows, while finding.
       void grows;
+      // A bounded window can move without changing height (so no resize is reported).
+      if (holds && reading) restore();
       const at = findNow ? elementOf(flow, findNow.id) : null;
       const first = mark(flow, findQ, at);
       if (findNow && findNow.n !== shown.current) {
@@ -984,7 +999,7 @@ export const Timeline = React.memo(function Timeline({
       }
       return () => void mark(flow, "", null);
     },
-    [findQ, findNow, grows, read],
+    [findQ, findNow, grows, holds, reading, read, restore],
   );
   const running = state?.status === "running";
   const tasks = state?.tasks ?? NO_TASKS;
@@ -1054,6 +1069,7 @@ export const Timeline = React.memo(function Timeline({
               meta={meta}
               onCommand={onCommand}
               agentLabel={agentLabel}
+              reading={reading}
             />
           ))}
           {/* A window further back: what came after joins as you scroll down to it. */}

@@ -21,6 +21,10 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     if !hub.ci.enabled() {
         return Ok(false);
     }
+    // A repository whose CI runs elsewhere (W23-R07): KilnCI stands aside.
+    if !super::providers::kiln_runs(hub, repo).await {
+        return Ok(true);
+    }
     let commit = load::load(hub, repo, &t.sha).await?;
     // A manual run of one pipeline runs that one only.
     let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
@@ -378,6 +382,32 @@ pub async fn repository_dispatch(hub: &Hub, repo: &Repo, event_type: &str, clien
     e.payload = context::repository_dispatch(&e, &f.repo, client_payload);
     let mut started = 0;
     for l in commit.workflows.iter().filter(|l| l.runs && !l.has_errors()) {
+        if start(hub, repo, &e, l, &message, actor, serde_json::Value::Null).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))? {
+            started += 1;
+        }
+    }
+    Ok(started)
+}
+
+/// `registry_package` (W12-R07): a package (an image tag) was published or updated in kiln's
+/// registry under the repository's name; the default branch's workflows that listen for it run,
+/// with the package in `github.event.registry_package`.
+pub async fn registry_package(hub: &Hub, repo: &Repo, action: &str, package: &serde_json::Value, actor: &str) -> Result<usize, Refused> {
+    if !hub.ci.enabled() {
+        return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
+    }
+    let f = facts(hub, repo).await;
+    let (full_ref, sha) = named_ref(hub, repo, &f.default_branch).await?;
+    let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let listening: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && !l.has_errors() && l.workflow.as_ref().is_some_and(|w| w.on.iter().any(|t| t.event == "registry_package"))).collect();
+    if listening.is_empty() {
+        return Ok(0);
+    }
+    let (message, _) = gitops::commit_info(hub, repo, &sha).await;
+    let mut e = Event { name: "registry_package".into(), action: action.to_owned(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), ..Event::default() };
+    e.payload = serde_json::json!({ "action": action, "registry_package": package, "repository": f.repo.payload(), "sender": { "login": actor, "type": "User" } });
+    let mut started = 0;
+    for l in listening {
         if start(hub, repo, &e, l, &message, actor, serde_json::Value::Null).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))? {
             started += 1;
         }

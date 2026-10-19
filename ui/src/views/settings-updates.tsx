@@ -24,6 +24,7 @@ import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { SpawnDialog } from "@/views/harness/spawn";
+import { UpgradeLog } from "./settings-upgrade-log";
 import "./settings-updates.css";
 
 /** A server upgrade in flight: the page reconnects to the new server and says what changed. */
@@ -138,12 +139,20 @@ export function UpdatesStatus() {
 }
 
 export function UpdatesPanel() {
-  const data = useRes(updatesRes).data;
+  const resource = useRes(updatesRes);
+  const data = resource.data;
   const live = useUpdateJobs();
   const [confirm, setConfirm] = React.useState<Confirming | null>(null);
+  const [starting, setStarting] = React.useState(false);
   // Runners chosen for one update policy at once, and that policy.
   const [selected, setSelected] = React.useState<Set<string>>(() => new Set());
   const [bulk, setBulk] = React.useState<UpdatePolicy>("notify");
+  const [policyPending, setPolicyPending] = React.useState<Record<string, UpdatePolicy>>({});
+  const [policyErrors, setPolicyErrors] = React.useState<Record<string, string>>({});
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const policyRequests = React.useRef(new Set<string>());
+  const selectable = data.runners.filter((r) => !r.locked);
+  const selectedNames = selectable.filter((r) => selected.has(r.name)).map((r) => r.name);
   const select = (name: string, on: boolean) =>
     setSelected((cur) => {
       const next = new Set(cur);
@@ -186,23 +195,41 @@ export function UpdatesPanel() {
 
   const startRunner = async (r: RunnerUpdate, way?: UpgradeWay) => {
     try {
-      started(await api.upgradeRunner(r.name, way));
+      const job = await api.upgradeRunner(r.name, way);
+      started(job);
+      if (job.state === "failed") throw new Error(job.error ?? "The upgrade couldn't start.");
       toast({ title: way === "build" ? `Building kiln on ${r.name}` : `Upgrading ${r.name}`, description: "Its terminals, agents and jobs keep running.", tone: "running" });
     } catch (e) {
       toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
+      throw e;
+    } finally {
+      readAgainSoon();
     }
-    readAgainSoon();
   };
 
-  const setPolicy = async (names: string[] | "all", policy: UpdatePolicy) => {
+  const setPolicy = async (names: string[], policy: UpdatePolicy, isBulk = false) => {
+    if (!names.length || names.some((name) => policyRequests.current.has(name))) return;
+    for (const name of names) policyRequests.current.add(name);
+    const scope = isBulk ? "bulk" : `runner:${names[0]}`;
+    setPolicyErrors((prev) => ({ ...prev, [scope]: "" }));
+    setPolicyPending((prev) => ({ ...prev, ...Object.fromEntries(names.map((name) => [name, policy])) }));
+    if (isBulk) setBulkBusy(true);
     try {
-      const [one] = names === "all" ? [] : names;
-      if (names !== "all" && names.length === 1 && one) await api.setRunnerPolicy(one, policy);
+      const [one] = names;
+      if (names.length === 1 && one) await api.setRunnerPolicy(one, policy);
       else await api.setPolicies(policy, names);
+      resource.setData((prev) => ({ ...prev, runners: prev.runners.map((r) => names.includes(r.name) ? { ...r, policy } : r) }));
+      setPolicyErrors((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== scope && !names.some((name) => key === `runner:${name}`))));
+      if (isBulk) setSelected((prev) => new Set([...prev].filter((name) => !names.includes(name))));
+      toast.success("Update policy saved", `${names.length === 1 ? one : plural(names.length, "runner")}: ${POLICIES.find((p) => p.value === policy)?.label}`);
     } catch (e) {
-      toast.error("Couldn't change the update policy", errorMessage(e));
+      setPolicyErrors((prev) => ({ ...prev, [scope]: `Couldn't save the update policy. ${errorMessage(e)}` }));
+    } finally {
+      for (const name of names) policyRequests.current.delete(name);
+      setPolicyPending((prev) => Object.fromEntries(Object.entries(prev).filter(([name]) => !names.includes(name))));
+      if (isBulk) setBulkBusy(false);
+      invalidate("updates");
     }
-    invalidate("updates");
   };
 
   const startAll = async () => {
@@ -213,8 +240,10 @@ export function UpdatesPanel() {
       for (const e of out.errors) toast.error("A runner wasn't upgraded", e);
     } catch (e) {
       toast.error("Couldn't upgrade the runners", errorMessage(e));
+      throw e;
+    } finally {
+      readAgainSoon();
     }
-    readAgainSoon();
   };
 
   const startServer = async (s: ServerUpdate, action: "restart" | "replace") => {
@@ -222,14 +251,14 @@ export function UpdatesPanel() {
       const job = await api.upgradeServer(action);
       started(job);
       if (job.state === "failed") {
-        toast.error("The server wasn't upgraded", job.error ?? undefined);
-        return;
+        throw new Error(job.error ?? "The server couldn't be upgraded.");
       }
       setPending({ from: s.build, at: Date.now() });
       // A restart that never comes still gets an answer.
       window.setTimeout(() => void settlePending(), PATIENCE_MS + 1_000);
     } catch (e) {
       toast.error("Couldn't upgrade the server", errorMessage(e));
+      throw e;
     }
   };
 
@@ -253,19 +282,13 @@ export function UpdatesPanel() {
 
   // Runners on a branch or a local build run it on purpose: "Upgrade all" leaves them be.
   const outdated = data.runners.filter((r) => r.connected && !r.up_to_date && r.how !== "left" && r.how !== "wait" && r.policy !== "off" && !r.locked);
-  const byPolicy = (p: UpdatePolicy) => data.runners.filter((r) => r.policy === p).length;
   const newest = data.newest ?? null;
   const current = data.runners.filter((r) => r.up_to_date).length;
   const runningRunners = new Set(jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
 
-  const summary =
-    data.runners.length === 0
-      ? "No machines have joined yet."
-      : newest
-        ? `${current} of ${data.runners.length} on ${shortSha(newest.commit)}, the newest kiln${newest.from === "server" ? " (the server's)" : ` (from ${newest.from})`} · ${
-            data.follow ? `${byPolicy("auto")} automatic, ${byPolicy("notify")} notify me, ${byPolicy("off")} off` : "automatic upgrades are off ([updates] follow)"
-          }`
-        : `${current} of ${data.runners.length} on the server's build`;
+  const offline = data.runners.filter((r) => !r.connected).length;
+  const summary = data.runners.length === 0 ? "No machines have joined yet." :
+    [`${current} of ${data.runners.length} up to date`, outdated.length ? `${outdated.length} ready to upgrade` : null, offline ? `${offline} offline` : null].filter(Boolean).join(" · ");
 
   return (
     <>
@@ -285,6 +308,7 @@ export function UpdatesPanel() {
         s={data.server}
         job={latest("server", "server")}
         pending={pending !== null && data.server.build === pending.from}
+        starting={starting}
         uploading={uploading}
         checking={checking || data.server.checking}
         onCheck={() => void check()}
@@ -299,7 +323,7 @@ export function UpdatesPanel() {
             run: () => startServer(data.server, action),
           })
         }
-        plan={confirm?.scope === "server" ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
+        plan={confirm?.scope === "server" ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} onBusyChange={setStarting} /> : null}
       />
       <SettingsGroup
         id="updates.runners"
@@ -310,7 +334,7 @@ export function UpdatesPanel() {
           <Button
             variant="secondary"
             size="xs"
-            disabled={outdated.length === 0 || outdated.every((r) => runningRunners.has(r.name))}
+            disabled={starting || outdated.length === 0 || outdated.every((r) => runningRunners.has(r.name))}
             onClick={() =>
               setConfirm({
                 scope: "all",
@@ -326,33 +350,36 @@ export function UpdatesPanel() {
           </Button>
         }
       >
-        {confirm?.scope === "all" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
+        {confirm?.scope === "all" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} onBusyChange={setStarting} />}
         {data.runners.length > 0 && (
-          <div className="upd-bulk">
+          <div className="upd-selection">
             <label className="upd-bulk-all">
               <input
                 type="checkbox"
                 className="check"
-                checked={selected.size > 0 && selected.size === data.runners.length}
-                onChange={(e) => setSelected(e.target.checked ? new Set(data.runners.map((r) => r.name)) : new Set())}
-                aria-label="Select every runner"
+                ref={(el) => { if (el) el.indeterminate = selectedNames.length > 0 && selectedNames.length < selectable.length; }}
+                checked={selectedNames.length > 0 && selectedNames.length === selectable.length}
+                disabled={bulkBusy || selectable.length === 0}
+                onChange={(e) => setSelected(e.target.checked ? new Set(selectable.map((r) => r.name)) : new Set())}
+                aria-label="Select all editable runners"
               />
-              <span>{selected.size ? `${plural(selected.size, "runner")} selected` : "Select runners"}</span>
+              <span>{selectedNames.length ? `${selectedNames.length} selected` : "Select runners"}</span>
             </label>
-            <SelectField label="Updates for the selected runners" hideLabel value={bulk} onChange={(v) => setBulk(v as UpdatePolicy)} options={POLICIES} className="upd-policy" />
-            <Button
-              size="xs"
-              variant="secondary"
-              disabled={selected.size === 0}
-              onClick={() => {
-                void setPolicy(selected.size === data.runners.length ? "all" : [...selected], bulk);
-                setSelected(new Set());
-              }}
-            >
-              {selected.size === 0 ? "Set" : `Set for ${selected.size === data.runners.length ? "all" : plural(selected.size, "runner")}`}
-            </Button>
+            {selectedNames.length > 0 ? (
+              <Button size="xs" variant="ghost" disabled={bulkBusy} onClick={() => setSelected(new Set())}>Clear selection</Button>
+            ) : newest && <span className="upd-target">Latest <code>{shortSha(newest.commit)}</code></span>}
           </div>
         )}
+        {selectedNames.length > 0 && (
+          <div className="upd-bulk" aria-label="Selected runner actions" aria-busy={bulkBusy}>
+            <PolicySelect label="Update policy for selected runners" value={bulk} onChange={setBulk} disabled={bulkBusy} />
+            <Button size="xs" variant="secondary" disabled={Object.keys(policyPending).length > 0} onClick={() => void setPolicy(selectedNames, bulk, true)}>
+              {bulkBusy ? "Saving…" : `Apply to ${selectedNames.length}`}
+            </Button>
+            {policyErrors.bulk && <p className="upd-policy-error" role="alert">{policyErrors.bulk}</p>}
+          </div>
+        )}
+        {data.follow === false && <p className="st-note upd-follow-note">Automatic upgrades are disabled on this server. Runners can still be upgraded here.</p>}
         <ul className="upd-runners">
           {data.runners.map((r) => {
             const job = latest("runner", r.name);
@@ -365,10 +392,14 @@ export function UpdatesPanel() {
                 job={job}
                 uploading={uploading}
                 onUpload={() => r.target && pickUpload(r.target)}
-                selected={selected.has(r.name)}
+                selected={selectedNames.includes(r.name)}
+                selectionDisabled={bulkBusy}
+                starting={starting}
                 onSelect={(on) => select(r.name, on)}
                 onPolicy={(p) => void setPolicy([r.name], p)}
-                plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
+                policyPending={policyPending[r.name]}
+                policyError={policyErrors[`runner:${r.name}`]}
+                plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} onBusyChange={setStarting} /> : null}
                 onUpgrade={(way) => {
                   const build = way ? way === "build" : r.how === "build";
                   setConfirm({
@@ -406,8 +437,9 @@ export function UpdatesPanel() {
 }
 
 /** Confirm an upgrade in place, showing step by step what it will do. */
-function InlinePlan({ confirm, onClose }: { confirm: Confirming; onClose: () => void }) {
+function InlinePlan({ confirm, onClose, onBusyChange }: { confirm: Confirming; onClose: () => void; onBusyChange: (busy: boolean) => void }) {
   const [busy, setBusy] = React.useState(false);
+  const [problem, setProblem] = React.useState<string | null>(null);
   return (
     <Confirm
       className="upd-confirm"
@@ -419,15 +451,20 @@ function InlinePlan({ confirm, onClose }: { confirm: Confirming; onClose: () => 
             disabled={busy}
             onClick={async () => {
               setBusy(true);
+              onBusyChange(true);
+              setProblem(null);
               try {
                 await confirm.run();
+                onClose();
+              } catch (e) {
+                setProblem(errorMessage(e));
               } finally {
                 setBusy(false);
-                onClose();
+                onBusyChange(false);
               }
             }}
           >
-            {confirm.confirmLabel}
+            {busy ? "Starting…" : confirm.confirmLabel}
           </Button>
           <Button size="xs" variant="ghost" disabled={busy} onClick={onClose}>
             Cancel
@@ -438,6 +475,7 @@ function InlinePlan({ confirm, onClose }: { confirm: Confirming; onClose: () => 
       <p className="upd-confirm-title">{confirm.title}</p>
       <p className="upd-sub">{confirm.lead}</p>
       {confirm.plan}
+      {problem && <p className="upd-policy-error" role="alert">{problem}</p>}
     </Confirm>
   );
 }
@@ -448,6 +486,7 @@ function ServerSection({
   s,
   job,
   pending,
+  starting,
   uploading,
   checking,
   onCheck,
@@ -458,6 +497,7 @@ function ServerSection({
   s: ServerUpdate;
   job: UpdateJob | undefined;
   pending: boolean;
+  starting: boolean;
   uploading: string | null;
   checking: boolean;
   onCheck: () => void;
@@ -474,7 +514,7 @@ function ServerSection({
       : s.release.error
         ? "couldn't ask GitHub"
         : "none published";
-  const busy = job?.state === "running" || pending;
+  const busy = job?.state === "running" || pending || starting;
   const tone = pending ? "running" : s.newer ? "queued" : s.image?.error || (s.mode !== "kubernetes" && s.release.error) ? "timed_out" : "succeeded";
   return (
     <SettingsGroup
@@ -519,7 +559,7 @@ function ServerSection({
         <span>{pending ? "Restarting… this page reconnects when the server is back." : s.note}</span>
       </p>
       {plan}
-      {job && <JobLog job={job} />}
+      {job && <UpgradeLog key={job.id} job={job} onChangeWaits={() => toWaits(job.timed_out)} />}
     </SettingsGroup>
   );
 }
@@ -556,10 +596,25 @@ function ServerPlan({ s, action }: { s: ServerUpdate; action: "restart" | "repla
 
 /** What a runner does with a newer kiln. */
 const POLICIES: { value: UpdatePolicy; label: string }[] = [
-  { value: "auto", label: "Updates: automatic" },
-  { value: "notify", label: "Updates: notify me" },
-  { value: "off", label: "Updates: off" },
+  { value: "auto", label: "Automatic" },
+  { value: "notify", label: "Notify me" },
+  { value: "off", label: "Off" },
 ];
+
+function PolicySelect({ label, value, onChange, disabled }: { label: string; value: UpdatePolicy; onChange: (value: UpdatePolicy) => void; disabled?: boolean }) {
+  const id = React.useId();
+  return (
+    <div className="upd-policy">
+      <label htmlFor={id}>Updates</label>
+      <div className="select">
+        <select id={id} aria-label={label} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value as UpdatePolicy)}>
+          {POLICIES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+        </select>
+        <ChevronDown size={13} aria-hidden="true" />
+      </div>
+    </div>
+  );
+}
 
 function runnerState(r: RunnerUpdate, job: UpdateJob | undefined): { tone: string; text: string } {
   if (job?.state === "running") return { tone: "running", text: job.method === "build" ? "building itself" : "upgrading" };
@@ -613,31 +668,23 @@ function ReleaseWaitWords({ w, newest }: { w: ReleaseWait; newest: FleetTarget |
 }
 
 function RunnerRow({
-  r,
-  newest,
-  job,
-  uploading,
-  plan,
-  onUpgrade,
-  onUpload,
-  selected,
-  onSelect,
-  onPolicy,
-  onAskAgent,
+  r, newest, job, uploading, plan, onUpgrade, onUpload, selected, selectionDisabled, starting,
+  onSelect, onPolicy, policyPending, policyError, onAskAgent,
 }: {
   r: RunnerUpdate;
-  /** The newest kiln, when kiln knows it. */
   newest: FleetTarget | null;
   job: UpdateJob | undefined;
   uploading: string | null;
-  /** Its upgrade, being confirmed. */
   plan: React.ReactNode;
-  /** Upgrade it that way (none: the way kiln picks). */
   onUpgrade: (way?: UpgradeWay) => void;
   onUpload: () => void;
   selected: boolean;
+  selectionDisabled: boolean;
+  starting: boolean;
   onSelect: (on: boolean) => void;
   onPolicy: (p: UpdatePolicy) => void;
+  policyPending: UpdatePolicy | undefined;
+  policyError: string | undefined;
   /** Start an agent on it to find out what's wrong, told what kiln's checks found. */
   onAskAgent: (findings: RunnerFinding[]) => void;
 }) {
@@ -648,12 +695,15 @@ function RunnerRow({
   const actionable = behind && job?.state !== "running" && r.how !== "upgrading" && !plan;
   const ways = upgradeWays(r);
   const open = ways.filter((w) => w.ok);
-  // The way that failed comes first (to try it again), else the way kiln would take.
   const first = failed ? wayOf(failed) : r.how === "build" ? "build" : "download";
   open.sort((a, b) => Number(b.way === first) - Number(a.way === first));
-  const build = r.commit ? shortSha(r.commit) : (r.build ?? "build not reported");
-  // On its way to another build: that has a line of its own, with what happens next.
-  const moving = r.connected && !r.up_to_date;
+  const primary = open[0];
+  const stuck = behind && open.length === 0 && ways.length > 0;
+  const build = r.commit ? shortSha(r.commit) : (r.build ?? "Build unknown");
+  const moving = r.connected && !r.up_to_date && r.how !== "left";
+  const saving = policyPending !== undefined;
+  const errorId = React.useId();
+  const hostnameDiffers = r.hostname.toLowerCase() !== r.name.toLowerCase();
   const [diag, setDiag] = React.useState<Diagnosing | null>(null);
   const look = async () => {
     setDiag((s) => ({ ...(s ?? {}), looking: true, error: undefined }));
@@ -679,99 +729,83 @@ function RunnerRow({
     }
   };
   return (
-    <li className="upd-runner">
-      <div className="upd-runner-top">
-        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(e.target.checked)} aria-label={`Select ${r.name}`} />
-        <StatusDot status={st.tone} title={st.text} />
-        <div className="min-w-0 flex-1">
-          <div className="upd-name">{r.name}</div>
-          <div className="upd-meta">
-            {r.hostname} · {r.os}/{r.arch} · v{r.version}
-            {moving ? "" : ` · ${build}`}
+    <li className="upd-runner" data-selected={selected || undefined}>
+      <label className="upd-runner-select" title={r.locked ? "Update policy is locked on this machine" : `Select ${r.name}`}>
+        <input type="checkbox" className="check" checked={selected} disabled={selectionDisabled || r.locked} onChange={(e) => onSelect(e.target.checked)} aria-label={`Select ${r.name}`} />
+      </label>
+      <div className="upd-runner-content">
+        <div className="upd-runner-top">
+          <span className="upd-name" title={r.name}>{r.name}</span>
+          <span className="upd-state" data-tone={st.tone}><StatusDot status={st.tone} />{st.text}</span>
+        </div>
+        <div className="upd-runner-meta">
+          <span>{r.os} / {r.arch}</span>
+          <span>v{r.version}</span>
+          <span className="upd-build" title={r.commit ?? r.build ?? undefined}>
+            {build}{moving && <> <span className="upd-dim">→</span> {newest ? shortSha(newest.commit) : (r.target_build ?? "pending build")}</>}
+          </span>
+        </div>
+        {r.waits_on && <p className="upd-sub upd-waiting"><ReleaseWaitWords w={r.waits_on} newest={newest} /></p>}
+        <div className="upd-runner-actions" aria-busy={saving}>
+          {r.locked ? <span className="upd-sub">Updates locked on this machine</span> : (
+            <div className="upd-policy-control" aria-describedby={policyError ? errorId : undefined}>
+              <PolicySelect label={`Updates for ${r.name}`} value={policyPending ?? r.policy} onChange={onPolicy} disabled={saving || selectionDisabled} />
+              {saving && <span className="upd-saving" role="status">Saving…</span>}
+            </div>
+          )}
+          <div className="upd-primary-actions">
+            {actionable && primary && (
+              <Button size="xs" variant="secondary" disabled={saving || starting} title={sentence(primary.why)} onClick={() => onUpgrade(primary.way)}>
+                {wayLabel(primary.way, true, failed !== undefined && wayOf(failed) === primary.way)}
+              </Button>
+            )}
+            {r.connected && !plan && (
+              <Button size="xs" variant="ghost" aria-expanded={diag !== null} onClick={() => (diag ? setDiag(null) : void look())}>
+                <Stethoscope /> {diag ? "Hide the diagnosis" : "Diagnose"}
+              </Button>
+            )}
           </div>
         </div>
-        <span className="upd-state" data-tone={st.tone}>
-          {st.text}
-        </span>
-      </div>
-      <div className="upd-runner-body">
-        {moving && (
-          <p className="upd-runner-build">
-            <span className="upd-build">
-              {build}
-              {r.how !== "left" && (
-                <>
-                  {" → "}
-                  {newest ? shortSha(newest.commit) : (r.target_build ?? `${r.target ?? "?"} build`)}
-                </>
-              )}
-            </span>
-            <span className="upd-sub">
-              {r.waits_on ? (
-                <ReleaseWaitWords w={r.waits_on} newest={newest} />
-              ) : r.next ? (
-                sentence(r.next)
-              ) : r.method === "native" ? (
-                "Upgrades itself"
-              ) : r.terminal ? (
-                "Upgraded through a terminal on it"
-              ) : (
-                "Terminals are off: upgrade it on the machine"
-              )}
-              {r.from && r.how !== "off" ? ` · ${r.from}` : ""}
-            </span>
-          </p>
-        )}
-        <div className="upd-acts">
-          {r.locked ? (
-            <span className="upd-sub">Updates off on the machine</span>
-          ) : (
-            <SelectField label={`Updates for ${r.name}`} hideLabel value={r.policy} onChange={(v) => onPolicy(v as UpdatePolicy)} options={POLICIES} className="upd-policy" />
-          )}
-          {missing && (
-            <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-              <Upload /> {uploading === r.target ? "Uploading…" : `Upload ${r.target}`}
-            </Button>
-          )}
-          {actionable &&
-            open.map((w, i) => (
-              <Button key={w.way} size="xs" variant={i === 0 ? "secondary" : "ghost"} title={sentence(w.why)} onClick={() => onUpgrade(w.way)}>
-                {wayLabel(w.way, i === 0, failed !== undefined && wayOf(failed) === w.way)}
-              </Button>
-            ))}
-          {r.connected && !plan && (
-            <Button size="xs" variant="ghost" aria-expanded={diag !== null} onClick={() => (diag ? setDiag(null) : void look())}>
-              <Stethoscope /> {diag ? "Hide the diagnosis" : "Diagnose"}
-            </Button>
-          )}
-        </div>
-        {actionable && open.length === 0 && ways.length > 0 && (
-          <p className="upd-sub upd-ways">
-            {ways.map((w) => (
-              <span key={w.way}>
-                {w.way === "build" ? "Can't build it there now" : "Can't download a build now"}: {w.why}
-              </span>
-            ))}
-          </p>
-        )}
+        {policyError && <p id={errorId} className="upd-policy-error" role="alert">{policyError}</p>}
+        <details className="upd-details">
+          <summary><ChevronDown size={13} aria-hidden="true" />Details &amp; options</summary>
+          <div className="upd-details-body">
+            <Facts items={[
+              ...(hostnameDiffers ? [{ label: "Hostname", value: r.hostname }] : []),
+              { label: "Installed build", value: r.build ?? "Not reported" },
+              ...(r.target_build ? [{ label: "Available build", value: r.target_build }] : []),
+            ]} />
+            {r.from && <p className="upd-sub">Source: {r.from}</p>}
+            {r.next && !r.waits_on && <p className="upd-sub">{sentence(r.next)}</p>}
+            {!r.connected && <p className="upd-sub">This runner is offline. It needs to reconnect before it can be upgraded.</p>}
+            {stuck && <div className="upd-ways">{ways.filter((w) => !w.ok).map((w) => (
+              <p key={w.way} className="upd-sub">{w.way === "build" ? "Build unavailable" : "Download unavailable"}: {w.why}</p>
+            ))}</div>}
+            <div className="upd-acts">
+              {actionable && open.slice(1).map((w) => (
+                <Button key={w.way} size="xs" variant="ghost" disabled={saving || starting} title={sentence(w.why)} onClick={() => onUpgrade(w.way)}>
+                  {wayLabel(w.way, false, failed !== undefined && wayOf(failed) === w.way)}
+                </Button>
+              ))}
+              {missing && <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}><Upload />{uploading === r.target ? "Uploading…" : "Upload binary"}</Button>}
+            </div>
+            {r.instances.length > 1 && (
+              <ul className="upd-procs">
+                {r.instances.map((i) => (
+                  <li key={i.id}>
+                    <StatusDot status={i.newest ? "succeeded" : "timed_out"} />
+                    <span>{i.newest ? "New runner" : "Previous runner"}</span>
+                    <span className="mono upd-dim">{i.build ?? (i.legacy ? "legacy" : i.id.slice(0, 8))}{i.pid ? ` · pid ${i.pid}` : ""}</span>
+                    <span className="upd-dim">{i.newest ? "Takes new work" : `Keeps ${holding(i)}; retires once that ends`}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </details>
         {plan}
         {diag && <DiagnosisPanel name={r.name} s={diag} onRepair={(f) => void repair(f)} onAgain={() => void look()} onAskAgent={onAskAgent} />}
-        {r.instances.length > 1 && (
-          <ul className="upd-procs">
-            {r.instances.map((i) => (
-              <li key={i.id}>
-                <StatusDot status={i.newest ? "succeeded" : "timed_out"} />
-                <span>{i.newest ? "new runner" : "old runner"}</span>
-                <span className="mono upd-dim">
-                  {i.build ?? (i.legacy ? "legacy" : i.id.slice(0, 8))}
-                  {i.pid ? ` · pid ${i.pid}` : ""}
-                </span>
-                <span className="upd-dim">{i.newest ? "takes new work" : `keeps ${holding(i)}; retires once that ends`}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-        {job && <JobLog job={job} />}
+        {job && <UpgradeLog key={job.id} job={job} onChangeWaits={() => toWaits(job.timed_out)} />}
       </div>
     </li>
   );
@@ -856,60 +890,6 @@ function AllPlan({ runners }: { runners: RunnerUpdate[] }) {
 }
 
 /* ---------------------------- jobs ---------------------------- */
-
-function jobTitle(j: UpdateJob) {
-  if (j.kind === "server") return j.method === "restart" ? "Rollout restart" : `Install build ${j.to_build ?? ""}`;
-  if (j.method === "build") return `Build ${j.commit ? shortSha(j.commit) : "the newest kiln"} and upgrade to it`;
-  const to = j.to_build ? `build ${j.to_build}` : "the new build";
-  return `Upgrade to ${to}${j.method === "terminal" ? " · through a terminal" : ""}`;
-}
-
-function JobLog({ job }: { job: UpdateJob }) {
-  const running = job.state === "running";
-  // Open while it runs; one that failed says its error, its log a tap away.
-  const [open, setOpen] = React.useState(running);
-  // An upgrade that starts running opens its log.
-  const [runningSeen, setRunningSeen] = React.useState(running);
-  if (running !== runningSeen) {
-    setRunningSeen(running);
-    if (running) setOpen(true);
-  }
-  // Its newest lines stay in view as they come.
-  const follow = React.useCallback(
-    (el: HTMLPreElement | null) => {
-      if (el) el.scrollTop = el.scrollHeight;
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [job.log.length],
-  );
-  const tone = running ? "running" : job.state === "done" ? "succeeded" : "failed";
-  return (
-    <div className="upd-job" data-state={job.state}>
-      <button type="button" className="upd-job-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-        <StatusDot status={tone} />
-        <span className="min-w-0 flex-1 truncate">{jobTitle(job)}</span>
-        <span className="mono upd-dim shrink-0">
-          {running ? "running" : job.state === "done" ? "done" : "failed"} · {relativeTime(job.ended_at ?? job.started_at)}
-        </span>
-        <ChevronDown size={14} className={cn("shrink-0 transition-transform", open && "rotate-180")} />
-      </button>
-      {open && (
-        <pre ref={follow} className="upd-log" aria-live={running ? "polite" : undefined}>
-          {job.log.join("\n") || "starting…"}
-        </pre>
-      )}
-      {!open && job.error && <p className="upd-err">{job.error}</p>}
-      {job.state === "failed" && job.timed_out && (
-        <p className="upd-sub upd-job-note">
-          kiln stopped waiting; the runner may still get there, and the upgrade then reads as done.{" "}
-          <button type="button" className="upd-link" onClick={() => toWaits(job.timed_out)}>
-            Change how long kiln waits
-          </button>
-        </p>
-      )}
-    </div>
-  );
-}
 
 /** Bring the waits into view, the one that ran out focused: their section and group open first. */
 function toWaits(which: UpdateJob["timed_out"]) {

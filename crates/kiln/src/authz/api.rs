@@ -159,6 +159,9 @@ struct NewUser {
     /// Grants to start with (`developer@org:acme`, …).
     #[serde(default)]
     grants: Vec<String>,
+    /// The email SSO matches them by (a host's verified one, docs/ci.md W23-R08).
+    #[serde(default)]
+    email: Option<String>,
 }
 
 fn parse_grants(texts: &[String], custom: &HashMap<String, Vec<String>>) -> Result<Vec<Grant>, Fail> {
@@ -178,7 +181,7 @@ async fn add_user(hub: &Hub, caller: &Caller, req: Request) -> Result<Response, 
         return Err(bad("a user's name is up to 64 letters, digits, `-`, `_`, `.` and `@` (and not admin or owner)"));
     }
     let grants = parse_grants(&b.grants, &custom(hub).await?)?;
-    let (id, by, n) = (crate::util::new_id(), caller.name.clone(), name.clone());
+    let (id, by, n, email) = (crate::util::new_id(), caller.name.clone(), name.clone(), b.email.clone().map(|e| e.trim().to_owned()).filter(|e| e.contains('@')));
     let uid = id.clone();
     let texts: Vec<(String, String, bool)> = grants.iter().map(|g| (g.what.clone(), g.scope.text(), g.deny)).collect();
     hub.store
@@ -189,7 +192,7 @@ async fn add_user(hub: &Hub, caller: &Caller, req: Request) -> Result<Response, 
             if taken {
                 anyhow::bail!("conflict: a user `{n}` exists (or did: names are not reused)");
             }
-            tx.execute("INSERT INTO users (id, name, created_at, created_by) VALUES (?1, ?2, ?3, ?4)", params![uid, n, now, by])?;
+            tx.execute("INSERT INTO users (id, name, created_at, created_by, email) VALUES (?1, ?2, ?3, ?4, ?5)", params![uid, n, now, by, email])?;
             for (what, scope, deny) in texts {
                 tx.execute("INSERT INTO grants (principal, what, scope, deny, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![format!("user:{uid}"), what, scope, deny, now, by])?;
             }

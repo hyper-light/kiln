@@ -51,7 +51,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W18: an attest step's SBOM and bundles, for its runner; the key that signs them.
         ["_kiln", "attestations", "sbom"] if req.method() == Method::POST => Some(super::attest::upload(hub, req).await),
         ["_kiln", "attestations"] => Some(super::attest::for_leg(hub, &req).await),
-        ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub)),
+        ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub).await),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -83,9 +83,80 @@ fn git_path(seg: &[&str]) -> bool {
 }
 
 /// `/api/ci/<rest>`, authenticated.
+/// Whether a call may reach other hosts (docs/ci.md W23): a repository's CI providers, a provider's
+/// runs, logs, artifacts and reviews, a host's pull requests.
+fn reaches_out(method: &Method, rest: &[&str]) -> bool {
+    matches!(
+        (method, rest),
+        (&Method::GET | &Method::PUT, ["repos", _, "providers"])
+            | (_, ["repos", _, "providers", "sync" | "workflows"])
+            | (&Method::GET, ["repos", _, "commits", _, "checks"])
+            | (_, ["repos", _, "pulls", ..])
+            | (&Method::POST, ["repos", _, "workflows", .., "dispatches"])
+            | (&Method::GET, ["runs", _, "pending" | "artifacts"])
+            | (&Method::GET, ["runs", _, "artifacts", _, "download"])
+            | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
+            | (&Method::GET, ["legs", _, "logs"])
+            | (&Method::GET, ["environments"])
+    )
+}
+
+/// A call that may reach other hosts, as a task of its own: a host's API calls nest deep, and a
+/// request's stack is already spent on the route tables above it (a debug build gives every arm's
+/// future a slot of its own).
+async fn reach_out(hub: &Arc<Hub>, method: Method, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
+    let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+    let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT) { crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+    let (hub, rest, q) = (Arc::clone(hub), rest.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>(), q.clone());
+    crate::rt::spawn(async move {
+        let segs: Vec<&str> = rest.iter().map(String::as_str).collect();
+        outside(&hub, &method, &segs, &q, body, caller.as_ref()).await
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "the call ended without an answer".to_owned()))?
+}
+
+async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<String, String>, body: serde_json::Value, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
+    let ok = |v: &serde_json::Value| crate::http::server::json(StatusCode::OK, v);
+    match (method, rest) {
+        // W23: what a repository's CI runs on, and the rest of the providers' contract (R01).
+        (&Method::GET, ["repos", repo, "providers"]) => Ok(ok(&super::providers::show(hub, repo).await?)),
+        (&Method::PUT, ["repos", repo, "providers"]) => {
+            let by = caller.map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            Ok(ok(&super::providers::set(hub, repo, &body, &by).await?))
+        }
+        (&Method::POST, ["repos", repo, "providers", "sync"]) => Ok(ok(&super::providers::sync_now(hub, repo).await?)),
+        (&Method::GET, ["repos", repo, "providers", "workflows"]) => Ok(ok(&super::providers::workflows(hub, repo).await?)),
+        (&Method::GET, ["repos", repo, "commits", sha, "checks"]) => Ok(ok(&super::providers::checks(hub, repo, sha).await?)),
+        // W23-R06: the host's pull requests (merge requests).
+        (_, ["repos", repo, "pulls", tail @ ..]) => crate::githost::pulls::route(hub, method, repo, tail, body, caller).await,
+        // W03-R11: dispatches (another provider's, W23-R01).
+        (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch_value(hub, repo, &path.join("/"), body).await,
+        (&Method::GET, ["runs", id, "pending"]) => super::runs_api::pending(hub, id).await,
+        (&Method::GET, ["runs", id, "artifacts"]) => super::runs_api::part(hub, id, "artifacts", q).await,
+        (&Method::GET, ["runs", id, "artifacts", artifact, "download"]) => super::runs_api::download(hub, id, artifact).await,
+        (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
+        (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body).await,
+        (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
+        (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
+        (&Method::GET, ["environments"]) => super::environments::route(hub, method, &[], q, body, caller).await,
+        _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
+    }
+}
+
 pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
+    if reaches_out(&method, rest) {
+        return reach_out(hub, method, rest, q, req).await;
+    }
     match (&method, rest) {
+        // W14-R10: the GitHub App, and making one by GitHub's manifest flow.
+        (&Method::GET, ["github", "app"]) => crate::githost::web::show(hub).await,
+        (&Method::POST, ["github", "app", "manifest"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 20).await.unwrap_or(serde_json::Value::Null);
+            crate::githost::web::start(hub, &by, &body).await
+        }
         // W02: workflows.
         (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
         // W04-R29: a plan without a run.
@@ -118,10 +189,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT | Method::PATCH) { crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
             super::environments::route(hub, &method, tail, q, body, caller.as_ref()).await
         }
-        (&Method::POST, ["runs", id, "approve"]) => {
-            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+        // W13-R11: the runner images kiln built.
+        (&Method::GET, ["images"]) => super::images::list(hub, q).await,
+        // W18-R04: whether a digest has kiln's provenance meeting a requirement.
+        (&Method::POST, ["attestations", "verify"]) => {
             let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-            super::environments::approve(hub, id, body, caller.as_ref()).await
+            super::attest::verify_route(hub, &body).await
         }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => super::routing::get(hub).await,
@@ -162,14 +235,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W16-R07, R08: benchmark metrics and their trends.
         (&Method::GET, ["runs", id, "metrics"]) => super::results::run_metrics(hub, id).await,
         (&Method::GET, ["repos", repo, "metrics"]) => super::results::repo_metrics(hub, repo, q).await,
-        (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which, q).await,
-        (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
-        (&Method::POST, ["runs", id, "rerun"]) => {
-            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-            super::runs_api::rerun(hub, id, &body).await
-        }
+        (&Method::GET, ["runs", id, which @ ("annotations" | "summary")]) => super::runs_api::part(hub, id, which, q).await,
         (&Method::GET, ["legs", id]) => super::runs_api::leg(hub, id).await,
-        (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["legs", id, "routing"]) => super::runs_api::routing(hub, id).await,
         (&Method::POST, ["legs", id, "rerun-step"]) => {
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
@@ -204,7 +271,6 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::POST, ["repos", repo, "dispatch"]) => workflows::dispatch_named(hub, repo, req.into_body()).await,
         (&Method::POST, ["repos", repo, "repository-dispatch"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
         // W03-R11: dispatches.
-        (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch(hub, repo, &path.join("/"), req.into_body()).await,
         (&Method::POST, ["repos", repo, "dispatches"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
         // W17-R06: runs of a working tree (`kiln workflow run`).
         (&Method::GET, ["repos", repo, "heads"]) => super::uploads::heads(hub, repo).await,

@@ -16,6 +16,8 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod sso;
+pub mod tokens;
 
 use std::collections::HashMap;
 
@@ -49,6 +51,7 @@ pub const CAPABILITIES: &[&str] = &[
     "environments.deploy",
     "environments.manage",
     "diffs.read",
+    "git.read",
     "diffs.submit",
     "diffs.review",
     "diffs.land",
@@ -339,9 +342,12 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/jobs/*/artifacts", "artifacts.read", At::Job(2)),
     // The CI engine.
     r("POST", "/api/ci/validate", "runs.read", At::Anywhere),
+    r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
+    r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
     r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),
     r("GET", "/api/ci/runs", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/runs/*", "runs.read", At::Run(3)),
+    r("GET", "/api/ci/runs/*/artifacts/*/download", "artifacts.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/**", "runs.read", At::Run(3)),
     r("POST", "/api/ci/runs/*/cancel", "runs.cancel", At::Run(3)),
     // Who may review is the environment's to say too: the handler checks its reviewers.
@@ -357,6 +363,14 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/legs/*/**", "runs.debug", At::Job(3)),
     r("GET", "/api/ci/legs/*/**", "runs.read", At::Job(3)),
     r("GET", "/api/ci/repos/*/names", "workflows.edit", At::Repo(3)),
+    // W23: a repository's CI providers, and its host's pull requests.
+    r("PUT", "/api/ci/repos/*/providers", "settings.manage", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/providers/sync", "runs.read", At::Repo(3)),
+    r("GET", "/api/ci/repos/*/pulls", "diffs.read", At::Repo(3)),
+    r("GET", "/api/ci/repos/*/pulls/*", "diffs.read", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),

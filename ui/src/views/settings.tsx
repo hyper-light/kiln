@@ -4,7 +4,7 @@
  * section or a group (`/settings#updates`, `/settings#updates.waits`) opens it.
  */
 import * as React from "react";
-import { LogOut } from "lucide-react";
+import { Check, LoaderCircle, LogOut } from "lucide-react";
 import { ApiError, api } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
@@ -44,7 +44,7 @@ export default function Settings() {
       <title>Settings · kiln</title>
       <PageIntro index={10} label="Settings" title="Settings" />
       <SettingsSearch value={query} onChange={setQuery} />
-      <SettingsSections query={query}>
+      <SettingsSections query={query} onQueryChange={setQuery}>
         <SettingsSection id="device" index={1} title="This device" about="How kiln behaves in this browser" words="browser phone">
           <Loadable label="notifications" fallback={<NotificationsHold />}>
             <NotificationsGroup />
@@ -93,7 +93,9 @@ function MotionGroup() {
         label="Pause motion"
         help={reduced ? "Your device asks for reduced motion, so kiln keeps still." : "The ambient prism and status pulses keep still. Your device's reduced-motion setting always wins."}
       >
-        <input id="st-motion" type="checkbox" className="check" checked={paused || reduced} disabled={reduced} onChange={toggle} />
+        <label className="st-check-control" htmlFor="st-motion">
+          <input id="st-motion" type="checkbox" className="check" checked={paused || reduced} disabled={reduced} onChange={toggle} />
+        </label>
       </SettingRow>
     </SettingsGroup>
   );
@@ -120,16 +122,29 @@ function ClustersGroup() {
 function GrafanaGroup() {
   const [grafana, setGrafana] = usePref("kiln.grafanaUrl", "");
   const [draft, setDraft] = React.useState(grafana);
-  const valid = draft === "" || /^https?:\/\/\S+$/.test(draft.trim());
+  const [saved, setSaved] = React.useState(false);
+  const trimmed = draft.trim();
+  let valid = trimmed === "";
+  if (trimmed) {
+    try {
+      const url = new URL(trimmed);
+      valid = ["http:", "https:"].includes(url.protocol) && /^https?:\/\//i.test(trimmed) && !/\s/.test(trimmed);
+    } catch {
+      valid = false;
+    }
+  }
   return (
     <SettingsGroup id="integrations.grafana" title="Grafana" words="grafana dashboard metrics url link">
       <form
+        noValidate
         onSubmit={(e) => {
           e.preventDefault();
           if (!valid) return;
-          setGrafana(draft.trim());
+          setGrafana(trimmed);
+          setDraft(trimmed);
+          setSaved(true);
           toast({
-            title: draft.trim() ? "Grafana link saved" : "Grafana link removed",
+            title: trimmed ? "Grafana link saved" : "Grafana link removed",
             tone: "info",
           });
         }}
@@ -137,14 +152,32 @@ function GrafanaGroup() {
         <SettingRow
           label="Dashboard link"
           htmlFor="st-grafana"
-          help={valid ? "Opened from the Metrics page; kiln ships its dashboards as ConfigMaps under deploy/. Kept in this browser." : "It must start with http:// or https://"}
+          help="Open your dashboard from Metrics. Saved in this browser."
         >
-          <div className="field st-wide">
-            <input id="st-grafana" type="url" inputMode="url" placeholder="https://grafana.example.com/d/kiln" value={draft} onChange={(e) => setDraft(e.target.value)} />
+          <div className="st-control-stack">
+            <div className="st-control-line">
+              <div className="field st-wide">
+                <input
+                  id="st-grafana"
+                  type="url"
+                  inputMode="url"
+                  placeholder="https://grafana.example.com/d/kiln"
+                  value={draft}
+                  aria-invalid={!valid || undefined}
+                  aria-describedby={!valid || saved ? "st-grafana-feedback" : undefined}
+                  onChange={(e) => { setDraft(e.target.value); setSaved(false); }}
+                />
+              </div>
+              <Button type="submit" size="xs" variant="secondary" disabled={!valid || trimmed === grafana}>
+                Save
+              </Button>
+            </div>
+            {(!valid || saved) && (
+              <p id="st-grafana-feedback" className="st-note st-feedback" data-tone={!valid ? "error" : "success"} role="status">
+                {!valid ? "Enter a valid http:// or https:// URL." : <><Check size={13} aria-hidden="true" /> {trimmed ? "Link saved" : "Link removed"}</>}
+              </p>
+            )}
           </div>
-          <Button type="submit" size="xs" variant="secondary" disabled={!valid || draft.trim() === grafana}>
-            Save
-          </Button>
         </SettingRow>
       </form>
     </SettingsGroup>
@@ -173,7 +206,7 @@ function PasswordGroup() {
   const methods = useRes(methodsRes).data;
   const [pw, setPw] = React.useState("");
   const [again, setAgain] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const [busy, setBusy] = React.useState<"save" | "remove" | null>(null);
   const [removing, setRemoving] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
   const isSet = methods.password;
@@ -182,8 +215,8 @@ function PasswordGroup() {
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (pw.length < 8 || pw !== again) return;
-    setBusy(true);
+    if (busy || removing || pw.length < 8 || pw !== again) return;
+    setBusy("save");
     setProblem(null);
     try {
       await api.setPassword(pw);
@@ -198,21 +231,25 @@ function PasswordGroup() {
     } catch (err) {
       setProblem(err instanceof ApiError ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
   const remove = async () => {
-    setBusy(true);
+    if (busy) return;
+    setBusy("remove");
+    setProblem(null);
     try {
       await api.clearPassword();
       toast({ title: "Password removed", tone: "info" });
+      setPw("");
+      setAgain("");
       setRemoving(false);
       invalidate("auth/methods");
     } catch (err) {
       setProblem(err instanceof ApiError ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
@@ -226,7 +263,7 @@ function PasswordGroup() {
       words={PASSWORD_WORDS}
       actions={
         isSet ? (
-          <Button variant="ghost" size="xs" disabled={busy} aria-expanded={removing} onClick={() => setRemoving(!removing)}>
+          <Button variant="ghost" size="xs" disabled={!!busy} aria-expanded={removing} onClick={() => { setRemoving(!removing); setProblem(null); }}>
             Remove
           </Button>
         ) : undefined
@@ -239,19 +276,20 @@ function PasswordGroup() {
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" disabled={busy} onClick={() => void remove()}>
-                Remove
+              <Button size="xs" variant="danger" disabled={!!busy} onClick={() => void remove()}>
+                {busy === "remove" && <LoaderCircle className="animate-spin" aria-hidden="true" />}
+                {busy === "remove" ? "Removing…" : "Remove password"}
               </Button>
-              <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
+              <Button size="xs" variant="ghost" disabled={!!busy} onClick={() => { setRemoving(false); setProblem(null); }}>
                 Cancel
               </Button>
             </>
           }
         >
-          <p>Remove the sign-in password? Devices will need the admin token or a `kiln login` link to sign in.</p>
+          <p>Devices will need the admin token or a <code>kiln login</code> link to sign in.</p>
         </Confirm>
       )}
-      <form className="st-password" onSubmit={save} autoComplete="on">
+      <form className="st-password" onSubmit={save} autoComplete="on" aria-busy={!!busy}>
         <input type="text" name="username" autoComplete="username" value="admin" readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
         <TextField
           label={isSet ? "New password" : "Password"}
@@ -259,24 +297,33 @@ function PasswordGroup() {
           name="new-password"
           autoComplete="new-password"
           value={pw}
-          onChange={(e) => setPw(e.target.value)}
-          hint={tooShort ? "At least 8 characters" : undefined}
+          disabled={!!busy}
+          aria-invalid={tooShort || undefined}
+          aria-describedby="st-password-help"
+          onChange={(e) => { setPw(e.target.value); setProblem(null); }}
+          hint={<span id="st-password-help" data-tone={tooShort ? "error" : undefined}>At least 8 characters</span>}
         />
         <TextField
-          label="Repeat it"
+          label="Confirm password"
           type="password"
           name="new-password-repeat"
           autoComplete="new-password"
           value={again}
-          onChange={(e) => setAgain(e.target.value)}
-          hint={mismatch ? "The two passwords differ" : undefined}
+          disabled={!!busy}
+          aria-invalid={mismatch || undefined}
+          aria-describedby={mismatch ? "st-password-match" : undefined}
+          onChange={(e) => { setAgain(e.target.value); setProblem(null); }}
+          hint={mismatch ? <span id="st-password-match" data-tone="error">The two passwords differ</span> : undefined}
         />
-        <Button type="submit" size="xs" variant="secondary" className="st-password-go" disabled={busy || pw.length < 8 || pw !== again}>
-          {isSet ? "Change password" : "Set password"}
-        </Button>
+        <div className="st-password-actions">
+          <Button type="submit" size="xs" variant="secondary" disabled={!!busy || removing || pw.length < 8 || pw !== again}>
+            {busy === "save" && <LoaderCircle className="animate-spin" aria-hidden="true" />}
+            {busy === "save" ? "Saving…" : isSet ? "Change password" : "Set password"}
+          </Button>
+        </div>
       </form>
       {problem && (
-        <p className="st-note" data-tone="error">
+        <p className="st-note" data-tone="error" role="alert">
           {problem}
         </p>
       )}

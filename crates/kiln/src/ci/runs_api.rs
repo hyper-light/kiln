@@ -37,11 +37,13 @@ fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "finished_at": r.get::<_, Option<i64>>(16)?, "error": r.get::<_, Option<String>>(17)?, "message": r.get::<_, String>(18)?, "github_run_id": r.get::<_, i64>(19)?,
         // W18-R06: `required` while an outside contributor's run waits for a maintainer.
         "approval": r.get::<_, Option<String>>(20)?, "approved_by": r.get::<_, Option<String>>(21)?,
+        // W23: where it ran (`kiln`, `github-actions`, …), and its page and number there.
+        "provider": r.get::<_, String>(22)?, "external_url": r.get::<_, Option<String>>(23)?, "external_number": r.get::<_, Option<i64>>(24)?,
     }))
 }
 
 const RUN_SELECT: &str = "SELECT r.id, r.number, p.name, r.workflow_id, r.pipeline, r.run_name, r.event, r.branch, r.sha, r.actor, r.status, r.conclusion, r.trust, r.attempt,
-     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
+     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by, r.provider, r.external_url, r.external_number FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
 
 /// `GET /api/ci/runs?…`: the engine's runs, newest first, cursor-paged.
 pub async fn list(hub: &Hub, q: &HashMap<String, String>) -> Result<Response, Fail> {
@@ -196,6 +198,13 @@ pub async fn graph_json(hub: &Hub, id: &str, attempt: Option<i64>) -> Result<Val
 /// `GET /api/ci/runs/:id/annotations`, `/summary`, `/artifacts`.
 pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     run_json(hub, id).await?;
+    // Another provider's run (W23-R01): its artifacts, from the provider.
+    if which == "artifacts"
+        && let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)?
+    {
+        let list = super::providers::artifacts(hub, &repo, &provider, &ext).await?;
+        return Ok(srv::json(StatusCode::OK, &json!({ "provider": provider, "artifacts": list })));
+    }
     let (run, which, attempt) = (id.to_owned(), which.to_owned(), attempt_of(q));
     let v = hub
         .store
@@ -241,9 +250,50 @@ pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>)
     Ok(srv::json(StatusCode::OK, &v))
 }
 
+/// `GET /api/ci/runs/:id/pending`: the deployments a run waits for a review of, whichever provider.
+pub async fn pending(hub: &Hub, id: &str) -> Result<Response, Fail> {
+    run_json(hub, id).await?;
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let list = super::providers::pending(hub, &repo, &provider, &ext).await?;
+        return Ok(srv::json(StatusCode::OK, &json!({ "provider": provider, "pending": list })));
+    }
+    let list: Vec<Value> = super::environments::waiting(hub, id).await.map_err(internal)?.into_iter().map(|e| json!({ "environment": e })).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "provider": super::providers::KILN, "pending": list })))
+}
+
+/// `GET /api/ci/runs/:id/artifacts/:artifact/download`: an artifact's archive, whichever provider
+/// (KilnCI's: a short-lived link to its blob).
+pub async fn download(hub: &Hub, id: &str, artifact: &str) -> Result<Response, Fail> {
+    run_json(hub, id).await?;
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let bytes = super::providers::artifact(hub, &repo, &provider, &ext, artifact).await?;
+        return Ok(srv::response(StatusCode::OK, "application/zip", srv::full(bytes)));
+    }
+    let (run, aid) = (id.to_owned(), artifact.parse::<i64>().map_err(|_| (StatusCode::NOT_FOUND, "no such artifact".to_owned()))?);
+    let found: Option<(bool, Option<i64>)> = hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT object IS NULL, expires_at FROM ci_artifacts WHERE id = ?1 AND run_id = ?2 AND finalized = 1", params![aid, run], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
+        .await
+        .map_err(internal)?;
+    match found {
+        Some((gone, expires)) if gone || expires.is_some_and(|e| e <= crate::util::now_unix()) => Err((StatusCode::GONE, "the artifact has expired".into())),
+        Some(_) => {
+            let origin = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+            let url = super::services::blob::url(hub, &origin, super::services::blob::Target::Artifact(aid), "r", 60);
+            Ok(srv::with_header(srv::status(StatusCode::FOUND), http::header::LOCATION, &url))
+        }
+        None => Err((StatusCode::NOT_FOUND, "no such artifact".into())),
+    }
+}
+
 /// `POST /api/ci/runs/:id/cancel`.
 pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
     run_json(hub, id).await?;
+    // Another provider's run (W23): its provider cancels it.
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let v = super::providers::cancel(hub, &repo, &provider, &ext).await?;
+        return Ok(srv::json(StatusCode::ACCEPTED, &v));
+    }
     hub.cancel_run(id, "cancelled from the API").await.map_err(internal)?;
     Ok(srv::status(StatusCode::ACCEPTED))
 }
@@ -252,6 +302,12 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 /// was (a new run; `{ mode: "all" }`, the default).
 pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
+    // Another provider's run (W23): its provider reruns it.
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
+        let mode = body.get("mode").and_then(Value::as_str).unwrap_or("all");
+        let v = super::providers::rerun(hub, &repo, &provider, &ext, mode, body.get("job").and_then(Value::as_str)).await?;
+        return Ok(srv::json(StatusCode::CREATED, &v));
+    }
     let mode = match body.get("mode").and_then(Value::as_str).unwrap_or("all") {
         "all" => RerunMode::All,
         "failed" => RerunMode::Failed,
@@ -456,6 +512,13 @@ pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Opt
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
     let from: usize = q.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Another provider's leg (W23): its log, read from the provider.
+    if let Some((repo, provider, run, job)) = super::providers::of_leg(hub, id).await.map_err(internal)? {
+        let text = super::providers::logs(hub, &repo, &provider, &run, &job).await?;
+        let data = text.into_bytes();
+        let data = if from == 0 { data } else { data.get(from..).map(<[u8]>::to_vec).unwrap_or_default() };
+        return Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)));
+    }
     let mut data = hub.logs.read(id, step).await;
     // A leg a rerun kept: the logs are those of the leg whose result it keeps (W05-R17).
     if data.is_empty() {

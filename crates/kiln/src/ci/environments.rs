@@ -237,7 +237,9 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
         (&Method::GET, []) => {
             let all = defs(hub, &repo).await.map_err(internal)?;
             let mut last = latest(hub, &repo).await.map_err(internal)?;
-            let list: Vec<Value> = all.iter().map(|(k, d)| env_json(d, last.remove(k))).collect();
+            let mut list: Vec<Value> = all.iter().map(|(k, d)| env_json(d, last.remove(k))).collect();
+            // The repository's environments on its other CI providers (docs/ci.md W23-R01, R05).
+            list.extend(super::providers::environments(hub, &repo).await);
             Ok(srv::json(StatusCode::OK, &json!({ "repo": repo.name, "environments": list })))
         }
         (&Method::GET, [name]) => {
@@ -354,6 +356,17 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
         "rejected" | "reject" => false,
         s => return Err(bad(format!("`{s}`: a review is `approved` or `rejected`"))),
     };
+    // Another provider's run (W23-R01): its provider takes the review, after kiln's own check.
+    if let Some((repo, provider, ext)) = super::providers::of_run(hub, run).await.map_err(internal)? {
+        let owner = Caller::owner();
+        let who = caller.unwrap_or(&owner);
+        if !who.is_owner() && !who.can("runs.approve", &Scope::Repo { repo: repo.name.clone() }) {
+            return Err((StatusCode::FORBIDDEN, format!("{} may not approve runs of {}: that needs runs.approve there", who.name, repo.name)));
+        }
+        let v = super::providers::approve(hub, &repo, &provider, &ext, &b.environments, approved, &b.comment, caller).await?;
+        hub.store.audit(who.name.clone(), if approved { "ci.runs.approve".into() } else { "ci.runs.reject".into() }, format!("{run} on {provider}: {}", b.environments.join(", "))).await;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
     let rid = run.to_owned();
     let row: Option<(String, String)> = hub
         .store
@@ -409,6 +422,11 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
     hub.store.audit(who.name.clone(), if approved { "ci.runs.approve".into() } else { "ci.runs.reject".into() }, format!("{run} {}", named.join(","))).await;
     hub.ci.send(super::dispatch::Msg::Reviewed { run: run.to_owned() });
     Ok(srv::json(StatusCode::OK, &json!({ "run": run, "environments": named, "state": if approved { "approved" } else { "rejected" } })))
+}
+
+/// The environments a KilnCI run waits on a review for.
+pub(crate) async fn waiting(hub: &Hub, run: &str) -> anyhow::Result<Vec<String>> {
+    waiting_envs(hub, run).await
 }
 
 /// The environments a run's legs wait on a review for (their wait reasons say so).

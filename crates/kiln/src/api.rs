@@ -189,6 +189,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         };
     }
 
+    // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
+    // of its own (an upload streams for as long as it takes).
+    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
+        let h = Arc::clone(&hub);
+        return crate::rt::spawn(async move { crate::ci::registry::proxy::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
+    }
+    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
+        let h = Arc::clone(&hub);
+        return crate::rt::spawn(async move { crate::ci::registry::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
+    }
+
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
         (&Method::POST, ["api", "mcp"]) => {
@@ -213,6 +224,26 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             };
         }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
+        // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
+        (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &crate::authz::sso::providers(&hub).await)),
+        (&Method::GET, ["api", "auth", provider, "start"]) => {
+            let q = srv::query(&req);
+            return match crate::authz::sso::start(&hub, provider, q.get("return").map(String::as_str)).await {
+                Ok(to) => Ok(srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &to)),
+                Err((c, m)) => Err(err(c, m)),
+            };
+        }
+        (&Method::GET, ["api", "auth", provider, "callback"]) => {
+            let q = srv::query(&req);
+            let (code, state) = (q.get("code").cloned().unwrap_or_default(), q.get("state").cloned().unwrap_or_default());
+            return match crate::authz::sso::callback(&hub, provider, &code, &state).await {
+                Ok((session, _, back)) => {
+                    let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &back);
+                    Ok(srv::with_header(r, header::SET_COOKIE, &cookie_for(&session, is_secure(&hub, &req))))
+                }
+                Err((c, m)) => Err(err(c, m)),
+            };
+        }
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
         (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,
@@ -233,6 +264,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return put_artifacts(&hub, &id, req).await;
         }
         (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        // The GitHub App's events and GitHub's return from making it (W14-R10): open, they carry
+        // their own proof (a signature; a state kiln handed out).
+        (&Method::POST, ["api", "hooks", "github", "app"]) => return crate::githost::web::webhook(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        // GitLab's and Bitbucket's webhooks, checked with their secrets (docs/ci.md W23-R04, R05).
+        (&Method::POST, ["api", "hooks", "gitlab"]) => return crate::githost::hooks::gitlab(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "hooks", "bitbucket"]) => return crate::githost::hooks::bitbucket(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ci", "github", "app", "callback"]) => return crate::githost::web::callback(&hub, &req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "shared", "plans", token]) => return shared_plan(&hub, token).await,
         (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();

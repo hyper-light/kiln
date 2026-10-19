@@ -106,6 +106,39 @@ fn secret_feeds(a: &AssignmentV2, dialect: Dialect) -> std::collections::BTreeSe
     out
 }
 
+/// The digest a `push` printed (`<tag>: digest: sha256:<hex> size: <n>`), the last one.
+fn pushed_digest(said: &str) -> Option<String> {
+    said.lines().rev().find_map(|l| {
+        let (_, rest) = l.split_once("digest: sha256:")?;
+        let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        (hex.len() == 64).then(|| format!("sha256:{hex}"))
+    })
+}
+
+/// The files a pattern names below `wd`, as a shell would expand it.
+fn glob_files(wd: &Path, pattern: &str) -> Vec<String> {
+    let full = wd.join(pattern).to_string_lossy().into_owned();
+    glob::glob(&full).map(|paths| paths.flatten().filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()).unwrap_or_default()
+}
+
+/// The leg's `PATH` from `path` (the runner's own by default): with what its steps added
+/// (`GITHUB_PATH`), then kiln's own binary (`kiln auth`, its credential helper).
+fn leg_path(st: &State, path: Option<&str>) -> String {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let base_path = std::env::var("PATH").unwrap_or_default();
+    let mut path = st.path.apply(path.unwrap_or(base_path.as_str()), sep);
+    if let Some(d) = &st.kiln_bin {
+        path = format!("{path}{sep}{}", d.to_string_lossy());
+    }
+    path
+}
+
+/// Where `prog` is on `env`'s `PATH`.
+fn on_path(env: &BTreeMap<String, String>, prog: &str) -> Option<PathBuf> {
+    let path = env.get("PATH")?;
+    std::env::split_paths(path).flat_map(|d| [d.join(prog), d.join(format!("{prog}.exe"))]).find(|p| p.is_file())
+}
+
 /// Whether a program is on `PATH`.
 fn which(prog: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
@@ -712,6 +745,31 @@ impl Leg {
         if serde_json::to_vec(&a.integrations).ok().is_some_and(|b| super::auth::write_private(&list, &b).is_ok()) {
             st.env.insert("KILN_INTEGRATIONS".into(), list.to_string_lossy().into_owned());
         }
+        // Docker asks kiln for registries' credentials when it needs them (W12-R03): the leg's
+        // `oci` integrations', and kiln's own registry's (the job's token, which ends with the leg).
+        let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
+        let docker = dir.join("docker");
+        // The runner's own logins stay for a leg on the host; a job container never sees them, and
+        // gets kiln's helper only when the leg names a registry (the helper is the runner's binary).
+        let base = if map.is_none() { super::credential::runner_config() } else { None };
+        let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
+        let wanted = map.is_none() || a.integrations.iter().any(|i| i.kind == "oci");
+        if wanted && std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+            st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
+            st.env.insert("KILN_REGISTRY_HOST".into(), own);
+        }
+        // Package tools through kiln's proxies (W12-R04), with the job's token.
+        if !a.runtime.proxies.is_empty() {
+            let pdir = dir.join("proxies");
+            match super::credential::proxy_env(&a.runtime.proxies, &a.runtime.github_token, &pdir, &seen) {
+                Ok(env) => {
+                    for (k, v) in env {
+                        st.env.entry(k).or_insert(v);
+                    }
+                }
+                Err(e) => self.note(0, &format!("kiln's package proxies: {e:#}")).await,
+            }
+        }
         true
     }
 
@@ -745,6 +803,18 @@ impl Leg {
 
     async fn note(&self, idx: u32, text: &str) {
         self.up.note(&self.a.job_id, idx, text).await;
+    }
+
+    /// The environment the tools a built-in runs get, as a step's: the leg's variables, GitHub's
+    /// and kiln's defaults (the job's token for kiln's credential helper), the leg's `PATH`.
+    fn tool_env(&self, st: &State) -> BTreeMap<String, String> {
+        let mut env = st.env.clone();
+        for (k, v) in self.env_vars(st) {
+            env.entry(k).or_insert(v);
+        }
+        let path = leg_path(st, env.get("PATH").map(String::as_str));
+        env.insert("PATH".into(), path);
+        env
     }
 
     fn env_vars(&self, st: &State) -> BTreeMap<String, String> {
@@ -959,7 +1029,8 @@ impl Leg {
             }
         }
         self.report_facts(&st).await;
-        if !a.integrations.is_empty() && !self.integrations(&mut st).await {
+        // Every leg: its integrations, kiln's registry and package proxies (W11, W12).
+        if !self.integrations(&mut st).await {
             if let Some(c) = &st.containers {
                 c.stop().await;
             }
@@ -1084,7 +1155,13 @@ impl Leg {
                 fetch.push(f);
             }
             fetch.extend(["origin", &sha]);
-            let mut steps: Vec<Vec<&str>> = vec![vec!["init", "--quiet", &w], vec!["-C", &w, "remote", "add", "origin", &remote]];
+            // A repository already there (the leg's own checkout, an earlier step's) is fetched
+            // into, its `origin` pointed at the server, as `actions/checkout` reuses one.
+            let mut has_origin = Command::new("git");
+            has_origin.args(["-C", &w, "remote", "get-url", "origin"]);
+            let reuse = ws.join(".git").exists() && crate::proc::output(has_origin, Duration::from_secs(30)).await.is_ok_and(|o| o.status.success());
+            let origin = if reuse { vec!["-C", w.as_str(), "remote", "set-url", "origin", &remote] } else { vec!["-C", w.as_str(), "remote", "add", "origin", &remote] };
+            let mut steps: Vec<Vec<&str>> = vec![vec!["init", "--quiet", &w], origin];
             if !c.sparse.is_empty() {
                 let mut set = vec!["-C", w.as_str(), "sparse-checkout", "set"];
                 if !c.cone {
@@ -1369,10 +1446,14 @@ impl Leg {
             (None, None) if step.is_control() => Err(anyhow::anyhow!("`wait`, `wait-all`, `cancel` and `parallel` can't be steps of a composite action (docs/ci.md W06-R17)")),
             (None, None) => Err(anyhow::anyhow!("the step runs neither a script nor an action")),
         };
+        // A step that couldn't run says why, as its annotation too (an action's `setFailed`).
+        let mut error = None;
         let (end, outputs) = match ran {
             Ok(r) => (r.end, r.outputs),
             Err(e) => {
-                self.note(idx, &format!("Error: {e:#}")).await;
+                let msg = format!("{e:#}");
+                self.note(idx, &format!("Error: {msg}")).await;
+                error = Some(msg);
                 (End::Exit(None), BTreeMap::new())
             }
         };
@@ -1389,9 +1470,10 @@ impl Leg {
                 (Conclusion::Failure, code)
             }
             End::Exit(code) => {
-                let msg = match code {
-                    Some(c) => format!("Process completed with exit code {c}."),
-                    None => "Process ended without an exit code (killed by a signal).".to_owned(),
+                let msg = match (code, error) {
+                    (Some(c), _) => format!("Process completed with exit code {c}."),
+                    (None, Some(e)) => e,
+                    (None, None) => "Process ended without an exit code (killed by a signal).".to_owned(),
                 };
                 self.annotate(idx, "error", &msg).await;
                 (Conclusion::Failure, code)
@@ -1662,7 +1744,16 @@ impl Leg {
         let said = parking_lot::Mutex::new(Vec::<String>::new());
         let say = |m: String| said.lock().push(m);
         let keys: Vec<String> = services.iter().map(|(k, _)| k.clone()).collect();
-        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, egress.as_ref().map(|(e, _)| e), &say).await;
+        // Images from the registries kiln mirrors come through it, signed in with the job's token
+        // (W12-R02).
+        let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
+        let cli = super::docker::Cli::new(&bin, config).through(&own, a.runtime.mirrors.clone());
+        if !a.runtime.mirrors.is_empty()
+            && let Err(e) = cli.login(&format!("{own}/kiln"), "kiln", &a.runtime.github_token)
+        {
+            say(format!("kiln's mirror: {e:#}"));
+        }
+        let started = super::docker::Containers::start(cli, &a.job_id, map, &workdir, job, services, egress.as_ref().map(|(e, _)| e), &say).await;
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{}\r\n", st.masker.mask(&line)).into_bytes()).await;
@@ -1757,12 +1848,7 @@ impl Leg {
             env.insert("KILN_OUTPUT".into(), p.to_string_lossy().to_string());
         }
         env.insert("KILN_LEG".into(), self.a.job_id.clone());
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        let base_path = std::env::var("PATH").unwrap_or_default();
-        let mut path = st.path.apply(env.get("PATH").map_or(base_path.as_str(), String::as_str), sep);
-        if let Some(d) = &st.kiln_bin {
-            path = format!("{path}{sep}{}", d.to_string_lossy());
-        }
+        let path = leg_path(st, env.get("PATH").map(String::as_str));
         env.insert("PATH".into(), path);
         let mut container_run: Option<(super::docker::Cli, String, Option<String>, Vec<String>)> = None;
         let (prog, args) = match (what, &file) {
@@ -2477,6 +2563,170 @@ impl Leg {
     }
 
     /// A built-in kiln action (W07-R10), run here.
+    /// `kiln/build-image@v1` (W13-R11): a Dockerfile through `docker buildx` (multi-platform where
+    /// the builder can), an Agentfile through `shards build` and `shards push` (shards' own, never
+    /// Docker), into kiln's registry under the repository's `images/<name>`, signed in with the
+    /// job's token by kiln's credential helper; the image reported over the runner's channel, so
+    /// the server registers what its registry holds.
+    async fn build_image(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, wd: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let name = get("name").unwrap_or_default();
+        anyhow::ensure!(!name.contains('/') && crate::ci::registry::valid_name(&name), "`{name}` isn't an image name (lowercase letters, digits, `.`, `_`, `-`)");
+        let context = get("context").unwrap_or_else(|| format!(".kiln/images/{name}"));
+        let agentfile = Path::new(&context).join("Agentfile");
+        // An Agentfile is shards' (it reads one before a Dockerfile, as here).
+        let (file, shards) = match get("file") {
+            Some(f) => {
+                let shards = Path::new(&f).file_name().is_some_and(|n| n == "Agentfile");
+                (f, shards)
+            }
+            None if wd.join(&agentfile).exists() => (agentfile.to_string_lossy().into_owned(), true),
+            None => (Path::new(&context).join("Dockerfile").to_string_lossy().into_owned(), false),
+        };
+        let prog = if shards { "shards" } else { "docker" };
+        // Found as the leg's steps find it: on the leg's `PATH`, kiln's credential helper too.
+        let env = self.tool_env(st);
+        let found = on_path(&env, prog).ok_or_else(|| anyhow::anyhow!("{file} is built by {prog}, which isn't on this runner{}", if shards { " (an Agentfile is never built with Docker)" } else { "" }))?;
+        let own = crate::githost::host_of(if self.a.runtime.registry_url.is_empty() { &self.a.runtime.facade_url } else { &self.a.runtime.registry_url });
+        let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let tag = get("tag").unwrap_or_else(|| sha.get(..12).unwrap_or("latest").to_owned());
+        let base = format!("{own}/{}/images/{name}", self.a.repo.to_ascii_lowercase());
+        let tags = if tag == "latest" { vec![format!("{base}:latest")] } else { vec![format!("{base}:{tag}"), format!("{base}:latest")] };
+        let platforms: Vec<String> = get("platforms").map(|p| p.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+        let meta = st.layout.temp.join(format!("_kiln_build_{idx}.json"));
+        let mut args: Vec<String> = if shards { vec!["build".into()] } else { vec!["buildx".into(), "build".into(), "--push".into(), "--metadata-file".into(), meta.to_string_lossy().into_owned()] };
+        args.extend(["-f".into(), file.clone()]);
+        for t in &tags {
+            args.extend(["-t".into(), t.clone()]);
+        }
+        if !platforms.is_empty() {
+            args.extend(["--platform".into(), platforms.join(",")]);
+        }
+        args.push(context.clone());
+        let mut said = String::new();
+        let mut runs = vec![args];
+        if shards {
+            runs.extend(tags.iter().map(|t| vec!["push".to_owned(), t.clone()]));
+        }
+        for args in runs {
+            self.note(idx, &format!("{prog} {}", args.join(" "))).await;
+            let mut c = Command::new(&found);
+            c.args(&args).current_dir(wd).envs(&env);
+            let out = crate::proc::output(c, Duration::from_secs(3600)).await.map_err(|e| anyhow::anyhow!("{prog}: {e:#}"))?;
+            let text = st.masker.mask(&format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+            self.log(idx, text.replace('\n', "\r\n").into_bytes()).await;
+            anyhow::ensure!(out.status.success(), "{prog} {} didn't finish (exit {})", args.first().map_or("", String::as_str), out.status.code().unwrap_or(-1));
+            said.push_str(&text);
+        }
+        // buildx's metadata names the digest pushed; a push says it (`…: digest: sha256:… size: …`).
+        let m: serde_json::Value = std::fs::read(&meta).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let _ = std::fs::remove_file(&meta);
+        let digest = m.get("containerimage.digest").and_then(serde_json::Value::as_str).map(str::to_owned).or_else(|| pushed_digest(&said)).unwrap_or_default();
+        let reference = tags.first().cloned().unwrap_or_default();
+        self.event(&JobEventV2::ImageBuilt { idx, name: name.clone(), reference: reference.clone(), digest: digest.clone(), platforms }).await;
+        let image = if digest.is_empty() { reference } else { format!("{base}@{digest}") };
+        Ok([("image".to_owned(), image), ("digest".to_owned(), digest)].into_iter().collect())
+    }
+
+    /// `kiln/publish@v1` (W12-R04): the ecosystem's own publishing tool, with the integration's
+    /// token handed to it as it reads one (a file of this leg's, or a variable), never in its
+    /// arguments.
+    async fn publish(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, wd: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let eco = get("ecosystem").unwrap_or_default();
+        let integration = match get("integration") {
+            Some(n) => Some(self.a.integrations.iter().find(|i| i.name == n).ok_or_else(|| anyhow::anyhow!("no integration `{n}` for this leg"))?),
+            None => None,
+        };
+        let token = integration.and_then(|i| i.token.clone()).unwrap_or_default();
+        if !token.is_empty() {
+            self.mask(st, &token).await;
+        }
+        let configured = integration.and_then(|i| i.config.get("registry").and_then(serde_json::Value::as_str).map(str::to_owned));
+        let path = get("path").unwrap_or_else(|| ".".into());
+        let dir = st.layout.temp.join(format!("_kiln_publish_{idx}"));
+        std::fs::create_dir_all(&dir)?;
+        let mut env = self.tool_env(st);
+        let public = |p: &str| p.to_owned();
+        let (registry, prog, args): (String, String, Vec<String>) = match eco.as_str() {
+            "npm" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://registry.npmjs.org"));
+                let rest = reg.split_once("://").map_or(reg.as_str(), |(_, r)| r).trim_end_matches('/').to_owned();
+                let rc = dir.join("npmrc");
+                super::auth::write_private(&rc, format!("registry={}/\n//{rest}/:_authToken={token}\n", reg.trim_end_matches('/')).as_bytes())?;
+                env.insert("NPM_CONFIG_USERCONFIG".into(), rc.to_string_lossy().into_owned());
+                // A folder, as npm reads one (a bare name is a package's).
+                let folder = if path.starts_with('/') || path.starts_with('.') { path.clone() } else { format!("./{path}") };
+                (reg.clone(), "npm".into(), vec!["publish".into(), folder, "--registry".into(), format!("{}/", reg.trim_end_matches('/'))])
+            }
+            "pypi" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://upload.pypi.org/legacy/"));
+                let files = glob_files(wd, if path == "." { "dist/*" } else { &path });
+                anyhow::ensure!(!files.is_empty(), "nothing to publish at `{path}`");
+                if on_path(&env, "uv").is_some() {
+                    env.insert("UV_PUBLISH_TOKEN".into(), token.clone());
+                    let mut a = vec!["publish".into(), "--publish-url".into(), reg.clone()];
+                    a.extend(files);
+                    (reg, "uv".into(), a)
+                } else {
+                    env.insert("TWINE_USERNAME".into(), "__token__".into());
+                    env.insert("TWINE_PASSWORD".into(), token.clone());
+                    let mut a = vec!["-m".into(), "twine".into(), "upload".into(), "--non-interactive".into(), "--repository-url".into(), reg.clone()];
+                    a.extend(files);
+                    (reg, "python3".into(), a)
+                }
+            }
+            "crates" => {
+                let manifest = Path::new(&path).join("Cargo.toml").to_string_lossy().into_owned();
+                match get("registry").or(configured) {
+                    Some(reg) => {
+                        env.insert("CARGO_REGISTRIES_KILN_PUBLISH_INDEX".into(), if reg.starts_with("sparse+") { reg.clone() } else { format!("sparse+{}/", reg.trim_end_matches('/')) });
+                        env.insert("CARGO_REGISTRIES_KILN_PUBLISH_TOKEN".into(), token.clone());
+                        (reg, "cargo".into(), vec!["publish".into(), "--manifest-path".into(), manifest, "--registry".into(), "kiln-publish".into()])
+                    }
+                    None => {
+                        env.insert("CARGO_REGISTRY_TOKEN".into(), token.clone());
+                        ("https://crates.io".into(), "cargo".into(), vec!["publish".into(), "--manifest-path".into(), manifest])
+                    }
+                }
+            }
+            "nuget" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://api.nuget.org/v3/index.json"));
+                let files = glob_files(wd, if path == "." { "*.nupkg" } else { &path });
+                anyhow::ensure!(files.len() == 1, "`{path}`: one package to push, not {}", files.len());
+                env.insert("NUGET_KILN_KEY".into(), token.clone());
+                let file = files.into_iter().next().unwrap_or_default();
+                // dotnet takes its key as an argument; a shell reads it from the variable, so it
+                // stays out of the command line the runner logs.
+                (reg.clone(), "sh".into(), vec!["-c".into(), "exec dotnet nuget push \"$1\" --api-key \"$NUGET_KILN_KEY\" --source \"$2\"".into(), "publish".into(), file, reg])
+            }
+            "rubygems" => {
+                let reg = get("registry").or(configured).unwrap_or_else(|| public("https://rubygems.org"));
+                let files = glob_files(wd, if path == "." { "*.gem" } else { &path });
+                anyhow::ensure!(files.len() == 1, "`{path}`: one gem to push, not {}", files.len());
+                env.insert("GEM_HOST_API_KEY".into(), token.clone());
+                (reg.clone(), "gem".into(), vec!["push".into(), files.into_iter().next().unwrap_or_default(), "--host".into(), reg])
+            }
+            "maven" => {
+                let reg = get("registry").or(configured).ok_or_else(|| anyhow::anyhow!("maven: the repository's URL (`registry`, or the integration's)"))?;
+                let user = integration.and_then(|i| i.config.get("username").and_then(serde_json::Value::as_str)).unwrap_or("kiln").to_owned();
+                let settings = dir.join("settings.xml");
+                super::auth::write_private(&settings, format!("<settings><servers><server><id>kiln-publish</id><username>{user}</username><password>{token}</password></server></servers></settings>\n").as_bytes())?;
+                (reg.clone(), "mvn".into(), vec!["-B".into(), "-s".into(), settings.to_string_lossy().into_owned(), "-f".into(), Path::new(&path).join("pom.xml").to_string_lossy().into_owned(), "deploy".into(), format!("-DaltDeploymentRepository=kiln-publish::{reg}")])
+            }
+            other => anyhow::bail!("kiln/publish@v1 publishes npm, pypi, crates, nuget, rubygems or maven, not `{other}`"),
+        };
+        self.note(idx, &format!("{prog} {} → {registry}", args.iter().filter(|a| !a.contains(&token) || token.is_empty()).cloned().collect::<Vec<_>>().join(" "))).await;
+        let mut c = Command::new(on_path(&env, &prog).unwrap_or_else(|| PathBuf::from(&prog)));
+        c.args(&args).current_dir(wd).envs(&env);
+        let out = crate::proc::output(c, Duration::from_secs(1800)).await.map_err(|e| anyhow::anyhow!("{prog}: {e:#}"))?;
+        let said = st.masker.mask(&format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+        self.log(idx, said.replace('\n', "\r\n").into_bytes()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        anyhow::ensure!(out.status.success(), "{prog} didn't publish (exit {})", out.status.code().unwrap_or(-1));
+        Ok([("registry".to_owned(), registry)].into_iter().collect())
+    }
+
     async fn builtin(&self, st: &mut State, idx: u32, b: &super::builtins::Builtin, mut with: BTreeMap<String, String>, wd: &Path) -> anyhow::Result<Ran> {
         for i in b.inputs {
             if let (Some(d), false) = (i.default, with.contains_key(i.name)) {
@@ -2563,6 +2813,14 @@ impl Leg {
             }
             "attest" => {
                 outputs = self.attest(st, idx, &with, wd).await?;
+                true
+            }
+            "publish" => {
+                outputs = self.publish(st, idx, &with, wd).await?;
+                true
+            }
+            "build-image" => {
+                outputs = self.build_image(st, idx, &with, wd).await?;
                 true
             }
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
@@ -3332,7 +3590,12 @@ jobs:
         if !std::process::Command::new(&node).arg("--version").output().is_ok_and(|v| String::from_utf8_lossy(&v.stdout).starts_with("v24.")) {
             return Ok(());
         }
-        let wf = r###"on: push
+        // The cancel comes once the action's main step is running (it says so in a file), however
+        // long a loaded machine takes to get there.
+        let tmp = tempfile::tempdir()?;
+        let started = tmp.path().join("started");
+        let wf = format!(
+            r###"on: push
 jobs:
   t:
     runs-on: x
@@ -3340,13 +3603,14 @@ jobs:
       - run: |
           mkdir -p .github/actions/slow
           printf 'name: slow\nruns:\n  using: node24\n  main: main.js\n  post: post.js\n' > .github/actions/slow/action.yml
-          echo 'setTimeout(() => {}, 60000)' > .github/actions/slow/main.js
+          echo 'require("fs").writeFileSync("{}", ""); setTimeout(() => {{}}, 60000)' > .github/actions/slow/main.js
           echo 'setTimeout(() => console.log("post: cleaned up"), 1500)' > .github/actions/slow/post.js
       - uses: ./.github/actions/slow
-"###;
-        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", wf, Dialect::Gha);
+"###,
+            started.display()
+        );
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", &wf, Dialect::Gha);
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
-        let tmp = tempfile::tempdir()?;
         let bin = tmp.path().join("_externals/node24/bin");
         std::fs::create_dir_all(&bin)?;
         std::os::unix::fs::symlink(&node, bin.join("node"))?;
@@ -3356,7 +3620,10 @@ jobs:
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
         let result = crate::rt::block_on(async move {
             crate::rt::spawn(async move {
-                crate::rt::sleep(Duration::from_secs(3)).await;
+                let until = Instant::now() + Duration::from_secs(120);
+                while !started.exists() && Instant::now() < until {
+                    crate::rt::sleep(Duration::from_millis(100)).await;
+                }
                 cancel.cancel();
             });
             Ok::<_, anyhow::Error>(leg.run().await)

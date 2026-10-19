@@ -16,11 +16,25 @@ import "./settings.css";
 
 /** Which sections and groups are open: `{ [id]: true }`. */
 const OPEN = "kiln.settings.open";
+const REVEAL = "kiln:settings-open";
 
 /** The words searched for, lower case; none while not searching. */
 const QueryContext = React.createContext<string[]>([]);
 /** The section's own words matched the search: every group in it shows. */
 const WholeContext = React.createContext(false);
+
+/** Search opens matches temporarily; toggling them never changes the saved layout. */
+function useDisclosure(id: string, words: string[]) {
+  const [open, setOpen] = usePref<Record<string, boolean>>(OPEN, {});
+  const [searched, setSearched] = React.useState<{ words: string[]; open: boolean } | null>(null);
+  const searching = words.length > 0;
+  const shown = searching ? (searched?.words === words ? searched.open : true) : open[id] === true;
+  const toggle = () => {
+    if (searching) setSearched({ words, open: !shown });
+    else setOpen({ ...getPref<Record<string, boolean>>(OPEN, {}), [id]: !shown });
+  };
+  return [shown, toggle] as const;
+}
 
 /** A query's words, lower case. */
 export const wordsOf = (q: string) => q.toLowerCase().split(/\s+/).filter(Boolean);
@@ -38,6 +52,8 @@ export function openSettings(...ids: string[]) {
     ...open,
     ...Object.fromEntries(ids.map((id) => [id, true])),
   });
+  // A direct link takes precedence over a filter that could hide its destination.
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(REVEAL));
 }
 
 /** The section or group a link asked for, until it's in view (or you scroll on your own). */
@@ -49,7 +65,12 @@ let sought: string | null = null;
  * fills in), until you scroll yourself. For the page's root: called once, as it mounts.
  */
 export function openHash(hash: string) {
-  const id = decodeURIComponent(hash.replace(/^#/, ""));
+  let id: string;
+  try {
+    id = decodeURIComponent(hash.replace(/^#/, ""));
+  } catch {
+    return;
+  }
   if (!id) return;
   const section = id.split(".")[0] ?? id;
   sought = id;
@@ -73,14 +94,17 @@ function seek(el: HTMLElement | null) {
 }
 
 export function SettingsSearch({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const input = React.useRef<HTMLInputElement>(null);
   return (
     <div className="field st-search">
       <Search size={14} aria-hidden="true" />
       <input
+        ref={input}
         type="search"
         value={value}
         placeholder="Search settings"
         aria-label="Search settings"
+        aria-controls="settings-sections"
         enterKeyHint="search"
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={(e) => {
@@ -91,7 +115,7 @@ export function SettingsSearch({ value, onChange }: { value: string; onChange: (
         }}
       />
       {value && (
-        <button type="button" className="st-search-clear" aria-label="Clear the search" onClick={() => onChange("")}>
+        <button type="button" className="st-search-clear" aria-label="Clear the search" onClick={() => { onChange(""); input.current?.focus(); }}>
           <X size={14} />
         </button>
       )}
@@ -100,14 +124,20 @@ export function SettingsSearch({ value, onChange }: { value: string; onChange: (
 }
 
 /** The sections, narrowed to what `query` finds. */
-export function SettingsSections({ query, children }: { query: string; children: React.ReactNode }) {
+export function SettingsSections({ query, onQueryChange, children }: { query: string; onQueryChange?: (value: string) => void; children: React.ReactNode }) {
   const words = React.useMemo(() => wordsOf(query), [query]);
+  const connect = React.useCallback((el: HTMLDivElement | null) => {
+    if (!el || !onQueryChange) return;
+    const reveal = () => onQueryChange("");
+    window.addEventListener(REVEAL, reveal);
+    return () => window.removeEventListener(REVEAL, reveal);
+  }, [onQueryChange]);
   return (
     <QueryContext.Provider value={words}>
-      <div className="st-sections" data-searching={words.length > 0 || undefined}>
+      <div ref={connect} id="settings-sections" className="st-sections" data-searching={words.length > 0 || undefined}>
         {children}
         {/* Shown (settings.css) only while searching and no group shows. */}
-        <p className="st-none">Nothing in Settings matches &ldquo;{query.trim()}&rdquo;.</p>
+        <p className="st-none" role="status">Nothing in Settings matches &ldquo;{query.trim()}&rdquo;.</p>
       </div>
     </QueryContext.Provider>
   );
@@ -136,9 +166,8 @@ export function SettingsSection({
   children: React.ReactNode;
 }) {
   const words = React.useContext(QueryContext);
-  const [open, setOpen] = usePref<Record<string, boolean>>(OPEN, {});
   const searching = words.length > 0;
-  const shown = searching || open[id] === true;
+  const [shown, toggle] = useDisclosure(id, words);
   // Its title or words, not what it says it holds: a word of one group's finds that group alone.
   const whole = searching && matches(words, title, more);
   return (
@@ -149,9 +178,7 @@ export function SettingsSection({
           className="st-section-head"
           aria-expanded={shown}
           aria-controls={`${id}-b`}
-          onClick={() => {
-            if (!searching) setOpen({ ...open, [id]: !open[id] });
-          }}
+          onClick={toggle}
         >
           <span className="st-index" aria-hidden="true">
             {String(index).padStart(2, "0")}
@@ -170,8 +197,10 @@ export function SettingsSection({
           <ChevronDown className="st-chev" aria-hidden="true" />
         </button>
       </h2>
-      {shown && (
-        <div id={`${id}-b`} className="st-section-body">
+      {(shown || searching) && (
+        // Keep matching groups mounted while a search result is collapsed: CSS uses their
+        // presence to determine whether this section belongs in the search results.
+        <div id={`${id}-b`} className="st-section-body" hidden={!shown}>
           <WholeContext.Provider value={whole}>{children}</WholeContext.Provider>
         </div>
       )}
@@ -206,10 +235,10 @@ export function SettingsGroup({
 }) {
   const words = React.useContext(QueryContext);
   const whole = React.useContext(WholeContext);
-  const [open, setOpen] = usePref<Record<string, boolean>>(OPEN, {});
   const searching = words.length > 0;
+  const [expanded, toggle] = useDisclosure(id, words);
   if (searching && !whole && !matches(words, title, typeof about === "string" ? about : undefined, more)) return null;
-  const shown = !collapsible || searching || open[id] === true;
+  const shown = !collapsible || expanded;
   const head = (
     <>
       <h3 className="st-group-title">{title}</h3>
@@ -224,9 +253,8 @@ export function SettingsGroup({
             type="button"
             className="st-group-toggle"
             aria-expanded={shown}
-            onClick={() => {
-              if (!searching) setOpen({ ...open, [id]: !open[id] });
-            }}
+            aria-controls={`${id}-b`}
+            onClick={toggle}
           >
             <span className="min-w-0">{head}</span>
             <ChevronDown className="st-chev" aria-hidden="true" />
@@ -236,7 +264,7 @@ export function SettingsGroup({
         )}
         {actions && <div className="st-group-actions">{actions}</div>}
       </div>
-      {shown && children && <div className="st-group-body">{children}</div>}
+      {shown && children && <div id={`${id}-b`} className="st-group-body">{children}</div>}
     </div>
   );
 }

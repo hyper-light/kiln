@@ -154,7 +154,7 @@ pub struct Resolved {
     pub platforms: Vec<String>,
 }
 
-fn client() -> anyhow::Result<&'static Client> {
+pub(crate) fn client() -> anyhow::Result<&'static Client> {
     static C: OnceLock<Client> = OnceLock::new();
     if let Some(c) = C.get() {
         return Ok(c);
@@ -257,7 +257,7 @@ fn urlencode(s: &str) -> String {
 }
 
 /// One request to the registry's API, answering its challenge once.
-async fn call(registry: &Registry, method: Method, path: &str, scope: &str) -> anyhow::Result<crate::http::client::Response> {
+pub(crate) async fn call(registry: &Registry, method: Method, path: &str, scope: &str) -> anyhow::Result<crate::http::client::Response> {
     let url = format!("{}{path}", registry.base);
     let first = client()?.request(method, &url).header("accept", ACCEPT).send().await.with_context(|| format!("{} {url}", method_name(method)))?;
     if first.status() != 401 {

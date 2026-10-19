@@ -57,6 +57,29 @@ pub const BUILTINS: &[Builtin] = &[
         outputs: &[("kind", "The integration's kind."), ("env", "The variables set, comma-separated.")],
     },
     Builtin {
+        name: "build-image",
+        description: "Build a runner image (W13-R11) from `.kiln/images/<name>/Dockerfile` (docker buildx, multi-platform where the builder can) or an Agentfile (shards build), push it to kiln's registry with the job's token, and register it for pools and routing rules.",
+        inputs: &[
+            Input { name: "name", description: "The image's name: `.kiln/images/<name>/`.", default: None, required: true },
+            input("context", "The build's directory (`.kiln/images/<name>` by default).", None),
+            input("file", "The Dockerfile (`<context>/Dockerfile` by default).", None),
+            input("platforms", "Platforms, comma-separated (`linux/amd64,linux/arm64`); the runner's own by default.", None),
+            input("tag", "The tag (the commit's first twelve characters by default; `latest` too).", None),
+        ],
+        outputs: &[("image", "The image: `<registry>/<repository>@<digest>`."), ("digest", "Its digest.")],
+    },
+    Builtin {
+        name: "publish",
+        description: "Publish a package to its registry (W12-R04) with an integration's credentials: npm (`npm publish`), PyPI (`uv publish`, else twine), crates.io (`cargo publish`), NuGet (`dotnet nuget push`), RubyGems (`gem push`), Maven (`mvn deploy`). A private registry (Artifactory, Nexus, GitHub Packages, GitLab Packages, CodeArtifact, Azure Artifacts, Artifact Registry, Cloudsmith) is the integration's `registry`.",
+        inputs: &[
+            Input { name: "ecosystem", description: "npm, pypi, crates, nuget, rubygems or maven.", default: None, required: true },
+            input("integration", "The registry's credentials: an integration of the leg's, by name (its token, and its `registry` URL).", None),
+            input("path", "What to publish: the package's directory (npm, cargo, maven), its files (a pattern: dist/* for PyPI, *.nupkg, *.gem).", Some(".")),
+            input("registry", "The registry's URL, when not the integration's or the ecosystem's public one.", None),
+        ],
+        outputs: &[("registry", "Where it went.")],
+    },
+    Builtin {
         name: "attest",
         description: "Attest what the job built (W18): SLSA v1.0 provenance the server makes from its own records of the run, which the job's steps can't write, and an SBOM of the working directory's lockfiles when asked, signed by the server as Sigstore bundles (beside each file as `<file>.sigstore.json`). kiln's way to attest: `actions/attest-build-provenance` works only with a Fulcio that trusts kiln's OIDC issuer.",
         inputs: &[
