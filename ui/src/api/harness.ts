@@ -1190,7 +1190,7 @@ export class SessionStore {
         })
         .catch(() => undefined)
         .finally(() => {
-          this.unpacking -= 1;
+          if (this.ws === ws) this.unpacking -= 1;
         });
     };
     ws.onclose = () => {

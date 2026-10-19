@@ -59,3 +59,40 @@ await test("live history stays bounded and retained events still update in place
   } finally { off(); }
 });
 
+await test("a previous connection's unpack cannot let text overtake a new snapshot", async () => {
+  const original = globalThis.DecompressionStream;
+  const release: (() => void)[] = [];
+  // Control completion of unpacking without depending on compression timing.
+  globalThis.DecompressionStream = class {
+    constructor() {
+      const wait = new Promise<void>((resolve) => release.push(resolve));
+      return new TransformStream({ async transform(chunk, controller) { await wait; controller.enqueue(chunk); } });
+    }
+  } as typeof DecompressionStream;
+  const store = new SessionStore("reconnect");
+  const off = store.subscribe(() => {});
+  const packed = snapshot("reconnect", [event(1)]).map((f) => JSON.stringify(f)).join("\n");
+  try {
+    const old = Socket.all.at(-1)!;
+    old.binary(packed);
+    await tick();
+    old.readyState = Socket.CLOSED;
+    store.wake();
+    const ws = Socket.all.at(-1)!;
+    assert.notEqual(ws, old);
+    ws.binary(packed);
+    release[0]!();
+    await tick();
+    ws.frame({ t: "stream", id: "e1", text: " after snapshot" });
+    assert.equal(release.length, 2);
+    release[1]!();
+    await tick();
+    await tick();
+    const last = store.get().events.at(-1);
+    assert.equal(last?.kind === "assistant" && last.text, "text after snapshot");
+  } finally {
+    for (const resolve of release) resolve();
+    off();
+    globalThis.DecompressionStream = original;
+  }
+});
