@@ -49,6 +49,10 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     if from == to {
         return Err(format!("it runs on {to} already"));
     }
+    // Its workspace is a volume in its machine's memory: it doesn't follow yet (docs/agentic.md W7).
+    if info.workspace.as_ref().is_some_and(|w| w.made.is_some()) {
+        return Err(format!("it works in a workspace of its own on {from}, which can't move with it yet: open a change request from its work (or write it to disk), then start an agent on {to}"));
+    }
     let connected = hub.agents.lock().get(&to).is_some_and(|a| a.connected && !a.ephemeral);
     if !connected {
         return Err(format!("{to} is not connected"));

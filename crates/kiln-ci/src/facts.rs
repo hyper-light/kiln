@@ -38,6 +38,24 @@ pub struct RunnerFacts {
     pub probed_at: i64,
     /// The kiln the runner runs (kiln's `fleet`).
     pub kiln: Option<KilnFacts>,
+    /// Whether its agents can have workspaces of their own (Slates volumes), and why not.
+    pub workspaces: Option<Workspaces>,
+}
+
+/// Agents' workspaces of their own on a machine: Slates volumes over their folders.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workspaces {
+    /// Agents here can have them.
+    pub available: bool,
+    /// The Slates binary.
+    pub slates: Option<String>,
+    /// How a volume is mounted here: `fuse` (Linux) or `nfs` (macOS).
+    pub mount: Option<String>,
+    /// Its Slates instance answers now.
+    pub running: bool,
+    /// Why agents here can't have them.
+    pub why_not: Option<String>,
 }
 
 /// The kiln a runner runs, and where kiln's source is on its machine.

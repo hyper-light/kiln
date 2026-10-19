@@ -217,6 +217,13 @@
   color: #d1aaad;
   font-style: normal;
 }
+.ms-change a:hover {
+  color: #fff;
+  text-decoration: underline;
+}
+.ms-change[data-state="landed"] {
+  color: #a8c9bc;
+}
 .ms-actions {
   grid-area: actions;
   display: flex;

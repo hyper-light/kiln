@@ -71,6 +71,27 @@ pub struct Package {
     /// Its turn was interrupted to move: it picks the turn up there.
     #[serde(default)]
     pub picks_up: bool,
+    /// Where its folder stood in its repo's sync log once its last changes were in: it goes on
+    /// there once the folder there has taken the log that far. None: its folder isn't synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced: Option<crate::sync::runner::Mark>,
+    /// Its repository besides its files: branches, tags, stash, what's staged, where HEAD is, and
+    /// the commits the machine it goes to lacks (`super::gitstate`). None: not a synced repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<super::gitstate::GitState>,
+}
+
+/// What a moved session's repository waits with until its files are in: written on arrival beside
+/// the session's files (`moved-git.json`), put in place before it goes on, then removed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovedGit {
+    pub from: String,
+    pub state: super::gitstate::GitState,
+}
+
+/// Where a moved session's [`MovedGit`] waits.
+pub fn moved_git(session_files: &std::path::Path) -> std::path::PathBuf {
+    session_files.join("moved-git.json")
 }
 
 /// Variables of one machine's environment that mean nothing on another (its paths, its terminal,
@@ -132,7 +153,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         Carry::ClaudeLines { session, .. } => spec.resume = Some(session.clone()),
         Carry::Seed { .. } | Carry::Words { .. } | Carry::Nothing => spec.resume = None,
     }
-    Package { version: version_of(&carry), id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms(), picks_up: false }
+    Package { version: version_of(&carry), id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms(), picks_up: false, synced: None, git: None }
 }
 
 /// Every message of transcript `had` is among `lines`: `had` is an earlier copy of the same

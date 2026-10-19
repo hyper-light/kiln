@@ -506,25 +506,27 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
                         // Docker Hub scopes tokens to a repository: ask for one under the user's
                         // namespace, which any account may pull from.
                         let repo = r.credentials.as_ref().filter(|_| r.name == oci::DOCKER_HUB).map(|(u, _)| format!("{u}/probe"));
-                        oci::verify(&r, repo.as_deref()).await.map_err(|e| format!("{e:#}"))
+                        Box::pin(oci::verify(&r, repo.as_deref())).await.map_err(|e| format!("{e:#}"))
                     }
                     Err(e) => Err(format!("{e:#}")),
                 },
                 Err(e) => Err(format!("{e:#}")),
             },
-            "aws" | "gcp" | "azure" => verify_federated(hub, &i, as_).await,
-            k if crate::ci::notify::CHANNELS.contains(&k) => crate::ci::notify::verify(hub, &i).await,
+            // Each kind's check on the heap: inline, their futures overflowed a shard's stack in a
+            // debug build (a webhook's verify took the server down).
+            "aws" | "gcp" | "azure" => Box::pin(verify_federated(hub, &i, as_)).await,
+            k if crate::ci::notify::CHANNELS.contains(&k) => Box::pin(crate::ci::notify::verify(hub, &i)).await,
             "vercel" => match secret(hub, &i).await {
-                Ok(Some(token)) => vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
+                Ok(Some(token)) => Box::pin(vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str))).await.map_err(|e| format!("{e:#}")),
                 Ok(None) => Err("no token stored".into()),
                 Err(e) => Err(format!("{e:#}")),
             },
             "cloudflare" => match secret(hub, &i).await {
-                Ok(Some(token)) => cloudflare::verify(&token, i.config.get("account_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
+                Ok(Some(token)) => Box::pin(cloudflare::verify(&token, i.config.get("account_id").and_then(Value::as_str))).await.map_err(|e| format!("{e:#}")),
                 Ok(None) => Err("no token stored".into()),
                 Err(e) => Err(format!("{e:#}")),
             },
-            "argocd" => crate::deploy::argocd::verify(hub, &i.name).await,
+            "argocd" => Box::pin(crate::deploy::argocd::verify(hub, &i.name)).await,
             other => Err(format!("no check for {other} yet")),
         }
     };
@@ -636,7 +638,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
             // Optional: whose identity a federated check runs with.
             let bytes = srv::body_bytes(body, 64 << 10).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             let as_: VerifyAs = if bytes.is_empty() { VerifyAs::default() } else { serde_json::from_slice(&bytes).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e}")))? };
-            let r = verify(hub, name, &as_).await.map_err(|e| fail(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+            let r = Box::pin(verify(hub, name, &as_)).await.map_err(|e| fail(StatusCode::NOT_FOUND, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &match r {
                 Ok(message) => json!({ "ok": true, "message": message }),
                 Err(error) => json!({ "ok": false, "error": error }),

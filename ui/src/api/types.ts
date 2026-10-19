@@ -419,7 +419,9 @@ export type ServerEvent =
   /** What machines hold, or a task moving a repository between them, changed: refetch GET /api/places. */
   | { type: "places" }
   /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
-  | { type: "push" };
+  | { type: "push" }
+  /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
+  | { type: "agent_change"; agent: string };
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 

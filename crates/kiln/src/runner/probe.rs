@@ -270,6 +270,7 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
         }
     }
     f.kiln = Some(crate::updates::kiln_facts());
+    f.workspaces = Some(crate::workspace::slates::facts().await);
     f.probed_at = crate::util::now_unix();
     f
 }

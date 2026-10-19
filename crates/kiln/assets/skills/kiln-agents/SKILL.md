@@ -8,8 +8,9 @@ description: Hand parts of your work to other coding agents through kiln (any ha
 kiln runs coding agents (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, Antigravity) on
 every machine it has. You can start some yourself: each is your **child**, works on its own,
 and reports back. The tools are `agents_start`, `agents_wait`, `agents_result`, `agents_send`,
-`agents_list`, `agents_get`, `agents_children`, `agents_interrupt` and `agents_stop` (in code
-mode `kiln.agents.*`; in a shell `kiln spawn --on …`, `kiln agents wait`, `kiln agents result`).
+`agents_list`, `agents_get`, `agents_children`, `agents_interrupt`, `agents_stop`,
+`agents_change`, `agents_changes` and `agents_workspace` (in code mode `kiln.agents.*`; in a shell
+`kiln spawn --on …`, `kiln agents wait`, `kiln agents result`).
 
 ## When to fan out
 
@@ -19,9 +20,11 @@ cores). Don't for a few minutes of work, for steps that depend on each other's r
 go, or for anything you'd have to explain at more length than doing it. One or two children,
 then more if it works; a child that starts children of its own is rarely what you want.
 
-Children in one folder share it: **only one should write at a time**. Until kiln gives agents
-workspaces of their own, give writers separate folders (or repositories), or let one write and
-the others read, review or test.
+Children in one folder share it: **only one should write at a time** there. To let several
+write, give each a workspace of its own: `workspace: "volume"` in `agents_start`, a Slates volume
+over the folder where what it changes stays its own (where its machine has Slates; it says if
+not). Otherwise give writers separate folders, or let one write and the others read, review or
+test.
 
 ## Briefing a child
 
@@ -80,10 +83,25 @@ your children's. Ask for less than that: `plan` or `read-only` to look and repor
 
 ## Merging their work
 
-Today children work in real folders. When they're done: read what each changed
-(`agents_result` lists the files), run the tests yourself, and fix conflicts between them before
-you go on. Never assume a child's claim; check it. (Workspaces of their own, merged by kiln, are
-coming: see `workspace` in `agents_start`.)
+When they're done: read what each changed (`agents_result` lists the files), run the tests
+yourself, and fix conflicts between them before you go on. Never assume a child's claim; check it.
+A child in a volume of its own changed nothing in the folder: its work comes back as its change
+request (`agents_change`), or a person writes it to disk. (kiln merging children's volumes into
+one, with conflicts down to the byte, waits on Slates.)
+
+## Putting work up for review
+
+`agents_change` opens a change request from an agent's work: yours (`agent` is your own id) or
+a child's. It takes the files the agent changed, commits them on the folder's last commit without
+touching the folder's branch, index or working tree, and pushes them as the branch
+`agents/<what it's about>-<id>`: into kiln's review for a repository kiln hosts, as a pull request
+for one on GitHub, GitLab or Bitbucket. Give it a `title` and a `body` that say what changed and
+why. Calling it again pushes a new version.
+
+Then comments on it, requests for changes, failing checks (with the failure's excerpt) and the
+land queue taking it out come to the agent as messages. Answer them by changing the code and
+calling `agents_change` again; landing it is for people and the land queue. `agents_result` and
+`agents_changes` say where each change stands.
 
 ## Never answering for the person
 

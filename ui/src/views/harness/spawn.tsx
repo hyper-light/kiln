@@ -6,9 +6,9 @@
 import * as React from "react";
 import "./harness.css";
 import { Dialog as D, DropdownMenu, Popover } from "radix-ui";
-import { Check, ChevronDown, Folder, Gauge, Rocket, Server, ShieldCheck, ShieldOff, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
+import { Check, ChevronDown, Folder, Gauge, Layers, Rocket, Server, ShieldCheck, ShieldOff, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
-import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec } from "@/api/harness";
+import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec, type WorkspacesAvailable } from "@/api/harness";
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -245,6 +245,8 @@ interface Machines {
   machines: Agent[];
   shells: TerminalSessionInfo[];
   reach: ReachRunner[];
+  /** Where an agent can have a workspace of its own. */
+  workspaces: WorkspacesAvailable;
 }
 
 /** Asked all at once. A part that can't be had is empty: no harnesses (the dialog says what to do), no machine names, no shells. */
@@ -260,7 +262,8 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
       (r) => r.runners.filter((x) => x.connected && x.reach),
       (): ReachRunner[] => [],
     ),
-  ]).then(([byTarget, machines, shells, reach]) => ({ byTarget, machines, shells, reach }));
+    harnessApi.workspaces().catch((): WorkspacesAvailable => ({})),
+  ]).then(([byTarget, machines, shells, reach, workspaces]) => ({ byTarget, machines, shells, reach, workspaces }));
 
 /** What stays from one opening to the next: the message, how many, its options, a start under way. */
 interface Kept {
@@ -477,7 +480,9 @@ function Setup({
   const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, reach, setReach, busy, setBusy } = kept;
   // Each machine's harnesses, the machines and their shells: shown at once when known from before,
   // read again as it opens.
-  const { byTarget, machines, shells, reach: reachRunners } = useSuspenseResource("harness/spawn", askMachines).data;
+  const { byTarget, machines, shells, reach: reachRunners, workspaces } = useSuspenseResource("harness/spawn", askMachines).data;
+  /** `volume`: a Slates volume of its own over the folder, where the machine can make one. */
+  const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "folder");
   const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
   const [effortByKind, setEffortByKind] = useLocalStorage<Record<string, string>>("kiln.agents.efforts", {});
@@ -543,6 +548,8 @@ function Setup({
     setUnchecked("");
     setModeByKind({ ...modeByKind, [kind]: id });
   };
+  const canVolume = workspaces[target]?.available === true;
+  const ownVolume = workspace === "volume" && canVolume && !shell;
   const efforts = effortsFor(kindInfo, model);
   const effort = efforts.some((e) => e.id === effortByKind[kind]) ? (effortByKind[kind] ?? "") : "";
   const effortInfo = efforts.find((e) => e.id === effort);
@@ -583,6 +590,7 @@ function Setup({
       prompt: prompt.trim() || undefined,
       shell: shell || undefined,
       reach: reach || undefined,
+      workspace: ownVolume ? { kind: "volume" } : undefined,
     };
     try {
       const started = await harnessApi.start(target, spec, count);
@@ -646,6 +654,26 @@ function Setup({
             options={where.map((t) => ({ value: t, label: machineName(t) }))}
           />
           {shell && <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : "this shell"} />}
+          {!shell && (
+            <Chip
+              title="Workspace"
+              icon={<Layers size={13} />}
+              label={ownVolume ? "Its own volume" : "This folder"}
+              value={ownVolume ? "volume" : "folder"}
+              onPick={(w) => setWorkspace(w)}
+              options={[
+                { value: "folder", label: "This folder", hint: "It works in the folder itself" },
+                {
+                  value: "volume",
+                  label: "Its own volume",
+                  hint: canVolume
+                    ? "A Slates volume over the folder: what it changes stays its own until it's up for review or you write it to disk"
+                    : (workspaces[target]?.why_not ?? "Not on this machine"),
+                  disabled: !canVolume,
+                },
+              ]}
+            />
+          )}
           <Chip title="How many" label={`×${count}`} value={count} onPick={(n) => setCount(n)} options={COUNTS.map((n) => ({ value: n, label: n === 1 ? "1 agent" : `${n} agents` }))} />
           {modes.length > 0 && (
             <Chip
