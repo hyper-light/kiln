@@ -199,6 +199,8 @@ pub struct Hub {
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
     pub tasks: crate::sync::tasks::Tasks,
+    /// Notifications to people's devices (`crate::push`).
+    pub push: crate::push::Service,
 }
 
 impl Hub {
@@ -264,6 +266,7 @@ impl Hub {
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             places,
             tasks,
+            push: crate::push::Service::default(),
         })
     }
 

@@ -410,6 +410,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/places/**", "agents.run", At::Server),
     any("/api/voice", "agents.run", At::Server),
     any("/api/voice/**", "agents.run", At::Server),
+    // Notifications of agents (docs/notifications.md): each person's own devices and mutes.
+    any("/api/push", "agents.run", At::Server),
+    any("/api/push/**", "agents.run", At::Server),
     // Identity (W10).
     any("/api/tokens", "tokens.manage", At::Own),
     any("/api/tokens/**", "tokens.manage", At::Own),
