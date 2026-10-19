@@ -135,9 +135,18 @@ async fn heard(hub: &Arc<Hub>, kind: &str, v: &Value) {
     }
 }
 
-/// Sends agent `r.agent` `text`, queued after its turn, when it still runs.
+/// Sends agent `r.agent` `text`, queued after its turn, when it still runs; for a step of a plan
+/// run still going, once the run ends (`crate::plans::stack::held`).
 async fn tell(hub: &Arc<Hub>, r: &Record, text: String) {
-    let Some(info) = hub.harness.info(&r.agent) else { return };
+    if crate::plans::stack::held(hub, r, &text).await {
+        return;
+    }
+    deliver(hub, &r.agent, text).await;
+}
+
+/// Sends agent `agent` `text`, queued after its turn, when it still runs.
+pub async fn deliver(hub: &Hub, agent: &str, text: String) {
+    let Some(info) = hub.harness.info(agent) else { return };
     if info.status == Status::Exited {
         return;
     }

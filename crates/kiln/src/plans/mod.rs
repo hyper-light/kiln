@@ -7,6 +7,7 @@
 pub mod agents;
 pub mod criteria;
 pub mod ops;
+pub mod stack;
 
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};

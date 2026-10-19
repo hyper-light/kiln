@@ -189,7 +189,13 @@ function runView() {
     return { n: i + 1, title: s.title, goal: s.goal, stand, agent: m ? brief(m.info) : null, agent_id: s.agent, started_at: s.started_at, ended_at: s.ended_at, reason: s.reason, tries: s.tries };
   });
   const met = steps.filter((s) => s.stand === "met").length;
-  return { id: RUN, plan: RUN_PLAN, title: RUN_TITLE, version: 4, state: run.state, reason: run.reason, note: null, at: run.at, ended_at: null, by: "admin", config: {}, steps, met, total: steps.length };
+  // Each met step's diff, on the one before's (docs/agentic.md P4).
+  const stacked = run.steps
+    .map((s, i) => ({ s, n: i + 1 }))
+    .filter(({ s }) => s.status === "met")
+    .map(({ n }) => ({ n, state: "made", change: `D${41 + n}`, url: `/diffs/D${41 + n}`, sha: `4b5c6d7e8f${n}a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d`, branch: null, files: n === 1 ? [".github/branch-protection.yml"] : ["bench/results/0.2.json"], pushed: true, error: null }));
+  const stack = stacked.length ? { off: null, provider: "kiln", repo: "hyper-light/kiln", trunk: "main", base: "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d", steps: stacked } : null;
+  return { id: RUN, plan: RUN_PLAN, title: RUN_TITLE, version: 4, state: run.state, reason: run.reason, note: null, at: run.at, ended_at: null, by: "admin", config: {}, steps, met, total: steps.length, stack };
 }
 
 /** The run's routes (before the plans' own, whose `:id` would take "runs"). */
@@ -400,6 +406,29 @@ const changes = new Map<string, Record<string, unknown>>([
       fix_checks: true,
       opened_at: Math.floor(Date.now() / 1000) - 3600,
       updated_at: Math.floor(Date.now() / 1000) - 600,
+    },
+  ],
+  [
+    "run-freeze",
+    {
+      agent: "run-freeze",
+      repo: "hyper-light/kiln",
+      provider: "kiln",
+      change: "D42",
+      url: "/diffs/D42",
+      branch: "",
+      trunk: "main",
+      sha: "4b5c6d7e8f1a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d",
+      version: 1,
+      files: [".github/branch-protection.yml"],
+      title: "Freeze main",
+      state: "open",
+      review: "approved",
+      checks: "passed",
+      fix_checks: true,
+      opened_at: Math.floor(Date.now() / 1000) - 360,
+      updated_at: Math.floor(Date.now() / 1000) - 120,
+      stack: { run: "pr_agents1", step: 1 },
     },
   ],
 ]);
