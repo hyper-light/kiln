@@ -54,14 +54,30 @@ pub fn get() -> Option<Arc<Deploy>> {
 
 /// Runs the service until the server shuts down: the worker that follows releases.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
+    let hosted = host::Hosted::new(&crate::ci::hosting::root(&hub));
+    // Release repositories from before they were native ones move into kiln's hosted root.
+    for repo in hosted.adopt(&hub.cfg.server.data_dir.join("deploy").join("repos")) {
+        tracing::info!(%repo, "deploy: a release repository moved into kiln's hosted root");
+    }
     let d = Arc::new(Deploy {
-        hosted: host::Hosted::new(&hub.cfg.server.data_dir),
+        hosted,
         owner: format!("server-{}", crate::util::new_id()),
         wake: crate::rt::Notify::new(),
         changes: crate::rt::Broadcast::new(256),
         hub: Arc::clone(&hub),
     });
     *DEPLOY.write() = Some(Arc::clone(&d));
+    // Each environment's release repository is a native repository, with its row.
+    match store::environments(&hub.store).await {
+        Ok(envs) => {
+            for e in envs.iter().filter(|e| e.release_repo.host == model::KILN_HOST) {
+                if let Err(why) = flow::ensure_release_repo(&d, &e.release_repo).await {
+                    tracing::warn!(environment = %e.name, repo = %e.release_repo.repo, error = %why, "deploy: an environment's release repository isn't one of kiln's own");
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "deploy: environments can't be read"),
+    }
     let result = flow::work(&d).await;
     *DEPLOY.write() = None;
     result

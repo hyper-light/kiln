@@ -162,11 +162,51 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
-    let (hosted, rr) = (d.hosted.clone(), e.release_repo.clone());
-    crate::rt::blocking(move || hosted.ensure(&rr.repo, &rr.branch)).await.and_then(|r| r).map_err(|e| bad(format!("{e:#}")))?;
+    ensure_release_repo(d, &e.release_repo).await.map_err(bad)?;
     store::put_environment(&d.hub.store, &e).await.map_err(internal)?;
     audit(d, actor, "deploy.environment.put", e.name.clone()).await;
     Ok(e)
+}
+
+/// An environment's release repository as one of kiln's native repositories (docs/ci.md W14): its
+/// bare repository, and its row, so kiln's git server serves it to readers with a token, its review
+/// rules hold, and people change it in diffs as any repository's.
+pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Result<(), String> {
+    if crate::ci::hosting::path_of(&d.hub, &rr.repo).is_none() {
+        return Err(format!("{}: a release repository on kiln's git server is `owner/name`, of letters, digits, '-', '_' and '.'", rr.repo));
+    }
+    let repos = d.hub.store.repos().await.map_err(|e| format!("{e:#}"))?;
+    let row = repos.iter().find(|r| r.name == rr.repo);
+    if let Some(r) = row
+        && r.mode != "native"
+    {
+        return Err(format!("{} is a repository kiln follows upstream: a release repository on kiln's git server is one of kiln's own, so name another", rr.repo));
+    }
+    let path = crate::ci::hosting::create(&d.hub, &rr.repo, &rr.branch, None).await.map_err(|e| format!("{e:#}"))?;
+    if row.is_some() {
+        return Ok(());
+    }
+    d.hub
+        .store
+        .upsert_repo(crate::store::Repo {
+            id: crate::util::new_id(),
+            name: rr.repo.clone(),
+            clone_url: crate::ci::hosting::clone_url(&path),
+            branches: Vec::new(),
+            poll_seconds: d.hub.cfg.gitops.poll_seconds,
+            enabled: true,
+            created_at: crate::util::now_unix(),
+            last_polled_at: None,
+            last_error: None,
+            mode: "native".into(),
+            default_branch: Some(rr.branch.clone()),
+            mirror: None,
+        })
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    d.hub.store.audit("kiln".into(), "repo.add".into(), format!("{} (a release repository, docs/deploy-api.md §6)", rr.repo)).await;
+    d.hub.gitops_kick.notify();
+    Ok(())
 }
 
 pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(), Fail> {
