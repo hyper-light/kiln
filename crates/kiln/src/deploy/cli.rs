@@ -227,7 +227,7 @@ enum AppCmd {
         #[arg(long, visible_alias = "to")]
         env: String,
     },
-    /// Change some of an app: owners, properties, contacts, template.
+    /// Change some of an app: owners, properties, contacts, template, source repository.
     Set {
         app: String,
         /// Its owner teams, replacing them: the owner first, then a co-owner and an ops owner.
@@ -247,6 +247,9 @@ enum AppCmd {
         links: Vec<String>,
         #[arg(long)]
         template: Option<String>,
+        /// Its source repository, one kiln has; `--source ''` for none.
+        #[arg(long)]
+        source: Option<String>,
     },
     /// The app as Backstage's catalog reads it (catalog-info.yaml).
     Catalog { app: String },
@@ -307,6 +310,10 @@ struct NewApp {
     set: Vec<String>,
     #[arg(long)]
     namespace: Option<String>,
+    /// Its source repository, one kiln has (`acme/web`); `--source ''` for none. Unset: the one
+    /// its template makes from its starter, if it makes one.
+    #[arg(long)]
+    source: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -686,6 +693,9 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             let v = api.call(Method::Get, &format!("/apps/{}", enc(&app)), None).await?;
             api.print(&v, |v| {
                 println!("{app} ({})", v.pointer("/app/project").and_then(Value::as_str).unwrap_or(""));
+                if let Some(r) = v.pointer("/app/source").and_then(Value::as_str) {
+                    println!("  source       {r}");
+                }
                 for e in v.get("environments").and_then(Value::as_array).into_iter().flatten() {
                     let env = e.pointer("/registration/environment").and_then(Value::as_str).unwrap_or("");
                     let running = e.get("running").filter(|r| !r.is_null()).map_or_else(|| "nothing released".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), s(r, "version")));
@@ -694,7 +704,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             });
         }
         AppCmd::Create(new) => {
-            let NewApp { app, template, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace } = *new;
+            let NewApp { app, template, project, owners, helm_repo, chart, chart_version, git_repo, platform, spec, files_repo, path, set, namespace, source } = *new;
             let mut sets = BTreeMap::new();
             for kv in &set {
                 let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set name=value"))?;
@@ -712,9 +722,12 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 (None, None, None) if template.is_some() => Value::Null,
                 _ => bail!("how is it deployed? --helm-repo and --chart, --git-repo (and --path), --platform and --spec, or a --template that says"),
             };
-            let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace, "template": template });
+            let body = json!({ "name": app, "project": project, "owners": owners, "package": package, "namespace": namespace, "template": template, "source": source });
             let v = api.call(Method::Post, "/apps", Some(body)).await?;
-            api.print(&v, |v| println!("app {} ready: register it in an environment (kiln app register {} --env <env>)", s(v, "name"), s(v, "name")));
+            api.print(&v, |v| {
+                let from = v.get("source").and_then(Value::as_str).map(|r| format!(", its source in {r}")).unwrap_or_default();
+                println!("app {}{from} ready: register it in an environment (kiln app register {} --env <env>)", s(v, "name"), s(v, "name"));
+            });
         }
         AppCmd::Register { app, env } => {
             let v = api.call(Method::Post, &format!("/apps/{}/environments/{}", enc(&app), enc(&env)), None).await?;
@@ -740,7 +753,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
                 println!("{app} deleted");
             }
         }
-        AppCmd::Set { app, owners, properties, oncall, channels, links, template } => {
+        AppCmd::Set { app, owners, properties, oncall, channels, links, template, source } => {
             let mut patch = serde_json::Map::new();
             if !owners.is_empty() {
                 patch.insert("owners".into(), json!(owners));
@@ -775,6 +788,9 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
             }
             if let Some(t) = template {
                 patch.insert("template".into(), json!(t));
+            }
+            if let Some(r) = source {
+                patch.insert("source".into(), json!(r));
             }
             let v = api.call(Method::Patch, &format!("/apps/{}", enc(&app)), Some(Value::Object(patch))).await?;
             api.print(&v, |v| println!("{} updated", s(v, "name")));

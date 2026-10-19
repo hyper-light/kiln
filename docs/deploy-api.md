@@ -116,9 +116,16 @@ and chosen in the call; an app can start as a name and an owner and grow from th
 3. **Template.** Sets the package defaults, the namespace pattern (`<app>`, `apps-<app>`, …), the
    targets the app may go to, what it may install (CRDs and cluster-scoped objects: operators), and
    its default checks.
-4. **Source repository.** Link an existing one, or create it on any git host from a template:
-   `.kiln/ci.yaml` that builds and publishes the image and the chart, a `Dockerfile`, and a chart
-   built on kiln's base chart (§3.4).
+4. **Source repository.** Link an existing one (`source: acme/web`, any repository kiln has), or
+   have the template make it: one of kiln's own repositories (W14), named as the template says
+   (`acme/{app}`), its first commit the files of the template's starter repository (its branch's
+   tree, not its history) with `{{kiln.app}}`, `{{kiln.project}}`, `{{kiln.owner}}` and
+   `{{kiln.repository}}` filled in, in files and in file names. The starter holds `.kiln/ci.yaml`
+   that builds and publishes the image and the chart, a `Dockerfile`, and a chart (on kiln's base
+   chart, §3.4, once it ships), so the app's first build starts with its first commit. kiln copies
+   the starter's files and runs nothing from it; links stay links and files keep their modes.
+   A name already taken is refused before anything is made, and nothing half made is kept. On
+   GitHub, GitLab or Bitbucket it comes with their hosts (§7, P3).
 5. **Registries.** Create the repositories for images and charts on the chosen registry (any OCI
    registry: ECR, Artifact Registry, ACR, GHCR, Docker Hub, kiln's own later), snapshot and release
    paths, release tags immutable, lifecycle rules.
@@ -141,7 +148,11 @@ internal, operator, datavant) are four templates; any number can be added. A tem
 - what it may install: an operator template allows CRDs and cluster-scoped objects, the others
   don't. On Argo CD this becomes the AppProject's allow lists (§8.3); on KilnCD, the app's project;
 - the checks its releases must pass (production rejects snapshots, for example);
-- properties a team may set on the app, with their allowed values (txst's `repo_url_base`).
+- properties a team may set on the app, with their allowed values (txst's `repo_url_base`);
+- the source repository each app gets (§3.1): `repository: { name: acme/{app}, starter:
+  https://github.com/acme/service-starter, starter_ref: v3, branch: main }`. Each app made from
+  such a template makes a repository, so the template is put by someone who may add repositories
+  (`settings.manage`); apps are then made from it by whoever may make apps.
 
 Changing an app's template is allowed and says what it changes first: namespaces, allow lists and
 checks change for every registration, as a release each.
@@ -159,7 +170,7 @@ checks change for every registration, as a release each.
   registration, and shows their progress together.
 - **Archive**: no new releases; history kept; what runs keeps running.
 - **Delete**: deregister everywhere (objects deleted or kept, per registration), then remove the
-  app. The source repository and registries are kept or archived, as the call says.
+  app. The source repository is kept (registries, once kiln makes them, too).
 
 ### 3.4 The base chart and app scaffolding
 
@@ -506,7 +517,7 @@ Every call is in kiln's OpenAPI document with the capability it needs (§15).
 ### 12.2 `kiln`
 
 ```sh
-kiln app create web --owner shop --template service --repo github:acme/web
+kiln app create web --owner shop --template service   # its template makes acme/web; --source links one
 kiln app register web --env staging
 kiln deploy web 1.4.2 --to staging          # follows the release to the end
 kiln deploy web --to production --from staging
@@ -688,7 +699,8 @@ deployments, and aren't carried over.
 | P7: platforms under releases through KilnCD: an app's `platform` package (its provider, `aws-lambda`, `aws-ecs`, `cloudflare-workers` or `vercel`, and its definition as `.kiln/deploy.yaml` holds it, `${{ release.* }}`, `${{ env.name }}` and `${{ app.name }}` filled, KilnCD's `${{ git.* }}` and `${{ artifacts.* }}` left to it; the platform's files from a repository at the release's version), an environment's `targets.platforms` (an account that is an integration of the provider's kind, its place), refused on Argo CD | built. KilnCD renders what a Lambda release defines into its Function (a test, against KilnCD's own provider); on the test server a release reached KilnCD for its target, and was cancelled and reverted; no real account yet (cd-targets.md D8) |
 | P5, first part: templates (a package with `{app}` in it, a namespace pattern, checks every release passes, properties with their allowed values, the environments allowed), apps made from a template, partial updates (`PATCH`: owners, properties, contacts, template, package), contacts (on call, channels, links), `catalog-info.yaml` for Backstage, whether a name is free, delete everywhere (deregistered first, objects kept or not); `kiln app set`, `kiln app catalog`, `kiln app templates`, the `deploy.templates.*` and `deploy.apps.*` operations | built. On the test server: an app made from a template took its package and namespace; a property and an environment the template doesn't allow were refused; contacts showed in its catalog-info.yaml; delete refused while registered, and deleted everywhere when asked |
 | Delivery metrics (§18; DORA's four keys from the releases: changes landed a day, lead time from asked to landed, change failure rate counting rollbacks, time to restore), for an app, an environment or all over N days; the versions a registration has run; releases by version (txst's last by version, deployed versions); `kiln deploy metrics|versions`, `history --version`; `deploy.metrics`, `deploy.registrations.versions`; an app's Delivery panel in the UI | built. From the test servers' releases: 17 changes, 11 landed, lead time 18 s at p50, 36% failed or rolled back, restored in 2 min 14 s at p50 |
-| P5, the rest: owners as groups (kiln has none yet), the source repository and scaffolding (kiln's base chart, §3.4), registries, secrets per app, fleet changes, chat | not yet |
+| P5: an app's source repository (§3.1, step 4): one linked (`source`), or one its template makes (`repository`: a name pattern, a starter repository at a branch or tag, the default branch) as one of kiln's own repositories, its first commit the starter's files with `{{kiln.app}}` and the rest filled in, in files and in names (links and modes kept, nothing of the starter run), its first build started as a push of it would; a template that makes repositories put only by someone who may add them; `kiln app create --source`, `kiln app set --source`; the source in `catalog-info.yaml` and on the app's page | built. On the test server: a starter served over git:// became `acme/shop-web` with every placeholder filled and Helm's own `{{ }}` left alone, a script still executable and a link still a link, and its `.kiln/ci.yaml` queued a run; podinfo 6.11.0 from GitHub became `demo/pod-src` (336 files, one commit, in a second); a taken name, a missing starter and a `file://` starter were each refused with nothing left behind; with a token of someone who may make apps but not add repositories, a template without a repository was put and one with a repository (or a new starter) refused, and an app made from the admin's template got its repository |
+| P5, the rest: owners as groups (kiln has none yet), kiln's base chart and `kiln app init` (§3.4), source repositories on GitHub, GitLab or Bitbucket (with P3), registries, secrets per app, fleet changes, chat | not yet |
 | Reads per registration, from either provider in KilnCD's shapes (txst's resources, render, diff and logs): resources with sync and health, the manifests it renders (Secrets masked, Helm's test hooks left out on Argo CD), what a sync would change (live, predicted, unified hunks), a workload's pods' logs; on Argo CD, a preview of another version (what it renders, and how that differs from what the deployed version renders). `GET …/resources`, `…/manifests`, `…/diff`, `…/logs`; `kiln deploy resources|manifests|diff|logs`; `deploy.registrations.*` | built. On the test servers each read answered on both providers; previewing podinfo 6.11.0 on Argo CD showed its labels and image change and nothing else. A version preview on KilnCD: not yet |
 | P8, first part: the Releases pages under Deployments (`/deployments/releases`): the environments board (apps down, environments across, what runs and what is on its way in each, its provider), what waits for approval with its answer at hand, an app's environments side by side with the release dialog (a version and its image, values, a promotion, a rollback picked from its candidates), pause, resume, enable and disable, its history, and a release's page (its facts, each gate's result and evidence, answers, cancel, what its provider said); live from the `deploy` event, at phone width too; `GET /api/deploy/board` | built. Against the test server in a browser: the board, an app and a release rendered; a reviewer signed in on the board approved a release waiting there and it landed; a refusal (a non-reviewer's) said why |
 | P8, the rest: chat (Slack), the MCP skills, environments and apps edited in the UI, a release's diff and logs in the page | not yet |

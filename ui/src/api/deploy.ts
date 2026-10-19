@@ -98,6 +98,8 @@ export interface App {
   properties?: Record<string, string>;
   template?: string;
   contacts?: { oncall?: string; channels?: string[]; links?: Record<string, string> };
+  /** Its source repository, as kiln names it (`acme/web`). */
+  source?: string;
   archived: boolean;
 }
 

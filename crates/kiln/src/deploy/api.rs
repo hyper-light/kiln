@@ -76,6 +76,8 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
     let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
     let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who { name: "admin".to_owned(), agent: false }, Who::of);
     let actor = who.name.clone();
+    // A template that makes repositories is put by someone who may add them.
+    let adds_repos = req.extensions().get::<crate::authz::Caller>().is_none_or(|c| c.can("settings.manage", &crate::authz::Scope::Server));
     let key = req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let method = req.method().clone();
     let store = &d.hub.store;
@@ -109,14 +111,14 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             ok(&m)
         }
         (&Method::GET, ["templates"]) => ok(&json!({ "templates": store::templates(store).await.map_err(internal)? })),
-        (&Method::POST, ["templates"]) => created(&flow::put_template(&d, &actor, body::<Template>(req.into_body()).await?).await?),
+        (&Method::POST, ["templates"]) => created(&flow::put_template(&d, &actor, body::<Template>(req.into_body()).await?, adds_repos).await?),
         (&Method::GET, ["templates", name]) => ok(&store::template(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no template {name}")))?),
         (&Method::PUT, ["templates", name]) => {
             let t: Template = body(req.into_body()).await?;
             if t.name != *name {
                 return Err(bad(format!("the body is template {}, the path {name}", t.name)));
             }
-            ok(&flow::put_template(&d, &actor, t).await?)
+            ok(&flow::put_template(&d, &actor, t, adds_repos).await?)
         }
         (&Method::DELETE, ["templates", name]) => {
             flow::delete_template(&d, &actor, name).await?;

@@ -282,7 +282,16 @@ function AppView({ name }: { name: string }) {
         <p className="cd-note">
           {a.project}
           {a.owners.length > 0 && ` · owned by ${a.owners.join(", ")}`}
-          {a.template && ` · from ${a.template}`} · <code>{pkg}</code>
+          {a.template && ` · from ${a.template}`}
+          {a.source && (
+            <>
+              {" · source "}
+              <Link to="/repos" className="text-link">
+                {a.source}
+              </Link>
+            </>
+          )}{" "}
+          · <code>{pkg}</code>
           {a.archived && " · archived"}
         </p>
       </header>
