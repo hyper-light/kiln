@@ -21,7 +21,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); next: CloudWatch Metric Streams, the clouds' logs | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); next: CloudWatch Metric Streams and the clouds' pushes (Firehose, Pub/Sub) | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -769,6 +769,8 @@ for (each cloud's API costs by the metric asked).
 | Tagged | `region`, each dimension by its name in lower case | the metric's and resource's labels, `resource_type`, the metadata's labels | `subscription_id`, `resource_group`, `name`, `region`, the resource's tags |
 | Given | keys (and a session token), a role to assume with its external id | a service account's key (JSON) | an app's tenant, client id and secret |
 | Ambient | the environment, the shared credentials file, a web identity (EKS), the container's (ECS, EKS Pod Identity), the instance's (IMDSv2); the region from the environment or the instance | `GOOGLE_APPLICATION_CREDENTIALS` (a key or a user's), gcloud's file, the metadata server (GCE, GKE, Cloud Run); the project from them | the environment's app, a workload identity (AKS), App Service's managed identity, the VM's |
+| Logs | `log_groups` (names, or prefixes ending in `*` found with `DescribeLogGroups`), each region's, matching `log_filter` (CloudWatch Logs' filter pattern) when said: `FilterLogEvents`, JSON 1.1, signed for `logs`; 100 groups a region (its quota is 5 searches a second) | `logs`: a filter in Logging's query language (empty, every entry), each project's: `entries.list` within the pull's window, oldest first, a thousand a page, 30 pages a pull (half the quota of 60 calls a minute) | `workspaces` (Log Analytics' ids), each `log_query`'s rows (a table, or KQL; every table unless said) within the pull's window, oldest first, 200,000 a pull, with a token of Log Analytics' own audience |
+| A record | `source` the AWS service its group is of (`/aws/lambda/…` `lambda`, `/aws/rds/…` `rds`; else `cloudwatch`), `service` the group's last name (a function's), `aws.awslogs.logGroup`, `aws.awslogs.logStream`, `region` | `source` `gcp.<resource type>`, `service` the resource's service, function, container or module (else the log's name), `host` its instance or pod, the trace and span, `textPayload` or the JSON payload's `message` (its other top-level values attributes), an audit entry's method and resource | `source` `azure.<table>`, `service` the resource's name (else the table), `host` `Computer`, the message `Message`, `RenderedDescription`, `Description`, `ResultDescription` or `OperationName` (else the row), the row's other values attributes |
 
 Names are Datadog's, as far as one rule makes them (a word starts at a capital after a lower-case
 letter: `CPUUtilization` → `cpuutilization`, `NetworkIn` → `network_in`), so a dashboard or a
@@ -780,14 +782,31 @@ distribution's quantiles are read from its buckets as Prometheus's `histogram_qu
 Google type with no series is quiet, asked again hourly, not each pull: a project's thousands of
 built-in types cost a call each an hour.
 
+**Logs, each record once.** A pull reads its lookback again for logs too: clouds take records
+late (CloudWatch Logs within seconds, Cloud Logging and Log Analytics minutes). A record's id is the
+cloud's own (CloudWatch Logs' `eventId` in its group, Cloud Logging's `insertId` with its log and
+time, Log Analytics' `_ItemId`, else the row's values), and a pull loop keeps the ids it took for
+its lookback (`cloud::Seen`; a million at the most, a thousand records a second over 15 minutes,
+some 20 MB, the oldest half forgotten past it and the status saying so): a record read again is not
+taken again, and one refused while observe was busy (its id not kept) is read again by the next
+pull. A record's level is the cloud's (Cloud Logging's severity, Application Insights' levels 0 to
+4, a `Level` column), else read from its message as a log pipeline's status remapper reads it: a
+JSON object's `level`, `severity`, `levelname`, `log.level` or `status`, else a level word in
+capitals among its first four words (`ERROR`, `[WARN]`, Lambda's tab-separated `ERROR`) or a
+`level=…`, else info. The integration's tags go on every record. Google's token asks for
+`logging.read` beside `monitoring.read` only when logs are read; a record's message is cut at 1 MiB.
+
 Calls throttled or failed on the service's side (429, 5xx, AWS's throttling codes, botocore's
 list) are tried again after `Retry-After`, else 1 s doubling, four tries; a failed pull is tried
 again after a minute, doubling, up to the interval. A region, project, subscription or resource
-that fails is a warning while the others are read; when all fail, the pull fails. The status
-(`GET clouds`) says each integration's state, its error and warnings, its last pull (series,
-points, points left to the next, calls, time); kiln's own series count them (`kiln.cloud.points`,
-`.calls`, `.errors`, `.series`, `.pull.duration`, by `integration` and `cloud`); its first pull, a
-failure and its recovery are events (`service:kiln.cloud @event.type:cloud.pull`).
+that fails is a warning while the others are read, as are a log group, project or workspace whose
+logs fail; when all of a pull's metrics fail, the pull fails. The status (`GET clouds`) says each
+integration's state, its error and warnings, its last pull (series, points, points left to the
+next, log records written and left, calls, time) and the records written since the server started;
+kiln's own series count them (`kiln.cloud.points`, `.records`, `.calls`, `.errors`, `.series`,
+`.pull.duration`, by `integration` and `cloud`); its first pull, a failure and its recovery are
+events (`service:kiln.cloud @event.type:cloud.pull`). A test (`POST clouds/<name>/test`) says what a
+pull would read: series, points, and the log records its lookback holds, with the newest few.
 
 Secrets (AWS's secret key and session token, Google's key, Azure's client secret) are sealed at
 rest with AES-256-GCM under the server's master key (`<data>/secrets/master.key`, CI's), each bound
@@ -843,7 +862,11 @@ time range and the search in the address (a page is a link).
   that checks its query. A composite (the form's other kind) is its monitors chosen by letter and a
   condition over the letters; its page lists what it reads, each one's state a link away.
 - **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
-  each one's mention to copy. The clouds kiln reads, and the Prometheus endpoints it scrapes: each
+  each one's mention to copy. The clouds kiln reads: each one's state, what it reads (its logs too:
+  log groups, a filter, workspaces), its credentials and its last pull (series, and the log records
+  it took); added and edited in a form that tests a pull (series, points, log records and the newest
+  of them) before it is kept, a filter's or query's field there once there are logs to filter. And
+  the Prometheus endpoints it scrapes: each
   target's state over the machines that read it (up, down, starting) and its error, its endpoint,
   who reads it and how often, its last scrape; added and edited in a form that tests the endpoint
   once from the server (what it reads, in which format) before it is kept, its token kept unshown.
@@ -1638,8 +1661,18 @@ token. Their figures are functions of the minute, so what is stored is checked m
   of settings without the secret keeps the kept one; settings that cannot be refused, saying
   which; a deleted integration pulled no more;
 - the server's own credentials where it runs: an EC2 instance's (its region too), a Compute Engine
-  VM's (its project too), an Azure VM's managed identity.
-2026-10-18: all pass (48 s).
+  VM's (its project too), an Azure VM's managed identity;
+- each cloud's logs, every pull reading its ten minutes back every 10 s: CloudWatch Logs' groups
+  found by their prefix over two pages (another's group not read), each search's first page empty
+  as CloudWatch Logs' can be, ten events a page; Cloud Logging's entries of the filter asked (another
+  resource's not read), eight a page, with Logging's scope in the assertion and its token taken by
+  `entries.list` alone; Log Analytics' rows with a token of its own audience. Every record stored
+  once over a dozen pulls (35, 21 and 16), a late one of each, inside the lookback, taken by the next
+  pull once; Datadog's names (`source:lambda service:checkout`, the group and stream, the region and
+  the integration's tags), levels from each cloud's own or the message's (five errors of thirty),
+  a JSON payload's values and its trace and span, Application Insights' levels; `kiln.cloud.records`
+  the same counts.
+2026-10-18: all pass (243 s).
 
 **Distributions** (`observe_live.rs`): three hosts' latencies posted as Datadog's distribution
 points (2,000 each, log-normal), a fourth's as an OTLP exponential histogram (delta, 3,000) and a

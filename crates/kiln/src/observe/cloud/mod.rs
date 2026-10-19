@@ -1,7 +1,9 @@
-//! Clouds' metrics, pulled (`docs/observe.md` §10.1): Amazon CloudWatch, Google Cloud Monitoring
-//! and Azure Monitor, each an integration with its credentials, read every `interval_s` and written
-//! as series named as Datadog's integrations name them (`aws.ec2.cpuutilization`,
-//! `gcp.compute.instance.cpu.utilization`, `azure.compute_virtualmachines.percentage_cpu`).
+//! Clouds' metrics and logs, pulled (`docs/observe.md` §10.1): Amazon CloudWatch, Google Cloud
+//! Monitoring and Azure Monitor, each an integration with its credentials, read every `interval_s`
+//! and written as series named as Datadog's integrations name them (`aws.ec2.cpuutilization`,
+//! `gcp.compute.instance.cpu.utilization`, `azure.compute_virtualmachines.percentage_cpu`); and
+//! the logs asked of each (CloudWatch Logs' log groups, Cloud Logging's entries, Log Analytics'
+//! tables) as log records, each record once though every pull reads its lookback again.
 //!
 //! - Credentials are the integration's (keys, a service account's key, a client secret: sealed at
 //!   rest under the server's master key, never shown again), or the server's own where it runs, as
@@ -23,6 +25,7 @@ pub mod gcp;
 pub mod sigv4;
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -293,6 +296,12 @@ pub fn parse_time(s: &str) -> Option<i64> {
     i64::try_from(t.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
+/// An RFC 3339 time in unix ns (a log record's).
+pub fn parse_time_ns(s: &str) -> Option<i64> {
+    let t = time::OffsetDateTime::parse(s.trim(), &time::format_description::well_known::Rfc3339).ok()?;
+    i64::try_from(t.unix_timestamp_nanos()).ok()
+}
+
 /// A URL's authority (`host[:port]`) and path, as a request to it sends and signs them.
 pub fn authority_and_path(url: &str) -> anyhow::Result<(String, String)> {
     let uri: http::Uri = url.parse().map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
@@ -452,6 +461,9 @@ async fn send(req: crate::http::client::RequestBuilder<'_>) -> anyhow::Result<An
 #[derive(Debug, Default)]
 pub struct Pulled {
     pub series: Vec<(SeriesKey, Vec<(i64, f64)>)>,
+    /// Log records with their ids ([`id_of`]): what the pull read of its lookback, records taken by
+    /// a pull before among them ([`Seen`] leaves those out).
+    pub logs: Vec<(u64, Record)>,
     /// Series asked for each pull, and those past `max_series`, not asked for.
     pub known: usize,
     pub over: usize,
@@ -516,6 +528,110 @@ pub struct Status {
     /// Pulls and failed pulls since the server started.
     pub pulls: u64,
     pub failures: u64,
+    /// The last pull's log records written (each once), and those left to the next pull to read
+    /// again (observe was busy); and the records written since the server started.
+    pub records: u64,
+    pub records_deferred: u64,
+    pub records_total: u64,
+}
+
+// ----------------------------------------------------------------------------------------- logs
+
+/// Log records' ids a pull loop keeps at the most ([`Seen`]): a lookback's records at a thousand a
+/// second (15 minutes': 900,000), some 20 MB. Past it the oldest half is forgotten, and a record of
+/// theirs read again would be taken again (the status counts them).
+pub const SEEN_MAX: usize = 1 << 20;
+/// Log records a write to the store holds at the most: a big pull is taken in parts.
+const WRITE_RECORDS: usize = 10_000;
+
+/// A record's id: the cloud's own and what it is unique within, hashed (64 bits: among a million
+/// ids, a collision once in some 30 million lookbacks).
+pub fn id_of(parts: &[&str]) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The ids of the records a pull loop took, by their times: a pull reads its lookback again (a
+/// cloud takes records late) and takes each record once.
+#[derive(Debug, Default)]
+pub struct Seen {
+    at: HashMap<u64, i64>,
+    /// Ids forgotten past [`SEEN_MAX`] before their time.
+    pub forgotten: u64,
+}
+
+impl Seen {
+    pub fn has(&self, id: u64) -> bool {
+        self.at.contains_key(&id)
+    }
+
+    /// Keeps `id`, its record's time `ms`.
+    pub fn add(&mut self, id: u64, ms: i64) {
+        self.at.insert(id, ms);
+    }
+
+    /// Forgets the ids of records before `from` (unix ms), none of which a pull reads again; past
+    /// [`SEEN_MAX`], the older half of the rest.
+    pub fn prune(&mut self, from: i64) {
+        self.at.retain(|_, t| *t >= from);
+        if self.at.len() > SEEN_MAX {
+            let mut times: Vec<i64> = self.at.values().copied().collect();
+            let mid = times.len() / 2;
+            let cut = *times.select_nth_unstable(mid).1;
+            let before = self.at.len();
+            self.at.retain(|_, t| *t >= cut);
+            self.forgotten += (before - self.at.len()) as u64;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.at.is_empty()
+    }
+}
+
+/// A record's level from its message, as a log pipeline's status remapper reads it: a JSON object's
+/// `level`, `severity`, `levelname`, `log.level` or `status`; else a level word among its first
+/// four words (`ERROR`, `[WARN]`, `level=info`, Lambda's `\tERROR\t`); else info.
+pub fn severity_of(message: &str) -> u8 {
+    let m = message.trim_start();
+    if m.starts_with('{')
+        && let Ok(Value::Object(o)) = serde_json::from_str::<Value>(m)
+        && let Some(l) = ["level", "severity", "levelname", "log.level", "status"].iter().find_map(|k| o.get(*k).and_then(Value::as_str))
+        && let Some(r) = kiln_obs::logs::record::severities(l)
+    {
+        return *r.start();
+    }
+    for word in m.split(|c: char| c.is_whitespace() || c == '|').filter(|w| !w.is_empty()).take(4) {
+        let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '=');
+        let w = w.rsplit_once('=').map_or(w, |(k, v)| if k.eq_ignore_ascii_case("level") || k.eq_ignore_ascii_case("severity") { v } else { "" });
+        // Words in capitals, or a level=…'s value: "Error" in a sentence is not a level.
+        if ((w.len() >= 4 && w.bytes().all(|b| b.is_ascii_uppercase())) || word.contains('='))
+            && let Some(r) = kiln_obs::logs::record::severities(w)
+        {
+            return *r.start();
+        }
+    }
+    9
+}
+
+/// A message no longer than a record holds, cut at a character.
+pub fn message(mut m: String) -> String {
+    let max = kiln_obs::logs::record::MAX_MESSAGE_BYTES;
+    if m.len() > max {
+        let mut c = max;
+        while !m.is_char_boundary(c) {
+            c -= 1;
+        }
+        m.truncate(c);
+    }
+    m
 }
 
 // --------------------------------------------------------------------------------------- store
@@ -664,7 +780,14 @@ impl Clouds {
                 let mut names: Vec<String> = p.series.iter().filter_map(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok().map(|k| k.metric.to_owned())).collect();
                 names.sort_unstable();
                 names.dedup();
-                json!({ "ok": true, "series": p.known, "over": p.over, "points": p.points(), "calls": api.calls(), "took_ms": took, "metrics": names.len(), "sample": names.iter().take(50).collect::<Vec<_>>(), "warnings": p.warnings })
+                // The log records the lookback holds (each once), and a few of them, the newest.
+                let mut ids: Vec<u64> = p.logs.iter().map(|(id, _)| *id).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let mut newest: Vec<&Record> = p.logs.iter().map(|(_, r)| r).collect();
+                newest.sort_by_key(|r| std::cmp::Reverse(r.ts));
+                let said: Vec<String> = newest.iter().take(5).map(|r| format!("{} {}: {}", r.source, r.service, r.message.chars().take(160).collect::<String>())).collect();
+                json!({ "ok": true, "series": p.known, "over": p.over, "points": p.points(), "records": ids.len(), "records_sample": said, "calls": api.calls(), "took_ms": took, "metrics": names.len(), "sample": names.iter().take(50).collect::<Vec<_>>(), "warnings": p.warnings })
             }
             Err(e) => json!({ "ok": false, "error": format!("{e:#}"), "calls": api.calls(), "took_ms": took }),
         }
@@ -715,6 +838,7 @@ async fn pull_loop(http: Arc<Client>, name: String, c: Cloud, stop: crate::rt::S
     }
     let interval = Duration::from_secs(common.interval_s);
     let mut puller = Puller::new(&c);
+    let mut seen = Seen::default();
     let mut failed = 0u32;
     let mut pulled_once = false;
     loop {
@@ -733,8 +857,15 @@ async fn pull_loop(http: Arc<Client>, name: String, c: Cloud, stop: crate::rt::S
         let calls = api.calls();
         let wait = match r {
             Ok(p) => {
-                let (known, over, warnings) = (p.known, p.over, p.warnings.clone());
+                let (known, over, mut warnings) = (p.known, p.over, p.warnings);
                 let (written, deferred) = write(p.series).await;
+                let forgotten = seen.forgotten;
+                let (records, records_deferred) = write_logs(p.logs, &mut seen).await;
+                // What the next pull reads again is in its lookback: older ids are of no use.
+                seen.prune(at.saturating_sub(common.lookback_ms()));
+                if seen.forgotten > forgotten {
+                    warnings.push(format!("{} log records' ids were forgotten past {SEEN_MAX} (a record of theirs read again is taken again): a shorter lookback_s keeps fewer", seen.forgotten - forgotten));
+                }
                 let was_failing = failed > 0;
                 failed = 0;
                 {
@@ -751,14 +882,18 @@ async fn pull_loop(http: Arc<Client>, name: String, c: Cloud, stop: crate::rt::S
                     s.calls = calls;
                     s.took_ms = took_ms;
                     s.pulls += 1;
+                    s.records = records;
+                    s.records_deferred = records_deferred;
+                    s.records_total += records;
                 }
                 if !pulled_once || was_failing {
                     let what = if was_failing { "recovered" } else { "pulling" };
                     let over = if over > 0 { format!(" ({over} more past max_series, not asked for)") } else { String::new() };
-                    event(&name, kind, 9, what, format!("{kind} integration {name} {what}: {known} series{over}, {written} points in {took_ms} ms"));
+                    let logs = if records > 0 { format!(" and {records} log records") } else { String::new() };
+                    event(&name, kind, 9, what, format!("{kind} integration {name} {what}: {known} series{over}, {written} points{logs} in {took_ms} ms"));
                 }
                 pulled_once = true;
-                record(&name, kind, written, calls, 0, known, took);
+                record(&name, kind, written, records, calls, 0, known, took);
                 interval.saturating_sub(took)
             }
             Err(e) => {
@@ -778,7 +913,7 @@ async fn pull_loop(http: Arc<Client>, name: String, c: Cloud, stop: crate::rt::S
                     tracing::warn!(integration = %name, cloud = kind, error = %why, "a cloud integration's pull failed");
                     event(&name, kind, 17, "failing", format!("{kind} integration {name} is failing: {why}"));
                 }
-                record(&name, kind, 0, calls, 1, 0, took);
+                record(&name, kind, 0, 0, calls, 1, 0, took);
                 RETRY_MAX.saturating_mul(1 << (failed - 1).min(10)).min(interval)
             }
         };
@@ -823,14 +958,49 @@ async fn write(series: Vec<(SeriesKey, Vec<(i64, f64)>)>) -> (u64, u64) {
     (written, deferred)
 }
 
+/// Writes a pull's log records that no pull took before (one of each the pull read twice), in time
+/// order and in parts, each when observe has room for it: the records written, their ids kept in
+/// `seen`; and those left to the next pull to read again.
+async fn write_logs(logs: Vec<(u64, Record)>, seen: &mut Seen) -> (u64, u64) {
+    let mut fresh: Vec<(u64, Record)> = logs.into_iter().filter(|(id, _)| !seen.has(*id)).collect();
+    fresh.sort_by_key(|(id, _)| *id);
+    fresh.dedup_by_key(|(id, _)| *id);
+    fresh.sort_by_key(|(_, r)| r.ts);
+    let Some(o) = super::api::get() else {
+        return (0, fresh.len() as u64);
+    };
+    let (mut written, mut deferred) = (0u64, 0u64);
+    let mut rest = fresh.into_iter().peekable();
+    while rest.peek().is_some() {
+        let part: Vec<(u64, Record)> = rest.by_ref().take(WRITE_RECORDS).collect();
+        let t0 = Instant::now();
+        while o.busy() && t0.elapsed() < BUSY_WAIT {
+            crate::rt::sleep(Duration::from_millis(200)).await;
+        }
+        let ids: Vec<(u64, i64)> = part.iter().map(|(id, r)| (*id, r.ts.div_euclid(1_000_000))).collect();
+        let n = part.len() as u64;
+        if o.offer_logs(part.into_iter().map(|(_, r)| r).collect()) {
+            written += n;
+            for (id, ms) in ids {
+                seen.add(id, ms);
+            }
+        } else {
+            deferred += n;
+        }
+    }
+    (written, deferred)
+}
+
 /// kiln's own series of a pull.
-fn record(name: &str, kind: &str, points: u64, calls: u64, errors: u64, series: usize, took: Duration) {
+#[allow(clippy::too_many_arguments)]
+fn record(name: &str, kind: &str, points: u64, records: u64, calls: u64, errors: u64, series: usize, took: Duration) {
     let Some(o) = super::api::get() else { return };
     let ts = super::clock_ms();
     let tags = [("integration", name), ("cloud", kind)];
-    let mut out = Vec::with_capacity(5);
+    let mut out = Vec::with_capacity(6);
     for (metric, k, v) in [
         ("kiln.cloud.points", Kind::Count, points as f64),
+        ("kiln.cloud.records", Kind::Count, records as f64),
         ("kiln.cloud.calls", Kind::Count, calls as f64),
         ("kiln.cloud.errors", Kind::Count, errors as f64),
         ("kiln.cloud.series", Kind::Gauge, series as f64),
@@ -861,6 +1031,44 @@ fn event(name: &str, kind: &str, severity: u8, result: &str, message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_s_level_is_read_as_a_log_pipeline_reads_it() {
+        for (m, want) in [
+            (r#"{"level":"error","msg":"no"}"#, 17),
+            (r#"{"severity":"WARNING"}"#, 13),
+            (r#"{"levelname": "DEBUG", "x": 1}"#, 5),
+            ("[ERROR]\t2026-10-18T12:00:00Z\tabc\tboom", 17),
+            ("2026-10-18T12:00:00.000Z\t6f2b\tWARN\tslow", 13),
+            ("time=2026 level=warn msg=late", 13),
+            ("INFO starting", 9),
+            ("FATAL: out of memory", 21),
+            ("Error in a sentence is not a level", 9),
+            ("NOTE: nothing to see", 9),
+            ("", 9),
+        ] {
+            assert_eq!(severity_of(m), want, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn seen_ids_are_kept_for_the_lookback_and_bounded() {
+        let mut s = Seen::default();
+        s.add(1, 1_000);
+        s.add(2, 2_000);
+        assert!(s.has(1) && s.has(2) && !s.has(3));
+        s.prune(1_500);
+        assert!(!s.has(1) && s.has(2), "older than the lookback, forgotten");
+        assert_eq!(s.forgotten, 0, "forgotten in time is not counted");
+        for i in 0..(SEEN_MAX as u64 + 10) {
+            s.add(i + 100, 10_000 + i as i64);
+        }
+        s.prune(0);
+        assert!(s.len() <= SEEN_MAX / 2 + 11 && s.forgotten > 0, "{} kept, {} forgotten", s.len(), s.forgotten);
+        assert!(s.has(SEEN_MAX as u64 + 105), "the newest are kept");
+        assert_eq!(id_of(&["a", "b"]), id_of(&["a", "b"]));
+        assert_ne!(id_of(&["a", "b"]), id_of(&["ab", ""]), "parts are told apart");
+    }
 
     #[test]
     fn names_break_into_words_as_datadog_s_do() {

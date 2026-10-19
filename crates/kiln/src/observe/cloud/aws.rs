@@ -14,6 +14,13 @@
 //! - any other statistic (`Maximum`, `Minimum`, `p99`, `tm99`, ...) is `<name>.<statistic>` in
 //!   lower case (`.maximum`, `.p99_9`), a gauge.
 //!
+//! Logs: the events of the log groups asked (`log_groups`: names, or prefixes ending in `*`, found
+//! with `DescribeLogGroups`), each region's, matching `log_filter` (CloudWatch Logs' filter pattern)
+//! when said, read over the lookback with `FilterLogEvents` (JSON 1.1, signed for `logs`). A record
+//! is Datadog's forwarder's: `source` the AWS service the group is of (`/aws/lambda/…` `lambda`,
+//! `/aws/rds/…` `rds`; else `cloudwatch`), `service` the group's last name (a function's), the group
+//! and stream `aws.awslogs.logGroup` and `aws.awslogs.logStream`, and `region`; its id the event's.
+//!
 //! Credentials: the integration's keys, else the server's own as AWS's SDKs find them: the
 //! environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), the shared
 //! credentials file (`AWS_SHARED_CREDENTIALS_FILE`, `AWS_PROFILE`), a web identity (EKS's IRSA:
@@ -29,11 +36,20 @@ use kiln_obs::batch::{Kind, SeriesKey};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
+use kiln_obs::logs::record::Record;
+
 use super::sigv4::{self, Keys};
 use super::{Answer, Api, Call, Common, DISCOVER_EVERY, METADATA_TIMEOUT, Pulled, REFRESH_MS, env, home, parse_time};
 
 /// Queries a `GetMetricData` call holds at the most (CloudWatch's limit).
 const QUERIES: usize = 500;
+/// Events a `FilterLogEvents` call returns at the most (CloudWatch Logs' limit).
+const EVENTS: u64 = 10_000;
+/// Log groups read a region at the most: `FilterLogEvents` is held to 5 calls a second an account
+/// and region (CloudWatch Logs' quota), so a hundred groups' pull takes some 20 s at the least.
+pub const LOG_GROUPS: usize = 100;
+/// Log records a pull takes at the most: the rest, the next pull's (and the status says so).
+pub const PULL_RECORDS: usize = 200_000;
 /// `ListMetrics`' `RecentlyActive`: metrics with points in the last 3 hours (the one value it
 /// takes).
 const RECENTLY: &str = "PT3H";
@@ -102,6 +118,16 @@ pub struct Config {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sts_endpoint: Option<String>,
+    /// Log groups whose events are read, in each region: names, or prefixes ending in `*`; none,
+    /// no logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_groups: Vec<String>,
+    /// A filter pattern the events read match (CloudWatch Logs' syntax); none, every event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_filter: Option<String>,
+    /// CloudWatch Logs' endpoint, `{region}` replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_endpoint: Option<String>,
     #[serde(flatten)]
     pub common: Common,
 }
@@ -120,6 +146,9 @@ impl Default for Config {
             external_id: None,
             endpoint: None,
             sts_endpoint: None,
+            log_groups: Vec::new(),
+            log_filter: None,
+            logs_endpoint: None,
             common: Common::default(),
         }
     }
@@ -159,12 +188,33 @@ impl Config {
         if self.external_id.is_some() && self.role_arn.is_none() {
             return Err("an external id goes with a role to assume".into());
         }
-        for e in [&self.endpoint, &self.sts_endpoint].into_iter().flatten() {
+        for e in [&self.endpoint, &self.sts_endpoint, &self.logs_endpoint].into_iter().flatten() {
             if !(e.starts_with("https://") || e.starts_with("http://")) {
                 return Err(format!("endpoint {e:?}: a URL"));
             }
         }
+        // A log group's name: 1 to 512 of these (CloudWatch Logs'), a prefix ending in `*`.
+        let named = |g: &str| {
+            let n = g.strip_suffix('*').unwrap_or(g);
+            (g.ends_with('*') || !n.is_empty()) && n.len() <= 512 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-/.#".contains(&b))
+        };
+        if let Some(g) = self.log_groups.iter().find(|g| !named(g)) {
+            return Err(format!("log group {g:?}: a name (/aws/lambda/checkout) or a prefix ending in * (/aws/lambda/*)"));
+        }
+        if self.log_groups.len() > LOG_GROUPS {
+            return Err(format!("log_groups: {LOG_GROUPS} at the most"));
+        }
+        if self.log_filter.as_deref().is_some_and(|f| f.len() > 1024) {
+            return Err("log_filter: 1024 characters at the most (CloudWatch Logs')".into());
+        }
+        if self.log_filter.is_some() && self.log_groups.is_empty() {
+            return Err("a log filter goes with the log groups it filters".into());
+        }
         Ok(())
+    }
+
+    fn logs(&self, region: &str) -> String {
+        self.logs_endpoint.as_deref().map_or_else(|| format!("https://logs.{region}.{}/", domain(region)), |e| e.replace("{region}", region))
     }
 
     fn monitoring(&self, region: &str) -> String {
@@ -240,6 +290,58 @@ struct DataResult {
     status_code: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupsOut {
+    #[serde(default)]
+    log_groups: Vec<Group>,
+    next_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Group {
+    log_group_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventsOut {
+    #[serde(default)]
+    events: Vec<Event>,
+    next_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Event {
+    #[serde(default)]
+    event_id: String,
+    #[serde(default)]
+    log_stream_name: String,
+    timestamp: i64,
+    #[serde(default)]
+    message: String,
+}
+
+/// An event's record (the module's doc says how), its id.
+fn record_of(region: &str, group: &str, e: Event, tags: &[(String, String)]) -> (u64, Record) {
+    let id = super::id_of(&["aws", region, group, &e.event_id]);
+    let mut parts = group.split('/').filter(|p| !p.is_empty());
+    let source = match (group.starts_with("/aws/"), parts.nth(1)) {
+        (true, Some(svc)) => svc.to_ascii_lowercase(),
+        _ => "cloudwatch".to_owned(),
+    };
+    let service = group.rsplit('/').find(|p| !p.is_empty()).unwrap_or(group).to_owned();
+    let mut attrs: Vec<(String, String)> = Vec::with_capacity(3 + tags.len());
+    attrs.push(("aws.awslogs.logGroup".into(), group.to_owned()));
+    attrs.push(("aws.awslogs.logStream".into(), e.log_stream_name));
+    attrs.push(("region".into(), region.to_owned()));
+    attrs.extend(tags.iter().filter(|(k, _)| !attrs.iter().any(|(a, _)| a == k)).cloned().collect::<Vec<_>>());
+    let severity = super::severity_of(&e.message);
+    (id, Record { ts: e.timestamp.saturating_mul(1_000_000), severity, service, host: String::new(), source, message: super::message(e.message), attrs, trace_id: None, span_id: None })
+}
+
 /// Timestamps as JSON 1.0 gives them (epoch seconds, fractions and all) or as text (RFC 3339), in
 /// unix ms.
 fn times<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<i64>, D::Error> {
@@ -289,6 +391,25 @@ fn xml(doc: &str, tag: &str) -> Option<String> {
     let len = doc.get(start..)?.find(&format!("</{tag}>"))?;
     let raw = doc.get(start..start + len)?;
     Some(raw.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&"))
+}
+
+/// A call of CloudWatch Logs' `op` in `region`, signed.
+async fn cloudwatch_logs(api: &Api<'_>, cfg: &Config, keys: &Keys, region: &str, op: &str, body: String) -> anyhow::Result<Answer> {
+    let url = cfg.logs(region);
+    let (host, path) = super::authority_and_path(&url)?;
+    let target = format!("Logs_20140328.{op}");
+    let ct = "application/x-amz-json-1.1";
+    let headers = [("host", host.as_str()), ("content-type", ct), ("x-amz-target", target.as_str())];
+    let signed = sigv4::sign(keys, region, "logs", &sigv4::Request { method: "POST", path: &path, query: &[], headers: &headers, body: body.as_bytes() }, OffsetDateTime::now_utc());
+    let mut call = Call::post(&url, ct, body).header("x-amz-target", &target);
+    for (k, v) in signed {
+        call = call.header(&k, &v);
+    }
+    let a = api.call(&call, throttled).await?;
+    if !a.ok() {
+        anyhow::bail!("CloudWatch Logs {op} in {region}: {}", error(&a));
+    }
+    Ok(a)
 }
 
 /// A call of CloudWatch's `op` in `region`, signed.
@@ -510,12 +631,14 @@ pub struct Puller {
     found: Vec<Region>,
     over: usize,
     discovered: Option<Instant>,
+    /// The log groups read: (region, name).
+    groups: Vec<(String, String)>,
 }
 
 impl Puller {
     pub fn new(cfg: Config) -> Self {
         let tags = cfg.common.tag_pairs();
-        Self { regions: cfg.regions.clone(), cfg, tags, creds: Creds::default(), found: Vec::new(), over: 0, discovered: None }
+        Self { regions: cfg.regions.clone(), cfg, tags, creds: Creds::default(), found: Vec::new(), over: 0, discovered: None, groups: Vec::new() }
     }
 
     /// The statistics' places of `Sum` and `SampleCount`, when both are asked: the average's.
@@ -539,6 +662,9 @@ impl Puller {
                 Err(e) if self.discovered.is_some() => warnings.push(format!("metrics were not listed again ({e:#}); those listed before are read")),
                 Err(e) => return Err(e),
             }
+            if !self.cfg.log_groups.is_empty() {
+                self.discover_logs(api, &keys, &mut warnings).await;
+            }
         }
         let p = i64::try_from(self.cfg.period_s.saturating_mul(1000)).unwrap_or(60_000);
         let end = now.div_euclid(p) * p;
@@ -559,8 +685,95 @@ impl Puller {
         if failed > 0 && failed == self.found.len() {
             return Err(first_error.unwrap_or_else(|| anyhow::anyhow!("every region failed")));
         }
+        if !self.cfg.log_groups.is_empty() {
+            out.logs = self.read_logs(api, &keys, now.saturating_sub(self.cfg.common.lookback_ms()), now, &mut warnings).await;
+        }
         out.warnings = warnings;
         Ok(out)
+    }
+
+    /// Each log group's events in `[start, end]` (unix ms), as records: a group that fails, a
+    /// warning, the rest read.
+    async fn read_logs(&self, api: &Api<'_>, keys: &Keys, start: i64, end: i64, warnings: &mut Vec<String>) -> Vec<(u64, Record)> {
+        let mut out = Vec::new();
+        for (region, group) in &self.groups {
+            let mut next: Option<String> = None;
+            loop {
+                if out.len() >= PULL_RECORDS {
+                    warnings.push(format!("{PULL_RECORDS} log records read, the most a pull takes: the rest are the next pull's"));
+                    return out;
+                }
+                let mut body = serde_json::Map::new();
+                body.insert("logGroupName".into(), group.as_str().into());
+                body.insert("startTime".into(), start.into());
+                body.insert("endTime".into(), end.into());
+                body.insert("limit".into(), EVENTS.into());
+                if let Some(f) = &self.cfg.log_filter {
+                    body.insert("filterPattern".into(), f.as_str().into());
+                }
+                if let Some(t) = &next {
+                    body.insert("nextToken".into(), t.as_str().into());
+                }
+                let page: EventsOut = match cloudwatch_logs(api, &self.cfg, keys, region, "FilterLogEvents", serde_json::Value::Object(body).to_string()).await.and_then(|a| a.json()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warnings.push(format!("{region} {group}: {e:#}"));
+                        break;
+                    }
+                };
+                out.extend(page.events.into_iter().map(|e| record_of(region, group, e, &self.tags)));
+                // A page may hold nothing and still go on: CloudWatch Logs searches in parts.
+                match page.next_token.filter(|t| !t.is_empty()) {
+                    Some(t) if next.as_ref() != Some(&t) => next = Some(t),
+                    _ => break,
+                }
+            }
+        }
+        out
+    }
+
+    /// The log groups the settings name, in each region: a prefix's from `DescribeLogGroups`.
+    async fn discover_logs(&mut self, api: &Api<'_>, keys: &Keys, warnings: &mut Vec<String>) {
+        let mut groups = Vec::new();
+        for region in &self.regions {
+            let mut here: Vec<String> = Vec::new();
+            for g in &self.cfg.log_groups {
+                let Some(prefix) = g.strip_suffix('*') else {
+                    here.push(g.clone());
+                    continue;
+                };
+                let mut next: Option<String> = None;
+                loop {
+                    let mut body = serde_json::Map::new();
+                    if !prefix.is_empty() {
+                        body.insert("logGroupNamePrefix".into(), prefix.into());
+                    }
+                    if let Some(t) = &next {
+                        body.insert("nextToken".into(), t.as_str().into());
+                    }
+                    let page: GroupsOut = match cloudwatch_logs(api, &self.cfg, keys, region, "DescribeLogGroups", serde_json::Value::Object(body).to_string()).await.and_then(|a| a.json()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warnings.push(format!("{region}: log groups {g:?} were not listed ({e:#})"));
+                            break;
+                        }
+                    };
+                    here.extend(page.log_groups.into_iter().map(|l| l.log_group_name));
+                    match page.next_token.filter(|t| !t.is_empty()) {
+                        Some(t) if next.as_ref() != Some(&t) => next = Some(t),
+                        _ => break,
+                    }
+                }
+            }
+            here.sort();
+            here.dedup();
+            if here.len() > LOG_GROUPS {
+                warnings.push(format!("{region}: {} log groups, {LOG_GROUPS} read (CloudWatch Logs' quota of 5 searches a second)", here.len()));
+                here.truncate(LOG_GROUPS);
+            }
+            groups.extend(here.into_iter().map(|g| (region.clone(), g)));
+        }
+        self.groups = groups;
     }
 
     fn known(&self) -> usize {
@@ -757,6 +970,33 @@ fn assemble(r: &Region, mut points: Vec<Vec<(i64, f64)>>, stats: usize, averaged
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_event_is_a_record_as_datadog_s_forwarder_makes_it() -> anyhow::Result<()> {
+        let tags = vec![("team".to_owned(), "pay".to_owned())];
+        let e = Event { event_id: "3721".into(), log_stream_name: "2026/10/18/[$LATEST]ab".into(), timestamp: 1_800_000_000_123, message: "2026-10-18T12:00:00Z\tid\tERROR\tcard declined".into() };
+        let (id, r) = record_of("eu-west-1", "/aws/lambda/checkout", e, &tags);
+        anyhow::ensure!(r.source == "lambda" && r.service == "checkout" && r.severity == 17 && r.ts == 1_800_000_000_123_000_000, "{r:?}");
+        anyhow::ensure!(r.attrs.contains(&("aws.awslogs.logGroup".into(), "/aws/lambda/checkout".into())) && r.attrs.contains(&("region".into(), "eu-west-1".into())) && r.attrs.contains(&("team".into(), "pay".into())), "{:?}", r.attrs);
+        let again = Event { event_id: "3721".into(), log_stream_name: String::new(), timestamp: 0, message: String::new() };
+        anyhow::ensure!(record_of("eu-west-1", "/aws/lambda/checkout", again, &tags).0 == id, "an event's id is its own, whatever else is read");
+        let other = Event { event_id: "1".into(), log_stream_name: "i-0abc".into(), timestamp: 1, message: "plain".into() };
+        let (_, r) = record_of("us-east-1", "app/web", other, &[]);
+        anyhow::ensure!(r.source == "cloudwatch" && r.service == "web" && r.severity == 9, "{r:?}");
+        let page: EventsOut = serde_json::from_str(r#"{"events":[{"eventId":"9","logStreamName":"s","timestamp":5,"message":"m","ingestionTime":6}],"nextToken":"t","searchedLogStreams":[]}"#)?;
+        anyhow::ensure!(page.events.len() == 1 && page.next_token.as_deref() == Some("t"));
+        Ok(())
+    }
+
+    #[test]
+    fn log_settings_are_checked() {
+        let with = |groups: &[&str], filter: Option<&str>| Config { log_groups: groups.iter().map(|g| (*g).to_owned()).collect(), log_filter: filter.map(str::to_owned), ..Config::default() }.check();
+        assert!(with(&["/aws/lambda/checkout", "/aws/rds/*", "*"], Some("ERROR")).is_ok());
+        assert!(with(&["bad name"], None).is_err());
+        assert!(with(&[""], None).is_err());
+        assert!(with(&[], Some("ERROR")).is_err(), "a filter without groups");
+        assert!(with(&vec!["g"; LOG_GROUPS + 1], None).is_err());
+    }
 
     fn listed(ns: &str, name: &str, dims: &[(&str, &str)]) -> Listed {
         Listed { namespace: Some(ns.into()), metric_name: Some(name.into()), dimensions: dims.iter().map(|(n, v)| Dimension { name: (*n).into(), value: (*v).into() }).collect() }

@@ -87,16 +87,30 @@ function Head() {
   );
 }
 
+/** Whether an integration reads logs. */
+function readsLogs(c: Cloud): boolean {
+  switch (c.kind) {
+    case "aws":
+      return (c.log_groups ?? []).length > 0;
+    case "gcp":
+      return c.logs !== undefined;
+    case "azure":
+      return (c.workspaces ?? []).length > 0;
+  }
+}
+
 /** What an integration reads, in words. */
 function reads(c: Cloud): string {
   const some = (xs: string[] | undefined, all: string) => (xs && xs.length > 0 ? xs.join(", ") : all);
   switch (c.kind) {
     case "aws":
-      return `${some(c.regions, "the server's region")} · ${some(c.namespaces, "every namespace")}`;
+      return `${some(c.regions, "the server's region")} · ${some(c.namespaces, "every namespace")}${readsLogs(c) ? ` · logs of ${some(c.log_groups, "")}` : ""}`;
     case "gcp":
-      return `${some(c.projects, "the credentials' project")} · ${some(c.services, "every service")}`;
-    case "azure":
-      return `${some(c.subscriptions, "every subscription")} · ${some(c.resource_types, "every type")}`;
+      return `${some(c.projects, "the credentials' project")} · ${some(c.services, "every service")}${readsLogs(c) ? ` · logs${c.logs ? ` where ${c.logs}` : ""}` : ""}`;
+    case "azure": {
+      const n = (c.workspaces ?? []).length;
+      return `${some(c.subscriptions, "every subscription")} · ${some(c.resource_types, "every type")}${n > 0 ? ` · logs of ${n} workspace${n === 1 ? "" : "s"}` : ""}`;
+    }
   }
 }
 
@@ -121,7 +135,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void
         <button type="button" className="text-link" onClick={onAdd}>
           Add one
         </button>{" "}
-        to read AWS CloudWatch, Google Cloud Monitoring or Azure Monitor into kiln&apos;s metrics.
+        to read AWS CloudWatch, Google Cloud Monitoring or Azure Monitor into kiln&apos;s metrics and logs.
       </p>
     );
   return (
@@ -173,6 +187,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void
                         {relativeTime(s.last_pull / 1000)}
                         <div className="text-[12px] text-[#8c8f98]">
                           {count(s.series)} series{s.over > 0 ? `, ${count(s.over)} past the limit` : ""}
+                          {readsLogs(c) ? `, ${count(s.records_total ?? 0)} log records` : ""}
                         </div>
                       </>
                     ) : (
@@ -213,7 +228,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void
         open={removing !== null}
         onOpenChange={(o) => !o && setRemoving(null)}
         title={`Remove ${removing?.name ?? ""}?`}
-        description="Its metrics are read no more; those read stay, until their retention."
+        description="Its metrics and logs are read no more; those read stay, until their retention."
         confirmLabel="Remove"
         danger
         onConfirm={async () => {
@@ -246,16 +261,22 @@ interface Form {
   secret: string;
   role: string;
   externalId: string;
+  logGroups: string;
   // Google
   projects: string;
   services: string;
   key: string;
+  /** "no" or "yes". */
+  readLogs: string;
   // Azure
   tenant: string;
   client: string;
   subscriptions: string;
   types: string;
   aggregations: string;
+  workspaces: string;
+  /** AWS's filter pattern, Google's filter, Azure's query. */
+  logFilter: string;
 }
 
 function formOf(c: Cloud | null): Form {
@@ -272,14 +293,18 @@ function formOf(c: Cloud | null): Form {
     secret: "",
     role: "",
     externalId: "",
+    logGroups: "",
     projects: "",
     services: "",
     key: "",
+    readLogs: "no",
     tenant: "",
     client: "",
     subscriptions: "",
     types: "",
     aggregations: "",
+    workspaces: "",
+    logFilter: "",
   };
   if (!c) return f;
   switch (c.kind) {
@@ -293,9 +318,18 @@ function formOf(c: Cloud | null): Form {
         keyId: c.access_key_id ?? "",
         role: c.role_arn ?? "",
         externalId: c.external_id ?? "",
+        logGroups: (c.log_groups ?? []).join(", "),
+        logFilter: c.log_filter ?? "",
       };
     case "gcp":
-      return { ...f, creds: c.service_account ? "given" : "server", projects: (c.projects ?? []).join(", "), services: (c.services ?? []).join(", ") };
+      return {
+        ...f,
+        creds: c.service_account ? "given" : "server",
+        projects: (c.projects ?? []).join(", "),
+        services: (c.services ?? []).join(", "),
+        readLogs: c.logs !== undefined ? "yes" : "no",
+        logFilter: c.logs ?? "",
+      };
     case "azure":
       return {
         ...f,
@@ -305,6 +339,8 @@ function formOf(c: Cloud | null): Form {
         subscriptions: (c.subscriptions ?? []).join(", "),
         types: (c.resource_types ?? []).join(", "),
         aggregations: (c.aggregations ?? []).join(", "),
+        workspaces: (c.workspaces ?? []).join(", "),
+        logFilter: c.log_query ?? "",
       };
   }
 }
@@ -334,11 +370,24 @@ function bodyOf(f: Form, was: Cloud | null): CloudIn {
         period_s: prior?.period_s,
         endpoint: prior?.endpoint,
         sts_endpoint: prior?.sts_endpoint,
+        log_groups: list(f.logGroups),
+        log_filter: list(f.logGroups).length > 0 ? f.logFilter.trim() || undefined : undefined,
+        logs_endpoint: prior?.logs_endpoint,
       };
     }
     case "gcp": {
       const prior = was?.kind === "gcp" ? was : null;
-      return { ...common, kind: "gcp", projects: list(f.projects), services: list(f.services), service_account: secret(f.key), period_s: prior?.period_s, endpoint: prior?.endpoint };
+      return {
+        ...common,
+        kind: "gcp",
+        projects: list(f.projects),
+        services: list(f.services),
+        service_account: secret(f.key),
+        period_s: prior?.period_s,
+        endpoint: prior?.endpoint,
+        logs: f.readLogs === "yes" ? f.logFilter.trim() : undefined,
+        logs_endpoint: prior?.logs_endpoint,
+      };
     }
     case "azure": {
       const prior = was?.kind === "azure" ? was : null;
@@ -354,6 +403,9 @@ function bodyOf(f: Form, was: Cloud | null): CloudIn {
         period_s: prior?.period_s,
         authority: prior?.authority,
         endpoint: prior?.endpoint,
+        workspaces: list(f.workspaces),
+        log_query: list(f.workspaces).length > 0 ? f.logFilter.trim() || undefined : undefined,
+        logs_endpoint: prior?.logs_endpoint,
       };
     }
   }
@@ -480,6 +532,26 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
                 hint="With Sum and SampleCount, each metric's own name is its average. Each statistic is a query CloudWatch bills."
                 spellCheck={false}
               />
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField
+                  label="Log groups"
+                  value={f.logGroups}
+                  onChange={(e) => set({ logGroups: e.target.value })}
+                  placeholder="/aws/lambda/*, /ecs/web"
+                  hint="Names, or prefixes ending in *. None: no logs."
+                  spellCheck={false}
+                />
+                {list(f.logGroups).length > 0 && (
+                  <TextField
+                    label="Log filter (optional)"
+                    value={f.logFilter}
+                    onChange={(e) => set({ logFilter: e.target.value })}
+                    placeholder="ERROR"
+                    hint="CloudWatch Logs' filter pattern."
+                    spellCheck={false}
+                  />
+                )}
+              </div>
             </>
           )}
           {f.kind === "gcp" && (
@@ -515,6 +587,27 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
                   spellCheck={false}
                 />
               </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <SelectField
+                  label="Logs"
+                  value={f.readLogs}
+                  onChange={(v) => set({ readLogs: v })}
+                  options={[
+                    { value: "no", label: "Not read" },
+                    { value: "yes", label: "Read" },
+                  ]}
+                />
+                {f.readLogs === "yes" && (
+                  <TextField
+                    label="Log filter (optional)"
+                    value={f.logFilter}
+                    onChange={(e) => set({ logFilter: e.target.value })}
+                    placeholder="severity>=WARNING"
+                    hint="Cloud Logging's query language. None: every entry."
+                    spellCheck={false}
+                  />
+                )}
+              </div>
             </>
           )}
           {f.kind === "azure" && (
@@ -548,6 +641,26 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
                 placeholder="Maximum, Minimum"
                 spellCheck={false}
               />
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField
+                  label="Log Analytics workspaces"
+                  value={f.workspaces}
+                  onChange={(e) => set({ workspaces: e.target.value })}
+                  placeholder="a workspace's id"
+                  hint="None: no logs."
+                  spellCheck={false}
+                />
+                {list(f.workspaces).length > 0 && (
+                  <TextField
+                    label="Log query (optional)"
+                    value={f.logFilter}
+                    onChange={(e) => set({ logFilter: e.target.value })}
+                    placeholder="AppTraces"
+                    hint="A table, or a query in KQL. None: every table."
+                    spellCheck={false}
+                  />
+                )}
+              </div>
             </>
           )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -558,15 +671,17 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
               onChange={(e) => set({ interval: e.target.value })}
               hint={Number(f.interval) < 10 ? "10 at the least" : undefined}
             />
-            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod, team:infra" hint="Given to every series." spellCheck={false} />
+            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod, team:infra" hint="Given to every series and log record." spellCheck={false} />
           </div>
           {tested && (
             <div className="field-hint" role="status">
               {tested.ok ? (
                 <span>
-                  Reads {count(tested.series ?? 0)} series of {count(tested.metrics ?? 0)} metrics, {count(tested.points ?? 0)} points, in {count(tested.calls ?? 0)} calls
+                  Reads {count(tested.series ?? 0)} series of {count(tested.metrics ?? 0)} metrics, {count(tested.points ?? 0)} points
+                  {tested.records !== undefined && tested.records > 0 ? `, ${count(tested.records)} log records` : ""}, in {count(tested.calls ?? 0)} calls
                   {tested.over ? `; ${count(tested.over)} more past the limit` : ""}.
                   {tested.sample && tested.sample.length > 0 && <span className="font-mono"> {tested.sample.slice(0, 4).join(", ")}…</span>}
+                  {tested.records_sample && tested.records_sample.length > 0 && <span className="block truncate font-mono">{tested.records_sample[0]}</span>}
                 </span>
               ) : (
                 <span className="text-[#e2c4c6]">{tested.error}</span>

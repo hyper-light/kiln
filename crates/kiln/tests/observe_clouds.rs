@@ -3,8 +3,9 @@
 //! service), Google (OAuth, Cloud Monitoring, the metadata server) and Azure (Entra, Resource
 //! Manager, the VM's metadata service). Each checks what the real one checks (a signature over the
 //! request, a signed assertion, a secret, a token) and answers with figures that are a function of
-//! their time, so what kiln stores can be checked point by point. And Prometheus's scrapes: an
-//! exporter served here, read by the server and a runner as its targets say.
+//! their time, so what kiln stores can be checked point by point; and their logs (CloudWatch Logs,
+//! Cloud Logging, Log Analytics), each record of which must be stored once. And Prometheus's
+//! scrapes: an exporter served here, read by the server and a runner as its targets say.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 mod common;
@@ -212,6 +213,57 @@ struct AwsState {
     throttle: usize,
     down: bool,
     bad_signatures: Vec<String>,
+    /// CloudWatch Logs' events: group, stream, time, id, message.
+    events: Vec<(String, String, i64, String, String)>,
+}
+
+/// The log groups CloudWatch Logs has.
+const AWS_GROUPS: [&str; 3] = ["/aws/lambda/checkout", "/aws/lambda/refunds", "/aws/rds/instance/db-1/postgresql"];
+
+/// CloudWatch Logs, JSON 1.1: `DescribeLogGroups` by prefix, two pages; `FilterLogEvents` over a
+/// group's events in `[startTime, endTime]`, ten a page after a first that holds none (CloudWatch
+/// Logs searches in parts), a pattern of one word matched within the message.
+fn aws_logs(r: &Req, st: &mut AwsState) -> Resp {
+    match aws_signed(r, "logs") {
+        Ok((id, _)) if id == AWS_BASE.0 => return aws_error(403, "AccessDeniedException", "the base keys may not read logs: assume the role"),
+        Ok(_) => {}
+        Err(e) => {
+            st.bad_signatures.push(format!("logs: {e}"));
+            return aws_error(403, "InvalidSignatureException", &e);
+        }
+    }
+    if r.header("content-type") != Some("application/x-amz-json-1.1") {
+        return aws_error(400, "SerializationException", "not CloudWatch Logs' JSON protocol");
+    }
+    let body = r.json();
+    match r.header("x-amz-target") {
+        Some("Logs_20140328.DescribeLogGroups") => {
+            let prefix = body["logGroupNamePrefix"].as_str().unwrap_or("");
+            let mine: Vec<Value> = AWS_GROUPS.iter().filter(|g| g.starts_with(prefix)).map(|g| json!({ "logGroupName": g, "arn": format!("arn:aws:logs:us-east-1:123456789012:log-group:{g}") })).collect();
+            match body["nextToken"].as_str() {
+                None if mine.len() > 1 => reply(200, &json!({ "logGroups": [mine[0]], "nextToken": "groups-2" })),
+                None => reply(200, &json!({ "logGroups": mine })),
+                Some(_) => reply(200, &json!({ "logGroups": mine[1..] })),
+            }
+        }
+        Some("Logs_20140328.FilterLogEvents") => {
+            let group = body["logGroupName"].as_str().unwrap_or("");
+            let (start, end) = (body["startTime"].as_i64().unwrap_or(0), body["endTime"].as_i64().unwrap_or(0));
+            let word = body["filterPattern"].as_str().unwrap_or("");
+            let mut found: Vec<&(String, String, i64, String, String)> = st.events.iter().filter(|e| e.0 == group && e.2 >= start && e.2 <= end && (word.is_empty() || e.4.contains(word))).collect();
+            found.sort_by_key(|e| e.2);
+            let page = |from: usize| -> Resp {
+                let events: Vec<Value> = found.iter().skip(from).take(10).map(|e| json!({ "logStreamName": e.1, "timestamp": e.2, "message": e.4, "ingestionTime": e.2 + 400, "eventId": e.3 })).collect();
+                let next = (from + 10 < found.len()).then(|| format!("events-{}", from + 10));
+                reply(200, &json!({ "events": events, "nextToken": next, "searchedLogStreams": [] }))
+            };
+            match body["nextToken"].as_str() {
+                None => reply(200, &json!({ "events": [], "nextToken": "events-0", "searchedLogStreams": [] })),
+                Some(t) => page(t.trim_start_matches("events-").parse().unwrap_or(0)),
+            }
+        }
+        _ => aws_error(400, "UnknownOperationException", "no such operation"),
+    }
 }
 
 /// The figures CloudWatch gives: an instance's CPU each minute (five samples of it), a function's
@@ -325,6 +377,10 @@ fn aws(state: Arc<Mutex<AwsState>>) -> impl Fn(&Req) -> Resp {
                 _ => text(404, ""),
             };
         }
+        // CloudWatch Logs, JSON 1.1.
+        if r.path.starts_with("/logs/") {
+            return aws_logs(r, &mut st);
+        }
         // CloudWatch, JSON 1.0.
         if st.down {
             return text(503, "Service Unavailable");
@@ -407,6 +463,9 @@ fn aws(state: Arc<Mutex<AwsState>>) -> impl Fn(&Req) -> Resp {
 
 #[derive(Default)]
 struct GcpState {
+    /// Cloud Logging's entries, and the filters `entries.list` was asked.
+    entries: Vec<Value>,
+    filters: Vec<String>,
     bad_assertions: Vec<String>,
 }
 
@@ -445,11 +504,17 @@ fn gcp(state: Arc<Mutex<GcpState>>, public_key: Vec<u8>, token_uri: String) -> i
             let claims: Value = parts.get(1).and_then(|c| b64.decode(c).ok()).and_then(|c| serde_json::from_slice(&c).ok()).unwrap_or(Value::Null);
             let now_s = now_ms() / 1000;
             let fresh = claims["iat"].as_i64().is_some_and(|iat| (iat - now_s).abs() < 300) && claims["exp"].as_i64() == claims["iat"].as_i64().map(|i| i + 3600);
-            if !verified || claims["aud"] != token_uri.as_str() || claims["iss"] != "kiln-e2e@proj-e2e.iam.gserviceaccount.com" || claims["scope"] != "https://www.googleapis.com/auth/monitoring.read" || !fresh {
+            // Monitoring's scope, and Logging's beside it when logs are read: a token of each.
+            let token = match claims["scope"].as_str() {
+                Some("https://www.googleapis.com/auth/monitoring.read") => "gcp-token-1",
+                Some("https://www.googleapis.com/auth/monitoring.read https://www.googleapis.com/auth/logging.read") => "gcp-token-logs",
+                _ => "",
+            };
+            if !verified || claims["aud"] != token_uri.as_str() || claims["iss"] != "kiln-e2e@proj-e2e.iam.gserviceaccount.com" || token.is_empty() || !fresh {
                 st.bad_assertions.push(format!("verified {verified}, claims {claims}"));
                 return reply(400, &json!({ "error": "invalid_grant", "error_description": "Invalid JWT Signature." }));
             }
-            return reply(200, &json!({ "access_token": "gcp-token-1", "expires_in": 3599, "token_type": "Bearer" }));
+            return reply(200, &json!({ "access_token": token, "expires_in": 3599, "token_type": "Bearer" }));
         }
         // The metadata server: Compute Engine's service account and project.
         if r.path.starts_with("/computeMetadata/v1/") {
@@ -463,8 +528,28 @@ fn gcp(state: Arc<Mutex<GcpState>>, public_key: Vec<u8>, token_uri: String) -> i
             };
         }
         let token = r.header("authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
+        // Cloud Logging: a project's entries in the filter's time, oldest first, eight a page.
+        if r.path == "/v2/entries:list" {
+            let body = r.json();
+            if token != "gcp-token-logs" || body["resourceNames"] != json!(["projects/proj-e2e"]) {
+                return reply(403, &json!({ "error": { "code": 403, "message": "Permission 'logging.logEntries.list' denied (or the token's scopes lack logging.read)", "status": "PERMISSION_DENIED" } }));
+            }
+            let filter = body["filter"].as_str().unwrap_or("").to_owned();
+            let bound = |key: &str| filter.split(key).nth(1).and_then(|r| r.split('"').next()).map(rfc3339_ms);
+            let (Some(from), Some(to)) = (bound("timestamp>=\""), bound("timestamp<=\"")) else {
+                return reply(400, &json!({ "error": { "code": 400, "message": "a window, please", "status": "INVALID_ARGUMENT" } }));
+            };
+            st.filters.push(filter.clone());
+            let typed = filter.contains("resource.type=\"cloud_run_revision\"");
+            let mut found: Vec<&Value> = st.entries.iter().filter(|e| (from..=to).contains(&rfc3339_ms(e["timestamp"].as_str().unwrap_or(""))) && (!typed || e["resource"]["type"] == "cloud_run_revision")).collect();
+            found.sort_by_key(|e| rfc3339_ms(e["timestamp"].as_str().unwrap_or("")));
+            let skip: usize = body["pageToken"].as_str().and_then(|t| t.parse().ok()).unwrap_or(0);
+            let page: Vec<&Value> = found.iter().skip(skip).take(8).copied().collect();
+            let next = (skip + 8 < found.len()).then(|| (skip + 8).to_string());
+            return reply(200, &json!({ "entries": page, "nextPageToken": next }));
+        }
         let project = match (token, r.path.strip_prefix("/v3/projects/").and_then(|p| p.split('/').next())) {
-            ("gcp-token-1", Some(p @ "proj-e2e")) | ("gce-token", Some(p @ "proj-gce")) => p.to_owned(),
+            ("gcp-token-1" | "gcp-token-logs", Some(p @ "proj-e2e")) | ("gce-token", Some(p @ "proj-gce")) => p.to_owned(),
             _ => return reply(403, &json!({ "error": { "code": 403, "message": "Permission monitoring.timeSeries.list denied (or the token is not this project's)", "status": "PERMISSION_DENIED" } })),
         };
         if r.path.ends_with("/metricDescriptors") {
@@ -534,17 +619,51 @@ fn network_in(t: i64) -> f64 {
 
 const SUB: &str = "00000000-0000-0000-0000-00000000e2e0";
 
+/// Log Analytics' workspace in the scenario, and its rows: each a time, an id and a message.
+const WS: &str = "00000000-0000-0000-0000-0000000000a1";
+
 fn azure(arm: String) -> impl Fn(&Req) -> Resp {
+    azure_with(arm, Arc::default())
+}
+
+/// Azure, its Log Analytics workspace holding `rows` (each its `TimeGenerated`, `_ItemId`,
+/// `Message` and `SeverityLevel`), its API under `/la` with a token of its own audience.
+fn azure_with(arm: String, rows: Arc<Mutex<Vec<(i64, String, String, i64)>>>) -> impl Fn(&Req) -> Resp {
     move |r: &Req| {
         if r.path == "/tenant-e2e/oauth2/v2.0/token" {
             let form = r.form();
-            if form.get("grant_type").map(String::as_str) != Some("client_credentials") || form.get("client_id").map(String::as_str) != Some("app-e2e") || form.get("scope") != Some(&format!("{arm}/.default")) {
+            let token = match form.get("scope") {
+                Some(s) if *s == format!("{arm}/.default") => "az-token-1",
+                Some(s) if *s == format!("{arm}/la/.default") => "az-logs-token",
+                _ => "",
+            };
+            if form.get("grant_type").map(String::as_str) != Some("client_credentials") || form.get("client_id").map(String::as_str) != Some("app-e2e") || token.is_empty() {
                 return reply(400, &json!({ "error": "invalid_request", "error_description": "AADSTS900144: The request body must contain the following parameter: 'scope'." }));
             }
             if form.get("client_secret").map(String::as_str) != Some("s3cret-az") {
                 return reply(401, &json!({ "error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value." }));
             }
-            return reply(200, &json!({ "token_type": "Bearer", "expires_in": 3599, "ext_expires_in": 3599, "access_token": "az-token-1" }));
+            return reply(200, &json!({ "token_type": "Bearer", "expires_in": 3599, "ext_expires_in": 3599, "access_token": token }));
+        }
+        // Log Analytics: a workspace's rows of the query's table within its timespan, oldest first.
+        if let Some(ws) = r.path.strip_prefix("/la/v1/workspaces/").and_then(|p| p.strip_suffix("/query")) {
+            let bearer = r.header("authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
+            if bearer != "az-logs-token" {
+                return reply(403, &json!({ "error": { "code": "InsufficientAccessError", "message": "The provided credentials have insufficient access to perform the requested operation (a token for Log Analytics' audience)" } }));
+            }
+            let body = r.json();
+            let query = body["query"].as_str().unwrap_or("");
+            let Some((from, to)) = body["timespan"].as_str().and_then(|t| t.split_once('/')).map(|(a, b)| (rfc3339_ms(a), rfc3339_ms(b))) else {
+                return reply(400, &json!({ "error": { "code": "BadArgumentError", "message": "timespan" } }));
+            };
+            if ws != WS || !query.starts_with("AppTraces") || !query.contains("| where TimeGenerated between (datetime(") || !query.contains("| order by TimeGenerated asc") {
+                return reply(400, &json!({ "error": { "code": "BadArgumentError", "message": format!("not the scenario's query: {query}") } }));
+            }
+            let mut kept: Vec<(i64, String, String, i64)> = rows.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|r| r.0 >= from && r.0 <= to).cloned().collect();
+            kept.sort_by_key(|r| r.0);
+            let rows: Vec<Value> = kept.iter().map(|(t, id, m, l)| json!([rfc3339(*t), m, l, format!("/subscriptions/{SUB}/resourceGroups/prod-rg/providers/Microsoft.Web/sites/checkout"), "api", id, "AppTraces"])).collect();
+            let columns = ["TimeGenerated", "Message", "SeverityLevel", "_ResourceId", "AppRoleName", "_ItemId", "Type"].map(|c| json!({ "name": c, "type": "string" }));
+            return reply(200, &json!({ "tables": [{ "name": "PrimaryResult", "columns": columns, "rows": rows }] }));
         }
         if r.path == "/metadata/identity/oauth2/token" {
             if r.header("metadata") != Some("true") || r.query.get("resource") != Some(&format!("{arm}/")) {
@@ -870,6 +989,139 @@ fn each_cloud_s_metrics_are_read_with_the_credentials_given_and_stored_as_datado
     Ok(())
 }
 
+
+/// The records `q` finds over `[from, now]`, once there are `n` (within 60 s), or those there are.
+fn records(f: &Fleet, q: &str, from: i64, n: usize) -> anyhow::Result<Vec<Value>> {
+    let start = Instant::now();
+    loop {
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": q, "from": from, "to": now_ms() + 60_000, "limit": 1000 })))?;
+        let got = at(&found, &["records"]).as_array().cloned().unwrap_or_default();
+        if got.len() >= n || start.elapsed() > Duration::from_secs(60) {
+            return Ok(got);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[test]
+#[ignore = "starts a kiln server as a process, and services that stand in for AWS, Google and Azure"]
+fn each_cloud_s_logs_are_stored_once_each_though_every_pull_reads_its_lookback() -> anyhow::Result<()> {
+    let t0 = now_ms();
+    // CloudWatch Logs: thirty events of the checkout function, every 7th an error; a few of the
+    // refunds function's; an RDS group's, which the prefix asked does not take.
+    let mut aws_state = AwsState::default();
+    for i in 0..30i64 {
+        let msg = if i % 7 == 0 { format!("[ERROR]\t{i}\tpayment {i} failed") } else { format!("[INFO]\t{i}\tpayment {i}") };
+        aws_state.events.push(("/aws/lambda/checkout".into(), format!("2026/10/18/[$LATEST]s{}", i % 3), t0 - 290_000 + i * 10_000, format!("e{i}"), msg));
+    }
+    for i in 0..4i64 {
+        aws_state.events.push(("/aws/lambda/refunds".into(), "s".into(), t0 - 200_000 + i * 1_000, format!("r{i}"), format!("refund {i}")));
+    }
+    aws_state.events.push(("/aws/rds/instance/db-1/postgresql".into(), "db".into(), t0 - 100_000, "d0".into(), "LOG: checkpoint".into()));
+    let aws_state = Arc::new(Mutex::new(aws_state));
+    let aws_mock = Service::start(aws(aws_state.clone()))?;
+    // Cloud Logging: twenty Cloud Run entries (text and JSON, every 5th an error, one traced) and a
+    // GCE one the filter leaves out.
+    let mut gcp_state = GcpState::default();
+    for i in 0..20i64 {
+        let mut e = json!({
+            "logName": "projects/proj-e2e/logs/run.googleapis.com%2Fstdout", "insertId": format!("g{i}"),
+            "timestamp": rfc3339(t0 - 280_000 + i * 12_000), "severity": if i % 5 == 0 { "ERROR" } else { "INFO" },
+            "resource": { "type": "cloud_run_revision", "labels": { "service_name": "checkout", "revision_name": "checkout-00042", "project_id": "proj-e2e" } },
+        });
+        if i % 2 == 0 {
+            e["textPayload"] = json!(format!("served {i}"));
+        } else {
+            e["jsonPayload"] = json!({ "message": format!("charged {i}"), "amount": i * 10 });
+        }
+        if i == 3 {
+            e["trace"] = json!("projects/proj-e2e/traces/0af7651916cd43dd8448eb211c80319c");
+            e["spanId"] = json!("b7ad6b7169203331");
+        }
+        gcp_state.entries.push(e);
+    }
+    gcp_state.entries.push(json!({ "logName": "projects/proj-e2e/logs/syslog", "insertId": "vm0", "timestamp": rfc3339(t0 - 100_000), "textPayload": "kernel", "resource": { "type": "gce_instance", "labels": { "instance_id": "1" } } }));
+    let gcp_state = Arc::new(Mutex::new(gcp_state));
+    let gcp_port = common::free_port()?;
+    let token_uri = format!("http://127.0.0.1:{gcp_port}/token");
+    let (key, public) = service_account(&token_uri)?;
+    let gcp_mock = Service::start_on(gcp_port, gcp(gcp_state.clone(), public, token_uri.clone()))?;
+    // Log Analytics: fifteen traces of the checkout app, their levels 0 to 3 in turn.
+    let rows: Arc<Mutex<Vec<(i64, String, String, i64)>>> = Arc::new(Mutex::new((0..15i64).map(|i| (t0 - 270_000 + i * 15_000, format!("a{i}"), format!("trace {i}"), i % 4)).collect()));
+    let azure_port = common::free_port()?;
+    let arm = format!("http://127.0.0.1:{azure_port}");
+    let azure_mock = Service::start_on(azure_port, azure_with(arm.clone(), rows.clone()))?;
+    let f = Fleet::new()?;
+
+    let aws_cfg = merge(
+        json!({
+            "kind": "aws", "regions": ["us-east-1"], "namespaces": ["AWS/Lambda"],
+            "access_key_id": AWS_BASE.0, "secret_access_key": AWS_BASE.1, "role_arn": AWS_ROLE, "external_id": "e2e-external",
+            "endpoint": format!("{}/cw/{{region}}/", aws_mock.url()), "sts_endpoint": format!("{}/sts/{{region}}/", aws_mock.url()),
+            "logs_endpoint": format!("{}/logs/{{region}}/", aws_mock.url()), "log_groups": ["/aws/lambda/*"], "tags": ["account:prod"],
+        }),
+        often(),
+    );
+    anyhow::ensure!(f.request("PUT", "/api/observe/v1/clouds/prod", Some(&aws_cfg))?.0 == 204);
+    let gcp_cfg = merge(json!({ "kind": "gcp", "services": ["compute.googleapis.com"], "service_account": key, "endpoint": gcp_mock.url(), "logs": "resource.type=\"cloud_run_revision\"", "logs_endpoint": gcp_mock.url() }), often());
+    anyhow::ensure!(f.request("PUT", "/api/observe/v1/clouds/gcp-main", Some(&gcp_cfg))?.0 == 204);
+    let azure_cfg = merge(json!({ "kind": "azure", "tenant_id": "tenant-e2e", "client_id": "app-e2e", "client_secret": "s3cret-az", "authority": arm, "endpoint": arm, "workspaces": [WS], "log_query": "AppTraces", "logs_endpoint": format!("{arm}/la") }), often());
+    anyhow::ensure!(f.request("PUT", "/api/observe/v1/clouds/azure-main", Some(&azure_cfg))?.0 == 204);
+
+    // The first pulls take every record of the lookback; three more, none again.
+    for (name, n) in [("prod", 34u64), ("gcp-main", 20), ("azure-main", 15)] {
+        let c = until_cloud(&f, name, Duration::from_secs(60), |s| s["state"] == "ok" && s["records_total"].as_u64().unwrap_or(0) >= n)?;
+        anyhow::ensure!(c["status"]["records_total"] == n && c["status"]["records_deferred"] == 0, "{name}: {:#}", c["status"]);
+        let pulls = c["status"]["pulls"].as_u64().unwrap_or(0);
+        let c = until_cloud(&f, name, Duration::from_secs(60), |s| s["pulls"].as_u64().unwrap_or(0) >= pulls + 3)?;
+        anyhow::ensure!(c["status"]["records"] == 0 && c["status"]["records_total"] == n, "{name}: later pulls take none again: {:#}", c["status"]);
+    }
+    // Records come late to a cloud: one each, inside the lookback, taken by the next pull, once.
+    aws_state.lock().unwrap_or_else(PoisonError::into_inner).events.push(("/aws/lambda/checkout".into(), "s9".into(), t0 - 250_000, "late".into(), "[WARN]\tlate\tretried".into()));
+    let mut late = json!({ "logName": "projects/proj-e2e/logs/run.googleapis.com%2Fstdout", "insertId": "glate", "timestamp": rfc3339(t0 - 250_000), "severity": "WARNING", "textPayload": "late", "resource": { "type": "cloud_run_revision", "labels": { "service_name": "checkout" } } });
+    gcp_state.lock().unwrap_or_else(PoisonError::into_inner).entries.push(late.take());
+    rows.lock().unwrap_or_else(PoisonError::into_inner).push((t0 - 250_000, "alate".into(), "late".into(), 2));
+    for name in ["prod", "gcp-main", "azure-main"] {
+        let pulls = cloud(&f, name)?["status"]["pulls"].as_u64().unwrap_or(0);
+        until_cloud(&f, name, Duration::from_secs(60), |s| s["pulls"].as_u64().unwrap_or(0) >= pulls + 3)?;
+    }
+
+    // CloudWatch Logs: Datadog's forwarder's names, each record once; the RDS group not asked.
+    let from = t0 - 600_000;
+    let checkout = records(&f, "source:lambda service:checkout", from, 31)?;
+    anyhow::ensure!(checkout.len() == 31, "{} of 31 records: {checkout:#?}", checkout.len());
+    let errors = records(&f, "source:lambda service:checkout status:error", from, 5)?;
+    anyhow::ensure!(errors.len() == 5 && errors.iter().all(|r| r["message"].as_str().is_some_and(|m| m.contains("failed"))), "{errors:#?}");
+    let one = checkout.iter().find(|r| r["message"].as_str().is_some_and(|m| m.contains("payment 3\t") || m.ends_with("payment 3"))).ok_or_else(|| anyhow::anyhow!("payment 3"))?;
+    anyhow::ensure!(one["attributes"]["aws.awslogs.logGroup"] == "/aws/lambda/checkout" && one["attributes"]["region"] == "us-east-1" && one["attributes"]["account"] == "prod" && one["ts_ns"] == (t0 - 290_000 + 30_000) * 1_000_000, "{one:#}");
+    anyhow::ensure!(records(&f, "source:lambda service:checkout status:warn", from, 1)?.len() == 1, "the late event, once");
+    anyhow::ensure!(records(&f, "source:lambda service:refunds", from, 4)?.len() == 4);
+    anyhow::ensure!(records(&f, "source:rds", from, 0)?.is_empty(), "a group the prefix does not name is not read");
+    // Cloud Logging: the filter asked within each pull's window; JSON payloads' values attributes.
+    let run = records(&f, "source:gcp.cloud_run_revision service:checkout", from, 21)?;
+    anyhow::ensure!(run.len() == 21, "{} of 21 entries", run.len());
+    let charged = run.iter().find(|r| r["message"] == "charged 3").ok_or_else(|| anyhow::anyhow!("charged 3"))?;
+    anyhow::ensure!(charged["attributes"]["amount"] == "30" && charged["trace_id"] == "0af7651916cd43dd8448eb211c80319c" && charged["span_id"] == "b7ad6b7169203331" && charged["status"] == "info", "{charged:#}");
+    anyhow::ensure!(records(&f, "source:gcp.cloud_run_revision status:error", from, 4)?.len() == 4);
+    anyhow::ensure!(records(&f, "source:gcp.gce_instance", from, 0)?.is_empty(), "the filter's resource type alone");
+    let filters = gcp_state.lock().unwrap_or_else(PoisonError::into_inner).filters.clone();
+    anyhow::ensure!(!filters.is_empty() && filters.iter().all(|q| q.starts_with("(resource.type=\"cloud_run_revision\") AND timestamp>=\"")), "{filters:?}");
+    // Log Analytics: Application Insights' levels; the resource's name the service.
+    let traces = records(&f, "source:azure.apptraces service:checkout", from, 16)?;
+    anyhow::ensure!(traces.len() == 16, "{} of 16 rows", traces.len());
+    let t3 = traces.iter().find(|r| r["message"] == "trace 3").ok_or_else(|| anyhow::anyhow!("trace 3"))?;
+    anyhow::ensure!(t3["status"] == "error" && t3["attributes"]["AppRoleName"] == "api" && t3["attributes"]["azure.workspace"] == WS, "{t3:#}");
+    anyhow::ensure!(records(&f, "source:azure.apptraces status:warn", from, 5)?.len() == 5, "levels 2: four and the late one");
+    anyhow::ensure!(azure_mock.count(|r| r.path.starts_with("/la/")) > 0 && azure_mock.count(|r| r.path.starts_with("/la/") && r.header("authorization") != Some("Bearer az-logs-token")) == 0, "Log Analytics with its own token alone");
+
+    // Every call signed or authorized as the cloud checks it; kiln's own count of what it took.
+    anyhow::ensure!(aws_state.lock().unwrap_or_else(PoisonError::into_inner).bad_signatures.is_empty());
+    anyhow::ensure!(gcp_state.lock().unwrap_or_else(PoisonError::into_inner).bad_assertions.is_empty());
+    let taken = read(&f, "sum:kiln.cloud.records{*} by {integration}.as_count()", t0 - 60_000, now_ms() + 60_000)?;
+    let total = |name: &str| taken.iter().find(|(t, _)| t.get("integration").map(String::as_str) == Some(name)).map_or(0.0, |(_, v)| v.values().sum::<f64>());
+    anyhow::ensure!(total("prod") == 35.0 && total("gcp-main") == 21.0 && total("azure-main") == 16.0, "{taken:?}");
+    Ok(())
+}
 
 #[test]
 #[ignore = "starts a kiln server as a process, and services that stand in for AWS and Azure"]

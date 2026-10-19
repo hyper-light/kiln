@@ -14,6 +14,15 @@
 //! A metric is read at the period, else at the finest time grain it has above it (a storage
 //! account's capacity is hourly); metrics that need a dimension to be read are not.
 //!
+//! Logs: each Log Analytics workspace's rows (`workspaces`, their ids) of `log_query` (a table,
+//! `AzureActivity`, or a query in KQL ending in rows; none, every table), read over the lookback
+//! oldest first with the Log Analytics query API (its own token, for its own audience), 200,000
+//! rows a workspace a pull at the most. A record: `source` `azure.<table>`, `service` the resource's
+//! name (`_ResourceId`'s last) else the table, `host` `Computer`, the message the row's `Message`,
+//! `RenderedDescription`, `Description`, `ResultDescription` or `OperationName` (else the row), its
+//! level `Level`'s, `SeverityLevel`'s (Application Insights': 0 verbose to 4 critical) or the
+//! message's, the row's other values attributes; its id `_ItemId`, else the row's values.
+//!
 //! Credentials: the integration's app (`tenant_id`, `client_id`, `client_secret`), else the
 //! server's own as Azure's SDKs find them: the environment's app (`AZURE_TENANT_ID`,
 //! `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`), a workload identity (AKS: `AZURE_FEDERATED_TOKEN_FILE`),
@@ -27,10 +36,18 @@ use kiln_obs::batch::{Kind, SeriesKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use kiln_obs::logs::record::Record;
+
 use super::{Answer, Api, Call, Common, DISCOVER_EVERY, METADATA_TIMEOUT, Pulled, REFRESH_MS, encode, env, number, parse_time};
 
 const LOGIN: &str = "https://login.microsoftonline.com";
 const ARM: &str = "https://management.azure.com";
+/// Log Analytics' API, and its token's audience.
+const LOGS: &str = "https://api.loganalytics.io";
+/// Rows a workspace's pull takes at the most (the query API answers 500,000 at the most).
+pub const LOG_ROWS: usize = 200_000;
+/// A record's attributes from its row's other columns, at the most.
+const ROW_ATTRS: usize = 32;
 /// The VM's metadata service, unless `AZURE_POD_IDENTITY_AUTHORITY_HOST` says another (as Azure's
 /// SDKs read it).
 const IMDS: &str = "http://169.254.169.254";
@@ -74,13 +91,38 @@ pub struct Config {
     pub authority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Log Analytics workspaces whose rows are read (their ids); none, no logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
+    /// What is read of them: a table (`AzureActivity`) or a query in KQL ending in rows; none, every
+    /// table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_query: Option<String>,
+    /// Log Analytics' root instead of the public cloud's: a national cloud's
+    /// (`https://api.loganalytics.us`), a test's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_endpoint: Option<String>,
     #[serde(flatten)]
     pub common: Common,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { tenant_id: None, client_id: None, client_secret: None, subscriptions: Vec::new(), resource_types: Vec::new(), aggregations: Vec::new(), period_s: period(), authority: None, endpoint: None, common: Common::default() }
+        Self {
+            tenant_id: None,
+            client_id: None,
+            client_secret: None,
+            subscriptions: Vec::new(),
+            resource_types: Vec::new(),
+            aggregations: Vec::new(),
+            period_s: period(),
+            authority: None,
+            endpoint: None,
+            workspaces: Vec::new(),
+            log_query: None,
+            logs_endpoint: None,
+            common: Common::default(),
+        }
     }
 }
 
@@ -101,12 +143,25 @@ impl Config {
         if grain(self.period_s).is_none() {
             return Err(format!("period_s {}: an Azure time grain (60, 300, 900, 1800, 3600, 21600, 43200, 86400)", self.period_s));
         }
-        for e in [&self.authority, &self.endpoint].into_iter().flatten() {
+        for e in [&self.authority, &self.endpoint, &self.logs_endpoint].into_iter().flatten() {
             if !(e.starts_with("https://") || e.starts_with("http://")) {
                 return Err(format!("{e:?}: a URL"));
             }
         }
+        if let Some(w) = self.workspaces.iter().find(|w| w.len() != 36 || !w.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')) {
+            return Err(format!("workspace {w:?}: a Log Analytics workspace's id (a GUID)"));
+        }
+        if self.log_query.as_deref().is_some_and(|q| q.trim().is_empty() || q.len() > 10_000) {
+            return Err("log_query: a table or a query, 10000 characters at the most".into());
+        }
+        if self.log_query.is_some() && self.workspaces.is_empty() {
+            return Err("a log query goes with the workspaces it reads".into());
+        }
         Ok(())
+    }
+
+    fn logs(&self) -> &str {
+        self.logs_endpoint.as_deref().unwrap_or(LOGS).trim_end_matches('/')
     }
 
     fn arm(&self) -> &str {
@@ -246,8 +301,8 @@ fn token_of(a: &Answer, what: &str, now: i64) -> anyhow::Result<Token> {
     Ok(Token { value, until })
 }
 
-async fn token(api: &Api<'_>, cfg: &Config, now: i64) -> anyhow::Result<Token> {
-    let audience = cfg.arm();
+/// A token for `audience` (Resource Manager's root, or Log Analytics').
+async fn token(api: &Api<'_>, cfg: &Config, audience: &str, now: i64) -> anyhow::Result<Token> {
     let scope = format!("{audience}/.default");
     let resource = format!("{audience}/");
     let entra = |tenant: &str| format!("{}/{}/oauth2/v2.0/token", cfg.login(), encode(tenant));
@@ -386,6 +441,7 @@ pub struct Puller {
     tags: Vec<(String, String)>,
     extras: Vec<Agg>,
     token: Option<Token>,
+    logs_token: Option<Token>,
     subscriptions: Vec<String>,
     resources: Vec<Resource>,
     over: usize,
@@ -396,7 +452,7 @@ impl Puller {
     pub fn new(cfg: Config) -> Self {
         let tags = cfg.common.tag_pairs();
         let extras = cfg.aggregations.iter().filter_map(|a| Agg::of(a)).collect();
-        Self { subscriptions: cfg.subscriptions.clone(), cfg, tags, extras, token: None, resources: Vec::new(), over: 0, discovered: None }
+        Self { subscriptions: cfg.subscriptions.clone(), cfg, tags, extras, token: None, logs_token: None, resources: Vec::new(), over: 0, discovered: None }
     }
 
     async fn bearer(&mut self, api: &Api<'_>, now: i64) -> anyhow::Result<String> {
@@ -405,10 +461,64 @@ impl Puller {
         {
             return Ok(t.value.clone());
         }
-        let t = token(api, &self.cfg, now).await?;
+        let t = token(api, &self.cfg, self.cfg.arm(), now).await?;
         let v = t.value.clone();
         self.token = Some(t);
         Ok(v)
+    }
+
+    async fn logs_bearer(&mut self, api: &Api<'_>, now: i64) -> anyhow::Result<String> {
+        if let Some(t) = &self.logs_token
+            && t.until.saturating_sub(now) > REFRESH_MS
+        {
+            return Ok(t.value.clone());
+        }
+        let t = token(api, &self.cfg, self.cfg.logs(), now).await?;
+        let v = t.value.clone();
+        self.logs_token = Some(t);
+        Ok(v)
+    }
+
+    /// Each workspace's rows in `[start, end]` (unix ms), oldest first, as records: a workspace that
+    /// fails, a warning, the rest read.
+    async fn read_logs(&mut self, api: &Api<'_>, start: i64, end: i64, warnings: &mut Vec<String>) -> Vec<(u64, Record)> {
+        let token = match self.logs_bearer(api, end).await {
+            Ok(t) => t,
+            Err(e) => {
+                warnings.push(format!("logs: {e:#}"));
+                return Vec::new();
+            }
+        };
+        let base = self.cfg.log_query.clone().unwrap_or_else(|| "union withsource=_Table *".into());
+        let (from, to) = (super::rfc3339(start), super::rfc3339(end));
+        let query = format!("{base}\n| where TimeGenerated between (datetime({from}) .. datetime({to}))\n| order by TimeGenerated asc\n| take {LOG_ROWS}");
+        let mut out = Vec::new();
+        for ws in &self.cfg.workspaces {
+            let url = format!("{}/v1/workspaces/{}/query", self.cfg.logs(), encode(ws));
+            let body = serde_json::json!({ "query": query, "timespan": format!("{from}/{to}") }).to_string();
+            let answer = api.call(&Call::post(&url, "application/json", body).bearer(&token), |a| a.status == 429).await;
+            let v: Value = match answer.and_then(|a| if a.ok() { a.json() } else { Err(anyhow::anyhow!("{}", error(&a))) }) {
+                Ok(v) => v,
+                Err(e) => {
+                    warnings.push(format!("workspace {ws}: {e:#}"));
+                    continue;
+                }
+            };
+            let mut rows = 0usize;
+            for t in v.get("tables").and_then(Value::as_array).into_iter().flatten() {
+                let columns: Vec<&str> = t.get("columns").and_then(Value::as_array).into_iter().flatten().map(|c| c.get("name").and_then(Value::as_str).unwrap_or("")).collect();
+                for row in t.get("rows").and_then(Value::as_array).into_iter().flatten() {
+                    rows += 1;
+                    if let Some(r) = row.as_array().and_then(|cells| record_of(ws, &columns, cells, &self.tags)) {
+                        out.push(r);
+                    }
+                }
+            }
+            if rows >= LOG_ROWS {
+                warnings.push(format!("workspace {ws}: {LOG_ROWS} rows read, the most a pull takes: the rest are the next pull's"));
+            }
+        }
+        out
     }
 
     async fn get(&self, api: &Api<'_>, token: &str, url: &str) -> anyhow::Result<Answer> {
@@ -472,6 +582,9 @@ impl Puller {
         }
         if failed > 0 && failed == self.resources.len() {
             return Err(first_error.unwrap_or_else(|| anyhow::anyhow!("every resource failed")));
+        }
+        if !self.cfg.workspaces.is_empty() {
+            out.logs = self.read_logs(api, now.saturating_sub(self.cfg.common.lookback_ms()), now, &mut warnings).await;
         }
         out.warnings = warnings;
         Ok(out)
@@ -656,9 +769,71 @@ fn absorb(asked: &[&Metric], got: Metrics, end: i64, out: &mut Vec<(SeriesKey, V
     }
 }
 
+/// A Log Analytics row's record (the module's doc says how), its id; none without a time.
+fn record_of(workspace: &str, columns: &[&str], cells: &[Value], tags: &[(String, String)]) -> Option<(u64, Record)> {
+    let cell = |name: &str| columns.iter().position(|c| *c == name).and_then(|i| cells.get(i)).filter(|v| !v.is_null() && v.as_str() != Some(""));
+    let text = |v: &Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+    let ts = cell("TimeGenerated").and_then(Value::as_str).and_then(super::parse_time_ns)?;
+    let table = cell("_Table").or_else(|| cell("Type")).map(text).unwrap_or_default();
+    let resource = cell("_ResourceId").map(text).unwrap_or_default();
+    let id = match cell("_ItemId") {
+        Some(i) => super::id_of(&["azure", workspace, &text(i)]),
+        None => super::id_of(&["azure", workspace, &Value::Array(cells.to_vec()).to_string()]),
+    };
+    let named = ["Message", "RenderedDescription", "Description", "ResultDescription", "OperationName"];
+    let said = named.iter().find_map(|k| cell(k)).map(text);
+    let message = said.unwrap_or_else(|| {
+        let row: serde_json::Map<String, Value> = columns.iter().zip(cells).filter(|(_, v)| !v.is_null()).map(|(c, v)| ((*c).to_owned(), v.clone())).collect();
+        Value::Object(row).to_string()
+    });
+    let severity = match (cell("SeverityLevel").and_then(Value::as_i64), cell("Level").or_else(|| cell("Severity")).and_then(Value::as_str)) {
+        // Application Insights' levels: verbose, information, warning, error, critical.
+        (Some(l), _) => [5u8, 9, 13, 17, 21].get(usize::try_from(l).unwrap_or(0)).copied().unwrap_or(9),
+        (None, Some(l)) => kiln_obs::logs::record::severities(l).map_or_else(|| super::severity_of(&message), |r| *r.start()),
+        (None, None) => super::severity_of(&message),
+    };
+    let service = resource.rsplit('/').find(|p| !p.is_empty()).map_or_else(|| table.clone(), str::to_owned);
+    let host = cell("Computer").map(text).unwrap_or_default();
+    let mut attrs: Vec<(String, String)> = vec![("azure.table".into(), table.clone()), ("azure.workspace".into(), workspace.to_owned())];
+    if !resource.is_empty() {
+        attrs.push(("azure.resource_id".into(), resource.clone()));
+    }
+    let skip = |c: &str| matches!(c, "TimeGenerated" | "_Table" | "Type" | "_ResourceId" | "_ItemId" | "Computer" | "SeverityLevel" | "Level" | "Severity" | "TenantId" | "SourceSystem" | "MG" | "ManagementGroupName") || named.contains(&c);
+    for (c, v) in columns.iter().zip(cells).filter(|(c, v)| !skip(c) && !v.is_null() && !v.is_object() && !v.is_array() && v.as_str() != Some("")).take(ROW_ATTRS) {
+        attrs.push(((*c).to_owned(), text(v)));
+    }
+    for (k, v) in tags {
+        if !attrs.iter().any(|(a, _)| a == k) {
+            attrs.push((k.clone(), v.clone()));
+        }
+    }
+    Some((id, Record { ts, severity, service, host, source: format!("azure.{}", table.to_ascii_lowercase()), message: super::message(message), attrs, trace_id: None, span_id: None }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_analytics_row_is_a_record() -> anyhow::Result<()> {
+        let ws = "00000000-0000-0000-0000-000000000001";
+        let cols = ["TimeGenerated", "Message", "SeverityLevel", "_ResourceId", "AppRoleName", "_ItemId", "Type", "Properties"];
+        let row: Vec<Value> = serde_json::from_str(r#"["2026-10-18T12:00:00.5Z", "payment failed", 3, "/subscriptions/s/resourceGroups/g/providers/Microsoft.Web/sites/checkout", "api", "item-9", "AppTraces", {"k": "v"}]"#)?;
+        let (id, r) = record_of(ws, &cols, &row, &[]).ok_or_else(|| anyhow::anyhow!("no record"))?;
+        anyhow::ensure!(r.message == "payment failed" && r.severity == 17 && r.service == "checkout" && r.source == "azure.apptraces" && r.ts == 1_792_324_800_500_000_000, "{r:?}");
+        anyhow::ensure!(r.attrs.contains(&("AppRoleName".into(), "api".into())) && !r.attrs.iter().any(|(k, _)| k == "Properties"), "{:?}", r.attrs);
+        let again: Vec<Value> = serde_json::from_str(r#"["2026-10-18T12:00:00.5Z", "other", 1, "", "", "item-9", "AppTraces", null]"#)?;
+        anyhow::ensure!(record_of(ws, &cols, &again, &[]).map(|x| x.0) == Some(id), "the row's _ItemId is its id");
+        let cols = ["TimeGenerated", "OperationName", "Level", "Type", "Computer"];
+        let row: Vec<Value> = serde_json::from_str(r#"["2026-10-18T12:00:01Z", "Delete virtual machine", "Warning", "AzureActivity", "vm-1"]"#)?;
+        let (_, r) = record_of(ws, &cols, &row, &[]).ok_or_else(|| anyhow::anyhow!("no record"))?;
+        anyhow::ensure!(r.message == "Delete virtual machine" && r.severity == 13 && r.host == "vm-1" && r.service == "AzureActivity", "{r:?}");
+        let cols = ["TimeGenerated", "Count", "Type"];
+        let row: Vec<Value> = serde_json::from_str(r#"["2026-10-18T12:00:02Z", 4, "Usage"]"#)?;
+        let (_, r) = record_of(ws, &cols, &row, &[]).ok_or_else(|| anyhow::anyhow!("no record"))?;
+        anyhow::ensure!(r.message.contains("\"Count\":4"), "a row without a message is its values: {}", r.message);
+        Ok(())
+    }
 
     #[test]
     fn names_tags_and_grains_read_as_datadog_s() {

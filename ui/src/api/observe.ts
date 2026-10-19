@@ -224,6 +224,10 @@ export interface CloudStatus {
   took_ms: number;
   pulls: number;
   failures: number;
+  /** The last pull's log records written (each once), those left to the next pull, and every one since the server started. */
+  records: number;
+  records_deferred: number;
+  records_total: number;
 }
 
 interface CloudCommon {
@@ -251,8 +255,22 @@ export type CloudIn = (
       external_id?: string;
       endpoint?: string;
       sts_endpoint?: string;
+      /** Log groups whose events are read: names, or prefixes ending in `*`. */
+      log_groups?: string[];
+      log_filter?: string;
+      logs_endpoint?: string;
     }
-  | { kind: "gcp"; projects?: string[]; services?: string[]; period_s?: number; service_account?: string; endpoint?: string }
+  | {
+      kind: "gcp";
+      projects?: string[];
+      services?: string[];
+      period_s?: number;
+      service_account?: string;
+      endpoint?: string;
+      /** Log entries read: a filter in Cloud Logging's query language; empty, every entry; left out, no logs. */
+      logs?: string;
+      logs_endpoint?: string;
+    }
   | {
       kind: "azure";
       tenant_id?: string;
@@ -264,6 +282,10 @@ export type CloudIn = (
       period_s?: number;
       authority?: string;
       endpoint?: string;
+      /** Log Analytics workspaces whose rows are read (their ids), each `log_query`'s (a table or KQL; every table unless said). */
+      workspaces?: string[];
+      log_query?: string;
+      logs_endpoint?: string;
     }
 ) &
   CloudCommon;
@@ -327,6 +349,9 @@ export interface CloudTest {
   series?: number;
   over?: number;
   points?: number;
+  /** The log records the lookback holds, each once, and a few of the newest. */
+  records?: number;
+  records_sample?: string[];
   calls?: number;
   took_ms?: number;
   metrics?: number;

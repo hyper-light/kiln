@@ -20,6 +20,14 @@
 //! A type without series is quiet: asked again hourly, not each pull, so a project's thousands of
 //! built-in types cost one call each an hour, and those with data one each pull.
 //!
+//! Logs: each project's entries matching `logs` (a filter in Cloud Logging's query language,
+//! `severity>=WARNING`; empty, every entry), read over the lookback oldest first (`entries.list`, a
+//! thousand a page, 30 pages a project a pull: half of Logging's 60 calls a minute). A record:
+//! `source` `gcp.<resource type>`, `service` the resource's (a Cloud Run service's, a function's, a
+//! container's, an App Engine module's) else the log's name, `host` the instance or pod, the trace
+//! and span from `trace` and `spanId`, `textPayload` or a JSON payload's `message` its message, the
+//! payload's other top-level values attributes; its id the entry's `insertId` with its log and time.
+//!
 //! Credentials: the integration's service account key (its JSON), else the server's own as
 //! Google's libraries find them: `GOOGLE_APPLICATION_CREDENTIALS` (a service account's key, or a
 //! user's from `gcloud auth application-default login`), gcloud's file, the metadata server
@@ -33,10 +41,20 @@ use kiln_obs::batch::Kind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use kiln_obs::logs::record::Record;
+
 use super::{Answer, Api, Call, Common, DISCOVER_EVERY, METADATA_TIMEOUT, Pulled, REFRESH_MS, encode, env, home, number, parse_time, rfc3339};
 
-/// What kiln asks of Google: reading monitoring data, nothing more.
+/// What kiln asks of Google: reading monitoring data, and logs when it reads them; nothing more.
 const SCOPE: &str = "https://www.googleapis.com/auth/monitoring.read";
+const LOGGING_SCOPE: &str = "https://www.googleapis.com/auth/logging.read";
+const LOGGING: &str = "https://logging.googleapis.com";
+/// `entries.list`'s largest page, and the pages a project's pull reads at the most (Logging allows
+/// 60 calls a minute a project).
+const LOG_PAGE: u64 = 1_000;
+const LOG_PAGES: usize = 30;
+/// A record's attributes from its payload, at the most.
+const PAYLOAD_ATTRS: usize = 32;
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const MONITORING: &str = "https://monitoring.googleapis.com";
 /// The metadata server, unless `GCE_METADATA_HOST` says another (its address, as Google's
@@ -71,13 +89,20 @@ pub struct Config {
     /// The Monitoring API's root instead of Google's: a test's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Log entries read, of each project: a filter in Cloud Logging's query language; empty, every
+    /// entry; none, no logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
+    /// Cloud Logging's root instead of Google's: a test's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_endpoint: Option<String>,
     #[serde(flatten)]
     pub common: Common,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { projects: Vec::new(), services: Vec::new(), period_s: period(), service_account: None, endpoint: None, common: Common::default() }
+        Self { projects: Vec::new(), services: Vec::new(), period_s: period(), service_account: None, endpoint: None, logs: None, logs_endpoint: None, common: Common::default() }
     }
 }
 
@@ -98,7 +123,22 @@ impl Config {
         if self.endpoint.as_deref().is_some_and(|e| !(e.starts_with("https://") || e.starts_with("http://"))) {
             return Err("endpoint: a URL".into());
         }
+        if self.logs_endpoint.as_deref().is_some_and(|e| !(e.starts_with("https://") || e.starts_with("http://"))) {
+            return Err("logs_endpoint: a URL".into());
+        }
+        if self.logs.as_deref().is_some_and(|f| f.len() > 20_000) {
+            return Err("logs: a filter of 20000 characters at the most (Cloud Logging's)".into());
+        }
         Ok(())
+    }
+
+    fn logging(&self) -> &str {
+        self.logs_endpoint.as_deref().unwrap_or(LOGGING).trim_end_matches('/')
+    }
+
+    /// The scopes its token asks for.
+    fn scope(&self) -> String {
+        if self.logs.is_some() { format!("{SCOPE} {LOGGING_SCOPE}") } else { SCOPE.to_owned() }
     }
 
     fn monitoring(&self) -> &str {
@@ -186,7 +226,7 @@ fn metadata_url(path: &str) -> String {
 }
 
 /// A signed JWT asking `token_uri` for an access token (RFC 7523, Google's service accounts).
-fn assertion(email: &str, key: &aws_lc_rs::rsa::KeyPair, key_id: Option<&str>, token_uri: &str, now_s: i64) -> anyhow::Result<String> {
+fn assertion(email: &str, key: &aws_lc_rs::rsa::KeyPair, key_id: Option<&str>, token_uri: &str, scope: &str, now_s: i64) -> anyhow::Result<String> {
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let mut head = serde_json::Map::new();
     head.insert("alg".into(), "RS256".into());
@@ -194,7 +234,7 @@ fn assertion(email: &str, key: &aws_lc_rs::rsa::KeyPair, key_id: Option<&str>, t
     if let Some(k) = key_id {
         head.insert("kid".into(), k.into());
     }
-    let claims = serde_json::json!({ "iss": email, "scope": SCOPE, "aud": token_uri, "iat": now_s, "exp": now_s + 3600 });
+    let claims = serde_json::json!({ "iss": email, "scope": scope, "aud": token_uri, "iat": now_s, "exp": now_s + 3600 });
     let signing = format!("{}.{}", b64.encode(serde_json::to_vec(&head)?), b64.encode(serde_json::to_vec(&claims)?));
     let mut sig = vec![0u8; key.public_modulus_len()];
     key.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &aws_lc_rs::rand::SystemRandom::new(), signing.as_bytes(), &mut sig).map_err(|_| anyhow::anyhow!("the service account's key did not sign"))?;
@@ -223,10 +263,10 @@ struct Token {
     until: i64,
 }
 
-async fn token(api: &Api<'_>, src: &Source, now: i64) -> anyhow::Result<Token> {
+async fn token(api: &Api<'_>, src: &Source, scope: &str, now: i64) -> anyhow::Result<Token> {
     let (a, what) = match src {
         Source::Account { email, key, key_id, token_uri, .. } => {
-            let jwt = assertion(email, key, key_id.as_deref(), token_uri, crate::util::now_unix())?;
+            let jwt = assertion(email, key, key_id.as_deref(), token_uri, scope, crate::util::now_unix())?;
             let body = super::form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)]);
             (api.call(&Call::post(token_uri, "application/x-www-form-urlencoded", body), |_| false).await?, format!("the service account {email}'s token"))
         }
@@ -495,7 +535,7 @@ impl Puller {
             });
         }
         let src = self.source.as_ref().ok_or_else(|| anyhow::anyhow!("no credentials"))?;
-        let t = token(api, src, now).await?;
+        let t = token(api, src, &self.cfg.scope(), now).await?;
         let v = t.value.clone();
         self.token = Some(t);
         Ok(v)
@@ -559,8 +599,49 @@ impl Puller {
             return Err(first_error.unwrap_or_else(|| anyhow::anyhow!("every type failed")));
         }
         out.known = out.series.len();
+        if let Some(filter) = &self.cfg.logs {
+            out.logs = self.read_logs(api, token, filter, now.saturating_sub(self.cfg.common.lookback_ms()), now, &mut warnings).await;
+        }
         out.warnings = warnings;
         Ok(out)
+    }
+
+    /// Each project's entries matching `filter` in `[start, end]` (unix ms), oldest first, as
+    /// records: a project that fails, a warning, the rest read.
+    async fn read_logs(&self, api: &Api<'_>, token: &str, filter: &str, start: i64, end: i64, warnings: &mut Vec<String>) -> Vec<(u64, Record)> {
+        let url = format!("{}/v2/entries:list", self.cfg.logging());
+        let window = format!("timestamp>=\"{}\" AND timestamp<=\"{}\"", rfc3339(start), rfc3339(end));
+        let filter = if filter.trim().is_empty() { window } else { format!("({filter}) AND {window}") };
+        let mut out = Vec::new();
+        for project in &self.projects {
+            let mut next: Option<String> = None;
+            for page_n in 0.. {
+                if page_n == LOG_PAGES {
+                    warnings.push(format!("{project}: {LOG_PAGES} pages of log entries read, the most a pull reads: the rest are the next pull's"));
+                    break;
+                }
+                let mut body = serde_json::json!({ "resourceNames": [format!("projects/{project}")], "filter": filter, "orderBy": "timestamp asc", "pageSize": LOG_PAGE });
+                if let (Some(t), Some(o)) = (&next, body.as_object_mut()) {
+                    o.insert("pageToken".into(), t.as_str().into());
+                }
+                let answer = api.call(&Call::post(&url, "application/json", body.to_string()).bearer(token), throttled).await;
+                let page: Value = match answer.and_then(|a| if a.ok() { a.json() } else { Err(anyhow::anyhow!("{}", error(&a))) }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warnings.push(format!("{project}: log entries: {e:#}"));
+                        break;
+                    }
+                };
+                if let Some(entries) = page.get("entries").and_then(Value::as_array) {
+                    out.extend(entries.iter().filter_map(|e| record_of(project, e, &self.tags)));
+                }
+                match page.get("nextPageToken").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                    Some(t) if next.as_deref() != Some(t) => next = Some(t.to_owned()),
+                    _ => break,
+                }
+            }
+        }
+        out
     }
 
     async fn home_project(&self, api: &Api<'_>) -> anyhow::Result<Vec<String>> {
@@ -738,9 +819,102 @@ fn absorb(name: &str, read: Read, s: &Series, tags: &[(String, String)], budget:
     }
 }
 
+/// A log entry's record (the module's doc says how), its id; none without a time.
+fn record_of(project: &str, e: &Value, tags: &[(String, String)]) -> Option<(u64, Record)> {
+    let at = e.get("timestamp").and_then(Value::as_str)?;
+    let ts = super::parse_time_ns(at)?;
+    let str_of = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_owned();
+    let log_name = str_of(e.get("logName"));
+    let log = log_name.split_once("/logs/").map_or(log_name.as_str(), |(_, l)| l).replace("%2F", "/");
+    let id = super::id_of(&["gcp", project, &log_name, &str_of(e.get("insertId")), at]);
+    let resource = e.get("resource");
+    let rtype = str_of(resource.and_then(|r| r.get("type")));
+    let rlabels = resource.and_then(|r| r.get("labels")).and_then(Value::as_object);
+    let rlabel = |k: &str| rlabels.and_then(|l| l.get(k)).and_then(Value::as_str).filter(|v| !v.is_empty());
+    let service = ["service_name", "function_name", "container_name", "module_id", "job_id"].iter().find_map(|k| rlabel(k)).unwrap_or(&log).to_owned();
+    let host = ["instance_id", "pod_name", "node_name", "instance_name"].iter().find_map(|k| rlabel(k)).unwrap_or("").to_owned();
+    let mut attrs: Vec<(String, String)> = vec![("gcp.log".into(), log.clone()), ("gcp.resource.type".into(), rtype.clone())];
+    for (k, v) in rlabels.into_iter().flatten() {
+        if let Some(v) = v.as_str() {
+            attrs.push((format!("gcp.resource.labels.{k}"), v.to_owned()));
+        }
+    }
+    for (k, v) in e.get("labels").and_then(Value::as_object).into_iter().flatten() {
+        if let Some(v) = v.as_str() {
+            attrs.push((format!("labels.{k}"), v.to_owned()));
+        }
+    }
+    // The message: the text, a JSON payload's message (its other top-level values attributes), an
+    // audit entry's method and resource, else the payload as it is.
+    let scalar = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    let message = if let Some(t) = e.get("textPayload").and_then(Value::as_str) {
+        t.to_owned()
+    } else if let Some(j) = e.get("jsonPayload").and_then(Value::as_object) {
+        let said = ["message", "msg", "textPayload"].iter().find_map(|k| j.get(*k).and_then(Value::as_str)).map(str::to_owned);
+        for (k, v) in j.iter().filter(|(k, _)| !matches!(k.as_str(), "message" | "msg" | "textPayload")).take(PAYLOAD_ATTRS) {
+            if let Some(v) = scalar(v) {
+                attrs.push((k.clone(), v));
+            }
+        }
+        said.unwrap_or_else(|| Value::Object(j.clone()).to_string())
+    } else if let Some(p) = e.get("protoPayload") {
+        match (p.get("methodName").and_then(Value::as_str), p.get("resourceName").and_then(Value::as_str)) {
+            (Some(m), Some(r)) => format!("{m} {r}"),
+            (Some(m), None) => m.to_owned(),
+            _ => p.to_string(),
+        }
+    } else {
+        String::new()
+    };
+    for (k, v) in tags {
+        if !attrs.iter().any(|(a, _)| a == k) {
+            attrs.push((k.clone(), v.clone()));
+        }
+    }
+    let severity = match e.get("severity").and_then(Value::as_str).and_then(kiln_obs::logs::record::severities) {
+        Some(r) => *r.start(),
+        None => super::severity_of(&message),
+    };
+    let hex = |s: &str| -> Option<Vec<u8>> { (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect() };
+    let trace_id = e.get("trace").and_then(Value::as_str).and_then(|t| t.rsplit('/').next()).and_then(hex).and_then(|b| <[u8; 16]>::try_from(b).ok());
+    let span_id = e.get("spanId").and_then(Value::as_str).and_then(hex).and_then(|b| <[u8; 8]>::try_from(b).ok());
+    Some((id, Record { ts, severity, service, host, source: format!("gcp.{rtype}"), message: super::message(message), attrs, trace_id, span_id }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_entry_is_a_record_with_its_resource_trace_and_payload() -> anyhow::Result<()> {
+        let e: Value = serde_json::from_str(r#"{
+            "logName": "projects/p/logs/run.googleapis.com%2Fstderr",
+            "resource": {"type": "cloud_run_revision", "labels": {"service_name": "checkout", "project_id": "p"}},
+            "timestamp": "2026-10-18T12:00:00.123456789Z", "insertId": "a1", "severity": "ERROR",
+            "trace": "projects/p/traces/0123456789abcdef0123456789abcdef", "spanId": "000000000000004a",
+            "jsonPayload": {"message": "card declined", "amount": 12, "retry": false, "nested": {"a": 1}},
+            "labels": {"instanceId": "00a"}
+        }"#)?;
+        let (id, r) = record_of("p", &e, &[]).ok_or_else(|| anyhow::anyhow!("no record"))?;
+        anyhow::ensure!(r.message == "card declined" && r.service == "checkout" && r.source == "gcp.cloud_run_revision" && r.severity == 17, "{r:?}");
+        anyhow::ensure!(r.ts == 1_792_324_800_123_456_789, "{}", r.ts);
+        anyhow::ensure!(r.trace_id.is_some_and(|t| t[0] == 0x01 && t[15] == 0xef) && r.span_id == Some([0, 0, 0, 0, 0, 0, 0, 0x4a]), "{:?} {:?}", r.trace_id, r.span_id);
+        for want in [("gcp.log", "run.googleapis.com/stderr"), ("amount", "12"), ("retry", "false"), ("labels.instanceId", "00a"), ("gcp.resource.labels.service_name", "checkout")] {
+            anyhow::ensure!(r.attrs.iter().any(|(k, v)| k == want.0 && v == want.1), "{want:?} in {:?}", r.attrs);
+        }
+        anyhow::ensure!(!r.attrs.iter().any(|(k, _)| k == "nested"), "only top-level values");
+        anyhow::ensure!(record_of("p", &e, &[]).map(|x| x.0) == Some(id));
+        let audit: Value = serde_json::from_str(r#"{"logName":"projects/p/logs/cloudaudit.googleapis.com%2Factivity","resource":{"type":"gce_instance","labels":{"instance_id":"77"}},"timestamp":"2026-10-18T12:00:01Z","insertId":"b","protoPayload":{"methodName":"v1.compute.instances.delete","resourceName":"projects/p/zones/z/instances/vm"}}"#)?;
+        let (_, r) = record_of("p", &audit, &[]).ok_or_else(|| anyhow::anyhow!("no record"))?;
+        anyhow::ensure!(r.message == "v1.compute.instances.delete projects/p/zones/z/instances/vm" && r.host == "77" && r.service == "cloudaudit.googleapis.com/activity" && r.severity == 9, "{r:?}");
+        anyhow::ensure!(record_of("p", &serde_json::json!({"textPayload": "no time"}), &[]).is_none());
+        Ok(())
+    }
 
     #[test]
     fn types_are_named_as_their_service_and_path() {
@@ -842,7 +1016,7 @@ mod tests {
         let key = serde_json::json!({ "type": "service_account", "project_id": "p", "private_key_id": "k1", "private_key": pem, "client_email": "kiln@p.iam.gserviceaccount.com", "token_uri": "https://oauth2.googleapis.com/token" }).to_string();
         let Source::Account { email, key: pair, key_id, token_uri, project } = Source::of_key(&key)? else { anyhow::bail!("a service account") };
         anyhow::ensure!(project.as_deref() == Some("p"));
-        let jwt = assertion(&email, &pair, key_id.as_deref(), &token_uri, 1_800_000_000)?;
+        let jwt = assertion(&email, &pair, key_id.as_deref(), &token_uri, SCOPE, 1_800_000_000)?;
         let parts: Vec<&str> = jwt.split('.').collect();
         let [head, claims, sig] = parts.as_slice() else { anyhow::bail!("three parts") };
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;

@@ -196,9 +196,14 @@ const scenarios = {
       ],
     });
     expect(posted.status === 202, `posting the values: ${posted.status}`);
+    // Every bucket the hour has: a grid begins at a multiple of its step, so an hour can straddle two.
     await until(
       "all 2,400 counted",
-      async () => (await api("POST", "/api/observe/v1/query", { query: `count:${metric}{*}`, from: now - 3_600_000, to: now + 60_000, points: 1 })).body?.series?.[0]?.values?.[0] === 2400,
+      async () =>
+        ((await api("POST", "/api/observe/v1/query", { query: `count:${metric}{*}`, from: now - 3_600_000, to: now + 60_000, points: 1 })).body?.series?.[0]?.values ?? []).reduce(
+          (a, v) => a + (v ?? 0),
+          0,
+        ) === 2400,
     );
     const widget = (id, title, kind, query, y) => ({ id, title, kind, queries: [query], search: "", text: "", layout: { x: 0, y, w: 12, h: 4 }, options: { unit: "s" } });
     const d = await api("POST", "/api/observe/v1/dashboards", {
@@ -508,8 +513,9 @@ const scenarios = {
   /**
    * A cloud added from the form (a key that is not one refused; the server's own credentials tested,
    * the test saying why they are not there), and one the API made against a stand-in for CloudWatch
-   * shown pulling, edited without its secret (kept: the next pull is signed by its key), pulled now,
-   * and both removed.
+   * shown pulling, edited without its secret (kept: the next pull is signed by its key) and given
+   * log groups and a filter (the filter's field there once groups are), pulled now, its log records
+   * counted, and both removed.
    */
   async "a cloud is added, tested, edited keeping its secret, and removed"() {
     const http = await import("node:http");
@@ -524,6 +530,16 @@ const scenarios = {
         const q = JSON.parse(body || "{}");
         const minutes = [];
         for (let t = Math.ceil((q.StartTime ?? 0) / 60) * 60; t < (q.EndTime ?? 0); t += 60) minutes.push(t);
+        // CloudWatch Logs, as far as a pull asks it: a group, and three events matching ERROR.
+        if (target.startsWith("Logs_20140328.")) {
+          const now = Date.now();
+          const logs = target.endsWith("DescribeLogGroups")
+            ? { logGroups: [{ logGroupName: "/aws/lambda/e2e" }] }
+            : { events: q.filterPattern === "ERROR" ? [0, 1, 2].map((i) => ({ eventId: `e${i}`, logStreamName: "s", timestamp: now - 60_000 + i, message: `[ERROR] e2e ${i} failed` })) : [] };
+          res.writeHead(200, { "content-type": "application/x-amz-json-1.1" });
+          res.end(JSON.stringify(logs));
+          return;
+        }
         const out = target.endsWith("ListMetrics")
           ? { Metrics: [{ Namespace: "AWS/EC2", MetricName: "CPUUtilization", Dimensions: [{ Name: "InstanceId", Value: "i-e2e" }] }] }
           : {
@@ -567,6 +583,7 @@ const scenarios = {
         access_key_id: "AKIDE2E",
         secret_access_key: `secret-${run}`,
         endpoint,
+        logs_endpoint: endpoint.replace("/cw/", "/logs/"),
         interval_s: 300,
       });
       expect(made.status === 204, `the cloud made, got ${made.status}`);
@@ -576,13 +593,22 @@ const scenarios = {
       const edit = page.getByRole("dialog");
       await edit.getByText("Kept. Type a new one to replace it.").waitFor();
       await fillIn(edit.getByLabel("Every (seconds)"), "120");
+      expect((await edit.getByLabel("Log filter (optional)").count()) === 0, "no filter's field without log groups");
+      await fillIn(edit.getByLabel("Log groups", { exact: true }), "/aws/lambda/*");
+      await fillIn(edit.getByLabel("Log filter (optional)"), "ERROR");
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       const after = await until("saved", async () => (await clouds()).find((c) => c.name === name && c.interval_s === 120));
       expect(after.secret_access_key === "…" && after.endpoint === endpoint && after.access_key_id === "AKIDE2E", `its secret, key and endpoint kept: ${JSON.stringify(after)}`);
+      expect(
+        JSON.stringify(after.log_groups) === JSON.stringify(["/aws/lambda/*"]) && after.log_filter === "ERROR" && after.logs_endpoint === endpoint.replace("/cw/", "/logs/"),
+        `its log groups and filter saved, its logs' endpoint kept: ${JSON.stringify(after)}`,
+      );
       const calls = seen.length;
       await row.getByRole("button", { name: `Pull ${name} now`, exact: true }).click();
       await until("a pull after the change, signed by its key", async () => seen.length > calls && seen.slice(calls).every((s) => s.auth.includes("Credential=AKIDE2E/")));
       await until("pulling still", async () => (await clouds()).find((c) => c.name === name)?.status.state === "ok");
+      await until("its log records taken, once each", async () => (await clouds()).find((c) => c.name === name)?.status.records_total === 3, 30_000);
+      if (!phone) await until("its log records counted in its row", async () => /3 log records/.test((await row.textContent()) ?? ""), 30_000);
       for (const n of [name, `${name}-g`]) {
         await rowOf(n)
           .getByRole("button", { name: `Remove ${n}`, exact: true })
