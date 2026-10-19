@@ -336,6 +336,13 @@ impl Live {
         let _ = hub.send_to_agent(&self.machine, LANE_STREAM, &ServerMsg::StreamControl { stream: self.id.clone(), session: self.session.clone(), json: c.to_string() }).await;
     }
 
+    /// Its picture's codec (WebCodecs' string), as its last configuration said, else as it was
+    /// opened (H.264 unless it said otherwise).
+    pub fn codec(&self) -> String {
+        let said = self.video.lock().as_ref().and_then(|c| serde_json::from_slice::<Value>(c.get(12..)?).ok()).and_then(|v| v.get("codec").and_then(Value::as_str).map(str::to_owned));
+        said.or_else(|| self.spec.get("codec").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_owned)).unwrap_or_else(|| "h264".to_owned())
+    }
+
     /// What a viewer did, to its runner.
     pub async fn input(&self, hub: &Hub, events: &Value) {
         let _ = hub.send_to_agent(&self.machine, LANE_STREAM, &ServerMsg::StreamInput { stream: self.id.clone(), session: self.session.clone(), json: events.to_string() }).await;
@@ -470,6 +477,8 @@ mod tests {
         assert!(l.video.lock().as_ref().is_some_and(|c| c.ends_with(b"avc1.42E01f\"}")));
         assert!(l.audio.lock().as_ref().is_some_and(|c| c.ends_with(b"opus\"}")));
         assert!(l.said.lock().contains_key("navigated"));
+        assert_eq!(l.codec(), "avc1.42E01f");
+        assert_eq!(live("v9", "m1").codec(), "h264");
         // It closed on its machine: it's gone, and its viewers are told.
         r.event("m1", "v1", json!({"closed": {"why": "the page went away"}}).to_string());
         assert!(r.get("v1").is_none());

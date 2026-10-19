@@ -1551,7 +1551,7 @@ const FILES_EVERY: Duration = Duration::from_millis(250);
 /// sent, their contents on the server, the log having brought them back), then where the copy
 /// stands, for the machine it goes to to take the log that far before it goes on there. None: its
 /// folder isn't a synced copy here. An error, and it doesn't leave: it would leave work behind.
-async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<crate::sync::runner::Mark>, String> {
+async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<(crate::sync::runner::Mark, String)>, String> {
     let Some(sync) = crate::sync::runner::global() else { return Ok(None) };
     let folder = std::path::Path::new(cwd);
     let started = Instant::now();
@@ -1561,7 +1561,7 @@ async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<crate::syn
         let st = sync.standing(folder).await.unwrap_or_default();
         if looked.looked && looked.proposed == 0 && st.unsent == 0 && st.behind == 0 {
             left_behind(cwd, &st).await?;
-            return Ok(Some(crate::sync::runner::Mark { repo: looked.repo, index: st.reached }));
+            return Ok(Some((crate::sync::runner::Mark { repo: looked.repo, index: st.reached }, st.folder)));
         }
         let why = match (&st.error, st.connected) {
             (Some(e), _) => format!(" ({e})"),
@@ -1583,14 +1583,43 @@ async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<crate::syn
     }
 }
 
-/// Before a session leaves: its repository besides its files ([`super::gitstate`]), less what the
-/// machine it goes to has. None: its folder isn't a git repository. An error, and it doesn't
-/// leave: a merge or rebase under way there, or more unpushed commits than a move carries.
-async fn git_out(s: &Session, cwd: &str, to: &str, there: &str) -> Result<Option<super::gitstate::GitState>, String> {
-    let c = cwd.to_owned();
-    let Some(root) = crate::rt::blocking(move || super::gitstate::root_of(std::path::Path::new(&c))).await.ok().flatten() else { return Ok(None) };
-    moving_note(s, &format!("Moving to {to}: its repository's branches, stash and what's staged"));
-    let theirs = match their_tips(to, there).await {
+/// What a session's repository carries besides its synced files.
+#[derive(Default)]
+struct GitOut {
+    git: Option<super::gitstate::GitState>,
+    ignored: Option<super::carry::Carried>,
+    worktree: Option<super::worktree::Worktree>,
+}
+
+/// Before a session leaves: its repository besides its files, less what the machine it goes to
+/// has: its branches, stash and what's staged ([`super::gitstate`]), and the files git ignores
+/// ([`super::carry`]); or, working in a worktree inside the synced repository, that worktree
+/// ([`super::worktree`]). `copy`: the synced folder it's in; `there`: its folder over there. An
+/// error, and it doesn't leave: something would be left behind.
+async fn git_out(s: &Session, cwd: &str, copy: &str, to: &str, there: &str) -> Result<GitOut, String> {
+    let (c, k) = (cwd.to_owned(), copy.to_owned());
+    let (root, nested) = crate::rt::blocking(move || {
+        let here = std::path::Path::new(&c);
+        (super::gitstate::root_of(here), super::worktree::nested(here, std::path::Path::new(&k)))
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    let Some(root) = root else { return Ok(GitOut::default()) };
+    moving_note(s, &format!("Moving to {to}: its repository's branches, stash, what's staged and what git ignores"));
+    // Its copy over there answers for what it has: the folder it goes on in, or, for a worktree
+    // that isn't there yet, the repository it's made in.
+    let ask = match &nested {
+        Some(super::worktree::Nested::Worktree { .. }) => {
+            let depth = std::path::Path::new(cwd).strip_prefix(copy).map_or(0, |r| r.components().count());
+            let mut p = std::path::PathBuf::from(there);
+            for _ in 0..depth {
+                p.pop();
+            }
+            p.to_string_lossy().into_owned()
+        }
+        _ => there.to_owned(),
+    };
+    let theirs = match their_tips(to, &ask).await {
         Some(t) => t,
         // Not told: what was pushed, it likely has.
         None => {
@@ -1598,7 +1627,21 @@ async fn git_out(s: &Session, cwd: &str, to: &str, there: &str) -> Result<Option
             crate::rt::blocking(move || super::gitstate::pushed(&r)).await.unwrap_or_default()
         }
     };
-    crate::rt::blocking(move || super::gitstate::capture(&root, &theirs)).await.map_err(|e| format!("{e:#}"))?.map(Some)
+    let c = cwd.to_owned();
+    crate::rt::blocking(move || -> Result<GitOut, String> {
+        match nested {
+            Some(super::worktree::Nested::Worktree { root: w, rel }) => {
+                let git = super::gitstate::capture(&w, &theirs)?;
+                let mut wt = super::worktree::capture(&w, &rel)?;
+                wt.sub = std::path::Path::new(&c).strip_prefix(&w).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                Ok(GitOut { git: Some(git), ignored: None, worktree: Some(wt) })
+            }
+            Some(super::worktree::Nested::Own(p)) => Err(format!("its folder is in {}, a repository of its own inside the synced one (or a submodule), whose files sync doesn't carry: commit and push its work, and it moves", p.display())),
+            None => Ok(GitOut { git: Some(super::gitstate::capture(&root, &theirs)?), ignored: Some(super::carry::ignored(&root)?), worktree: None }),
+        }
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?
 }
 
 /// What the copy of the folder on machine `to` (at `there`) has at the tips of its refs, as it
@@ -1636,11 +1679,40 @@ async fn git_in(s: &Session, sink: &Sink, files: &Files) {
     let path = super::moving::moved_git(&files.dir);
     let Ok(bytes) = std::fs::read(&path) else { return };
     let cwd = s.core.lock().state.cwd.clone();
+    // The synced folder a worktree goes in: the copy its folder here is in.
+    let copy = match crate::sync::runner::global() {
+        Some(sync) => sync.standing(std::path::Path::new(&cwd)).await.map(|st| st.folder),
+        None => None,
+    };
     let said = crate::rt::blocking(move || -> Vec<String> {
         let Ok(kept) = serde_json::from_slice::<super::moving::MovedGit>(&bytes) else { return vec!["Its repository's state from the machine it left couldn't be read".into()] };
+        if let Some(w) = &kept.worktree {
+            let copy = copy.map(std::path::PathBuf::from).or_else(|| {
+                // Without sync's word: its folder less the worktree's place in the repository.
+                let up = std::path::Path::new(&w.rel).components().count() + std::path::Path::new(&w.sub).components().count();
+                std::path::Path::new(&cwd).ancestors().nth(up).map(std::path::Path::to_path_buf)
+            });
+            let Some(copy) = copy else { return vec![format!("Its worktree couldn't be made here: no copy of its repository holds {cwd}")] };
+            if let Err(e) = super::gitstate::fetch(&copy, &kept.state, &kept.from) {
+                return vec![format!("Its worktree couldn't be made here ({e}); it stays on {}", kept.from)];
+            }
+            return match super::worktree::place(&copy, w, &kept.from) {
+                Ok((at, mut said)) => {
+                    said.extend(super::gitstate::restore_at(&copy, &at, &kept.state, &kept.from));
+                    said
+                }
+                Err(e) => vec![format!("Its worktree couldn't be made here ({e}); it stays on {}", kept.from)],
+            };
+        }
         match super::gitstate::root_of(std::path::Path::new(&cwd)) {
-            Some(root) => super::gitstate::restore(&root, &kept.state, &kept.from),
-            None => vec![format!("Its folder here, {cwd}, isn't a git repository, so its branches and stash stay on {}", kept.from)],
+            Some(root) => {
+                let mut said = super::gitstate::restore(&root, &kept.state, &kept.from);
+                if let Some(ig) = &kept.ignored {
+                    said.extend(super::carry::place(&root, ig, &kept.from));
+                }
+                said
+            }
+            None => vec![format!("Its folder here, {cwd}, isn't a git repository, so its branches, stash and the files git ignores stay on {}", kept.from)],
         }
     })
     .await
@@ -1657,21 +1729,15 @@ async fn git_in(s: &Session, sink: &Sink, files: &Files) {
 }
 
 /// What of a session's folder sync doesn't carry, and would be left behind: then it doesn't move.
-/// A git worktree, or a repository of its own, inside the synced one (sync carries the outer one's
-/// files, never a nested repository's), and files too big for sync.
+/// A repository of its own nested inside the synced one, or a submodule (sync carries the outer
+/// one's files, never a nested repository's; a worktree of the same repository moves with the
+/// session, [`super::worktree`]), and files too big for sync.
 async fn left_behind(cwd: &str, st: &crate::sync::runner::Standing) -> Result<(), String> {
     let (c, copy) = (cwd.to_owned(), st.folder.clone());
-    let nested = crate::rt::blocking(move || {
-        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let copy = canon(std::path::Path::new(&copy));
-        super::gitstate::root_of(std::path::Path::new(&c)).map(|r| canon(&r)).filter(|r| *r != copy && r.starts_with(&copy))
-    })
-    .await
-    .ok()
-    .flatten();
-    if let Some(inner) = nested {
+    let nested = crate::rt::blocking(move || super::worktree::nested(std::path::Path::new(&c), std::path::Path::new(&copy))).await.ok().flatten();
+    if let Some(super::worktree::Nested::Own(inner)) = nested {
         return Err(format!(
-            "its folder is in {}, a git worktree (or a repository of its own) inside {}: sync carries {}'s files and not its, so its work would be left behind. Commit and push it, or move it into the repository, and it moves",
+            "its folder is in {}, a repository of its own inside {} (or a submodule): sync carries {}'s files and not its, so its work would be left behind. Commit and push it, and it moves",
             inner.display(),
             st.folder,
             st.folder
@@ -1824,13 +1890,18 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
     // Its folder's last changes go first, so it goes on there from them; then its repository's
     // state besides its files (only a synced folder's: there's a repository there to take it).
     let synced = files_out(s, &from_cwd, &mv.to).await?;
-    let git = if synced.is_some() { git_out(s, &from_cwd, &mv.to, &mv.cwd).await? } else { None };
+    let out = match &synced {
+        Some((_, copy)) => git_out(s, &from_cwd, copy, &mv.to, &mv.cwd).await?,
+        None => GitOut::default(),
+    };
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
     pkg.picks_up = mv.picks_up || cut;
-    pkg.synced = synced;
-    pkg.git = git;
+    pkg.synced = synced.map(|(m, _)| m);
+    pkg.git = out.git;
+    pkg.ignored = out.ignored;
+    pkg.worktree = out.worktree;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
     reach.adopt(&mv.to, &bytes).await

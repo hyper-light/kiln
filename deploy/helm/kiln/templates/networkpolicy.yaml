@@ -44,6 +44,12 @@ spec:
         - port: {{ .Values.ports.quic }}
           protocol: UDP
     {{- end }}
+    {{- if .Values.ports.webrtc }}
+    # WebRTC: live pages' viewers, wherever they are.
+    - ports:
+        - port: {{ .Values.ports.webrtc }}
+          protocol: UDP
+    {{- end }}
 {{- if .Values.networkPolicy.isolateJobs }}
 ---
 # Job pods only dial out (to the kiln server, registries, git remotes); nothing dials in.

@@ -265,21 +265,22 @@ impl Host {
         }
         let mut pkg = pkg;
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
-        // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home.
+        // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home. A
+        // worktree it brings is made once its repository's files are here.
         let mut note = None;
-        if !std::path::Path::new(&cwd).is_dir() {
+        if !std::path::Path::new(&cwd).is_dir() && pkg.worktree.is_none() {
             note = Some(format!("{cwd} isn't on this machine, so it works in the home folder"));
             cwd = session::resolve_cwd(None);
             pkg.spec.cwd = Some(cwd.clone());
         }
         let items = super::moving::install(&pkg, &cwd)?;
-        // Its repository's state, kept on disk until its files are here (a restart keeps it too).
+        // Its repository's state, the files git ignores and its worktree, kept on disk until its
+        // files are here (a restart keeps them too), readable by this user alone: they may hold
+        // secrets.
         if let Some(g) = pkg.git.take() {
             let dir = self.files_dir.join(&pkg.id);
-            let kept = super::moving::MovedGit { from: pkg.from.clone(), state: g };
-            std::fs::create_dir_all(&dir)
-                .and_then(|()| std::fs::write(super::moving::moved_git(&dir), serde_json::to_vec(&kept).unwrap_or_default()))
-                .map_err(|e| format!("keeping its repository's state: {e}"))?;
+            let kept = super::moving::MovedGit { from: pkg.from.clone(), state: g, ignored: pkg.ignored.take(), worktree: pkg.worktree.take() };
+            std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| format!("keeping its repository's state: {e}"))?;
         }
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced };
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))

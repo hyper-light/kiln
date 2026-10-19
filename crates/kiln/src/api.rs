@@ -3690,6 +3690,12 @@ async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
 /// stream's chunks (binary, as its runner sent them: `crate::browser::stream::frame`) and events
 /// (text, JSON); it sends `{"input": [...]}` (what its person does) and `{"control": {...}}`
 /// (resize, pause, keyframe, go, reload, back, forward).
+///
+/// With the server's WebRTC on (`crate::harness::webrtc`) it's told `{"webrtc": {"can": true}}`,
+/// and may send `{"webrtc": {"offer": sdp}}`, answered `{"webrtc": {"answer": sdp}}` (or
+/// `{"error"}`); once its peer shows the stream it sends `{"webrtc": {"playing": true}}` and the
+/// chunks go to the peer alone, until it says `{"playing": false}` or `{"close": true}`, or the
+/// peer goes (`{"webrtc": {"gone": why}}`).
 fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
     let me = person(&req);
     let live = hub.harness.streams.get(sid).filter(|l| l.session == id && l.for_whom(me.as_deref())).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
@@ -3705,34 +3711,116 @@ fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
 
 async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, socket: ws::WebSocket) -> anyhow::Result<()> {
     use crate::harness::streams::ToViewer;
+    use crate::harness::webrtc::{Peer, Said};
     use futures::FutureExt as _;
+    /// A key frame asked for a peer's loss at most this often.
+    const KEY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    enum Next {
+        Socket(Option<Result<Message, tungstenite::Error>>),
+        Said(Option<Said>),
+        Stream(Result<ToViewer, async_channel::RecvError>),
+    }
     let (mut tx, mut rx) = socket.split();
     let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
+    let rtc = &hub.harness.webrtc;
+    // The viewer's WebRTC peer, and whether it shows the stream (its chunks then go there alone).
+    let mut peer: Option<Peer> = None;
+    let mut playing = false;
+    let mut keyed: Option<std::time::Instant> = None;
     let r: anyhow::Result<()> = async {
+        if rtc.on() {
+            tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
+        }
         loop {
-            futures::select_biased! {
-                m = rx.next().fuse() => match m {
-                    Some(Ok(Message::Text(t))) => {
-                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
-                        if let Some(events) = v.get("input").filter(|e| e.is_array()) {
-                            live.input(&hub, events).await;
-                        }
-                        if let Some(c) = v.get("control").filter(|c| c.is_object()) {
-                            live.control(&hub, c).await;
-                        }
+            let next = {
+                let said = async {
+                    match &peer {
+                        Some(p) => p.said.recv().await.ok(),
+                        None => futures::future::pending().await,
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                    _ => {}
-                },
-                m = from_stream.recv().fuse() => match m {
-                    Ok(ToViewer::Chunk(b)) => tx.send(ws::binary(b)).await?,
-                    Ok(ToViewer::Event(e)) => tx.send(ws::text(e)).await?,
-                    Err(_) => return Ok(()),
-                },
+                };
+                futures::select_biased! {
+                    m = rx.next().fuse() => Next::Socket(m),
+                    s = said.fuse() => Next::Said(s),
+                    m = from_stream.recv().fuse() => Next::Stream(m),
+                }
+            };
+            match next {
+                Next::Socket(Some(Ok(Message::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
+                    if let Some(events) = v.get("input").filter(|e| e.is_array()) {
+                        live.input(&hub, events).await;
+                    }
+                    if let Some(c) = v.get("control").filter(|c| c.is_object()) {
+                        live.control(&hub, c).await;
+                    }
+                    let Some(w) = v.get("webrtc") else { continue };
+                    let was = playing;
+                    if let Some(sdp) = w.get("offer").and_then(serde_json::Value::as_str) {
+                        // A new peer, in place of one there was.
+                        peer = None;
+                        playing = false;
+                        let said = match rtc.offer(&live.codec(), sdp) {
+                            Ok((p, answer)) => {
+                                peer = Some(p);
+                                serde_json::json!({"webrtc": {"answer": answer}})
+                            }
+                            Err(e) => serde_json::json!({"webrtc": {"error": format!("{e:#}")}}),
+                        };
+                        tx.send(ws::text(said.to_string())).await?;
+                    }
+                    if let Some(on) = w.get("playing").and_then(serde_json::Value::as_bool) {
+                        playing = on && peer.is_some();
+                    }
+                    if w.get("close").and_then(serde_json::Value::as_bool) == Some(true) {
+                        peer = None;
+                        playing = false;
+                    }
+                    // Back on this socket: its decoder starts again from a key frame.
+                    if was && !playing {
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                }
+                Next::Socket(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => return Ok(()),
+                Next::Socket(_) => {}
+                // Connected, it starts from a key frame; one lost, a key frame mends it.
+                Next::Said(Some(Said::Connected)) => {
+                    keyed = Some(std::time::Instant::now());
+                    live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                }
+                Next::Said(Some(Said::Keyframe)) => {
+                    if keyed.is_none_or(|k| k.elapsed() >= KEY_EVERY) {
+                        keyed = Some(std::time::Instant::now());
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                }
+                Next::Said(gone) => {
+                    let why = match gone {
+                        Some(Said::Gone(why)) => why,
+                        _ => "WebRTC stopped on this server".to_owned(),
+                    };
+                    peer = None;
+                    if playing {
+                        playing = false;
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                    tx.send(ws::text(serde_json::json!({"webrtc": {"gone": why}}).to_string())).await?;
+                }
+                Next::Stream(Ok(ToViewer::Chunk(b))) => {
+                    if let Some(p) = &peer {
+                        p.chunk(&b);
+                    }
+                    if !playing {
+                        tx.send(ws::binary(b)).await?;
+                    }
+                }
+                Next::Stream(Ok(ToViewer::Event(e))) => tx.send(ws::text(e)).await?,
+                Next::Stream(Err(_)) => return Ok(()),
             }
         }
     }
     .await;
+    drop(peer);
     hub.harness.streams.leave(&hub, &live, me).await;
     r
 }
