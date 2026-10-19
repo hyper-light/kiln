@@ -457,13 +457,23 @@ impl LogStore {
     /// Every record in `[from, to]` (ns) that `search` matches, to `f`, across the head, sealed
     /// blocks and files (blocks a search rules out are never read); the rows read and the blocks
     /// ruled out.
-    fn each_match(&self, search: &Search, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>) -> Result<(), AggregateError>) -> Result<(u64, u64), AggregateError> {
+    /// Every record in `[from, to]` (ns) of every head segment, sealed block and file, in no order,
+    /// handed to `f`: one at a time, none kept.
+    pub fn each_record(&self, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>)) -> Result<(), LogStoreError> {
+        self.each_match(&Search::all(), from, to, |r| {
+            f(r);
+            Ok::<(), LogStoreError>(())
+        })
+        .map(|_| ())
+    }
+
+    fn each_match<E: From<LogStoreError>>(&self, search: &Search, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<(u64, u64), E> {
         let (mut rows_scanned, mut blocks_pruned) = (0u64, 0u64);
         if to < from {
             return Ok((0, 0));
         }
         let mut scratch = RowScratch::default();
-        let mut row = |r: &RecordRef<'_>, rows_scanned: &mut u64| -> Result<(), AggregateError> {
+        let mut row = |r: &RecordRef<'_>, rows_scanned: &mut u64| -> Result<(), E> {
             *rows_scanned += 1;
             if r.ts < from || r.ts > to || !search.row(r, &mut scratch) {
                 return Ok(());
@@ -534,7 +544,7 @@ impl LogStore {
             for (g, f) in gs.iter_mut().zip(facets) {
                 g.take(r, std::slice::from_ref(f), &Measure::Count, 0, MAX_GROUPS)?;
             }
-            Ok(())
+            Ok::<(), AggregateError>(())
         })?;
         let facets = gs
             .into_iter()

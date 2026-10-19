@@ -1456,12 +1456,14 @@ impl Store {
             d = d.wrapping_add(term);
         }
         if full {
-            let all = crate::logs::search::Search::all();
-            for r in self.search_logs(&all, i64::MIN, i64::MAX, usize::MAX)?.records {
-                let mut row = Vec::new();
-                crate::logs::record::put_row(&mut row, &r, 0);
+            // Every record since the logs' cutoff, visited (a sum's terms: in no order, none kept),
+            // each as its own row.
+            let mut row = Vec::new();
+            self.logs.each_record(self.logs_cutoff.saturating_mul(1_000_000), i64::MAX, |r| {
+                row.clear();
+                crate::logs::record::put_row_ref(&mut row, r, 0);
                 d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)));
-            }
+            })?;
         }
         Ok(d)
     }

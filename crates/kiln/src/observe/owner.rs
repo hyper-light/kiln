@@ -184,6 +184,8 @@ enum Input {
     /// Take the full digest, and on the server ask every replica for theirs.
     Verify,
     Verified { at: u64, digest: u64 },
+    /// The full digest could not be taken.
+    DigestFailed,
     /// The server's scrape targets, all of them: each runner is told those it reads.
     Scrapes(Vec<(String, super::scrape::Target)>),
     /// The server's log sources, all of them: as scrape targets.
@@ -611,6 +613,10 @@ struct Owner {
     disk_low: bool,
     compact_asked: bool,
     verified: Option<(u64, u64)>,
+    /// A full digest being taken (one at a time: it reads the whole replica), and whether another
+    /// was asked for meanwhile (taken once it is done, so the asker gets one of now).
+    digesting: bool,
+    digest_again: bool,
     /// When the replica asks to be driven again though nothing arrives (ns since `start`).
     wake_at: Option<u64>,
     // The server's.
@@ -675,6 +681,8 @@ impl Owner {
             disk_low: false,
             compact_asked: false,
             verified: None,
+            digesting: false,
+            digest_again: false,
             wake_at: None,
             members: Members::default(),
             up: HashSet::new(),
@@ -887,8 +895,18 @@ impl Owner {
                     }
                 }
             }
+            Input::DigestFailed => {
+                self.digesting = false;
+                if std::mem::take(&mut self.digest_again) {
+                    self.digest_full();
+                }
+            }
             Input::Verified { at, digest } => {
                 self.verified = Some((at, digest));
+                self.digesting = false;
+                if std::mem::take(&mut self.digest_again) {
+                    self.digest_full();
+                }
                 // A runner says so at once.
                 if !self.is_server() && self.server_up {
                     let status = self.status();
@@ -1312,16 +1330,22 @@ impl Owner {
     /// The full digest of the replica, taken on a thread of its own under the store's read lock
     /// (a read of everything), said when it is done.
     fn digest_full(&mut self) {
+        if self.digesting {
+            self.digest_again = true;
+            return;
+        }
         let Some(rep) = &self.rep else { return };
         let (store, input) = (rep.r.machine().shared(), self.input.clone());
         let spawned = std::thread::Builder::new().name("kiln-observe-digest".into()).spawn(move || {
             let s = store.read().unwrap_or_else(PoisonError::into_inner);
-            if let Ok(digest) = s.digest(true) {
-                let _ = input.send(Input::Verified { at: s.applied(), digest });
-            }
+            let _ = input.send(match s.digest(true) {
+                Ok(digest) => Input::Verified { at: s.applied(), digest },
+                Err(_) => Input::DigestFailed,
+            });
         });
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "observe's digest did not start");
+        match spawned {
+            Ok(_) => self.digesting = true,
+            Err(e) => tracing::warn!(error = %e, "observe's digest did not start"),
         }
     }
 

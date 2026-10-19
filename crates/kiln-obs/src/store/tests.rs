@@ -751,6 +751,72 @@ fn a_digest_tells_apart_stores_that_differ_in_any_sample_or_record() {
     assert_ne!(a.digest(true).unwrap(), c.digest(true).unwrap());
 }
 
+/// The full digest as it was before records were visited one at a time (gathered by a search,
+/// newest first): what a replica of an older version says.
+fn digest_before(st: &Store) -> u64 {
+    let mix = |x: u64| {
+        let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut d = mix(st.cutoff as u64).wrapping_add(mix(st.logs_cutoff as u64 ^ 0x1)).wrapping_add(mix(st.max_series ^ 0x2));
+    for (sender, s) in &st.sessions {
+        d = d.wrapping_add(mix(mix(*sender) ^ s.seq));
+    }
+    let mut scratch = Scratch::default();
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    for id in 0..st.index.len() as u32 {
+        let Some(fp) = st.index.fp(id) else { continue };
+        let last = st.last.get(id as usize).copied().unwrap_or(i64::MIN);
+        let mut term = mix(fp ^ mix(last as u64));
+        ts.clear();
+        vs.clear();
+        st.read_with(id, i64::MIN, i64::MAX, &mut scratch, &mut ts, &mut vs).unwrap();
+        for (&t, &v) in ts.iter().zip(&vs) {
+            term = mix(term ^ mix(t as u64) ^ v.to_bits());
+        }
+        d = d.wrapping_add(term);
+    }
+    let all = crate::logs::search::Search::all();
+    for r in st.search_logs(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records {
+        let mut row = Vec::new();
+        crate::logs::record::put_row(&mut row, &r, 0);
+        d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)));
+    }
+    d
+}
+
+/// A full digest visits each record once and keeps none (a store of millions of records took a
+/// search of all of them, sorted as it went, before: hours); its sum is the one of before, so
+/// replicas of two versions agree.
+#[test]
+fn a_full_digest_visits_each_record_and_sums_as_before() {
+    for seed in 0..20 {
+        let entries = stream(seed, 150);
+        let mut a = Store::new(Keyed::with_keys(1, 1));
+        apply_at(&mut a, &entries, 0, entries.len());
+        let mut rng = Rng::new(seed);
+        let mut bld = Builder::new();
+        let records: Vec<Record> = (0..500)
+            .map(|i| Record {
+                // Some before the cutoff, some at one time, attributes and ids now and then.
+                ts: (a.logs_cutoff() + rng.below(1_000) as i64 - 100) * 1_000_000 + (i % 7),
+                severity: (rng.below(24) + 1) as u8,
+                service: format!("svc{}", rng.below(4)),
+                host: "h".into(),
+                message: format!("record {i} {}", rng.below(1_000_000)),
+                attrs: (0..rng.below(4)).map(|k| (format!("k{k}"), format!("v{}", rng.below(9)))).collect(),
+                trace_id: (i % 11 == 0).then_some([7; 16]),
+                ..Record::default()
+            })
+            .collect();
+        bld.logs(&records);
+        a.apply(&bld.finish()).unwrap();
+        assert_eq!(a.digest(true).unwrap(), digest_before(&a), "seed {seed}");
+    }
+}
+
 #[test]
 fn a_rewrite_planned_before_an_install_is_not_taken_in_after() {
     let entries = stream(7, 200);

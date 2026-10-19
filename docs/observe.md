@@ -1960,6 +1960,19 @@ the server's highest 94 MiB in the second third and 95 in the last; a request p5
 ms; a dashboard query p50 7.9 ms, p99 349 ms (every host's 15 minutes, read raw: some 60 M points;
 a rollup tier, as Datadog keeps, is what would make it fast).
 
+Two hours (`KOBS_SOAK_SECS=7200`, a release build, 2026-10-18 on a 32-thread Linux machine of the
+fleet): 1,439,493,000 points and 14.4 M records, every one stored once, none dropped. The server
+held 257–258 MiB resident (204–205 anonymous) from its first hour to its last, the runner 141
+(102); where the server's memory lay, said every ten minutes, did not move: its heap 1 MiB, the C
+library's 33 arenas 158–169 MiB (the largest 50), the rest 39–41. The same two hours in a debug
+build climbed to 785 MiB: a slower server's backlogs, not a leak. The run found two faults in its
+last check, the replicas compared: a full digest gathered every record with a search, sorted as it
+went (14.4 M of them: hours, and gigabytes), and each request for one started another beside those
+still running. A digest now visits each record once and keeps none (the same sum, so replicas of
+two versions agree: a test against the digest of before), one at a time a replica, a request
+meanwhile answered by the next. It still holds the replica's writes while it reads (some seconds a
+billion samples): an operator's check, not a routine.
+
 What floods leave (§12.11) is a high-water mark, not a leak: after one, the server held some 300 MiB
 more than before, most of it in the C library's per-thread arenas (32 of them, from
 `/proc/<pid>/smaps`), while its store held under 15 MiB; `GLIBC_TUNABLES=glibc.malloc.arena_max=2`
