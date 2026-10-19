@@ -12,7 +12,7 @@ import "./harness.css";
 import "./console.css";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import { harnessApi, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
+import { sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loading } from "@/components/ui/loading";
@@ -36,6 +36,7 @@ import { Timeline } from "./timeline";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
+import { useEndWithChildren } from "./family";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -201,9 +202,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     else showTools();
   };
 
+  // Ending it ends the agents it started too, unless the dialog says otherwise.
+  const ending = useEndWithChildren(id);
   const stop = async () => {
     try {
-      await harnessApi.stop(id);
+      await ending.end();
       navigate("/agents");
     } catch (e) {
       toast.error("Couldn't stop the agent", errorMessage(e));
@@ -342,7 +345,12 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
         open={confirmStop}
         onOpenChange={setConfirmStop}
         title="End this agent?"
-        description="Its process stops on the machine. Its changes stay on disk; the conversation can be resumed later from its harness."
+        description={
+          <>
+            Its process stops on the machine. Its changes stay on disk; the conversation can be resumed later from its harness.
+            {confirmStop && ending.note}
+          </>
+        }
         confirmLabel="End agent"
         danger
         onConfirm={stop}

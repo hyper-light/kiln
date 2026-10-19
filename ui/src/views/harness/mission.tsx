@@ -29,6 +29,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
+import { Families, families } from "./family";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 
@@ -120,7 +121,7 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
 }
 
 /** A row re-renders only when its own agent changes (or is selected); its clock counts by itself. */
-const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void }) {
+const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void; of?: string }) {
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   const ap = a.approvals[0];
@@ -149,7 +150,10 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
         </div>
       ) : (
         <button type="button" className="ms-main" onClick={open}>
-          <span className="ms-name">{label}</span>
+          <span className="ms-name">
+            {label}
+            {of && <span className="ms-of">started by {of}</span>}
+          </span>
           {line}
         </button>
       )}
@@ -496,9 +500,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           </div>
           {live.length > 0 ? (
             <ul className="ms-list">
-              {live.map(({ a, stand }) => (
-                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
-              ))}
+              <Families items={families(live, list)} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
             </ul>
           ) : filtered && ended.length === 0 ? (
             <p className="ms-quiet">
