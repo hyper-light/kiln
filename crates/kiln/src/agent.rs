@@ -842,6 +842,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
     let harness = (!o.ephemeral && o.terminal).then(|| {
+        // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
+        crate::workspace::slates::init(&o.state_dir);
         convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
@@ -1798,7 +1800,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         spec.env = env;
                                     }
                                 }
-                                h.open(Some(session.clone()), spec).map(|_| ())
+                                if crate::workspace::needs_preparing(&spec) {
+                                    // Its workspace first (a volume made and mounted), off this loop: then it starts there.
+                                    let (h, up, session, json) = (Arc::clone(h), uplink.0.clone(), session.clone(), json.clone());
+                                    crate::rt::spawn(async move {
+                                        let opened = match crate::workspace::prepare(&mut spec, &session).await {
+                                            Ok(()) => h.open(Some(session.clone()), spec).map(|_| ()),
+                                            Err(e) => Err(e.context("its workspace")),
+                                        };
+                                        if let Err(e) = opened {
+                                            for u in crate::harness::host::refusal(&session, &json, &format!("{e:#}")) {
+                                                if let Ok(json) = serde_json::to_string(&u) {
+                                                    up.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                                }
+                                            }
+                                        }
+                                    });
+                                    Ok(())
+                                } else {
+                                    h.open(Some(session.clone()), spec).map(|_| ())
+                                }
                             }
                         };
                         if let Err(e) = opened {
@@ -2107,11 +2128,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // About one of this machine's agents' folders: the session says which, so
                         // a question can only be about a folder an agent here works in.
                         let up = uplink.0.clone();
-                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| std::path::PathBuf::from(s.info().cwd));
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
+                            let ws = s.spec.lock().workspace.clone();
+                            (std::path::PathBuf::from(s.info().cwd), ws)
+                        });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some(cwd) => crate::workspace::serve(&cwd, &json).await,
+                                Some((cwd, ws)) => crate::workspace::serve(&cwd, ws.as_ref(), &json).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });

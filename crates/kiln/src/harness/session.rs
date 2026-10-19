@@ -79,6 +79,10 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// Where it works when not in its folder itself: a Slates volume of its own laid over the
+    /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::Workspace>,
 }
 
 fn yes() -> bool {
@@ -111,6 +115,7 @@ impl Default for Spec {
             reach: None,
             parent: None,
             plan_run: None,
+            workspace: None,
         }
     }
 }
@@ -235,6 +240,9 @@ pub struct Info {
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_bypass: bool,
+    /// Its workspace of its own, when it has one (as `Spec::workspace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::Workspace>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -753,6 +761,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
         no_bypass: !spec.allow_bypass,
+        workspace: spec.workspace.clone(),
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -2584,6 +2593,7 @@ mod tests {
             parent: None,
             plan_run: None,
             no_bypass: false,
+            workspace: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

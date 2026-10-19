@@ -360,6 +360,9 @@ impl Host {
         let found = s.is_some();
         if let Some(s) = s {
             s.close();
+            // A workspace of its own ends with it.
+            let spec = s.spec.lock().clone();
+            crate::workspace::release(&spec);
             // Its attachments go with it.
             let dir = self.files_dir.join(id);
             crate::rt::spawn(async move {
@@ -846,6 +849,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
         no_bypass: !spec.allow_bypass,
+        workspace: spec.workspace.clone(),
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]

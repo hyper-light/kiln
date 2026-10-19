@@ -19,6 +19,7 @@ import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
 import { ChangeBar } from "./change-bar";
+import { WorkspaceBar } from "./workspace-bar";
 
 const NO_EVENTS: HEvent[] = [];
 
@@ -38,17 +39,37 @@ function fromServer(files: ServerChange[]): FileChange[] {
   }));
 }
 
-/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them. */
-export const Changes = React.memo(function Changes({ events, changes, cwd, agentId }: { events: HEvent[]; changes: ServerChange[] | null; cwd: string; agentId?: string }) {
+/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them, and `volumeOver`, the folder its workspace of its own is laid over. */
+export const Changes = React.memo(function Changes({
+  events,
+  changes,
+  cwd,
+  agentId,
+  volumeOver,
+}: {
+  events: HEvent[];
+  changes: ServerChange[] | null;
+  cwd: string;
+  agentId?: string;
+  volumeOver?: string;
+}) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
   const [sel, setSel] = React.useState<string | null>(null);
   const shown: FileChange[] = sel ? files.filter((f) => f.path === sel) : files;
   const add = files.reduce((n, f) => n + f.add, 0);
   const del = files.reduce((n, f) => n + f.del, 0);
-  if (files.length === 0) return <div className="hx-empty">No changes yet.</div>;
+  const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
+  if (files.length === 0)
+    return (
+      <div className="hx-changes">
+        {wsBar}
+        <div className="hx-empty">No changes yet.</div>
+      </div>
+    );
   return (
     <div className="hx-changes">
+      {wsBar}
       {agentId && (
         <Loadable label="Loading its change request" fallback={<div className="hx-change-bar" aria-busy="true" />}>
           <ChangeBar agentId={agentId} />
@@ -275,6 +296,8 @@ export function Inspector({
 }) {
   const events = useSession(store, (s) => s.events);
   const changes = useSession(store, (s) => s.changes);
+  // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
+  const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
@@ -306,7 +329,7 @@ export function Inspector({
         ))}
       </div>
       <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} />}
+        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} />}
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
