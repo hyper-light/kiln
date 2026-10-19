@@ -11,6 +11,7 @@ import { Link, useSearchParams } from "@/lib/router";
 import { Rocket } from "lucide-react";
 
 import { appHref, cdApi, newAppHref, plansHref, type CdFilters, type CdSort } from "@/api/cd";
+import { boardHref } from "@/api/deploy";
 import { useServerEvents } from "@/api/events";
 import type { CdApp, CdFacets, CdSummary } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -145,6 +146,9 @@ export default function Deployments() {
         lead="What git says, and what runs: every app's sync and health, live."
         actions={
           <>
+            <Button asChild size="sm" variant="secondary">
+              <Link to={boardHref}>Releases</Link>
+            </Button>
             <Button asChild size="sm" variant="secondary">
               <Link to={plansHref}>Plan a deploy</Link>
             </Button>

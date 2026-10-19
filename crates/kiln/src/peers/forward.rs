@@ -143,7 +143,7 @@ impl Forwarder {
         let r = if crate::http::ws::is_upgrade(&req) { forward_ws(live, req, &grant).await } else { forward_http(live, req, &grant).await };
         r.unwrap_or_else(|e| {
             tracing::debug!(peer = %live.route.name, error = %format!("{e:#}"), "forwarding to a peered cluster failed");
-            srv::text(StatusCode::BAD_GATEWAY, &format!("{} didn't answer: {e:#}", live.route.name))
+            srv::text(StatusCode::BAD_GATEWAY, &unanswered(&live.route, &format!("{e:#}")))
         })
     }
 
@@ -181,6 +181,17 @@ impl Forwarder {
         }
         r
     }
+}
+
+/// What the frame says when the peer didn't answer: why, and the fix when it's a known one.
+fn unanswered(route: &Route, error: &str) -> String {
+    let name = &route.name;
+    // TLS spoken to a port that answers plain HTTP (a kiln server's own port, without HTTPS on).
+    if route.url.starts_with("https://") && (error.contains("InvalidContentType") || error.contains("corrupt message")) {
+        let plain = route.url.replacen("https://", "http://", 1);
+        return format!("{name} didn't answer over HTTPS: {} answers plain HTTP. Change its address to {plain} (Clusters → {name} → Change address).", route.url);
+    }
+    format!("{name} didn't answer: {error}")
 }
 
 /// The cookie holding a peer's grant at its address (per peer: addresses by port share a host's
@@ -410,6 +421,14 @@ mod tests {
         assert_eq!(f.slug_of_port(7170).as_deref(), Some("work"));
         assert_eq!(f.slug_of_port(0), None);
         Ok(())
+    }
+
+    #[test]
+    fn https_to_plain_http_says_how_to_fix_it() {
+        let r = Route { name: "work".into(), url: "https://192.168.1.70:7070".into(), ..Route::default() };
+        let said = unanswered(&r, "TLS to 192.168.1.70: received corrupt message of type InvalidContentType");
+        assert!(said.contains("answers plain HTTP") && said.contains("http://192.168.1.70:7070") && said.contains("Change address"), "{said}");
+        assert_eq!(unanswered(&r, "connection refused"), "work didn't answer: connection refused");
     }
 
     #[test]

@@ -76,7 +76,6 @@ export function AgentHeader({
   cwd,
   actions,
   send,
-  onUsage,
   onSettings,
   onBackground,
   onFind,
@@ -102,8 +101,6 @@ export function AgentHeader({
   cwd: string;
   actions: ReturnType<typeof useAgentActions>;
   send: (c: Command) => void;
-  /** Everything about the session's usage and status (the inspector's Tools). */
-  onUsage: () => void;
   onSettings: () => void;
   /** Show what it left running in the background. */
   onBackground?: () => void;
@@ -237,6 +234,7 @@ export function AgentHeader({
           id={usageId}
           limits={limits}
           plan={plan}
+          cost={state?.usage?.cost_usd ?? info?.cost_usd}
           stopAt={state?.pause_at ?? null}
           onStopAt={(percent) => send({ type: "pause_at", percent })}
           elsewhere={
@@ -246,10 +244,6 @@ export function AgentHeader({
               </React.Suspense>
             )
           }
-          onMore={() => {
-            setUsage(false);
-            onUsage();
-          }}
         />
       )}
     </header>
