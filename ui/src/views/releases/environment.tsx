@@ -2,15 +2,17 @@
  * An environment deployed to by API (docs/deploy-api.md §4): its provider and release repository,
  * where it deploys, the gates each release passes there and who may release; what runs there; and
  * a freeze, put on and lifted here with why (an incident, a holiday): nothing goes until it's lifted.
+ * Its gates, concurrency and what agents may do are changed here too.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
-import { Snowflake, Sun } from "lucide-react";
+import { Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { boardHref, deployApi, describe, providerName, releaseAppHref, releaseHref, type Environment, type Gates } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
-import { Crumbs, Facts, Panel, TextField } from "@/components/ui/misc";
+import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
+import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -32,6 +34,140 @@ function gateLines(g: Gates): { label: string; value: string }[] {
   }
   if (g.checks?.length) out.push({ label: "Checks", value: g.checks.join(", ") });
   return out;
+}
+
+/** Names in a field, separated by commas. */
+const names = (s: string) =>
+  s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+type WindowRow = { kind: "allow" | "deny"; cron: string; duration: string; timezone: string };
+
+const CHECKS: { name: string; words: string }[] = [
+  { name: "no-snapshots", words: "No snapshot versions" },
+  { name: "owners-set", words: "The app has an owner team" },
+];
+
+/** What every release here passes, how a second one waits, and what agents may do; saved whole. */
+function Settings({ e }: { e: Environment }) {
+  const g = e.gates;
+  const [after, setAfter] = React.useState((g.after ?? []).join(", "));
+  const [soak, setSoak] = React.useState(g.soak ?? "");
+  const [approvals, setApprovals] = React.useState(String(g.approvals?.count ?? 0));
+  const [reviewers, setReviewers] = React.useState((g.approvals?.reviewers ?? []).join(", "));
+  const [selfApprove, setSelfApprove] = React.useState(!!g.approvals?.self_approve);
+  const [checks, setChecks] = React.useState<string[]>(g.checks ?? []);
+  const [windows, setWindows] = React.useState<WindowRow[]>(
+    (g.windows ?? []).map((w) => ({ kind: w.allow ? "allow" : "deny", cron: w.allow ?? w.deny ?? "", duration: w.duration, timezone: w.timezone ?? "" })),
+  );
+  const [concurrency, setConcurrency] = React.useState(e.concurrency);
+  const [agents, setAgents] = React.useState(e.agents);
+  const [busy, setBusy] = React.useState(false);
+  const count = Number(approvals);
+  const wrong =
+    !Number.isInteger(count) || count < 0
+      ? "Approvals: a whole number, 0 for none."
+      : windows.some((w) => !w.cron.trim() || !w.duration.trim())
+        ? "Each window needs its schedule and how long it lasts."
+        : null;
+  const setWindow = (i: number, patch: Partial<WindowRow>) => setWindows((ws) => ws.map((w, j) => (j === i ? { ...w, ...patch } : w)));
+  const save = async () => {
+    const gates: Gates = {
+      after: names(after),
+      soak: soak.trim() || undefined,
+      approvals: count > 0 ? { count, reviewers: names(reviewers), self_approve: selfApprove } : undefined,
+      windows: windows.map((w) => {
+        const when = { duration: w.duration.trim(), timezone: w.timezone.trim() || undefined };
+        return w.kind === "allow" ? { allow: w.cron.trim(), ...when } : { deny: w.cron.trim(), ...when };
+      }),
+      checks,
+      freeze: g.freeze,
+    };
+    setBusy(true);
+    try {
+      await deployApi.putEnvironment({ ...e, gates, concurrency, agents });
+      toast({ title: `${e.name} is saved`, description: "Releases asked for from now on pass its gates as they are.", tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (err) {
+      toast({ title: "Not saved", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Panel eyebrow="Settings" title="How releases go here" description="Each release passes these gates in order; a person changes what agents may do.">
+      <div className="cd-new-grid">
+        <TextField label="After" placeholder="staging" value={after} spellCheck={false} onChange={(ev) => setAfter(ev.target.value)} hint="Environments a version runs in first." />
+        <TextField label="Soak" placeholder="30m" value={soak} spellCheck={false} onChange={(ev) => setSoak(ev.target.value)} hint="How long it runs there first." />
+        <TextField label="Approvals" inputMode="numeric" value={approvals} onChange={(ev) => setApprovals(ev.target.value)} hint="How many people approve; 0 for none." />
+        <TextField label="Reviewers" placeholder="ada, grace" value={reviewers} onChange={(ev) => setReviewers(ev.target.value)} hint="Who may approve; anyone who approves releases when empty." />
+      </div>
+      <div className="cd-new-checks">
+        <label className="cd-new-check">
+          <input type="checkbox" className="check" checked={selfApprove} onChange={(ev) => setSelfApprove(ev.target.checked)} /> Whoever asked may approve it too
+        </label>
+        {CHECKS.map((c) => (
+          <label key={c.name} className="cd-new-check">
+            <input type="checkbox" className="check" checked={checks.includes(c.name)} onChange={(ev) => setChecks((xs) => (ev.target.checked ? [...xs, c.name] : xs.filter((x) => x !== c.name)))} />{" "}
+            {c.words}
+          </label>
+        ))}
+      </div>
+      <div className="rel-windows">
+        <span className="field-label">Windows</span>
+        {windows.map((w, i) => (
+          <div key={i} className="rel-window">
+            <SelectField
+              label="Kind"
+              hideLabel
+              value={w.kind}
+              onChange={(v) => setWindow(i, { kind: v === "allow" ? "allow" : "deny" })}
+              options={[
+                { value: "deny", label: "No releases" },
+                { value: "allow", label: "Releases only" },
+              ]}
+            />
+            <TextField label="From (cron)" placeholder="0 17 * * 5" value={w.cron} spellCheck={false} onChange={(ev) => setWindow(i, { cron: ev.target.value })} />
+            <TextField label="For" placeholder="64h" value={w.duration} spellCheck={false} onChange={(ev) => setWindow(i, { duration: ev.target.value })} />
+            <TextField label="Time zone" placeholder="UTC" value={w.timezone} spellCheck={false} onChange={(ev) => setWindow(i, { timezone: ev.target.value })} />
+            <Button size="xs" variant="ghost-danger" aria-label="Remove the window" onClick={() => setWindows((ws) => ws.filter((_, j) => j !== i))}>
+              <Trash2 />
+            </Button>
+          </div>
+        ))}
+        <Button size="xs" variant="ghost" onClick={() => setWindows((ws) => [...ws, { kind: "deny", cron: "", duration: "", timezone: "" }])}>
+          <Plus /> A window
+        </Button>
+      </div>
+      <div className="rel-settings-row">
+        <Segmented
+          label="A release asked for while one is on its way"
+          value={concurrency}
+          onChange={setConcurrency}
+          options={[
+            { value: "reject", label: "Refused" },
+            { value: "queue", label: "Waits its turn" },
+          ]}
+        />
+        <div className="cd-new-checks">
+          <label className="cd-new-check">
+            <input type="checkbox" className="check" checked={agents.deploy} onChange={(ev) => setAgents({ ...agents, deploy: ev.target.checked })} /> Agents may release here
+          </label>
+          <label className="cd-new-check">
+            <input type="checkbox" className="check" checked={agents.approve} onChange={(ev) => setAgents({ ...agents, approve: ev.target.checked })} /> Agents may approve here
+          </label>
+        </div>
+      </div>
+      {wrong && <p className="rel-msg">{wrong}</p>}
+      <div className="rel-settings-actions">
+        <Button size="sm" disabled={busy || !!wrong} onClick={() => void save()}>
+          Save
+        </Button>
+      </div>
+    </Panel>
+  );
 }
 
 /** A freeze, put on with why, or lifted. */
@@ -129,6 +265,9 @@ function EnvView({ name }: { name: string }) {
       <Loadable label="what runs here">
         <Here env={e.name} />
       </Loadable>
+      <div className="rel-stack">
+        <Settings key={JSON.stringify(e)} e={e} />
+      </div>
     </>
   );
 }

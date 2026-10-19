@@ -260,6 +260,9 @@ export const deployApi = {
   deleteApp: (name: string, o: { everywhere: boolean; keep: boolean }) => request<void>("DELETE", `/api/deploy/apps/${enc(name)}?everywhere=${o.everywhere}&keep=${o.keep}`),
   environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
   putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
+  /** A new environment: what isn't given is the server's default (no gates, one release at a time, no agents). */
+  createEnvironment: (e: { name: string; provider: string; release_repo: { repo: string; branch: string; root: string }; targets: { kubernetes: string[] } }) =>
+    request<Environment>("POST", "/api/deploy/environments", e),
   register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
   resources: (app: string, env: string, signal?: AbortSignal) => request<{ resources: RunningObject[] }>("GET", `${reg(app, env)}/resources`, undefined, { signal }).then((r) => r.resources),
   manifests: (app: string, env: string, version?: string, signal?: AbortSignal) =>

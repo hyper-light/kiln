@@ -17,6 +17,7 @@ import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
+import { NewEnvironment } from "./new-environment";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
@@ -195,11 +196,14 @@ export default function Releases() {
         <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases" }]} />
         <div className="rel-head-row">
           <h1 className="cd-title">Releases</h1>
-          <Button asChild size="sm">
-            <Link to={newAppHref}>
-              <Plus /> New app
-            </Link>
-          </Button>
+          <div className="rel-head-actions">
+            <NewEnvironment />
+            <Button asChild size="sm">
+              <Link to={newAppHref}>
+                <Plus /> New app
+              </Link>
+            </Button>
+          </div>
         </div>
         <p className="cd-note">
           Every app across its environments: what runs in each, what is on its way, and what waits for you. A release is a commit to an environment's release repository, made to run by its
