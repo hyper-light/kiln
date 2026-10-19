@@ -430,6 +430,12 @@ export function searchSaid(q: string, agent: string | null, until: number | null
 const late = Number(process.env.MOCK_LATE_SESSION ?? 0);
 const knownAt = Date.now() + late;
 if (late > 0) setTimeout(() => emit({ type: "harness", info: longInfo() }), late);
+/** Agents at work send a stream of news (MOCK_CHURN=n): n of its entry from 4 s on, 100 ms apart, the last with an approval waiting. */
+const CHURN = Number(process.env.MOCK_CHURN ?? 0);
+for (let i = 1; i <= CHURN; i++) {
+  const waits = i === CHURN ? [{ id: "churn", tool: "shell" as const, tool_name: "Bash", title: "rm -rf build", at: Date.now() }] : [];
+  setTimeout(() => emit({ type: "harness", info: { ...longInfo(), activity: `Step ${i}`, approvals: waits } }), 4_000 + i * 100);
+}
 // Its machine back: viewers hear it, as the server tells them.
 if (offline())
   setTimeout(() => {
