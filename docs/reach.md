@@ -232,9 +232,16 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    brought them back. Where its copy then stands in the log (an index) goes with the package. Then
    the repository besides its files, which sync doesn't carry: every branch (commits pushed nowhere
    included), the tags, the stash, what is staged and where HEAD is, with the commits the other
-   machine lacks (its tips, asked over reach) as a git bundle. It doesn't move while a merge,
-   rebase, cherry-pick, revert or bisect is under way (git keeps those in `.git` alone), nor with
-   more than 128 MB of commits to carry: the timeline says why, and it goes on where it is.
+   machine lacks (its tips, asked over reach) as a git bundle. Then the files git ignores, which
+   sync leaves alone (`.env`, local settings, keys, a local database), but not what a build makes
+   again (`node_modules`, `target`, `.venv`, `dist` and the like), each with its permissions. An
+   agent working in a git worktree inside the repository (`.claude/worktrees/x`) carries that
+   worktree instead (`harness/worktree.rs`): the commit its HEAD is at, what differs from it
+   (changed, staged, new and deleted files) and the files git ignores there. It doesn't move while
+   a merge, rebase, cherry-pick, revert or bisect is under way (git keeps those in `.git` alone),
+   with more than 128 MB of commits or 64 MB of ignored files to carry (16 MB a file), with files
+   too big for sync, or from a repository of its own nested inside the synced one (or a
+   submodule): the timeline says why, and it goes on where it is.
 4. **The hand-over** (`harness/moving.rs`). The runner packs the session — the harness's own record
    (Claude Code's transcript as it is; Codex's conversation as a new thread's history, as a switch of
    harness carries it; for ACP agents and Antigravity, whose own records kiln doesn't keep, the
@@ -252,8 +259,13 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    older than the ones it left. Then its repository is put as it was, touching no file of the working
    tree: branches made, or moved on where they were behind; one with other commits there keeps them,
    beside it (`<name>.before-move` for the branch HEAD is on, `<name>.from-<machine>` for another);
-   stash entries stored; the index read from what was staged; HEAD pointed where it was. What
-   couldn't come is said, and stays on the machine it left: nothing is deleted on either side.
+   stash entries stored; the index read from what was staged; HEAD pointed where it was. The files
+   git ignores are written where they're missing, their permissions kept; one that differs there
+   stays, and the one that came goes beside it (`<name>.from-<machine>`), which git there is told to
+   ignore (`info/exclude`), so it's never committed nor synced. A worktree is made from the
+   repository's copy at its commit, the differences written over it, its HEAD and index put as they
+   were; one there already (the agent coming back) keeps what changed in it, stashed. What couldn't
+   come is said, and stays on the machine it left: nothing is deleted on either side.
 
 **Into another harness.** `move {"to": …, "kind": "codex", "model": "…"}` moves it to a runner that
 has that harness instead of its own, the conversation carried over as a switch of harness carries it
