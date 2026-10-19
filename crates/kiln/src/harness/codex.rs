@@ -2087,7 +2087,7 @@ impl Codex {
             "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
                 if core.get(id).is_none() {
-                    let body = if method == "item/agentMessage/delta" {
+                    let body = if matches!(method, "item/agentMessage/delta" | "item/plan/delta") {
                         Body::Assistant { text: String::new(), streaming: true }
                     } else {
                         Body::Thinking { text: String::new(), streaming: true, redacted: false }
@@ -2098,6 +2098,15 @@ impl Codex {
                 if method == "item/agentMessage/delta" && core.state.doing.as_deref() != Some("Writing") {
                     core.state.doing = Some("Writing".to_owned());
                     core.touch_state();
+                }
+            }
+            "item/reasoning/summaryPartAdded" => {
+                let Some(id) = p.get("itemId").and_then(Value::as_str) else { return };
+                if core.get(id).is_none() {
+                    core.upsert(id, None, Body::Thinking { text: String::new(), streaming: true, redacted: false });
+                }
+                if p.get("summaryIndex").and_then(Value::as_u64).is_some_and(|i| i > 0) {
+                    core.append(id, "\n\n");
                 }
             }
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
@@ -2372,8 +2381,9 @@ impl Codex {
                 }
             }
             "plan" => {
-                if let Some(text) = item.get("text").and_then(Value::as_str).filter(|_| done) {
-                    core.upsert(&id, None, Body::Assistant { text: text.to_owned(), streaming: false });
+                if done || core.get(&id).is_none() {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
+                    core.upsert(&id, None, Body::Assistant { text, streaming: !done });
                 }
             }
             "commandExecution" => {
@@ -3679,6 +3689,27 @@ mod tests {
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
         Ok(())
+    }
+
+    #[test]
+    fn streamed_plans_and_reasoning_parts_keep_their_final_shape() {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "plan", "id": "plan", "text": "The "}), false);
+        feed(&mut c, &mut core, &[json!({"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "plan", "delta": "plan"}})]);
+        assert!(core.get("plan").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: true } if text == "The plan")));
+        c.item(&mut core, &json!({"type": "plan", "id": "plan", "text": "The plan"}), true);
+        assert!(core.get("plan").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text == "The plan")));
+        feed(&mut c, &mut core, &[json!({"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "delta-plan", "delta": "Another plan"}})]);
+        assert!(core.get("delta-plan").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: true, .. })));
+        for (index, text) in [(0, "First"), (1, "Second")] {
+            feed(&mut c, &mut core, &[
+                json!({"method": "item/reasoning/summaryPartAdded", "params": {"threadId": "th1", "turnId": "turn", "itemId": "thinking", "summaryIndex": index}}),
+                json!({"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "th1", "turnId": "turn", "itemId": "thinking", "summaryIndex": index, "delta": text}}),
+            ]);
+        }
+        assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: true, .. } if text == "First\n\nSecond")));
+        c.item(&mut core, &json!({"type": "reasoning", "id": "thinking", "summary": ["First", "Second"], "content": []}), true);
+        assert!(core.get("thinking").is_some_and(|e| matches!(&e.body, Body::Thinking { text, streaming: false, .. } if text == "First\n\nSecond")));
     }
 
     #[test]
