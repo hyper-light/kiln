@@ -117,6 +117,10 @@ page appears in the conversation, live.
   configuration and a fresh key frame at once. One too slow for a chunk loses it, and the next key
   frame mends it. With nobody looking, the stream pauses: nothing is captured, encoded or sent.
   After ten minutes unwatched it closes.
+- **Over WebRTC when it can.** With `[server] webrtc_addr` set, the server is each viewer's WebRTC
+  peer and sends the stream's chunks to it as RTP, as they were encoded. Until the peer plays, and
+  again if it goes, the pictures come over the viewer's socket; its events and what's done in it
+  always do. See "WebRTC" below.
 - **Shown in the viewer's browser** with WebCodecs (Chrome, Edge, Firefox and Safari have it). The
   frame is the page's window: the conversation's width, as tall as the conversation shows. The
   page lays out at that size on the agent's machine, as a phone lays it out for a phone. Its
@@ -141,6 +145,41 @@ page appears in the conversation, live.
 - **Where it is:** the frame shows the page's address. Type another, or go back, forward, reload.
 - **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
   that ended can be started again from the frame.
+
+### WebRTC
+
+A stream's viewers take it over WebRTC when the server has it and it gets through, and over their
+socket (WebCodecs) otherwise. Nothing changes for the page or its runner: the server is the peer
+(`crates/kiln/src/harness/webrtc.rs`, on str0m, its DTLS and SRTP from aws-lc-rs).
+
+- **Turned on** with `[server] webrtc_addr`, a UDP address such as `0.0.0.0:7072`
+  (`KILN_WEBRTC_ADDR`). Viewers are told to reach it at `webrtc_advertise`, a list of `host:port`s
+  (`KILN_WEBRTC_ADVERTISE`, comma-separated): a forwarded or NATed port, or a Tailscale address.
+  Without it they're told the bound address, or, bound on every address, each LAN address of the
+  machine at the bound port. Unset, there's no WebRTC and viewers stay on their sockets.
+- **One port, every viewer.** A viewer's socket offers a peer connection (receive-only video and
+  audio). The server answers as an ICE-lite peer, with a host candidate at each address viewers
+  are told of, and drives every peer from one loop on one UDP socket. The offer and answer go over
+  the viewer's socket, which only its person (or one they share the conversation with) has.
+- **As it was encoded.** H.264 goes out on the payload type the viewer offered for it in fragments
+  (packetization mode 1), constrained baseline first; VP8, VP9 and AV1 go on theirs, and the sound
+  as Opus. Nothing is decoded or encoded again. A picture's media time is when it's sent, so a
+  still frame sent again sharp shows at once. What a viewer loses is sent again (NACK). Past that
+  (PLI), a key frame is asked of the runner, and nothing more of the picture goes to that viewer
+  until it comes.
+- **The socket stays.** The first picture comes over it, while the peer connects. Once the peer
+  plays, the viewer says so and its pictures go to the peer alone (its canvas, which takes taps
+  and keys, is clear over WebRTC's video). If the peer doesn't play within ten seconds (the
+  server's port is out of reach), fails, or the server's WebRTC stops, the pictures come over the
+  socket again, from a key frame. A page that saw WebRTC fail twice doesn't try it again.
+- **Measured** on one machine (server, runner and viewer together, under load): the first picture
+  came over the socket 0.3 s after Open and the pictures over WebRTC 0.4 s after; a tap showed in
+  them 34 ms later at the median, as over the socket, and the socket carried no pictures
+  meanwhile. Over a real network, a lost packet over WebRTC holds up nothing behind it, as one
+  over the socket's TCP does.
+- **In a cluster** the server's UDP port has to reach viewers, as QUIC's does for runners: the
+  chart's `ports.webrtc` and `webrtcAdvertise` (and the external Service's NodePort), and on a
+  host that forwards LAN ports to it, `KILN_LAN_WEBRTC=1 deploy/cluster/expose-lan.sh up`.
 
 ### Engines
 
@@ -310,7 +349,11 @@ Connections run on the runner link's own lane (`LANE_PORTS`, runners with `CAP_P
   `copied`, `dialog`, `agent`, `closed`, `error`). It sends `{"input": [...]}` (what the person
   does) and `{"control": {...}}` (`resize`, `pause`, `keyframe`, `go`, `back`, `forward`,
   `reload`, `copy`, `record`). Its events include `recording` and `recorded` (a recording's
-  files, length and size, and its `id` here).
+  files, length and size, and its `id` here). With the server's WebRTC on, it's told
+  `{"webrtc": {"can": true}}` first and may send `{"webrtc": {"offer": sdp}}`, answered with
+  `{"webrtc": {"answer": sdp}}` (or `{"error"}`). It sends `{"webrtc": {"playing": true}}` once its
+  peer shows the stream (its chunks then go to the peer alone), and `{"playing": false}` or
+  `{"close": true}` to have them back. A peer that went is said as `{"webrtc": {"gone": why}}`.
 - `DELETE /api/harness/sessions/:id/streams/:stream`: close it (its tab goes).
 
 An agent's MCP server opens one through its runner, for its own session only (`{"op": "stream",

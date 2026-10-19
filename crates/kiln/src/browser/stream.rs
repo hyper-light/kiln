@@ -143,6 +143,8 @@ struct Streamer {
     worker: String,
     offscreen: futures::lock::Mutex<Option<String>>,
     outs: Arc<Mutex<HashMap<String, async_channel::Sender<Out>>>>,
+    /// Since when it's had no stream (unix ms): started ahead of one, or its last one closed.
+    idle_since: std::sync::atomic::AtomicI64,
 }
 
 /// One stream: its tab, and what its viewers do, in order.
@@ -275,9 +277,29 @@ impl Streams {
         let cdp = browser.cdp.clone();
         let worker = super::target(&cdp, |t| t.get("type").and_then(Value::as_str) == Some("service_worker") && t.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with(&format!("chrome-extension://{EXTENSION_ID}/")))).await?;
         let worker = cdp.call(None, "Target.attachToTarget", json!({"targetId": worker, "flatten": true})).await?.get("sessionId").and_then(Value::as_str).unwrap_or("").to_owned();
-        let s = Arc::new(Streamer { browser, alone: profile.starts_with("clean:"), worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default() });
+        let s = Arc::new(Streamer { browser, alone: profile.starts_with("clean:"), worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default(), idle_since: std::sync::atomic::AtomicI64::new(crate::util::now_ms()) });
         g.insert(profile.to_owned(), s.clone());
         Ok(s)
+    }
+
+    /// A conversation's browser, started ahead of its first stream (a person is choosing what to
+    /// open: `super::apps`'s look), so what they open opens at once. One nothing opens in stops
+    /// a while later, as one whose streams closed does.
+    pub fn warm(&'static self, dir: &Path, session: &str) {
+        let (dir, profile) = (dir.to_path_buf(), format!("conversation:{session}"));
+        crate::rt::spawn(async move {
+            let running = self.streamers.lock().await.get(&profile).is_some_and(|s| s.browser.alive());
+            if running {
+                return;
+            }
+            match self.streamer(&dir, &profile).await {
+                Ok(s) => {
+                    crate::rt::sleep(IDLE_BROWSER).await;
+                    self.stop_if_idle(&s).await;
+                }
+                Err(e) => tracing::debug!(error = %format!("{e:#}"), "no browser started ahead of a stream"),
+            }
+        });
     }
 
     /// Open a stream of `spec` as `id`; its chunks and events go to `out`.
@@ -442,6 +464,7 @@ impl Streams {
         }
         let streamer = s.streamer.clone();
         drop(s);
+        streamer.idle_since.store(crate::util::now_ms(), std::sync::atomic::Ordering::Relaxed);
         if streamer.alone {
             self.streamers.lock().await.retain(|_, s| !Arc::ptr_eq(s, &streamer));
             streamer.browser.stop();
@@ -453,9 +476,10 @@ impl Streams {
         });
     }
 
-    /// Stop a profile's browser that has no streams open.
+    /// Stop a profile's browser that has had no streams open for [`IDLE_BROWSER`].
     async fn stop_if_idle(&self, streamer: &Arc<Streamer>) {
-        if streamer.outs.lock().is_empty() {
+        let idle = crate::util::now_ms() - streamer.idle_since.load(std::sync::atomic::Ordering::Relaxed);
+        if streamer.outs.lock().is_empty() && idle >= i64::try_from(IDLE_BROWSER.as_millis()).unwrap_or(i64::MAX) - 1000 {
             let mut g = self.streamers.lock().await;
             g.retain(|_, s| !Arc::ptr_eq(s, streamer));
             drop(g);
