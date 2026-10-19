@@ -340,12 +340,18 @@ fn shutdown_on_signals(token: Shutdown) {
 /// [`kiln::supervise::HANDOVER_EXIT`], so the supervisor starts that binary at once.
 async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if opts.ephemeral {
-        return kiln::agent::run(opts, shutdown).await;
+        let r = kiln::agent::run(opts, shutdown).await;
+        kiln::browser::driven::stop_all().await;
+        return r;
     }
     let reg = kiln::sup::Registry::default();
     let sd = shutdown.clone();
     let h = kiln::sup::spawn(&reg, "agent", shutdown, move || kiln::agent::run(opts.clone(), sd.clone()));
     let _ = h.await;
+    // The supervisor drops the runner's loop as it stops (that loop's own shutdown never runs):
+    // the other engines' browsers it drove (Firefox, a WebDriver) stop here, or they'd outlive it.
+    // Chromium's go with their pipes.
+    kiln::browser::driven::stop_all().await;
     if kiln::agent::handed_over() {
         return Err(kiln::reach::cli::ExitWith(kiln::supervise::HANDOVER_EXIT).into());
     }
