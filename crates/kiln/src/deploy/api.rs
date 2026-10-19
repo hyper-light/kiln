@@ -4,6 +4,7 @@
 //!
 //! | Route | |
 //! | --- | --- |
+//! | `GET /board` | every registration, what runs and what's in flight, and what waits for approval |
 //! | `GET`, `POST /environments`; `GET`, `PUT`, `DELETE /environments/{env}` | environments |
 //! | `GET`, `POST /templates`; `GET`, `PUT`, `DELETE /templates/{name}` | what apps are made from |
 //! | `GET`, `POST /apps`; `GET`, `PUT`, `PATCH`, `DELETE /apps/{app}` (`?everywhere&keep`) | apps |
@@ -92,6 +93,7 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
 
+        (&Method::GET, ["board"]) => ok(&board(&d).await?),
         (&Method::GET, ["templates"]) => ok(&json!({ "templates": store::templates(store).await.map_err(internal)? })),
         (&Method::POST, ["templates"]) => created(&flow::put_template(&d, &actor, body::<Template>(req.into_body()).await?).await?),
         (&Method::GET, ["templates", name]) => ok(&store::template(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no template {name}")))?),
@@ -183,6 +185,25 @@ pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, 
         }
         _ => Err((StatusCode::NOT_FOUND, "not found".into())),
     }
+}
+
+/// Every registration with what runs and what's in flight, and what waits for people: the
+/// environments board, in one answer.
+async fn board(d: &Deploy) -> Result<Value, Fail> {
+    let st = &d.hub.store;
+    let environments = store::environments(st).await.map_err(internal)?;
+    let apps = store::apps(st).await.map_err(internal)?;
+    let mut cells = Vec::new();
+    for reg in store::registrations(st, None, None).await.map_err(internal)? {
+        let running = match reg.running {
+            Some(id) => store::release(st, id).await.map_err(internal)?,
+            None => None,
+        };
+        let in_flight = store::in_flight(st, &reg.app, &reg.environment).await.map_err(internal)?;
+        cells.push(json!({ "registration": reg, "running": running, "in_flight": in_flight }));
+    }
+    let waiting = store::releases(st, store::ReleaseQuery { state: Some(State::WaitingApproval), limit: 200, ..store::ReleaseQuery::default() }).await.map_err(internal)?;
+    Ok(json!({ "environments": environments, "apps": apps, "cells": cells, "waiting_approval": waiting }))
 }
 
 /// An app, with each environment it's registered in and what runs there.
