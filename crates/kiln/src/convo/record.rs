@@ -161,7 +161,7 @@ impl Following {
                     rows.push(Row::RecordReset { session: session.to_owned(), source: source.to_owned(), at: crate::util::now_ms() });
                 }
                 for (n, end, line) in lines {
-                    rows.push(Row::Record(Box::new(RecordRow { session: session.to_owned(), source: source.to_owned(), n, end, line })));
+                    rows.push(Row::Record(Box::new(RecordRow { session: session.to_owned(), source: source.to_owned(), n, end, line, kept: None })));
                 }
             }
             Err(e) => {

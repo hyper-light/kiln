@@ -37,7 +37,9 @@ For each agent session (kiln's id):
   is kept brotli-compressed (quality 5) when that saves a tenth or more, about 3× overall. Lines
   kept before that are compressed in the background, a few thousand at a time while the store has
   nothing else to do, under the same numbers, so no feed sends them again. Feed batches travel
-  compressed too, to a taker that says it takes them (`zip` in its answer).
+  compressed too, to a taker that says it takes them (`zip` in its answer), and a compressed line
+  goes as it is kept to a taker that says it takes lines so (`kept`): it is never decompressed on
+  one side and compressed again on the other. A store from before says neither, and gets text.
 - **An ended agent's transcript goes after `keep_closed_days`** (30 unless set). Its events stay,
   where search finds them; only the harness's record of it is let go, as nothing reads that once
   the agent has ended. Each store lets go by its own clock, a few thousand lines at a time while
@@ -98,9 +100,11 @@ what it took, and says through where it has it.
   ports and no HTTP. The runner announces it with `CAP_CONVO`.
 - **The exchange:**
   1. When the link comes up, the runner says hello with its store's id.
-  2. The server answers with the number it has (0 for a store it hasn't seen).
+  2. The server answers with the number it has (0 for a store it hasn't seen), and how it takes
+     batches (`zip`, `kept`).
   3. The runner sends batches from there, two ahead of what the server has acknowledged. A batch
-     larger than a frame goes in parts, so a transcript line of any size arrives whole.
+     larger than a frame goes in parts, so a transcript line of any size arrives whole. Reading a
+     batch reads no more of the store than the batch takes: a page of rows stops at its bytes.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.
@@ -186,6 +190,8 @@ outlives the server's disk and its own machine both.
   machine comes back while the copy is being taken goes on with what its machine says. What the
   copy dropped stays dropped. The copy goes through what it held when it began, then the mirror
   says so (`Restored`), and the sessions it brought back are listed at once, no restart needed.
+  What the copy brought isn't sent back to that mirror: the server notes the numbers it wrote it
+  under, and the mirror's feed goes through them without sending them.
   - **By itself:** a server that starts with an empty store while `mirrors.json` still names its
     mirrors (the store was lost, the rest wasn't) asks the first of them to connect.
   - **On demand:** `POST /api/conversations/restore {"from": "<machine>"}` asks that runner;
@@ -267,6 +273,6 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
 | C3 resume elsewhere | live (dfbbd1a, 2026-10-18): Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context. Built since (e1bb7f2): every harness (ACP agents and Antigravity with their conversation in words), and a gone machine's agents moved on at once (Mission Control's Move them on). Lab (`~/.cache/kiln-mcp-lab/recover_e2e.py`, 12 checks): an ACP agent's runner killed outright, its agent moved on to the other runner, which answers from the conversation it was given |
 | C4 search UI | live (dfbbd1a, 2026-10-18): Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
 | C5 mirrors | live (dfbbd1a, 2026-10-18): the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |
-| Compression | built (2540397): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |
-| Pruning and compaction | pruning built (902b999): an ended agent's transcript goes after `keep_closed_days`. Compaction (215 MB made 108 MB in about a second) went live with c98ae28 and took the first server down (out of memory on its store of several GB, every minute, until rolled back); the store no longer compacts itself, and a server answers nothing rather than "from 0" when it can't read where a runner's store stands (which had every runner send everything again) |
-| Restore from a mirror | built: a server that starts with an empty store asks a mirror named in `mirrors.json` for its copy, or `POST /api/conversations/restore` asks one; the copy fills in what the store lacks and never overwrites what a machine's own feed brought. Lab C6 (12 checks): the store deleted and the agent's machine killed, the server restores by itself, the agent is listed away and moved on with its context; a second restore changes nothing. At scale (a 4 GB store holding 2.5 GB of transcript text, the server and the mirror each capped at 2 GiB like the pod): restored by itself in 12 minutes, the server at 141 MB and the mirror at 298 MB at most, no OOM. It is slow: the feed carries each line as text and the server compresses it again, about 3.4 MB/s, so a store of several GB takes most of an hour |
+| Compression | live (2540397, deployed with 2bd78af, 2026-10-18): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |
+| Pruning and compaction | pruning live (902b999, deployed with 5360484, 2026-10-19): an ended agent's transcript goes after `keep_closed_days`. Compaction (215 MB made 108 MB in about a second) went live with c98ae28 and took the first server down (out of memory on its store of several GB, every minute, until rolled back); the store no longer compacts itself, and a server answers nothing rather than "from 0" when it can't read where a runner's store stands (which had every runner send everything again). That fix (9b7558f) is live with 5360484: over its first 12 minutes on the first server (a 6.6 GB store), no restarts, memory at 350–550 MiB of 2 GiB, and the crash loop's partial copy removed at start |
+| Restore from a mirror | live (5360484, 2026-10-19): a server that starts with an empty store asks a mirror named in `mirrors.json` for its copy, or `POST /api/conversations/restore` asks one; the copy fills in what the store lacks and never overwrites what a machine's own feed brought. Lab C6 (12 checks): the store deleted and the agent's machine killed, the server restores by itself, the agent is listed away and moved on with its context; a second restore changes nothing. At scale (a 4 GB store: 40 sessions, 75,764 transcript lines kept compressed; the server and the mirror each capped at 2 GiB like the pod): restored by itself in 18 seconds, identical row for row, the server at 107 MB and the mirror at 93 MB at most, no OOM (122 seconds before the feed read only what a batch takes, sent lines as kept, and stopped sending the copy back). Mixed versions (an old server with new runners, and the other way) pass labs C2 and C6 |

@@ -839,12 +839,35 @@ export interface Snapshot {
   ready: boolean;
   /** A stop asked of the turn under way: which turn, and when (ms). Done with once none runs. */
   stopAsked: { turn: number | undefined; at: number } | null;
+  /** When the turn under way began, kept once it ends: between turns the clock holds the last one's length. */
+  ranFrom: number | null;
+}
+
+/**
+ * When the last turn began, for the clock between turns: as this page saw it start, else (opened
+ * since, or the start went by unseen) when it was last asked something before it ended. Null while
+ * a turn runs, and before one has ended.
+ */
+export function lastTurnFrom(s: Snapshot): number | null {
+  const end = s.state?.last_turn?.at;
+  if (end == null || s.state?.turn_started != null) return null;
+  let asked = 0;
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (e?.kind === "user" && e.at <= end) {
+      asked = e.at;
+      break;
+    }
+  }
+  const seen = s.ranFrom != null && s.ranFrom <= end ? s.ranFrom : 0;
+  // What it saw start, unless a later ask began a turn it didn't see.
+  return seen && seen + 2000 >= asked ? seen : asked || null;
 }
 
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null, ranFrom: null };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -1317,6 +1340,7 @@ export class SessionStore {
       info: share(s.info, inc.info),
       meta: share(s.meta, inc.meta),
       state: share(s.state, inc.state),
+      ranFrom: inc.state?.turn_started ?? s.ranFrom,
       changes: share(s.changes, inc.changes),
       error: null,
       ready: true,
@@ -1357,7 +1381,7 @@ export class SessionStore {
         const state = share<State | null>(this.snap.state, now) ?? now;
         // A stop asked of a turn holds while one runs; once none does, it's done with.
         const stopAsked = state.status === "running" || state.status === "waiting" ? this.snap.stopAsked : null;
-        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked };
+        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked, ranFrom: state.turn_started ?? this.snap.ranFrom };
         break;
       }
       case "meta":

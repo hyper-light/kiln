@@ -2601,7 +2601,7 @@ fn adopt_handover(
 /// the intake that takes the server's feed into it, its answers going up the link.
 fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
     let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().keep_closed())?;
-    match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays) {
+    match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays, None) {
         Ok((intake, out)) => {
             let up = up.clone();
             crate::rt::spawn(async move {
