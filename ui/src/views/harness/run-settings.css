@@ -11,16 +11,15 @@
   min-width: 0;
   max-width: 100%;
 }
+/* One line at the values' own widths, closely spaced. It never wraps or changes height: when it's
+   short, the model gives way (ellipsized). A value is only as wide as its words, so it moves what
+   follows it only when you change it; usage changes on its own, so it comes last. */
 .rs-top {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 16ch;
+  display: flex;
   align-items: center;
-  column-gap: 8px;
-  width: 100%;
-  max-width: 440px;
-  min-height: 28px;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+  min-width: 0;
+  max-width: 100%;
+  height: 28px;
 }
 .rs-line,
 .rs-extra {
@@ -37,34 +36,38 @@
   text-transform: uppercase;
   white-space: nowrap;
 }
-/* Width depends only on the viewport, never the selected names or whether effort is available. */
-.rs-values {
-  display: grid;
-  grid-template-columns: 8ch 14px minmax(0, 1fr) 14px 8ch;
-  align-items: center;
-  width: 100%;
-  min-width: 0;
+.rs-line {
+  flex: 0 1 auto;
 }
 .rs-extra {
-  display: grid;
-  grid-template-columns: 7px minmax(0, 1fr);
-  gap: 8px;
+  flex: none;
 }
-.rs-divider,
-.rs-sep {
+.rs-values {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.rs-values > .rs-v {
+  flex: none;
+}
+.rs-values > .rs-v[data-kind="model"] {
+  flex: 0 1 auto;
+}
+.rs-sep,
+.rs-divider {
+  flex: none;
   color: #6d7078;
-  text-align: center;
+}
+.rs-sep {
+  padding: 0 0.6ch;
+}
+.rs-divider {
+  padding: 0 1ch;
 }
 .rs-value-text {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-/* Small phones reserve a second line for usage. Name changes never trigger wrapping. */
-@container (max-width: 340px) {
-  .rs-top { grid-template-columns: minmax(0, 1fr); grid-template-rows: 28px 28px; }
-  .rs-extra { width: 16ch; grid-template-columns: minmax(0, 1fr); }
-  .rs-divider { display: none; }
 }
 .rs-v {
   position: relative;
