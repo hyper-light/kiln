@@ -162,6 +162,9 @@ pub fn repair_here(here: &Here, action: &str) -> Result<String, String> {
                 return Err("an upgrade is running on this machine: its build may be using the cache, so it stays".to_owned());
             }
             let dir = self_build_dir().ok_or("this machine has no home folder, so no self-build cache")?;
+            if !dir.is_dir() {
+                return Ok("There's no self-build cache on this machine: nothing to clear.".to_owned());
+            }
             let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             let (mut freed, mut kept_logs) = (0u64, 0usize);
             for e in entries.filter_map(Result::ok) {
