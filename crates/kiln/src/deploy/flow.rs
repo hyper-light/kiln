@@ -74,6 +74,25 @@ fn emit_release(d: &Deploy, r: &Release) {
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
+    // Chat, paging and webhooks: the server's rules, and the app's own channels.
+    let event = match r.state {
+        State::WaitingApproval => Some("release.waiting_approval"),
+        State::Succeeded => Some("release.succeeded"),
+        State::Failed => Some("release.failed"),
+        State::Cancelled => Some("release.cancelled"),
+        _ => None,
+    };
+    if let Some(event) = event {
+        let (hub, app) = (Arc::clone(&d.hub), r.app.clone());
+        let mut release = serde_json::to_value(r).unwrap_or(Value::Null);
+        if let (Some(m), Some(approvers)) = (release.as_object_mut(), e.get("approvers")) {
+            m.insert("approvers".into(), approvers.clone());
+        }
+        crate::rt::spawn(async move {
+            let channels = store::app(&hub.store, &app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
+            crate::ci::notify::release_event(hub, event, release, channels).await;
+        });
+    }
 }
 
 /// Who asks for a change: the name the audit, the release and its commit say, and whether it is

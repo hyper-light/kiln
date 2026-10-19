@@ -307,7 +307,13 @@ function Settings({ a, registered }: { a: App; registered: string[] }) {
         <TextField label="Project" value={project} spellCheck={false} onChange={(e) => setProject(e.target.value)} />
         <TextField label="Owner teams" value={owners} placeholder="payments, platform" onChange={(e) => setOwners(e.target.value)} />
         <TextField label="On call" value={oncall} placeholder="ada" onChange={(e) => setOncall(e.target.value)} />
-        <TextField label="Chat channels" value={channels} placeholder="#deploys" onChange={(e) => setChannels(e.target.value)} />
+        <TextField
+          label="Chat channels"
+          value={channels}
+          placeholder="slack:#deploys"
+          onChange={(e) => setChannels(e.target.value)}
+          hint="Where its release messages go: kind:target, a bare #channel being Slack's."
+        />
         <TextField label="Source repository" value={source} placeholder="acme/web" spellCheck={false} onChange={(e) => setSource(e.target.value)} hint="One kiln has; empty for none." />
       </div>
       <div className="rel-settings-actions">

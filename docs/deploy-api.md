@@ -538,7 +538,14 @@ until the two become one.
   (what runs where, what waits to move), a release's page (its gates, commit and live progress),
   the deploy dialog, the rollback picker, an approvals inbox that works on a phone.
 - **Chat**: Slack first. Commands for the calls above, and a message per release that updates in
-  place as it moves (txst's deployment messages), in the registration's channels.
+  place as it moves (txst's deployment messages), in the registration's channels. Built so far: a
+  message when a release waits for approval (naming who may approve), lands, fails or is
+  cancelled (`release.waiting_approval`, `release.succeeded`, `release.failed`,
+  `release.cancelled`), to the app's own channels (`contacts.channels`: `kind:target` as
+  ci.md W19-R06 names channels, a bare `#channel` being Slack's) and through the server's
+  notification rules (`[[ci.notify]]`, `where` reading `release`: its `app`, `environment`,
+  `kind`, `version`, `requested_by`, `approvers`), on any channel kiln has: Slack, Discord, Teams,
+  Telegram, PagerDuty, Opsgenie, signed webhooks. Each goes once per release, event and channel.
 - **MCP**: one operation per call, in kiln's registry of operations (ci.md W20): MCP tools
   (`deploy_releases_create`) and code mode's `kiln.deploy.*`. Each is one of `/api/deploy`'s routes,
   judged by the route table as that route is, and audited as it is:
@@ -706,5 +713,6 @@ deployments, and aren't carried over.
 | P8: a new app from one page (`/deployments/releases/new`, and New app on the board): its name checked as it's left, a template (its package, namespace, checks, allowed environments and the repository it makes, shown filled in for the app) or a package, its source repository (the template's, one kiln has, or none), the environments it's registered in; registering an app from its page | built. In a browser against the test server: an app made from a template got `acme/ui-web` from its starter (its first build queued) and its registration in `e2e`, landed on its page, and its first release, asked for there, landed through KilnCD (Synced, Healthy); at phone width the page fits |
 | P8: an app's settings on its page (project, owner teams, on call, chat channels, its source repository; archive and unarchive; delete, deregistered everywhere first, what it runs kept or not, its releases and repository kept); an environment's page from the board (its provider and release repository, clusters and platforms, concurrency, what agents may do, each gate, what runs there) with a freeze put on and lifted there, with why | built. In a browser against the test server: owners, on call and channels saved; an archived app's registration refused; an app deleted from its page; `e2e` frozen from its page held a release ("e2e is frozen: An incident in payments") until the freeze was lifted there, and it landed |
 | P8: what runs for an app in an environment, as its provider sees it, on a page of its own (What runs, on each environment of an app's page): its objects with sync and health, the manifests it renders, what a sync would change, a workload's pods' logs; on Argo CD another version previewed (what it renders, what deploying it changes). Both providers answer a diff as `diffs` (Argo CD's said `changes`, so `kiln deploy diff` said "nothing would change" on KilnCD) | built. In a browser against the test servers: `ui-web` in `e2e` (KilnCD) showed its Service and Deployment synced and healthy, their manifests and its pod's log; `podinfo` in `argo-staging` (Argo CD) previewed 6.11.0 as its labels and image changing, side by side, as `kiln deploy diff --version` printed it |
-| P8, the rest: chat (Slack), the MCP skills, an environment's gates edited in the UI, an app's package and template edited in the UI | not yet |
+| Release messages (§12.3): a release waiting for approval, landed, failed or cancelled, to its app's channels and through the server's notification rules (`where` reading `release`), on every channel kiln sends to | built. On the test server, through a signed webhook: an approval gate on `e2e` held a release, and "⏸ ui-web 6.11.1 → e2e waits for approval … approvers: ada" came once (a server rule and the app's channel naming the same webhook); ada's approval of another landed it ("✓ ui-web 6.11.0 landed in e2e"); her rejection cancelled one ("◌ … was cancelled … not today"). Loopback was refused until `[ci] allow_private_targets` listed it |
+| P8, the rest: chat commands and a message that updates in place (Slack), the MCP skills, an environment's gates edited in the UI, an app's package and template edited in the UI | not yet |
 | P3, P6 | not yet |

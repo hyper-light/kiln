@@ -6,7 +6,10 @@
 //! - **Events**: `run.failed`, `run.fixed` (the first success after failures on the same branch
 //!   and workflow), `run.succeeded`, `run.cancelled`, `approval.waiting`; and an agent's
 //!   (docs/agentic.md N2): `agent.needs_you`, `agent.finished`, `agent.stopped`, `agent.paused`,
-//!   which only the server's rules take (an agent is no repository's), `where` reading `agent`.
+//!   which only the server's rules take (an agent is no repository's), `where` reading `agent`;
+//!   and a release's (docs/deploy-api.md §12.3): `release.waiting_approval`, `release.succeeded`,
+//!   `release.failed`, `release.cancelled`, which the server's rules take (`where` reading
+//!   `release`) and which go to the app's own channels too (its `contacts.channels`).
 //! - **Channels** are `kind:target`: an integration of that kind (one named `target`, or the
 //!   first, with `target` as its channel or chat): `slack:#ci`, `discord:team-hook`,
 //!   `teams:ops`, `telegram:-1001234`, `pagerduty:oncall`, `opsgenie:ops`, `webhook:audit`.
@@ -29,9 +32,28 @@ use crate::hub::Hub;
 use crate::store::Repo;
 
 /// The events rules can name.
-pub const EVENTS: &[&str] = &["run.failed", "run.fixed", "run.succeeded", "run.cancelled", "approval.waiting", "agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
+pub const EVENTS: &[&str] = &[
+    "run.failed",
+    "run.fixed",
+    "run.succeeded",
+    "run.cancelled",
+    "approval.waiting",
+    "agent.needs_you",
+    "agent.finished",
+    "agent.stopped",
+    "agent.paused",
+    "release.waiting_approval",
+    "release.succeeded",
+    "release.failed",
+    "release.cancelled",
+];
 /// The events about an agent (`crate::push`): the server's rules take them, a repository's can't.
 pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
+/// The events about a release deployed by API (`crate::deploy`): the server's rules take them, a
+/// repository's can't, and each goes to the app's own channels as well.
+pub const RELEASE_EVENTS: &[&str] = &["release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
+/// How long a release's event, once sent through a channel, isn't sent through it again.
+const RELEASE_ONCE: i64 = 90 * 86_400;
 /// The integration kinds that are channels.
 pub const CHANNELS: &[&str] = &["slack", "discord", "teams", "telegram", "pagerduty", "opsgenie", "webhook"];
 
@@ -70,6 +92,9 @@ impl Rule {
         }
         if !server && let Some(e) = self.on.iter().find(|e| AGENT_EVENTS.contains(&e.as_str())) {
             return Err(format!("`{e}` is about an agent, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml)"));
+        }
+        if !server && let Some(e) = self.on.iter().find(|e| RELEASE_EVENTS.contains(&e.as_str())) {
+            return Err(format!("`{e}` is about a release, not a repository: the server's rules take it (`[[ci.notify]]` in kiln.toml), and an app's own channels"));
         }
         if self.to.is_empty() {
             return Err("a rule needs somewhere to send to (`to`)".into());
@@ -219,6 +244,43 @@ impl Msg {
         let line = format!("{text} · {machine} · {url}");
         let webhook = json!({ "event": event, "title": title, "text": line, "agent": ev.get("agent").cloned().unwrap_or(Value::Null), "url": url });
         Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook }
+    }
+}
+
+impl Msg {
+    /// A release's event: `release` as `/api/deploy/releases/{id}` answers it, with the people who
+    /// may approve it (`approvers`) when it waits for them.
+    fn of_release(event: &str, r: &Value, url: &str) -> Msg {
+        let get = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (app, env, version, by, message) = (get("app"), get("environment"), get("version"), get("requested_by"), get("message"));
+        let id = r.get("id").and_then(Value::as_i64).unwrap_or_default();
+        let what = match get("kind").as_str() {
+            "deploy" => version,
+            "rollback" => format!("a rollback to {version}"),
+            "config" => "new values".to_owned(),
+            "enable" => "enabling".to_owned(),
+            "disable" => "disabling".to_owned(),
+            other => other.to_owned(),
+        };
+        let title = match event {
+            "release.waiting_approval" => format!("⏸ {app} {what} → {env} waits for approval"),
+            "release.succeeded" => format!("✓ {app} {what} landed in {env}"),
+            "release.failed" => format!("✗ {app} {what} failed in {env}"),
+            "release.cancelled" => format!("◌ {app} {what} → {env} was cancelled"),
+            other => format!("{other}: {app} → {env}"),
+        };
+        let approvers: Vec<&str> = r.get("approvers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut parts = vec![format!("release {id}, asked by {by}")];
+        if !approvers.is_empty() {
+            parts.push(format!("approvers: {}", approvers.join(", ")));
+        }
+        if let Some(first) = message.lines().next().filter(|l| !l.is_empty()) {
+            parts.push(first.to_owned());
+        }
+        parts.push(url.to_owned());
+        let line = parts.join(" · ");
+        let webhook = json!({ "event": event, "title": title, "text": line, "release": r, "url": url });
+        Msg { title, line, url: url.to_owned(), what: "the release", dedup: format!("kiln:release:{app}:{env}"), resolve: event == "release.succeeded", webhook }
     }
 }
 
@@ -432,6 +494,48 @@ pub async fn agent_event(hub: Arc<Hub>, ev: Value) {
     }
 }
 
+/// Whether `rule` takes a release's `event`: `where` reads `release` (its `id`, `app`,
+/// `environment`, `kind`, `version`, `state`, `requested_by`, `message`, `approvers`).
+fn takes_release(rule: &Rule, event: &str, release: &Value) -> bool {
+    if !rule.on.iter().any(|e| e == event) {
+        return false;
+    }
+    let Some(c) = &rule.cond else { return true };
+    let Ok(cond) = kiln_ci::expr::Condition::parse(c, &kiln_ci::expr::ParseOptions::permissive(kiln_ci::expr::Dialect::Kiln)) else { return false };
+    let cx = kiln_ci::expr::MapContexts::default().with("release", kiln_ci::expr::Value::from_json(release));
+    kiln_ci::expr::eval_condition(&cond, &cx, &mut kiln_ci::expr::Budget::default()).unwrap_or(false)
+}
+
+/// A channel an app names for its release messages: `kind:target`, or a bare `#channel`, which is
+/// Slack's.
+fn app_channel(c: &str) -> String {
+    if c.contains(':') { c.to_owned() } else { format!("slack:{c}") }
+}
+
+/// A release's event (docs/deploy-api.md §12.3), through every server rule that takes it and to
+/// the app's own channels: once per release, event and channel (kept, so a restart or the same
+/// state said again sends nothing more).
+pub async fn release_event(hub: Arc<Hub>, event: &'static str, release: Value, channels: Vec<String>) {
+    let id = release.get("id").and_then(Value::as_i64).unwrap_or_default();
+    let url = format!("{}/deployments/releases/{id}", hub.cfg.server.public_url.trim_end_matches('/'));
+    let m = Msg::of_release(event, &release, &url);
+    let mut sends: Vec<(String, String)> = Vec::new();
+    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+        if rule.check(true).is_err() || !takes_release(rule, event, &release) {
+            continue;
+        }
+        sends.extend(rule.to.iter().map(|spec| (format!("server#{}", n + 1), spec.clone())));
+    }
+    sends.extend(channels.iter().map(|c| ("app".to_owned(), app_channel(c))));
+    let mut seen = std::collections::HashSet::new();
+    for (rule, spec) in sends {
+        if !seen.insert(spec.clone()) || throttled(&hub, &format!("release\u{0}{id}\u{0}{event}\u{0}{spec}"), Some(RELEASE_ONCE)).await {
+            continue;
+        }
+        deliver(&hub, None, &rule, event, &format!("release:{id}"), &m, &spec).await;
+    }
+}
+
 /// A run's facts for its events.
 async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>> {
     let r = run.to_owned();
@@ -589,5 +693,29 @@ mod tests {
         // A run's message is as it was.
         let r = Msg::of_run("run.failed", &subject());
         assert_eq!((r.title.as_str(), r.dedup.as_str(), r.resolve), ("✗ CI #7 failed on main", "kiln:acme/app:.github/workflows/ci.yml:main", false));
+    }
+
+    /// docs/deploy-api.md §12.3: a release's events through the server's rules, `where` reading
+    /// `release`, and to the app's own channels.
+    #[test]
+    fn a_releases_events_go_through_the_servers_rules_and_the_apps_channels() {
+        let r = json!({ "id": 42, "app": "web", "environment": "production", "kind": "deploy", "state": "waiting_approval", "version": "1.4.2", "requested_by": "ada", "message": "the parser fix\n\nlong", "approvers": ["grace", "linus"] });
+        let rule = |on: &str, cond: Option<&str>| Rule { on: vec![on.into()], cond: cond.map(str::to_owned), to: vec!["slack:#deploys".into()], throttle: None };
+        assert!(takes_release(&rule("release.waiting_approval", None), "release.waiting_approval", &r));
+        assert!(!takes_release(&rule("release.failed", None), "release.waiting_approval", &r));
+        assert!(takes_release(&rule("release.waiting_approval", Some("release.environment == 'production'")), "release.waiting_approval", &r));
+        assert!(!takes_release(&rule("release.waiting_approval", Some("release.app == 'api'")), "release.waiting_approval", &r));
+        // A server rule may name them; a repository's may not.
+        assert!(rule("release.succeeded", None).check(true).is_ok());
+        assert!(parse_rules("- on: release.succeeded\n  to: slack:#x\n").is_err());
+        let m = Msg::of_release("release.waiting_approval", &r, "https://kiln.example/deployments/releases/42");
+        assert_eq!(m.title, "⏸ web 1.4.2 → production waits for approval");
+        assert_eq!(m.line, "release 42, asked by ada · approvers: grace, linus · the parser fix · https://kiln.example/deployments/releases/42");
+        assert_eq!((m.dedup.as_str(), m.resolve), ("kiln:release:web:production", false));
+        let rollback = json!({ "id": 43, "app": "web", "environment": "production", "kind": "rollback", "version": "1.4.1", "requested_by": "grace" });
+        let landed = Msg::of_release("release.succeeded", &rollback, "u");
+        assert_eq!((landed.title.as_str(), landed.resolve), ("✓ web a rollback to 1.4.1 landed in production", true));
+        assert_eq!(app_channel("#deploys"), "slack:#deploys", "a bare channel is Slack's");
+        assert_eq!(app_channel("teams:ops"), "teams:ops");
     }
 }
