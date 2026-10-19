@@ -14,30 +14,33 @@ import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { UpdatesHold, UpdatesPanel } from "@/views/settings-updates";
 import { DeploySettings } from "@/views/settings-deploy";
+import { NotificationsHold, NotificationsPanel } from "@/views/settings-notifications";
+import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
 
 const methodsRes: Res<{ password: boolean; token: boolean }> = { key: "auth/methods", fetch: (sig) => api.authMethods(sig) };
 
 export default function Settings() {
-  warm(updatesRes, methodsRes);
+  warm(updatesRes, methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes);
   return (
     <div className="container-console page max-w-[880px]">
       <title>Settings · kiln</title>
       <PageIntro index={10} label="Settings" title="Settings" lead="Preferences here are stored in this browser only." />
       {/* The page arrives whole: nothing below a loading panel moves when it lands. */}
-      <Loadable label="the settings" fallback={<SettingsPanels updates={<UpdatesHold />} password={<PasswordHold />} />}>
-        <SettingsPanels updates={<UpdatesPanel />} password={<PasswordPanel />} />
+      <Loadable label="the settings" fallback={<SettingsPanels updates={<UpdatesHold />} password={<PasswordHold />} notifications={<NotificationsHold />} />}>
+        <SettingsPanels updates={<UpdatesPanel />} password={<PasswordPanel />} notifications={<NotificationsPanel />} />
       </Loadable>
     </div>
   );
 }
 
-function SettingsPanels({ updates, password }: { updates: React.ReactNode; password: React.ReactNode }) {
+function SettingsPanels({ updates, password, notifications }: { updates: React.ReactNode; password: React.ReactNode; notifications: React.ReactNode }) {
   const [grafana, setGrafana] = usePref("kiln.grafanaUrl", "");
   const [draft, setDraft] = React.useState(grafana);
   const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
   const valid = draft === "" || /^https?:\/\/\S+$/.test(draft.trim());
   return (
     <div className="space-y-4">
+      {notifications}
       {updates}
       <DeploySettings />
       <Panel eyebrow="Integrations" title="Grafana" description="Linked from the Metrics page. kiln ships dashboards as ConfigMaps under deploy/.">

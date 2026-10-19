@@ -414,7 +414,9 @@ export type ServerEvent =
   /** A rollout of an app's object on a target moved on: refetch GET /api/cd/apps/:app/rollout. */
   | { type: "cd_rollout"; app: string; id: string }
   /** What machines hold, or a task moving a repository between them, changed: refetch GET /api/places. */
-  | { type: "places" };
+  | { type: "places" }
+  /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
+  | { type: "push" };
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
