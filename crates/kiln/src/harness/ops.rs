@@ -24,8 +24,21 @@ fn agent_of(v: &Value) -> Result<String, Fail> {
     text(v, "agent")
 }
 
+/// The agent `id` names: its id, or the start of it (8 characters, as lists shorten it).
 fn known(cx: &Cx, id: &str) -> Result<Info, Fail> {
-    cx.hub.harness.info(id).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no agent {id}")))
+    if let Some(i) = cx.hub.harness.info(id) {
+        return Ok(i);
+    }
+    if id.len() >= 4 {
+        let mut found: Vec<Info> = cx.hub.harness.list().into_iter().filter(|i| i.id.starts_with(id)).collect();
+        if found.len() > 1 {
+            return Err((StatusCode::BAD_REQUEST, format!("{id} is the start of {} agents' ids: give more of it", found.len())));
+        }
+        if let Some(i) = found.pop() {
+            return Ok(i);
+        }
+    }
+    Err((StatusCode::NOT_FOUND, format!("no agent {id}")))
 }
 
 /// Who starts agents for this call.
@@ -69,8 +82,8 @@ async fn list(cx: Cx, v: Value) -> Out {
 const HEAVY: &[&str] = &["skills", "plugins", "mcp", "harness_status", "delivery", "control_values", "inventory", "limits", "stop_waived"];
 
 async fn get(cx: Cx, v: Value) -> Out {
-    let id = agent_of(&v)?;
-    let info = known(&cx, &id)?;
+    let info = known(&cx, &agent_of(&v)?)?;
+    let id = info.id.clone();
     let (mut state, _, _) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     if let Some(o) = state.as_object_mut() {
         for k in HEAVY {
@@ -101,6 +114,7 @@ async fn send(cx: Cx, v: Value) -> Out {
         other => return Err((StatusCode::BAD_REQUEST, format!("`mode` is queue, steer or now, not {other:?}"))),
     };
     let info = known(&cx, &id)?;
+    let id = info.id.clone();
     may_steer(&cx, &id)?;
     let message = crate::util::new_id();
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
@@ -141,7 +155,8 @@ fn flag(v: &Value, k: &str) -> bool {
 }
 
 async fn wait_for(cx: Cx, v: Value) -> Out {
-    let ids = ids_of(&v)?;
+    // Each by its id or the start of it; one kiln doesn't run (any more) has ended.
+    let ids: Vec<String> = ids_of(&v)?.into_iter().map(|id| known(&cx, &id).map_or(id, |i| i.id)).collect();
     let until = match v.get("until").and_then(Value::as_str).unwrap_or("settled") {
         "settled" => Until::Settled,
         "change" => Until::Change,
@@ -158,8 +173,8 @@ fn reply_of(e: &Value) -> Option<Value> {
 }
 
 async fn result(cx: Cx, v: Value) -> Out {
-    let id = agent_of(&v)?;
-    let info = known(&cx, &id)?;
+    let info = known(&cx, &agent_of(&v)?)?;
+    let id = info.id.clone();
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
@@ -186,8 +201,8 @@ async fn result(cx: Cx, v: Value) -> Out {
 }
 
 async fn interrupt(cx: Cx, v: Value) -> Out {
-    let id = agent_of(&v)?;
-    let info = known(&cx, &id)?;
+    let info = known(&cx, &agent_of(&v)?)?;
+    let id = info.id.clone();
     may_steer(&cx, &id)?;
     match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
         Sent::Ok => Ok(json!({"interrupted": true})),
@@ -207,8 +222,7 @@ pub async fn end(hub: &crate::hub::Hub, id: &str, actor: &str) -> bool {
 }
 
 async fn stop(cx: Cx, v: Value) -> Out {
-    let id = agent_of(&v)?;
-    known(&cx, &id)?;
+    let id = known(&cx, &agent_of(&v)?)?.id;
     may_steer(&cx, &id)?;
     let mut ended: Vec<String> = Vec::new();
     // Its children first (those that ended too: they leave with it), the deepest first, so none
@@ -229,9 +243,29 @@ async fn stop(cx: Cx, v: Value) -> Out {
 }
 
 async fn children(cx: Cx, v: Value) -> Out {
-    let id = agent_of(&v)?;
-    known(&cx, &id)?;
+    let id = known(&cx, &agent_of(&v)?)?.id;
     Ok(json!({"children": lineage::children_brief(&cx.hub, &id)}))
+}
+
+/// How the server's own socket asks it an operation (`super::socket::Forward`): for the agent that
+/// asks, or the person in the kiln shell.
+pub fn forward(hub: std::sync::Arc<crate::hub::Hub>) -> super::socket::Forward {
+    std::sync::Arc::new(move |asker, name, input| {
+        let hub = std::sync::Arc::clone(&hub);
+        Box::pin(async move {
+            let caller = match &asker {
+                super::socket::Asker::Agent(id) => crate::mcp::session_caller(&hub, id, None).await,
+                super::socket::Asker::Terminal(t) => crate::mcp::terminal_caller(&hub, t, None).await,
+            };
+            match caller {
+                Ok(caller) => match crate::ops::call(Cx { hub, caller }, &name, input).await {
+                    Ok(v) => json!({"ok": v}),
+                    Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
+                },
+                Err(e) => json!({"error": e}),
+            }
+        })
+    })
 }
 
 /// The `agents.*` operations.

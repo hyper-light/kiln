@@ -2579,6 +2579,8 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
     if !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
     }
+    // Who opens it: `kiln spawn --on` and `kiln agents` in it act for them.
+    let opener = req.extensions().get::<crate::authz::Caller>().and_then(crate::authz::Caller::opener);
     let t: NewTerminal = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
@@ -2598,6 +2600,9 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
         }
         None => return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<machine>\"")),
     };
+    if let Some(o) = opener {
+        let _ = hub.store.kv_set(crate::mcp::terminal_opener_key(&session.id), o).await;
+    }
     Ok(srv::json(StatusCode::CREATED, &session.info()))
 }
 

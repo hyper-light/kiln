@@ -212,6 +212,11 @@ fn set_env(p: &mut Process, spec: &Spec) {
             p.env(k, v);
         }
     }
+    // `kiln spawn` and `kiln agents` in its commands: what it starts are its children (the socket
+    // knows the agent by its process).
+    if let Some(sock) = super::socket::served() {
+        p.env("KILN_HARNESS_SOCK", sock);
+    }
     for k in super::claude::SCRUB_ENV {
         p.env_remove(k);
     }

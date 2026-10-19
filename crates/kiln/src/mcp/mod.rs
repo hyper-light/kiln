@@ -117,7 +117,16 @@ pub fn opener_key(id: &str) -> String {
 /// whoever started it (the owner on a kiln nobody else signs in to), audited as
 /// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
 pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
+    // Who started it; for one started with `kiln spawn` in a kiln shell, whoever opened that shell.
+    let shell = hub.harness.info(session).and_then(|i| i.shell);
     let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
+        Some(o) => Some(o),
+        None => match shell {
+            Some(t) => hub.store.kv_get(terminal_opener_key(&t)).await.ok().flatten(),
+            None => None,
+        },
+    };
+    let opener = match opener {
         Some(o) => o,
         None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
         None => return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned()),
@@ -129,6 +138,29 @@ pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> R
     };
     caller.agent = Some(session.to_owned());
     Ok(caller)
+}
+
+/// Where kiln keeps who opened kiln terminal `id` (`owner` or `user:<id>`).
+pub fn terminal_opener_key(id: &str) -> String {
+    format!("terminals/opener/{id}")
+}
+
+/// The person in kiln terminal `terminal` (one on `runner`, or on the server): whoever opened it
+/// (the owner on a kiln nobody else signs in to), audited as `shell:<short>[@<runner>] for <them>`.
+pub async fn terminal_caller(hub: &Hub, terminal: &str, runner: Option<&str>) -> Result<Caller, String> {
+    let short: String = terminal.chars().take(8).collect();
+    let t = hub.terminals.get(terminal).ok_or_else(|| format!("kiln has no terminal {short} open: run this in a terminal kiln opened"))?;
+    let here = runner.map_or_else(|| "local".to_owned(), |r| format!("agent:{r}"));
+    if t.target != here {
+        return Err(format!("terminal {short} isn't on this machine"));
+    }
+    let opener = match hub.store.kv_get(terminal_opener_key(terminal)).await.ok().flatten() {
+        Some(o) => o,
+        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
+        None => return Err("kiln doesn't know who opened this terminal, so it can't act for them: open a new one".to_owned()),
+    };
+    let name = runner.map_or_else(|| format!("shell:{short}"), |r| format!("shell:{short}@{r}"));
+    crate::authz::gate::agent_for(hub, &name, &opener).await.ok_or_else(|| "whoever opened this terminal can't sign in here any more".to_owned())
 }
 
 /// The caller an MCP token of an agent session is (`session_token`), when `actor` is one: that
@@ -155,10 +187,16 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
     let session = ask.get("session").and_then(Value::as_str).unwrap_or("");
-    if session.is_empty() || !hub.harness.located_on(session, runner) {
+    let terminal = ask.get("terminal").and_then(Value::as_str).unwrap_or("");
+    // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
+    let caller = if session.is_empty() && !terminal.is_empty() && ask.get("op").and_then(Value::as_str) == Some("call") {
+        terminal_caller(hub, terminal, Some(runner)).await
+    } else if session.is_empty() || !hub.harness.located_on(session, runner) {
         return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
-    }
-    let caller = match session_caller(hub, session, Some(runner)).await {
+    } else {
+        session_caller(hub, session, Some(runner)).await
+    };
+    let caller = match caller {
         Ok(c) => c,
         Err(e) => return json!({"error": e}),
     };
@@ -455,7 +493,8 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
             .bearer(&token)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .timeout(std::time::Duration::from_secs(120))
+            // `agents_wait` may wait up to 10 minutes.
+            .timeout(std::time::Duration::from_secs(660))
             .body(line.clone())
             .send()
             .await;

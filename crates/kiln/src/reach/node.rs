@@ -46,8 +46,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(45);
 const DIRECTORY_TTL: Duration = Duration::from_secs(30);
 /// A peer with nothing to follow keeps its link this long.
 const IDLE_LINK: Duration = Duration::from_secs(300);
-/// A question for the server an agent's tools asked ([`Handle::query`]) is given up after this.
-const QUERY_TIMEOUT: Duration = Duration::from_secs(600);
+/// A question for the server an agent's tools asked ([`Handle::query`]) is given up after this
+/// (`agents.wait` waits up to 10 minutes).
+const QUERY_TIMEOUT: Duration = Duration::from_secs(660);
 
 #[derive(Debug, Clone)]
 pub struct Config {

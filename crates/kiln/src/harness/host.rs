@@ -210,6 +210,14 @@ impl Host {
         self.sessions.lock().get(id).cloned()
     }
 
+    /// Each session and its harness's process, where one runs (which agent a process is: a
+    /// `kiln` command run by an agent's tool, `super::socket`). The sessions' own locks are taken
+    /// after this host's is let go.
+    pub fn harness_pids(&self) -> Vec<(String, Option<u32>)> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect()
+    }
+
     pub fn list(&self) -> Vec<Info> {
         let mut v: Vec<Info> = self.sessions.lock().values().map(|s| s.info()).collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
