@@ -227,6 +227,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
+        (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
         (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
         (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
         (&Method::GET, ["dl", "kiln", target, build]) => return download_build(&hub, target, build).await,
@@ -3091,6 +3092,38 @@ async fn readyz(hub: &Hub) -> Response {
     }
 }
 
+/// `/healthz/server`: how this server is, for the checks that watch a deploy of kiln
+/// (docs/cd-targets.md §10). The commit it runs; how long it has been up; how many times kiln's
+/// supervisor started it again (a crash, or the kernel's OOM killer: neither shows in its pod's
+/// status); its container's memory, from its cgroup; and its runners, connected now and just
+/// before it started, and the share of those back (checks' criteria compare, they don't count).
+/// Numbers and the commit only, so it's open, as `/healthz` is.
+fn server_health(hub: &Hub) -> Response {
+    let memory = crate::os::cgroup::memory().map(|m| json!({ "used": m.used, "limit": m.limit, "share": m.share(), "peak": m.peak, "oom_kills": m.oom_kills }));
+    let connected = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).count() as u64;
+    let before = hub.runners_before.load(std::sync::atomic::Ordering::Relaxed);
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "commit": COMMIT,
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_s": hub.started.elapsed().as_secs(),
+            "restarts": hub.generation.saturating_sub(1),
+            "memory": memory,
+            "runners": { "connected": connected, "before": before, "back": back(connected, before) },
+        }),
+    )
+}
+
+/// The share of the runners connected before a start that are connected now, to three places:
+/// all of them when there were none.
+fn back(connected: u64, before: u64) -> f64 {
+    if before == 0 {
+        return 1.0;
+    }
+    (connected.min(before) as f64 / before as f64 * 1000.0).round() / 1000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3108,6 +3141,14 @@ mod tests {
             assert!(script.contains("@@KILN_SERVER@@"));
             assert!(script.contains("/dl/kiln/"));
         }
+    }
+
+    #[test]
+    fn the_share_of_runners_back_after_a_start() {
+        assert_eq!(back(0, 0), 1.0, "none before: all of them");
+        assert_eq!(back(3, 6), 0.5);
+        assert_eq!(back(2, 3), 0.667);
+        assert_eq!(back(9, 6), 1.0, "more than before is all of them");
     }
 
     #[test]

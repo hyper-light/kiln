@@ -18,6 +18,14 @@ apps:
     sync:
       options: [CreateNamespace=true, SkipDryRunOnMissingResource=true]
       retry: { limit: 10, backoff: 10s, factor: 2, max: 3m }
+    # A new kiln is kept only once it has proved itself. kiln can't run beside itself (one writer
+    # on its data), so it takes over at once; then these checks watch it for ten minutes, and any
+    # that fails puts the previous version back (docs/cd-targets.md §10). The guard also fails it
+    # when its pod restarts or stops being ready.
+    rollout:
+      all-at-once:
+        after: [serving, steady, memory, commit, runners]
+        window: 10m
 
   namespaces:
     source: deploy/argocd/namespaces
@@ -36,3 +44,37 @@ apps:
     sync:
       options: [CreateNamespace=true, ServerSideApply=true]
       retry: { limit: 10, backoff: 10s, factor: 2, max: 3m }
+
+# What a new kiln must keep showing for its deploy to stand. Each reads its report of itself
+# (/healthz/server) or /readyz through its Service.
+checks:
+  # It answers, and so does its store.
+  serving:
+    http: { url: "http://kiln.kiln.svc.cluster.local:7070/readyz" }
+    every: 10s
+    failures: 1
+  # Its server stays up. kiln's supervisor starting it again inside its pod, after a crash or the
+  # kernel's OOM killer, doesn't show in the pod's status: on 2026-10-18 a new kiln was killed
+  # every minute and its pod read as ready throughout.
+  steady:
+    http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }
+    every: 10s
+    fail: "${{ result.json.restarts > 0 || result.json.memory.oom_kills > 0 }}"
+  # Its memory stays well under its pod's limit.
+  memory:
+    http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }
+    every: 15s
+    failures: 1
+    fail: "${{ result.json.memory.share > 0.8 }}"
+  # It runs the commit deployed (an image built without KILN_COMMIT knows none).
+  commit:
+    http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }
+    count: 1
+    pass: "${{ result.json.commit == rollout.revision }}"
+  # Runners reach it: three minutes in, at least half of those connected before it started are
+  # back.
+  runners:
+    http: { url: "http://kiln.kiln.svc.cluster.local:7070/healthz/server" }
+    delay: 3m
+    count: 1
+    pass: "${{ result.json.runners.back >= 0.5 }}"

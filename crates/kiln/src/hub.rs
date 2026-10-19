@@ -163,6 +163,8 @@ pub struct Hub {
     pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
     pub generation: u64,
+    /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
+    pub runners_before: AtomicU64,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -244,6 +246,7 @@ impl Hub {
             launching: Mutex::new(HashMap::new()),
             started: Instant::now(),
             generation,
+            runners_before: AtomicU64::new(0),
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
