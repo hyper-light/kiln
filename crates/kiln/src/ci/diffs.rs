@@ -6,7 +6,7 @@
 //! version's files, an interdiff between versions (`git range-diff`), a stack. Its author marks
 //! it ready, abandons or reclaims it; anyone who may submit commandeers it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -711,6 +711,8 @@ async fn files(hub: &Hub, d: &Diff, v: &Version, viewer: &str, latest: &Version)
     let mut list = numstat(&String::from_utf8_lossy(&stat));
     let statuses = name_status(&String::from_utf8_lossy(&status));
     let seen = if v.n == latest.n { super::review::viewed_files(hub, d, viewer, latest).await } else { HashMap::new() };
+    let paths: Vec<String> = list.iter().filter_map(|f| f.get("path").and_then(Value::as_str).map(str::to_owned)).collect();
+    let generated = generated_files(hub, &path, &v.commit, &paths).await;
     for f in &mut list {
         let path = f.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
         if let Some(o) = f.as_object_mut() {
@@ -718,12 +720,86 @@ async fn files(hub: &Hub, d: &Diff, v: &Version, viewer: &str, latest: &Version)
                 o.insert("status".into(), json!(s));
             }
             o.insert("viewed".into(), json!(seen.contains_key(&path)));
+            o.insert("generated".into(), json!(generated.contains(&path)));
         }
     }
     const MAX: usize = 8 << 20;
     let truncated = patch.len() > MAX;
     let text = String::from_utf8_lossy(patch.get(..MAX.min(patch.len())).unwrap_or_default()).into_owned();
     Ok(json!({ "diff": d.name, "version": v.n, "commit": v.commit, "parent": v.parent, "files": list, "patch": text, "truncated": truncated }))
+}
+
+/// Which of `paths` the repository's `.gitattributes` (as of `commit`) marks generated
+/// (`linguist-generated`) or not to diff (`-diff`, as `binary` does): the review folds them.
+async fn generated_files(hub: &Hub, repo: &str, commit: &str, paths: &[String]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let source = format!("--source={commit}");
+    for chunk in paths.chunks(500) {
+        let mut args: Vec<&str> = vec!["-C", repo, "check-attr", &source, "-z", "linguist-generated", "diff", "--"];
+        args.extend(chunk.iter().map(String::as_str));
+        let Ok(said) = gitops::run_git(hub, &args, LS_REMOTE_TIMEOUT).await else { continue };
+        let text = String::from_utf8_lossy(&said);
+        let mut parts = text.split('\0');
+        while let (Some(path), Some(attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
+            let marked = match attr {
+                "linguist-generated" => value == "set" || value == "true",
+                "diff" => value == "unset",
+                _ => false,
+            };
+            if marked {
+                out.insert(path.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// The most of a file `/versions/:v/blob` serves.
+const MAX_BLOB: u64 = 10 << 20;
+
+/// `GET /api/diffs/:id/versions/:v/blob?path=&side=old|new`: a file as it is at the version's
+/// commit (`new`, the default) or its parent (`old`; a renamed file's `old_path`), typed by its
+/// name and never more than [`MAX_BLOB`]. Sandboxed, so nothing in it runs as kiln.
+async fn blob(hub: &Hub, d: &Diff, v: &Version, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    let path = q
+        .get("path")
+        .map(String::as_str)
+        .filter(|p| !p.is_empty() && !p.starts_with('/') && !p.split('/').any(|x| x == ".." || x.is_empty()))
+        .ok_or((StatusCode::BAD_REQUEST, "`path`: a file of the repository".to_owned()))?;
+    let rev = match q.get("side").map(String::as_str) {
+        None | Some("new") => &v.commit,
+        Some("old") => &v.parent,
+        Some(other) => return Err((StatusCode::BAD_REQUEST, format!("`side` is `old` or `new`, not `{other}`"))),
+    };
+    let (_, repo) = home(hub, d).await?;
+    let spec = format!("{rev}:{path}");
+    let size = gitops::run_git(hub, &["-C", &repo, "cat-file", "-s", &spec], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::NOT_FOUND, format!("no {path} on that side")))?;
+    let size: u64 = String::from_utf8_lossy(&size).trim().parse().unwrap_or(u64::MAX);
+    if size > MAX_BLOB {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("{path} is {size} bytes; at most {MAX_BLOB} are served")));
+    }
+    let bytes = gitops::run_git(hub, &["-C", &repo, "cat-file", "blob", &spec], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let r = srv::response(StatusCode::OK, content_type(path), srv::full(bytes));
+    let r = srv::with_header(r, http::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    Ok(srv::with_header(r, http::header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
+}
+
+/// A file's type by its name: images (and PDFs) as themselves, the rest as bytes.
+fn content_type(path: &str) -> &'static str {
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
 }
 
 /// `git diff --numstat -z`: `added\tdeleted\tpath\0`, or for a rename `added\tdeleted\t\0old\0new\0`.
@@ -927,6 +1003,10 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     let vs = versions(hub, &d).await.map_err(fail)?;
                     let latest = vs.last().cloned().ok_or((StatusCode::NOT_FOUND, "no versions".to_owned()))?;
                     ok(files(hub, &d, &version_of(&vs, n)?, &super::review::who(caller).0, &latest).await?)
+                }
+                (&Method::GET, ["versions", n, "blob"]) => {
+                    let vs = versions(hub, &d).await.map_err(fail)?;
+                    blob(hub, &d, &version_of(&vs, n)?, q).await
                 }
                 (&Method::GET, ["interdiff"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;

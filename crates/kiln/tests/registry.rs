@@ -764,7 +764,12 @@ fn w13_r11_build_image() -> anyhow::Result<()> {
         "aarch64" => "arm64",
         a => a,
     };
-    check_built(&b, &json!([format!("linux/{arch}")]))?;
+    let checked = check_built(&b, &json!([format!("linux/{arch}")]));
+    // buildx's docker driver keeps the image in the engine too: not this test's to leave there.
+    for tag in ["v1", "latest"] {
+        let _ = std::process::Command::new("docker").args(["image", "rm", &format!("127.0.0.1:{}/acme/images/images/tools:{tag}", b.s.port)]).output();
+    }
+    checked?;
     assert!(b.log.contains("docker buildx build --push"), "{}", b.log);
     Ok(())
 }

@@ -974,3 +974,89 @@ fn w14_r05_suggestions_mirror_signing() -> anyhow::Result<()> {
     assert!(st == 422 && r.to_string().contains("doesn't apply"), "{st} {r}");
     Ok(())
 }
+
+/// A GET's status, headers (names lowercase) and body as bytes.
+fn get_raw(port: u16, token: &str, path: &str) -> anyhow::Result<(u16, std::collections::HashMap<String, String>, Vec<u8>)> {
+    use std::io::{Read as _, Write as _};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(60)))?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n")?;
+    let mut all = Vec::new();
+    s.read_to_end(&mut all)?;
+    let split = all.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| anyhow::anyhow!("no header end"))?;
+    let head = String::from_utf8_lossy(all.get(..split).unwrap_or_default()).into_owned();
+    let mut body = all.get(split + 4..).unwrap_or_default().to_vec();
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let headers: std::collections::HashMap<String, String> = head.lines().skip(1).filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())).collect();
+    if headers.get("transfer-encoding").is_some_and(|t| t.eq_ignore_ascii_case("chunked")) {
+        let mut out = Vec::new();
+        let mut rest = body.as_slice();
+        while let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") {
+            let size = usize::from_str_radix(String::from_utf8_lossy(rest.get(..eol).unwrap_or_default()).trim(), 16).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(rest.get(eol + 2..eol + 2 + size).unwrap_or_default());
+            rest = rest.get(eol + 4 + size..).unwrap_or_default();
+        }
+        body = out;
+    }
+    Ok((status, headers, body))
+}
+
+/// What the review folds and shows as images (docs/ci.md W14, for W21's review pages): files
+/// `.gitattributes` marks generated (`linguist-generated`) or not to diff (`-diff`, and `binary`)
+/// say `generated`; a version's file is served as it is on either side, with its type, sandboxed,
+/// up to 10 MiB.
+#[test]
+fn w14_generated_files_and_blobs() -> anyhow::Result<()> {
+    const PNG_V1: &[u8] = b"\x89PNG\r\n\x1a\nthe first logo";
+    const PNG_V2: &[u8] = b"\x89PNG\r\n\x1a\nthe second logo";
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join(".gitattributes"), "dist/** linguist-generated\n*.lock -diff\n*.bin binary\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    std::fs::write(work.join("logo.png"), PNG_V1)?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the trunk")?;
+    must(git(&home, &work, &["checkout", "-qb", "change"]), "branch")?;
+    std::fs::create_dir_all(work.join("dist"))?;
+    std::fs::write(work.join("dist/app.js"), "built();\n")?;
+    std::fs::write(work.join("deps.lock"), "lock\n")?;
+    std::fs::write(work.join("data.bin"), [0u8, 1, 2, 3])?;
+    std::fs::write(work.join("src.rs"), "fn main() {}\n")?;
+    std::fs::write(work.join("logo.png"), PNG_V2)?;
+    std::fs::write(work.join("big.bin"), vec![0u8; 11 << 20])?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "change\n\nChange-Id: I4444444444444444444444444444444444444444"]), "commit")?;
+    must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "submit")?;
+    let files = api(&s, &dev, "GET", "/api/diffs/D1/versions/1/files")?;
+    let generated = |p: &str| files.get("files").and_then(Value::as_array).and_then(|f| f.iter().find(|x| text(x, "path") == p)).and_then(|x| x.get("generated")).and_then(Value::as_bool);
+    for (p, want) in [("dist/app.js", true), ("deps.lock", true), ("data.bin", true), ("big.bin", true), ("src.rs", false), ("logo.png", false)] {
+        assert_eq!(generated(p), Some(want), "{p}: {files}");
+    }
+    // Both sides of the image, with its type, sandboxed.
+    for (side, want) in [("old", PNG_V1), ("new", PNG_V2)] {
+        let (st, h, bytes) = get_raw(s.port, &dev, &format!("/api/diffs/D1/versions/1/blob?path=logo.png&side={side}"))?;
+        assert_eq!((st, bytes.as_slice()), (200, want), "{side}: {}", String::from_utf8_lossy(&bytes));
+        assert_eq!(h.get("content-type").map(String::as_str), Some("image/png"), "{h:?}");
+        assert_eq!(h.get("x-content-type-options").map(String::as_str), Some("nosniff"), "{h:?}");
+        assert!(h.get("content-security-policy").is_some_and(|c| c.contains("sandbox")), "{h:?}");
+    }
+    // What isn't on a side, what's too big, and what isn't a path in the repository.
+    let status = |q: &str| get_raw(s.port, &dev, &format!("/api/diffs/D1/versions/1/blob?{q}")).map(|r| r.0);
+    assert_eq!(status("path=src.rs&side=old")?, 404, "new in this version");
+    assert_eq!(status("path=big.bin")?, 413, "past 10 MiB");
+    assert_eq!(status("path=../../etc/passwd")?, 400);
+    assert_eq!(status("path=logo.png&side=both")?, 400);
+    Ok(())
+}

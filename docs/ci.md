@@ -3273,7 +3273,9 @@ enforcement points to W18, agent isolation to W20.
   read from that manifest (an index's members, else its config's). `GET /api/ci/images?repo=&name=`
   lists them, newest first. The step's outputs are `image` (by digest) and `digest`.
   `w13_r11_build_image` builds a Dockerfile this way and checks the registration against the
-  registry; `w13_r11_build_agentfile` does the same for an Agentfile where shards is installed.
+  registry. `w13_r11_build_agentfile` does the same for an Agentfile where shards is installed.
+  It passed on an Apple silicon Mac with shards 0.1.0: a Linux arm64 microVM image, pushed by
+  shards with kiln's helper, and no Docker in the leg's log.
 - *Left.*
   - R01's probes and R02.
   - The `firecracker`, `shards` and `k8s` executors (R05 to R07).
@@ -3478,6 +3480,13 @@ left.
     `/versions/:v/files`, `/interdiff?from=&to=` (`git range-diff`), `/api/stacks/:id`, and
     `ready`, `abandon`, `reclaim`, `commandeer`, scoped to the diff's repository in the route
     table;
+  - for the review pages (W21): each file of `/versions/:v/files` says whether it's `generated`.
+    That is, the repository's `.gitattributes` at that version's commit marks it
+    `linguist-generated`, or not to diff (`-diff`, which `binary` implies), and the review folds
+    it. `/versions/:v/blob?path=&side=new|old` serves a file as it is on either side (`old` reads
+    the parent, a renamed file's `old_path`). It's typed by its name (images and PDFs as
+    themselves), `nosniff` and sandboxed, at most 10 MiB (413 past that), and a 404 where the
+    side has no such file (`w14_generated_files_and_blobs`);
   - the CLI (`crates/kiln/src/ci/review_cli.rs`):
     - `kiln clone` (kiln's git credential helper, and the commit-msg hook that adds Change-Ids);
     - `kiln submit` (adds the Change-Ids commits lack, then pushes);
@@ -5189,7 +5198,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/openapi.json` | the route table as OpenAPI 3.1 (`x-kiln-capability`) | signed in | W10 |
 | * | `/git/<owner>/<repo>.git/...` | git smart HTTP | diffs.submit (push), diffs.read | W14 |
 | GET | `/api/repos/:repo/diffs?state=&author=&reviewer=` | `diffs.list` | diffs.read | W14 |
-| GET | `/api/diffs/:id` · `/versions/:v/files` · `/interdiff?from=&to=` | `diffs.get`, `.files`, `.interdiff` | diffs.read | W14 |
+| GET | `/api/diffs/:id` · `/versions/:v/files` · `/versions/:v/blob?path=&side=` · `/interdiff?from=&to=` | `diffs.get`, `.files`, `.blob`, `.interdiff` | diffs.read | W14 |
 | GET/POST | `/api/diffs/:id/comments` · PATCH `/api/comments/:id` | `diffs.comments.*` | diffs.review | W14 |
 | POST | `/api/diffs/:id/review` | `diffs.review` (`accept\|request_changes\|comment\|resign`) | diffs.review | W14 |
 | POST | `/api/diffs/:id/{ready,abandon,reclaim,commandeer}` | `diffs.<action>` | diffs.submit | W14 |
