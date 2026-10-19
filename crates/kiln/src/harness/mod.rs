@@ -50,4 +50,5 @@ pub mod streams;
 pub mod transcript;
 pub mod visuals;
 pub mod wait;
+pub mod webrtc;
 pub mod worktree;

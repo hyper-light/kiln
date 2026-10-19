@@ -74,6 +74,13 @@ pub struct Server {
     /// site of its own, so browsers keep pages apart from kiln. Unset: kiln's own address serves
     /// them, each sandboxed in an origin of its own.
     pub pages_url: Option<String>,
+    /// WebRTC to streams' viewers (docs/previews.md, "Streams"): the UDP address it listens on, as
+    /// `0.0.0.0:7072`. Unset, viewers take streams over their WebSocket (WebCodecs) alone.
+    pub webrtc_addr: Option<String>,
+    /// The `host:port`s viewers reach it at (its ICE candidates), when they aren't `webrtc_addr`
+    /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
+    /// every address) each LAN address of this machine at its port.
+    pub webrtc_advertise: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +370,8 @@ impl Default for Server {
             https_cert: None,
             https_key: None,
             pages_url: None,
+            webrtc_addr: None,
+            webrtc_advertise: Vec::new(),
         }
     }
 }
@@ -483,6 +492,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_QUIC_ADVERTISE") {
             cfg.server.quic_advertise = v;
+        }
+        if let Ok(v) = std::env::var("KILN_WEBRTC_ADDR") {
+            cfg.server.webrtc_addr = Some(v).filter(|v| !v.trim().is_empty());
+        }
+        if let Ok(v) = std::env::var("KILN_WEBRTC_ADVERTISE") {
+            cfg.server.webrtc_advertise = v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
         }
         Ok(cfg)
     }
