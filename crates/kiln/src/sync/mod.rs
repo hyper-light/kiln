@@ -9,6 +9,7 @@
 //! the step's time, on every copy alike. A copy never overwrites a file changed on it that it hasn't
 //! proposed yet: that change is proposed from the version it was made from, and meets the rule.
 
+pub mod activity;
 pub mod blobs;
 pub mod disk;
 pub mod git;

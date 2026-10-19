@@ -198,11 +198,117 @@ it adopts the group's files through) and its status `looked` and `adopting`.
 commits made after a sync joined move between copies with `git` (fetch, pull) until git refs
 (phase 3) carry them. Line endings a Windows checkout converts are a difference like any other.
 
+## Watching it
+
+Sync is replication between peers, so each part of it can be watched: what each copy holds and
+lacks, every change as it goes from one machine to the others, and what was dropped, failed or
+tried again on the way.
+
+**On the Repositories page**, a section that opens and closes (*Sync*) shows it. Closed, it is one
+line: the synced repos and copies, each copy's state counted, and when the last change was made.
+Open, it shows two things:
+
+- **Each synced repo.** What its log did since the server started: changes, files, bytes,
+  conflicts, steps let go, things tried again, errors. Beside it, the files changed each minute
+  over the last half hour. Each copy has a row:
+  - its state;
+  - how many log entries its folder hasn't taken (*behind*);
+  - its own steps not in the log yet (*to send*);
+  - contents it waits for (*fetching*);
+  - how long the last change from another machine took to reach its folder;
+  - what it sent and fetched since its runner started;
+  - transfers that failed and things tried again, with the last failure;
+  - when the server last heard from it.
+- **What happened**, newest first. Each change shows:
+  - the machine that made it;
+  - its files: added (+), changed (~) or deleted (−), with their sizes, the first 40 by name;
+  - what the log did with each file: taken, already so, a conflict and the name its version went
+    under, or refused;
+  - each other copy, filled once its folder has the change and hollow while it is on its way;
+  - how long the change took to reach the log.
+
+  Between the changes it shows:
+  - copies added, removed and taking the repo's files;
+  - a copy going offline and coming back, or getting an error and getting over it;
+  - steps the server let go, and why;
+  - contents asked for again;
+  - conflicts resolved;
+  - agent sessions moving with their files. A move shows the index its files are in the log
+    through, how long the machine it left waited for that, and how long the machine it went to
+    waited for its folder to have them.
+
+  The view can be narrowed to one repo, one machine, or only file changes, problems or moves. The
+  server keeps each repo's newest 300 events in `<data>/sync/<id>.activity.json`, so a restart
+  doesn't blank the view.
+
+**Metrics** (Prometheus, at `/metrics` of the server and of each runner; Observe reads both).
+`repo` is the synced repo's name and `machine` a copy's. Histograms run from 1 ms to 10 min.
+
+*The server's* (the leader of every repo's log):
+
+| Metric | Labels | |
+| --- | --- | --- |
+| `kiln_sync_steps_committed_total` | repo | steps the log committed |
+| `kiln_sync_changes_total` | repo, kind | their changes: `added`, `changed`, `deleted` |
+| `kiln_sync_conflicts_total` | repo | changes that met another machine's (kept beside) |
+| `kiln_sync_dropped_total` | repo, what, reason | `what`: `step`, `message` or `change`. `reason`: `not_member`, `too_many_changes`, `out_of_order` (they come again), `too_big`, `stalled`, `budget`, `refused`, `fenced`, `undecodable`, `offline` (a message to a machine away) or `unsafe_path` |
+| `kiln_sync_retries_total` | repo, what | `step_again` (a step sent again, taken already) and `contents_asked` (contents asked for again) |
+| `kiln_sync_errors_total` | repo, kind | `group`: the repo's log stopped |
+| `kiln_sync_commit_seconds` | repo | histogram: a step's arrival to its commit |
+| `kiln_sync_copy_lag_steps` | repo, machine | log entries the copy's folder hasn't taken |
+| `kiln_sync_copy_unsent_steps` | repo, machine | its own steps not in the log yet |
+| `kiln_sync_copy_waiting_blobs` | repo, machine | contents it waits for |
+| `kiln_sync_copy_state` | repo, machine, state | every state 0 or 1 (`in_step`, `catching_up`, `fetching`, `sending`, `starting`, `offline`, `error`) |
+| `kiln_sync_copy_heard_age_seconds` | repo, machine | since the copy last said how it is |
+| `kiln_sync_conflict_files` | repo | conflict copies not resolved yet |
+| `kiln_sync_blob_requests_total` | machine, direction, result | contents sent (`up`) and fetched (`down`): `ok`, `present`, `missing`, `refused`, `failed`, `unauthorized` |
+| `kiln_sync_blob_bytes_total` | machine, direction | their bytes |
+
+*Each runner's* (the copies it holds):
+
+| Metric | Labels | |
+| --- | --- | --- |
+| `kiln_sync_proposed_total` | repo | steps its copies proposed |
+| `kiln_sync_applied_total` | repo | other machines' steps its folders took |
+| `kiln_sync_folder_writes_total` | repo, outcome | what those did to each file: `applied`, `conflict`, `kept` (changed here, on its way), `refused` |
+| `kiln_sync_transfers_total` | repo, direction, result | contents moved with the server: `ok`, `present`, `gone` (replaced since), `failed` (tried again in 10 s) |
+| `kiln_sync_transfer_bytes_total` | repo, direction | their bytes |
+| `kiln_sync_transfer_seconds` | direction | histogram: how long each took |
+| `kiln_sync_retries_total` | repo, what | `fetch`, `upload`, `resend` (steps sent again) |
+| `kiln_sync_errors_total` | repo, kind | `group`, `folder` (taking the log), `look` (looking at the folder) |
+| `kiln_sync_apply_lag_seconds` | repo | histogram: from the look on the machine that made a change to its file here (the two clocks apart add to it) |
+| `kiln_sync_look_seconds` | repo | histogram: a look at the folder |
+| `kiln_sync_skipped_files` | repo | files the last look left out |
+| `kiln_moves_total` | result | agent sessions moving off this machine: `ok`, `failed` |
+| `kiln_move_barrier_seconds` | | histogram: a session leaving waits for its folder's last changes to be in the log |
+| `kiln_move_files_wait_seconds` | | histogram: a session arriving waits for them in its folder |
+| `kiln_move_carried_bytes_total` | what | what moving sessions' repositories carried besides synced files: `git`, `ignored`, `worktree` |
+
+**Logs and traces** use the target `kiln.sync`, which Observe takes as service `kiln.sync`. An
+event carries an `event` field and is taken whatever else it says. These are the events:
+
+- `sync.step` (info): a step committed, with its counts.
+- `sync.conflict` (warn): with `path` and `beside`.
+- `sync.copy_state`: going offline or into an error is a warn, coming back an info. Each has
+  `from` and `to`.
+- `sync.dropped` (warn, at most once a minute for the same reason from the same machine): with
+  `what` and `reason`.
+- `sync.error` (warn).
+- `sync.transfer_failed` (warn, the first failure and every tenth): with `direction`, `hash` and
+  `tries`.
+- `sync.retry` (debug).
+- `sync.move` (info).
+- `sync.blob_refused` (warn).
+
+The spans are `move` (on the machine a session leaves, with `repo`, `machine` the machine it goes to
+and `result`), its child `move.barrier`, and `move.files` on the machine it arrives on.
+
 ## API
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/sync` | synced repos: name, mode, copies (machine, path, state, applied, conflicts) |
+| GET | `/api/sync` | synced repos: name, mode, copies (machine, path, state, applied, conflicts, `lag`, `heard`, the copy's own `traffic` and `lag_ms`), `stats` since the server started |
+| GET | `/api/sync/activity?since=&repo=&limit=` | what happened, newest first (`limit` up to 500), and `next`, the number to ask `since` for what's new |
 | POST | `/api/sync` | `{name, mode?, copies: [{machine, path}]}`: start syncing |
 | POST | `/api/sync/:id/copies` | `{machine, path}`: add a copy (it catches up from the log) |
 | DELETE | `/api/sync/:id/copies/:machine` | stop syncing there (its files stay) |
