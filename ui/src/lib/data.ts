@@ -17,7 +17,7 @@ import { preload, useSuspenseResource, type ResourceOptions } from "./resource";
 export interface Res<T> {
   key: string;
   fetch: (signal: AbortSignal) => Promise<T>;
-  opts?: ResourceOptions;
+  opts?: ResourceOptions<T>;
 }
 
 /** Start loading these now, without waiting (a section's keys, before it reads the first). */
@@ -132,7 +132,20 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
 }
 
 /** The agents kiln runs (an older server without them: none), as their events change them. */
-export const harnessSessionsRes: Res<AgentInfo[]> = { key: "harness/sessions", fetch: () => harnessApi.list().catch(() => []), opts: { on: ["harness", "harness_closed"] } };
+export const harnessSessionsRes: Res<AgentInfo[]> = {
+  key: "harness/sessions",
+  fetch: () => harnessApi.list().catch(() => []),
+  // Each event carries the agent's whole entry (or says it closed): applied, the list isn't loaded again.
+  opts: {
+    on: ["harness", "harness_closed"],
+    apply: (list, ev) => {
+      if (ev.type === "harness_closed") return list.filter((a) => a.id !== ev.id);
+      if (ev.type !== "harness") return undefined;
+      const i = list.findIndex((a) => a.id === ev.info.id);
+      return i === -1 ? [...list, ev.info] : list.map((a, j) => (j === i ? ev.info : a));
+    },
+  },
+};
 
 /** The terminal sessions the server keeps (any device can attach to them). */
 export const terminalSessionsRes: Res<TerminalSessionInfo[]> = { key: "terminal/sessions", fetch: (s) => api.terminalSessions(s).catch(() => []), opts: { on: ["terminals"] } };

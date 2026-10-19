@@ -18,6 +18,9 @@ use tungstenite::protocol::WebSocketConfig;
 /// A server-side WebSocket over an upgraded hyper connection.
 pub type WebSocket = async_tungstenite::WebSocketStream<FuturesIo<Upgraded>>;
 
+/// Its sending half (`WebSocket::split`).
+pub type Sender = async_tungstenite::WebSocketSender<FuturesIo<Upgraded>>;
+
 /// Adapts hyper's IO traits to `futures-io`, which async-tungstenite speaks. Safe code only: the
 /// caller's buffer is already initialised, so hyper's `ReadBuf` can wrap it directly.
 pub struct FuturesIo<T>(pub T);
