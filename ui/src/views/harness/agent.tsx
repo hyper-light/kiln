@@ -15,7 +15,6 @@ import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
 import { lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
-import { Loading } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
@@ -36,6 +35,7 @@ import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
 import { useEndWithChildren } from "./family";
+import { Beam, PrismLabel } from "./signals";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -57,7 +57,7 @@ export default function AgentPage() {
 function AgentConsole({ id }: { id: string }) {
   const store = sessionStore(id);
   return (
-    <React.Suspense fallback={<AgentLoading />}>
+    <React.Suspense fallback={<AgentLoading id={id} />}>
       <Agent id={id} store={store} />
     </React.Suspense>
   );
@@ -278,7 +278,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const hasFiles = (e: React.DragEvent) => [...e.dataTransfer.types].includes("Files");
   return (
     <div
-      className="hx-agent"
+      className="hx-agent ag-ready"
       onDragEnter={(e) => {
         if (hasFiles(e)) setDragging(true);
       }}
@@ -520,17 +520,31 @@ function Settings({ store, open, onOpenChange, send }: { store: SessionStore; op
  * tabs or the side, the composer's place) as the page will have it, and the loader where the
  * conversation goes, so nothing moves when it's in.
  */
-function AgentLoading() {
+function AgentLoading({ id }: { id: string }) {
   const wide = useMediaQuery("(min-width: 1100px)");
+  const draft = useDrafts((s) => s.drafts[id] ?? "");
+  const sizeDraft = React.useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      void draft;
+      if (!el) return;
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight}px`;
+    },
+    [draft],
+  );
   const work = (
     <div className="hx-main">
-      <div className="hx-timeline">
-        <Loading label="Loading the conversation" />
+      <div className="hx-timeline ag-loading" role="status">
+        <span aria-hidden="true"><Beam status="running" /></span>
+        <PrismLabel live>Loading conversation</PrismLabel>
       </div>
       <div className="hx-dock">
         <div className="hx-composer cp">
           <div className="hx-compose-box">
-            <textarea className="hx-compose-input" rows={1} disabled aria-label="Message to the agent" />
+            <div className="cp-field">
+              <div className="hx-compose-input cp-mirror" aria-hidden="true">{draft}{"​"}</div>
+              <textarea ref={sizeDraft} className="hx-compose-input cp-input" rows={1} value={draft} placeholder="Loading conversation…" disabled aria-label="Message to the agent" />
+            </div>
             <div className="cp-bar">
               <span className="cp-gap" />
               <button type="button" className="cp-send" data-mode="send" disabled aria-label="Send">
@@ -546,15 +560,16 @@ function AgentLoading() {
     <div className="hx-agent" aria-busy="true">
       <title>Agent · kiln</title>
       <header className="ag-head">
+        <p className="ag-eyebrow">
+          <Link to="/agents" className="ag-back">
+            <ArrowLeft size={12} aria-hidden="true" /> Agents
+          </Link>
+        </p>
         <div className="ag-top">
           <div className="ag-id">
-            <p className="ag-eyebrow">
-              <Link to="/agents" className="ag-back">
-                <ArrowLeft size={12} aria-hidden="true" /> Agents
-              </Link>
-            </p>
             <h1 className="ag-title hx-ghost">Agent</h1>
           </div>
+          <span className="ag-actions hx-ghost" aria-hidden="true"><span className="fig-round" /></span>
         </div>
         <div className="ag-clock-row" aria-hidden="true" />
         <div className="ag-run rs-tuner" aria-hidden="true">
@@ -580,7 +595,7 @@ function AgentLoading() {
         <div className="hx-agent-phone">
           <div className="pt" aria-hidden="true">
             {["Work", "Changes", "Plan", "Tools"].map((t, i) => (
-              <button key={t} type="button" tabIndex={-1} aria-selected={i === 0}>
+              <button key={t} type="button" tabIndex={-1} aria-selected={i === 0} disabled>
                 {t}
               </button>
             ))}

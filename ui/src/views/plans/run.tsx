@@ -1,20 +1,24 @@
 /**
  * A plan run as one agent per step (docs/plans.md, "One agent per step"): each step with its
- * agent, where it stands (waiting, working, needs you, met, not met) and what it changed; stop the
- * run, retry a step with a new agent, take a step over (kiln stops holding its agent to the goal)
- * and say it's met. Everything in the page's flow, kept live.
+ * agent, where it stands (waiting, working, needs you, met, not met), what it changed and its diff
+ * in review (each met step's on the one before's: the run ends as a stack); stop the run, retry a
+ * step with a new agent, take a step over (kiln stops holding its agent to the goal) and say it's
+ * met. Everything in the page's flow, kept live.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
+import { changesRes, changeWords } from "@/api/changes";
 import { ApiError } from "@/api/client";
-import { planHref, plansApi, type PlanRunView, type RunStep, type StepStand } from "@/api/plans";
+import { planHref, plansApi, type PlanRunView, type RunStack, type RunStep, type StackStep, type StepStand } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState } from "@/components/ui/misc";
+import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { ChangeLink, Quiet } from "@/views/harness/change-bar";
 import "./plans.css";
 
 const WORD: Record<StepStand, string> = {
@@ -47,7 +51,7 @@ export default function RunPage() {
 }
 
 function RunOrNone({ run }: { run: string }) {
-  const res = useSuspenseResource(`plans/runs/${run}`, (s) => plansApi.runView(run, s).catch(unlessGone), { on: ["harness", "harness_closed"], pollMs: 4000 });
+  const res = useSuspenseResource(`plans/runs/${run}`, (s) => plansApi.runView(run, s).catch(unlessGone), { on: ["harness", "harness_closed", "plan_stack"], pollMs: 4000 });
   const v = res.data;
   if (v === "gone") {
     return (
@@ -87,6 +91,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
         One agent per step · v{v.version} · {STATE[v.state]} · {v.met} of {v.total} met · started {relativeTime(v.at)} by {v.by}
       </p>
       {v.note && <p className="plan-dim run-note">{v.note}</p>}
+      {v.stack && <StackLine stack={v.stack} />}
       {v.state === "stopped" && v.reason && <p className="run-reason">Stopped: {v.reason}.</p>}
       {v.state === "running" && (
         <div className="plan-actions">
@@ -99,14 +104,57 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state !== "running" && error && <span className="plan-error">{error}</span>}
       <ol className="run-steps">
         {v.steps.map((s) => (
-          <Step key={s.n} s={s} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a))} />
+          <Step key={s.n} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a))} />
         ))}
       </ol>
     </>
   );
 }
 
-function Step({ s, busy, onAct }: { s: RunStep; busy: string | null; onAct: (a: "retry" | "take" | "met") => void }) {
+/** Where the run's met steps go up for review, or why they don't. */
+function StackLine({ stack }: { stack: RunStack }) {
+  if (stack.off) return <p className="plan-dim run-note">Its steps don't go up for review: {stack.off}.</p>;
+  const made = stack.steps.filter((e) => e.state === "made");
+  if (made.length === 0) return null;
+  const where =
+    stack.provider === "local"
+      ? "commits in the folder's repository"
+      : stack.provider === "kiln"
+        ? `a stack of ${made.length} diff${made.length === 1 ? "" : "s"}`
+        : `${made.length} pull request${made.length === 1 ? "" : "s"}, each on the one before`;
+  return (
+    <p className="plan-dim run-note">
+      In review as {where}, into {stack.trunk}
+      {stack.repo ? ` of ${stack.repo}` : ""}.
+    </p>
+  );
+}
+
+/** A met step's work in review: its diff and where it stands, or why it has none. */
+function StepReview({ e, agentId, provider }: { e: StackStep; agentId: string | null; provider: string }) {
+  const record = useRes(changesRes).data.find((c) => c.agent === agentId);
+  if (e.state === "nothing") return <p className="plan-dim run-what">It changed no files: no diff for this step.</p>;
+  if (e.state === "failed") return <p className="plan-dim run-what">Its work goes up with the next step's{e.error ? `: ${e.error}` : "."}</p>;
+  if (e.state === "elsewhere") return <p className="plan-dim run-what">{e.error}</p>;
+  const sha = e.sha?.slice(0, 10) ?? "";
+  if (!e.pushed && !e.change)
+    return (
+      <p className="plan-dim run-what">
+        Committed as {sha}
+        {provider === "local" ? " in the folder's repository (it has no remote)." : `, not pushed yet${e.error ? `: ${e.error}` : "."}`}
+      </p>
+    );
+  const words = record && record.change === e.change ? changeWords(record) : (e.change ?? `${e.branch ?? sha} pushed: open its pull request`);
+  return (
+    <p className="run-what run-review">
+      <ChangeLink c={{ provider, change: e.change ?? undefined, url: e.url }}>{words}</ChangeLink>
+      {e.error && <span className="plan-dim"> · {e.error}</span>}
+    </p>
+  );
+}
+
+function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; busy: string | null; onAct: (a: "retry" | "take" | "met") => void }) {
+  const e = stack?.steps.find((x) => x.n === s.n);
   const a = s.agent;
   const live = s.stand === "working" || s.stand === "needs_you";
   const what = a?.needs?.[0] ? `Asks a person: ${a.needs[0].tool_name ? `${a.needs[0].tool_name}: ` : ""}${a.needs[0].title}` : (a?.doing ?? a?.summary ?? "");
@@ -136,6 +184,13 @@ function Step({ s, busy, onAct }: { s: RunStep; busy: string | null; onAct: (a: 
         s.agent_id && <p className="plan-dim run-what">Its agent has ended{s.tries > 1 ? ` (try ${s.tries})` : ""}.</p>
       )}
       {s.reason && (s.stand === "unmet" || s.stand === "stopped" || s.stand === "yours") && <p className="plan-dim run-what">{s.reason}</p>}
+      {e && stack && (
+        <Quiet>
+          <React.Suspense fallback={null}>
+            <StepReview e={e} agentId={s.agent_id} provider={stack.provider} />
+          </React.Suspense>
+        </Quiet>
+      )}
       <p className="plan-dim run-goal" title={s.goal}>
         Held to: {s.goal}
       </p>

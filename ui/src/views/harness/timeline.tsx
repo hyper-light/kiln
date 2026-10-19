@@ -887,7 +887,8 @@ export const Timeline = React.memo(function Timeline({
   const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
   const keeper = useKeeper(placeKey(agent, parent));
   const { read, restore, atEnd, setTail, toEnd } = keeper;
-  const [reading, setReading] = React.useState<string | null>(null);
+  // Scrolling records the place for the next content update without rendering the conversation.
+  const reading = React.useRef<string | null>(null);
   // The turns in the page (`WINDOW` at a time, `MOST` at most): from the one `anchor` names (null:
   // the latest), through the one `till` names (null: the end). Read back, the window stays put as
   // more comes; gone far back (your place from last time, a match you find), it's a window there,
@@ -959,7 +960,7 @@ export const Timeline = React.memo(function Timeline({
     return () => io.disconnect();
   }, []);
   const onScroll = () => {
-    setReading(keeper.onScroll());
+    reading.current = keeper.onScroll();
     // Back at the end: the page holds the latest turns again, and follows them. Read back, it stays put.
     if (atEnd()) {
       if (anchor !== null) setAnchor(null);
@@ -969,7 +970,7 @@ export const Timeline = React.memo(function Timeline({
   const latest = () => {
     setAnchor(null);
     setTill(null);
-    setReading(null);
+    reading.current = null;
     toEnd();
   };
   // Find: every match marked in place (again as the conversation grows), and the one shown brought
@@ -978,7 +979,7 @@ export const Timeline = React.memo(function Timeline({
   const findNow = find?.now ?? null;
   const shown = React.useRef(0);
   const grows = findQ ? events : null;
-  const holds = reading ? turns : null;
+  const holds = reading.current ? turns : null;
   const marks = React.useCallback(
     (flow: HTMLDivElement | null) => {
       const root = flow?.parentElement;
@@ -986,7 +987,10 @@ export const Timeline = React.memo(function Timeline({
       // Marked again as the conversation grows, while finding.
       void grows;
       // A bounded window can move without changing height (so no resize is reported).
-      if (holds && reading) restore();
+      void holds;
+      void from;
+      void to;
+      restore();
       const at = findNow ? elementOf(flow, findNow.id) : null;
       const first = mark(flow, findQ, at);
       if (findNow && findNow.n !== shown.current) {
@@ -999,7 +1003,7 @@ export const Timeline = React.memo(function Timeline({
       }
       return () => void mark(flow, "", null);
     },
-    [findQ, findNow, grows, holds, reading, read, restore],
+    [findQ, findNow, grows, holds, from, to, read, restore],
   );
   const running = state?.status === "running";
   const tasks = state?.tasks ?? NO_TASKS;
@@ -1069,7 +1073,7 @@ export const Timeline = React.memo(function Timeline({
               meta={meta}
               onCommand={onCommand}
               agentLabel={agentLabel}
-              reading={reading}
+              reading={reading.current}
             />
           ))}
           {/* A window further back: what came after joins as you scroll down to it. */}

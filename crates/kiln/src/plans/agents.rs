@@ -12,6 +12,9 @@
 //! step's agent, follows its goal to met or unmet and goes on, with no console open and across
 //! restarts. A person stops a run, retries a step (a new agent for it), or takes a step over (kiln
 //! stops holding its agent to the goal, and they say when it's met).
+//!
+//! As each step is met, what its agent changed goes up for review as that step's diff, on the
+//! step before's (`super::stack`): the run ends as a stack with one diff per step.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,6 +116,9 @@ pub struct Run {
     pub steps: Vec<Step>,
     pub met: usize,
     pub total: usize,
+    /// What its met steps are in review: one diff per step, each on the one before
+    /// (`super::stack::shown`).
+    pub stack: Option<Value>,
 }
 
 /// A run as lists show it (Mission control groups its agents under it).
@@ -284,7 +290,14 @@ pub async fn view(hub: &Hub, run: &str) -> R<Run> {
         })
         .collect();
     let met = steps.iter().filter(|s| s.stand == "met").count();
-    Ok(Run { id: run.to_owned(), plan: head.plan, title, version: head.version, state: head.state, reason: head.reason, note: head.note, at: head.at, ended_at: head.ended_at, by: head.by, config: head.config, total: steps.len(), met, steps })
+    let stack = super::stack::of(hub, run).await.map(|s| super::stack::shown(&s));
+    Ok(Run { id: run.to_owned(), plan: head.plan, title, version: head.version, state: head.state, reason: head.reason, note: head.note, at: head.at, ended_at: head.ended_at, by: head.by, config: head.config, total: steps.len(), met, steps, stack })
+}
+
+/// Where run `run` stands (`running`, `stopped`, `done`), when there is such a run.
+pub async fn state(hub: &Hub, run: &str) -> Option<String> {
+    let run = run.to_owned();
+    hub.store.call(move |c| Ok(c.query_row("SELECT COALESCE(state, '') FROM plan_runs WHERE id = ?1", params![run], |r| r.get::<_, String>(0)).optional()?)).await.ok().flatten()
 }
 
 /// Runs one agent per step, newest first: those under way (`active`), else the last 50.
@@ -326,15 +339,26 @@ async fn set_step(hub: &Hub, run: &str, idx: i64, status: &str, reason: Option<S
 }
 
 async fn set_run(hub: &Hub, run: &str, state: &str, reason: Option<String>) -> R<()> {
-    let (run, state, now) = (run.to_owned(), state.to_owned(), crate::util::now_unix());
+    let (run_c, state_c, now) = (run.to_owned(), state.to_owned(), crate::util::now_unix());
     let ends = state != "running";
     hub.store
         .call(move |c| {
-            c.execute("UPDATE plan_runs SET state = ?2, reason = ?3, ended_at = CASE WHEN ?4 THEN ?5 ELSE NULL END WHERE id = ?1", params![run, state, reason, ends, now])?;
+            c.execute("UPDATE plan_runs SET state = ?2, reason = ?3, ended_at = CASE WHEN ?4 THEN ?5 ELSE NULL END WHERE id = ?1", params![run_c, state_c, reason, ends, now])?;
             Ok(())
         })
         .await?;
+    // What review and CI said to its steps' agents while it went on goes to them now.
+    if ends {
+        super::stack::release(hub, run).await;
+    }
     Ok(())
+}
+
+/// Step `row` is met: what its agent changed goes up for review, on the step before's.
+async fn stacked(hub: &Arc<Hub>, run: &str, head: &Head, row: &Row, total: usize) {
+    let plan = super::get(hub, &head.plan).await.map(|p| p.title).unwrap_or_default();
+    let m = super::stack::Met { run, n: usize::try_from(row.idx).unwrap_or(0) + 1, total, title: &row.title, goal: &row.goal, plan: &plan, agent: row.agent.as_deref(), opener: head.config.opener.as_deref() };
+    super::stack::met(hub, m).await;
 }
 
 /// Starts step `row`'s agent, holds it to the step's goal, and notes it.
@@ -396,7 +420,7 @@ async fn outcome(hub: &Hub, row: &Row) -> R<Option<(bool, Option<String>)>> {
 
 /// Moves run `run` on: a step met lets the next one's agent start; one unmet stops the run (a
 /// person retries it, or takes it over); all met, it's done.
-pub async fn advance(hub: &Hub, run: &str) -> R<()> {
+pub async fn advance(hub: &Arc<Hub>, run: &str) -> R<()> {
     let (head, rows) = load_run(hub, run).await?;
     if head.state != "running" {
         return Ok(());
@@ -416,6 +440,7 @@ pub async fn advance(hub: &Hub, run: &str) -> R<()> {
                 Some((true, why)) => {
                     set_step(hub, run, row.idx, "met", why).await?;
                     tracing::info!(%run, step = row.idx + 1, "a plan step was met");
+                    stacked(hub, run, &head, row, rows.len()).await;
                     continue;
                 }
                 Some((false, why)) => {
@@ -486,7 +511,7 @@ fn step_row(rows: &[Row], n: usize) -> R<&Row> {
 
 /// Tries step `n` again with a new agent (the one before, if it still runs, ends), and the run
 /// goes on from there.
-pub async fn retry(hub: &Hub, run: &str, n: usize, by: &str) -> R<Run> {
+pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
     let (_, rows) = load_run(hub, run).await?;
     let row = step_row(&rows, n)?;
     if row.status == "met" {
@@ -532,8 +557,8 @@ pub async fn take(hub: &Hub, run: &str, n: usize, by: &str) -> R<Run> {
 }
 
 /// A person says step `n` is met (one they took over, or one they judge done): the next starts.
-pub async fn met(hub: &Hub, run: &str, n: usize, by: &str) -> R<Run> {
-    let (_, rows) = load_run(hub, run).await?;
+pub async fn met(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
+    let (head, rows) = load_run(hub, run).await?;
     let row = step_row(&rows, n)?;
     if row.status == "waiting" {
         return Err(Error::Bad(format!("step {n} hasn't started yet")));
@@ -542,6 +567,7 @@ pub async fn met(hub: &Hub, run: &str, n: usize, by: &str) -> R<Run> {
         let _ = crate::goals::control(hub, a, crate::goals::Action::Clear).await;
     }
     set_step(hub, run, row.idx, "met", Some(format!("met, said {by}"))).await?;
+    stacked(hub, run, &head, row, rows.len()).await;
     set_run(hub, run, "running", None).await?;
     hub.store.audit(by.to_owned(), "plan.run.met".into(), format!("{run} step {n}")).await;
     if let Err(e) = advance(hub, run).await {

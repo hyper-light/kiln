@@ -181,20 +181,125 @@ pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, 
     if before.as_deref() == Some(tree.as_str()) {
         return Ok(None);
     }
+    let sha = commit_tree(top, &tree, parent, message, (who, None), who).await?;
+    let files = changed(top, parent, &sha).await?;
+    Ok(Some(Made { sha, parent: parent.map(str::to_owned), files }))
+}
+
+/// Writes the commit of `tree` on `parent`, saying `message`, by `author` (at the time given, else
+/// now), committed by `who`.
+async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str, author: (&Ident, Option<&str>), who: &Ident) -> anyhow::Result<String> {
     let mut c = git(top);
-    c.args(["commit-tree", &tree, "-F", "-"]);
+    c.args(["commit-tree", tree, "-F", "-"]);
     if let Some(p) = parent {
         c.args(["-p", p]);
     }
-    c.env("GIT_AUTHOR_NAME", &who.name).env("GIT_AUTHOR_EMAIL", &who.email).env("GIT_COMMITTER_NAME", &who.name).env("GIT_COMMITTER_EMAIL", &who.email);
-    let sha = with_stdin(c, message.as_bytes()).await?;
+    c.env("GIT_AUTHOR_NAME", &author.0.name).env("GIT_AUTHOR_EMAIL", &author.0.email).env("GIT_COMMITTER_NAME", &who.name).env("GIT_COMMITTER_EMAIL", &who.email);
+    if let Some(at) = author.1 {
+        c.env("GIT_AUTHOR_DATE", at);
+    }
+    with_stdin(c, message.as_bytes()).await
+}
+
+/// The files commit `sha` changes over `parent` (`None`: all of them, a first commit).
+async fn changed(top: &Path, parent: Option<&str>, sha: &str) -> anyhow::Result<Vec<String>> {
     let mut c = git(top);
     match parent {
-        Some(p) => c.args(["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", p, &sha]),
-        None => c.args(["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", &sha]),
+        Some(p) => c.args(["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", p, sha]),
+        None => c.args(["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", sha]),
     };
-    let files = run(c, GIT_TIMEOUT).await?.split('\0').filter(|s| !s.is_empty()).map(str::to_owned).collect();
-    Ok(Some(Made { sha, parent: parent.map(str::to_owned), files }))
+    Ok(run(c, GIT_TIMEOUT).await?.split('\0').filter(|s| !s.is_empty()).map(str::to_owned).collect())
+}
+
+/// Commit `sha`'s message, its author and when they wrote it.
+async fn authored(top: &Path, sha: &str) -> anyhow::Result<(String, Ident, String)> {
+    let mut c = git(top);
+    c.args(["log", "-1", "--format=%an%x00%ae%x00%aD%x00%B", sha]);
+    let out = crate::proc::output(c, GIT_TIMEOUT).await?;
+    anyhow::ensure!(out.status.success(), "git log {sha}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut parts = text.splitn(4, '\0');
+    let (name, email, date, message) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+    Ok((format!("{}\n", message.trim_end()), Ident { name: name.to_owned(), email: email.to_owned() }, date.to_owned()))
+}
+
+/// What commit `to` changes over commit `from`, as `git apply` takes it back.
+async fn patch(top: &Path, from: &str, to: &str) -> anyhow::Result<Vec<u8>> {
+    let mut c = git(top);
+    c.args(["diff", "--binary", "--full-index", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", from, to]);
+    let out = crate::proc::output(c, GIT_TIMEOUT).await?;
+    anyhow::ensure!(out.status.success(), "git diff {from} {to}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(out.stdout)
+}
+
+/// The tree `patch` makes of commit `onto`'s, made beside the folder (a scratch index, a three-way
+/// merge where the patch's context has moved): `Err` with what git said when it doesn't go.
+async fn applied(top: &Path, onto: &str, patch: &[u8]) -> anyhow::Result<String> {
+    let id = crate::util::new_id();
+    let scratch = Scratch(std::env::temp_dir().join(format!("kiln-restack-{id}.index")));
+    let file = Scratch(std::env::temp_dir().join(format!("kiln-restack-{id}.diff")));
+    std::fs::write(&file.0, patch)?;
+    let mut c = git(top);
+    c.env("GIT_INDEX_FILE", &scratch.0).args(["read-tree", onto]);
+    run(c, GIT_TIMEOUT).await?;
+    if !patch.is_empty() {
+        let mut c = git(top);
+        c.env("GIT_INDEX_FILE", &scratch.0).args(["apply", "--cached", "--3way", "--whitespace=nowarn"]).arg(&file.0);
+        run(c, GIT_TIMEOUT).await?;
+    }
+    let mut c = git(top);
+    c.env("GIT_INDEX_FILE", &scratch.0).arg("write-tree");
+    run(c, GIT_TIMEOUT).await
+}
+
+async fn tree_of(top: &Path, sha: &str) -> anyhow::Result<String> {
+    let mut c = git(top);
+    c.args(["rev-parse", &format!("{sha}^{{tree}}")]);
+    run(c, GIT_TIMEOUT).await
+}
+
+/// A new version of the first of `commits` (a stack's, bottom first, each on the one before) with
+/// the agent's `paths` as the folder has them now, and the commits above it made again on it
+/// (docs/agentic.md P4). The agent's change is taken against the stack's top (the folder holds the
+/// whole stack's work), then put into the first commit; each commit above is its own change again,
+/// on the new one below. `message` replaces the first's. Refused, saying why, when a change
+/// doesn't go where it must (it changes what a commit above changed too), or when the new top
+/// wouldn't be what the folder has.
+pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: Option<&str>, who: &Ident) -> anyhow::Result<Vec<Made>> {
+    let (Some(first), Some(last)) = (commits.first(), commits.last()) else { anyhow::bail!("no commits to make again") };
+    let Some(change) = commit(top, Some(last), Some(paths), "kiln: an agent's change, before it is restacked", who).await? else {
+        anyhow::bail!("nothing to add: its files are as the stack has them")
+    };
+    let mut c = git(top);
+    c.args(["rev-parse", "--verify", "--quiet", &format!("{first}^1")]);
+    let base = run(c, GIT_TIMEOUT).await.map_err(|_| anyhow::anyhow!("{first} has no commit below it"))?;
+    let into_first = patch(top, last, &change.sha).await?;
+    let mut made: Vec<Made> = Vec::new();
+    let (mut old_below, mut new_below) = (base.clone(), base);
+    for (i, old) in commits.iter().enumerate() {
+        let what = if i == 0 { into_first.clone() } else { patch(top, &old_below, old).await? };
+        let onto = if i == 0 { old.clone() } else { new_below.clone() };
+        let tree = applied(top, &onto, &what).await.map_err(|e| {
+            if i == 0 {
+                anyhow::anyhow!("the change can't go into its own commit alone: it changes what a later one changed too ({e:#})")
+            } else {
+                anyhow::anyhow!("{} doesn't go on the new version below it ({e:#})", short_sha(old))
+            }
+        })?;
+        let (said, author, date) = authored(top, old).await?;
+        let message = if i == 0 { message.map_or(said, str::to_owned) } else { said };
+        let sha = commit_tree(top, &tree, Some(&new_below), &message, (&author, Some(&date)), who).await?;
+        let files = changed(top, Some(&new_below), &sha).await?;
+        made.push(Made { sha: sha.clone(), parent: Some(new_below.clone()), files });
+        old_below.clone_from(old);
+        new_below = sha;
+    }
+    anyhow::ensure!(tree_of(top, &new_below).await? == tree_of(top, &change.sha).await?, "made again, the commits don't come out as the folder has them");
+    Ok(made)
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 /// Runs `c` with `input` on its stdin; its stdout trimmed.
@@ -215,6 +320,21 @@ async fn with_stdin(mut c: Command, input: &[u8]) -> anyhow::Result<String> {
         anyhow::bail!("git commit-tree: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Commits `paths` as the working tree has them on `on` (`None`: the folder's last commit), as
+/// [`commit`] does: one step of a plan run's stack. `Ok(None)` when that changes nothing.
+pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: &str, fallback: &Ident) -> anyhow::Result<Option<Made>> {
+    let facts = facts(cwd).await?;
+    let top = Path::new(&facts.top);
+    let who = identity(top, fallback).await;
+    let parent = on.or(facts.head.as_deref());
+    if let Some(p) = on {
+        let mut c = git(top);
+        c.args(["cat-file", "-e", &format!("{p}^{{commit}}")]);
+        run(c, GIT_TIMEOUT).await.map_err(|_| anyhow::anyhow!("the commit of the step before ({}) isn't in {} any more", short_sha(p), facts.top))?;
+    }
+    commit(top, parent, Some(paths), message, &who).await
 }
 
 /// Of `paths`, those a commit takes: inside the repository, and not ignored (unless git tracks them).
@@ -391,5 +511,64 @@ mod tests {
         assert_eq!(relative(top, "../b/a.rs"), None);
         assert_eq!(relative(top, "/elsewhere/a.rs"), None);
         assert_eq!(remotes_of("origin\tgit@x:a/b.git (fetch)\norigin\tgit@x:a/b.git (push)\nup\thttps://h/u.git (fetch)\n"), vec![Remote { name: "origin".into(), url: "git@x:a/b.git".into() }, Remote { name: "up".into(), url: "https://h/u.git".into() }]);
+    }
+
+    /// A plan run's stack (docs/agentic.md P4): steps' commits each on the one before, then a
+    /// step's new version with the steps above it made again; the folder as it was throughout.
+    #[test]
+    fn a_step_s_new_version_goes_into_its_own_commit_and_the_ones_above_are_made_again() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        let here = top.clone();
+        let status = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&status);
+        let look = move |dir: &Path| -> anyhow::Result<()> {
+            seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.push((out(dir, &["rev-parse", "HEAD"])?, out(dir, &["diff", "--cached", "--name-only"])?));
+            Ok(())
+        };
+        crate::rt::block_on(async move {
+            let top = here;
+            let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
+            let show = |sha: &str, file: &str| out(&top, &["show", &format!("{sha}:{file}")]);
+            let one = |s: &str| std::fs::write(top.join("one.txt"), s);
+            // Step 1 writes one.txt, step 2 two.txt, step 3 changes one.txt's last line.
+            one("1\n2\n3\n4\n5\n6\n7\n8\n")?;
+            let s1 = commit_on(&top, None, &["one.txt".into()], "Step one\n\nChange-Id: I1111111111111111111111111111111111111111\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            std::fs::write(top.join("two.txt"), "two\n")?;
+            let s2 = commit_on(&top, Some(&s1.sha), &["two.txt".into()], "Step two\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            one("1\n2\n3\n4\n5\n6\n7\nEIGHT\n")?;
+            let s3 = commit_on(&top, Some(&s2.sha), &[top.join("one.txt").to_string_lossy().into_owned()], "Step three\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            assert_eq!((s2.parent.as_deref(), s3.parent.as_deref(), s3.files.clone()), (Some(s1.sha.as_str()), Some(s2.sha.as_str()), vec!["one.txt".to_owned()]));
+            assert!(commit_on(&top, Some(&s3.sha), &["one.txt".into()], "again", &who).await?.is_none(), "nothing new: no commit");
+            assert!(commit_on(&top, Some("0123456789012345678901234567890123456789"), &["one.txt".into()], "x", &who).await.is_err(), "a step before that isn't there");
+            look(&top)?;
+            // Step 1's agent fixes its first line in the folder, which has the whole stack's work.
+            one("ONE\n2\n3\n4\n5\n6\n7\nEIGHT\n")?;
+            let stack = [s1.sha.clone(), s2.sha.clone(), s3.sha.clone()];
+            let made = restack(&top, &stack, &["one.txt".into()], None, &who).await?;
+            let [m1, m2, m3] = made.as_slice() else { anyhow::bail!("{made:?}") };
+            assert_eq!(show(&m1.sha, "one.txt")?, "ONE\n2\n3\n4\n5\n6\n7\n8", "the fix, in step 1's own commit");
+            assert_eq!(m1.parent, s1.parent, "on what step 1 was on");
+            assert_eq!(out(&top, &["log", "-1", "--format=%B", &m1.sha])?, "Step one\n\nChange-Id: I1111111111111111111111111111111111111111", "its message and Change-Id kept");
+            assert_eq!((show(&m2.sha, "two.txt")?, m2.parent.as_deref(), m2.files.clone()), ("two".to_owned(), Some(m1.sha.as_str()), vec!["two.txt".to_owned()]));
+            assert_eq!(show(&m3.sha, "one.txt")?, "ONE\n2\n3\n4\n5\n6\n7\nEIGHT", "step 3 on it, the fix kept");
+            assert_eq!(out(&top, &["log", "-1", "--format=%s", &m3.sha])?, "Step three");
+            // A new message for it.
+            let titled = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, renamed\n"), &who).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert!(titled.contains("nothing to add"), "{titled}");
+            // A fix to what a later step changed can't go into step 1 alone: refused, saying so.
+            one("ONE\n2\n3\n4\n5\n6\n7\nEIGHT!\n")?;
+            let e = restack(&top, &[m1.sha.clone(), m2.sha.clone(), m3.sha.clone()], &["one.txt".into()], None, &who).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert!(e.contains("changes what a later one changed too"), "{e}");
+            // At the top, it goes.
+            let top_only = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, again\n"), &who).await?;
+            assert_eq!(top_only.first().map(|m| show(&m.sha, "one.txt")).transpose()?.as_deref(), Some("ONE\n2\n3\n4\n5\n6\n7\nEIGHT!"));
+            look(&top)?;
+            anyhow::Ok(())
+        })?;
+        let seen = status.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
+        assert!(seen.len() == 2 && seen.first() == seen.last(), "the folder's branch and index didn't move: {seen:?}");
+        assert_eq!(out(&top, &["log", "--format=%s", "-1"])?, "init");
+        Ok(())
     }
 }
