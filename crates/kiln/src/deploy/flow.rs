@@ -1233,6 +1233,30 @@ async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -
     repo::decode(&bytes).map_err(|e| format!("release.json doesn't read: {e:#}"))
 }
 
+/// What `a` renders in `env` now, and what a release of `version` would render there: what runs,
+/// at that version (its values and artifacts as they are), each rendered as KilnCD renders it
+/// (docs/deploy-api.md §8.1).
+pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, version: &str) -> Result<(Vec<Value>, Vec<Value>), Fail> {
+    let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "KilnCD isn't running".to_owned()))?;
+    let nothing = || conflict(format!("nothing runs for {} in {} yet: release a version first", a.name, env.name));
+    let now = cd.definition(&kilncd::app_id(a, &env.name)).ok_or_else(nothing)?;
+    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(internal)?.ok_or_else(|| missing(format!("{} isn't registered in {}", a.name, env.name)))?;
+    let running = match reg.running {
+        Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+        None => None,
+    };
+    let commit = running.and_then(|r| r.commit).ok_or_else(nothing)?;
+    let mut file = release_file_at(d, a, env, &commit).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    file.version = Some(version.to_owned());
+    // A version that isn't there is said as a release of it would be told.
+    if let Some(why) = super::check::missing_version(&d.hub, &a.package, &file).await {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
+    }
+    let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
+    let then = kilncd::definition(a, env, &reg, &file, &commit, &url).map_err(bad)?;
+    futures::try_join!(cd.render_definition(now), cd.render_definition(then)).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))
+}
+
 /// A file of a release's commit, for its registration (`None`: the commit has none).
 async fn file_at(d: &Deploy, env: &Environment, commit: &str, path: String) -> Result<Option<String>, String> {
     let (hosted, rr, commit) = (d.hosted.clone(), env.release_repo.clone(), commit.to_owned());
