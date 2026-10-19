@@ -264,6 +264,15 @@ async fn environment(d: &Deploy, name: &str) -> Result<Environment, Fail> {
 // ------------------------------------------------------------------ apps
 
 pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
+    check_app(d, &a).await?;
+    store::put_app(&d.hub.store, &a).await.map_err(internal)?;
+    audit(d, actor, "deploy.app.put", a.name.clone()).await;
+    Ok(a)
+}
+
+/// What an app must be to be kept: its names DNS labels, a package that deploys, what its template
+/// allows, a source repository kiln has.
+async fn check_app(d: &Deploy, a: &App) -> Result<(), Fail> {
     dns_label("app", &a.name)?;
     dns_label("project", &a.project)?;
     if let Some(ns) = &a.namespace {
@@ -304,9 +313,13 @@ pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
             }
         }
     }
-    store::put_app(&d.hub.store, &a).await.map_err(internal)?;
-    audit(d, actor, "deploy.app.put", a.name.clone()).await;
-    Ok(a)
+    if let Some(s) = &a.source {
+        let repos = d.hub.store.repos().await.map_err(internal)?;
+        if !repos.iter().any(|r| &r.name == s) {
+            return Err(bad(format!("source {s}: kiln has no repository {s}")));
+        }
+    }
+    Ok(())
 }
 
 /// Deletes an app. `everywhere`: deregistered from every environment first, what it runs there
@@ -352,6 +365,10 @@ pub struct AppAsk {
     pub template: Option<String>,
     #[serde(default)]
     pub contacts: Contacts,
+    /// Its source repository, one kiln has (`acme/web`), or `""` for none. Unset: the one it has,
+    /// or else the one its template makes (§3.1).
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub archived: bool,
 }
@@ -373,7 +390,8 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         None => from_template()?.ok_or_else(|| bad("how is it deployed? give a package, or a template that has one"))?,
     };
     let namespace = ask.namespace.clone().or_else(|| t.as_ref().and_then(|t| t.namespace.as_ref()).map(|p| p.replace("{app}", &ask.name)));
-    let a = App {
+    let had = store::app(&d.hub.store, &ask.name).await.map_err(internal)?.and_then(|a| a.source);
+    let mut a = App {
         name: ask.name,
         project: ask.project.unwrap_or_else(|| "default".to_owned()),
         owners: ask.owners,
@@ -382,9 +400,26 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         properties: ask.properties,
         template: ask.template,
         contacts: ask.contacts,
+        source: None,
         archived: ask.archived,
     };
-    put_app(d, actor, a).await
+    check_app(d, &a).await?;
+    // Its source repository: the one named, the one it has, or one its template makes, once the
+    // rest of it is known to be right.
+    let mut made = None;
+    a.source = match (ask.source, had, t.as_ref().and_then(|t| t.repository.as_ref())) {
+        (Some(s), _, _) => Some(s).filter(|s| !s.is_empty()),
+        (None, Some(s), _) => Some(s),
+        (None, None, Some(r)) => {
+            made = Some(super::scaffold::create(d, r, &a, actor).await?);
+            made.clone()
+        }
+        (None, None, None) => None,
+    };
+    put_app(d, actor, a).await.map_err(|(code, why)| match &made {
+        Some(r) => (code, format!("{why} (its repository {r} is made: give it as the app's source)")),
+        None => (code, why),
+    })
 }
 
 /// `{app}` in every string of a value is `name`.
@@ -416,6 +451,9 @@ pub struct AppPatch {
     pub template: Option<String>,
     #[serde(default)]
     pub contacts: Option<Contacts>,
+    /// A repository kiln has, or `""` for none.
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub archived: Option<bool>,
 }
@@ -448,6 +486,9 @@ pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Resu
     if let Some(x) = p.contacts {
         a.contacts = x;
     }
+    if let Some(x) = p.source {
+        a.source = Some(x).filter(|s| !s.is_empty());
+    }
     if let Some(x) = p.archived {
         a.archived = x;
     }
@@ -475,6 +516,9 @@ pub fn catalog_info(a: &App) -> String {
     if !a.contacts.channels.is_empty() {
         annotations.insert("kiln.dev/channels".into(), json!(a.contacts.channels.join(",")));
     }
+    if let Some(s) = &a.source {
+        annotations.insert("kiln.dev/source".into(), json!(s));
+    }
     let doc = json!({
         "apiVersion": "backstage.io/v1alpha1",
         "kind": "Component",
@@ -495,8 +539,17 @@ async fn template(d: &Deploy, name: &str) -> Result<Template, Fail> {
     store::template(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no template {name}")))
 }
 
-pub async fn put_template(d: &Deploy, actor: &str, t: Template) -> Result<Template, Fail> {
+/// Puts a template. One that makes repositories, or changes how, is put by someone who may add
+/// repositories (`adds_repos`: `settings.manage`), since each app made from it makes one.
+pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool) -> Result<Template, Fail> {
     dns_label("template", &t.name)?;
+    if let Some(r) = &t.repository {
+        let before = store::template(&d.hub.store, &t.name).await.map_err(internal)?.and_then(|b| b.repository);
+        if !adds_repos && before.as_ref() != Some(r) {
+            return Err((StatusCode::FORBIDDEN, "a template that makes repositories is put by someone who may add them (settings.manage)".into()));
+        }
+        super::scaffold::check(d, r).map_err(bad)?;
+    }
     for c in &t.checks {
         if !matches!(c.as_str(), "no-snapshots" | "owners-set") {
             return Err(bad(format!("kiln has no check `{c}` (no-snapshots, owners-set)")));
@@ -1512,9 +1565,11 @@ mod tests {
             properties: BTreeMap::new(),
             template: Some("service".into()),
             contacts: Contacts { oncall: Some("ada".into()), channels: vec!["#deploys".into()], links: BTreeMap::from([("dashboard".into(), "https://grafana.example/d/web".into())]) },
+            source: Some("shop/web".into()),
             archived: false,
         };
         let doc: Value = serde_yaml::from_str(&catalog_info(&a)).map_err(|e| e.to_string())?;
+        assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1source"), Some(&json!("shop/web")));
         assert_eq!(doc.pointer("/kind"), Some(&json!("Component")));
         assert_eq!(doc.pointer("/spec/owner"), Some(&json!("payments")), "the owner team first");
         assert_eq!(doc.pointer("/spec/type"), Some(&json!("service")));

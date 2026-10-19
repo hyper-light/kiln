@@ -337,3 +337,42 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ---------------------------------------------------------------- a new app */
+.rel-template {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--color-muted);
+  font-size: 13px;
+}
+.rel-template code {
+  overflow-wrap: anywhere;
+  color: var(--color-foreground);
+}
+.rel-new-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.rel-register {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+.rel-register > :first-child {
+  min-width: 200px;
+}
+.rel-head-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rel-gap {
+  margin-top: 0.75rem;
+}
