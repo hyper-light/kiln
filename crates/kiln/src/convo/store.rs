@@ -103,9 +103,14 @@ pub struct Query {
 
 /// Most results one search returns.
 pub const SEARCH_MAX: usize = 500;
-/// Events a search looks at in one go, at most: a go holds the store for a few tens of
-/// milliseconds, and the store does what else waits between them.
-pub const SEARCH_SLICE: usize = 10_000;
+/// How long one go of a search may hold the store, about: the events it looks at in a go grow
+/// or shrink to it (from `SEARCH_SLICE_FIRST`, between `SEARCH_SLICE_MIN` and `SEARCH_SLICE`), as
+/// the disk is quick or not (one agent's events, spread through the file, are slower than the
+/// newest of every agent's), and the store does what else waits between them.
+pub const SEARCH_SLICE_TIME: Duration = Duration::from_millis(50);
+pub const SEARCH_SLICE_FIRST: usize = 2_000;
+pub const SEARCH_SLICE_MIN: usize = 250;
+pub const SEARCH_SLICE: usize = 20_000;
 /// How long one search goes on, at most: past that it answers with the newest matches it found
 /// (it looks newest first).
 pub const SEARCH_WAIT: Duration = Duration::from_secs(8);
@@ -326,11 +331,22 @@ impl Store {
     pub fn search(&self, q: Query) -> anyhow::Result<Vec<EventRow>> {
         let limit = q.limit.unwrap_or(100).min(SEARCH_MAX);
         let (q, until) = (Arc::new(q), Instant::now() + SEARCH_WAIT);
-        let (mut found, mut from) = (Vec::new(), None);
+        let (mut found, mut from, mut rows) = (Vec::new(), None, SEARCH_SLICE_FIRST);
         while found.len() < limit {
             let (q, want) = (q.clone(), limit - found.len());
-            let (more, next) = self.run(move |e| e.search_some(&q, from, SEARCH_SLICE, want))?;
+            let (more, next, took) = self.run(move |e| {
+                let began = Instant::now();
+                let (more, next) = e.search_some(&q, from, rows, want)?;
+                Ok((more, next, began.elapsed()))
+            })?;
             found.extend(more);
+            rows = if took > SEARCH_SLICE_TIME {
+                (rows / 2).max(SEARCH_SLICE_MIN)
+            } else if took < SEARCH_SLICE_TIME / 2 {
+                (rows * 2).min(SEARCH_SLICE)
+            } else {
+                rows
+            };
             match next {
                 Some(next) if Instant::now() < until => from = Some(next),
                 _ => break,
