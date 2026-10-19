@@ -259,6 +259,19 @@ impl Store {
         .await?
     }
 
+    /// Runners connected just before this server started: those still marked connected (a server
+    /// that was killed didn't mark them gone), or gone within `within_s` (its shutdown, a restart).
+    /// Not a job's own pod, which doesn't come back. Read before [`Store::recover`]; how many
+    /// return is a deploy's check (`/healthz/server`).
+    pub async fn runners_before(&self, within_s: i64) -> anyhow::Result<u64> {
+        let since = crate::util::now_unix() - within_s;
+        self.call(move |c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM agents WHERE ephemeral = 0 AND (connected = 1 OR last_seen >= ?1)", [since], |r| r.get(0))?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+        .await
+    }
+
     /// After a server restart every agent is marked disconnected until it reconnects. Running jobs
     /// are left alone: agents keep executing through a server outage and reclaim their jobs in
     /// `Hello`; whatever is not reclaimed within the grace period is requeued by the scheduler.
@@ -1226,6 +1239,37 @@ mod tests {
             let moved = s.upsert_repo(at("https://github.com/hyper-light/kiln.git")).await?;
             anyhow::ensure!(moved.id == repo.id, "a moved repository keeps its id (and its runs)");
             anyhow::ensure!(s.refs(repo.id.clone()).await?.is_empty(), "refs from the old remote survived the move");
+            anyhow::Ok(())
+        })
+    }
+
+    /// The runners a server counts as connected just before it started, so a deploy can check
+    /// they came back: still marked connected, or gone in the last minutes; not a job's pod.
+    #[test]
+    fn runners_connected_before_a_start() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let now = crate::util::now_unix();
+            let runner = |name: &str, connected: bool, last_seen: i64, ephemeral: bool| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots: 1,
+                hostname: name.into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "1".into(),
+                ephemeral,
+                connected,
+                last_seen,
+                enrolled_at: 0,
+            };
+            s.upsert_agent(runner("killed-with-its-server", true, now - 86_400, false)).await?;
+            s.upsert_agent(runner("gone-at-its-shutdown", false, now - 30, false)).await?;
+            s.upsert_agent(runner("asleep-for-hours", false, now - 7_200, false)).await?;
+            s.upsert_agent(runner("a-jobs-pod", false, now - 30, true)).await?;
+            anyhow::ensure!(s.runners_before(900).await? == 2);
+            s.recover().await?;
+            anyhow::ensure!(s.runners_before(900).await? == 1, "recovering marks them all gone; read it first");
             anyhow::Ok(())
         })
     }

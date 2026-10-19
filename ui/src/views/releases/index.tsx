@@ -5,9 +5,9 @@
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
-import { Check, X } from "lucide-react";
+import { Check, Plus, X } from "lucide-react";
 
-import { deployApi, describe, providerName, releaseAppHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Release } from "@/api/deploy";
+import { deployApi, describe, newAppHref, providerName, releaseAppHref, releaseHref, STATE_DOT, STATE_WORDS, type Board, type Cell, type Environment, type Release } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel } from "@/components/ui/misc";
@@ -24,6 +24,7 @@ import "./releases.css";
 export const DEPLOY_EVENTS = ["deploy", "deploy_registration"] as const;
 
 export const boardRes: Res<Board> = { key: "deploy/board", fetch: (s) => deployApi.board(s), opts: { on: DEPLOY_EVENTS, pollMs: 30_000 } };
+export const environmentsRes: Res<Environment[]> = { key: "deploy/environments", fetch: (s) => deployApi.environments(s), opts: { on: DEPLOY_EVENTS } };
 
 /** A release's state, as a dot and its words. */
 export function ReleaseState({ r }: { r: Release }) {
@@ -129,8 +130,18 @@ function BoardView() {
   const board = useRes(boardRes).data;
   if (!board.apps.length) {
     return (
-      <EmptyState title="Nothing released by API yet">
-        Apps, environments and their releases appear here once they exist: <code>kiln app create</code>, <code>kiln deploy env add</code>, then <code>kiln deploy &lt;app&gt; &lt;version&gt; --to &lt;env&gt;</code>.
+      <EmptyState
+        title="Nothing released by API yet"
+        action={
+          <Button asChild size="sm">
+            <Link to={newAppHref}>
+              <Plus /> New app
+            </Link>
+          </Button>
+        }
+      >
+        Apps, environments and their releases appear here once they exist: make an app here or with <code>kiln app create</code>, add environments with <code>kiln deploy env add</code>, then release
+        from the app's page.
       </EmptyState>
     );
   }
@@ -179,7 +190,14 @@ export default function Releases() {
       <title>Releases · kiln</title>
       <header className="cd-head">
         <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases" }]} />
-        <h1 className="cd-title">Releases</h1>
+        <div className="rel-head-row">
+          <h1 className="cd-title">Releases</h1>
+          <Button asChild size="sm">
+            <Link to={newAppHref}>
+              <Plus /> New app
+            </Link>
+          </Button>
+        </div>
         <p className="cd-note">
           Every app across its environments: what runs in each, what is on its way, and what waits for you. A release is a commit to an environment's release repository, made to run by its
           provider, KilnCD or Argo CD.

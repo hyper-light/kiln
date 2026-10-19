@@ -423,8 +423,9 @@ rollouts, and past Argo Rollouts, which is Kubernetes only. §5.2 compares the t
 Rollouts' code; §5.3 says what each platform's API allows.
 
 **Built so far.** The state machine is the same for every platform. The server drives it on
-**Lambda aliases** for now: canary, linear and blue/green, with `http`, `metric` (Prometheus) and
-`approve` checks. A rollout that names a check of another kind is refused before any traffic
+**Lambda aliases** for now: canary, linear, blue/green and all-at-once, with `http`, `metric`
+(Prometheus) and `approve` checks. On Kubernetes, **kiln's own deploy** is health-gated: its guard
+watches an all-at-once rollout's after checks (§10). A rollout that names a check of another kind is refused before any traffic
 moves. Not built yet: the other platforms of §5.3 (Workers, Vercel and ECS come next), `script` and
 `workflow` checks, metric backends other than Prometheus, `http` checks from runners (`from:`),
 secrets in checks, and notifications.
@@ -435,7 +436,7 @@ secrets in checks, and notifications.
 
 | Strategy | What happens |
 | --- | --- |
-| `all-at-once` | the default |
+| `all-at-once` | the default. With `after:` checks, they watch it for `window` (10 minutes) once it has all the traffic, and a failure goes back to blue: for what can't run two versions side by side, as kiln's own server can't (one writer on its data) |
 | `rolling` | batches with a maximum unavailable, for instance-based targets |
 | `blue-green` | green starts beside blue with an address of its own; checks run against it, then traffic switches, then checks run against production; blue stays warm to switch back to |
 | `canary` | steps: weights, pauses, checks, approvals |
@@ -874,11 +875,36 @@ a rollout: that changes nothing that runs.
    4. You approve, from the UI or your phone.
    5. kiln syncs, and restarts into the new version.
 5. **Self-deploy safety.** A sync that changes kiln's own Deployment can't watch its own restart.
-   - Before applying, kiln creates a **guard** Job (a hook, running the *previous* kiln image).
-   - The guard waits for the new server to become ready within a deadline. If it doesn't, the
-     guard puts the previous image back and records why.
-   - When the new server starts, it finds the sync it inherited and finishes it, as restart
-     safety already allows.
+   kiln can't run beside itself either (one writer on its data), so it takes over all at once and
+   then has to prove itself before its deploy stands.
+   - Before applying, kiln creates a **guard** Job (a hook, running the *previous* kiln image) and
+     tells it what to watch: the app's `rollout: all-at-once: { after, window }`, or five minutes
+     with no checks of its own when the app says none. A rollout kiln's deploy can't do (canary,
+     blue/green, an approval with nobody there while kiln restarts) stops the sync before it
+     applies.
+   - The guard waits for the new server's pods to be available within a deadline (10 minutes),
+     and gives up sooner when their containers keep restarting.
+   - Then it watches them for the window. The pods must stay available, and none of their
+     containers may restart. kiln's server in them must not be started again by its supervisor,
+     after a crash or the kernel's OOM killer, which a pod's status doesn't show: the guard reads
+     kiln's report of itself, `/healthz/server`, on each pod. The after checks must pass, each
+     measured by its own timing and limits as in any rollout. One that can't tell fails, since
+     nobody is there to decide.
+   - Anything failing puts the previous image back. The annotation `kiln.dev/guard` says how the
+     watch goes (`watching`, until when), then how it ended (`ready` or `rolled-back`), why, and
+     each check's record.
+   - The server that runs afterwards finishes the record once the guard has said: the deployment
+     succeeded and stayed healthy for its window, or failed with the guard's reason. Until then
+     the deploy isn't over.
+   - `/healthz/server` answers with the commit the server runs, how long it has been up, how many
+     times its supervisor started it again, its container's memory (from its cgroup: the working
+     set, the limit, the share, the peak, the OOM killer's kills), and its runners: connected now,
+     connected just before it started, and the share back. Numbers and the commit only, so it is
+     open, as `/healthz` is.
+   - kiln's own `.kiln/deploy.yaml` watches ten minutes. It checks that `/readyz` answers, that the
+     server isn't started again and the OOM killer doesn't strike, that its memory stays under 80%
+     of its limit, that it runs the commit deployed, and that three minutes in, at least half of
+     the runners connected before are back.
    - `deploy-image.sh` stays as break-glass, documented.
 6. **Runners** keep following the server's build (releases.md). A later `kiln-runners` provider
    could make that a CD rollout (batches, health per runner), outside this work.
@@ -939,11 +965,12 @@ Agreed with the Kiln CI work on 2026-10-18:
 | --- | --- |
 | This design | agreed 2026-10-18 |
 | Registries (§7.1): `oci` integrations, any OCI registry, private or public, tag → digest, indexes' platforms, pull secrets | built; checked against a fake token-auth registry and Docker Hub |
-| Artifacts (§1.3): images resolved per revision, in render keys and sources (`${{ artifacts.* }}`, in plain manifests too), recorded with each deployment, a rollback's exactly as recorded; plans ask no registry | built; checked on the test cluster |
+| Artifacts (§1.3): images resolved per revision, in render keys and sources (`${{ artifacts.* }}`, in plain manifests too), recorded with each deployment, a rollback's exactly as recorded and never waiting on the head's (git's head may be what broke, or its image still building); plans ask no registry | built; checked on the test cluster |
 | Published images (§7.1, §10): local Docker (loaded into the cluster's nodes by the image pipeline) or a registry, set in the UI (Settings → Deployments) | built; checked on the test cluster |
 | `.kiln/deploy.yaml` from kiln's repositories at trunk, apps registered and removed with the file | built; checked on the test cluster |
 | Agents deploy only where people let them (D6) | built; checked |
 | kiln deploying itself, with the guard (§10) | built and live (2026-10-18); production's three apps registered from `.kiln/deploy.yaml`, differing from Argo CD's objects only by kiln's tracking marks; the move off Argo CD waits for your go-ahead |
+| Health-gated self-deploys (§10): the guard's window, its own watch of pods and kiln's server, the app's after checks (all-at-once), `/healthz/server`, kiln's checks in its deploy file | built; the guard checked end to end on the test cluster against a stand-in server (kept when healthy; put back when its server restarts, its memory nears its limit, its container restarts, or it can't start; let go when someone else deploys). Production's first deploy with it is still guarded by the previous version's guard |
 | Accounts (§6, W11): AWS (SigV4, AssumeRoleWithWebIdentity), Google Cloud (STS, then impersonation), Azure (client assertion) from kiln's identity; Cloudflare and Vercel tokens; Verify; the issuer's documents served while any account federates | built; checked against AWS's signing examples and fakes of each service; no real account yet (D8) |
 | The provider framework (§1, §2): targets as clusters, kinds and scopes, polling (60 s at rest, 3 s while a sync changes a kind), request budgets, what kiln applied kept and read back (drift as §2.4 says), tracking in tags, credentials per app's workload | built; checked against fakes |
 | Workflow artifacts (§7): a file a run uploaded, by its hash; zips opened; Lambda zips through kiln's bucket in the account | built; checked against fakes |

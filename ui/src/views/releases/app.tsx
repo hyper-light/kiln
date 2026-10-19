@@ -5,9 +5,9 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
-import { Pause, Play, Rocket } from "lucide-react";
+import { Pause, Play, Plus, Rocket } from "lucide-react";
 
-import { boardHref, deployApi, describe, providerName, releaseHref, STATE_DOT, STATE_WORDS, type ReleaseAsk } from "@/api/deploy";
+import { boardHref, deployApi, describe, packageWords, providerName, releaseHref, STATE_DOT, STATE_WORDS, type ReleaseAsk } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
@@ -18,7 +18,8 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
-import { DEPLOY_EVENTS, ReleaseState } from "./index";
+import { useRes } from "@/lib/data";
+import { DEPLOY_EVENTS, environmentsRes, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
@@ -194,28 +195,60 @@ function EnvCard({ app, env, others }: { app: string; env: string; others: strin
           <dd>{status?.error ? <span className="rel-msg">{status.error}</span> : status ? `${status.sync ?? "?"} · ${status.health ?? "?"}` : <span className="rel-quiet">nothing there</span>}</dd>
         </div>
       </dl>
-      <div className="rel-env-actions">
-        {reg.paused ? (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("resume")}>
-            <Play /> Resume
-          </Button>
-        ) : (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("pause")}>
-            <Pause /> Pause
-          </Button>
-        )}
-        {reg.enabled ? (
-          <Button size="xs" variant="ghost-danger" disabled={busy || !!d.in_flight} onClick={() => void act("disable")}>
-            Disable
-          </Button>
-        ) : (
-          <Button size="xs" variant="ghost" disabled={busy || !!d.in_flight} onClick={() => void act("enable")}>
-            Enable
-          </Button>
-        )}
-      </div>
+      {/* Nothing released here yet: its first release is all there is to do. */}
+      {(d.running || d.in_flight) && (
+        <div className="rel-env-actions">
+          {reg.paused ? (
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("resume")}>
+              <Play /> Resume
+            </Button>
+          ) : (
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("pause")}>
+              <Pause /> Pause
+            </Button>
+          )}
+          {reg.enabled ? (
+            <Button size="xs" variant="ghost-danger" disabled={busy || !!d.in_flight} onClick={() => void act("disable")}>
+              Disable
+            </Button>
+          ) : (
+            <Button size="xs" variant="ghost" disabled={busy || !!d.in_flight} onClick={() => void act("enable")}>
+              Enable
+            </Button>
+          )}
+        </div>
+      )}
       <ReleaseDialog app={app} env={env} others={others} open={open} onOpenChange={setOpen} />
     </Panel>
+  );
+}
+
+/** The environments it isn't registered in yet, one to register it in. */
+function RegisterIn({ app, registered }: { app: string; registered: string[] }) {
+  const left = useRes(environmentsRes).data.filter((e) => !registered.includes(e.name));
+  const [env, setEnv] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  if (!left.length) return null;
+  const pick = left.some((e) => e.name === env) ? env : (left[0]?.name ?? "");
+  const go = async () => {
+    setBusy(true);
+    try {
+      await deployApi.register(app, pick);
+      toast({ title: `${app} registered in ${pick}`, description: "Nothing runs there until you release it.", tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (e) {
+      toast({ title: "Not registered", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="rel-register">
+      <SelectField label="Register it in" value={pick} onChange={setEnv} options={left.map((e) => ({ value: e.name, label: `${e.name} · ${providerName(e.provider)}` }))} />
+      <Button size="sm" variant="secondary" disabled={busy || !pick} onClick={() => void go()}>
+        <Plus /> Register
+      </Button>
+    </div>
   );
 }
 
@@ -273,7 +306,7 @@ function AppView({ name }: { name: string }) {
   const d = useSuspenseResource(`deploy/app/${name}`, (s) => deployApi.app(name, s), { on: DEPLOY_EVENTS }).data;
   const envs = d.environments.map((e) => e.registration.environment);
   const a = d.app;
-  const pkg = a.package.kind === "helm" ? `${a.package.repo} ${a.package.chart}` : a.package.kind === "git" ? `${a.package.repo} ${a.package.path}` : `${a.package.provider}`;
+  const pkg = packageWords(a.package);
   return (
     <>
       <header className="cd-head">
@@ -282,12 +315,21 @@ function AppView({ name }: { name: string }) {
         <p className="cd-note">
           {a.project}
           {a.owners.length > 0 && ` · owned by ${a.owners.join(", ")}`}
-          {a.template && ` · from ${a.template}`} · <code>{pkg}</code>
+          {a.template && ` · from ${a.template}`}
+          {a.source && (
+            <>
+              {" · source "}
+              <Link to="/repos" className="text-link">
+                {a.source}
+              </Link>
+            </>
+          )}{" "}
+          · <code>{pkg}</code>
           {a.archived && " · archived"}
         </p>
       </header>
       {envs.length === 0 ? (
-        <p className="rel-quiet">It isn't registered in any environment yet: kiln app register {a.name} --env &lt;env&gt;.</p>
+        <p className="rel-quiet">It isn't registered in any environment yet.</p>
       ) : (
         <div className="rel-envs">
           {envs.map((e) => (
@@ -297,6 +339,9 @@ function AppView({ name }: { name: string }) {
           ))}
         </div>
       )}
+      <Loadable label="the environments">
+        <RegisterIn app={a.name} registered={envs} />
+      </Loadable>
       <Loadable label="how it delivers">
         <Delivery app={a.name} />
       </Loadable>

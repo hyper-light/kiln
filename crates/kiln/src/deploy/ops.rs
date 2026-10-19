@@ -121,7 +121,7 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["templates"]), HashMap::new())),
                 run: |_cx: Cx, _v: Value| async move { answer(json!({ "templates": store::templates(&service()?.hub.store).await.map_err(internal)? })) }),
-            op!("deploy.templates.put", "Create or replace a template: the package its apps start with (`{app}` is the app's name), their namespace pattern (`apps-{app}`), the checks their releases pass, the properties they may have, the environments they may go to.", ro: false, destructive: false,
+            op!("deploy.templates.put", "Create or replace a template: the package its apps start with (`{app}` is the app's name), their namespace pattern (`apps-{app}`), the checks their releases pass, the properties they may have, the environments they may go to, and the source repository kiln makes for each (`repository: {name: \"acme/{app}\", starter: <git URL>, starter_ref?, branch?}`: its first commit the starter's files, `{{kiln.app}}` filled in). A template that makes repositories is put by someone who may add them (settings.manage).", ro: false, destructive: false,
                 input: || schema(json!({"template": {"type": "object", "description": "The template, as deploy.templates.list shows one."}}), &["template"]),
                 route: |v| {
                     let name = v.pointer("/template/name").and_then(Value::as_str).ok_or_else(|| bad("`template.name` is required"))?;
@@ -129,23 +129,23 @@ pub fn ops() -> &'static [Op] {
                 },
                 run: |cx: Cx, v: Value| async move {
                     let t: Template = serde_json::from_value(v.get("template").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the template doesn't read: {e}")))?;
-                    answer(flow::put_template(&*service()?, &cx.caller.name, t).await?)
+                    answer(flow::put_template(&*service()?, &cx.caller.name, t, cx.caller.can("settings.manage", &crate::authz::Scope::Server)).await?)
                 }),
-            op!("deploy.apps.create", "Create an app: its name, owner teams, and how it is deployed, or a template that says how (its package, namespace and checks follow). Then register it in environments.", ro: false, destructive: false,
-                input: || schema(json!({"app": {"type": "object", "description": "{name, project?, owners?, template?, package?, namespace?, properties?, contacts?}"}}), &["app"]),
+            op!("deploy.apps.create", "Create an app: its name, owner teams, and how it is deployed, or a template that says how (its package, namespace and checks follow, and the source repository it makes, from its starter). `source` names an existing kiln repository instead (`\"\"`: none). Then register it in environments.", ro: false, destructive: false,
+                input: || schema(json!({"app": {"type": "object", "description": "{name, project?, owners?, template?, package?, namespace?, properties?, contacts?, source?}"}}), &["app"]),
                 route: |_| Ok((Method::POST, path(&["apps"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let ask: flow::AppAsk = serde_json::from_value(v.get("app").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the app doesn't read: {e}")))?;
                     answer(flow::create_app(&*service()?, &cx.caller.name, ask).await?)
                 }),
-            op!("deploy.apps.patch", "Change some of an app: owners, properties (null removes one), contacts (on call, channels, links), template, package, namespace, archived. A package's change reaches each environment with its next release.", ro: false, destructive: false,
+            op!("deploy.apps.patch", "Change some of an app: owners, properties (null removes one), contacts (on call, channels, links), template, package, namespace, source (a kiln repository, `\"\"` for none), archived. A package's change reaches each environment with its next release.", ro: false, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "patch": {"type": "object"}}), &["app", "patch"]),
                 route: |v| Ok((Method::PATCH, path(&["apps", &text(v, "app")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let p: flow::AppPatch = serde_json::from_value(v.get("patch").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the patch doesn't read: {e}")))?;
                     answer(flow::patch_app(&*service()?, &cx.caller.name, &text(&v, "app")?, p).await?)
                 }),
-            op!("deploy.apps.delete", "Delete an app. With `everywhere`, it is deregistered from every environment first, what it runs deleted (or kept, with `keep`); otherwise an app still registered somewhere is refused.", ro: false, destructive: true,
+            op!("deploy.apps.delete", "Delete an app. With `everywhere`, it is deregistered from every environment first, what it runs deleted (or kept, with `keep`); otherwise an app still registered somewhere is refused. Its source repository is kept.", ro: false, destructive: true,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "everywhere": {"type": "boolean"}, "keep": {"type": "boolean"}}), &["app"]),
                 route: |v| {
                     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false).to_string();

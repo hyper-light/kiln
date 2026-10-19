@@ -164,6 +164,10 @@ pub struct ToolCall {
     /// For a skill run: the skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<String>,
+    /// A command run on another machine (kiln reach): the runner it ran on once one is picked, what
+    /// it must be (`linux/amd64`) until then, or empty while kiln picks the best.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
 }
 
 impl ToolCall {
@@ -1660,6 +1664,7 @@ mod tests {
             server: None,
             tool_short: None,
             skill: None,
+            runner: None,
         };
         t.annotate();
         assert_eq!((t.server.as_deref(), t.tool_short.as_deref(), t.tool), (Some("github"), Some("search_issues"), ToolKind::Mcp));
