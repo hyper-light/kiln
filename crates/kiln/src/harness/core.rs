@@ -722,6 +722,7 @@ mod tests {
             server: None,
             tool_short: None,
             skill: None,
+            runner: None,
         }))
     }
 

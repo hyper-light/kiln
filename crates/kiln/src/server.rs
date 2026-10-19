@@ -27,6 +27,9 @@ use crate::config::Config;
 use crate::hub::Hub;
 use crate::sup::{self, Registry};
 
+/// A runner seen this recently before the server started counts as connected before it.
+const RUNNERS_BEFORE_S: i64 = 900;
+
 pub fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
     R.get_or_init(Registry::default)
@@ -65,6 +68,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
+    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
     let requeued = store.recover().await?;
     if requeued > 0 {
         tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
@@ -94,6 +98,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.

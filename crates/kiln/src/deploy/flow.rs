@@ -74,6 +74,25 @@ fn emit_release(d: &Deploy, r: &Release) {
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
+    // Chat, paging and webhooks: the server's rules, and the app's own channels.
+    let event = match r.state {
+        State::WaitingApproval => Some("release.waiting_approval"),
+        State::Succeeded => Some("release.succeeded"),
+        State::Failed => Some("release.failed"),
+        State::Cancelled => Some("release.cancelled"),
+        _ => None,
+    };
+    if let Some(event) = event {
+        let (hub, app) = (Arc::clone(&d.hub), r.app.clone());
+        let mut release = serde_json::to_value(r).unwrap_or(Value::Null);
+        if let (Some(m), Some(approvers)) = (release.as_object_mut(), e.get("approvers")) {
+            m.insert("approvers".into(), approvers.clone());
+        }
+        crate::rt::spawn(async move {
+            let channels = store::app(&hub.store, &app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
+            crate::ci::notify::release_event(hub, event, release, channels).await;
+        });
+    }
 }
 
 /// Who asks for a change: the name the audit, the release and its commit say, and whether it is
@@ -264,6 +283,15 @@ async fn environment(d: &Deploy, name: &str) -> Result<Environment, Fail> {
 // ------------------------------------------------------------------ apps
 
 pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
+    check_app(d, &a).await?;
+    store::put_app(&d.hub.store, &a).await.map_err(internal)?;
+    audit(d, actor, "deploy.app.put", a.name.clone()).await;
+    Ok(a)
+}
+
+/// What an app must be to be kept: its names DNS labels, a package that deploys, what its template
+/// allows, a source repository kiln has.
+async fn check_app(d: &Deploy, a: &App) -> Result<(), Fail> {
     dns_label("app", &a.name)?;
     dns_label("project", &a.project)?;
     if let Some(ns) = &a.namespace {
@@ -304,9 +332,13 @@ pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
             }
         }
     }
-    store::put_app(&d.hub.store, &a).await.map_err(internal)?;
-    audit(d, actor, "deploy.app.put", a.name.clone()).await;
-    Ok(a)
+    if let Some(s) = &a.source {
+        let repos = d.hub.store.repos().await.map_err(internal)?;
+        if !repos.iter().any(|r| &r.name == s) {
+            return Err(bad(format!("source {s}: kiln has no repository {s}")));
+        }
+    }
+    Ok(())
 }
 
 /// Deletes an app. `everywhere`: deregistered from every environment first, what it runs there
@@ -352,6 +384,10 @@ pub struct AppAsk {
     pub template: Option<String>,
     #[serde(default)]
     pub contacts: Contacts,
+    /// Its source repository, one kiln has (`acme/web`), or `""` for none. Unset: the one it has,
+    /// or else the one its template makes (§3.1).
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub archived: bool,
 }
@@ -373,7 +409,8 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         None => from_template()?.ok_or_else(|| bad("how is it deployed? give a package, or a template that has one"))?,
     };
     let namespace = ask.namespace.clone().or_else(|| t.as_ref().and_then(|t| t.namespace.as_ref()).map(|p| p.replace("{app}", &ask.name)));
-    let a = App {
+    let had = store::app(&d.hub.store, &ask.name).await.map_err(internal)?.and_then(|a| a.source);
+    let mut a = App {
         name: ask.name,
         project: ask.project.unwrap_or_else(|| "default".to_owned()),
         owners: ask.owners,
@@ -382,9 +419,26 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         properties: ask.properties,
         template: ask.template,
         contacts: ask.contacts,
+        source: None,
         archived: ask.archived,
     };
-    put_app(d, actor, a).await
+    check_app(d, &a).await?;
+    // Its source repository: the one named, the one it has, or one its template makes, once the
+    // rest of it is known to be right.
+    let mut made = None;
+    a.source = match (ask.source, had, t.as_ref().and_then(|t| t.repository.as_ref())) {
+        (Some(s), _, _) => Some(s).filter(|s| !s.is_empty()),
+        (None, Some(s), _) => Some(s),
+        (None, None, Some(r)) => {
+            made = Some(super::scaffold::create(d, r, &a, actor).await?);
+            made.clone()
+        }
+        (None, None, None) => None,
+    };
+    put_app(d, actor, a).await.map_err(|(code, why)| match &made {
+        Some(r) => (code, format!("{why} (its repository {r} is made: give it as the app's source)")),
+        None => (code, why),
+    })
 }
 
 /// `{app}` in every string of a value is `name`.
@@ -416,6 +470,9 @@ pub struct AppPatch {
     pub template: Option<String>,
     #[serde(default)]
     pub contacts: Option<Contacts>,
+    /// A repository kiln has, or `""` for none.
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub archived: Option<bool>,
 }
@@ -448,6 +505,9 @@ pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Resu
     if let Some(x) = p.contacts {
         a.contacts = x;
     }
+    if let Some(x) = p.source {
+        a.source = Some(x).filter(|s| !s.is_empty());
+    }
     if let Some(x) = p.archived {
         a.archived = x;
     }
@@ -475,6 +535,9 @@ pub fn catalog_info(a: &App) -> String {
     if !a.contacts.channels.is_empty() {
         annotations.insert("kiln.dev/channels".into(), json!(a.contacts.channels.join(",")));
     }
+    if let Some(s) = &a.source {
+        annotations.insert("kiln.dev/source".into(), json!(s));
+    }
     let doc = json!({
         "apiVersion": "backstage.io/v1alpha1",
         "kind": "Component",
@@ -495,8 +558,17 @@ async fn template(d: &Deploy, name: &str) -> Result<Template, Fail> {
     store::template(&d.hub.store, name).await.map_err(internal)?.ok_or_else(|| missing(format!("no template {name}")))
 }
 
-pub async fn put_template(d: &Deploy, actor: &str, t: Template) -> Result<Template, Fail> {
+/// Puts a template. One that makes repositories, or changes how, is put by someone who may add
+/// repositories (`adds_repos`: `settings.manage`), since each app made from it makes one.
+pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool) -> Result<Template, Fail> {
     dns_label("template", &t.name)?;
+    if let Some(r) = &t.repository {
+        let before = store::template(&d.hub.store, &t.name).await.map_err(internal)?.and_then(|b| b.repository);
+        if !adds_repos && before.as_ref() != Some(r) {
+            return Err((StatusCode::FORBIDDEN, "a template that makes repositories is put by someone who may add them (settings.manage)".into()));
+        }
+        super::scaffold::check(d, r).map_err(bad)?;
+    }
     for c in &t.checks {
         if !matches!(c.as_str(), "no-snapshots" | "owners-set") {
             return Err(bad(format!("kiln has no check `{c}` (no-snapshots, owners-set)")));
@@ -690,6 +762,138 @@ pub struct RollbackAsk {
     /// The release to go back to; by default the newest that succeeded before the one running.
     #[serde(default)]
     pub to: Option<i64>,
+}
+
+/// A change to many apps of an environment at once (docs/deploy-api.md §3.3): each app selected is
+/// released, at one version, or with values set in its own (a config release each). Each passes
+/// the environment's gates as any release does.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetAsk {
+    pub environment: String,
+    /// The apps: these, or those made from `template`, in `project`, owned by `owner` (each given
+    /// must hold); every app registered in the environment when none is given.
+    #[serde(default)]
+    pub apps: Vec<String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// A deploy of this version to each.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Values set in each app's own values in the environment, by path (`image.pullPolicy`):
+    /// numbers and `true`/`false` as such, the rest as text.
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    /// Asked for again with the same key, it is the same fleet: the same releases.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `set`'s values in a values file, by path; the file as YAML (its comments don't survive).
+pub fn merge_values(text: &str, set: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut doc: serde_yaml::Value = if text.trim().is_empty() { serde_yaml::Value::Mapping(serde_yaml::Mapping::new()) } else { serde_yaml::from_str(text).map_err(|e| format!("its values don't read: {e}"))? };
+    if doc.is_null() {
+        doc = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    for (path, raw) in set {
+        let value = match serde_yaml::from_str::<serde_yaml::Value>(raw) {
+            Ok(v @ (serde_yaml::Value::Number(_) | serde_yaml::Value::Bool(_))) => v,
+            _ => serde_yaml::Value::String(raw.clone()),
+        };
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.iter().any(|p| p.is_empty()) {
+            return Err(format!("`{path}` isn't a path of values (`image.tag`)"));
+        }
+        let mut at = &mut doc;
+        for (i, p) in parts.iter().enumerate() {
+            let above = parts.get(..i).map(|x| x.join(".")).unwrap_or_default();
+            let map = at.as_mapping_mut().ok_or_else(|| format!("{path}: {above} isn't a map of values"))?;
+            let key = serde_yaml::Value::String((*p).to_owned());
+            if i + 1 == parts.len() {
+                map.insert(key, value.clone());
+                break;
+            }
+            at = map.entry(key).or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        }
+    }
+    serde_yaml::to_string(&doc).map_err(|e| format!("{e}"))
+}
+
+/// Releases each selected app of a fleet change (see [`FleetAsk`]): its id, and each app's release,
+/// or why it has none.
+pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
+    if f.version.is_some() == !f.set.is_empty() {
+        return Err(bad("a fleet change is a version to deploy, or values to set: one of them"));
+    }
+    let env = store::environment(&d.hub.store, &f.environment).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {}", f.environment)))?;
+    agents_may(who, &env, "release apps")?;
+    let id = f.idempotency_key.clone().unwrap_or_else(crate::util::new_id);
+    let registered: Vec<String> = store::registrations(&d.hub.store, None, Some(&env.name)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
+    let apps: Vec<App> = store::apps(&d.hub.store)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|a| registered.contains(&a.name))
+        .filter(|a| f.apps.is_empty() || f.apps.contains(&a.name))
+        .filter(|a| f.template.as_ref().is_none_or(|t| a.template.as_ref() == Some(t)))
+        .filter(|a| f.project.as_ref().is_none_or(|p| &a.project == p))
+        .filter(|a| f.owner.as_ref().is_none_or(|o| a.owners.contains(o)))
+        .collect();
+    if apps.is_empty() {
+        return Err(bad(format!("no app registered in {} is selected", env.name)));
+    }
+    let mut out = Vec::new();
+    for a in &apps {
+        let key = Some(format!("fleet:{id}:{}", a.name));
+        let ask = match &f.version {
+            Some(v) => Ask { app: a.name.clone(), environment: env.name.clone(), version: Some(v.clone()), idempotency_key: key, ..Ask::default() },
+            None => {
+                let values = match current_values(d, a, &env).await.and_then(|text| merge_values(&text.unwrap_or_default(), &f.set).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))) {
+                    Ok(v) => v,
+                    Err((code, why)) => {
+                        out.push(json!({ "app": a.name, "status": code.as_u16(), "error": why }));
+                        continue;
+                    }
+                };
+                Ask { app: a.name.clone(), environment: env.name.clone(), values: Some(values), idempotency_key: key, ..Ask::default() }
+            }
+        };
+        match release(d, who, ask).await {
+            Ok(r) => out.push(json!({ "app": a.name, "release": r })),
+            Err((code, why)) => out.push(json!({ "app": a.name, "status": code.as_u16(), "error": why })),
+        }
+    }
+    audit(d, &who.name, "deploy.fleet", format!("{id} in {}: {} apps", env.name, apps.len())).await;
+    Ok(json!({ "fleet": id, "environment": env.name, "releases": out }))
+}
+
+/// A fleet change's releases as they stand, and whether each has finished.
+pub async fn fleet_status(d: &Deploy, id: &str) -> Result<Value, Fail> {
+    let list = store::releases_keyed(&d.hub.store, &format!("fleet:{id}:")).await.map_err(internal)?;
+    if list.is_empty() {
+        return Err(missing(format!("no fleet change {id}")));
+    }
+    let done = list.iter().all(|r| !r.state.in_flight());
+    let mut states: BTreeMap<&str, u32> = BTreeMap::new();
+    for r in &list {
+        *states.entry(r.state.as_str()).or_default() += 1;
+    }
+    Ok(json!({ "fleet": id, "done": done, "states": states, "releases": list }))
+}
+
+/// The values file an app runs with in an environment (`None`: nothing runs, or it has none).
+async fn current_values(d: &Deploy, a: &App, env: &Environment) -> Result<Option<String>, Fail> {
+    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(internal)?;
+    let running = match reg.and_then(|r| r.running) {
+        Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+        None => None,
+    };
+    let Some(commit) = running.and_then(|r| r.commit) else { return Ok(None) };
+    file_at(d, env, &commit, repo::values_file(&env.release_repo, a, &env.name)).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
 /// The releases a registration can roll back to: the last 10 that succeeded, the one running and
@@ -1161,6 +1365,30 @@ async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -
     repo::decode(&bytes).map_err(|e| format!("release.json doesn't read: {e:#}"))
 }
 
+/// What `a` renders in `env` now, and what a release of `version` would render there: what runs,
+/// at that version (its values and artifacts as they are), each rendered as KilnCD renders it
+/// (docs/deploy-api.md §8.1).
+pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, version: &str) -> Result<(Vec<Value>, Vec<Value>), Fail> {
+    let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "KilnCD isn't running".to_owned()))?;
+    let nothing = || conflict(format!("nothing runs for {} in {} yet: release a version first", a.name, env.name));
+    let now = cd.definition(&kilncd::app_id(a, &env.name)).ok_or_else(nothing)?;
+    let reg = store::registration(&d.hub.store, &a.name, &env.name).await.map_err(internal)?.ok_or_else(|| missing(format!("{} isn't registered in {}", a.name, env.name)))?;
+    let running = match reg.running {
+        Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+        None => None,
+    };
+    let commit = running.and_then(|r| r.commit).ok_or_else(nothing)?;
+    let mut file = release_file_at(d, a, env, &commit).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    file.version = Some(version.to_owned());
+    // A version that isn't there is said as a release of it would be told.
+    if let Some(why) = super::check::missing_version(&d.hub, &a.package, &file).await {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
+    }
+    let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
+    let then = kilncd::definition(a, env, &reg, &file, &commit, &url).map_err(bad)?;
+    futures::try_join!(cd.render_definition(now), cd.render_definition(then)).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))
+}
+
 /// A file of a release's commit, for its registration (`None`: the commit has none).
 async fn file_at(d: &Deploy, env: &Environment, commit: &str, path: String) -> Result<Option<String>, String> {
     let (hosted, rr, commit) = (d.hosted.clone(), env.release_repo.clone(), commit.to_owned());
@@ -1311,9 +1539,51 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
     }
     audit(d, &format!("deploy for {}", r.requested_by), "deploy.release.end", format!("release {} {}{}", r.id, state.as_str(), r.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())).await;
     emit_release(d, &r);
+    if state == State::Succeeded && r.kind == Kind::Deploy {
+        promote_onward(d, &r).await;
+    }
     // A release waiting behind this one may go now.
     d.wake.notify();
     Ok(())
+}
+
+/// The environments a version that landed in `from` moves on to by itself: those that promote
+/// automatically with `from` among their `after`, where the app is registered.
+fn onward(envs: &[Environment], registered: &[String], from: &str) -> Vec<String> {
+    envs.iter()
+        .filter(|e| e.gates.promote == super::model::Promote::Auto && e.gates.after.iter().any(|a| a == from) && registered.contains(&e.name))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// A version that landed, released on by itself (docs/deploy-api.md §9.2): exactly what landed,
+/// to each environment that promotes automatically after this one, through its other gates
+/// (soak, approvals, windows, freezes). Asked for in the name of who asked for the landed one, so
+/// they don't approve their own change on its way; once per landing and environment however often
+/// this runs. One refused (a release already in flight there, an `after` it doesn't run in yet)
+/// goes when the next of its `after` lands, or by hand.
+async fn promote_onward(d: &Deploy, landed: &Release) {
+    let st = &d.hub.store;
+    let next = async {
+        let envs = store::environments(st).await?;
+        let registered: Vec<String> = store::registrations(st, Some(&landed.app), None).await?.into_iter().map(|r| r.environment).collect();
+        anyhow::Ok(onward(&envs, &registered, &landed.environment))
+    };
+    let next = match next.await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(app = %landed.app, error = %format!("{e:#}"), "deploy: the environments a version promotes to by itself didn't read");
+            return;
+        }
+    };
+    let who = Who { name: landed.requested_by.clone(), agent: false };
+    for env in next {
+        let ask = Ask { app: landed.app.clone(), environment: env.clone(), promote_from: Some(landed.environment.clone()), idempotency_key: Some(format!("promote:{}:{env}", landed.id)), ..Ask::default() };
+        match Box::pin(release(d, &who, ask)).await {
+            Ok(r) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, release = r.id, "deploy: a version promoted by itself"),
+            Err((_, why)) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, %why, "deploy: a version didn't promote by itself"),
+        }
+    }
 }
 
 /// The trailer of a commit that reverts a release's: the release.
@@ -1512,15 +1782,51 @@ mod tests {
             properties: BTreeMap::new(),
             template: Some("service".into()),
             contacts: Contacts { oncall: Some("ada".into()), channels: vec!["#deploys".into()], links: BTreeMap::from([("dashboard".into(), "https://grafana.example/d/web".into())]) },
+            source: Some("shop/web".into()),
             archived: false,
         };
         let doc: Value = serde_yaml::from_str(&catalog_info(&a)).map_err(|e| e.to_string())?;
+        assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1source"), Some(&json!("shop/web")));
         assert_eq!(doc.pointer("/kind"), Some(&json!("Component")));
         assert_eq!(doc.pointer("/spec/owner"), Some(&json!("payments")), "the owner team first");
         assert_eq!(doc.pointer("/spec/type"), Some(&json!("service")));
         assert_eq!(doc.pointer("/metadata/links/0/url"), Some(&json!("https://grafana.example/d/web")));
         assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1oncall"), Some(&json!("ada")));
         Ok(())
+    }
+
+    #[test]
+    fn a_fleet_change_sets_values_in_each_apps_own() -> Result<(), String> {
+        let set = BTreeMap::from([("replicaCount".to_owned(), "2".to_owned()), ("image.pullPolicy".to_owned(), "Always".to_owned()), ("ui.enabled".to_owned(), "true".to_owned())]);
+        let merged = merge_values("# the app's own\nimage:\n  repository: ghcr.io/acme/web\nui:\n  message: hi\n", &set)?;
+        let v: serde_yaml::Value = serde_yaml::from_str(&merged).map_err(|e| e.to_string())?;
+        assert_eq!(v.get("replicaCount"), Some(&serde_yaml::Value::Number(2.into())), "a number stays a number");
+        assert_eq!(v.get("image").and_then(|i| i.get("repository")).and_then(serde_yaml::Value::as_str), Some("ghcr.io/acme/web"), "what it had stays");
+        assert_eq!(v.get("image").and_then(|i| i.get("pullPolicy")).and_then(serde_yaml::Value::as_str), Some("Always"));
+        assert_eq!(v.get("ui").and_then(|u| u.get("enabled")), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(v.get("ui").and_then(|u| u.get("message")).and_then(serde_yaml::Value::as_str), Some("hi"));
+        // From nothing, and where a path runs into something that isn't a map.
+        let fresh = merge_values("", &BTreeMap::from([("a.b".to_owned(), "x".to_owned())]))?;
+        assert_eq!(fresh.trim(), "a:\n  b: x");
+        assert!(merge_values("image: web\n", &BTreeMap::from([("image.tag".to_owned(), "1".to_owned())])).is_err_and(|e| e.contains("image isn't a map")));
+        assert!(merge_values("", &BTreeMap::from([("a..b".to_owned(), "1".to_owned())])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_version_moves_on_by_itself_only_where_an_environment_says() {
+        let after = |name: &str, upstream: &[&str], auto: bool| {
+            let mut e = env(false);
+            e.name = name.into();
+            e.gates.after = upstream.iter().map(|u| (*u).to_owned()).collect();
+            e.gates.promote = if auto { super::super::model::Promote::Auto } else { super::super::model::Promote::Manual };
+            e
+        };
+        let envs = vec![after("staging", &[], false), after("production", &["staging"], true), after("eu", &["staging"], false), after("canary", &["staging"], true)];
+        let registered = vec!["staging".to_owned(), "production".to_owned(), "eu".to_owned()];
+        assert_eq!(onward(&envs, &registered, "staging"), ["production"], "eu promotes by hand; canary doesn't run the app");
+        assert!(onward(&envs, &registered, "production").is_empty(), "nothing comes after production");
+        assert_eq!(serde_json::to_value(super::super::model::Gates::default()).ok(), Some(json!({})), "`manual`, the default, isn't written");
     }
 
     #[test]

@@ -2282,6 +2282,7 @@ impl Claude {
                         server: None,
                         tool_short: None,
                         skill: None,
+                        runner: remote_of(&name, &input),
                     };
                     if parent.is_none() {
                         core.state.doing = Some(doing(&call));
@@ -2471,6 +2472,7 @@ impl Claude {
             t.exit_code = exit_code.or(t.exit_code);
             if let Some(runner) = reach.and_then(|r| r.runner) {
                 t.detail = Some(format!("on {runner}"));
+                t.runner = Some(runner);
             }
             t.ended = Some(Core::now());
         } else if !name.is_empty() {
@@ -2498,6 +2500,7 @@ impl Claude {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 })),
             );
         }
@@ -3347,6 +3350,14 @@ pub fn modes(allow_bypass: bool) -> Vec<ModeOption> {
 /// told it runs in a sandbox (`IS_SANDBOX`).
 pub(super) fn bypass_possible() -> bool {
     !crate::os::is_root() || std::env::var_os("IS_SANDBOX").is_some()
+}
+
+/// For a call of kiln reach's `run` (`mcp__kiln__run`): where it goes, so the timeline shows it as
+/// a command on another machine from the start (`reach::remote`).
+fn remote_of(name: &str, input: &Value) -> Option<String> {
+    let mut parts = name.strip_prefix("mcp__")?.splitn(2, "__");
+    let (server, tool) = (parts.next()?, parts.next()?);
+    crate::reach::remote(server, tool, input)
 }
 
 /// Kind, one-line title and detail for a tool call.

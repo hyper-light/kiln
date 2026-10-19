@@ -178,7 +178,8 @@ const RUNNER_ANSWER_MAX: usize = 4 << 20;
 
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
 /// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
-/// operations, or `{"op": "call", "session", "name", "input"}` to run one. The session must be one
+/// operations, `{"op": "call", "session", "name", "input"}` to run one, or `{"op": "page",
+/// "session", "do", ...}` for a page it shows (`crate::harness::visuals::ask`). The session must be one
 /// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner
 /// on a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The
 /// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`.
@@ -211,6 +212,33 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
             match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input).await {
                 Ok(v) => json!({"ok": v}),
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
+            }
+        }
+        // A page it shows in its conversation (`crate::harness::visuals`), or one it streams
+        // live there (`crate::harness::streams`): its own session's, audited as the agent acting
+        // for whoever started it.
+        Some(op @ ("page" | "stream")) => {
+            let r = if op == "page" { crate::harness::visuals::ask(hub, session, ask).await } else { crate::harness::streams::ask(hub, session, ask).await };
+            let what = format!("{}.{}", if op == "page" { "pages" } else { "streams" }, ask.get("do").and_then(Value::as_str).unwrap_or("?"));
+            if what != "pages.measured" {
+                let (principal, on_behalf_of) = crate::audit::who(&caller);
+                let entry = crate::audit::Entry {
+                    principal,
+                    on_behalf_of,
+                    action: what,
+                    target: Some(format!("agent session {session}")),
+                    result: if r.is_ok() { "ok".to_owned() } else { "error".to_owned() },
+                    detail: match &r {
+                        Ok(v) => v.get("url").or_else(|| v.get("path")).and_then(Value::as_str).unwrap_or("").to_owned(),
+                        Err(e) => format!("{e:#}"),
+                    },
+                    ..crate::audit::Entry::default()
+                };
+                crate::audit::write(&hub.store, entry).await;
+            }
+            match r {
+                Ok(v) => json!({"ok": v}),
+                Err(e) => json!({"error": format!("{e:#}")}),
             }
         }
         _ => json!({"error": "an unknown question"}),

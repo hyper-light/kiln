@@ -83,6 +83,26 @@ pub struct Gates {
     /// Held, and why (an incident, a holiday): no release goes until it's lifted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze: Option<String>,
+    /// `auto`: a version that lands in one of `after` is released here by itself, exactly what
+    /// landed (§9.2), through this environment's other gates (its soak, its approvals);
+    /// `manual`, the default: someone releases it.
+    #[serde(default, skip_serializing_if = "Promote::is_manual")]
+    pub promote: Promote,
+}
+
+/// Whether a version moves on from the environments before by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Promote {
+    #[default]
+    Manual,
+    Auto,
+}
+
+impl Promote {
+    pub fn is_manual(&self) -> bool {
+        *self == Promote::Manual
+    }
 }
 
 /// People who approve a release before it goes.
@@ -272,6 +292,9 @@ pub struct App {
     /// Who to reach, and where its release messages go.
     #[serde(default, skip_serializing_if = "Contacts::is_empty")]
     pub contacts: Contacts,
+    /// Its source repository (§3.1), as kiln names it: `acme/web`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default)]
     pub archived: bool,
 }
@@ -319,6 +342,34 @@ pub struct Template {
     /// The environments its apps may be registered in (none: any).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environments: Vec<String>,
+    /// The source repository kiln makes for each of its apps (§3.1), unless the app names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepoTemplate>,
+}
+
+/// The source repository a template makes for each app: one of kiln's own, its first commit the
+/// starter's files with `{{kiln.app}}`, `{{kiln.project}}`, `{{kiln.owner}}` and
+/// `{{kiln.repository}}` filled in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoTemplate {
+    /// `owner/name`, with `{app}` and `{project}` filled in.
+    #[serde(default = "default_repo_name")]
+    pub name: String,
+    /// The repository whose files it starts with (https://, ssh://, git:// or user@host:path); an
+    /// empty repository when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter: Option<String>,
+    /// The starter's branch or tag; its default branch when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter_ref: Option<String>,
+    /// The new repository's default branch.
+    #[serde(default = "main_branch")]
+    pub branch: String,
+}
+
+fn default_repo_name() -> String {
+    "{project}/{app}".to_owned()
 }
 
 fn default_project() -> String {

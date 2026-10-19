@@ -1,4 +1,4 @@
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -235,6 +235,10 @@ export const api = {
   checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),
   /** Upgrade that runner now (a retry too): that way, or whichever kiln can. */
   upgradeRunner: (name: string, way?: UpgradeWay) => post<UpdateJob>(`/api/updates/runners/${enc(name)}`, way ? { way } : undefined),
+  /** What's wrong with that runner: what the server knows, and what the machine finds about itself. */
+  diagnoseRunner: (name: string, signal?: AbortSignal) => get<RunnerDiagnosis>(`/api/agents/${enc(name)}/diagnose`, signal),
+  /** A repair a diagnosis offered (`retry-upgrade` with a way, `clear-self-build-cache`, `prune-versions`, `re-sign`). */
+  repairRunner: (name: string, action: string, way?: UpgradeWay) => post<RunnerRepair>(`/api/agents/${enc(name)}/repair`, way ? { action, way } : { action }),
   /** How long kiln waits on runners' upgrades from now on (those under way too). */
   setUpgradeWaits: (waits: UpgradeWaits) => request<void>("PUT", "/api/updates/waits", waits),
   /** Back to what kiln.toml says. */

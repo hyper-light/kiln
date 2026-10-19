@@ -29,6 +29,15 @@ pub enum Up {
     /// The conversation feed (`crate::convo::feed`), on its own lane: never buffered across a
     /// disconnect (the feed goes on from what the server says it has, on the next connection).
     Convo(AgentMsg),
+    /// Files read for the people viewing an agent session (`crate::harness::files`), on their own
+    /// lane: never buffered across a disconnect (whoever asked has given up by then).
+    File(AgentMsg),
+    /// A streamed page's chunks and events (`crate::browser::stream`), on their own lane: never
+    /// buffered across a disconnect (a viewer wants what's now, from the next key frame).
+    Stream(AgentMsg),
+    /// Connections to the machine's ports (`crate::browser::ports`), on their own lane: never
+    /// buffered across a disconnect (a connection doesn't outlive it).
+    Port(AgentMsg),
 }
 
 #[derive(Clone)]

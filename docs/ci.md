@@ -4387,9 +4387,12 @@ channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
   - Rules come from trunk's `.kiln/notify.yaml` and the server's `[[ci.notify]]`, as written
     above: `on`, `where` (an expression over `github` and `run`), `to` and `throttle`.
   - Events so far: `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and
-    `approval.waiting`, announced once per leg; and an agent's `agent.needs_you`,
+    `approval.waiting`, announced once per leg; an agent's `agent.needs_you`,
     `agent.finished`, `agent.stopped` and `agent.paused` (docs/notifications.md), which only the
-    server's rules take, `where` reading `agent`.
+    server's rules take, `where` reading `agent`; and a release's `release.waiting_approval`,
+    `release.succeeded`, `release.failed` and `release.cancelled` (docs/deploy-api.md §12.3),
+    which only the server's rules take, `where` reading `release`, and which go to the app's own
+    channels too, once per release, event and channel.
   - Channels are W11-R06's integration kinds (`slack`, `discord`, `teams`, `telegram`,
     `pagerduty`, `opsgenie`, `webhook`), named `kind:target`: the integration called `target`,
     or the first the repository may use, with `target` as its channel or chat.

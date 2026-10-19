@@ -23,8 +23,9 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-/// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.
 pub mod battery;
+pub mod cgroup;
+/// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.
 pub mod macsign;
 
 /// Child processes: [`crate::proc`]'s implementation.
@@ -72,6 +73,22 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// Whether `name` is an executable on `PATH`.
 pub fn have(name: &str) -> bool {
     which(name).is_some()
+}
+
+/// Bytes this user may still write on the volume holding `path` (None: unknown).
+// The statvfs fields' types differ by platform: a conversion that is one elsewhere is none here.
+#[allow(clippy::useless_conversion)]
+pub fn disk_available(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let s = nix::sys::statvfs::statvfs(path).ok()?;
+        Some(u64::from(s.blocks_available()).saturating_mul(u64::from(s.fragment_size())))
+    }
+    #[cfg(not(unix))]
+    {
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        disks.iter().filter(|d| path.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(sysinfo::Disk::available_space)
+    }
 }
 
 /// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):

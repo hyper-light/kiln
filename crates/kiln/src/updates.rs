@@ -1973,6 +1973,11 @@ async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf)
 
 static UPGRADING: AtomicBool = AtomicBool::new(false);
 
+/// Whether this runner is fetching an upgrade now (`crate::doctor` leaves the caches alone meanwhile).
+pub fn upgrading() -> bool {
+    UPGRADING.load(Ordering::Acquire)
+}
+
 /// The downloaded binary and its install's output, in the runner's own directory.
 fn upgrade_files(own_dir: &Path) -> (PathBuf, PathBuf) {
     (own_dir.join(if cfg!(windows) { "kiln-upgrade.exe" } else { "kiln-upgrade" }), own_dir.join("kiln-upgrade.log"))
@@ -2219,6 +2224,7 @@ pub fn kiln_checkout() -> Option<PathBuf> {
 
 /// Everything this build's runner can do ([`AgentMsg::Build`]).
 pub const RUNNER_CAPS: u32 = CAP_UPGRADE
+    | crate::proto::CAP_DOCTOR
     | crate::proto::CAP_UPDATES
     | crate::proto::CAP_FACTS
     | crate::proto::CAP_TAKEOVER
@@ -2230,13 +2236,17 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_CI2
     | crate::proto::CAP_ACTIONS
     | crate::proto::CAP_REACH
-    | crate::proto::CAP_JOB_TTY;
+    | crate::proto::CAP_JOB_TTY
+    | crate::proto::CAP_FILES
+    | crate::proto::CAP_STREAM
+    | crate::proto::CAP_PREVIEW
+    | crate::proto::CAP_PORTS;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
 /// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,
 /// repo copies or reach.
 pub const OUTPOST_CAPS: u32 =
-    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP;
+    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP | crate::proto::CAP_FILES;
 
 /// An outpost's [`AgentMsg::Build`].
 pub fn outpost_build() -> AgentMsg {
@@ -2442,13 +2452,16 @@ mod tests {
             b.resize(2 << 20, 7);
             b
         };
+        // A Mac's and Windows' binaries, and the server's own platform's (one of those two on a
+        // server that is one).
+        const OTHERS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"];
+        let mut entries = vec![("dist/kiln-aarch64-apple-darwin".to_owned(), fake(&[0xcf, 0xfa, 0xed, 0xfe])), ("dist/kiln-x86_64-pc-windows-msvc.exe".to_owned(), fake(b"MZ"))];
+        if !OTHERS.contains(&crate::api::TARGET) {
+            entries.push((format!("dist/kiln-{}", crate::api::TARGET), fake(b"\x7fELF")));
+        }
+        entries.push(("dist/SHA256SUMS".to_owned(), b"sums".to_vec()));
         let mut tar = tar::Builder::new(Vec::new());
-        for (name, bytes) in [
-            ("dist/kiln-aarch64-apple-darwin".to_owned(), fake(&[0xcf, 0xfa, 0xed, 0xfe])),
-            ("dist/kiln-x86_64-pc-windows-msvc.exe".to_owned(), fake(b"MZ")),
-            (format!("dist/kiln-{}", crate::api::TARGET), fake(b"\x7fELF")),
-            ("dist/SHA256SUMS".to_owned(), b"sums".to_vec()),
-        ] {
+        for (name, bytes) in entries {
             let mut h = tar::Header::new_gnu();
             h.set_size(bytes.len() as u64);
             h.set_mode(0o755);
@@ -2482,6 +2495,7 @@ mod tests {
         targets.sort_unstable();
         let mut all = vec!["aarch64-apple-darwin", "x86_64-pc-windows-msvc", crate::api::TARGET];
         all.sort_unstable();
+        all.dedup();
         assert_eq!(targets, all);
         assert!(kept.iter().all(|b| b.origin == "built" && b.run == Some(12) && b.sha.as_deref() == Some("0d21482abcdef")));
         assert!(dir.path().join("binaries/kiln-aarch64-apple-darwin").exists());
@@ -2491,7 +2505,8 @@ mod tests {
             let kept = adopt_into(&cfg, &artifacts, &own)?;
             let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
             targets.sort_unstable();
-            assert_eq!(targets, ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"], "this server's own platform keeps its own build");
+            let others: Vec<&str> = OTHERS.into_iter().filter(|t| *t != crate::api::TARGET).collect();
+            assert_eq!(targets, others, "this server's own platform keeps its own build");
         }
         Ok(())
     }

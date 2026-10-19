@@ -43,8 +43,26 @@ pub fn describe(server: &str, tool: &str, input: &serde_json::Value) -> Option<(
         "runners" => (ToolKind::Search, s("want").map_or_else(|| "Runners".to_owned(), |w| format!("Runners for {w}")), None),
         "output" => (ToolKind::Shell, format!("output of {}", s("id").unwrap_or_default()), None),
         "stop" => (ToolKind::Shell, format!("stop {}", s("id").unwrap_or_default()), None),
+        "show_page" => (ToolKind::Mcp, s("title").unwrap_or_else(|| "A page".to_owned()), None),
+        "show_live" => (ToolKind::Web, s("title").or_else(|| s("url")).unwrap_or_else(|| "A live page".to_owned()), s("url")),
+        "use_live" => {
+            let n = input.get("actions").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+            (ToolKind::Web, format!("Used the live page ({n} {})", if n == 1 { "action" } else { "actions" }), None)
+        }
+        "preview_page" => {
+            let what = s("url").or_else(|| s("path")).unwrap_or_else(|| "a page".to_owned());
+            let w = input.get("width").and_then(serde_json::Value::as_u64).unwrap_or(390);
+            let h = input.get("height").and_then(serde_json::Value::as_u64).unwrap_or(844);
+            (ToolKind::Web, format!("Preview {what}"), Some(format!("{w}×{h}")))
+        }
         _ => return None,
     })
+}
+
+/// For a call of reach's `run`: where it goes, as said (a runner's name or what it must be, empty
+/// for the best), so the timeline shows it as a command on another machine from the start.
+pub fn remote(server: &str, tool: &str, input: &serde_json::Value) -> Option<String> {
+    (ours(server) && tool == "run").then(|| input.get("on").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_owned())
 }
 
 /// What a reach tool returned, as the timeline shows a command's result: its output, its exit
@@ -57,6 +75,22 @@ pub struct Shown {
 
 pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
     let tool = tool_name.strip_prefix("mcp__kiln__").or_else(|| tool_name.strip_prefix("mcp__kiln-reach__")).or_else(|| tool_name.strip_prefix("mcp__kiln_reach__"))?;
+    // A page shown or previewed: what it said, on one line (its picture is for the agent; the
+    // conversation shows the page itself).
+    if matches!(tool, "show_page" | "preview_page" | "show_live" | "use_live") {
+        let text = match result {
+            serde_json::Value::String(s) => s.lines().find(|l| l.starts_with('{')).map(str::to_owned),
+            serde_json::Value::Object(o) => o
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|c| c.iter().find_map(|b| b.get("text").and_then(serde_json::Value::as_str)))
+                .map(str::to_owned)
+                .or_else(|| o.get("structuredContent").map(serde_json::Value::to_string)),
+            _ => None,
+        }?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        return Some(Shown { output: v.to_string(), exit_code: None, runner: None });
+    }
     if !matches!(tool, "run" | "output" | "stop") {
         return None;
     }

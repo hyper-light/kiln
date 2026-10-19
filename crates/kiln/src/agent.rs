@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -430,6 +430,7 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
 /// build once it has taken over, or the old one again after a rollback (the paths are the same).
 #[cfg(unix)]
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
+    crate::browser::set_home(state_dir);
     if let Some(r) = reach
         && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir))
     {
@@ -745,6 +746,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             });
             let path = crate::reach::local::path(&name, &o.state_dir);
+            crate::browser::set_home(&o.state_dir);
             if take_over_pending.is_some() {
                 crate::reach::local::set_socket(path.to_string_lossy().into_owned());
             } else {
@@ -838,7 +840,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().keep_closed());
+        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
         h.restore_from(convo.as_ref());
@@ -1836,6 +1838,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.close(&session);
                         }
+                        // What it had going live: its app, its streams.
+                        crate::browser::apps::stop(&session);
+                        let dir = o.state_dir.clone();
+                        crate::rt::spawn(async move { crate::browser::stream::streams().close_session(&dir, &session).await });
                     }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
@@ -1952,6 +1958,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    // What's wrong with this machine, and repairs to it (`crate::doctor`): on the
+                    // blocking pool, as they read and remove files.
+                    ServerMsg::Diagnose { req } => {
+                        let here = crate::doctor::Here { state_dir: o.state_dir.clone(), work_dir: o.work_dir.clone() };
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = crate::rt::blocking(move || serde_json::to_string(&crate::doctor::examine(&here)).ok()).await.ok().flatten();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        });
+                    }
+                    ServerMsg::Repair { req, action } => {
+                        let here = crate::doctor::Here { state_dir: o.state_dir.clone(), work_dir: o.work_dir.clone() };
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            tracing::info!(%action, "a repair the server asked for");
+                            let json = crate::rt::blocking(move || crate::doctor::answer_repair(&here, &action)).await.ok();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        });
+                    }
                     ServerMsg::Reach { from, link, open, data, close } => {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Frame { from, link, open, data, close }).await;
@@ -2022,6 +2047,56 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(intake) = &mirror {
                             intake.heard(SERVER_PEER, "server", json, data);
                         }
+                    }
+                    ServerMsg::HarnessFileRead { req, session: _, path, offset, len } => {
+                        // A file one of its sessions' messages mentions, for whoever views it: a
+                        // piece, read off this loop, sent on the files' own lane.
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let read = crate::rt::blocking(move || crate::harness::files::read(&path, offset, len)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
+                            let json = serde_json::to_string(&crate::harness::files::Answer::of(&read)).unwrap_or_default();
+                            let data = read.map(|(_, d)| d).unwrap_or_default();
+                            let _ = up.send(Up::File(AgentMsg::HarnessFileData { req, json, data })).await;
+                        });
+                    }
+                    // Pages streamed for whoever views one of its sessions (`crate::browser::stream`).
+                    ServerMsg::StreamOpen { stream, session, json } => {
+                        crate::rt::spawn(crate::browser::stream::serve_open(o.state_dir.clone(), stream, session, json, uplink.0.clone()));
+                    }
+                    ServerMsg::StreamControl { stream, session: _, json } => {
+                        crate::rt::spawn(crate::browser::stream::serve_control(stream, json));
+                    }
+                    ServerMsg::StreamInput { stream, session: _, json } => crate::browser::stream::serve_input(&stream, &json),
+                    ServerMsg::StreamClose { stream, session: _ } => {
+                        crate::rt::spawn(async move { crate::browser::stream::streams().close(&stream).await });
+                    }
+                    // A port of this machine's, for a person's own device (`crate::browser::ports`):
+                    // one its session's machine lists, on loopback.
+                    ServerMsg::PortOpen { conn, session, port } => {
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| *s.pid.lock());
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let allowed = match found {
+                                Some(root) => crate::rt::blocking(move || crate::browser::ports::allowed(&session, root, port)).await.unwrap_or(false),
+                                None => false,
+                            };
+                            crate::browser::ports::serve_open(conn, port, allowed, up).await;
+                        });
+                    }
+                    ServerMsg::PortData { conn, session: _, data } => crate::browser::ports::data(conn, data),
+                    ServerMsg::PortAck { conn, session: _, bytes } => crate::browser::ports::ack(conn, bytes),
+                    ServerMsg::PortClose { conn, session: _ } => crate::browser::ports::close(conn),
+                    // What a person opens live from one of its sessions (`crate::browser::apps`).
+                    ServerMsg::Preview { req, session, json } => {
+                        let (up, dir) = (uplink.0.clone(), o.state_dir.clone());
+                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| (std::path::PathBuf::from(s.info().cwd), *s.pid.lock()));
+                        crate::rt::spawn(async move {
+                            let answer = match found {
+                                None => serde_json::json!({"error": "no such session here"}),
+                                Some((cwd, pid)) => crate::browser::apps::serve(&dir, &session, &cwd, pid, &json).await,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
+                        });
                     }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
@@ -2219,11 +2294,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
+                    Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
+                    Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
+                    Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.
@@ -2600,7 +2678,7 @@ fn adopt_handover(
 /// The copy of the server's conversation store this runner keeps (a mirror), beside its own, and
 /// the intake that takes the server's feed into it, its answers going up the link.
 fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
-    let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().keep_closed())?;
+    let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().upkeep())?;
     match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays, None) {
         Ok((intake, out)) => {
             let up = up.clone();

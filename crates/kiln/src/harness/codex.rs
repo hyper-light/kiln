@@ -2439,6 +2439,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
@@ -2493,6 +2494,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
@@ -2540,6 +2542,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: shown.as_ref().and_then(|s| s.runner.clone()).or_else(|| crate::reach::remote(server, tool_name, item.get("arguments").unwrap_or(&Value::Null))),
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -2564,6 +2567,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -2632,6 +2636,7 @@ impl Codex {
                     server: None,
                     tool_short: None,
                     skill: None,
+                    runner: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }

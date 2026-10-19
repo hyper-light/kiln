@@ -905,6 +905,7 @@ fn merge(known: Option<ToolCall>, u: &Value, cwd: &str) -> ToolCall {
         server: None,
         tool_short: None,
         skill: None,
+        runner: None,
     });
     if let Some(k) = u.get("kind").and_then(Value::as_str) {
         t.name = k.to_owned();

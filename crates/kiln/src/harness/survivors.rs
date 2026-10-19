@@ -339,6 +339,19 @@ pub fn said(trees: &[(Ran, Vec<u32>)], now_s: u64) -> String {
     s
 }
 
+/// A shell command that sleeps `secs` as a process whose environment this machine lets kiln read
+/// (how a process that runs apart is found by its mark). macOS hides the environment of Apple's own
+/// programs (`/bin/sleep`), and copies of them can't run (arm64e), so there it is Python's. `None`
+/// on a Mac without Python.
+#[cfg(all(test, unix))]
+pub(crate) fn sleeper(secs: u32) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let python = std::process::Command::new("python3").args(["-c", "pass"]).output().is_ok_and(|o| o.status.success());
+        return python.then(|| format!("python3 -c 'import time; time.sleep({secs})'"));
+    }
+    Some(format!("sleep {secs}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,14 +392,19 @@ mod tests {
     fn what_a_session_started_is_found_under_it_or_by_its_mark_until_it_is_stopped() -> anyhow::Result<()> {
         // One under this process; one marked as session "s1"'s that runs apart (its shell exited).
         let mut child = std::process::Command::new("sleep").arg("31").spawn()?;
-        let out = std::process::Command::new("sh").arg("-c").arg("sleep 32 >/dev/null 2>&1 & echo $!").env(MARK, "s1").output()?;
+        let Some(sleep_32) = sleeper(32) else {
+            eprintln!("skipped: nothing here sleeps as a process whose environment can be read");
+            let _ = child.kill();
+            return Ok(());
+        };
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_32} >/dev/null 2>&1 & echo $!")).env(MARK, "s1").output()?;
         let apart: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
         let me = std::process::id();
         let seen = scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
         let s1 = seen.get("s1").cloned().unwrap_or_default();
         let sleep = s1.under.iter().find(|r| r.pid == child.id()).cloned().ok_or_else(|| anyhow::anyhow!("the child isn't seen under its harness: {:?}", s1.under))?;
         assert!(sleep.command.contains("sleep 31"));
-        assert!(s1.apart.iter().any(|r| r.pid == apart && r.command.contains("sleep 32")), "{:?}", s1.apart);
+        assert!(s1.apart.iter().any(|r| r.pid == apart && r.command.contains("32")), "{:?}", s1.apart);
         assert!(seen.get("s2").is_some_and(|s| s.apart.is_empty() && s.under.is_empty()));
         assert_eq!(alive(std::slice::from_ref(&sleep)).len(), 1);
         // Another start time is another process.

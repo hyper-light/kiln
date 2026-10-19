@@ -24,8 +24,10 @@ import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { handlePush, pushHeard } from "./push.ts";
+import { handleReview } from "./review.ts";
+import { handleDoctor } from "./doctor.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -1221,6 +1223,8 @@ const server = http.createServer(async (req, res) => {
         ].join("\n"),
       );
     }
+    // Pages agents show: open, as the server's are (their address is their key).
+    if (handleShownPages(p, res)) return;
     if (!p.startsWith("/api/")) return serveStatic(p, res);
 
     // ---- auth (open) ----
@@ -1257,6 +1261,27 @@ const server = http.createServer(async (req, res) => {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));
       return json(res, 200, { ok: true });
     }
+    // ---- files the long session's messages mention ----
+    if (handleLongFiles(p, url, req, res)) return;
+    // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
+    const live = /^\/api\/harness\/sessions\/([^/]+)\/(preview|preview\/stop|streams)$/.exec(p);
+    if (live) {
+      if (live[2] === "preview" && m === "GET")
+        return json(res, 200, {
+          ports: [
+            { port: 5173, address: "127.0.0.1", pid: 4242, command: "node", agents: true },
+            { port: 8080, address: "0.0.0.0", pid: 977, command: "python3", agents: false },
+          ],
+          app: { configured: true, start: "npm run dev", port: 5173, path: "/", running: null },
+        });
+      if (live[2] === "preview/stop" && m === "POST") return json(res, 200, { stopped: false });
+      if (live[2] === "streams" && m === "GET") return json(res, 200, []);
+      if (live[2] === "streams" && m === "POST") return err(res, 409, "the mock doesn't stream pages: run a kiln server and a runner for live pages");
+    }
+    if (/^\/api\/harness\/sessions\/[^/]+\/recordings$/.test(p) && m === "GET") return json(res, 200, []);
+    const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
+    if (opened && m === "GET") return json(res, 200, []);
+    if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
@@ -1582,7 +1607,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handleReview(req, res, url, { json, err, body, emit: (ev) => emit(ev as never) })) return;
     if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
+    if (await handleDoctor(req, res, url, { json, err, body, runners: () => [...agents.values()].map((a) => ({ name: a.name, connected: a.connected, os: a.os })) })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
     if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;

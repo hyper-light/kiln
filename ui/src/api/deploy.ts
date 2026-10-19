@@ -4,6 +4,7 @@
  * provider (KilnCD or Argo CD) makes run; it waits on the environment's gates first.
  */
 import { request } from "./client";
+import type { CdDiff, CdResourceKey } from "./types";
 
 export type ReleaseState = "waiting" | "waiting_approval" | "committing" | "delivering" | "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded";
 export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable";
@@ -71,6 +72,8 @@ export interface Gates {
   windows?: { allow?: string; deny?: string; duration: string; timezone?: string }[];
   checks?: string[];
   freeze?: string;
+  /** `auto`: a version that lands in one of `after` is released here by itself (§9.2). */
+  promote?: "auto" | "manual";
 }
 
 export interface Environment {
@@ -98,7 +101,55 @@ export interface App {
   properties?: Record<string, string>;
   template?: string;
   contacts?: { oncall?: string; channels?: string[]; links?: Record<string, string> };
+  /** Its source repository, as kiln names it (`acme/web`). */
+  source?: string;
   archived: boolean;
+}
+
+/** The source repository a template makes for each app (§3.1): one of kiln's own. */
+export interface RepoTemplate {
+  /** `acme/{app}`: `{app}` and `{project}` filled in. */
+  name: string;
+  starter?: string;
+  starter_ref?: string;
+  branch: string;
+}
+
+/** What apps are made from (§3.2). */
+export interface Template {
+  name: string;
+  description?: string;
+  package?: Package;
+  namespace?: string;
+  checks?: string[];
+  properties?: Record<string, string[]>;
+  environments?: string[];
+  repository?: RepoTemplate;
+}
+
+/** An app as asked for: a template fills what isn't given. `source: ""` makes none. */
+export interface AppAsk {
+  name: string;
+  project?: string;
+  owners?: string[];
+  template?: string;
+  package?: Package;
+  namespace?: string;
+  properties?: Record<string, string>;
+  source?: string;
+}
+
+/** What changes in an app: only what is given. A property set to `null` is removed; `source: ""` unlinks. */
+export interface AppPatch {
+  project?: string;
+  owners?: string[];
+  package?: Package;
+  namespace?: string;
+  properties?: Record<string, string | null>;
+  template?: string;
+  contacts?: App["contacts"];
+  source?: string;
+  archived?: boolean;
 }
 
 /** One registration on the board: what runs, and what's on its way. */
@@ -126,6 +177,27 @@ export interface RegistrationDetail {
 export interface AppDetail {
   app: App;
   environments: { registration: Registration; running: Release | null }[];
+}
+
+/** One object of what runs, as the provider sees it (KilnCD's shape, from either provider). */
+export interface RunningObject extends CdResourceKey {
+  sync: string;
+  health: string | null;
+  message: string | null;
+  missing?: boolean;
+  requires_pruning?: boolean;
+  hook?: boolean;
+  why?: string | null;
+}
+
+/** A workload's pods' logs, the last lines of each (Argo CD gives only the lines). */
+export interface LogRead {
+  lines: { pod: string; ts: string; text: string }[];
+  pods?: string[];
+  more_pods?: number;
+  container?: string | null;
+  containers?: string[];
+  errors?: string[];
 }
 
 /** DORA's four keys, from the releases (durations in seconds). */
@@ -182,13 +254,40 @@ export const deployApi = {
   cancel: (id: number) => request<Release>("POST", `/api/deploy/releases/${id}/cancel`, {}),
   approve: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/approve`, { note }),
   reject: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/reject`, { note }),
+  templates: (signal?: AbortSignal) => request<{ templates: Template[] }>("GET", "/api/deploy/templates", undefined, { signal }).then((r) => r.templates),
+  environments: (signal?: AbortSignal) => request<{ environments: Environment[] }>("GET", "/api/deploy/environments", undefined, { signal }).then((r) => r.environments),
+  nameFree: (name: string) => request<{ name: string; available: boolean; why?: string | null }>("GET", `/api/deploy/app-names/${enc(name)}`),
+  createApp: (ask: AppAsk) => request<App>("POST", "/api/deploy/apps", ask),
+  patchApp: (name: string, patch: AppPatch) => request<App>("PATCH", `/api/deploy/apps/${enc(name)}`, patch),
+  deleteApp: (name: string, o: { everywhere: boolean; keep: boolean }) => request<void>("DELETE", `/api/deploy/apps/${enc(name)}?everywhere=${o.everywhere}&keep=${o.keep}`),
+  environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
+  putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
+  /** A new environment: what isn't given is the server's default (no gates, one release at a time, no agents). */
+  createEnvironment: (e: { name: string; provider: string; release_repo: { repo: string; branch: string; root: string }; targets: { kubernetes: string[] } }) =>
+    request<Environment>("POST", "/api/deploy/environments", e),
+  register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
+  resources: (app: string, env: string, signal?: AbortSignal) => request<{ resources: RunningObject[] }>("GET", `${reg(app, env)}/resources`, undefined, { signal }).then((r) => r.resources),
+  manifests: (app: string, env: string, version?: string, signal?: AbortSignal) =>
+    request<{ manifests: { key: CdResourceKey; yaml: string }[] }>("GET", `${reg(app, env)}/manifests${version ? `?version=${enc(version)}` : ""}`, undefined, { signal }).then((r) => r.manifests),
+  diff: (app: string, env: string, version?: string, signal?: AbortSignal) =>
+    request<{ diffs: CdDiff[] }>("GET", `${reg(app, env)}/diff${version ? `?version=${enc(version)}` : ""}`, undefined, { signal }).then((r) => r.diffs),
+  logs: (app: string, env: string, q: { kind: string; name: string; namespace?: string; container?: string; tail: number }, signal?: AbortSignal) => {
+    const qs = Object.entries(q)
+      .filter(([, v]) => v !== undefined && v !== "")
+      .map(([k, v]) => `${enc(k)}=${enc(String(v))}`)
+      .join("&");
+    return request<LogRead>("GET", `${reg(app, env)}/logs?${qs}`, undefined, { signal });
+  },
   pause: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/pause`, {}),
   resume: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/resume`, {}),
 };
 
 export const boardHref = "/deployments/releases";
+export const newAppHref = "/deployments/releases/new";
 export const releaseHref = (id: number) => `/deployments/releases/${id}`;
 export const releaseAppHref = (app: string) => `/deployments/releases/apps/${enc(app)}`;
+export const releaseEnvHref = (env: string) => `/deployments/releases/environments/${enc(env)}`;
+export const registrationHref = (app: string, env: string) => `/deployments/releases/apps/${enc(app)}/environments/${enc(env)}`;
 
 /** The status dot a release's state shows as. */
 export const STATE_DOT: Record<ReleaseState, string> = {
@@ -229,6 +328,18 @@ export function describe(r: Release): string {
       return "config";
     default:
       return r.kind;
+  }
+}
+
+/** How a package deploys, in a few words: `oci://ghcr.io/acme/charts web`. */
+export function packageWords(p: Package): string {
+  switch (p.kind) {
+    case "helm":
+      return `${p.repo} ${p.chart}`;
+    case "git":
+      return `${p.repo}${p.path ? ` ${p.path}` : ""}`;
+    case "platform":
+      return p.provider;
   }
 }
 

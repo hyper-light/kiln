@@ -233,6 +233,7 @@ outlives the server's disk and its own machine both.
 mirrors = 1          # runners that keep a copy of the server's store; 0: none
 mirror_on = []       # runners to pick first, by name
 keep_closed_days = 30  # days an ended agent's transcript is kept (its events stay); 0: for good
+compact = true       # make the store's file compact once a third of it is free (runners and mirrors too)
 ```
 
 ## Milestones
@@ -255,13 +256,25 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
   lesson of c0ffda6 (agents.md).
 - **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
   MB. They are kept compressed, and ended agents' transcripts go after `keep_closed_days`. What
-  that frees is used again for what comes next; the file doesn't shrink by itself. The engine can
-  make it compact (`Engine::compact`: a compact copy, `VACUUM INTO`, takes the file's place; a
-  copy written whole before a crash takes it at the next start, one written in part is removed),
-  but the store never does it on its own. It once did, hourly, and on the first server's store of
-  several GB the copy held the writer and took more memory than the server has: the server was
-  killed for it every minute (2026-10-18). Compacting a big store needs a way that keeps its
-  memory bounded first.
+  that frees is used again for what comes next, and once a third of the file (and 256 MiB) is
+  free, the store makes it compact while it has nothing else to do (`Engine::compact_some`):
+  1. It copies itself into `<file>.compact.tmp` a step at a time: the writer reads 4 MiB of rows,
+     and a thread of its own writes them into the copy, a transaction of their own there, under
+     the same numbers, the copy's log written into it each time. Two batches ahead at most.
+  2. Then what was written meanwhile, by its numbers, in the order it was written: what a drop
+     took away is taken away from the copy too, and a session changed without a number of its
+     own (where it runs) is copied again.
+  3. Caught up, the copy goes to disk and is counted against the store, table by table.
+  4. With nothing else writing, the rest is copied, the copy counted again, and it takes the
+     file's place.
+
+  A step holds the store for a few tens of milliseconds (it only reads; the copy's disk is the
+  copier's to wait on). Counting the store before the swap, and the swap, hold it for up to a
+  second or two on a busy disk. The memory it takes is a few steps'. A copy written whole before a crash
+  takes the file's place at the next start; one written in part is removed. It needs room beside
+  the file for what the file holds, and waits until there is. `compact = false` turns it off. It
+  once copied the whole file in one go (`VACUUM INTO`, one transaction), which took more memory
+  than the first server had: it was killed for it every minute until rolled back (2026-10-18).
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status
@@ -274,5 +287,5 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
 | C4 search UI | live (dfbbd1a, 2026-10-18): Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
 | C5 mirrors | live (dfbbd1a, 2026-10-18): the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |
 | Compression | live (2540397, deployed with 2bd78af, 2026-10-18): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |
-| Pruning and compaction | pruning live (902b999, deployed with 5360484, 2026-10-19): an ended agent's transcript goes after `keep_closed_days`. Compaction (215 MB made 108 MB in about a second) went live with c98ae28 and took the first server down (out of memory on its store of several GB, every minute, until rolled back); the store no longer compacts itself, and a server answers nothing rather than "from 0" when it can't read where a runner's store stands (which had every runner send everything again). That fix (9b7558f) is live with 5360484: over its first 12 minutes on the first server (a 6.6 GB store), no restarts, memory at 350–550 MiB of 2 GiB, and the crash loop's partial copy removed at start |
+| Pruning and compaction | pruning live (902b999, deployed with 5360484, 2026-10-19): an ended agent's transcript goes after `keep_closed_days`. Compaction went live with c98ae28 as one copy of the whole file in one transaction (`VACUUM INTO`) and took the first server down: out of memory on its store of several GB, every minute, until rolled back. The fix (9b7558f, live with 5360484) took it out, and a server answers nothing rather than "from 0" when it can't read where a runner's store stands. Built again (6ca8494): a copy a step at a time, written on a thread of its own, under the same numbers, caught up by them, counted, then swapped. On a 4 GB store (1M events, 76k compressed transcript lines), capped at 2 GiB with a runner feeding it meanwhile: made 2.8 GB in 3 to 5 minutes, identical after (integrity ok), memory under 140 MB, reads 2 ms median and 0.15 to 0.46 s at p99, none failed; the swap held the store 0.3 to 1.4 s |
 | Restore from a mirror | live (5360484, 2026-10-19): a server that starts with an empty store asks a mirror named in `mirrors.json` for its copy, or `POST /api/conversations/restore` asks one; the copy fills in what the store lacks and never overwrites what a machine's own feed brought. Lab C6 (12 checks): the store deleted and the agent's machine killed, the server restores by itself, the agent is listed away and moved on with its context; a second restore changes nothing. At scale (a 4 GB store: 40 sessions, 75,764 transcript lines kept compressed; the server and the mirror each capped at 2 GiB like the pod): restored by itself in 18 seconds, identical row for row, the server at 107 MB and the mirror at 93 MB at most, no OOM (122 seconds before the feed read only what a batch takes, sent lines as kept, and stopped sending the copy back). Mixed versions (an old server with new runners, and the other way) pass labs C2 and C6 |

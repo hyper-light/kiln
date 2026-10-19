@@ -5,11 +5,11 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
-import { Pause, Play, Rocket } from "lucide-react";
+import { Pause, Play, Plus, Rocket } from "lucide-react";
 
-import { boardHref, deployApi, describe, providerName, releaseHref, STATE_DOT, STATE_WORDS, type ReleaseAsk } from "@/api/deploy";
+import { boardHref, deployApi, describe, packageWords, providerName, registrationHref, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type ReleaseAsk } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -18,7 +18,8 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
-import { DEPLOY_EVENTS, ReleaseState } from "./index";
+import { useRes } from "@/lib/data";
+import { DEPLOY_EVENTS, environmentsRes, ReleaseState, templatesRes } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
@@ -167,9 +168,14 @@ function EnvCard({ app, env, others }: { app: string; env: string; others: strin
       eyebrow={providerName(d.provider.kind === "argocd" ? `argocd/${d.provider.integration ?? ""}` : "kilncd")}
       title={env}
       actions={
-        <Button size="xs" onClick={() => setOpen(true)} disabled={!!d.in_flight}>
-          <Rocket /> Release
-        </Button>
+        <>
+          <Button asChild size="xs" variant="ghost">
+            <Link to={registrationHref(app, env)}>What runs</Link>
+          </Button>
+          <Button size="xs" onClick={() => setOpen(true)} disabled={!!d.in_flight}>
+            <Rocket /> Release
+          </Button>
+        </>
       }
       className="rel-env"
     >
@@ -194,27 +200,254 @@ function EnvCard({ app, env, others }: { app: string; env: string; others: strin
           <dd>{status?.error ? <span className="rel-msg">{status.error}</span> : status ? `${status.sync ?? "?"} · ${status.health ?? "?"}` : <span className="rel-quiet">nothing there</span>}</dd>
         </div>
       </dl>
-      <div className="rel-env-actions">
-        {reg.paused ? (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("resume")}>
-            <Play /> Resume
-          </Button>
+      {/* Nothing released here yet: its first release is all there is to do. */}
+      {(d.running || d.in_flight) && (
+        <div className="rel-env-actions">
+          {reg.paused ? (
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("resume")}>
+              <Play /> Resume
+            </Button>
+          ) : (
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("pause")}>
+              <Pause /> Pause
+            </Button>
+          )}
+          {reg.enabled ? (
+            <Button size="xs" variant="ghost-danger" disabled={busy || !!d.in_flight} onClick={() => void act("disable")}>
+              Disable
+            </Button>
+          ) : (
+            <Button size="xs" variant="ghost" disabled={busy || !!d.in_flight} onClick={() => void act("enable")}>
+              Enable
+            </Button>
+          )}
+        </div>
+      )}
+      <ReleaseDialog app={app} env={env} others={others} open={open} onOpenChange={setOpen} />
+    </Panel>
+  );
+}
+
+/** The environments it isn't registered in yet, one to register it in. */
+function RegisterIn({ app, registered }: { app: string; registered: string[] }) {
+  const left = useRes(environmentsRes).data.filter((e) => !registered.includes(e.name));
+  const [env, setEnv] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  if (!left.length) return null;
+  const pick = left.some((e) => e.name === env) ? env : (left[0]?.name ?? "");
+  const go = async () => {
+    setBusy(true);
+    try {
+      await deployApi.register(app, pick);
+      toast({ title: `${app} registered in ${pick}`, description: "Nothing runs there until you release it.", tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (e) {
+      toast({ title: "Not registered", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="rel-register">
+      <SelectField label="Register it in" value={pick} onChange={setEnv} options={left.map((e) => ({ value: e.name, label: `${e.name} · ${providerName(e.provider)}` }))} />
+      <Button size="sm" variant="secondary" disabled={busy || !pick} onClick={() => void go()}>
+        <Plus /> Register
+      </Button>
+    </div>
+  );
+}
+
+/** What an app is, changed here: its project and owners, who to reach, its source repository; it
+ * archived (no new releases, what runs keeps running), or deleted. */
+function Settings({ a, registered }: { a: App; registered: string[] }) {
+  const navigate = useNavigate();
+  const [project, setProject] = React.useState(a.project);
+  const [owners, setOwners] = React.useState(a.owners.join(", "));
+  const [oncall, setOncall] = React.useState(a.contacts?.oncall ?? "");
+  const [channels, setChannels] = React.useState((a.contacts?.channels ?? []).join(", "));
+  const [source, setSource] = React.useState(a.source ?? "");
+  const [busy, setBusy] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [keep, setKeep] = React.useState(true);
+  const list = (s: string) =>
+    s
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  const patch = async (p: AppPatch, done: string) => {
+    setBusy(true);
+    try {
+      await deployApi.patchApp(a.name, p);
+      toast({ title: done, tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (e) {
+      toast({ title: "Not changed", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const save = () =>
+    patch(
+      { project: project.trim() || "default", owners: list(owners), contacts: { ...a.contacts, oncall: oncall.trim() || undefined, channels: list(channels) }, source: source.trim() },
+      `${a.name} is saved`,
+    );
+  const remove = async () => {
+    try {
+      await deployApi.deleteApp(a.name, { everywhere: true, keep });
+      toast({ title: `${a.name} is deleted`, description: a.source ? `Its repository ${a.source} is kept.` : undefined, tone: "succeeded" });
+      invalidate("deploy/");
+      navigate(boardHref);
+    } catch (e) {
+      toast({ title: "Not deleted", description: errorMessage(e), tone: "failed" });
+    }
+  };
+  return (
+    <Panel eyebrow="Settings" title="What it is" description="Owners, who to reach and its source change here; its package and template, by API or kiln app set.">
+      <div className="cd-new-grid">
+        <TextField label="Project" value={project} spellCheck={false} onChange={(e) => setProject(e.target.value)} />
+        <TextField label="Owner teams" value={owners} placeholder="payments, platform" onChange={(e) => setOwners(e.target.value)} />
+        <TextField label="On call" value={oncall} placeholder="ada" onChange={(e) => setOncall(e.target.value)} />
+        <TextField
+          label="Chat channels"
+          value={channels}
+          placeholder="slack:#deploys"
+          onChange={(e) => setChannels(e.target.value)}
+          hint="Where its release messages go: kind:target, a bare #channel being Slack's."
+        />
+        <TextField label="Source repository" value={source} placeholder="acme/web" spellCheck={false} onChange={(e) => setSource(e.target.value)} hint="One kiln has; empty for none." />
+      </div>
+      <div className="rel-settings-actions">
+        <Button size="sm" disabled={busy} onClick={() => void save()}>
+          Save
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void patch({ archived: !a.archived }, a.archived ? `${a.name} takes releases again` : `${a.name} is archived`)}>
+          {a.archived ? "Unarchive" : "Archive"}
+        </Button>
+        <Button size="sm" variant="ghost-danger" disabled={busy} onClick={() => setDeleting(true)}>
+          Delete
+        </Button>
+      </div>
+      <ConfirmDialog
+        open={deleting}
+        onOpenChange={setDeleting}
+        title={`Delete ${a.name}?`}
+        description={
+          <>
+            {registered.length ? `It is deregistered from ${registered.join(", ")} first. ` : ""}
+            Its releases stay in the history{a.source ? `, and its repository ${a.source} is kept` : ""}.
+            {registered.length > 0 && (
+              <label className="rel-keep">
+                <input type="checkbox" className="check" checked={keep} onChange={(e) => setKeep(e.target.checked)} /> Leave what it runs in place
+              </label>
+            )}
+          </>
+        }
+        confirmLabel="Delete the app"
+        danger
+        onConfirm={remove}
+      />
+    </Panel>
+  );
+}
+
+/** How it deploys: its template, and its package (a Helm chart, or a path in git) with the values
+ * each release sets. A change reaches each environment with its next release there. */
+function Deploys({ a }: { a: App }) {
+  const templates = useRes(templatesRes).data;
+  const p = a.package;
+  const [template, setTemplate] = React.useState(a.template ?? "");
+  const [kind, setKind] = React.useState<"helm" | "git">(p.kind === "git" ? "git" : "helm");
+  const [repo, setRepo] = React.useState(p.kind === "platform" ? "" : p.repo);
+  const [chart, setChart] = React.useState(p.kind === "helm" ? p.chart : "");
+  const [chartVersion, setChartVersion] = React.useState(p.kind === "helm" ? (p.chart_version ?? "") : "");
+  const [path, setPath] = React.useState(p.kind === "git" ? p.path : "");
+  const [set, setSet] = React.useState(
+    Object.entries((p.kind === "platform" ? undefined : p.set) ?? {})
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n"),
+  );
+  const [busy, setBusy] = React.useState(false);
+  if (p.kind === "platform") {
+    return (
+      <Panel eyebrow="How it deploys" title={`To ${p.provider}`} description="Its definition changes by API or kiln app set; each environment takes it with its next release.">
+        <p className="rel-quiet">From template {a.template ?? "none"}.</p>
+      </Panel>
+    );
+  }
+  const lines = set
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const wrong = lines.find((l) => !l.includes("=")) ? "Each value is name=value, one a line." : !repo.trim() || (kind === "helm" && !chart.trim()) ? "Its repository, and a chart's name." : null;
+  const save = async () => {
+    const values = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
+    const pkg: AppPatch["package"] =
+      kind === "helm"
+        ? { kind: "helm", repo: repo.trim(), chart: chart.trim(), chart_version: chartVersion.trim() || undefined, set: values }
+        : { kind: "git", repo: repo.trim(), path: path.trim(), set: values };
+    setBusy(true);
+    try {
+      await deployApi.patchApp(a.name, { template, package: pkg });
+      toast({ title: `${a.name} deploys anew`, description: "Each environment takes it with its next release.", tone: "succeeded" });
+      invalidate("deploy/");
+    } catch (e) {
+      toast({ title: "Not changed", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Panel eyebrow="How it deploys" title="Its package" description="A change reaches each environment with its next release there.">
+      <div className="cd-new-grid">
+        <SelectField label="Template" value={template} onChange={setTemplate} options={[{ value: "", label: "None" }, ...templates.map((t) => ({ value: t.name, label: t.name }))]} />
+        <Segmented
+          label="What it deploys"
+          value={kind}
+          onChange={setKind}
+          options={[
+            { value: "helm", label: "A Helm chart" },
+            { value: "git", label: "A path in git" },
+          ]}
+        />
+      </div>
+      <div className="cd-new-grid">
+        <TextField label={kind === "helm" ? "Chart repository" : "Git repository"} value={repo} spellCheck={false} onChange={(e) => setRepo(e.target.value)} />
+        {kind === "helm" ? (
+          <>
+            <TextField label="Chart" value={chart} spellCheck={false} onChange={(e) => setChart(e.target.value)} />
+            <TextField
+              label="Chart version"
+              placeholder="each release's"
+              value={chartVersion}
+              spellCheck={false}
+              onChange={(e) => setChartVersion(e.target.value)}
+              hint="Empty: each release's version."
+            />
+          </>
         ) : (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("pause")}>
-            <Pause /> Pause
-          </Button>
-        )}
-        {reg.enabled ? (
-          <Button size="xs" variant="ghost-danger" disabled={busy || !!d.in_flight} onClick={() => void act("disable")}>
-            Disable
-          </Button>
-        ) : (
-          <Button size="xs" variant="ghost" disabled={busy || !!d.in_flight} onClick={() => void act("enable")}>
-            Enable
-          </Button>
+          <TextField label="Path" value={path} spellCheck={false} onChange={(e) => setPath(e.target.value)} hint="At each release's version." />
         )}
       </div>
-      <ReleaseDialog app={app} env={env} others={others} open={open} onOpenChange={setOpen} />
+      <div className="rel-gap">
+        <label className="field-label" htmlFor={`set-${a.name}`}>
+          Values a release sets
+        </label>
+        <textarea
+          id={`set-${a.name}`}
+          className="rel-textarea"
+          rows={4}
+          spellCheck={false}
+          value={set}
+          onChange={(e) => setSet(e.target.value)}
+          placeholder={"image.tag=${{ release.artifacts.image.tag }}"}
+        />
+      </div>
+      {wrong && <p className="rel-msg">{wrong}</p>}
+      <div className="rel-settings-actions">
+        <Button size="sm" disabled={busy || !!wrong} onClick={() => void save()}>
+          Save
+        </Button>
+      </div>
     </Panel>
   );
 }
@@ -273,7 +506,7 @@ function AppView({ name }: { name: string }) {
   const d = useSuspenseResource(`deploy/app/${name}`, (s) => deployApi.app(name, s), { on: DEPLOY_EVENTS }).data;
   const envs = d.environments.map((e) => e.registration.environment);
   const a = d.app;
-  const pkg = a.package.kind === "helm" ? `${a.package.repo} ${a.package.chart}` : a.package.kind === "git" ? `${a.package.repo} ${a.package.path}` : `${a.package.provider}`;
+  const pkg = packageWords(a.package);
   return (
     <>
       <header className="cd-head">
@@ -282,12 +515,21 @@ function AppView({ name }: { name: string }) {
         <p className="cd-note">
           {a.project}
           {a.owners.length > 0 && ` · owned by ${a.owners.join(", ")}`}
-          {a.template && ` · from ${a.template}`} · <code>{pkg}</code>
+          {a.template && ` · from ${a.template}`}
+          {a.source && (
+            <>
+              {" · source "}
+              <Link to="/repos" className="text-link">
+                {a.source}
+              </Link>
+            </>
+          )}{" "}
+          · <code>{pkg}</code>
           {a.archived && " · archived"}
         </p>
       </header>
       {envs.length === 0 ? (
-        <p className="rel-quiet">It isn't registered in any environment yet: kiln app register {a.name} --env &lt;env&gt;.</p>
+        <p className="rel-quiet">It isn't registered in any environment yet.</p>
       ) : (
         <div className="rel-envs">
           {envs.map((e) => (
@@ -297,12 +539,21 @@ function AppView({ name }: { name: string }) {
           ))}
         </div>
       )}
-      <Loadable label="how it delivers">
-        <Delivery app={a.name} />
-      </Loadable>
-      <Loadable label="its releases">
-        <Latest app={a.name} />
-      </Loadable>
+      <div className="rel-stack">
+        <Loadable label="the environments">
+          <RegisterIn app={a.name} registered={envs} />
+        </Loadable>
+        <Loadable label="how it delivers">
+          <Delivery app={a.name} />
+        </Loadable>
+        <Loadable label="its releases">
+          <Latest app={a.name} />
+        </Loadable>
+        <Settings key={JSON.stringify(a)} a={a} registered={envs} />
+        <Loadable label="its templates">
+          <Deploys key={JSON.stringify(a)} a={a} />
+        </Loadable>
+      </div>
     </>
   );
 }

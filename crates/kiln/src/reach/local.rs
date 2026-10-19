@@ -30,6 +30,10 @@ pub enum Req {
     /// A question for the kiln server (JSON), from an agent's MCP server: kiln's operations,
     /// asked for its session (`crate::mcp::runner_ask`). Answered with [`Ev::Answer`].
     Ask { json: String },
+    /// Something for the machine's preview browser (JSON `{"op": "preview", ...}`, see
+    /// `crate::browser::ask`), from an agent's MCP server. Answered with [`Ev::Answer`]. Appended
+    /// last: postcard encodes variants by index.
+    Browser { json: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -483,6 +487,13 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
         }
         Req::Ask { json } => {
             let ev = match handle.query(json).await {
+                Ok(a) => Ev::Answer(a),
+                Err(e) => Ev::Error(format!("{e:#}")),
+            };
+            let _ = ev_tx.send(ev).await;
+        }
+        Req::Browser { json } => {
+            let ev = match crate::browser::ask(&json).await {
                 Ok(a) => Ev::Answer(a),
                 Err(e) => Ev::Error(format!("{e:#}")),
             };

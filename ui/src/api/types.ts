@@ -33,6 +33,8 @@ export interface Me {
   public_url?: string;
   /** Its runners' front doors (`https://kiln.home`, …). */
   origins?: string[];
+  /** Where pages agents show are served, when not here (docs/previews.md). */
+  pages_url?: string | null;
 }
 
 export interface Repo {
@@ -695,6 +697,39 @@ export interface RunnerUpdate {
 /** How a person has a runner upgraded: a binary of the newest kiln, downloaded; or kiln built on
  * the machine itself, from the server's source. */
 export type UpgradeWay = "download" | "build";
+
+/** What a diagnosis found about a runner (`GET /api/agents/:name/diagnose`, docs/releases.md). */
+export interface RunnerFinding {
+  /** What was checked (`disk.work`, `upgrade.last`, …). */
+  id: string;
+  level: "ok" | "info" | "warn" | "fail";
+  title: string;
+  /** What was seen in more words, or a log's last lines. */
+  detail?: string;
+  /** The repair that fixes it, when kiln can make it (`POST /api/agents/:name/repair`). */
+  fix?: { action: string; label: string; way?: UpgradeWay };
+}
+
+/** A runner diagnosed: what the server knows, and what the machine found about itself. */
+export interface RunnerDiagnosis {
+  runner: string;
+  /** Unix ms. */
+  at: number;
+  worst: RunnerFinding["level"];
+  /** Worst first. */
+  findings: RunnerFinding[];
+  /** The machine looked at itself too (else `why` says why not). */
+  machine_checked: boolean;
+  why: string | null;
+}
+
+/** A repair's outcome: what it did, or the upgrade it started. */
+export interface RunnerRepair {
+  ok: boolean;
+  action: string;
+  message?: string | null;
+  job?: UpdateJob;
+}
 
 export interface UpgradeWayOpen {
   way: UpgradeWay;

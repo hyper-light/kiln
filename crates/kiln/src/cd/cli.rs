@@ -139,6 +139,10 @@ enum CdCmd {
         /// Seconds the new version has to become available.
         #[arg(long, default_value_t = 600)]
         deadline: u64,
+        /// What to watch once it is up, as JSON: `{"window_s": 300, "after": [...], "checks": {...},
+        /// "rollout": {...}}` (none: it ends once the new version is up).
+        #[arg(long)]
+        watch: Option<String>,
         /// From outside the cluster: a kubeconfig context.
         #[arg(long)]
         context: Option<String>,
@@ -313,9 +317,13 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
         println!("{report}");
         return Ok(());
     }
-    if let CdCmd::Guard { namespace, deployment, container, previous, expect, deadline, context, kubeconfig } = args.cmd {
-        let a = super::guard::Args { namespace, deployment, container, previous, expect, deadline: std::time::Duration::from_secs(deadline), context: context.map(|c| (c, kubeconfig)) };
-        return super::guard::run(&a).await;
+    if let CdCmd::Guard { namespace, deployment, container, previous, expect, deadline, watch, context, kubeconfig } = args.cmd {
+        let watch = match watch.as_deref() {
+            Some(w) => serde_json::from_str(w).context("--watch: the guard's watch as JSON")?,
+            None => super::guard::Watch::default(),
+        };
+        let a = super::guard::Args { namespace, deployment, container, previous, expect, deadline: std::time::Duration::from_secs(deadline), watch, context: context.map(|c| (c, kubeconfig)) };
+        return Box::pin(super::guard::run(&a)).await;
     }
     let t = crate::access::resolve(cfg, args.url.as_deref(), args.token.as_deref()).await?;
     let api = Api { client: Client::public()?, url: t.url, token: t.token };
