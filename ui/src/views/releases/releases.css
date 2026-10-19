@@ -52,6 +52,15 @@
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
+.rel-tag-alert {
+  border-color: var(--color-warn);
+  color: var(--color-warn);
+}
+.rel-alert {
+  border-left: 2px solid var(--color-warn);
+  padding-left: 8px;
+  color: var(--color-foreground);
+}
 .rel-answer {
   display: flex;
   flex-wrap: wrap;

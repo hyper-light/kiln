@@ -97,8 +97,10 @@ kiln deploy rollback web --env production    # to the release before (--to <id> 
 kiln deploy fleet --env staging --template service --set replicaCount=2   # many apps at once
 ```
 
-A release that fails (its provider refuses it, or it doesn't land in time) has its commit
-reverted: what ran before runs again.
+A release that fails (its provider refuses it, its sync fails, or it doesn't land in time) is put
+back: a revert release restores what ran before, followed until it runs again. A rollback that
+fails, or a release asked `--no-revert` (a migration that can't run backwards), is held instead,
+and the app's page says it needs a person until the next release lands.
 
 ## 6. People and agents
 

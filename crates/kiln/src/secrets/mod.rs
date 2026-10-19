@@ -183,6 +183,9 @@ pub trait Backend: Send + Sync {
     fn resolve<'a>(&'a self, at: &'a Scope, want: &'a [(String, u32)], why: &'a Use) -> Fut<'a, Bundle>;
     /// The reads recorded, newest first.
     fn reads<'a>(&'a self, at: &'a Scope, limit: usize) -> Fut<'a, Vec<Read>>;
+    /// Which of these versions have no value kept (older than those kept, deleted, never set):
+    /// what a delivery of them would fail on, asked without reading a value.
+    fn missing<'a>(&'a self, at: &'a Scope, want: &'a [(String, u32)]) -> Fut<'a, Vec<(String, u32)>>;
     /// Re-seals what it keeps under new keys: how many values. Nothing to do for some.
     fn rotate(&self) -> Fut<'_, usize>;
     /// Deletes every secret of the scope and destroys their values (their records stay): what
@@ -336,6 +339,11 @@ impl Secrets {
     /// Each secret's current version, for a release to pin: `[(name, version)]`, by name.
     pub async fn current(&self, at: &Scope) -> anyhow::Result<Vec<(String, u32)>> {
         Ok(self.backend.list(at).await?.into_iter().map(|m| (m.name, m.version)).collect())
+    }
+
+    /// Which of the versions a release pins have no value kept: a release's preflight (§8.1).
+    pub async fn missing(&self, at: &Scope, want: &[(String, u32)]) -> anyhow::Result<Vec<(String, u32)>> {
+        self.backend.missing(at, want).await
     }
 
     /// The values of the versions a release pinned, for a delivery: never for a person or an

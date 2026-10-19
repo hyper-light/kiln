@@ -234,6 +234,27 @@ impl Backend for KilnBackend {
         })
     }
 
+    fn missing<'a>(&'a self, at: &'a Scope, want: &'a [(String, u32)]) -> Fut<'a, Vec<(String, u32)>> {
+        let (scope, want) = (at.key(), want.to_vec());
+        Box::pin(async move {
+            self.hub
+                .store
+                .call(move |c| {
+                    let mut out = Vec::new();
+                    for (name, version) in want {
+                        let kept: Option<bool> = c
+                            .query_row("SELECT ciphertext IS NOT NULL FROM secret_versions WHERE scope = ?1 AND name = ?2 AND version = ?3", params![scope, name, version], |r| r.get(0))
+                            .optional()?;
+                        if kept != Some(true) {
+                            out.push((name, version));
+                        }
+                    }
+                    Ok(out)
+                })
+                .await
+        })
+    }
+
     fn rotate(&self) -> Fut<'_, usize> {
         let hub = Arc::clone(&self.hub);
         Box::pin(async move {
@@ -369,6 +390,11 @@ mod tests {
             anyhow::ensure!(texts(&s.resolve(&web, &[("DB_PASSWORD".to_owned(), 3)], &why).await?) == [("DB_PASSWORD".into(), 3, "pw-3".into())]);
             anyhow::ensure!(s.resolve(&web, &[("DB_PASSWORD".to_owned(), 2)], &why).await.is_err_and(|e| e.to_string().contains("no longer kept")));
             anyhow::ensure!(s.resolve(&web, &[("DB_PASSWORD".to_owned(), 99)], &why).await.is_err());
+            // A preflight asks which have no value, reading none.
+            let reads_before = s.reads(&web, 1000, &ada()).await?.len();
+            let pins = [("DB_PASSWORD".to_owned(), 3), ("DB_PASSWORD".to_owned(), 2), ("API_KEY".to_owned(), 1), ("NEVER".to_owned(), 1)];
+            anyhow::ensure!(s.missing(&web, &pins).await? == [("DB_PASSWORD".to_owned(), 2), ("NEVER".to_owned(), 1)]);
+            anyhow::ensure!(s.reads(&web, 1000, &ada()).await?.len() == reads_before, "nothing read");
 
             // Agents look; people change. Names are environment variables'; values aren't empty.
             let agent = Caller { name: "claude".into(), agent: true };

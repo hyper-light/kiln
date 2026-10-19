@@ -427,15 +427,42 @@ deployment, read a push webhook, and create a repository from a template.
 | `automation(app, env, on)` | pause or resume the provider's automation (§5) |
 
 **When a release is done.** The provider reports, on every target of the environment, the release's
-commit, synced and healthy, steady for `watch.settle` (default 30 s). **When it failed**: a sync
-failed after its retries, or it didn't land within `watch.timeout` (health that stays Degraded, pods
-that never start). A provider that can't be reached leaves the release `delivering`, retried with
-backoff until the timeout. **When it was refused**: the provider can't make anything of it (Argo CD
+commit, synced and healthy, steady for `watch.settle` (default 30 s). **When it failed**, on
+evidence rather than on the clock alone: a sync failed after its retries; or it was synced and its
+health stayed Degraded for `watch.degraded` (default 60 s): Kubernetes' progress deadline passed (no
+new pod became ready for `progressDeadlineSeconds`), pods can't start; or it didn't land within
+`watch.timeout`, or within three times that while its provider says it's still progressing (a slow
+rollout isn't a failed one). A provider that can't be reached leaves the release `delivering`,
+retried with backoff until the timeout. **When it was refused**: the provider can't make anything of it (Argo CD
 answers `4xx` to its Application, or reports a `ComparisonError`; KilnCD can't read its sources or
-render them) for `watch.refused` (default 60 s, room for a passing trouble to clear). **However it
-fails**, its commit is reverted and the provider is handed what git says then: what ran before runs
-on (and a provider that couldn't be reached takes it once it answers). A commit kiln didn't make
-(a release of origin `git`) stays: git is its author's.
+render them) for `watch.refused` (default 60 s, room for a passing trouble to clear).
+
+**Before its commit**, each release is checked for what can be known to fail, and refused while
+nothing has changed: its secrets' pinned versions still have their values; every image it runs is
+in its registry (its artifacts, and on KilnCD each container image it renders); and on KilnCD it
+renders as KilnCD will render it (the values it commits given inline) and its cluster takes each
+object in a server-side dry run (invalid fields, an admission policy's no, a quota, a field that
+can't change). What kiln can't ask (a registry or cluster it can't reach, a namespace or a kind
+the sync makes first, a hook) lets it through: the provider has the last word. A rollback refused
+leaves what it rolled back from running, and marks the registration degraded.
+
+**What follows a failure** is decided on what's known, so that kiln never makes things worse:
+
+| What happened | What kiln does |
+| --- | --- |
+| Refused, or it never reached the provider: nothing of it was applied | its commit is reverted (bookkeeping: what ran before runs on) |
+| A deploy, config, secrets, enable or disable release failed after it was applied | **a revert**: its commit reverted as a release of kind `revert`, origin `kiln`, followed like any release until what ran before runs again |
+| A rollback failed | **held**: not reverted, as that would bring back what it rolled back from |
+| A revert failed | **held**: kiln doesn't revert its own way back |
+| One asked with `no_revert` failed (a migration that can't run backwards; a secret rotated after a leak, which a revert would deliver again) | **held** |
+| One that runs a Job on its way in (a Helm `pre-install`/`pre-upgrade`/`post-*` hook, Argo CD's `PreSync`/`Sync`/`PostSync`: a migration) failed, as its preflight found it | **held**: what ran before may not run on what it changed; a hook marked `kiln.dev/reversible: "true"` (kiln-base: `jobs.<name>.reversible`, an expand-then-contract change) doesn't count |
+| A commit kiln didn't make (origin `git`) failed | **held**: git is its author's |
+| The provider took it and can't be asked since | nothing is done blind: it's judged when the provider answers, and **held** past `watch.unreachable` (default 6 h) |
+
+A release **held** fails as it is, and its registration is marked `degraded` (why, on the board and
+the app's page): it needs a person, and nothing is promoted into it by itself until the next release
+that lands there clears it. A rollback refused leaves what it rolled back from running, so it marks
+the registration degraded too. Kiln never retries a release by itself.
 
 ### 8.2 KilnCD
 
@@ -727,8 +754,8 @@ kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's route
 | --- | --- |
 | The commit landed, the record didn't (a crash between them) | `release.json` carries the release number: kiln finds the commit and completes the record |
 | Someone pushed in between | the commit is redone on the new head, keeping their changes |
-| The provider can't be reached | the release stays `delivering`, retried with backoff until its timeout; then it fails and its commit is reverted, which the provider takes once it answers |
-| A release's sync fails, or it doesn't land within `watch.timeout` (Degraded, pods that never start) | it fails, its commit is reverted and the provider handed what ran before |
+| The provider can't be reached | the release stays `delivering`, retried with backoff; one the provider never took fails at its timeout and is reverted; one it took is judged when the provider answers, held past `watch.unreachable` |
+| A release's sync fails, or it doesn't land within `watch.timeout` (Degraded, pods that never start) | it fails, and a revert release puts back what ran before, followed until it runs again; a rollback, a revert, or one asked `no_revert` is held instead and its registration marked degraded (§8.1) |
 | The provider refuses the release (its chart doesn't render, its spec is invalid) | after `watch.refused` the release fails, its commit is reverted and the provider handed what ran before |
 | A version that isn't in its registry | refused before it is recorded (`422`), with the newest versions there |
 | The server restarts mid-release | the watch item's lease lapses and a server takes it again |

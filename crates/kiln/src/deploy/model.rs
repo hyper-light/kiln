@@ -242,12 +242,24 @@ pub struct WatchSettings {
     /// invalid) fails it, and its commit is reverted: a passing trouble gets this long to clear.
     #[serde(default = "a_minute")]
     pub refused_secs: u64,
+    /// A provider that took a release and can't be asked since is waited on this long, the
+    /// release judged when it answers; past it, the release fails held (what it did is unknown).
+    #[serde(default = "six_hours")]
+    pub unreachable_secs: u64,
+    /// A release synced and Degraded this long (Kubernetes' progress deadline passed, pods that
+    /// can't start) has failed: room for a passing trouble to clear.
+    #[serde(default = "a_minute")]
+    pub degraded_secs: u64,
 }
 
 impl Default for WatchSettings {
     fn default() -> Self {
-        Self { timeout_secs: fifteen_minutes(), settle_secs: half_a_minute(), refused_secs: a_minute() }
+        Self { timeout_secs: fifteen_minutes(), settle_secs: half_a_minute(), refused_secs: a_minute(), unreachable_secs: six_hours(), degraded_secs: a_minute() }
     }
+}
+
+fn six_hours() -> u64 {
+    6 * 60 * 60
 }
 
 fn fifteen_minutes() -> u64 {
@@ -449,6 +461,11 @@ pub struct Registration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<i64>,
     pub created_at: i64,
+    /// Why what runs here needs a person (§8.1): a release failed and kiln didn't put back what ran
+    /// before (a rollback, a revert, one asked not to be), or putting it back didn't land. The next
+    /// release that lands clears it; until then nothing is promoted here by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +479,9 @@ pub enum Kind {
     Rollback,
     Enable,
     Disable,
+    /// What ran before a release that failed, put back by kiln (§8.1): the failed one's commit
+    /// reverted, and followed until it lands.
+    Revert,
 }
 
 impl Kind {
@@ -472,6 +492,7 @@ impl Kind {
             Self::Rollback => "rollback",
             Self::Enable => "enable",
             Self::Disable => "disable",
+            Self::Revert => "revert",
         }
     }
 }
@@ -540,6 +561,8 @@ pub enum Origin {
     Api,
     /// A commit kiln didn't make, found on the release repository.
     Git,
+    /// kiln's own: a revert after a release failed.
+    Kiln,
 }
 
 /// An image or other build output a release deploys, pinned by digest where known.
@@ -611,6 +634,20 @@ pub struct Release {
     /// (`DB_PASSWORD v4`), or changes a waiting release took on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<String>,
+    /// Failed, it isn't reverted: it is held for a person (asked so, as for a secret rotated after
+    /// a leak, which a revert would deliver again).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_revert: bool,
+    /// A revert: the release it puts back what ran before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverts: Option<i64>,
+    /// The revert that puts back what ran before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverted_by: Option<i64>,
+    /// What it runs on its way in that a revert couldn't undo (a migration's hook), as its
+    /// preflight found it: failed, it's held rather than reverted (§8.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irreversible: Option<String>,
 }
 
 /// `release.json`: what an environment runs, as kiln commits it (docs/deploy-api.md §6). Argo CD's

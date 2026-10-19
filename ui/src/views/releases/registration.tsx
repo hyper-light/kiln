@@ -348,6 +348,7 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
           )}{" "}
           · {d.running ? <Link to={releaseHref(d.running.id)}>runs {describe(d.running)}</Link> : "nothing released yet"}
         </p>
+        {d.registration.degraded && <p className="rel-msg rel-alert">Needs a person: {d.registration.degraded}. The next release that lands clears this.</p>}
       </header>
       <Segmented
         className="rel-tabs"

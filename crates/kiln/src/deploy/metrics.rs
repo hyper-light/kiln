@@ -131,6 +131,10 @@ mod tests {
             committed_at: None,
             ended_at: ended,
             secrets: None,
+            no_revert: false,
+            reverts: None,
+            reverted_by: None,
+            irreversible: None,
         }
     }
 

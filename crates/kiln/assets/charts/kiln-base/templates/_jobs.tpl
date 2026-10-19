@@ -46,6 +46,10 @@ metadata:
     helm.sh/hook: {{ default "pre-install,pre-upgrade" $j.hook | quote }}
     helm.sh/hook-weight: {{ default 0 $j.weight | quote }}
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    {{- if $j.reversible }}
+    {{- /* What it changes, what ran before also runs on: a release that fails may be reverted. */}}
+    kiln.dev/reversible: "true"
+    {{- end }}
 spec:
   backoffLimit: {{ default 1 $j.backoffLimit }}
   {{- with $j.activeDeadlineSeconds }}

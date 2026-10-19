@@ -61,7 +61,12 @@ tolerations: []
 affinity: {}
 # Spread its pods across nodes (as far as the scheduler can).
 topologySpread: true
+# How a new version replaces the old. Empty: kiln's default, RollingUpdate with maxUnavailable 0 (no
+# old pod goes before a new one is ready, so a version that can't start costs no capacity).
 strategy: {}
+# How long a rollout may go without a new pod becoming ready before Kubernetes calls it stuck
+# (Degraded): kiln fails the release on it and puts back what ran before (docs/deploy-api.md §8.1).
+progressDeadlineSeconds: 300
 
 service:
   enabled: true
@@ -114,7 +119,10 @@ persistence: []
 
 # name: {schedule: "*/15 * * * *", command: [...], args: [...]}
 cronJobs: {}
-# A migration before each release: migrate: {command: [...], hook: "pre-install,pre-upgrade"}
+# A migration before each release: migrate: {command: [...], hook: "pre-install,pre-upgrade"}.
+# A release that runs one isn't reverted if it fails (what ran before may not run on what it
+# changed): it's held for a person. `reversible: true` says what ran before runs on it too (expand
+# now, contract in a later release), and a failed release is reverted as any other.
 jobs: {}
 
 networkPolicy:

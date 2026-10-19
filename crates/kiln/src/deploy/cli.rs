@@ -64,6 +64,9 @@ pub struct DeployArgs {
     /// (after `kiln app secret set --no-release`).
     #[arg(long, conflicts_with_all = ["version", "values", "from"])]
     secrets: bool,
+    /// Failed, it isn't reverted: it's held for a person (a migration that can't run backwards).
+    #[arg(long)]
+    no_revert: bool,
     /// Return once the release is asked for, without following it.
     #[arg(long)]
     no_wait: bool,
@@ -343,6 +346,10 @@ enum SecretCmd {
         /// release) delivers it.
         #[arg(long)]
         no_release: bool,
+        /// If the release delivering it fails, hold it rather than revert it: for a secret rotated
+        /// after a leak, which a revert would deliver again.
+        #[arg(long)]
+        no_revert: bool,
     },
     /// Set each `NAME=value` of a dotenv file, released together.
     Import {
@@ -352,6 +359,8 @@ enum SecretCmd {
         env: String,
         #[arg(long)]
         no_release: bool,
+        #[arg(long)]
+        no_revert: bool,
     },
     /// An app's secrets in an environment: each one's version, size, who set it and when.
     List {
@@ -367,6 +376,8 @@ enum SecretCmd {
         env: String,
         #[arg(long)]
         no_release: bool,
+        #[arg(long)]
+        no_revert: bool,
     },
     /// A secret's versions, newest first: who set each and when, and whether its value is kept.
     Versions {
@@ -527,7 +538,7 @@ async fn secret(api: &Api, cmd: SecretCmd) -> Result<()> {
     let at = |app: &str, env: &str| format!("/apps/{}/environments/{}", enc(app), enc(env));
     let when = |v: &Value, k: &str| crate::ci::cli::when(v.get(k).and_then(Value::as_i64));
     match cmd {
-        SecretCmd::Set { app, name, env, from_file, no_release } => {
+        SecretCmd::Set { app, name, env, from_file, no_release, no_revert } => {
             let body = match from_file {
                 Some(p) => match String::from_utf8(std::fs::read(&p).with_context(|| format!("read {}", p.display()))?) {
                     Ok(text) => json!({ "value": text }),
@@ -538,17 +549,17 @@ async fn secret(api: &Api, cmd: SecretCmd) -> Result<()> {
                 },
                 None => json!({ "value": secret_from_stdin(&name)? }),
             };
-            let v = api.call(Method::Put, &format!("{}/secrets/{}{}", at(&app, &env), enc(&name), held(no_release)), Some(body)).await?;
+            let v = api.call(Method::Put, &format!("{}/secrets/{}{}", at(&app, &env), enc(&name), held(no_release, no_revert)), Some(body)).await?;
             api.print(&v, |v| println!("{name} set for {app} in {env}: version {}; {}", v.get("version").and_then(Value::as_u64).unwrap_or(0), s(v, "next")));
         }
-        SecretCmd::Import { app, file, env, no_release } => {
+        SecretCmd::Import { app, file, env, no_release, no_revert } => {
             let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
             let pairs = crate::ci::cli::dotenv(&text);
             // Released once, with the last.
             let mut last = Value::Null;
             for (n, (name, value)) in pairs.iter().enumerate() {
                 let hold = no_release || n + 1 < pairs.len();
-                last = api.call(Method::Put, &format!("{}/secrets/{}{}", at(&app, &env), enc(name), held(hold)), Some(json!({ "value": value }))).await.with_context(|| name.clone())?;
+                last = api.call(Method::Put, &format!("{}/secrets/{}{}", at(&app, &env), enc(name), held(hold, no_revert)), Some(json!({ "value": value }))).await.with_context(|| name.clone())?;
             }
             if !api.json {
                 println!("{} secrets set for {app} in {env}; {}", pairs.len(), s(&last, "next"));
@@ -567,8 +578,8 @@ async fn secret(api: &Api, cmd: SecretCmd) -> Result<()> {
                 }
             });
         }
-        SecretCmd::Rm { app, name, env, no_release } => {
-            let v = api.call(Method::Delete, &format!("{}/secrets/{}{}", at(&app, &env), enc(&name), held(no_release)), None).await?;
+        SecretCmd::Rm { app, name, env, no_release, no_revert } => {
+            let v = api.call(Method::Delete, &format!("{}/secrets/{}{}", at(&app, &env), enc(&name), held(no_release, no_revert)), None).await?;
             api.print(&v, |v| println!("{name} deleted for {app} in {env}; {}", s(v, "next")));
         }
         SecretCmd::Versions { app, name, env } => {
@@ -608,8 +619,15 @@ async fn secret(api: &Api, cmd: SecretCmd) -> Result<()> {
 }
 
 /// The query that keeps a secret's change from being released.
-fn held(hold: bool) -> &'static str {
-    if hold { "?release=false" } else { "" }
+/// The query a secret's change goes with: `release=false` keeps it for a later release,
+/// `revert=false` holds that release if it fails rather than delivering the old value again.
+fn held(hold: bool, no_revert: bool) -> String {
+    match (hold, no_revert) {
+        (false, false) => String::new(),
+        (true, false) => "?release=false".into(),
+        (false, true) => "?revert=false".into(),
+        (true, true) => "?release=false&revert=false".into(),
+    }
 }
 
 /// A secret's value from stdin: asked for, unechoed, at a terminal; otherwise read to its end, one
@@ -668,6 +686,7 @@ fn what(r: &Value) -> String {
         "deploy" => format!("deploy {}", s(r, "version")),
         "rollback" => format!("rollback to {}{}", s(r, "version"), r.get("rollback_of").and_then(Value::as_i64).map(|t| format!(" (release {t})")).unwrap_or_default()),
         "config" if r.get("values").is_none_or(Value::is_null) && !s(r, "secrets").is_empty() => format!("secrets: {}", s(r, "secrets")),
+        "revert" => format!("revert of release {}", r.get("reverts").and_then(Value::as_i64).unwrap_or(0)),
         k => k.to_owned(),
     };
     // A release that took on secrets' changes while it waited says so.
@@ -726,6 +745,9 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             api.print(&v, |v| {
                 let running = v.get("running").filter(|r| !r.is_null());
                 println!("{app} in {env}: {}", running.map_or_else(|| "nothing released yet".to_owned(), |r| format!("release {} ({})", r.get("id").and_then(Value::as_i64).unwrap_or(0), what(r))));
+                if let Some(why) = v.pointer("/registration/degraded").and_then(Value::as_str) {
+                    println!("needs a person: {why}");
+                }
                 if let Some(f) = v.get("in_flight").filter(|r| !r.is_null()) {
                     println!("in flight: {}", line(f));
                 }
@@ -905,7 +927,7 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
                 if args.version.is_some() || args.values.is_some() {
                     bail!("--from promotes what another environment runs: no version or --values with it");
                 }
-                let ask = json!({ "app": app, "environment": env, "promote_from": from });
+                let ask = json!({ "app": app, "environment": env, "promote_from": from, "no_revert": args.no_revert });
                 let r = api.call(Method::Post, "/releases", Some(ask)).await?;
                 if args.no_wait {
                     api.print(&r, |r| println!("{}", line(r)));
@@ -917,7 +939,7 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
                 return Ok(());
             }
             if args.secrets {
-                let ask = json!({ "app": app, "environment": env, "secrets": "" });
+                let ask = json!({ "app": app, "environment": env, "secrets": "", "no_revert": args.no_revert });
                 let r = api.call(Method::Post, "/releases", Some(ask)).await?;
                 if args.no_wait {
                     api.print(&r, |r| println!("{}", line(r)));
@@ -935,11 +957,11 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
                         let (name, spec) = artifact(a)?;
                         arts.insert(name, spec);
                     }
-                    json!({ "app": app, "environment": env, "version": v, "artifacts": arts })
+                    json!({ "app": app, "environment": env, "version": v, "artifacts": arts, "no_revert": args.no_revert })
                 }
                 (None, Some(path)) => {
                     let values = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-                    json!({ "app": app, "environment": env, "values": values })
+                    json!({ "app": app, "environment": env, "values": values, "no_revert": args.no_revert })
                 }
                 (Some(_), Some(_)) => bail!("a version or --values, not both: deploy the version first, then change its values"),
                 (None, None) => bail!("what to release? a version (kiln deploy <app> <version> --to <env>), --values <file>, or --secrets"),

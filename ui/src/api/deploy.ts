@@ -7,7 +7,7 @@ import { request } from "./client";
 import type { CdDiff, CdResourceKey } from "./types";
 
 export type ReleaseState = "waiting" | "waiting_approval" | "committing" | "delivering" | "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded";
-export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable";
+export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable" | "revert";
 
 export interface Artifact {
   repository: string;
@@ -37,7 +37,7 @@ export interface Release {
   environment: string;
   kind: ReleaseKind;
   state: ReleaseState;
-  origin: "api" | "git";
+  origin: "api" | "git" | "kiln";
   version?: string;
   artifacts?: Record<string, Artifact>;
   values?: string;
@@ -56,6 +56,14 @@ export interface Release {
   ended_at?: number;
   /** Secrets' changes it delivers (docs/deploy-api.md §3.5): a secrets release's reason (`DB_PASSWORD v4`), or ones it took on while it waited. */
   secrets?: string | null;
+  /** Failed after its commit, it isn't reverted: it's held for a person (§8.1). */
+  no_revert?: boolean;
+  /** A revert: the release it puts back what ran before. */
+  reverts?: number | null;
+  /** The revert that puts back what ran before it. */
+  reverted_by?: number | null;
+  /** What it runs on its way in that a revert couldn't undo (a migration's hook): failed, it's held rather than reverted. */
+  irreversible?: string | null;
 }
 
 export interface Registration {
@@ -65,6 +73,8 @@ export interface Registration {
   paused: boolean;
   running?: number;
   created_at: number;
+  /** Why what runs here needs a person (docs/deploy-api.md §8.1): a release failed and wasn't put back, or putting it back didn't land. The next release that lands clears it. */
+  degraded?: string | null;
 }
 
 export interface Gates {
@@ -366,6 +376,8 @@ export function describe(r: Release): string {
       return r.promoted_from ? `promote ${r.version ?? ""} (from release ${r.promoted_from})` : `deploy ${r.version ?? ""}`;
     case "rollback":
       return `rollback to ${r.version ?? ""}${r.rollback_of ? ` (release ${r.rollback_of})` : ""}`;
+    case "revert":
+      return `revert of release ${r.reverts ?? ""}`;
     case "config":
       return r.secrets && !r.values ? `secrets: ${r.secrets}` : r.secrets ? `config (and secrets: ${r.secrets})` : "config";
     default:

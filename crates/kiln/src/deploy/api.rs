@@ -211,12 +211,12 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         (&Method::GET, ["apps", app, "environments", env, "secrets"]) => ok(&boxed(|| secrets_list(&d, &who, app, env)).await?),
         (&Method::PUT, ["apps", app, "environments", env, "secrets", name]) => {
             let value = secret_value(req.into_body()).await?;
-            let release = q.get("release").is_none_or(|v| v != "false" && v != "0");
-            ok(&boxed(|| secret_put(&d, &who, app, env, name, value, release)).await?)
+            let how = Change::of(q);
+            ok(&boxed(|| secret_put(&d, &who, app, env, name, value, how)).await?)
         }
         (&Method::DELETE, ["apps", app, "environments", env, "secrets", name]) => {
-            let release = q.get("release").is_none_or(|v| v != "false" && v != "0");
-            ok(&boxed(|| secret_delete(&d, &who, app, env, name, release)).await?)
+            let how = Change::of(q);
+            ok(&boxed(|| secret_delete(&d, &who, app, env, name, how)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "secrets", name, "versions"]) => ok(&boxed(|| secret_versions(&d, &who, app, env, name)).await?),
         (&Method::POST, ["secret-keys", "rotate"]) => {
@@ -422,10 +422,10 @@ pub(super) async fn secrets_list(d: &Deploy, who: &Who, app: &str, env: &str) ->
 
 /// Sets a secret's next version, and releases it unless `release` is false: the version, and the
 /// release that delivers it (made, or joined) with what happens next.
-async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, release: bool) -> Result<Value, Fail> {
+async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, how: Change) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let meta = secrets::of(&d.hub).put(&at, name, value, &caller(who)).await.map_err(refused)?;
-    let (release, next) = released(d, who, app, env, format!("{name} v{}", meta.version), release).await;
+    let (release, next) = released(d, who, app, env, format!("{name} v{}", meta.version), how).await;
     let mut v = serde_json::to_value(&meta).map_err(|e| internal(e.into()))?;
     if let Some(o) = v.as_object_mut() {
         o.insert("release".into(), json!(release));
@@ -434,20 +434,36 @@ async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, val
     Ok(v)
 }
 
-async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, release: bool) -> Result<Value, Fail> {
+async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, how: Change) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     secrets::of(&d.hub).delete(&at, name, &caller(who)).await.map_err(refused)?;
-    let (release, next) = released(d, who, app, env, format!("{name} deleted"), release).await;
+    let (release, next) = released(d, who, app, env, format!("{name} deleted"), how).await;
     Ok(json!({ "name": name, "deleted": true, "release": release, "next": next }))
 }
 
 /// A secret's change on its way to what runs (§3.5): a secrets release, when something runs there
 /// on KilnCD to take it; a release still waiting takes it instead, as it commits (and says so, for
 /// whoever approves it). The release, and what happens next in words.
-async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, release: bool) -> (Option<Release>, String) {
+/// How a secret's change goes out: `?release=false` keeps it for a later release, `?revert=false`
+/// asks that the release delivering it isn't reverted if it fails (a rotation after a leak: a
+/// revert would deliver the old value again).
+#[derive(Debug, Clone, Copy)]
+struct Change {
+    release: bool,
+    revert: bool,
+}
+
+impl Change {
+    fn of(q: &HashMap<String, String>) -> Change {
+        let yes = |k: &str| q.get(k).is_none_or(|v| v != "false" && v != "0");
+        Change { release: yes("release"), revert: yes("revert") }
+    }
+}
+
+async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how: Change) -> (Option<Release>, String) {
     let st = &d.hub.store;
     let later = format!("release it with `kiln deploy {app} --to {env} --secrets`");
-    if !release {
+    if !how.release {
         return (None, format!("not released: {later}"));
     }
     match store::environment(st, env).await {
@@ -465,13 +481,15 @@ async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, rel
     {
         let was = r.state;
         r.secrets = Some(r.secrets.take().map_or_else(|| what.clone(), |s| format!("{s}, {what}")));
+        // A change that mustn't come back makes the release delivering it one not reverted.
+        r.no_revert |= !how.revert;
         if store::update_release(st, &r, was).await.unwrap_or(false) {
             flow::emit_release(d, &r);
             let id = r.id;
             return (Some(r), format!("release {id}, waiting, delivers it as it goes"));
         }
     }
-    let ask = Ask { app: app.to_owned(), environment: env.to_owned(), secrets: Some(what), ..Ask::default() };
+    let ask = Ask { app: app.to_owned(), environment: env.to_owned(), secrets: Some(what), no_revert: !how.revert, ..Ask::default() };
     match flow::release(d, who, ask).await {
         Ok(r) => {
             let id = r.id;
@@ -515,7 +533,7 @@ mod tests {
     /// Sets a secret as a person would over the API: what the answer says.
     async fn set(d: &Deploy, env: &str, name: &str, release: bool) -> anyhow::Result<Value> {
         let ada = Who { name: "ada".into(), agent: false };
-        secret_put(d, &ada, "web", env, name, secrets::Value::new(b"value".to_vec()), release).await.map_err(|(code, m)| anyhow::anyhow!("{code}: {m}"))
+        secret_put(d, &ada, "web", env, name, secrets::Value::new(b"value".to_vec()), Change { release, revert: true }).await.map_err(|(code, m)| anyhow::anyhow!("{code}: {m}"))
     }
 
     fn next(v: &Value) -> &str {
@@ -551,7 +569,7 @@ mod tests {
             anyhow::ensure!(v.get("version") == Some(&json!(1)) && v.get("release") == Some(&Value::Null) && next(&v).contains("first release"), "{v}");
 
             // Something runs: a secrets release, through the environment's gates.
-            store::put_registration(st, &Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: Some(1), created_at: 0 }).await?;
+            store::put_registration(st, &Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: Some(1), created_at: 0, degraded: None }).await?;
             let v = set(&d, "staging", "DB_PASSWORD", true).await?;
             let r: Release = serde_json::from_value(v.get("release").cloned().unwrap_or_default())?;
             anyhow::ensure!(r.kind == Kind::Config && r.values.is_none() && r.secrets.as_deref() == Some("DB_PASSWORD v2") && r.state == State::Committing, "{r:?}");

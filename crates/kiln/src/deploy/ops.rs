@@ -311,7 +311,8 @@ pub fn ops() -> &'static [Op] {
                     "enabled": {"type": "boolean", "description": "Run the app here again (true), or stop running it (false)."},
                     "promote_from": {"type": "string", "description": "A promotion: exactly what this environment runs, the same version and artifacts."},
                     "keep": {"type": "boolean", "description": "With enabled false: leave what it runs in place."},
-                    "idempotency_key": {"type": "string", "description": KEY}
+                    "idempotency_key": {"type": "string", "description": KEY},
+                    "no_revert": {"type": "boolean", "description": "Failed after its commit, it isn't reverted: it's held for a person (a migration that can't run backwards). By default a failed release is reverted and what ran before runs again."}
                 }), &["app", "environment"]),
                 route: |_| Ok((Method::POST, path(&["releases"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {

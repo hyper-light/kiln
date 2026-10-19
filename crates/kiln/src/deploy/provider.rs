@@ -10,6 +10,10 @@ pub enum Landed {
     No,
     /// Its sync failed: why.
     Failed(String),
+    /// Synced from the release's commit, and its health is Degraded: why, as the provider says it
+    /// (Kubernetes' progress deadline passed, pods that can't start). Evidence it doesn't run, not
+    /// a guess from the time it takes.
+    Degraded(String),
     /// The provider can't make anything of it (its package doesn't render, or its spec was
     /// refused): why. What ran before runs on.
     Refused(String),

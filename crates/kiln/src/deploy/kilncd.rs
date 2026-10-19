@@ -48,6 +48,21 @@ pub async fn git_chart(cd: &Arc<Cd>, package: &Package, version: &str) -> bool {
     })
 }
 
+/// Makes sure KilnCD's mirror of `repo` holds `commit`, fetching once if it doesn't: a render of
+/// it reads it.
+pub async fn fetched(cd: &Arc<Cd>, repo: &str, commit: &str) -> anyhow::Result<()> {
+    let (dir, auth, url, commit) = (cd.mirror_dir(repo), cd.git_auth(repo), repo.to_owned(), commit.to_owned());
+    crate::rt::blocking(move || -> anyhow::Result<()> {
+        let m = kiln_cd::git::Mirror::open(&dir, &url, auth)?;
+        if !m.has(&commit) {
+            m.fetch()?;
+        }
+        Ok(())
+    })
+    .await
+    .and_then(|r| r)
+}
+
 /// The definition KilnCD deploys a release from. `chart`: a git package is a Helm chart (see
 /// [`git_chart`]).
 pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, commit: &str, release_url: &str, chart: bool) -> Result<AppDef, String> {
@@ -205,16 +220,37 @@ pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value)
         "last_sync": ran.as_ref().map(|h| json!({ "succeeded": h.succeeded, "message": h.message, "at_ms": h.at_ms, "id": h.id })),
     });
     let settled = s("sync") == "Synced" && s("health") == "Healthy";
+    let degraded = (s("health") == "Degraded").then(|| Some(s("message")).filter(|m| !m.is_empty()).unwrap_or_else(|| "KilnCD says its health is Degraded".to_owned()));
     let syncing = status.pointer("/operation/phase").and_then(Value::as_str).is_some_and(|p| matches!(p, "DryRun" | "Running" | "Failing" | "Terminating"));
-    let landed = match (ran, refused) {
-        (Some(h), _) if !h.succeeded => Landed::Failed(if h.message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { h.message }),
-        (Some(_), _) if settled => Landed::Yes,
+    let ran = ran.map(|h| (h.succeeded, h.message));
+    (verdict(ran, refused, Seen { at_commit, settled, syncing }, degraded), view)
+}
+
+/// Where KilnCD's app stands, for [`verdict`].
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    /// KilnCD read the release's commit.
+    at_commit: bool,
+    /// Synced and healthy.
+    settled: bool,
+    /// A sync is running.
+    syncing: bool,
+}
+
+/// What KilnCD's state says of a release: its sync since it began (whether it succeeded, its
+/// message), why its sources don't read or render, where the app stands, and why it's Degraded.
+fn verdict(ran: Option<(bool, String)>, refused: Option<String>, seen: Seen, degraded: Option<String>) -> Landed {
+    match (ran, refused) {
+        (Some((false, message)), _) => Landed::Failed(if message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { message }),
+        (Some(_), _) if seen.settled => Landed::Yes,
+        // Synced from this commit, and Degraded: what the release runs doesn't.
+        (Some(_), _) if !seen.syncing && degraded.is_some() => Landed::Degraded(degraded.unwrap_or_default()),
         (None, Some(why)) => Landed::Refused(why),
         // Nothing to sync: KilnCD read the release's commit, and what it renders runs already.
-        (None, None) if at_commit && settled && !syncing => Landed::Yes,
+        (None, None) if seen.at_commit && seen.settled && !seen.syncing => Landed::Yes,
+        (None, None) if seen.at_commit && !seen.syncing && degraded.is_some() => Landed::Degraded(degraded.unwrap_or_default()),
         _ => Landed::No,
-    };
-    (landed, view)
+    }
 }
 
 #[cfg(test)]
@@ -273,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_release_becomes_a_definition_pinned_to_its_commit() -> Result<(), String> {
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
         let def = definition(&app(), &env(), &reg, &file(), "abc123", "file:///data/releases.git", false)?;
         assert_eq!(def.id(), "shop/web-staging");
         assert_eq!((def.destination.cluster.as_str(), def.destination.namespace.as_str()), ("dev", "shop-web"));
@@ -297,8 +333,23 @@ mod tests {
     }
 
     #[test]
+    fn a_release_lands_synced_and_healthy_and_fails_on_evidence() {
+        let seen = |at_commit, settled, syncing| Seen { at_commit, settled, syncing };
+        let degraded = || Some("Deployment \"web\" exceeded its progress deadline".to_owned());
+        assert_eq!(verdict(Some((true, String::new())), None, seen(true, true, false), None), Landed::Yes);
+        assert!(matches!(verdict(Some((false, "apply failed".into())), None, seen(true, false, false), None), Landed::Failed(m) if m == "apply failed"));
+        assert!(matches!(verdict(Some((true, String::new())), None, seen(true, false, false), degraded()), Landed::Degraded(m) if m.contains("progress deadline")));
+        assert_eq!(verdict(Some((true, String::new())), None, seen(true, false, true), degraded()), Landed::No, "a sync still running decides nothing yet");
+        assert_eq!(verdict(Some((true, String::new())), None, seen(true, false, false), None), Landed::No, "progressing");
+        assert!(matches!(verdict(None, Some("render failed".into()), seen(false, false, false), None), Landed::Refused(_)));
+        assert_eq!(verdict(None, None, seen(true, true, false), None), Landed::Yes, "nothing to sync: it runs already");
+        assert!(matches!(verdict(None, None, seen(true, false, false), degraded()), Landed::Degraded(_)));
+        assert_eq!(verdict(None, None, seen(false, false, false), degraded()), Landed::No, "what's Degraded isn't this release's yet");
+    }
+
+    #[test]
     fn a_git_chart_renders_as_the_app_with_the_environments_values() -> Result<(), String> {
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
         let git = App { package: Package::Git { repo: "file:///repos/web.git".into(), path: "charts/web".into(), set: BTreeMap::new() }, ..app() };
         let f = ReleaseFile { package: git.package.clone(), ..file() };
         let auto = definition(&git, &env(), &reg, &f, "abc", "file:///x", false)?;
@@ -327,7 +378,7 @@ mod tests {
         let a = App { package: lambda, ..app() };
         let mut e = env();
         e.targets.platforms.insert("aws-lambda".into(), serde_json::from_value(json!({ "account": "aws-prod", "region": "us-east-1" })).map_err(|e| e.to_string())?);
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
         let f = ReleaseFile { package: a.package.clone(), ..file() };
         let def = definition(&a, &e, &reg, &f, "abc123", "file:///data/hosted/kiln/releases.git", false)?;
         assert_eq!(def.destination.cluster, "aws-lambda/aws-prod/us-east-1", "the target is the engine's cluster");
@@ -350,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_release_without_a_version_has_nothing_to_deploy() {
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
         let unversioned = ReleaseFile { version: None, ..file() };
         assert!(definition(&app(), &env(), &reg, &unversioned, "abc", "file:///x", false).is_err());
     }

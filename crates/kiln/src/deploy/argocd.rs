@@ -344,6 +344,9 @@ pub fn landed(app: &Value, release: i64, version: &str) -> (Landed, Value) {
         Landed::Failed(op.get("message").and_then(Value::as_str).filter(|m| !m.is_empty()).map_or_else(|| format!("Argo CD's sync {}", phase.to_lowercase()), str::to_owned))
     } else if ours && s("/status/sync/status") == "Synced" && s("/status/health/status") == "Healthy" && !matches!(phase.as_str(), "Running" | "Terminating") {
         Landed::Yes
+    } else if ours && op_ours && phase == "Succeeded" && s("/status/health/status") == "Degraded" {
+        // Synced from this release, and Degraded: what it runs doesn't.
+        Landed::Degraded(Some(s("/status/health/message")).filter(|m| !m.is_empty()).unwrap_or_else(|| "Argo CD says its health is Degraded".to_owned()))
     } else if let Some(why) = refused {
         Landed::Refused(why)
     } else {
@@ -414,7 +417,7 @@ mod tests {
     }
 
     fn reg() -> Registration {
-        Registration { app: "web".into(), environment: "production".into(), enabled: true, paused: false, running: None, created_at: 0 }
+        Registration { app: "web".into(), environment: "production".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None }
     }
 
     #[test]
@@ -460,6 +463,9 @@ mod tests {
         assert_eq!(landed(&argo_app("Synced", "Progressing", "42", "Succeeded"), 42, "1.4.2").0, Landed::No, "not healthy yet");
         assert!(matches!(landed(&argo_app("OutOfSync", "Degraded", "42", "Failed"), 42, "1.4.2").0, Landed::Failed(m) if m.contains("failed to apply")));
         assert_eq!(landed(&argo_app("OutOfSync", "Degraded", "41", "Failed"), 42, "1.4.2").0, Landed::No, "an earlier release's failure isn't this one's");
+        // Synced from this release and Degraded: evidence it doesn't run.
+        assert!(matches!(landed(&argo_app("Synced", "Degraded", "42", "Succeeded"), 42, "1.4.2").0, Landed::Degraded(_)));
+        assert_eq!(landed(&argo_app("Synced", "Degraded", "41", "Succeeded"), 42, "1.4.2").0, Landed::No, "the release before's health isn't this one's");
     }
 
     #[test]
