@@ -71,6 +71,10 @@ pub enum Msg {
     LogSources { sources: Vec<(String, super::collect::Source)> },
     /// Server → runner: the log pipelines every node applies (`super::pipeline`), in order.
     Pipelines { pipelines: Vec<super::pipeline::PipelineDef> },
+    /// Server → runner: the synthetic tests this machine runs (`super::synthetics`), as scrape
+    /// targets; and one of them to run now.
+    Synthetics { tests: Vec<(String, super::synthetics::Test)> },
+    RunSynthetic { name: String },
 }
 
 /// What a write came to, as its sender needs it.
@@ -135,6 +139,8 @@ pub struct Status {
     pub scrapes: Vec<(String, super::scrape::State)>,
     /// How each log source it reads goes.
     pub collect: Vec<(String, super::collect::State)>,
+    /// How each synthetic test it runs goes.
+    pub synthetics: Vec<(String, super::synthetics::State)>,
 }
 
 pub fn encode(msg: &Msg) -> String {

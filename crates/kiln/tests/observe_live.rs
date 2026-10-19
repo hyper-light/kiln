@@ -1631,6 +1631,21 @@ fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
     for name in ["hook", "og", "mail"] {
         check("DELETE", &format!("{base}/integrations/{name}"), &ipath, None, 204)?;
     }
+    // A synthetic test of the server's own: kept, tried, run, listed with its state, removed.
+    let spath = format!("{base}/synthetics/{{name}}");
+    let syn = json!({ "type": "http", "url": "http://127.0.0.1:9/health", "every_s": 3600, "timeout_s": 2, "assertions": [{ "type": "status_code", "operator": "is", "target": 200 }], "alert": { "message": "x", "min_locations": 1 } });
+    check("PUT", &format!("{base}/synthetics/probe"), &spath, Some(syn.clone()), 204)?;
+    check("PUT", &format!("{base}/synthetics/bad"), &spath, Some(json!({ "type": "tcp", "host": "", "port": 1 })), 400)?;
+    check("POST", &format!("{base}/synthetics/probe/test"), &format!("{base}/synthetics/{{name}}/test"), Some(syn), 200)?;
+    check("POST", &format!("{base}/synthetics/probe/run"), &format!("{base}/synthetics/{{name}}/run"), None, 202)?;
+    let start = Instant::now();
+    while !f.call("GET", "/api/observe/v1/synthetics", None)?.to_string().contains("\"runs\":1") {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(20), "the probe never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    check("GET", &format!("{base}/synthetics"), &format!("{base}/synthetics"), None, 200)?;
+    check("DELETE", &format!("{base}/synthetics/probe"), &spath, None, 204)?;
+    check("DELETE", &format!("{base}/synthetics/probe"), &spath, None, 404)?;
     check("PUT", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), Some(json!({ "url": "http://127.0.0.1:9/metrics", "every_s": 60 })), 204)?;
     check("GET", &format!("{base}/scrapes"), &format!("{base}/scrapes"), None, 200)?;
     check("DELETE", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), None, 204)?;

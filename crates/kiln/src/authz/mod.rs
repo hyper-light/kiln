@@ -410,6 +410,8 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/integrations/**", "observe.manage", At::Server),
     any("/api/observe/v1/clouds/**", "observe.manage", At::Server),
     any("/api/observe/v1/scrapes/**", "observe.manage", At::Server),
+    // Synthetic tests reach endpoints from the machines, as scrapes do.
+    any("/api/observe/v1/synthetics/**", "observe.manage", At::Server),
     any("/api/observe/v1/log_sources/**", "observe.manage", At::Server),
     // Pipelines change every record stored from then on: a maintainer's; trying one, a reader's.
     r("POST", "/api/observe/v1/pipeline_test", "observe.read", At::Server),

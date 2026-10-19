@@ -81,6 +81,28 @@ fn scrapes() -> Result<&'static std::sync::Arc<super::scrape::Targets>, Fail> {
     SCRAPES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "scrape targets are kept by the server"))
 }
 
+/// The server's synthetic tests, once it started.
+static SYNTHETICS: OnceLock<std::sync::Arc<super::synthetics::Tests>> = OnceLock::new();
+
+pub fn set_synthetics(t: std::sync::Arc<super::synthetics::Tests>) {
+    let _ = SYNTHETICS.set(t);
+}
+
+fn synthetics() -> Result<&'static std::sync::Arc<super::synthetics::Tests>, Fail> {
+    SYNTHETICS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "synthetic tests are kept by the server"))
+}
+
+/// The tests now, applied: the server's own run from now, each runner told its own.
+fn apply_synthetics(t: &super::synthetics::Tests) {
+    let all = t.list();
+    if let Some(r) = super::synthetics::runner() {
+        r.set(&all);
+    }
+    if let Some(o) = get() {
+        o.set_synthetics(all);
+    }
+}
+
 /// The server's log sources, once it started.
 static LOG_SOURCES: OnceLock<std::sync::Arc<super::collect::Sources>> = OnceLock::new();
 
@@ -659,6 +681,102 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 Err(e) => json!({ "ok": false, "error": format!("{e:#}"), "took_ms": t0.elapsed().as_millis() as u64 }),
             };
             Ok(srv::json(StatusCode::OK, &answer))
+        }
+        (&Method::GET, ["synthetics"]) => {
+            // Each test, and how each location goes: the server's own here, a runner's from its
+            // last status.
+            let mut by_test: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+            for (name, st) in super::synthetics::runner().map(|r| r.states()).unwrap_or_default() {
+                by_test.entry(name).or_default().push(json!({ "machine": super::synthetics::SERVER, "state": st }));
+            }
+            if let Some(o) = get() {
+                for m in o.view().machines {
+                    for (name, st) in m.status.map(|s| s.synthetics).unwrap_or_default() {
+                        by_test.entry(name).or_default().push(json!({ "machine": m.machine, "state": st }));
+                    }
+                }
+            }
+            let list: Vec<Value> = synthetics()?
+                .list()
+                .into_iter()
+                .map(|(name, t)| {
+                    let mut v = t.redacted();
+                    if let Value::Object(o) = &mut v {
+                        o.insert("name".into(), Value::from(name.clone()));
+                        o.insert("machines".into(), Value::from(by_test.remove(&name).unwrap_or_default()));
+                        if t.alert.is_some() {
+                            o.insert("monitor_id".into(), Value::from(super::synthetics::monitor_id(&name)));
+                        }
+                    }
+                    v
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "synthetics": list })))
+        }
+        (&Method::PUT, ["synthetics", name]) => {
+            let name = (*name).to_owned();
+            let t: super::synthetics::Test = read_json(req.into_body(), QUERY_BODY).await?;
+            t.check().map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            // Its monitor checked before anything is kept: a test whose alerting does not compile
+            // is refused whole.
+            let owned = t.monitor(&name);
+            if let Some(m) = &owned {
+                m.compiled().map_err(|e| fail(StatusCode::BAD_REQUEST, format!("alert: {e}")))?;
+            }
+            let store = synthetics()?;
+            store.put(&name, t).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            if let Ok(ms) = monitors() {
+                match owned {
+                    Some(m) => {
+                        ms.put(m).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("alert: {e}")))?;
+                    }
+                    None => {
+                        let _ = ms.delete(&super::synthetics::monitor_id(&name));
+                    }
+                }
+            }
+            apply_synthetics(store);
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::DELETE, ["synthetics", name]) => {
+            let store = synthetics()?;
+            match store.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+                true => {
+                    if let Ok(ms) = monitors() {
+                        let _ = ms.delete(&super::synthetics::monitor_id(name));
+                    }
+                    apply_synthetics(store);
+                    Ok(srv::status(StatusCode::NO_CONTENT))
+                }
+                false => Err(fail(StatusCode::NOT_FOUND, "no such synthetic test")),
+            }
+        }
+        (&Method::POST, ["synthetics", name, "test"]) => {
+            // The test given (its token, if left out or "…", the kept one's), or the kept one, run
+            // once from the server: what it would see, nothing written.
+            let name = (*name).to_owned();
+            let given: Option<super::synthetics::Test> = read_json::<Value>(req.into_body(), QUERY_BODY).await.ok().filter(|v| v.as_object().is_some_and(|o| !o.is_empty())).and_then(|v| serde_json::from_value(v).ok());
+            let kept = synthetics()?.get(&name);
+            let mut t = given.or_else(|| kept.clone()).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such synthetic test"))?;
+            if let (super::synthetics::Check::Http { bearer, .. }, Some(super::synthetics::Check::Http { bearer: old, .. })) = (&mut t.check, kept.map(|k| k.check))
+                && (bearer.is_none() || bearer.as_deref() == Some("…"))
+            {
+                *bearer = old;
+            }
+            t.check().map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let out = super::synthetics::run(&t).await;
+            Ok(srv::json(StatusCode::OK, &serde_json::to_value(&out).unwrap_or(Value::Null)))
+        }
+        (&Method::POST, ["synthetics", name, "run"]) => {
+            // Every location runs it now: the server here, each runner told.
+            synthetics()?.get(name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such synthetic test"))?;
+            if let Some(r) = super::synthetics::runner() {
+                r.run_now(name);
+            }
+            if let Some(o) = get() {
+                o.run_synthetic(name);
+            }
+            Ok(srv::json(StatusCode::ACCEPTED, &json!({ "run": true })))
         }
         (&Method::GET, ["log_sources"]) => {
             // Each source, and how each machine that reads it goes: the server's own here, a

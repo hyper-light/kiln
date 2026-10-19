@@ -195,6 +195,7 @@ pub trait Side {
     fn is_handshaking(&self) -> bool;
     fn send_close_notify(&mut self);
     fn alpn_protocol(&self) -> Option<&[u8]>;
+    fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]>;
 }
 
 macro_rules! side {
@@ -227,6 +228,9 @@ macro_rules! side {
             }
             fn alpn_protocol(&self) -> Option<&[u8]> {
                 (**self).alpn_protocol()
+            }
+            fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+                (**self).peer_certificates()
             }
         }
     };
@@ -323,6 +327,11 @@ impl<S, C: Side> Stream<S, C> {
     /// The protocol agreed in the handshake (ALPN), if any: [`H2`], [`HTTP11`].
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.conn.alpn_protocol()
+    }
+
+    /// The certificates the peer presented, its own first (a server's chain to a client).
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        self.conn.peer_certificates()
     }
 }
 

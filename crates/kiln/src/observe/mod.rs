@@ -24,6 +24,7 @@ pub mod scrape;
 pub mod slos;
 pub mod smtp;
 pub mod spans;
+pub mod synthetics;
 pub mod wire;
 
 pub use owner::{Observe, Out, Role, SERVER, Settings, View};

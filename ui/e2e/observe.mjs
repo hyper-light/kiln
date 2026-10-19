@@ -628,6 +628,64 @@ const scenarios = {
     }
   },
 
+  /** A synthetic test made from the form and tried once (the endpoint a server here), run now and
+   * seen passing; an assertion added that the endpoint does not meet, tried and saved, run, seen
+   * failing with why; removed. */
+  async "a synthetic test is made, tried, run, failed and removed"() {
+    const http = await import("node:http");
+    const site = http.createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"status":"ok"}');
+    });
+    await new Promise((r) => site.listen(0, "127.0.0.1", r));
+    const name = `e2e-syn-${run}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    const test = async () => (await api("GET", "/api/observe/v1/synthetics")).body.synthetics.find((t) => t.name === name);
+    try {
+      await page.goto(`${BASE}/observe/synthetics`);
+      await page.getByRole("button", { name: "New test", exact: true }).click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Name", { exact: true }), name);
+      await fillIn(d.getByLabel("URL", { exact: true }), `http://127.0.0.1:${site.address().port}/health`);
+      await fillIn(d.getByLabel("Every (s)"), "3600");
+      await d.getByRole("button", { name: "Test", exact: true }).click();
+      await d
+        .getByRole("status")
+        .getByText(/^Passed in [0-9.]+ ms .* · 200$/)
+        .waitFor({ timeout: 20_000 });
+      await d.getByRole("button", { name: "Make it", exact: true }).click();
+      const row = rowOf(name);
+      await row.waitFor();
+      const kept = await test();
+      expect(
+        kept?.type === "http" && kept.every_s === 3600 && JSON.stringify(kept.assertions) === JSON.stringify([{ type: "status_code", operator: "is", target: 200 }]),
+        `kept as made: ${JSON.stringify(kept)}`,
+      );
+      await row.getByRole("button", { name: `Run ${name} now`, exact: true }).click();
+      await until("passing at the server", async () => /Passing/.test((await row.textContent()) ?? ""), 30_000);
+
+      await row.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+      const e = page.getByRole("dialog");
+      await e.getByRole("button", { name: "Add assertion", exact: true }).click();
+      await e.getByLabel("Assertion 2", { exact: true }).selectOption("body");
+      await e.getByLabel("Operator").nth(1).selectOption("contains");
+      await fillIn(e.getByLabel("Target").nth(1), "nope");
+      await e.getByRole("button", { name: "Test", exact: true }).click();
+      await e.getByRole("status").getByText('body contains "nope": was "{\\"status\\":\\"ok\\"}"').waitFor({ timeout: 20_000 });
+      await e.getByRole("button", { name: "Save", exact: true }).click();
+      await until("saved with two assertions", async () => (await test())?.assertions?.length === 2);
+      await row.getByRole("button", { name: `Run ${name} now`, exact: true }).click();
+      await until("failing, and why", async () => /Failing/.test((await row.textContent()) ?? "") && /body contains/.test((await row.textContent()) ?? ""), 30_000);
+
+      await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until(`${name} gone`, async () => !(await test()));
+    } finally {
+      site.close();
+      await api("DELETE", `/api/observe/v1/synthetics/${name}`);
+    }
+  },
+
   /** Opsgenie and email integrations added from the form, each tested: an SMTP relay (a sink here)
    * is sent the test's message, to both recipients; Opsgenie's Alert API hears an alert with the
    * key given; then both removed. */

@@ -452,6 +452,78 @@ fn schemas() -> Map<String, Value> {
             &["ok", "took_ms"],
         ),
     );
+    // Synthetic tests (docs/observe.md §10.4).
+    let assertion = object(
+        &[
+            ("type", one_of(&["status_code", "response_time", "header", "body", "certificate_days", "address"])),
+            ("operator", one_of(&["is", "is_not", "less_than", "more_than", "contains", "does_not_contain", "matches", "does_not_match"])),
+            ("property", describe(string(), "a header assertion's header")),
+            ("target", describe(json!({}), "a number (status_code, response_time in ms, certificate_days) or text")),
+        ],
+        &["type", "operator", "target"],
+    );
+    let alerting = object(&[("message", describe(string(), "mentions and Datadog's template variables")), ("min_locations", integer()), ("for_s", integer()), ("priority", nullable(integer()))], &[]);
+    let synthetic_fields = vec![
+        ("type", describe(one_of(&["http", "tcp", "dns", "tls"]), "what it tries")),
+        ("url", describe(string(), "http: the request's URL")),
+        ("method", string()),
+        ("headers", array(array(string()))),
+        ("body", string()),
+        ("follow_redirects", boolean()),
+        ("bearer", describe(string(), "http: a token sent as Authorization: Bearer; sealed at rest, shown \"…\"")),
+        ("ca", describe(string(), "http and tls: a CA (PEM) the certificate is signed by, when not a public one")),
+        ("host", describe(string(), "tcp, dns and tls: the host")),
+        ("port", integer()),
+        ("assertions", array(assertion)),
+        ("locations", describe(array(string()), "`server`, runners by name, or `*`: every machine")),
+        ("every_s", integer()),
+        ("timeout_s", integer()),
+        ("retries", integer()),
+        ("retry_ms", integer()),
+        ("tags", array(string())),
+        ("paused", boolean()),
+        ("alert", describe(alerting, "a monitor of its own: at least min_locations failing for for_s")),
+    ];
+    put("SyntheticIn", object(&synthetic_fields, &["type"]));
+    let synthetic_state = object(
+        &[
+            ("passed", nullable(boolean())),
+            ("last_ms", nullable(integer())),
+            ("took_us", integer()),
+            ("status", nullable(integer())),
+            ("certificate_minutes", nullable(integer())),
+            ("attempts", integer()),
+            ("failed", array(string())),
+            ("runs", integer()),
+            ("failures", integer()),
+        ],
+        &["passed", "runs", "failures"],
+    );
+    let mut listed = synthetic_fields.clone();
+    listed.extend([("name", string()), ("monitor_id", describe(string(), "the monitor it owns, when it alerts")), ("machines", array(object(&[("machine", string()), ("state", synthetic_state)], &["machine", "state"])))]);
+    put("Synthetic", object(&listed, &["name", "type", "locations", "every_s", "machines"]));
+    put(
+        "SyntheticOutcome",
+        object(
+            &[
+                ("passed", boolean()),
+                ("failures", array(string())),
+                ("total_ms", number()),
+                ("dns_ms", nullable(number())),
+                ("connect_ms", nullable(number())),
+                ("tls_ms", nullable(number())),
+                ("firstbyte_ms", nullable(number())),
+                ("download_ms", nullable(number())),
+                ("redirect_ms", nullable(number())),
+                ("status", nullable(integer())),
+                ("size", nullable(integer())),
+                ("certificate_days", nullable(number())),
+                ("addresses", array(string())),
+                ("attempts", integer()),
+            ],
+            &["passed", "failures", "total_ms", "attempts"],
+        ),
+    );
     let rule = object(
         &[
             ("type", one_of(&["exclude_at_match", "include_at_match", "mask_sequences", "multi_line"])),
@@ -1021,6 +1093,11 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: vec![name()], ..op("delete", "/integrations/{name}", "Removes an integration", "observe.manage", None, vec![no_content()]) },
         Op { params: vec![name()], ..op("post", "/integrations/{name}/test", "Sends an integration a test notice", "observe.manage", None, vec![accepted(object(&[("sent", boolean())], &["sent"]))]) },
         op("get", "/scrapes", "Lists Prometheus scrape targets, each machine's state of them", "observe.read", None, vec![("200", answer_of("the targets", object(&[("scrapes", array(schema("Scrape")))], &["scrapes"])))]),
+        op("get", "/synthetics", "Lists synthetic tests, each location's state of them", "observe.read", None, vec![("200", answer_of("the tests", object(&[("synthetics", array(schema("Synthetic")))], &["synthetics"])))]),
+        Op { params: vec![name()], ..op("put", "/synthetics/{name}", "Makes or changes a synthetic test (and the monitor it owns, when it alerts)", "observe.manage", Some(body("SyntheticIn")), vec![no_content()]) },
+        Op { params: vec![name()], ..op("delete", "/synthetics/{name}", "Removes a synthetic test and the monitor it owns", "observe.manage", None, vec![no_content()]) },
+        Op { params: vec![name()], ..op("post", "/synthetics/{name}/test", "Runs a test once from the server (the one given, or the kept one), nothing written", "observe.manage", Some(json!({ "required": false, "content": { "application/json": { "schema": schema("SyntheticIn") } } })), vec![ok("SyntheticOutcome")]) },
+        Op { params: vec![name()], ..op("post", "/synthetics/{name}/run", "Runs a test now at every location", "observe.manage", None, vec![("202", answer_of("asked", object(&[("run", boolean())], &["run"])))]) },
         Op { params: vec![name()], ..op("put", "/scrapes/{name}", "Makes or changes a scrape target", "observe.manage", Some(body("ScrapeIn")), vec![no_content()]) },
         Op { params: vec![name()], ..op("delete", "/scrapes/{name}", "Removes a scrape target", "observe.manage", None, vec![no_content()]) },
         Op { params: vec![name()], ..op("post", "/scrapes/{name}/test", "Reads a target once from the server (the one given, or the kept one), nothing written", "observe.manage", Some(json!({ "required": false, "content": { "application/json": { "schema": schema("ScrapeIn") } } })), vec![ok("ScrapeTest")]) },
@@ -1149,7 +1226,7 @@ pub fn document(version: &str) -> Value {
         "info": {
             "title": "kiln observe",
             "version": version,
-            "description": "Observe's API (docs/observe.md §7): metric queries, log search and analytics, events, monitors, dashboards, integrations, clouds, scrapes, log sources, and what is sent in. Times are ms since the epoch unless said (`_ns`: nanoseconds).",
+            "description": "Observe's API (docs/observe.md §7): metric queries, log search and analytics, events, monitors, dashboards, integrations, clouds, scrapes, synthetic tests, log sources, and what is sent in. Times are ms since the epoch unless said (`_ns`: nanoseconds).",
         },
         "components": {
             "securitySchemes": {

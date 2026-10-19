@@ -196,6 +196,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "scrapes did not start: no HTTPS client"),
         }
+        // Synthetic tests: kept here, the server's own run here, each runner told its own.
+        let tests = std::sync::Arc::new(crate::observe::synthetics::Tests::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key")));
+        let all = tests.list();
+        crate::observe::synthetics::start(crate::observe::synthetics::SERVER, shutdown.clone()).set(&all);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_synthetics(all);
+        }
+        crate::observe::api::set_synthetics(tests);
         // Log pipelines: kept here, applied here and by every runner.
         let pipelines = std::sync::Arc::new(crate::observe::pipeline::kept::Pipelines::open(&cfg.data("observe")));
         crate::observe::pipeline::kept::activate(&pipelines.defs());

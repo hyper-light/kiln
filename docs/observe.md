@@ -27,6 +27,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
+| O-16 | Synthetic tests (§10.4): Datadog's API tests, HTTP (its time cut into DNS, connection, TLS, first byte, download and redirects), TCP, DNS and TLS (a certificate's days left), from the server and runners as locations; Datadog's assertions and series; a location failing or recovering an event once; alerting by a monitor each test owns (at least N locations failing for a while); tried once from the server, run now everywhere; their page; checked live (a server and a runner, an endpoint switched to 500 and back, a TLS endpoint with a CA of its own) and in browsers (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -509,8 +510,9 @@ same search syntax.
 Under `/api/observe/v1/` (all JSON; the UI uses nothing else), each route under a capability of
 kiln's (docs/access.md): every GET, and every query, search and check asked by POST, needs
 `observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
-developer's); integrations, clouds, scrape targets, log sources (they read machines' files), log
-pipelines (they change every record stored after) and the store's operations need `observe.manage`
+developer's); integrations, clouds, scrape targets, synthetic tests (they reach endpoints from the
+machines), log sources (they read machines' files), log pipelines (they change every record stored
+after) and the store's operations need `observe.manage`
 (a maintainer's), but their listings, `observe.read` (their
 secrets are never in them).
 
@@ -543,6 +545,7 @@ its schema (§13). Built:
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
+| `GET synthetics`, `PUT/DELETE synthetics/{name}`, `POST synthetics/{name}/test`, `POST synthetics/{name}/run` | Synthetic tests (§10.4), each with how each location goes (passed, its last run's time, status, certificate's minutes, tries, failures; a runner's as of its last status) and the monitor it owns; a token left out of a `PUT` (or `"…"`) is the one kept, never shown; `test` runs one once from the server, nothing written; `run` runs it now at every location |
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
 | `GET/POST pipelines`, `GET/PUT/DELETE pipelines/{id}`, `PUT pipeline_order`, `POST pipeline_test` | log pipelines (§8.2), in the order they apply, kiln's own first (read-only but for whether they are on: one is turned off, not removed); a pipeline made or changed is checked (it compiles) and applied from the next record on every machine; `pipeline_test` runs a pipeline given (or every one, in order) on records given and keeps nothing |
 | `GET/POST log_metrics`, `GET/PUT/DELETE log_metrics/{name}`, `POST log_metric_test` | metrics from logs (§8.3): Datadog's definitions, in kiln's shape or their API's envelope; each with what its latest window with records held, and how counting goes (the settle learned, windows counted again, windows too late); a name whose series another writes is refused (409); what a metric computes stays (400); `log_metric_test` counts a definition over the last fifteen minutes (an hour at the most) and writes nothing |
@@ -1211,6 +1214,52 @@ logs alone (its workspaces', its hubs'): no metrics pulled, no credentials neede
   `kiln.cloud.stream.lag` (by `integration` and `hub`, every 15 s); an event as a stream starts
   failing and as it recovers (`source:kiln.event @event.type:cloud.stream`).
 
+### 10.4 Synthetic tests
+
+`crate::observe::synthetics`: Datadog's Synthetic API tests. An endpoint tried on a schedule from the
+machines that are its locations (`locations`: `server`, runners by name, or `*`, every machine), each
+run judged by its assertions and written as Datadog writes it. The server keeps the tests
+(`PUT /api/observe/v1/synthetics/<name>`; `<observe>/synthetics.json`, a bearer token sealed under the
+master key and never shown) and tells each runner its own on observe's lane, when it connects and
+when they change, as scrape targets are told (§8); each machine says how its runs go in its status.
+
+- **Checks**: **HTTP** (a request, `method`, `headers`, `body`, a bearer token; its redirects
+  followed unless `follow_redirects: false`, ten at the most; its time measured on the way: DNS,
+  the connection, TLS, the first byte, the download, the redirects), **TCP** (a connection to a host
+  and port), **DNS** (a name resolved by the machine's own resolver: what its applications see) and
+  **TLS** (a handshake, the certificate verified for the host against the public roots or a CA
+  given, and its days until it expires). A check reaches its endpoint directly, not through the
+  machine's proxy: what is tested is whether that machine reaches it.
+- **Assertions**, Datadog's: the status code, the response time (ms), a header (by its name, any
+  case), the body, the certificate's days left, an address resolved (any of them); each `is`,
+  `is_not`, `less_than`, `more_than` (numbers), `contains`, `does_not_contain`, `matches`,
+  `does_not_match` (text; a pattern checked when the test is kept). An HTTP test without assertions
+  passes under 400. What fails is said: `status_code is 200: was 503`.
+- **Runs**: every `every_s` (10 s to a week; 60 unless said), each test at its own offset into its
+  interval (a hash of its name, as Prometheus spreads scrapes) and kept to its schedule; a run that
+  takes longer than its interval puts the next an interval after it. A run is given `timeout_s` (60
+  at the most; 30 unless said) and, failing, is tried again `retries` times (3 at the most)
+  `retry_ms` apart (300 ms) before it counts, as Datadog's are.
+- **What a run writes**, tagged `test`, `location` and `subtype` and the test's tags: Datadog's series
+  (`synthetics.test_runs` by `status`, `passed` or `failed`; `synthetics.http.response.time`,
+  `.dns.time`, `.connect.time`, `.ssl.time`, `.firstbyte.time`, `.download.time`, `.redirect.time`
+  in ms and `.response.size` in bytes; `synthetics.ssl.response.time`, `.dns.time`,
+  `.handshake.time`, `.time_to_expiry` in minutes, also of an HTTPS test's certificate;
+  `synthetics.dns.response.time`; `synthetics.tcp.response.time`, `.dns.time`, `.connect.time`), and
+  kiln's own `synthetics.failing` (1 while the location's last run failed). A location that starts
+  failing, or recovers, is an event once (`source:kiln.event @event.type:synthetics`), its failures
+  said.
+- **Alerting**, Datadog's: a test with `alert` owns a monitor (`syn-<name>`), `min(last_<w>m):sum:
+  synthetics.failing{test:<name>}.rollup(max, <every>) >= <min_locations>`: each bucket the
+  locations failing, every bucket of the window at least `min_locations` (the window `for_s`, an
+  interval at the least); judged as often as the test runs (10 s to a minute); its message the
+  test's (mentions, templates), so it notifies, mutes, renotifies and is held by downtimes as any
+  monitor is. It is made, changed and removed with its test; a test whose alerting does not compile
+  is refused whole.
+- **Trying and running**: `POST synthetics/<name>/test` runs a test (the one given, or the kept one)
+  once from the server and answers what it saw, its parts timed, nothing written; `POST
+  synthetics/<name>/run` runs it now at every location (the runners told on observe's lane).
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -1297,6 +1346,12 @@ time range and the search in the address (a page is a link).
   target's state over the machines that read it (up, down, starting) and its error, its endpoint,
   who reads it and how often, its last scrape; added and edited in a form that tests the endpoint
   once from the server (what it reads, in which format) before it is kept, its token kept unshown.
+- **Synthetics**: each test's state over its locations (passing, failing and how many, pending,
+  paused), what it tries, why it fails (a location's first failure), each location's dot, its last
+  run (when, how long, its status code), the monitor it owns; run now from everywhere, edited and
+  removed in a click; made and edited in a form (its kind's fields, an assertions editor of the kinds
+  its check takes, its locations, schedule and alerting) that tries it once from the server (passed
+  or failed, its time cut into its parts, what failed) before it is kept.
 - **Live**: the hosts' samples of the last hour at 5 s, streamed (what the Metrics page was); before
   that, the Hosts dashboard.
 
@@ -2106,7 +2161,11 @@ added, tested (the receiver checks the signature) and removed; an Azure integrat
 (nothing answering at their endpoint): its row failing with the hub's error and what it reads, the
 form showing metrics not read, its namespace and hubs and the connection string kept, a hub added
 (the connection string, endpoint and TLS kept), the connection string given up for the
-integration's credentials, removed (2026-10-19: passes in Chromium and WebKit as a phone); an email
+integration's credentials, removed (2026-10-19: passes in Chromium and WebKit as a phone); a
+synthetic test made from the form (an endpoint in the scenario), tried (`Passed in … · 200`), kept
+as made, run now and seen passing, an assertion added the endpoint does not meet, tried
+(`body contains "nope": was …`), saved, run and seen failing with why, removed (2026-10-19: passes in
+Chromium and WebKit as a phone); an email
 integration added from the form (its recipients, sender, relay, security and port) and tested, an
 SMTP sink in the scenario sent the test's message to both recipients, and an Opsgenie one added
 (its key never shown) and tested, its Alert API hearing the key, both removed (2026-10-19: passes
@@ -2215,6 +2274,20 @@ token. Their figures are functions of the minute, so what is stored is checked m
   once (seven); a Pub/Sub push of a Cloud Logging entry sent twice, taken once; a wrong token
   refused; kiln's counts of what was taken and sent again.
 2026-10-18: all pass (243 s; the pushes 99 s).
+
+**Synthetic tests** (`crates/kiln/tests/observe_synthetics.rs`): a kiln server and a runner, the
+locations; an HTTP endpoint the test serves, a TLS one (`openssl s_server`, its certificate signed
+for 90 days by a CA the test makes) and a port nothing listens on. An HTTP test of both locations,
+through a redirect, its status, body, a header (named in another case) and its time asserted, passes
+at each; DNS at every machine, TLS's certificate 89 to 90 days left (in minutes), HTTPS from the
+runner trusting the CA given; the closed port failing with why (`connect`), said once; Datadog's
+series by location (its response time at each, its runs by status, its connection, first byte,
+redirect, DNS and expiry); a test tried once from the server, nothing kept (`status_code is 201: was
+200`); an hourly test run now, at once at both. The endpoint switched to 500: both locations fail,
+each said once, and the monitor the test owns alerts a webhook (its message the test's); switched
+back, it recovers, told, and each location's recovery is said. Removed, its monitor goes with it
+(404). In the OpenAPI document and its conformance test; the routes a maintainer's. 2026-10-19:
+passes (181 s).
 
 **Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
 KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and

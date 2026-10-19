@@ -246,6 +246,85 @@ export type IntegrationIn =
   | { kind: "opsgenie"; api_key: string; url?: string }
   | { kind: "email"; to: string[]; from: string; host: string; port?: number; security?: SmtpSecurity; username?: string; password?: string; ca?: string };
 
+/** A synthetic test's kind (docs/observe.md §10.4). */
+export type SyntheticType = "http" | "tcp" | "dns" | "tls";
+export type SyntheticAssertionType = "status_code" | "response_time" | "header" | "body" | "certificate_days" | "address";
+export type SyntheticOperator = "is" | "is_not" | "less_than" | "more_than" | "contains" | "does_not_contain" | "matches" | "does_not_match";
+
+export interface SyntheticAssertion {
+  type: SyntheticAssertionType;
+  operator: SyntheticOperator;
+  /** A header assertion's header. */
+  property?: string;
+  /** A number (status code, ms, days) or text. */
+  target: number | string;
+}
+
+/** A test that alerts owns a monitor: at least `min_locations` failing for `for_s`. */
+export interface SyntheticAlert {
+  message?: string;
+  min_locations?: number;
+  for_s?: number;
+  priority?: number | null;
+}
+
+/** A synthetic test as it is sent. A bearer token left out (or "…") is the one kept. */
+export interface SyntheticIn {
+  type: SyntheticType;
+  url?: string;
+  method?: string;
+  headers?: [string, string][];
+  body?: string;
+  follow_redirects?: boolean;
+  bearer?: string;
+  ca?: string;
+  host?: string;
+  port?: number;
+  assertions?: SyntheticAssertion[];
+  /** `server`, runners by name, or `*` (every machine). */
+  locations?: string[];
+  every_s?: number;
+  timeout_s?: number;
+  retries?: number;
+  retry_ms?: number;
+  tags?: string[];
+  paused?: boolean;
+  alert?: SyntheticAlert;
+}
+
+/** How a location's runs of a test go. Times are unix ms; the last run's took_us in µs. */
+export interface SyntheticState {
+  passed: boolean | null;
+  last_ms?: number | null;
+  took_us: number;
+  status?: number | null;
+  certificate_minutes?: number | null;
+  attempts: number;
+  failed: string[];
+  runs: number;
+  failures: number;
+}
+
+export type Synthetic = SyntheticIn & { name: string; monitor_id?: string; machines: { machine: string; state: SyntheticState }[] };
+
+/** One run, its parts in ms. */
+export interface SyntheticOutcome {
+  passed: boolean;
+  failures: string[];
+  total_ms: number;
+  dns_ms: number | null;
+  connect_ms: number | null;
+  tls_ms: number | null;
+  firstbyte_ms: number | null;
+  download_ms: number | null;
+  redirect_ms: number | null;
+  status: number | null;
+  size: number | null;
+  certificate_days: number | null;
+  addresses: string[];
+  attempts: number;
+}
+
 export type CloudKind = "aws" | "gcp" | "azure";
 
 /** What a cloud integration is doing (docs/observe.md §10.1). Times are unix ms. */
@@ -752,6 +831,11 @@ export const observeApi = {
   testCloud: (name: string, c: CloudIn) => request<CloudTest>("POST", `${BASE}/clouds/${enc(name)}/test`, c),
   scrapes: (signal?: AbortSignal) => request<{ scrapes: Scrape[] }>("GET", `${BASE}/scrapes`, undefined, { signal }).then((r) => r.scrapes),
   putScrape: (name: string, t: ScrapeIn) => request<void>("PUT", `${BASE}/scrapes/${enc(name)}`, t),
+  synthetics: (signal?: AbortSignal) => request<{ synthetics: Synthetic[] }>("GET", `${BASE}/synthetics`, undefined, { signal }).then((r) => r.synthetics),
+  putSynthetic: (name: string, t: SyntheticIn) => request<void>("PUT", `${BASE}/synthetics/${enc(name)}`, t),
+  deleteSynthetic: (name: string) => request<void>("DELETE", `${BASE}/synthetics/${enc(name)}`),
+  testSynthetic: (name: string, t: SyntheticIn) => request<SyntheticOutcome>("POST", `${BASE}/synthetics/${enc(name)}/test`, t),
+  runSynthetic: (name: string) => request<{ run: boolean }>("POST", `${BASE}/synthetics/${enc(name)}/run`),
   deleteScrape: (name: string) => request<void>("DELETE", `${BASE}/scrapes/${enc(name)}`),
   testScrape: (name: string, t: ScrapeIn) => request<ScrapeTest>("POST", `${BASE}/scrapes/${enc(name)}/test`, t),
   pipelines: (signal?: AbortSignal) => request<{ pipelines: Pipeline[] }>("GET", `${BASE}/pipelines`, undefined, { signal }).then((r) => r.pipelines),

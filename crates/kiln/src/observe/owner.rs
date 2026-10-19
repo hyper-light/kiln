@@ -193,6 +193,10 @@ enum Input {
     LogSources(Vec<(String, super::collect::Source)>),
     /// The server's log pipelines, in order: every runner is told them all.
     Pipelines(Vec<super::pipeline::PipelineDef>),
+    /// The server's synthetic tests, all of them: each runner is told those it runs; and one of
+    /// them to run now everywhere.
+    Synthetics(Vec<(String, super::synthetics::Test)>),
+    RunSynthetic(String),
 }
 
 /// What a node has taken to write and not yet cut into a write, against the batcher's bound: taken
@@ -432,6 +436,17 @@ impl Observe {
         let _ = self.tx.send(Input::Pipelines(all));
     }
 
+    /// The server's synthetic tests now: each runner is told those it runs, now and when it
+    /// connects.
+    pub fn set_synthetics(&self, all: Vec<(String, super::synthetics::Test)>) {
+        let _ = self.tx.send(Input::Synthetics(all));
+    }
+
+    /// Asks every runner that runs test `name` to run it now.
+    pub fn run_synthetic(&self, name: &str) {
+        let _ = self.tx.send(Input::RunSynthetic(name.to_owned()));
+    }
+
     /// Log records of kiln's own (its events): taken up to the bound itself, else refused and
     /// counted as dropped.
     pub fn log(&self, records: Vec<Record>) {
@@ -622,6 +637,7 @@ struct Owner {
     batcher: Batcher,
     /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
     scrapes: Vec<(String, super::scrape::Target)>,
+    synthetics: Vec<(String, super::synthetics::Test)>,
     log_sources: Vec<(String, super::collect::Source)>,
     pipelines: Vec<super::pipeline::PipelineDef>,
     joiner: Joiner,
@@ -696,6 +712,7 @@ impl Owner {
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
             scrapes: Vec::new(),
+            synthetics: Vec::new(),
             log_sources: Vec::new(),
             pipelines: Vec::new(),
             joiner: Joiner::default(),
@@ -900,6 +917,19 @@ impl Owner {
                     self.send_scrapes(&machine);
                 }
             }
+            Input::Synthetics(all) => {
+                self.synthetics = all;
+                let up: Vec<String> = self.up.iter().cloned().collect();
+                for machine in up {
+                    self.send_synthetics(&machine);
+                }
+            }
+            Input::RunSynthetic(name) => {
+                let up: Vec<String> = self.up.iter().filter(|m| self.synthetics.iter().any(|(n, t)| *n == name && t.run_by(m))).cloned().collect();
+                for machine in up {
+                    self.send(&machine, Msg::RunSynthetic { name: name.clone() }, Vec::new());
+                }
+            }
             Input::LogSources(all) => {
                 self.log_sources = all;
                 let up: Vec<String> = self.up.iter().cloned().collect();
@@ -984,6 +1014,7 @@ impl Owner {
         };
         self.send(machine, Msg::Member { member, token, group: self.members.group.clone() }, Vec::new());
         self.send_scrapes(machine);
+        self.send_synthetics(machine);
         self.send_log_sources(machine);
         self.send(machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
     }
@@ -992,6 +1023,12 @@ impl Owner {
     fn send_scrapes(&mut self, machine: &str) {
         let targets: Vec<(String, super::scrape::Target)> = self.scrapes.iter().filter(|(_, t)| t.read_by(machine)).cloned().collect();
         self.send(machine, Msg::Scrapes { targets }, Vec::new());
+    }
+
+    /// Tells `machine` the synthetic tests it runs.
+    fn send_synthetics(&mut self, machine: &str) {
+        let tests: Vec<(String, super::synthetics::Test)> = self.synthetics.iter().filter(|(_, t)| t.run_by(machine)).cloned().collect();
+        self.send(machine, Msg::Synthetics { tests }, Vec::new());
     }
 
     /// Tells `machine` the log sources it reads.
@@ -1045,7 +1082,7 @@ impl Owner {
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
             }
-            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } | Msg::LogSources { .. } | Msg::Pipelines { .. } => {}
+            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } | Msg::LogSources { .. } | Msg::Pipelines { .. } | Msg::Synthetics { .. } | Msg::RunSynthetic { .. } => {}
         }
     }
 
@@ -1167,6 +1204,16 @@ impl Owner {
                 }
             }
             Msg::Pipelines { pipelines } => super::pipeline::kept::activate(&pipelines),
+            Msg::Synthetics { tests } => {
+                if let Some(r) = super::synthetics::runner() {
+                    r.set(&tests);
+                }
+            }
+            Msg::RunSynthetic { name } => {
+                if let Some(r) = super::synthetics::runner() {
+                    r.run_now(&name);
+                }
+            }
             Msg::Write { .. } | Msg::Status(_) => {}
         }
     }
@@ -1418,6 +1465,7 @@ impl Owner {
         s.disk_bytes = self.dir_bytes;
         s.scrapes = super::scrape::get().map(|s| s.states()).unwrap_or_default();
         s.collect = super::collect::get().map(|c| c.states()).unwrap_or_default();
+        s.synthetics = super::synthetics::runner().map(|r| r.states()).unwrap_or_default();
         s
     }
 
