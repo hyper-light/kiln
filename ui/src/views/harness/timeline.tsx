@@ -535,7 +535,7 @@ const TurnView = React.memo(function TurnView({
   meta?: Meta | null;
   onCommand?: (c: Command) => void;
 }) {
-  const edits = React.useMemo(() => changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))), [turn]);
+  const edits = React.useMemo(() => (turn.outcome ? changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))) : []), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
   // A turn of hundreds of steps shows its latest; the rest are a tap away (and there for a match

@@ -476,21 +476,14 @@ export function FileDiffView({
   }
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(() => new Set());
   const body = React.useRef<HTMLDivElement>(null);
+  const hunks = diff.hunks;
   const model = React.useMemo(() => {
-    const hunks = diff.hunks.map(hunkOf);
     let last = 1;
-    for (const h of diff.hunks) last = Math.max(last, h.old_start + h.old_lines - 1, h.new_start + h.new_lines - 1);
-    let dels = false;
-    let adds = false;
-    for (const h of hunks)
-      for (const s of h.segs)
-        if (s.t === "chg") {
-          dels ||= s.dels.length > 0;
-          adds ||= s.adds.length > 0;
-        }
-    const only = dels && !adds ? "del" : adds && !dels ? "add" : undefined;
-    return { hunks, digits: Math.max(2, String(last).length), only, stats: diffStats([diff]) };
-  }, [diff]);
+    for (const h of hunks) last = Math.max(last, h.old_start + h.old_lines - 1, h.new_start + h.new_lines - 1);
+    const stats = diffStats([{ hunks }]);
+    const only = stats.del > 0 && stats.add === 0 ? "del" : stats.add > 0 && stats.del === 0 ? "add" : undefined;
+    return { hunks: open ? hunks.map(hunkOf) : [], digits: Math.max(2, String(last).length), only, stats };
+  }, [hunks, open]);
   // Side by side only helps when lines changed on both sides (not in a new file or a pure deletion,
   // whose other column of numbers goes, too).
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;

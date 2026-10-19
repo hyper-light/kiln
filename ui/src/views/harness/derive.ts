@@ -100,7 +100,7 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
     } else if (e.kind === "thinking") {
       // A run of thoughts is one row.
       const last = t.items.at(-1);
-      if (last && last.type === "thought" && !last.event.streaming && !e.redacted) last.more = [...(last.more ?? []), e];
+      if (last && last.type === "thought" && !last.event.streaming && !e.redacted) (last.more ??= []).push(e);
       else t.items.push({ type: "thought", key: e.id, event: e });
     } else {
       const last = t.items.at(-1);
@@ -158,7 +158,7 @@ export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
   return out;
 }
 
-export function diffStats(diffs: FileDiff[] | undefined): { add: number; del: number } {
+export function diffStats(diffs: Pick<FileDiff, "hunks">[] | undefined): { add: number; del: number } {
   let add = 0;
   let del = 0;
   for (const d of diffs ?? [])
