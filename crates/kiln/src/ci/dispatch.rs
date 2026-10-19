@@ -1293,8 +1293,17 @@ impl Dispatch {
         // itself get an installation token of the App, limited to the job's permissions and the
         // repository, as GITHUB_TOKEN, and GitHub's URLs.
         let on_github = github_api(&self.hub, &r.repo).await;
-        let job_token = match &on_github {
-            Some((app, name)) => match app.token(name, &crate::githost::github::permissions_of(&l.spec.permissions.0)).await {
+        // On a task of its own: GitHub is another host, and this is deep in the dispatcher's
+        // calls, where a debug build's shard stack runs out.
+        let github_token = match &on_github {
+            Some((app, name)) => {
+                let (app, name, perms) = (Arc::clone(app), name.clone(), crate::githost::github::permissions_of(&l.spec.permissions.0));
+                Some(crate::rt::spawn(async move { app.token(&name, &perms).await }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("the token request ended without an answer"))))
+            }
+            None => None,
+        };
+        let job_token = match github_token {
+            Some(token) => match token {
                 Ok(t) => t,
                 Err(e) => {
                     runs::annotation(&self.hub, leg, None, "error", Some("github_api".into()), &format!("`github_api: github`: no GitHub token for the job: {e:#}"), None, None, None, None, None).await?;

@@ -45,7 +45,10 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W16: test reports from legs.
         ["_kiln", "test-results"] => Some(super::results::ingest(hub, req).await),
         // W19: a step's message (`kiln/notify@v1`).
-        ["_kiln", "notify"] => Some(super::notify::from_leg(hub, req).await),
+        ["_kiln", "notify"] => {
+            let hub = Arc::clone(hub);
+            Some(apart(async move { super::notify::from_leg(&hub, req).await }).await)
+        }
         // W19-R03: what a leg runs on, for comparing runs.
         ["_kiln", "facts"] => Some(super::compare::facts_from_leg(hub, req).await),
         // W18: an attest step's SBOM and bundles, for its runner; the key that signs them.
@@ -99,6 +102,19 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (&Method::GET, ["legs", _, "logs"])
             | (&Method::GET, ["environments"])
     )
+}
+
+/// `f` on a task of its own: a call that reaches other hosts (a webhook, KMS, a chat service)
+/// nests deep, and beneath the router's frames a debug build's shard stack runs out.
+async fn apart<F>(f: F) -> Result<Response, Fail>
+where
+    F: std::future::Future<Output = Result<Response, Fail>> + Send + 'static,
+{
+    crate::rt::spawn(f).await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "the call ended without an answer".to_owned()))?
+}
+
+fn owned(rest: &[&str]) -> Vec<String> {
+    rest.iter().map(|s| (*s).to_owned()).collect()
 }
 
 /// A call that may reach other hosts, as a task of its own: a host's API calls nest deep, and a
@@ -202,7 +218,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W18-R04: whether a digest has kiln's provenance meeting a requirement.
         (&Method::POST, ["attestations", "verify"]) => {
             let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-            super::attest::verify_route(hub, &body).await
+            let hub = Arc::clone(hub);
+            apart(async move { super::attest::verify_route(&hub, &body).await }).await
         }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => super::routing::get(hub).await,
@@ -218,7 +235,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W09: secrets (names only) and variables.
         (_, ["secrets", ..] | ["variables", ..]) => super::secrets::route(hub, &method, rest, q, req.into_body()).await,
         // W11: integrations, shared by jobs and deployments (docs/cd-targets.md §6, §7.1).
-        (_, ["integrations", ..]) => super::integrations::route(hub, &method, rest, q, req.into_body()).await,
+        (_, ["integrations", ..]) => {
+            let (hub, method, rest, q, body) = (Arc::clone(hub), method.clone(), owned(rest), q.clone(), req.into_body());
+            apart(async move { super::integrations::route(&hub, &method, &rest.iter().map(String::as_str).collect::<Vec<_>>(), &q, body).await }).await
+        }
         // §4.1: the engine's runs, legs and caches (W21's data).
         (&Method::GET, ["runs"]) => super::runs_api::list(hub, q).await,
         (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id, q).await,
@@ -239,7 +259,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W19-R01: insights.
         (&Method::GET, ["insights", rest @ ..]) => super::insights::route(hub, rest, q).await,
         // W19-R07: outgoing webhooks' deliveries, and sending one again.
-        (_, ["webhooks", rest @ ..]) => super::webhooks::route(hub, &method, rest, q).await,
+        (_, ["webhooks", rest @ ..]) => {
+            let (hub, method, rest, q) = (Arc::clone(hub), method.clone(), owned(rest), q.clone());
+            apart(async move { super::webhooks::route(&hub, &method, &rest.iter().map(String::as_str).collect::<Vec<_>>(), &q).await }).await
+        }
         // W16-R07, R08: benchmark metrics and their trends.
         (&Method::GET, ["runs", id, "metrics"]) => super::results::run_metrics(hub, id).await,
         (&Method::GET, ["repos", repo, "metrics"]) => super::results::repo_metrics(hub, repo, q).await,
