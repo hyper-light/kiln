@@ -201,7 +201,10 @@ outlives the server's disk and its own machine both.
     machine, who said it, when, and the words around the match, marked. A match opens its agent
     with the find bar already looking for the same words. An agent that ended and is forgotten has
     its matches listed, but not as links.
-  - **An agent's find bar** finds what its timeline holds. When the timeline holds only the latest
+  - **A long conversation** opens on its latest 30 turns. Earlier ones join as you scroll up, without
+    moving what you're reading, and back at the end it holds the latest again. A long turn shows its
+    latest 60 steps, with *N earlier steps* to show the rest.
+  - **An agent's find bar** finds what its timeline holds, and opens the turn of the match it shows. When the timeline holds only the latest
     events (`MAX_EVENTS`), the matches before them, from its history, are listed under the bar
     (*N earlier, in its history*) to read in place.
   - The UI mock answers the search too: `MOCK_DROPPED=n` gives its long conversation an earlier
