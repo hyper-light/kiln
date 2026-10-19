@@ -7,7 +7,7 @@
 import * as React from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { Link, useParams } from "@/lib/router";
-import { diffRes, filesRes, readinessRes, reviewApi, STATE_WORD, threadsRes, whoSaid, type DiffDetail, type ReviewAction, type Thread } from "@/api/review";
+import { diffRes, filesRes, inboxRes, readinessRes, reviewApi, STATE_WORD, threadsRes, whoSaid, type DiffDetail, type ReviewAction, type Thread } from "@/api/review";
 import { Button } from "@/components/ui/button";
 import { Loadable, Loading } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
@@ -110,6 +110,9 @@ function Review({ diffKey }: { diffKey: string }) {
 
 function Head({ d }: { d: DiffDetail }) {
   const [busy, setBusy] = React.useState(false);
+  // The author's actions are the author's: on yours, or your agents'.
+  const you = useRes(inboxRes).data.you;
+  const yours = d.author === you || d.author_for === you;
   const act = async (a: "ready" | "abandon" | "reclaim" | "commandeer") => {
     setBusy(true);
     try {
@@ -154,24 +157,26 @@ function Head({ d }: { d: DiffDetail }) {
           </React.Suspense>
         </div>
       )}
-      <div className="rv-acts">
-        {d.state === "draft" && (
-          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void act("ready")}>
-            Ready for review
-          </Button>
-        )}
-        {d.state === "abandoned" ? (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("reclaim")}>
-            Reclaim
-          </Button>
-        ) : (
-          d.state !== "landed" && (
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("abandon")}>
-              Abandon
+      {yours && (
+        <div className="rv-acts">
+          {d.state === "draft" && (
+            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void act("ready")}>
+              Ready for review
             </Button>
-          )
-        )}
-      </div>
+          )}
+          {d.state === "abandoned" ? (
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("reclaim")}>
+              Reclaim
+            </Button>
+          ) : (
+            d.state !== "landed" && (
+              <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("abandon")}>
+                Abandon
+              </Button>
+            )
+          )}
+        </div>
+      )}
     </header>
   );
 }
