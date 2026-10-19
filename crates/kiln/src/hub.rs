@@ -1049,6 +1049,8 @@ impl Hub {
                     self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
                 }
             }
+            // A pool's executor it was asked to start (docs/ci.md W13-R09).
+            AgentMsg::Executor { json } => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.clone(), json }),
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {

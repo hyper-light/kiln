@@ -17,6 +17,7 @@ pub mod facade;
 pub mod hooks;
 pub mod hosting;
 pub mod images;
+pub mod pools;
 pub mod insights;
 pub mod land;
 pub mod integrations;

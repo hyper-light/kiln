@@ -5,8 +5,10 @@
 //! - [`groups`]: concurrency groups.
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
+//! - [`pools`]: pools of executors kiln starts and stops (W13-R09).
 
 pub mod groups;
+pub mod pools;
 pub mod retry;
 pub mod routing;
 pub mod sim;

@@ -611,6 +611,8 @@ pub struct Requirement {
     pub rules: Vec<usize>,
     /// Docker only when its engine runs rootless (an untrusted leg's, W18-R07).
     pub rootless_docker: bool,
+    /// The pool whose executors run it (W13-R09).
+    pub pool: Option<String>,
 }
 
 impl Requirement {
@@ -621,7 +623,16 @@ impl Requirement {
         labels.dedup();
         let mut cs: Vec<&str> = self.constraints.iter().map(|(s, _)| s.as_str()).collect();
         cs.sort_unstable();
-        format!("labels={};group={};req={};caps={:x};exec={}{}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","), if self.rootless_docker { ";rootless" } else { "" })
+        format!(
+            "labels={};group={};req={};caps={:x};exec={}{}{}",
+            labels.join(","),
+            self.group.as_deref().unwrap_or(""),
+            cs.join(" && "),
+            self.caps,
+            self.executors.join(","),
+            if self.rootless_docker { ";rootless" } else { "" },
+            self.pool.as_deref().map(|p| format!(";pool={p}")).unwrap_or_default()
+        )
     }
 }
 

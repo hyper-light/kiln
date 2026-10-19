@@ -137,6 +137,9 @@ pub struct ExecutorSpec {
     pub kind: String,
     pub image: Option<String>,
     pub options: serde_json::Value,
+    /// The pool's executor, ready on the runner, the leg runs in (W13-R09).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
 }
 
 /// The contexts the server knows (W06-R03).

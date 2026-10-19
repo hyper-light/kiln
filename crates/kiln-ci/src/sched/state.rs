@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::Serialize;
 
 use super::groups::{GroupAction, GroupConfig, Groups};
+use super::pools::{self, ExecState, Executor, Pool, PoolView};
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
 
@@ -43,6 +44,8 @@ pub struct Config {
     pub rules: Vec<Rule>,
     /// Legs in progress at most, per repository (W05-R11).
     pub quotas: HashMap<String, usize>,
+    /// Pools, in order: a leg goes to the first that serves its labels (W13-R09).
+    pub pools: Vec<Pool>,
 }
 
 impl Default for Config {
@@ -57,6 +60,7 @@ impl Default for Config {
             overcommit_disk: 1.0,
             rules: vec![routing::native_rule()],
             quotas: HashMap::new(),
+            pools: Vec::new(),
         }
     }
 }
@@ -126,6 +130,11 @@ pub enum Input {
     RunnerLost { runner: String },
     RunnerDraining { runner: String },
     RulesChanged(Vec<Rule>),
+    /// A pool's executor its host started is ready for a leg (W13-R09).
+    ExecutorReady { executor: String },
+    /// Its host couldn't start it, or it's gone.
+    ExecutorFailed { executor: String, error: String },
+    PoolsChanged(Vec<Pool>),
     /// The time a [`Command::Timer`] asked for.
     Tick,
 }
@@ -142,6 +151,8 @@ pub enum WaitReason {
     Quota { limit: usize },
     Exclusive,
     Retry { at: i64 },
+    /// Its pool's executors are all busy or starting (W13-R09).
+    Pool { pool: String, executors: usize, busy: usize, starting: usize, max: usize },
 }
 
 /// What to do.
@@ -150,8 +161,13 @@ pub enum Command {
     StartRun { run: String },
     CancelRun { run: String, reason: String },
     /// `image` is the routing rule's, for container and microVM executors (W13); `docker`, the
-    /// Docker access the rules give the leg (W13-R04).
-    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String> },
+    /// Docker access the rules give the leg (W13-R04); `slot`, the pool's executor it runs in
+    /// (W13-R09).
+    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String>, slot: Option<String> },
+    /// Start one of a pool's executors on `runner`, ready for a leg (W13-R09).
+    StartExecutor { pool: String, executor: String, runner: String, kind: String, image: Option<String> },
+    /// Stop an idle executor (past its pool's `idle_timeout`, or its pool gone).
+    StopExecutor { executor: String, runner: String },
     /// Stop a leg's attempt on its runner.
     Cancel { leg: String, attempt: u32, reason: String },
     /// A failed attempt will be retried at `at` as `attempt`.
@@ -223,6 +239,12 @@ pub struct Scheduler {
     seq: u64,
     timers: BTreeMap<i64, Vec<String>>,
     in_progress: HashMap<String, usize>,
+    /// Pools' executors, by id.
+    executors: BTreeMap<String, Executor>,
+    /// (pool, runner) left alone until, and the wait after the next failure.
+    backoff: HashMap<(String, String), (i64, i64)>,
+    /// Each pool's last failure to start an executor: (runner, error).
+    pool_errors: HashMap<String, (String, String)>,
 }
 
 impl Scheduler {
@@ -255,6 +277,7 @@ impl Scheduler {
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
+                    self.discard_used(&leg, &mut out);
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.avoid = Some(runner.clone());
                     }
@@ -270,6 +293,20 @@ impl Scheduler {
                 }
             }
             Input::RulesChanged(rules) => self.rules_changed(rules, now, &mut out),
+            Input::ExecutorReady { executor } => self.executor_ready(&executor, now, &mut out),
+            Input::ExecutorFailed { executor, error } => self.executor_failed(&executor, error, now, &mut out),
+            Input::PoolsChanged(pools) => {
+                self.cfg.pools = pools;
+                // A pool gone: its idle and starting executors stop; busy ones end with their legs.
+                let gone: Vec<Executor> = self.executors.values().filter(|e| !matches!(e.state, ExecState::Busy { .. }) && !self.cfg.pools.iter().any(|p| p.name == e.pool)).cloned().collect();
+                for e in gone {
+                    self.drop_executor(&e.id);
+                    out.push(Command::StopExecutor { executor: e.id, runner: e.runner });
+                }
+                let rules = self.cfg.rules.clone();
+                self.rules_changed(rules, now, &mut out);
+                self.scale_all(now, &mut out);
+            }
             Input::Tick => self.tick(now, &mut out),
         }
         out
@@ -343,18 +380,43 @@ impl Scheduler {
     }
 
     fn requirement(&self, input: &LegIn) -> Requirement {
+        // A pool that serves the leg's labels runs it (W13-R09), on the hosts the pool names; an
+        // untrusted leg only where its executors may run untrusted code (W18-R07).
+        let untrusted_ok = |p: &Pool| input.route.untrusted.as_ref().is_none_or(|u| u.executors.contains(&p.executor));
+        if let Some(p) = self.config().pools.iter().find(|p| p.serves(&input.route.labels) && untrusted_ok(p)) {
+            let mut constraints = p.hosts.clone();
+            for c in &input.route.requires {
+                match routing::Constraint::parse(c) {
+                    Ok(x) => constraints.push((c.clone(), x)),
+                    Err(e) => constraints.push((e, routing::Constraint::Or(Vec::new()))),
+                }
+            }
+            return Requirement {
+                constraints,
+                caps: input.route.caps | p.caps,
+                executors: vec![p.executor.clone()],
+                image: p.image.clone(),
+                pool: Some(p.name.clone()),
+                rootless_docker: input.route.untrusted.as_ref().is_some_and(|u| !u.rootful_docker),
+                ..Requirement::default()
+            };
+        }
         routing::resolve(&input.route, &self.config().rules).unwrap_or_else(|e| {
             // A constraint that doesn't parse: no runner can satisfy it, and the leg says why.
             Requirement { labels: input.route.labels.clone(), constraints: vec![(e, routing::Constraint::Or(Vec::new()))], caps: input.route.caps, ..Requirement::default() }
         })
     }
 
-    fn leg_queued(&mut self, input: LegIn, now: i64, out: &mut Vec<Command>) {
+    fn leg_queued(&mut self, mut input: LegIn, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
         if self.legs.get(&id).is_some_and(|l| l.state != State::Done) {
             return;
         }
         let mut req = self.requirement(&input);
+        // A pool's leg takes what its executor holds already.
+        if req.pool.is_some() {
+            input.request = Resources::default();
+        }
         req.prefer.extend(input.prefer.iter().cloned());
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
@@ -428,6 +490,9 @@ impl Scheduler {
             }
             self.try_runner(&r, now, out);
         }
+        if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
+            self.scale(&pool, now, out);
+        }
         if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
             let reason = self.wait_reason(id);
             self.set_reason(id, reason, out);
@@ -497,6 +562,10 @@ impl Scheduler {
         {
             return false;
         }
+        // A pool's leg runs in one of its idle executors on that host.
+        if let Some(pool) = &l.req.pool {
+            return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle);
+        }
         let c = self.config();
         match (c.resources, r.input.capacity) {
             (true, Some(cap)) => {
@@ -506,8 +575,13 @@ impl Scheduler {
                     && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                     && r.used.gpu + q.gpu <= cap.gpu
             }
-            _ => r.running.len() < r.input.slots.max(1) as usize,
+            _ => self.own_legs(r) < r.input.slots.max(1) as usize,
         }
+    }
+
+    /// The legs a runner runs in its own slots (a pool's run in their executors).
+    fn own_legs(&self, r: &Runner) -> usize {
+        r.running.iter().filter(|x| !self.legs.get(*x).is_some_and(|l| l.req.pool.is_some())).count()
     }
 
     /// Gives a runner the best queued legs that fit it, until none does.
@@ -535,7 +609,6 @@ impl Scheduler {
     }
 
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
-        let _ = now;
         self.unqueue(id);
         let Some(l) = self.legs.get_mut(id) else { return };
         l.state = State::Assigned { runner: runner.to_owned() };
@@ -553,7 +626,13 @@ impl Scheduler {
             r.exclusive = exclusive;
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
-        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker });
+        // Its pool's idle executor there, which it alone uses.
+        let slot = req.pool.as_ref().and_then(|p| self.executors.values_mut().find(|e| e.pool == *p && e.runner == runner && e.state == ExecState::Idle)).map(|e| {
+            e.state = ExecState::Busy { leg: id.to_owned() };
+            e.since = now;
+            e.id.clone()
+        });
+        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker, slot });
     }
 
     fn release(&mut self, id: &str) -> Option<String> {
@@ -573,12 +652,23 @@ impl Scheduler {
         Some(runner)
     }
 
+    /// The executor a leg ran in took its one leg: it's discarded. Its host removed it as the leg
+    /// ended; one the leg never reached (refused, failed before it started) goes now.
+    fn discard_used(&mut self, id: &str, out: &mut Vec<Command>) {
+        let used: Vec<(String, String)> = self.executors.values().filter(|e| e.state == ExecState::Busy { leg: id.to_owned() }).map(|e| (e.id.clone(), e.runner.clone())).collect();
+        for (e, runner) in used {
+            self.drop_executor(&e);
+            out.push(Command::StopExecutor { executor: e, runner });
+        }
+    }
+
     fn finished(&mut self, id: &str, attempt: u32, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
         let Some(l) = self.legs.get(id) else { return };
         if l.attempt != attempt || l.state == State::Done {
             return;
         }
         let runner = self.release(id);
+        self.discard_used(id, out);
         // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
         if let Some(why) = self.legs.get(id).and_then(|l| l.cancelling.clone()) {
             let (outcome, reason) = match outcome {
@@ -589,6 +679,7 @@ impl Scheduler {
             if let Some(r) = runner {
                 self.try_runner(&r, now, out);
             }
+            self.scale_all(now, out);
             return;
         }
         let decision = match &outcome {
@@ -623,6 +714,7 @@ impl Scheduler {
         if let Some(r) = runner {
             self.try_runner(&r, now, out);
         }
+        self.scale_all(now, out);
     }
 
     fn settle(&mut self, id: &str, outcome: Outcome, reason: Option<String>, now: i64, out: &mut Vec<Command>) {
@@ -659,6 +751,7 @@ impl Scheduler {
         self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, exclusive });
         self.refresh_eligibility(&id);
         self.try_runner(&id, now, out);
+        self.scale_all(now, out);
         self.refresh_reasons(out);
     }
 
@@ -683,10 +776,16 @@ impl Scheduler {
             None => return,
         };
         self.refresh_eligibility(runner);
+        // Its pools' executors went with it.
+        let gone: Vec<String> = self.executors.values().filter(|e| e.runner == runner && !matches!(e.state, ExecState::Busy { .. })).map(|e| e.id.clone()).collect();
+        for e in gone {
+            self.drop_executor(&e);
+        }
         for leg in legs {
             let attempt = self.legs.get(&leg).map_or(0, |l| l.attempt);
             self.finished(&leg, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
         }
+        self.scale_all(now, out);
         self.refresh_reasons(out);
     }
 
@@ -730,6 +829,183 @@ impl Scheduler {
                 }
             }
         }
+        self.reap_idle(now, out);
+        self.scale_all(now, out);
+    }
+
+    // ------------------------------------------------------------------ pools (W13-R09)
+
+    fn pool(&self, name: &str) -> Option<&Pool> {
+        self.cfg.pools.iter().find(|p| p.name == name)
+    }
+
+    fn drop_executor(&mut self, id: &str) {
+        if let Some(e) = self.executors.remove(id)
+            && let Some(r) = self.runners.get_mut(&e.runner)
+        {
+            sub(&mut r.used, &e.reserved);
+        }
+    }
+
+    /// Legs queued for `pool`.
+    fn waiting_for(&self, pool: &str) -> usize {
+        self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool)).map(|s| s.queue.len()).sum()
+    }
+
+    /// The hosts that may run `pool`'s executors now, with room for another: connected, not
+    /// draining, eligible for its legs, under `per_host_max`, with the resources in resource
+    /// mode, and not backing off; the least loaded with the pool first.
+    fn hosts_for(&self, p: &Pool, now: i64) -> Vec<String> {
+        let req = Requirement { constraints: p.hosts.clone(), caps: p.caps, executors: vec![p.executor.clone()], pool: Some(p.name.clone()), ..Requirement::default() };
+        let mut hosts: Vec<(usize, String)> = self
+            .runners
+            .values()
+            .filter(|r| r.connected && !r.draining && routing::eligible(&req, &r.input.view))
+            .filter(|r| self.backoff.get(&(p.name.clone(), r.input.id.clone())).is_none_or(|(until, _)| *until <= now))
+            .filter_map(|r| {
+                let here = self.executors.values().filter(|e| e.pool == p.name && e.runner == r.input.id).count();
+                if here >= p.per_host_max {
+                    return None;
+                }
+                let c = self.config();
+                if let (true, Some(cap)) = (c.resources, r.input.capacity) {
+                    let q = &p.request;
+                    let fits = r.used.cpu + q.cpu <= cap.cpu * c.overcommit_cpu
+                        && (r.used.mem + q.mem) as f64 <= cap.mem as f64 * c.overcommit_mem
+                        && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
+                        && r.used.gpu + q.gpu <= cap.gpu;
+                    if !fits {
+                        return None;
+                    }
+                }
+                Some((here, r.input.id.clone()))
+            })
+            .collect();
+        hosts.sort();
+        hosts.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Starts as many of `pool`'s executors as its waiting legs and `min_idle` want.
+    fn scale(&mut self, pool: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(p) = self.pool(pool).cloned() else { return };
+        let count = |s: fn(&ExecState) -> bool| self.executors.values().filter(|e| e.pool == pool && s(&e.state)).count();
+        let (starting, idle, busy) = (count(|s| *s == ExecState::Starting), count(|s| *s == ExecState::Idle), count(|s| matches!(s, ExecState::Busy { .. })));
+        let mut want = pools::wanted(&p, starting, idle, busy, self.waiting_for(pool));
+        while want > 0 {
+            let Some(host) = self.hosts_for(&p, now).into_iter().next() else { break };
+            self.seq += 1;
+            let id = format!("pool-{pool}-{now:x}-{:x}", self.seq);
+            self.executors.insert(id.clone(), Executor { id: id.clone(), pool: pool.to_owned(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request });
+            if let Some(r) = self.runners.get_mut(&host) {
+                add(&mut r.used, &p.request);
+            }
+            out.push(Command::StartExecutor { pool: pool.to_owned(), executor: id, runner: host, kind: p.executor.clone(), image: p.image.clone() });
+            want -= 1;
+        }
+    }
+
+    fn scale_all(&mut self, now: i64, out: &mut Vec<Command>) {
+        let names: Vec<String> = self.cfg.pools.iter().map(|p| p.name.clone()).collect();
+        for n in names {
+            self.scale(&n, now, out);
+        }
+    }
+
+    fn executor_ready(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(e) = self.executors.get_mut(id) else { return };
+        if e.state != ExecState::Starting {
+            return;
+        }
+        e.state = ExecState::Idle;
+        e.since = now;
+        let (pool, runner) = (e.pool.clone(), e.runner.clone());
+        self.backoff.remove(&(pool.clone(), runner.clone()));
+        self.try_runner(&runner, now, out);
+        self.idle_timer(&pool, now, out);
+        self.refresh_reasons(out);
+    }
+
+    fn executor_failed(&mut self, id: &str, error: String, now: i64, out: &mut Vec<Command>) {
+        let Some(e) = self.executors.get(id).cloned() else { return };
+        self.drop_executor(id);
+        // Gone under its leg: the leg's runner reports how the attempt ended.
+        if matches!(e.state, ExecState::Busy { .. }) {
+            return;
+        }
+        // The host is left alone a while, longer each time it fails.
+        let key = (e.pool.clone(), e.runner.clone());
+        let delay = self.backoff.get(&key).map_or(pools::FIRST_BACKOFF_MS, |(_, d)| *d);
+        self.backoff.insert(key, (now + delay, (delay * 2).min(pools::MAX_BACKOFF_MS)));
+        self.pool_errors.insert(e.pool.clone(), (e.runner.clone(), error));
+        self.timers.entry(now + delay).or_default();
+        out.push(Command::Timer { at: now + delay });
+        self.scale(&e.pool, now, out);
+        self.refresh_reasons(out);
+    }
+
+    /// A timer for when `pool`'s oldest idle executor passes its `idle_timeout`.
+    fn idle_timer(&mut self, pool: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(p) = self.pool(pool) else { return };
+        let timeout = p.idle_timeout_ms;
+        if let Some(at) = self.executors.values().filter(|e| e.pool == pool && e.state == ExecState::Idle).map(|e| e.since + timeout).min()
+            && at > now
+        {
+            self.timers.entry(at).or_default();
+            out.push(Command::Timer { at });
+        }
+    }
+
+    /// Stops executors idle past their pool's `idle_timeout`, oldest first, while the pool keeps
+    /// `min_idle` and nothing waits for it.
+    fn reap_idle(&mut self, now: i64, out: &mut Vec<Command>) {
+        let pools: Vec<Pool> = self.cfg.pools.clone();
+        for p in pools {
+            if self.waiting_for(&p.name) > 0 {
+                continue;
+            }
+            let mut idle: Vec<(i64, String, String)> = self.executors.values().filter(|e| e.pool == p.name && e.state == ExecState::Idle).map(|e| (e.since, e.id.clone(), e.runner.clone())).collect();
+            idle.sort();
+            let spare = idle.len() + self.executors.values().filter(|e| e.pool == p.name && e.state == ExecState::Starting).count();
+            let mut over = spare.saturating_sub(p.min_idle);
+            for (since, id, runner) in idle {
+                if over == 0 || now - since < p.idle_timeout_ms {
+                    break;
+                }
+                self.drop_executor(&id);
+                out.push(Command::StopExecutor { executor: id, runner });
+                over -= 1;
+            }
+            self.idle_timer(&p.name, now, out);
+        }
+    }
+
+    /// The pools and their executors now (the Pools page, `GET /api/ci/pools`).
+    pub fn pools(&self) -> Vec<PoolView> {
+        self.cfg
+            .pools
+            .iter()
+            .map(|p| {
+                let mine: Vec<Executor> = self.executors.values().filter(|e| e.pool == p.name).cloned().collect();
+                let count = |f: fn(&ExecState) -> bool| mine.iter().filter(|e| f(&e.state)).count();
+                PoolView {
+                    name: p.name.clone(),
+                    executor: p.executor.clone(),
+                    image: p.image.clone(),
+                    labels: p.labels.clone(),
+                    hosts: p.hosts.first().map(|(s, _)| s.clone()),
+                    min_idle: p.min_idle,
+                    max: p.max,
+                    per_host_max: p.per_host_max,
+                    idle_timeout_ms: p.idle_timeout_ms,
+                    starting: count(|s| *s == ExecState::Starting),
+                    idle: count(|s| *s == ExecState::Idle),
+                    busy: count(|s| matches!(s, ExecState::Busy { .. })),
+                    waiting: self.waiting_for(&p.name),
+                    last_error: self.pool_errors.get(&p.name).cloned(),
+                    executors: mine,
+                }
+            })
+            .collect()
     }
 
     fn set_reason(&mut self, id: &str, reason: WaitReason, out: &mut Vec<Command>) {
@@ -759,6 +1035,16 @@ impl Scheduler {
             return WaitReason::Quota { limit: *q };
         }
         let eligible: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        if let (Some(pool), false) = (&l.req.pool, eligible.is_empty()) {
+            let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == *pool).collect();
+            return WaitReason::Pool {
+                pool: pool.clone(),
+                executors: mine.len(),
+                busy: mine.iter().filter(|e| matches!(e.state, ExecState::Busy { .. })).count(),
+                starting: mine.iter().filter(|e| e.state == ExecState::Starting).count(),
+                max: self.pool(pool).map_or(0, |p| p.max),
+            };
+        }
         if !eligible.is_empty() {
             if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {
                 return WaitReason::Exclusive;

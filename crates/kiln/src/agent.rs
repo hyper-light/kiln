@@ -214,6 +214,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Running {
     cancel: Shutdown,
+    /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
+    pooled: bool,
 }
 
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
@@ -779,6 +781,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
     let mut jobs: HashMap<String, Running> = HashMap::new();
+    // Pools' executors this runner started (docs/ci.md W13-R09).
+    let pool_execs = crate::runner::pool::Executors::default();
+    crate::runner::pool::sweep(&o.work_dir);
     let mut exclusive = false;
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
@@ -1473,6 +1478,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
                 }
+                // The pools' executors were the last connection's: the server starts what it wants
+                // again (docs/ci.md W13-R09).
+                for w in pool_execs.drain() {
+                    crate::rt::spawn(crate::runner::pool::discard(w));
+                }
                 // Whether this machine takes upgrades (an older server skips it).
                 if !o.ephemeral && !o.outpost {
                     let accept = takes_updates(&o);
@@ -1635,7 +1645,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // from here (NAT, NodePorts, cluster DNS all differ).
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        let full = u32::try_from(jobs.values().filter(|j| !j.pooled).count()).unwrap_or(u32::MAX) >= o.slots.max(1);
                         if o.outpost || draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
@@ -1646,7 +1656,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         exclusive = a.spec.exclusive;
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -2066,7 +2076,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         };
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        // A pool's leg runs in its executor, beside this runner's own slots.
+                        let pooled = a.executor.slot.is_some();
+                        let own = jobs.values().filter(|j| !j.pooled).count();
+                        let full = !pooled && u32::try_from(own).unwrap_or(u32::MAX) >= o.slots.max(1);
                         if o.outpost || draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
@@ -2100,9 +2113,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone() };
+                        // Its pool's executor, when the leg can run in it as it is; else the leg
+                        // runs the usual way and the executor goes all the same.
+                        let warm = a.executor.slot.as_deref().and_then(|s| pool_execs.take(s));
+                        let warm = match warm {
+                            Some(w) if crate::runner::pool::adoptable(&a, &w) => Some(w),
+                            Some(w) => {
+                                crate::rt::spawn(crate::runner::pool::discard(w));
+                                None
+                            }
+                            None => None,
+                        };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)) };
                         let done = done_tx.clone();
                         crate::rt::spawn(async move {
                             let result = leg.run().await;
@@ -2110,6 +2134,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         });
                     }
                     ServerMsg::ProbeFacts => probe_facts(&uplink, &o.work_dir, &o.declared, &probing),
+                    // Start or stop a pool's executor (docs/ci.md W13-R09).
+                    ServerMsg::Executor { json } => {
+                        let ask: crate::runner::pool::Ask = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "an executor request this runner can't read");
+                                continue;
+                            }
+                        };
+                        let (execs, work, up) = (pool_execs.clone(), o.work_dir.clone(), uplink.clone());
+                        crate::rt::spawn(async move {
+                            if let Some(said) = crate::runner::pool::handle(&execs, &work, ask).await
+                                && let Ok(json) = serde_json::to_string(&said)
+                            {
+                                up.msg(AgentMsg::Executor { json }).await;
+                            }
+                        });
+                    }
                     // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
                     // there (W17-R05): its workspace and environment, or its container; the leg's
                     // secrets masked in what it shows.

@@ -2,7 +2,7 @@
 //! driving the real [`Scheduler`]. Tests and `kiln ci bench --scheduler` use it.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use super::retry::{Failed, FailureClass};
 use super::state::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler, WaitReason};
@@ -41,6 +41,13 @@ pub struct Sim {
     pub runs: Vec<(i64, Command)>,
     /// Slot-time: (repo, start, end).
     pub busy: Vec<(String, i64, i64)>,
+    /// How long a host takes to start a pool's executor (W13-R09).
+    pub executor_start_ms: i64,
+    /// Hosts whose executors fail to start.
+    pub failing_hosts: HashSet<String>,
+    /// Executors started: (time, executor, host); and stopped: (time, executor).
+    pub executors_started: Vec<(i64, String, String)>,
+    pub executors_stopped: Vec<(i64, String)>,
 }
 
 impl Sim {
@@ -60,6 +67,10 @@ impl Sim {
             waits: Vec::new(),
             runs: Vec::new(),
             busy: Vec::new(),
+            executor_start_ms: 500,
+            failing_hosts: HashSet::new(),
+            executors_started: Vec::new(),
+            executors_stopped: Vec::new(),
         }
     }
 
@@ -143,6 +154,16 @@ impl Sim {
                     }
                 }
                 Command::Timer { at } => self.at(at, Ev::Tick),
+                Command::StartExecutor { executor, runner, .. } => {
+                    self.executors_started.push((self.now, executor.clone(), runner.clone()));
+                    let t = self.now + self.executor_start_ms;
+                    if self.failing_hosts.contains(&runner) {
+                        self.input(t, Input::ExecutorFailed { executor, error: format!("{runner} couldn't start it") });
+                    } else {
+                        self.input(t, Input::ExecutorReady { executor });
+                    }
+                }
+                Command::StopExecutor { executor, .. } => self.executors_stopped.push((self.now, executor)),
                 Command::Settled { leg, outcome, .. } => self.settled.push((self.now, leg, outcome)),
                 Command::Wait { leg, reason } => self.waits.push((self.now, leg, reason)),
                 c @ (Command::StartRun { .. } | Command::CancelRun { .. }) => self.runs.push((self.now, c)),

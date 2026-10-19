@@ -138,6 +138,10 @@ pub enum AgentMsg {
     /// [`ServerMsg::Repair`]): JSON, or `None` when there's nothing to say. Appended last: postcard
     /// encodes variants by index.
     Answer { req: u64, json: Option<String> },
+    /// CI: one of a pool's executors this runner was asked to start is ready, or failed (JSON
+    /// `crate::runner::pool::Said`, docs/ci.md W13-R09). Only from runners announcing
+    /// [`CAP_POOLS`]. Appended last: postcard encodes variants by index.
+    Executor { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -205,6 +209,9 @@ pub const CAP_CONVO: u32 = 1 << 19;
 /// [`AgentMsg::Build`] capability: the runner looks at its own machine and repairs it
 /// ([`ServerMsg::Diagnose`], [`ServerMsg::Repair`], `crate::doctor`).
 pub const CAP_DOCTOR: u32 = 1 << 21;
+/// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
+/// Clear of every bit above, and of 1 << 21 (the Kiln Agents lane's `CAP_DOCTOR`).
+pub const CAP_POOLS: u32 = 1 << 22;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -375,6 +382,10 @@ pub enum ServerMsg {
     /// [`AgentMsg::Answer`] (`{message}` or `{error}`). Only to runners announcing [`CAP_DOCTOR`].
     /// Appended last: postcard encodes variants by index.
     Repair { req: u64, action: String },
+    /// CI: start or stop one of a pool's executors (JSON `crate::runner::pool::Ask`, docs/ci.md
+    /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
+    /// variants by index.
+    Executor { json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -553,6 +564,23 @@ mod tests {
         let b = encode(&answer)?;
         assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Answer comes right after Power");
         assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_executors_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Repair { req: 1, action: "a".into() })?;
+        let start = ServerMsg::Executor { json: "{}".into() };
+        let b = encode(&start)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after Repair");
+        assert_eq!(decode::<ServerMsg>(&b)?, start);
+        let last_agent = encode(&AgentMsg::Answer { req: 1, json: None })?;
+        let said = AgentMsg::Executor { json: "{}".into() };
+        let b = encode(&said)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Executor comes right after Answer");
+        assert_eq!(decode::<AgentMsg>(&b)?, said);
+        let others = CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
+        assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
         Ok(())
     }
 
