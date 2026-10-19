@@ -136,6 +136,105 @@ const family = new Map<string, Member>(
   if (m) m.info.approvals = [{ id: migrApproval.id, tool: migrApproval.tool, tool_name: migrApproval.tool_name, title: migrApproval.title, at: migrApproval.at }];
 }
 
+/* ------------------------------------------------------------------ a plan run, one agent per step */
+
+const RUN = "pr_agents1";
+const RUN_PLAN = "pl_release";
+const RUN_TITLE = "Cut the 0.2 release";
+for (const m of [
+  member("run-freeze", "claude", "agent:metal-ryzen-01", "Step 1: Freeze main", "idle", "default", "Step 1 of 3 of the plan \"Cut the 0.2 release\": Freeze main — Stop merging features; only fixes from here. — Done when: Branch protection requires a release label.", "Branch protection now requires a release label on main.", {
+    plan_run: RUN,
+    last_activity: Date.now() - 6 * 60_000,
+  }),
+  member("run-bench", "codex", "agent:metal-epyc-01", "Step 2: Run the full bench", "running", "untrusted", "Step 2 of 3 of the plan \"Cut the 0.2 release\": Run the full bench — Compare against 0.1 on the metal runners.", "Running the bench against 0.1.", {
+    plan_run: RUN,
+    doing: "Running kiln run bench --all",
+  }),
+])
+  family.set(m.info.id, m);
+
+interface MockStep {
+  title: string;
+  goal: string;
+  status: "waiting" | "started" | "taken" | "met" | "unmet" | "stopped";
+  agent: string | null;
+  reason: string | null;
+  tries: number;
+  started_at: number | null;
+  ended_at: number | null;
+}
+const run = {
+  state: "running" as "running" | "stopped" | "done",
+  reason: null as string | null,
+  at: Math.floor((t0 + 30_000) / 1000),
+  steps: [
+    { title: "Freeze main", goal: family.get("run-freeze")?.info.goal ?? "", status: "met", agent: "run-freeze", reason: "Claude Code's check: the condition holds.", tries: 1, started_at: null, ended_at: null },
+    { title: "Run the full bench", goal: family.get("run-bench")?.info.goal ?? "", status: "started", agent: "run-bench", reason: null, tries: 1, started_at: null, ended_at: null },
+    { title: "Tag and publish", goal: 'Step 3 of 3 of the plan "Cut the 0.2 release": Tag and publish', status: "waiting", agent: null, reason: null, tries: 0, started_at: null, ended_at: null },
+  ] as MockStep[],
+};
+
+function runView() {
+  const steps = run.steps.map((s, i) => {
+    const m = s.agent ? family.get(s.agent) : undefined;
+    const stand = s.status === "started" ? (m && (m.info.approvals.length || m.info.status === "waiting") ? "needs_you" : "working") : s.status === "taken" ? "yours" : s.status;
+    return { n: i + 1, title: s.title, goal: s.goal, stand, agent: m ? brief(m.info) : null, agent_id: s.agent, started_at: s.started_at, ended_at: s.ended_at, reason: s.reason, tries: s.tries };
+  });
+  const met = steps.filter((s) => s.stand === "met").length;
+  return { id: RUN, plan: RUN_PLAN, title: RUN_TITLE, version: 4, state: run.state, reason: run.reason, note: null, at: run.at, ended_at: null, by: "admin", config: {}, steps, met, total: steps.length };
+}
+
+/** The run's routes (before the plans' own, whose `:id` would take "runs"). */
+async function handleRun(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
+  const p = url.pathname;
+  const m = req.method ?? "GET";
+  if (p === "/api/plans/runs" && m === "GET") {
+    const v = runView();
+    const runs = [{ id: RUN, plan: RUN_PLAN, title: RUN_TITLE, state: v.state, met: v.met, total: v.total, at: v.at }];
+    json(res, 200, { runs: url.searchParams.get("active") ? runs.filter((r) => r.state === "running") : runs });
+    return true;
+  }
+  const rm = p.match(/^\/api\/plans\/runs\/([^/]+)(?:\/stop|\/steps\/(\d+)\/(retry|take|met))?$/);
+  if (!rm) return false;
+  if (decodeURIComponent(rm[1] ?? "") !== RUN) {
+    json(res, 404, { error: `no plan run ${rm[1]}` });
+    return true;
+  }
+  if (m === "GET") {
+    json(res, 200, runView());
+    return true;
+  }
+  if (p.endsWith("/stop")) {
+    run.state = "stopped";
+    run.reason = "stopped by admin";
+    for (const s of run.steps.filter((x) => x.status === "started")) {
+      s.status = "stopped";
+      s.reason = "stopped by admin";
+    }
+  } else {
+    const s = run.steps[Number(rm[2]) - 1];
+    if (!s) return (json(res, 400, { error: "no such step" }), true);
+    if (rm[3] === "take") {
+      s.status = "taken";
+      s.reason = "taken over by admin";
+    } else if (rm[3] === "met") {
+      s.status = "met";
+      s.reason = "met, said admin";
+      const next = run.steps.find((x) => x.status === "waiting");
+      if (next) next.status = "started";
+    } else {
+      s.status = "started";
+      s.tries += 1;
+      s.reason = null;
+    }
+    run.state = "running";
+    run.reason = null;
+  }
+  emitEvent({ type: "harness", info: family.get("run-bench")?.info });
+  json(res, 200, runView());
+  return true;
+}
+
 /** The family, for the agents list. */
 export function familyInfos(): AgentInfo[] {
   return [...family.values()].map((m) => m.info);
@@ -239,6 +338,7 @@ function end(id: string): boolean {
 
 /** The `agents.*` routes. True when it answered. */
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
+  if (await handleRun(req, res, url)) return true;
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
