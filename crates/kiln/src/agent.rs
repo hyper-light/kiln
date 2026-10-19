@@ -1952,6 +1952,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    // What's wrong with this machine, and repairs to it (`crate::doctor`): on the
+                    // blocking pool, as they read and remove files.
+                    ServerMsg::Diagnose { req } => {
+                        let here = crate::doctor::Here { state_dir: o.state_dir.clone(), work_dir: o.work_dir.clone() };
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = crate::rt::blocking(move || serde_json::to_string(&crate::doctor::examine(&here)).ok()).await.ok().flatten();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        });
+                    }
+                    ServerMsg::Repair { req, action } => {
+                        let here = crate::doctor::Here { state_dir: o.state_dir.clone(), work_dir: o.work_dir.clone() };
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            tracing::info!(%action, "a repair the server asked for");
+                            let json = crate::rt::blocking(move || crate::doctor::answer_repair(&here, &action)).await.ok();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        });
+                    }
                     ServerMsg::Reach { from, link, open, data, close } => {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Frame { from, link, open, data, close }).await;

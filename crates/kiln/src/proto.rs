@@ -134,6 +134,10 @@ pub enum AgentMsg {
     /// changes, and every 10 minutes. A machine on battery sleeps when it runs out, and its runner
     /// with it; the server says so first. Appended last: postcard encodes variants by index.
     Power { json: String },
+    /// The answer to a question the server asked by `req` ([`ServerMsg::Diagnose`],
+    /// [`ServerMsg::Repair`]): JSON, or `None` when there's nothing to say. Appended last: postcard
+    /// encodes variants by index.
+    Answer { req: u64, json: Option<String> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -198,6 +202,9 @@ pub const CAP_REACH: u32 = 1 << 17;
 /// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
 /// observe and updates take (128, 256, 512).
 pub const CAP_CONVO: u32 = 1 << 19;
+/// [`AgentMsg::Build`] capability: the runner looks at its own machine and repairs it
+/// ([`ServerMsg::Diagnose`], [`ServerMsg::Repair`], `crate::doctor`).
+pub const CAP_DOCTOR: u32 = 1 << 21;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -360,6 +367,14 @@ pub enum ServerMsg {
     /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
     /// by index.
     UpdateAvailable { commit: String, build: String, from: String },
+    /// Look at this machine and say what's wrong (JSON `crate::doctor::Machine`), answered by
+    /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_DOCTOR`]. Appended last: postcard
+    /// encodes variants by index.
+    Diagnose { req: u64 },
+    /// Make repair `action` on this machine (`crate::doctor::RUNNER_ACTIONS`), answered by
+    /// [`AgentMsg::Answer`] (`{message}` or `{error}`). Only to runners announcing [`CAP_DOCTOR`].
+    /// Appended last: postcard encodes variants by index.
+    Repair { req: u64, action: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -522,6 +537,22 @@ mod tests {
             assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
             seen |= c;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_diagnosis_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
+        for (i, m) in [ServerMsg::Diagnose { req: 7 }, ServerMsg::Repair { req: 8, action: "prune-versions".into() }].into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + i as u8), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let last_agent = encode(&AgentMsg::Power { json: "{}".into() })?;
+        let answer = AgentMsg::Answer { req: 7, json: Some("{}".into()) };
+        let b = encode(&answer)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Answer comes right after Power");
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
         Ok(())
     }
 
