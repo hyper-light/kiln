@@ -786,6 +786,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Pools' executors this runner started (docs/ci.md W13-R09).
     let pool_execs = crate::runner::pool::Executors::default();
     crate::runner::pool::sweep(&o.work_dir);
+    // And the containers and networks this runner left running when it last stopped.
+    crate::runner::docker::sweep(&o.work_dir).await;
     let mut exclusive = false;
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and

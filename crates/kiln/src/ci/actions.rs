@@ -130,18 +130,27 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             reached.push(w);
         }
     }
-    let mut todo: Vec<(String, usize)> = Vec::new();
+    // Each action, its depth, and the job's own step that reached it (a composite's actions are
+    // its step's).
+    let mut todo: Vec<(String, usize, Option<String>)> = Vec::new();
     for w in &reached {
         for j in &w.jobs {
             let mut u = Vec::new();
             steps_uses(&j.steps, &mut u);
-            todo.extend(u.into_iter().map(|x| (x, 0)));
+            todo.extend(u.into_iter().map(|x| (x, 0, None)));
         }
     }
     let mut out: BTreeMap<String, ActionRef> = BTreeMap::new();
-    let mut shas: BTreeMap<(String, String), String> = BTreeMap::new();
-    while let Some((uses, depth)) = todo.pop() {
-        if out.contains_key(&uses) {
+    let mut shas: BTreeMap<(String, String), Result<String, String>> = BTreeMap::new();
+    // Actions that couldn't be resolved, under a step's action that uses them: that step's action
+    // can't run either.
+    let mut beneath: Vec<(String, String)> = Vec::new();
+    while let Some((uses, depth, root)) = todo.pop() {
+        let below = root.clone().unwrap_or_else(|| uses.clone());
+        if let Some(a) = out.get(&uses) {
+            if let (Some(why), Some(root)) = (&a.error, &root) {
+                beneath.push((root.clone(), format!("`{uses}`: {why}")));
+            }
             continue;
         }
         // kiln's own actions (W07-R10) run on the runner itself: nothing to fetch or pin, and no
@@ -171,7 +180,7 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
                 if action.runs.using == "composite" {
                     let mut inner = Vec::new();
                     steps_uses(&action.runs.steps, &mut inner);
-                    todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+                    todo.extend(inner.into_iter().map(|x| (x, depth + 1, Some(below.clone()))));
                 }
             }
             out.insert(uses.clone(), a);
@@ -182,12 +191,23 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             return Err(format!("`{uses}`: composite actions nest at most 10 deep"));
         }
         let key = (r.full(), r.git_ref.clone());
-        let sha = match shas.get(&key) {
+        let pinned = match shas.get(&key) {
             Some(s) => s.clone(),
             None => {
-                let s = pin(hub, &r).await.map_err(|e| format!("`{uses}` could not be resolved: {e:#}"))?;
+                let s = pin(hub, &r).await.map_err(|e| format!("{e:#}"));
                 shas.insert(key, s.clone());
                 s
+            }
+        };
+        // One that can't be resolved fails the jobs that use it, not the run (W07-R03).
+        let sha = match pinned {
+            Ok(sha) => sha,
+            Err(why) => {
+                if let Some(root) = &root {
+                    beneath.push((root.clone(), format!("`{uses}`: {why}")));
+                }
+                out.insert(uses.clone(), ActionRef { repo: r.full(), path: r.path.clone(), error: Some(why), ..ActionRef::default() });
+                continue;
             }
         };
         let mut a = ActionRef { repo: r.full(), sha: sha.clone(), path: r.path.clone(), url: format!("/_kiln/actions/{}/{}/{sha}.tar.gz", r.owner, r.repo), ..ActionRef::default() };
@@ -199,12 +219,33 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             if action.runs.using == "composite" {
                 let mut inner = Vec::new();
                 steps_uses(&action.runs.steps, &mut inner);
-                todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+                todo.extend(inner.into_iter().map(|x| (x, depth + 1, Some(below.clone()))));
             }
         }
         out.insert(uses.clone(), a);
     }
+    for (root, why) in beneath {
+        if let Some(a) = out.get_mut(&root)
+            && a.error.is_none()
+        {
+            a.error = Some(format!("an action it uses could not be resolved, {why}"));
+        }
+    }
     Ok(out)
+}
+
+/// Where `owner/repo` is fetched from (W07-R02): the first `[[ci.actions.sources]]` that names
+/// its owner (another host, or one of kiln's native repositories), else GitHub.
+pub(crate) fn source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<String> {
+    let Some(s) = hub.cfg.ci.actions.source_of(owner) else { return Ok(format!("https://github.com/{owner}/{repo}.git")) };
+    match (&s.url, s.native) {
+        (Some(url), false) if url.contains("{repo}") => Ok(url.replace("{owner}", owner).replace("{repo}", repo)),
+        (None, true) => super::hosting::path_of(hub, &format!("{owner}/{repo}"))
+            .filter(|p| p.join("HEAD").exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("`{owner}/{repo}` is no repository kiln hosts (`[[ci.actions.sources]]` takes `{owner}`'s actions from kiln's own)")),
+        _ => anyhow::bail!("`[[ci.actions.sources]]` for `{owner}` needs `url` (with `{{repo}}` in it) or `native = true`, and not both"),
+    }
 }
 
 /// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
@@ -212,8 +253,11 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
 pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     let dir = mirror(hub, &r.owner, &r.repo);
     let d = dir.to_string_lossy().to_string();
-    let url = format!("https://github.com/{}/{}.git", r.owner, r.repo);
-    if !dir.join("HEAD").exists() {
+    let url = source(hub, &r.owner, &r.repo)?;
+    if dir.join("HEAD").exists() {
+        // The source may have moved (`[[ci.actions.sources]]` changed): fetch from where it is now.
+        let _ = gitops::run_git(hub, &["-C", &d, "remote", "set-url", "origin", &url], GIT_TIMEOUT).await;
+    } else {
         if let Some(parent) = dir.parent() {
             let p = parent.to_path_buf();
             crate::rt::blocking(move || std::fs::create_dir_all(p)).await??;
@@ -221,7 +265,11 @@ pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
         // Treeless: every commit, and a commit's trees and files only when one is read (its
         // `action.yml`, its tarball). An action repository that keeps its built code in every
         // commit (codeql-action) mirrors in seconds, not minutes.
-        gitops::run_git(hub, &["clone", "--bare", "--quiet", "--filter=tree:0", &url, &d], GIT_TIMEOUT).await?;
+        if let Err(e) = gitops::run_git(hub, &["clone", "--bare", "--quiet", "--filter=tree:0", &url, &d], GIT_TIMEOUT).await {
+            // What a failed clone leaves isn't a mirror.
+            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
+            anyhow::bail!("action source unreachable and not mirrored: {e:#}");
+        }
     }
     let full_sha = r.git_ref.len() == 40 && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
     let fetched = if full_sha {

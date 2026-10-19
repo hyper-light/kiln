@@ -463,12 +463,34 @@ pub struct Actions {
     /// Actions to mirror by `kiln actions sync` (`owner/repo@ref`), for servers that will run
     /// without reaching GitHub.
     pub prefetch: Vec<String>,
+    /// `[[ci.actions.sources]]`: where some owners' actions come from instead of GitHub, the
+    /// first that names the owner (W07-R02).
+    pub sources: Vec<ActionSource>,
 }
 
 impl Actions {
     pub fn policy(&self) -> kiln_ci::policy::Policy {
         kiln_ci::policy::Policy { allow: self.allow.clone(), deny: self.deny.clone(), require_sha_pins: self.require_sha_pins }
     }
+
+    /// The source for `owner`'s actions, when one names it.
+    pub fn source_of(&self, owner: &str) -> Option<&ActionSource> {
+        let owner = owner.to_ascii_lowercase();
+        self.sources.iter().find(|s| s.owners.iter().any(|g| crate::pipeline::glob_match(&g.to_ascii_lowercase(), &owner)))
+    }
+}
+
+/// Another home for some owners' actions (W07-R02): a git host (`url`, with `{owner}` and
+/// `{repo}` filled in), or the repositories kiln hosts itself (`native`, W14-R01).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActionSource {
+    /// Owner globs (`acme`, `acme-*`).
+    pub owners: Vec<String>,
+    /// The clone URL: `https://git.example.com/{owner}/{repo}.git`.
+    pub url: Option<String>,
+    /// `owner/repo` is one of kiln's native repositories.
+    pub native: bool,
 }
 
 /// `[ci.cache]`: GitHub's cache service (docs/ci.md W08-R06).

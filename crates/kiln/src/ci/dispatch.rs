@@ -149,6 +149,17 @@ fn declared_sources(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections:
     out
 }
 
+/// The actions in `steps` that couldn't be resolved when the run started (W07-R03), as GitHub
+/// says so at "Set up job".
+fn unresolved(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>) -> Option<String> {
+    let lines: Vec<String> = steps
+        .iter()
+        .filter_map(|s| s.uses.as_deref())
+        .filter_map(|u| actions.get(u).and_then(|a| a.error.as_deref()).map(|why| format!("Unable to resolve action `{u}`: {why}")))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// `KCI4031` (W07-R11): the scopes a kiln action in `steps` needs that `granted` gives less of.
 fn short_permissions(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>, granted: &kiln_ci::plan::perms::Resolved) -> Option<String> {
     let mut lines = Vec::new();
@@ -411,6 +422,10 @@ struct Dispatch {
     runs: HashMap<String, RunSt>,
     legs: HashMap<String, LegSt>,
     timers: BTreeSet<i64>,
+    /// What a command left for the command loop to do next ([`Dispatch::fail_unstarted`]): run
+    /// by the loop, not a level down from it, which in a debug build would take more stack than a
+    /// shard has.
+    next: Vec<Command>,
 }
 
 fn now_ms() -> i64 {
@@ -465,7 +480,7 @@ pub fn spawn(hub: Arc<Hub>) {
         let rules = sources.effective();
         let mut cfg = sched_config(&hub, rules);
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -1225,7 +1240,8 @@ impl Dispatch {
 
     /// Carries out what the scheduler decided.
     async fn commands(&mut self, cmds: Vec<Command>) {
-        for c in cmds {
+        let mut todo: std::collections::VecDeque<Command> = cmds.into();
+        while let Some(c) = todo.pop_front() {
             let r = match c {
                 Command::StartRun { run } => {
                     let held = self.runs.get_mut(&run).and_then(|r| r.held.take()).unwrap_or_default();
@@ -1275,10 +1291,24 @@ impl Dispatch {
             if let Err(e) = r {
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");
             }
+            // What it left to do comes next, before the rest: as if it had done it itself.
+            for c in std::mem::take(&mut self.next).into_iter().rev() {
+                todo.push_front(c);
+            }
         }
     }
 
     /// Sends a leg to its runner (W05, W06).
+    /// Fails `leg`'s attempt before it reaches a runner, saying why on the leg; what follows is
+    /// the command loop's to do (`next`), as `assign` is only ever one of its commands.
+    async fn fail_unstarted(&mut self, leg: &str, attempt: u32, kind: &'static str, why: String) -> anyhow::Result<()> {
+        runs::annotation(&self.hub, leg, None, "error", Some(kind.into()), &why, None, None, None, None, None).await?;
+        let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
+        let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
+        self.next.extend(cmds);
+        Ok(())
+    }
+
     async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, placed: Placement) -> anyhow::Result<()> {
         let Placement { executor, image, docker, slot } = placed;
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
@@ -1305,13 +1335,7 @@ impl Dispatch {
         let job_token = match github_token {
             Some(token) => match token {
                 Ok(t) => t,
-                Err(e) => {
-                    runs::annotation(&self.hub, leg, None, "error", Some("github_api".into()), &format!("`github_api: github`: no GitHub token for the job: {e:#}"), None, None, None, None, None).await?;
-                    let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
-                    let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
-                    Box::pin(self.commands(cmds)).await;
-                    return Ok(());
-                }
+                Err(e) => return self.fail_unstarted(leg, attempt, "github_api", format!("`github_api: github`: no GitHub token for the job: {e:#}")).await,
             },
             None => job_token,
         };
@@ -1322,13 +1346,14 @@ impl Dispatch {
         }
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // An action it uses that couldn't be resolved (W07-R03) fails it as it starts, as GitHub
+        // fails a job at "Set up job"; the run's other jobs go on.
+        if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, &r.actions)) {
+            return self.fail_unstarted(leg, attempt, "actions", m).await;
+        }
         // KCI4031 (W07-R11): a kiln action that needs more permissions than the job grants.
         if let Some(m) = l.spec.def().and_then(|j| short_permissions(&j.steps, &r.actions, &l.spec.permissions)) {
-            runs::annotation(&self.hub, leg, None, "error", Some("permissions".into()), &m, None, None, None, None, None).await?;
-            let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
-            let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
-            Box::pin(self.commands(cmds)).await;
-            return Ok(());
+            return self.fail_unstarted(leg, attempt, "permissions", m).await;
         }
         if let Some((app, _)) = &on_github {
             a.runtime.facade_url = app.web.clone();
@@ -1338,13 +1363,7 @@ impl Dispatch {
         // Its integrations (W11-R03); one it may not use fails it before it starts.
         match self.leg_integrations(l, r, a.runtime.id_token_url.is_some()).await {
             Ok(list) => a.integrations = list,
-            Err(m) => {
-                runs::annotation(&self.hub, leg, None, "error", Some("integrations".into()), &m, None, None, None, None, None).await?;
-                let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
-                let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
-                Box::pin(self.commands(cmds)).await;
-                return Ok(());
-            }
+            Err(m) => return self.fail_unstarted(leg, attempt, "integrations", m).await,
         }
         // Its deployment (W15-R04), unless `deployment: false`.
         let deploys = l.deployment.is_none() && l.spec.environment.as_ref().is_some_and(|e| e.deployment && !e.name.is_empty());

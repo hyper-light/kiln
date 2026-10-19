@@ -66,7 +66,7 @@ pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded
         Ok(actions) => {
             // Every resolution is audited (W07-R04): who, which ref, which commit.
             if !actions.is_empty() {
-                let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.sha)).collect();
+                let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.error.as_ref().map_or_else(|| a.sha.clone(), |e| format!("unresolved ({e})")))).collect();
                 hub.store.audit(event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", repo.name, l.path, event.sha, list.join(", "))).await;
             }
             hub.ci.send(Msg::Start(Box::new(Start {

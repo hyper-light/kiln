@@ -206,6 +206,11 @@ pub struct ActionRef {
     pub secrets: Vec<(String, bool)>,
     pub requires: Vec<String>,
     pub permissions: Vec<(String, String)>,
+    /// Why it couldn't be resolved when the run started (W07-R03): its source unreachable and
+    /// never mirrored, no such ref. A job using it fails as it starts, as GitHub's fails at "Set
+    /// up job", and the run's other jobs go on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl ActionRef {

@@ -139,7 +139,7 @@ async fn start(work: &Path, ask: &Ask) -> anyhow::Result<Warm> {
         (tools, "/opt/hostedtoolcache".into()),
         (work.join("_externals"), "/__e".into()),
     ]);
-    let cli = Cli::new(&bin, config);
+    let cli = Cli::new(&bin, config).owned_by(work);
     let spec = Spec { image: image.clone(), user: docker::host_user(), ..Spec::default() };
     let said = parking_lot::Mutex::new(Vec::<String>::new());
     let containers = docker::Containers::start(cli, &ask.executor, map, &same(&dir), Some(spec), Vec::new(), None, &|m: String| said.lock().push(m)).await?;

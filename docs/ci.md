@@ -2115,10 +2115,32 @@ Gives step execution for `uses:`.
     - R02: every remote `uses:` a run can reach is pinned when the run starts, including those of
       composite actions (up to 10 deep). The pins are saved with the run's plan input, so a run
       replayed after a restart keeps them.
-    - R03: a bare mirror per action repository (`<data>/actions/<owner>__<repo>.git`). A ref
-      resolves as a tag, then a branch, then a SHA. A known pin still resolves when the source is
-      unreachable. Each pinned commit is served as a tarball (`git archive`) at
-      `/_kiln/actions/<owner>/<repo>/<sha>.tar.gz`, for a leg's token.
+    - R03: a bare mirror per action repository (`<data>/actions/<owner>__<repo>.git`). The
+      mirror is treeless (`--filter=tree:0`): it holds every commit, and git fetches a commit's
+      trees and blobs the first time it's archived. So an action with a large history
+      (`github/codeql-action`) mirrors well within the fetch's timeout; a full clone didn't. A
+      ref resolves as a tag, then a branch, then a SHA. A known pin still resolves when the
+      source is unreachable. Each pinned commit is served as a tarball (`git archive`) at
+      `/_kiln/actions/<owner>/<repo>/<sha>.tar.gz`, for a leg's token. An action that was
+      never mirrored and can't be fetched fails with "action source unreachable and not
+      mirrored". That fails only the jobs that use it, as GitHub fails them at "Set up job": each
+      one fails before it reaches a runner, with "Unable to resolve action `…`" on the leg, and
+      the run's other jobs go on. A composite's own unresolvable action fails the jobs that use
+      the composite. Policy refusals (R04) still fail the whole run as it starts.
+    - R02's `[[ci.actions.sources]]`: some owners' actions come from somewhere other than
+      GitHub, the first entry that names the owner deciding. That is either another git host
+      or one of kiln's own native repositories (W14-R01). The mirror follows a source that
+      moves.
+
+      ```toml
+      [[ci.actions.sources]]
+      owners = ["acme", "acme-*"]
+      url = "https://git.example.com/{owner}/{repo}.git"
+
+      [[ci.actions.sources]]
+      owners = ["platform"]
+      native = true
+      ```
   - `crates/kiln/src/runner/runtime.rs`, on the runner:
     - R01: `./path` and `owner/repo[/path]@ref`.
     - R05:
@@ -2127,10 +2149,15 @@ Gives step execution for `uses:`.
         `<work>/_externals`.
       - Inputs: `INPUT_*`, with defaults evaluated, and GitHub's "Unexpected input(s)" warning.
       - `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF`.
-      - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11).
+      - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11). What a pre step saves,
+        its main and post steps get, as on GitHub.
     - R07: composite actions, with their own `steps` context, inputs, outputs and nesting.
     - R08: outputs.
     - R06: Docker actions (Dockerfile and `docker://`), on hosts with Docker (W13).
+      - `runs.args` and `runs.env` are evaluated with the action's own `inputs`, as hadolint's
+        `HADOLINT_OUTPUT: ${{ inputs.output-file }}` needs.
+      - `pre-entrypoint` runs with the pre steps, before the job's steps, and
+        `post-entrypoint` with the post steps, each in a new container of the action's image.
   - `actions/checkout@v4` runs unmodified end to end against the git facade (W14).
   - R01's `$/path`: resolved to the run's own commit and served from the repository's mirror,
     to that repository's legs only. No checkout is needed.
@@ -2171,14 +2198,33 @@ Gives step execution for `uses:`.
   - **`permissions:`** above what the job grants fail the leg with `KCI4031`, which names the
     scope and the grant to add.
   - Verified end to end: an action needing `deployments: write`, used by a job that grants none.
+- *Done.* AC03 (`w07_ac03_mirror_offline`): a run with two jobs, one using a mirrored action,
+  one an action its source never had. The first job passes and the second fails with the
+  message, the run conclusion being `failure`, not a startup failure. With the source gone, the
+  next run's pin comes from the mirror, and the first job passes again.
+- *Done.* AC04 (`crates/kiln/tests/actions.rs`), on a server with its own runner, with its
+  actions from a source of the test's own (`[[ci.actions.sources]]`):
+  - a JavaScript action with `pre` and `post`;
+  - a Docker action from a Dockerfile, with `pre-entrypoint` and `post-entrypoint`;
+  - one from `docker://`;
+  - a composite three levels deep, each level calling the next by its remote name;
+  - a local `./` action.
+
+  Each gets its inputs (defaults evaluated, `with:`, `runs.args` and `runs.env`) and gives its
+  outputs, and the Docker action's file is in the workspace. An image made for GitHub's runner
+  user (`USER 1001`, as kubesec's action is) runs as this runner's user, the workspace's owner,
+  so it can write there too. Each pre step's state reaches its
+  main and post steps, and each main step's reaches its post step. They run in GitHub's order:
+  the pre steps first, in step order (`Pre js kind`, `Pre docker kind`); then the job's steps;
+  then the post steps, in reverse.
 - *Left.*
   - R01's `kiln://`.
-  - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
-    tarballs in W08's store (today they are files under `<data>/actions/tar`).
+  - The pins on the run page, "rerun with fresh actions", and storing tarballs in W08's store
+    (today they are files under `<data>/actions/tar`).
   - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
     `kiln/deploy`, `kiln/attest`, `kiln/upload` and `kiln/download`, each with its workstream.
   - musl Node for Alpine job containers, with W13.
-  - AC01 to AC06.
+  - AC01, AC02, AC05 and AC06.
 
 ### W08 Runtime services: store, caches, artifacts, reuse
 
@@ -3257,7 +3303,15 @@ enforcement points to W18, agent isolation to W20.
   - a JDK (`JAVA_HOME`) with Maven, Ant and sbt;
   - PHP with Composer;
   - Ruby with Bundler;
-  - Leiningen, pipx, Rust (rustup, rustfmt, clippy) and Node.js 22.
+  - Leiningen, pipx, Rust (rustup, rustfmt, clippy) and Node.js 22;
+  - conda at `$CONDA` (`/usr/share/miniconda`, where GitHub's Miniconda is), from conda-forge's
+    Miniforge (pinned, its checksum checked), so the image needs no Anaconda license; its base
+    environment is the `runner` user's, as the Conda starter needs;
+  - PowerShell 7.6 (`pwsh`) and the GitHub CLI (`gh`), pinned and checked against their
+    releases' sums.
+
+  On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
+  does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
 
   apt assumes yes, as GitHub's images set it. Cargo's and npm's global directories are the
   `runner` user's, so `cargo install` and `npm install -g` work. `kiln/runner-ubuntu-24.04-slim`
@@ -3268,6 +3322,19 @@ enforcement points to W18, agent isolation to W20.
   and action directories, so `docker run -v $GITHUB_WORKSPACE:/src` mounts what the step sees.
   Every docker leg on a runner has its workspace at the same depth, so a cache saved relative to
   it restores in any other.
+- *Done.* What a runner leaves behind goes:
+  - A runner's legs' networks and containers and its pools' executors carry its label. The label
+    comes from its work directory, so each runner on an engine has its own.
+  - A runner killed mid-leg, or crashed, leaves them running. When it next starts, it removes
+    everything with its label before it takes a leg, and nothing of another runner's.
+  - A start that fails partway removes what it made (a leg's network, a created container).
+  - Left behind, a leg's network holds one of the engine's few address pools until no leg on
+    the machine can start ("all predefined address pools have been fully subnetted").
+  - The engine gets ten minutes, not one, to create or start a container: a busy machine's
+    Docker takes minutes, as GitHub's runner allows.
+  - Checked: `crates/kiln/tests/leftovers.rs` kills a server mid-leg and starts it again. The
+    leg's container and network go, and another runner's network stays. A unit test fails a
+    start on a service image there is no pulling.
 - *Done.* `KILN_CONTAINER_NETWORK=host` on a runner puts a leg's job container, services and
   Docker actions on the host's network. That is for machines whose firewall drops container
   traffic to the host, such as one of the fleet's, where a container could not reach a server
@@ -3665,7 +3732,24 @@ is left.
     and deletes of jobs' own comments). A job writes as `github-actions[bot]`, an agent: its
     approval counts only where `agents-can-approve`; a comment on the whole pull request doesn't
     hold a land up. Checked with a real run (`w14_r11_pulls`);
-  - `/user`, `/rate_limit`;
+  - workflow runs as GitHub shapes them, from kiln's: `/actions/runs` (with GitHub's filters),
+    `/actions/runs/{id}`, `/actions/workflows/{id}` and `/actions/workflows/{id}/runs` (by file
+    name or number);
+  - code scanning (`crates/kiln/src/ci/rest/scanning.rs`), for W11-R10:
+    - `POST /code-scanning/sarifs` (the public API) and `PUT /code-scanning/analysis` (what
+      codeql-action uploads with) take SARIF 2.1.0 in base64, gzipped or not, up to 64 MiB
+      unpacked, read it into alerts at once and answer 202 with the upload's id;
+    - an analysis per tool, ref and commit;
+    - alerts by fingerprint on a ref (the result's `partialFingerprints`, else its rule, file,
+      line and message): a result seen again keeps its alert's number; one the same tool and
+      category no longer find is `fixed`, and open again if it comes back;
+    - the leg gets the new alerts as annotations (the first 50);
+    - `/sarifs/{id}`, `/analyses` and `/alerts` (with `/alerts/{n}`) read them back, with
+      GitHub's filters;
+    - codeql-action's feature flags (`/codeql/features`: none) and its status reports
+      (`PUT /code-scanning/analysis/status`) are answered, so
+      `github/codeql-action/upload-sarif` runs unmodified;
+  - `/user`, `/rate_limit`, `/meta`;
   - 501 "not implemented by kiln", with a warning on the leg, for everything else;
   - GraphQL answering the same;
   - GitHub-shaped run links redirected to kiln's pages.
@@ -3673,7 +3757,10 @@ is left.
     - `github-script` (statuses, checks, repository, commit, contents);
     - `docker/metadata-action`;
     - `softprops/action-gh-release` with an asset;
-    - `actions/checkout` unpacking the tarball where git is missing.
+    - `actions/checkout` unpacking the tarball where git is missing;
+    - a job reading its own run, its workflow and the runs list, then uploading SARIF twice:
+      the first upload opens an alert, the second fixes it, and a bad commit gets a 422
+      (`w14_r11_runs_and_code_scanning`).
 - *Left.* Everything else:
   - R03's `kiln absorb`;
   - the rest of R11's REST subset and GraphQL;

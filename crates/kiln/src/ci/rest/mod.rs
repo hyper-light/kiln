@@ -160,8 +160,11 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::GET, ["code-scanning", "alerts", n]) => scanning::alerts(&s, Some(n), &q).await,
             // codeql-action's status reports (how each step of it went): taken, as GitHub takes them.
             (&Method::PUT, ["code-scanning", "analysis", "status"]) => Ok(srv::status(StatusCode::NO_CONTENT)),
-            // codeql-action's feature flags: none here, so its defaults.
-            (&Method::GET, ["code-scanning", "codeql", "features"]) => Ok(srv::json(StatusCode::OK, &json!({}))),
+            // codeql-action's feature flags (asked at either path, by its version): none here, so its
+            // defaults.
+            (&Method::GET, ["code-scanning", "codeql" | "codeql-action", "features"]) => Ok(srv::json(StatusCode::OK, &json!({}))),
+            // The repository's custom properties (codeql-action reads them): none.
+            (&Method::GET, ["properties", "values"]) => Ok(srv::json(StatusCode::OK, &json!([]))),
             // W18-R02: GitHub's attestations API.
             (&Method::GET, ["attestations", digest]) => crate::ci::attest::facade_list(hub, &s.repo.id, digest, q.get("predicate_type").map(String::as_str)).await,
             (&Method::POST, ["attestations"]) => crate::ci::attest::facade_create(hub, &claims, &body(req).await?).await,

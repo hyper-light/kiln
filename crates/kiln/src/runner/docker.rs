@@ -24,7 +24,12 @@ use base64::Engine as _;
 
 /// How long pulls and builds may take.
 const SLOW: Duration = Duration::from_secs(1800);
-const QUICK: Duration = Duration::from_secs(60);
+/// How long any other call to the engine may take. Long: a busy machine's daemon can take
+/// minutes to create or start a container, and GitHub's runner waits as long as it takes; this
+/// only catches a daemon that's stuck.
+const CALL: Duration = Duration::from_secs(600);
+/// How long a runner's sweep of what it left running may take, at its start.
+const SWEEP: Duration = Duration::from_secs(60);
 /// How long services may take to become healthy.
 const HEALTHY_WITHIN: Duration = Duration::from_secs(600);
 
@@ -74,6 +79,22 @@ pub fn rootless_engine() -> bool {
     })
 }
 
+/// Who to run `image` as when it says it's GitHub's runner. GitHub's hosted runners run as uid
+/// 1001, and an image whose `USER` is 1001 means that user, the owner of the workspace it's
+/// given (kubesec's action; images made for Actions), though GitHub asks Docker actions not to set
+/// one. Here the workspace is the runner's own user's, so such an image runs as that user: root
+/// on a rootless engine, which is the host's user. `None` for any other image.
+pub async fn as_runner(cli: &Cli, image: &str) -> Option<String> {
+    let user = cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Config.User}}"), image.to_owned()], &BTreeMap::new(), CALL).await.ok()?;
+    if user != "1001" && !user.starts_with("1001:") {
+        return None;
+    }
+    if crate::rt::blocking(rootless_engine).await.unwrap_or(false) {
+        return Some(s("0:0"));
+    }
+    host_user().filter(|(uid, _)| *uid != 1001).map(|(uid, gid)| format!("{uid}:{gid}"))
+}
+
 /// A container to start, its keys evaluated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Spec {
@@ -119,8 +140,10 @@ pub fn host_user() -> Option<(u32, u32)> {
 /// network basics, that's the toolchains workflows call without a `setup-*` action: CMake,
 /// Ninja, the autotools and Clang; a JDK with Maven, Ant and sbt (`JAVA_HOME` set); PHP with
 /// Composer; Ruby and Bundler; Leiningen; pipx; Rust (rustup, with rustfmt and clippy); Node.js
-/// 22; the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04). Each
-/// comes from Ubuntu's archive or the project's own release server. apt assumes yes, as GitHub's
+/// 22; the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04); conda at
+/// `$CONDA` (`/usr/share/miniconda`, where GitHub's Miniconda is), from conda-forge's Miniforge,
+/// whose channel needs no Anaconda license. Each comes from Ubuntu's archive or the project's own
+/// release server. apt assumes yes, as GitHub's
 /// images set it, so `sudo apt-get install x` works without `-y`. `-slim` (`kiln/runner-ubuntu-24.04-slim`) is
 /// the basics alone, for rules that want a small image.
 ///
@@ -133,9 +156,10 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
     let (name, slim) = name.strip_suffix("-slim").map_or((name, false), |n| (n, true));
     // `ImageOS` as GitHub's hosted runners set it: setup-ruby, setup-beam and others pick their
     // prebuilt tools by it.
-    let (base, os) = match name {
-        "ubuntu-24.04" => ("ubuntu:24.04", "ubuntu24"),
-        "ubuntu-22.04" => ("ubuntu:22.04", "ubuntu22"),
+    // And the release's ICU, which PowerShell needs.
+    let (base, os, icu) = match name {
+        "ubuntu-24.04" => ("ubuntu:24.04", "ubuntu24", "libicu74"),
+        "ubuntu-22.04" => ("ubuntu:22.04", "ubuntu22", "libicu70"),
         _ => return None,
     };
     let mut d = format!(
@@ -161,8 +185,30 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy --no-modify-path && chmod -R a+w \"$RUSTUP_HOME\" \"$CARGO_HOME\"\n\
              RUN case \"$(dpkg --print-architecture)\" in amd64) a=x64 ;; arm64) a=arm64 ;; *) a=\"$(dpkg --print-architecture)\" ;; esac \\\n    \
              && f=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | awk -v want=\"linux-$a.tar.xz\" 'substr($2, length($2) - length(want) + 1) == want { print $2 }') \\\n    \
-             && curl -fsSL \"https://nodejs.org/dist/latest-v22.x/$f\" | tar -xJ -C /usr/local --strip-components=1 --exclude CHANGELOG.md --exclude LICENSE --exclude README.md\n",
+             && curl -fsSL \"https://nodejs.org/dist/latest-v22.x/$f\" | tar -xJ -C /usr/local --strip-components=1 --exclude CHANGELOG.md --exclude LICENSE --exclude README.md\n\
+             ENV CONDA=/usr/share/miniconda\n\
+             RUN u=\"https://github.com/conda-forge/miniforge/releases/download/26.7.2-0/Miniforge3-26.7.2-0-Linux-$(uname -m).sh\" \\\n    \
+             && curl -fsSL -o /tmp/miniforge.sh \"$u\" && echo \"$(curl -fsSL \"$u.sha256\" | cut -d' ' -f1)  /tmp/miniforge.sh\" | sha256sum -c - \\\n    \
+             && bash /tmp/miniforge.sh -b -p \"$CONDA\" && rm /tmp/miniforge.sh && ln -s \"$CONDA/bin/conda\" /usr/bin/conda\n",
         );
+        // PowerShell (`pwsh`) and the GitHub CLI (`gh`), each checked against its release's sums
+        // (PowerShell's in UTF-16).
+        d.push_str(&format!(
+            "RUN apt-get update && apt-get install -y --no-install-recommends {icu} && rm -rf /var/lib/apt/lists/* \\\n    \
+             && case \"$(dpkg --print-architecture)\" in amd64) a=x64 g=amd64 ;; arm64) a=arm64 g=arm64 ;; esac \\\n    \
+             && f=\"powershell-7.6.7-linux-$a.tar.gz\" u=https://github.com/PowerShell/PowerShell/releases/download/v7.6.7 \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"$u/$f\" && echo \"$(curl -fsSL \"$u/hashes.sha256\" | iconv -f UTF-16 -t UTF-8 | tr -d '\\r' | grep \" \\*$f$\" | cut -d' ' -f1)  /tmp/$f\" | sha256sum -c - \\\n    \
+             && mkdir -p /opt/microsoft/powershell/7 && tar -xzf \"/tmp/$f\" -C /opt/microsoft/powershell/7 && rm \"/tmp/$f\" \\\n    \
+             && chmod +x /opt/microsoft/powershell/7/pwsh && ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh \\\n    \
+             && f=\"gh_2.102.0_linux_$g.tar.gz\" u=https://github.com/cli/cli/releases/download/v2.102.0 \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"$u/$f\" && echo \"$(curl -fsSL \"$u/gh_2.102.0_checksums.txt\" | grep \"  $f$\" | cut -d' ' -f1)  /tmp/$f\" | sha256sum -c - \\\n    \
+             && tar -xzf \"/tmp/$f\" -C /tmp && install -m 0755 \"/tmp/gh_2.102.0_linux_$g/bin/gh\" /usr/local/bin/gh && rm -rf \"/tmp/$f\" \"/tmp/gh_2.102.0_linux_$g\"\n"
+        ));
+        if os == "ubuntu24" {
+            // pip installs as it does on GitHub's Ubuntu 24.04 machines, whose `/etc/pip.conf`
+            // says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
+            d.push_str("RUN printf '[global]\\nbreak-system-packages = true\\n' > /etc/pip.conf\n");
+        }
     }
     if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
         // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
@@ -170,12 +216,13 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
             "RUN u=$(getent passwd {uid} | cut -d: -f1); if [ -n \"$u\" ]; then userdel -r \"$u\" 2>/dev/null || userdel \"$u\"; fi \\\n    \
              && (getent group {gid} >/dev/null || groupadd -g {gid} runner) \\\n    \
              && useradd -m -u {uid} -g {gid} -s /bin/bash runner \\\n    \
-             && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n"
+             && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n\
+             ENV PATH=/home/runner/.local/bin:$PATH\n"
         ));
         if !slim {
             // And the directories setup actions install into without sudo, as GitHub's images
-            // let them (setup-dotnet's /usr/share/dotnet).
-            d.push_str(&format!("RUN mkdir -p /usr/share/dotnet && chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet\n"));
+            // let them (setup-dotnet's /usr/share/dotnet; conda's base environment).
+            d.push_str(&format!("RUN mkdir -p /usr/share/dotnet && chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda\n"));
         }
     }
     Some(d)
@@ -183,6 +230,52 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
 
 /// One runner image build at a time on this machine.
 static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
+
+/// The label on everything a runner starts: its legs' networks and containers, and its pools'
+/// executors. It comes from the runner's work directory, so another runner on the same engine
+/// has its own, and what a runner finds with its own label when it starts, it left behind when it
+/// last stopped ([`sweep`]).
+pub fn owner_label(work: &Path) -> String {
+    let p = std::path::absolute(work).unwrap_or_else(|_| work.to_path_buf());
+    let h = crate::util::sha256_hex(p.to_string_lossy().as_bytes());
+    format!("kiln.runner-work={}", h.get(..16).unwrap_or(&h))
+}
+
+/// Removes what this runner (`work`, its work directory) left running when it last stopped, a
+/// crash or a kill among the ways: its legs' containers and networks and its pools' executors,
+/// found by [`owner_label`]. A leg never outlives its runner (an upgrade waits for none to run),
+/// and this runs before it takes one. Left in place, a leg's network holds one of the engine's
+/// few address pools until no leg can start.
+pub async fn sweep(work: &Path) {
+    let Ok(Some(bin)) = crate::rt::blocking(find).await else { return };
+    let cli = Cli::new(&bin, work.join("_docker_config")).owned_by(work);
+    let Some(owner) = cli.owner.clone() else { return };
+    let none = BTreeMap::new();
+    let filter = [s("--filter"), format!("label={owner}")];
+    let mut ps = vec![s("ps"), s("-aq")];
+    ps.extend(filter.clone());
+    let ids: Vec<String> = cli.run(&ps, &none, SWEEP).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
+    if !ids.is_empty() {
+        let mut rm = vec![s("rm"), s("--force")];
+        rm.extend(ids.iter().cloned());
+        if let Err(e) = cli.run(&rm, &none, SWEEP).await {
+            tracing::warn!(error = %format!("{e:#}"), "what this runner left running could not be removed");
+        }
+    }
+    let mut ls = vec![s("network"), s("ls"), s("-q")];
+    ls.extend(filter);
+    let nets: Vec<String> = cli.run(&ls, &none, SWEEP).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
+    if !nets.is_empty() {
+        let mut rm = vec![s("network"), s("rm")];
+        rm.extend(nets.iter().cloned());
+        if let Err(e) = cli.run(&rm, &none, SWEEP).await {
+            tracing::warn!(error = %format!("{e:#}"), "the networks this runner left could not be removed");
+        }
+    }
+    if !ids.is_empty() || !nets.is_empty() {
+        tracing::info!(containers = ids.len(), networks = nets.len(), "removed what this runner left running when it last stopped");
+    }
+}
 
 /// The CLI, with the leg's own credential store.
 #[derive(Debug, Clone)]
@@ -192,11 +285,30 @@ pub struct Cli {
     /// kiln's registry (its host) and the registries it mirrors, `(upstream, prefix)`: images from
     /// those are pulled through kiln first (W12-R02).
     through: Option<(String, Vec<(String, String)>)>,
+    /// The runner's [`owner_label`], on everything it starts.
+    owner: Option<String>,
 }
 
 impl Cli {
     pub fn new(bin: &str, config: PathBuf) -> Cli {
-        Cli { bin: bin.to_owned(), config, through: None }
+        Cli { bin: bin.to_owned(), config, through: None, owner: None }
+    }
+
+    /// What it starts carries the label of the runner working in `work` ([`owner_label`]).
+    #[must_use]
+    pub fn owned_by(mut self, work: &Path) -> Cli {
+        self.owner = Some(owner_label(work));
+        self
+    }
+
+    /// The runner's label, when it has one.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+
+    /// `--label <owner>`, for what it starts.
+    pub fn owner_args(&self) -> Vec<String> {
+        self.owner.iter().flat_map(|o| [s("--label"), o.clone()]).collect()
     }
 
     /// Pulls go through kiln's mirrors at `host` for the registries it mirrors.
@@ -233,7 +345,7 @@ impl Cli {
             say(format!("{} pull {via} (kiln's mirror of {image})", self.bin));
             match self.run(&[s("pull"), s("--quiet"), via.clone()], &none, SLOW).await {
                 Ok(_) => {
-                    self.run(&[s("tag"), via, image.to_owned()], &none, QUICK).await?;
+                    self.run(&[s("tag"), via, image.to_owned()], &none, CALL).await?;
                     return Ok(());
                 }
                 Err(e) => say(format!("kiln's mirror didn't have it ({e:#}); pulling from its registry")),
@@ -496,7 +608,7 @@ impl Containers {
         ids.extend(self.services.iter().map(|v| (format!("service {}", v.key), v.id.clone())));
         let mut out = Vec::new();
         for (role, id) in ids {
-            if let Ok(o) = self.cli.run(&[s("inspect"), s("--format"), s("{{.Config.Image}} {{.Image}}"), id], &BTreeMap::new(), QUICK).await
+            if let Ok(o) = self.cli.run(&[s("inspect"), s("--format"), s("{{.Config.Image}} {{.Image}}"), id], &BTreeMap::new(), CALL).await
                 && let Some((name, digest)) = o.trim().split_once(' ')
             {
                 out.push((role, name.to_owned(), digest.to_owned()));
@@ -523,125 +635,146 @@ impl Containers {
         }
         if !shared {
             let mut create = vec![s("network"), s("create"), s("--label"), label.clone()];
+            create.extend(cli.owner_args());
             if egress.is_some() {
                 create.push(s("--internal"));
             }
             create.push(network.clone());
-            cli.run(&create, &none, QUICK).await?;
+            cli.run(&create, &none, CALL).await?;
         }
         let mut c = Containers { cli, network, label, job: None, services: Vec::new(), relay: None };
-        // The relay first, so the leg's way out is there before anything in it starts.
-        if let Some(e) = egress {
-            let image = job.as_ref().map(|j| j.image.clone()).or_else(|| services.first().map(|(_, x)| x.image.clone())).unwrap_or_default();
-            say(format!("Starting the egress relay (in {image})"));
-            let image = c.prepare(&image, None, say).await?;
-            c.relay = Some(c.start_relay(&short, e, &image).await?);
-        }
-        let proxy = if egress.is_some() { proxy_env(services.iter().map(|(k, _)| k.as_str())) } else { Vec::new() };
-        for spec in services.iter().map(|(_, x)| x).chain(job.iter()) {
-            if let Some((u, p)) = &spec.credentials {
-                c.cli.login(&spec.image, u, p)?;
+        // What a start that fails partway made goes with it: half a leg's containers and its
+        // network would stay otherwise, the network holding one of the engine's few address pools.
+        let filled = async {
+            // The relay first, so the leg's way out is there before anything in it starts.
+            if let Some(e) = egress {
+                let image = job.as_ref().map(|j| j.image.clone()).or_else(|| services.first().map(|(_, x)| x.image.clone())).unwrap_or_default();
+                say(format!("Starting the egress relay (in {image})"));
+                let image = c.prepare(&image, None, say).await?;
+                c.relay = Some(c.start_relay(&short, e, &image).await?);
             }
-        }
-        // Services first, so the job container can reach them by name.
-        for (key, spec) in &services {
-            if spec.image.is_empty() {
-                continue;
-            }
-            say(format!("Starting service {key} ({})", spec.image));
-            let image = c.prepare(&spec.image, None, say).await?;
-            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_{key}"), s("--label"), c.label.clone(), s("--network"), c.network.clone()];
-            if !shared {
-                args.extend([s("--network-alias"), key.clone()]);
-                for p in &spec.ports {
-                    args.extend([s("-p"), p.clone()]);
+            let proxy = if egress.is_some() { proxy_env(services.iter().map(|(k, _)| k.as_str())) } else { Vec::new() };
+            for spec in services.iter().map(|(_, x)| x).chain(job.iter()) {
+                if let Some((u, p)) = &spec.credentials {
+                    c.cli.login(&spec.image, u, p)?;
                 }
             }
-            let mut env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
-            for (k, v) in &proxy {
-                env.entry(k.clone()).or_insert_with(|| v.clone());
+            // Services first, so the job container can reach them by name.
+            for (key, spec) in &services {
+                if spec.image.is_empty() {
+                    continue;
+                }
+                say(format!("Starting service {key} ({})", spec.image));
+                let image = c.prepare(&spec.image, None, say).await?;
+                let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_{key}"), s("--label"), c.label.clone(), s("--network"), c.network.clone()];
+                args.extend(c.cli.owner_args());
+                if !shared {
+                    args.extend([s("--network-alias"), key.clone()]);
+                    for p in &spec.ports {
+                        args.extend([s("-p"), p.clone()]);
+                    }
+                }
+                let mut env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
+                for (k, v) in &proxy {
+                    env.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                for k in env.keys() {
+                    args.extend([s("-e"), k.clone()]);
+                }
+                for v in &spec.volumes {
+                    args.extend([s("-v"), v.clone()]);
+                }
+                args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
+                args.push(image);
+                let id = c.cli.run(&args, &env, CALL).await?;
+                c.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
+                c.services.push(Service { key: key.clone(), id, ports: BTreeMap::new() });
             }
-            for k in env.keys() {
-                args.extend([s("-e"), k.clone()]);
+            if let Some(spec) = &job {
+                say(format!("Starting job container ({})", spec.image));
+                // A rootless engine's root is the host user already.
+                let user = match spec.user {
+                    Some(u) if u.0 != 0 && !c.rootless().await => Some(u),
+                    _ => None,
+                };
+                let image = c.prepare(&spec.image, user, say).await?;
+                // A job's `container:` made for GitHub's runner user runs as this runner's.
+                let as_runner = if user.is_none() { as_runner(&c.cli, &image).await } else { None };
+                let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), host_alias()];
+                args.extend(c.cli.owner_args());
+                if let Some(u) = &as_runner {
+                    args.extend([s("--user"), u.clone()]);
+                }
+                if shared {
+                    // Services by name, as on a network of the leg's own.
+                    for svc in &c.services {
+                        args.extend([s("--add-host"), format!("{}:127.0.0.1", svc.key)]);
+                    }
+                }
+                if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
+                    args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
+                    // The runner user reaches it through the socket's group, as the host's user does.
+                    if user.is_some()
+                        && let Some(gid) = socket_group()
+                    {
+                        args.extend([s("--group-add"), gid.to_string()]);
+                    }
+                }
+                for m in map.mounts() {
+                    args.extend([s("-v"), m]);
+                }
+                if !shared {
+                    for p in &spec.ports {
+                        args.extend([s("-p"), p.clone()]);
+                    }
+                }
+                let env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
+                for k in env.keys() {
+                    args.extend([s("-e"), k.clone()]);
+                }
+                for v in &spec.volumes {
+                    args.extend([s("-v"), v.clone()]);
+                }
+                args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
+                args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
+                let id = c.cli.run(&args, &env, CALL).await?;
+                c.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
+                let path = c.image_path(&image).await.unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+                let has_bash = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s("command -v bash")], &none, CALL).await.is_ok_and(|o| !o.is_empty());
+                let (user, home) = match user {
+                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
+                    None => (as_runner, "/github/home".to_owned()),
+                };
+                c.job = Some(JobContainer { id, user, home, path, has_bash, map });
             }
-            for v in &spec.volumes {
-                args.extend([s("-v"), v.clone()]);
+            // Health checks, then the ports the host got.
+            let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();
+            for (key, id) in ids {
+                c.healthy(&key, &id, say).await?;
             }
-            args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
-            args.push(image);
-            let id = c.cli.run(&args, &env, QUICK).await?;
-            c.cli.run(&[s("start"), id.clone()], &none, QUICK).await?;
-            c.services.push(Service { key: key.clone(), id, ports: BTreeMap::new() });
-        }
-        if let Some(spec) = &job {
-            say(format!("Starting job container ({})", spec.image));
-            // A rootless engine's root is the host user already.
-            let user = match spec.user {
-                Some(u) if u.0 != 0 && !c.rootless().await => Some(u),
-                _ => None,
-            };
-            let image = c.prepare(&spec.image, user, say).await?;
-            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), host_alias()];
-            if shared {
-                // Services by name, as on a network of the leg's own.
-                for svc in &c.services {
-                    args.extend([s("--add-host"), format!("{}:127.0.0.1", svc.key)]);
+            for i in 0..c.services.len() {
+                let id = c.services.get(i).map(|x| x.id.clone()).unwrap_or_default();
+                // On the host's network a service listens on its own ports.
+                let ports = if shared {
+                    let key = c.services.get(i).map(|x| x.key.clone()).unwrap_or_default();
+                    let spec = services.iter().find(|(k, _)| *k == key).map(|(_, x)| x.ports.clone()).unwrap_or_default();
+                    spec.iter().filter_map(|p| p.rsplit(':').next()).map(|p| p.split('/').next().unwrap_or(p)).filter(|p| !p.is_empty()).map(|p| (p.to_owned(), p.to_owned())).collect()
+                } else {
+                    c.ports(&id).await
+                };
+                if let Some(x) = c.services.get_mut(i) {
+                    x.ports = ports;
                 }
             }
-            if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
-                args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
-                // The runner user reaches it through the socket's group, as the host's user does.
-                if user.is_some()
-                    && let Some(gid) = socket_group()
-                {
-                    args.extend([s("--group-add"), gid.to_string()]);
-                }
-            }
-            for m in map.mounts() {
-                args.extend([s("-v"), m]);
-            }
-            if !shared {
-                for p in &spec.ports {
-                    args.extend([s("-p"), p.clone()]);
-                }
-            }
-            let env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
-            for k in env.keys() {
-                args.extend([s("-e"), k.clone()]);
-            }
-            for v in &spec.volumes {
-                args.extend([s("-v"), v.clone()]);
-            }
-            args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
-            args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
-            let id = c.cli.run(&args, &env, QUICK).await?;
-            c.cli.run(&[s("start"), id.clone()], &none, QUICK).await?;
-            let path = c.image_path(&image).await.unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
-            let has_bash = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s("command -v bash")], &none, QUICK).await.is_ok_and(|o| !o.is_empty());
-            let (user, home) = match user {
-                Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
-                None => (None, "/github/home".to_owned()),
-            };
-            c.job = Some(JobContainer { id, user, home, path, has_bash, map });
+            Ok::<(), anyhow::Error>(())
         }
-        // Health checks, then the ports the host got.
-        let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();
-        for (key, id) in ids {
-            c.healthy(&key, &id, say).await?;
-        }
-        for i in 0..c.services.len() {
-            let id = c.services.get(i).map(|x| x.id.clone()).unwrap_or_default();
-            // On the host's network a service listens on its own ports.
-            let ports = if shared {
-                let key = c.services.get(i).map(|x| x.key.clone()).unwrap_or_default();
-                let spec = services.iter().find(|(k, _)| *k == key).map(|(_, x)| x.ports.clone()).unwrap_or_default();
-                spec.iter().filter_map(|p| p.rsplit(':').next()).map(|p| p.split('/').next().unwrap_or(p)).filter(|p| !p.is_empty()).map(|p| (p.to_owned(), p.to_owned())).collect()
-            } else {
-                c.ports(&id).await
-            };
-            if let Some(x) = c.services.get_mut(i) {
-                x.ports = ports;
+        .await;
+        if let Err(e) = filled {
+            c.stop().await;
+            if egress.is_some() && c.relay.is_none() {
+                let _ = c.cli.run(&[s("network"), s("rm"), format!("{}_out", c.network)], &none, CALL).await;
             }
+            return Err(e);
         }
         Ok(c)
     }
@@ -650,9 +783,9 @@ impl Containers {
     async fn rootless(&self) -> bool {
         let none = BTreeMap::new();
         if self.cli.bin.ends_with("podman") {
-            return self.cli.run(&[s("info"), s("--format"), s("{{.Host.Security.Rootless}}")], &none, QUICK).await.is_ok_and(|o| o == "true");
+            return self.cli.run(&[s("info"), s("--format"), s("{{.Host.Security.Rootless}}")], &none, CALL).await.is_ok_and(|o| o == "true");
         }
-        self.cli.run(&[s("info"), s("--format"), s("{{json .SecurityOptions}}")], &none, QUICK).await.is_ok_and(|o| o.contains("rootless"))
+        self.cli.run(&[s("info"), s("--format"), s("{{json .SecurityOptions}}")], &none, CALL).await.is_ok_and(|o| o.contains("rootless"))
     }
 
     /// The image to run `image` as: kiln's runner images are built here, tagged by their
@@ -663,7 +796,7 @@ impl Containers {
             let _g = IMAGE_BUILD.lock().await;
             let digest = crate::util::sha256_hex(dockerfile.as_bytes());
             let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
-            if self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), QUICK).await.is_ok() {
+            if self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
                 return Ok(tag);
             }
             let owner = user.map_or_else(|| "0".to_owned(), |(uid, _)| uid.to_string());
@@ -695,17 +828,17 @@ impl Containers {
         let mut args = vec![s("image"), s("ls")];
         args.extend(filters);
         args.extend([s("--format"), s("{{.Repository}}:{{.Tag}}")]);
-        let Ok(out) = self.cli.run(&args, &none, QUICK).await else { return };
+        let Ok(out) = self.cli.run(&args, &none, CALL).await else { return };
         let old: Vec<String> = out.lines().map(str::trim).filter(|t| !t.is_empty() && *t != keep && !t.ends_with(":<none>")).map(str::to_owned).collect();
         for t in old {
-            if self.cli.run(&[s("image"), s("rm"), t.clone()], &none, QUICK).await.is_ok() {
+            if self.cli.run(&[s("image"), s("rm"), t.clone()], &none, CALL).await.is_ok() {
                 tracing::info!(image = %t, "removed an older build of a runner image");
             }
         }
     }
 
     async fn image_path(&self, image: &str) -> Option<String> {
-        let out = self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{json .Config.Env}}"), image.to_owned()], &BTreeMap::new(), QUICK).await.ok()?;
+        let out = self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{json .Config.Env}}"), image.to_owned()], &BTreeMap::new(), CALL).await.ok()?;
         let env: Vec<String> = serde_json::from_str(&out).ok()?;
         env.iter().find_map(|e| e.strip_prefix("PATH=")).map(str::to_owned)
     }
@@ -716,7 +849,8 @@ impl Containers {
         let start = std::time::Instant::now();
         let mut wait = Duration::from_secs(1);
         loop {
-            let status = self.cli.run(&[s("inspect"), s("--format"), fmt.clone(), id.to_owned()], &BTreeMap::new(), QUICK).await.unwrap_or_default();
+            // No answer isn't "no health check": ask again.
+            let status = self.cli.run(&[s("inspect"), s("--format"), fmt.clone(), id.to_owned()], &BTreeMap::new(), CALL).await.unwrap_or_else(|e| format!("not answering ({e:#})"));
             match status.as_str() {
                 "" => return Ok(()),
                 "healthy" => {
@@ -737,7 +871,7 @@ impl Containers {
 
     /// `docker port <id>`: container port to host port.
     async fn ports(&self, id: &str) -> BTreeMap<String, String> {
-        let out = self.cli.run(&[s("port"), id.to_owned()], &BTreeMap::new(), QUICK).await.unwrap_or_default();
+        let out = self.cli.run(&[s("port"), id.to_owned()], &BTreeMap::new(), CALL).await.unwrap_or_default();
         parse_ports(&out)
     }
 
@@ -755,38 +889,43 @@ impl Containers {
     async fn start_relay(&self, short: &str, e: &EgressSpec, image: &str) -> anyhow::Result<(String, u16)> {
         let none = BTreeMap::new();
         let out = format!("kiln_{short}_out");
-        self.cli.run(&[s("network"), s("create"), s("--label"), self.label.clone(), out.clone()], &none, QUICK).await?;
-        let args = vec![
-            s("create"), s("--name"), format!("kiln_{short}_egress"), s("--label"), self.label.clone(), s("--network"), out.clone(),
+        let mut net = vec![s("network"), s("create"), s("--label"), self.label.clone()];
+        net.extend(self.cli.owner_args());
+        net.push(out.clone());
+        self.cli.run(&net, &none, CALL).await?;
+        let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_egress"), s("--label"), self.label.clone()];
+        args.extend(self.cli.owner_args());
+        args.extend([
+            s("--network"), out.clone(),
             s("-p"), format!("127.0.0.1::{}", super::egress::RUNNER_PORT), s("-e"), s("KILN_EGRESS_TOKEN"),
             s("-v"), format!("{}:/kiln-egress:ro", e.binary.display()), s("--entrypoint"), s("/kiln-egress"),
             // Nothing it needs but its two ports.
             s("--user"), s("65534:65534"), s("--read-only"), s("--cap-drop"), s("ALL"), s("--security-opt"), s("no-new-privileges"),
             image.to_owned(), s("egress-relay"),
-        ];
+        ]);
         let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), e.token.clone())].into();
-        let id = self.cli.run(&args, &env, QUICK).await?;
-        self.cli.run(&[s("network"), s("connect"), s("--alias"), s(super::egress::ALIAS), self.network.clone(), id.clone()], &none, QUICK).await?;
-        self.cli.run(&[s("start"), id.clone()], &none, QUICK).await?;
-        let ports = parse_ports(&self.cli.run(&[s("port"), id], &none, QUICK).await?);
+        let id = self.cli.run(&args, &env, CALL).await?;
+        self.cli.run(&[s("network"), s("connect"), s("--alias"), s(super::egress::ALIAS), self.network.clone(), id.clone()], &none, CALL).await?;
+        self.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
+        let ports = parse_ports(&self.cli.run(&[s("port"), id], &none, CALL).await?);
         let port = ports.get(&super::egress::RUNNER_PORT.to_string()).and_then(|p| p.parse().ok()).ok_or_else(|| anyhow::anyhow!("the egress relay's port wasn't published"))?;
         Ok((out, port))
     }
 
     pub async fn stop(&self) {
         let none = BTreeMap::new();
-        let ids = self.cli.run(&[s("ps"), s("-aq"), s("--filter"), format!("label={}", self.label)], &none, QUICK).await.unwrap_or_default();
+        let ids = self.cli.run(&[s("ps"), s("-aq"), s("--filter"), format!("label={}", self.label)], &none, CALL).await.unwrap_or_default();
         let ids: Vec<String> = ids.lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
         if !ids.is_empty() {
             let mut args = vec![s("rm"), s("--force")];
             args.extend(ids);
-            if let Err(e) = self.cli.run(&args, &none, QUICK).await {
+            if let Err(e) = self.cli.run(&args, &none, CALL).await {
                 tracing::warn!(error = %format!("{e:#}"), "the leg's containers could not be removed");
             }
         }
         let relay = self.relay.as_ref().map(|(n, _)| n.clone());
         for network in std::iter::once(self.network.clone()).filter(|n| n != "host").chain(relay) {
-            if let Err(e) = self.cli.run(&[s("network"), s("rm"), network], &none, QUICK).await {
+            if let Err(e) = self.cli.run(&[s("network"), s("rm"), network], &none, CALL).await {
                 tracing::warn!(error = %format!("{e:#}"), "the leg's network could not be removed");
             }
         }
@@ -815,7 +954,7 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
         return Ok(i.to_owned());
     }
     let none = BTreeMap::new();
-    if cli.run(&[s("image"), s("inspect"), tag.to_owned()], &none, QUICK).await.is_ok() {
+    if cli.run(&[s("image"), s("inspect"), tag.to_owned()], &none, CALL).await.is_ok() {
         return Ok(tag.to_owned());
     }
     let dockerfile = dir.join(image);
@@ -828,8 +967,15 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
 /// `docker run` for a Docker action's step, with GitHub's mounts: its arguments (the values
 /// come by name from `env`).
 #[allow(clippy::too_many_arguments)]
-pub fn action_run_args(name: &str, label: &str, network: Option<&str>, mounts: &[String], env: &BTreeMap<String, String>, entrypoint: Option<&str>, image: &str, args: &[String]) -> Vec<String> {
-    let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned(), s("--label"), label.to_owned(), s("--workdir"), s("/github/workspace"), s("--add-host"), host_alias()];
+pub fn action_run_args(name: &str, labels: &[String], user: Option<&str>, network: Option<&str>, mounts: &[String], env: &BTreeMap<String, String>, entrypoint: Option<&str>, image: &str, args: &[String]) -> Vec<String> {
+    let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned()];
+    for l in labels {
+        a.extend([s("--label"), l.clone()]);
+    }
+    if let Some(u) = user {
+        a.extend([s("--user"), u.to_owned()]);
+    }
+    a.extend([s("--workdir"), s("/github/workspace"), s("--add-host"), host_alias()]);
     if let Some(n) = network {
         a.extend([s("--network"), n.to_owned()]);
     } else if host_network() {
@@ -856,6 +1002,28 @@ pub fn action_run_args(name: &str, label: &str, network: Option<&str>, mounts: &
 mod tests {
     use super::*;
 
+    /// A start that fails partway takes what it made with it: here the leg's network, made before
+    /// a service whose image there is no pulling.
+    #[test]
+    fn a_failed_start_leaves_nothing() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        if host_network() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let leg = format!("test-failed-start-{}", std::process::id());
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let services = vec![("db".to_owned(), Spec { image: "kiln-test/no-such-image:never".into(), ..Spec::default() })];
+        let (failed, left) = crate::rt::block_on(async move {
+            let failed = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/w", None, services, None, &|_| {}).await.is_err();
+            let filter = [s("network"), s("ls"), s("-q"), s("--filter"), format!("label=kiln.leg={leg}")];
+            Ok((failed, cli.run(&filter, &BTreeMap::new(), CALL).await?))
+        })?;
+        assert!(failed, "a service with no image can't start");
+        assert!(left.is_empty(), "the leg's network is gone: {left}");
+        Ok(())
+    }
+
     #[test]
     fn w12_r02_pulls_through_kiln() {
         let cli = Cli::new("docker", PathBuf::from("/tmp/x")).through("kiln.example:7070", vec![("docker.io".into(), "docker.io".into()), ("ghcr.io".into(), "gh".into())]);
@@ -877,17 +1045,18 @@ mod tests {
         // The full image: GitHub's toolchains that workflows call without a setup action.
         let full = runner_dockerfile("kiln/runner-ubuntu-24.04", None).unwrap_or_default();
         assert!(full.starts_with(&d), "the full image starts as the slim one");
-        for tool in ["cmake", "clang", "maven", "ant", "sbt", "composer", "ruby-full", "ruby-bundler", "leiningen", "sh.rustup.rs", "nodejs.org/dist/latest-v22.x", "JAVA_HOME=", "Assume-Yes", "docker-buildx", "docker-compose"] {
+        for tool in ["cmake", "clang", "maven", "ant", "sbt", "composer", "ruby-full", "ruby-bundler", "leiningen", "sh.rustup.rs", "nodejs.org/dist/latest-v22.x", "JAVA_HOME=", "Assume-Yes", "docker-buildx", "docker-compose", "CONDA=/usr/share/miniconda", "conda-forge/miniforge", "/usr/bin/pwsh", "libicu74", "cli/cli/releases", "break-system-packages"] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
         assert!(full.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {full}");
-        assert!(runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default().contains(" ImageOS=ubuntu22\n"));
+        let jammy = runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default();
+        assert!(jammy.contains(" ImageOS=ubuntu22\n") && jammy.contains("libicu70") && !jammy.contains("break-system-packages"), "{jammy}");
         assert!(runner_dockerfile("ubuntu:24.04", None).is_none());
         assert!(runner_dockerfile("kiln/runner-centos", None).is_none());
         // The host's user, with sudo; root stays root.
         let u = runner_dockerfile("kiln/runner-ubuntu-24.04", Some((1000, 1000))).unwrap_or_default();
         assert!(u.contains("useradd -m -u 1000 -g 1000 -s /bin/bash runner") && u.contains("NOPASSWD:ALL"), "{u}");
-        assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet"), "{u}");
+        assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
     }
 

@@ -158,12 +158,19 @@ fn json_text(v: &serde_json::Value) -> String {
 #[derive(Clone)]
 struct Post {
     name: String,
-    node: PathBuf,
-    script: PathBuf,
+    run: PostRun,
     env: BTreeMap<String, String>,
     cond: Option<Tpl>,
     wd: PathBuf,
     uses: String,
+}
+
+/// What a post step runs: a JavaScript action's `post`, or a Docker action's `post-entrypoint`
+/// in a new container of its image (W07-R06).
+#[derive(Clone)]
+enum PostRun {
+    Node { node: PathBuf, script: PathBuf },
+    Container { image: String, entrypoint: String },
 }
 
 /// Where an action is, once fetched.
@@ -306,6 +313,17 @@ fn str_map(m: &BTreeMap<String, String>) -> Value {
     Value::object(m.iter().map(|(k, v)| (k.clone(), Value::str(v))))
 }
 
+/// An action's `runs.env`, evaluated with its own `inputs` in context, as GitHub evaluates it (a
+/// Docker action's `HADOLINT_OUTPUT: ${{ inputs.output-file }}`).
+fn runs_env(st: &mut State, action: &kiln_ci::wf::Action, inputs: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let saved = st.base.clone();
+    st.base.retain(|(k, _)| *k != "inputs");
+    st.base.push(("inputs", str_map(inputs)));
+    let env = action.runs.env.iter().map(|(k, t)| (k.clone(), st.render(t, Site::StepEnv, &format!("runs.env.{k}")).unwrap_or_else(|_| t.src.clone()))).collect();
+    st.base = saved;
+    env
+}
+
 /// The leg's state as its steps change it.
 #[derive(Clone)]
 struct State {
@@ -331,6 +349,11 @@ struct State {
     /// background processes alive until the job ends).
     groups: Vec<i32>,
     posts: Vec<Post>,
+    /// What each step's pre step saved (`$GITHUB_STATE`), by the step's index: its main and post
+    /// steps get it as `STATE_*`, as GitHub's do.
+    pre_state: BTreeMap<u32, Vec<(String, String)>>,
+    /// The running step's, taken by its action.
+    action_state: Vec<(String, String)>,
     /// The index the next pre or post step gets (after the job's own steps).
     next_idx: u32,
     /// `GITHUB_SERVER_URL` as the leg reaches it, which [`NOT_GHES`] stands in for.
@@ -985,6 +1008,8 @@ impl Leg {
             allow_unsecure: false,
             groups: Vec::new(),
             posts: Vec::new(),
+            pre_state: BTreeMap::new(),
+            action_state: Vec::new(),
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
             containers: None,
@@ -1348,6 +1373,8 @@ impl Leg {
     /// continue-on-error, run, environment files, outcome and conclusion.
     /// `nested`: a composite action's step, which reports into its caller's step.
     async fn step(&self, st: &mut State, idx: u32, step: &Step, job_deadline: Instant, nested: bool) -> Option<End> {
+        // What this step's pre step saved, for its action (pre steps are the job's steps' own).
+        st.action_state = if nested { Vec::new() } else { st.pre_state.remove(&idx).unwrap_or_default() };
         // ID tokens minted since the last step (W11-R03): masked before it can print them.
         if let Some(r) = st.refresh.clone() {
             for t in r.take_fresh() {
@@ -1773,7 +1800,7 @@ impl Leg {
         // Images from the registries kiln mirrors come through it, signed in with the job's token
         // (W12-R02).
         let own = crate::githost::host_of(if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url });
-        let cli = super::docker::Cli::new(&bin, config).through(&own, a.runtime.mirrors.clone());
+        let cli = super::docker::Cli::new(&bin, config).owned_by(&self.work_dir).through(&own, a.runtime.mirrors.clone());
         if !a.runtime.mirrors.is_empty()
             && let Err(e) = cli.login(&format!("{own}/kiln"), "kiln", &a.runtime.github_token)
         {
@@ -1895,9 +1922,11 @@ impl Leg {
             inner.insert("HOME".into(), "/github/home".into());
             inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
             let network = st.containers.as_ref().map(|c| c.network.clone());
-            let label = format!("kiln.leg={}", self.a.job_id);
+            let labels: Vec<String> = std::iter::once(format!("kiln.leg={}", self.a.job_id)).chain(cli.owner().map(str::to_owned)).collect();
             let name = format!("kiln_{}_{}", self.a.job_id, id.get(id.len().saturating_sub(8)..).unwrap_or(&id));
-            let run_args = super::docker::action_run_args(&name, &label, network.as_deref(), &map.mounts(), &inner, entrypoint.as_deref(), &image, &args);
+            // An image made for GitHub's runner user runs as this runner's (the workspace's owner).
+            let user = super::docker::as_runner(&cli, &image).await;
+            let run_args = super::docker::action_run_args(&name, &labels, user.as_deref(), network.as_deref(), &map.mounts(), &inner, entrypoint.as_deref(), &image, &args);
             let mut c = Command::new(&cli.bin);
             c.args(&run_args).envs(&inner);
             c
@@ -2585,7 +2614,7 @@ impl Leg {
         let config = st.layout.temp.join("_docker_config");
         let c = config.clone();
         crate::rt::blocking(move || std::fs::create_dir_all(c)).await??;
-        Ok(super::docker::Cli::new(&bin, config))
+        Ok(super::docker::Cli::new(&bin, config).owned_by(&self.work_dir))
     }
 
     /// A built-in kiln action (W07-R10), run here.
@@ -3066,9 +3095,10 @@ impl Leg {
         aenv.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
         aenv.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
         aenv.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
-        for (k, t) in &action.runs.env {
-            aenv.insert(k.clone(), st.render(t, Site::StepEnv, &format!("runs.env.{k}")).unwrap_or_else(|_| t.src.clone()));
+        for (k, v) in std::mem::take(&mut st.action_state) {
+            aenv.insert(format!("STATE_{k}"), v);
         }
+        aenv.extend(runs_env(st, action, &inputs));
         match action.runs.using.as_str() {
             "node12" | "node16" | "node20" | "node24" => {
                 let node = self.node(&action.runs.using).await?;
@@ -3085,23 +3115,16 @@ impl Leg {
                         penv.insert(format!("STATE_{k}"), v.clone());
                     }
                     let name = action.name.clone().unwrap_or_else(|| uses.to_owned());
-                    st.posts.push(Post { name: format!("Post {name}"), node, script: loc.dir.join(post), env: penv, cond: action.runs.post_if.clone(), wd: wd.to_path_buf(), uses: uses.to_owned() });
+                    st.posts.push(Post { name: format!("Post {name}"), run: PostRun::Node { node, script: loc.dir.join(post) }, env: penv, cond: action.runs.post_if.clone(), wd: wd.to_path_buf(), uses: uses.to_owned() });
                 }
                 Ok(ran)
             }
             "composite" => Box::pin(self.composite(st, idx, action, loc, &inputs, aenv, deadline)).await,
             "docker" => {
-                // A Docker action (W07-R06): its image built or pulled, then run with GitHub's mounts.
-                let cli = self.cli(st).await?;
-                let spec_image = action.runs.image.clone().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
-                let tag = format!("kiln-action/{}:{}", if loc.repo.is_empty() { "local".to_owned() } else { loc.repo.to_ascii_lowercase().replace('/', "-") }, crate::util::sha256_hex(loc.dir.to_string_lossy().as_bytes()).get(..12).unwrap_or("latest"));
-                let said = parking_lot::Mutex::new(Vec::<String>::new());
-                let image = super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await;
-                let lines = std::mem::take(&mut *said.lock());
-                for line in lines {
-                    self.log(idx, format!("{line}\r\n").into_bytes()).await;
-                }
-                let image = image?;
+                // A Docker action (W07-R06): its image built or pulled, then run with GitHub's
+                // mounts. Its `pre-entrypoint` ran with the pre steps; its `post-entrypoint` runs
+                // with the post steps, as GitHub runs them.
+                let (cli, image) = self.docker_action_image(st, idx, uses, action, loc).await?;
                 // `runs.args` see the action's own `inputs`.
                 let saved = st.base.clone();
                 st.base.retain(|(k, _)| *k != "inputs");
@@ -3109,18 +3132,14 @@ impl Leg {
                 let args: Result<Vec<String>, String> = action.runs.args.iter().map(|t| st.render(t, Site::StepWith, "runs.args")).collect();
                 st.base = saved;
                 let args = args.map_err(anyhow::Error::msg)?;
-                if let Some(pre) = action.runs.pre_entrypoint.clone().filter(|e| !e.is_empty()) {
-                    let r = self.exec(st, idx, Run::Container { cli: cli.clone(), image: image.clone(), entrypoint: Some(pre), args: Vec::new() }, wd, aenv.clone(), deadline).await?;
-                    if r.end != End::Exit(Some(0)) {
-                        return Ok(r);
-                    }
-                }
-                let ran = self.exec(st, idx, Run::Container { cli: cli.clone(), image: image.clone(), entrypoint: action.runs.entrypoint.clone(), args }, wd, aenv.clone(), deadline).await?;
+                let ran = self.exec(st, idx, Run::Container { cli, image: image.clone(), entrypoint: action.runs.entrypoint.clone(), args }, wd, aenv.clone(), deadline).await?;
                 if let Some(post) = action.runs.post_entrypoint.clone().filter(|e| !e.is_empty()) {
-                    let r = self.exec(st, idx, Run::Container { cli, image, entrypoint: Some(post), args: Vec::new() }, wd, aenv, deadline).await?;
-                    if r.end != End::Exit(Some(0)) {
-                        return Ok(r);
+                    let mut penv = aenv;
+                    for (k, v) in &ran.state {
+                        penv.insert(format!("STATE_{k}"), v.clone());
                     }
+                    let name = action.name.clone().unwrap_or_else(|| uses.to_owned());
+                    st.posts.push(Post { name: format!("Post {name}"), run: PostRun::Container { image, entrypoint: post }, env: penv, cond: action.runs.post_if.clone(), wd: wd.to_path_buf(), uses: uses.to_owned() });
                 }
                 Ok(ran)
             }
@@ -3180,10 +3199,26 @@ impl Leg {
         Ok(Ran { end, outputs, state: Vec::new() })
     }
 
-    /// Pre steps (W06-R11): every remote JavaScript action's `pre`, before the job's steps, in
-    /// step order, under `pre-if` (default `always()`).
+    /// A Docker action's image (W07-R06): built from its Dockerfile (tagged by where the action
+    /// is, so once per pin) or pulled, what the engine said on the step's log.
+    async fn docker_action_image(&self, st: &State, idx: u32, uses: &str, action: &kiln_ci::wf::Action, loc: &Located) -> anyhow::Result<(super::docker::Cli, String)> {
+        let cli = self.cli(st).await?;
+        let spec_image = action.runs.image.clone().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
+        let tag = format!("kiln-action/{}:{}", if loc.repo.is_empty() { "local".to_owned() } else { loc.repo.to_ascii_lowercase().replace('/', "-") }, crate::util::sha256_hex(loc.dir.to_string_lossy().as_bytes()).get(..12).unwrap_or("latest"));
+        let said = parking_lot::Mutex::new(Vec::<String>::new());
+        let image = super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await;
+        let lines = std::mem::take(&mut *said.lock());
+        for line in lines {
+            self.log(idx, format!("{line}\r\n").into_bytes()).await;
+        }
+        Ok((cli, image?))
+    }
+
+    /// Pre steps (W06-R11, W07-R06): every remote action's `pre` (JavaScript) or
+    /// `pre-entrypoint` (Docker), before the job's steps, in step order, under `pre-if` (default
+    /// `always()`). What one saves (`$GITHUB_STATE`) its main and post steps get as `STATE_*`.
     async fn pre_steps(&self, st: &mut State, deadline: Instant) {
-        for step in &self.a.steps {
+        for (pos, step) in self.a.steps.iter().enumerate() {
             let Some(uses) = &step.uses else { continue };
             if uses.starts_with("./") || uses.starts_with("docker://") || !self.a.actions.contains_key(uses) {
                 continue;
@@ -3191,10 +3226,13 @@ impl Leg {
             let Ok(loc) = self.locate(uses).await else { continue };
             let dir = loc.dir.clone();
             let Ok(Ok(action)) = crate::rt::blocking(move || load_action(&dir)).await else { continue };
-            let Some(pre) = &action.runs.pre else { continue };
-            if !action.runs.using.starts_with("node") {
-                continue;
-            }
+            let docker = action.runs.using == "docker";
+            let pre = match action.runs.using.as_str() {
+                "docker" => action.runs.pre_entrypoint.clone().filter(|e| !e.is_empty()),
+                u if u.starts_with("node") => action.runs.pre.clone(),
+                _ => None,
+            };
+            let Some(pre) = pre else { continue };
             let run = match &action.runs.pre_if {
                 Some(t) => st.condition(Some(t)).unwrap_or(false),
                 None => true,
@@ -3216,14 +3254,26 @@ impl Leg {
             env.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
             env.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
             env.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
-            let (dir, script) = (loc.dir.clone(), pre.clone());
-            if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
-                env.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
-            }
-            let r = match self.node(&action.runs.using).await {
-                Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &st.layout.workspace.clone(), env, deadline).await,
-                Err(e) => Err(e),
+            env.extend(runs_env(st, &action, &inputs));
+            let ws = st.layout.workspace.clone();
+            let r = if docker {
+                match self.docker_action_image(st, idx, uses, &action, &loc).await {
+                    Ok((cli, image)) => self.exec(st, idx, Run::Container { cli, image, entrypoint: Some(pre), args: Vec::new() }, &ws, env, deadline).await,
+                    Err(e) => Err(e),
+                }
+            } else {
+                let (dir, script) = (loc.dir.clone(), pre.clone());
+                if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
+                    env.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
+                }
+                match self.node(&action.runs.using).await {
+                    Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &ws, env, deadline).await,
+                    Err(e) => Err(e),
+                }
             };
+            if let Ok(ran) = &r {
+                st.pre_state.insert(u32::try_from(pos).unwrap_or(u32::MAX), ran.state.clone());
+            }
             let ok = matches!(r, Ok(Ran { end: End::Exit(Some(0)), .. }));
             if let Err(e) = &r {
                 self.note(idx, &format!("Error: {e:#}")).await;
@@ -3254,7 +3304,13 @@ impl Leg {
                 self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Skipped, conclusion: Conclusion::Skipped, exit_code: None, outputs: BTreeMap::new() }).await;
                 continue;
             }
-            let r = self.exec(st, idx, Run::Program { prog: p.node.to_string_lossy().to_string(), args: vec![p.script.to_string_lossy().to_string()] }, &p.wd, p.env, deadline).await;
+            let r = match p.run {
+                PostRun::Node { node, script } => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![script.to_string_lossy().to_string()] }, &p.wd, p.env, deadline).await,
+                PostRun::Container { image, entrypoint } => match self.cli(st).await {
+                    Ok(cli) => self.exec(st, idx, Run::Container { cli, image, entrypoint: Some(entrypoint), args: Vec::new() }, &p.wd, p.env, deadline).await,
+                    Err(e) => Err(e),
+                },
+            };
             let ok = matches!(r, Ok(Ran { end: End::Exit(Some(0)), .. }));
             if let Err(e) = &r {
                 self.note(idx, &format!("Error: {e:#}")).await;

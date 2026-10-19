@@ -1110,6 +1110,10 @@ jobs:
           api "$wf" | grep -q '"state":"active"'
           api "$R/actions/runs?event=push" | grep -q '"total_count":1'
           api "$GITHUB_API_URL/meta" > /dev/null
+          # What codeql-action asks before it analyzes: its features (none) and the repository's
+          # custom properties (none).
+          test "$(api "$R/code-scanning/codeql-action/features")" = "{}"
+          test "$(api "$R/properties/values")" = "[]"
           sarif() { printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Lint","rules":[{"id":"no-eval","defaultConfiguration":{"level":"error"}}]}},"results":[%s]}]}' "$1" | gzip -c | base64 -w0; }
           found='{"ruleId":"no-eval","message":{"text":"eval is evil"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/a.js"},"region":{"startLine":3}}}]}'
           up() { api -X POST "$R/code-scanning/sarifs" -d "{\"commit_sha\":\"$GITHUB_SHA\",\"ref\":\"$GITHUB_REF\",\"sarif\":\"$(sarif "$1")\",\"tool_name\":\"Lint\"}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'; }

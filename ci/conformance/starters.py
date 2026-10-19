@@ -11,7 +11,8 @@ result, with the reason for every one that didn't pass or didn't run.
         --token-file <data_dir>/admin.token --repo-dir <the repository's work tree> --repo acme/starters
 
 The repository must be one the server polls (`[[repos]]`) with GitHub workflows on, and the
-server's runners must route `ubuntu-latest` (`[ci] github_labels = true`).
+server's runners must route `ubuntu-latest` (`[ci] github_labels = true`) and give its legs
+Docker, as GitHub's hosted runners have it (`[[ci.routing]]` with `docker = "socket"`, W13-R04).
 """
 
 import argparse
@@ -36,9 +37,14 @@ OUT = os.path.join(ROOT, "docs", "ci-conformance.md")
 # GitHub fills these in when a starter is added to a repository.
 PLACEHOLDERS = {
     "$default-branch": "main",
-    "$protected-branches": "[ main ]",
+    # Always inside a flow list (`branches: [ $default-branch, $protected-branches ]`): one name.
+    "$protected-branches": "main",
     "$cron-daily": "0 0 * * *",
     "$cron-weekly": "0 0 * * 0",
+    # CodeQL's languages, as GitHub fills them in for the languages it finds; one is enough to run
+    # CodeQL end to end (each language's leg downloads its bundle). On its own line, under
+    # `matrix:`.
+    "$codeql-languages-matrix": "include:\n        - language: python\n          build-mode: none",
 }
 
 # Starters this run leaves out, and why. Everything not here and not caught by a family's rule
@@ -63,6 +69,10 @@ NOT_RUN = {
     "automation_label.yml": "labels pull requests through GitHub's REST API: not in kiln's facade yet (W14)",
     "automation_stale.yml": "closes stale issues through GitHub's REST API: not in kiln's facade yet (W14)",
     "automation_summary.yml": "summarizes issues with GitHub Models: needs an account",
+    "code-scanning_clj-watson.yml": "reads GitHub's advisory database through github.com's GraphQL API: needs a token for GitHub itself",
+    "code-scanning_detekt.yml": "asks github.com's GraphQL API for detekt's release (`gh api graphql`): needs a token for GitHub itself, which a kiln job's isn't",
+    "code-scanning_endorlabs.yml": "scans with Endor Labs: needs an Endor Labs account (its namespace)",
+    "code-scanning_ethicalcheck.yml": "tests an API with APIsec's EthicalCheck: needs an APIsec account (and its action's repository is gone from GitHub)",
 }
 
 # Why a run that doesn't pass doesn't, when kiln isn't the reason: each fails the same way on
@@ -76,7 +86,15 @@ KNOWN = {
     "ci_ruby.yml": "as on GitHub's ubuntu-latest: the pinned setup-ruby v1.146.0 predates Ubuntu 24.04, and Rubies 2.6 and 2.7 aren't built for it",
     "ci_maven.yml": "the pinned maven-dependency-submission-action posts to api.github.com whatever GITHUB_API_URL says, as it does on GitHub Enterprise Server; on GitHub its read-only default token is refused too",
     "ci_scala.yml": "as on GitHub: the workflow's `permissions: contents: read` is too little to submit the dependency graph (403)",
-    "ci_python-package-conda.yml": "kiln's runner image has no conda (`$CONDA`), which GitHub's has",
+    "code-scanning_brakeman.yml": "as on GitHub's ubuntu-latest: the pinned setup-ruby v1.146.0 predates Ubuntu 24.04, and Ruby 2.7 isn't built for it",
+    "code-scanning_credo.yml": "as on GitHub's ubuntu-latest: the pinned setup-beam predates Ubuntu 24.04",
+    "code-scanning_mobsf.yml": "as on GitHub: the pinned mobsfscan requires semgrep 0.50.1, which pip finds nowhere on PyPI now",
+    "code-scanning_phpmd.yml": "as on GitHub: setup-php installs PHPMD 3, whose command line the starter's `phpmd ./ sarif …` predates",
+    "code-scanning_anchore.yml": "as on GitHub: the pinned scan-action's grype gets its schema's last vulnerability database, a year old, and refuses it",
+    "code-scanning_pmd.yml": "as on GitHub Enterprise Server: pmd-github-action asks the API it's given (`GITHUB_API_URL`) for pmd/pmd's latest release, which only github.com has",
+    "code-scanning_puppet-lint.yml": "as on GitHub's ubuntu-latest: the pinned setup-ruby v1.146.0 predates Ubuntu 24.04, and Ruby 2.7 isn't built for it",
+    "code-scanning_rubocop.yml": "as on GitHub's ubuntu-latest: the pinned setup-ruby v1.146.0 predates Ubuntu 24.04, and Ruby 2.6 isn't built for it",
+    "code-scanning_sobelow.yml": "as on GitHub: the pinned sobelow action's image has Elixir 1.11, and the sobelow it installs needs 1.12",
 }
 
 # Dispatched by hand, with these inputs.
@@ -85,6 +103,12 @@ DISPATCH = {"automation_manual.yml": {"name": "kiln"}}
 
 def family_reason(name, text):
     """Why a starter of a family that needs an account or GitHub's own services doesn't run."""
+    runs_on = " ".join(re.findall(r"runs-on:\s*(.+)", text))
+    if "ubuntu" not in runs_on and "${{" not in runs_on:
+        if "macos" in runs_on:
+            return "runs on macOS: no macOS runner in this run"
+        if "windows" in runs_on:
+            return "runs on Windows: no Windows runner in this run"
     if name.startswith("deployments_"):
         cloud = name[len("deployments_"):-len(".yml")].split("-")[0]
         return f"deploys to {cloud}: needs a cloud account (W11-AC03)"
@@ -98,12 +122,6 @@ def family_reason(name, text):
         if "upload-sarif" in text or "codeql-action" in text:
             return None
         return "needs GitHub's dependency graph or security APIs: not in kiln's facade yet (W14)"
-    runs_on = " ".join(re.findall(r"runs-on:\s*(.+)", text))
-    if "ubuntu" not in runs_on and "${{" not in runs_on:
-        if "macos" in runs_on:
-            return "runs on macOS: no macOS runner in this run"
-        if "windows" in runs_on:
-            return "runs on Windows: no Windows runner in this run"
     return None
 
 
