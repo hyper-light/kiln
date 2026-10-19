@@ -593,7 +593,7 @@ mod tests {
             *r.primary.write() = "kiln.test".into();
             r.https_port.store(443, Ordering::Relaxed);
             *r.ca_der.write() = pki.ca_der.clone();
-            let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+            let port = crate::frontdoor::test_port()?;
             let _l = listen_redirect(port, &r)?;
             let client = crate::http::client::Client::public()?;
             // By address (127.0.0.1) or by a name (localhost, not one of the front door's).
@@ -722,7 +722,7 @@ mod tests {
         crate::rt::block_on(async {
             assert!(speaks_h2(&Upstream::parse(&format!("http://{}", upstream(true)?), &[])?).await);
             assert!(!speaks_h2(&Upstream::parse(&format!("http://{}", upstream(false)?), &[])?).await);
-            let closed = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?;
+            let closed = SocketAddr::from((Ipv4Addr::LOCALHOST, crate::frontdoor::test_port()?));
             assert!(!speaks_h2(&Upstream::parse(&format!("http://{closed}"), &[])?).await);
             Ok(())
         })
@@ -743,7 +743,7 @@ mod tests {
                 let shared = Arc::new(Shared::default());
                 *shared.tls.write() = Some(ServerTls::from_pem(&cert, &key)?);
                 *shared.upstream.write() = Some(Upstream::parse(&format!("http://{}", upstream(h2_upstream)?), &[])?);
-                let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+                let port = crate::frontdoor::test_port()?;
                 let _l = listen_https(port, &shared)?;
                 // Asked at once.
                 let until = Instant::now() + Duration::from_secs(5);

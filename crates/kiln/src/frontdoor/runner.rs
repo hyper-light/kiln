@@ -778,7 +778,7 @@ mod tests {
     use crate::frontdoor::{Cert, Dns, Https};
 
     fn free_port() -> anyhow::Result<u16> {
-        Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+        Ok(crate::frontdoor::test_port()?)
     }
 
     /// The whole runner side, on loopback and high ports: settings in, listeners up, a CSR out;

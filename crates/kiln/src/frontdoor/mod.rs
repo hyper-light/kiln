@@ -505,6 +505,25 @@ pub struct Status {
     pub tailscale: Option<tailnet::TailnetStatus>,
 }
 
+/// A port for a test to listen on (TCP and UDP): below Linux's ephemeral range, where no
+/// connection's own end and no other test's `bind(0)` lands, and never one this process handed out
+/// before. Taking a port from `bind(0)` and binding it again races every test running alongside.
+#[cfg(test)]
+pub(crate) fn test_port() -> std::io::Result<u16> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let start = 20_000 + u16::try_from(std::process::id() % 10_000).unwrap_or(0);
+    let _ = NEXT.compare_exchange(0, start, Ordering::SeqCst, Ordering::SeqCst);
+    for _ in 0..500 {
+        let port = NEXT.fetch_add(1, Ordering::SeqCst);
+        let free = std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok();
+        if free {
+            return Ok(port);
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "no free port for a test"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
