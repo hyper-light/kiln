@@ -1,7 +1,8 @@
 /**
  * A dashboard's widgets, each kind drawn from what it asks: series over the range (timeseries),
- * one number (query value), series ranked (toplist) or tabled, the newest log records or events,
- * monitors' states, or text.
+ * one number (query value), series ranked (toplist), tabled or as shares of a ring (pie), the
+ * newest log records or events, monitors' states, or text. A group's widgets are drawn by the
+ * dashboard, on a grid of the group's own.
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
@@ -45,10 +46,12 @@ export const KIND_WORDS: Record<Widget["kind"], string> = {
   table: "Table",
   heatmap: "Heatmap",
   distribution: "Distribution",
+  pie: "Pie",
   logs: "Log stream",
   events: "Event stream",
   monitors: "Monitors",
   note: "Note",
+  group: "Group",
 };
 
 /** What a widget shows, its queries' template variables filled (`fill`). */
@@ -62,7 +65,13 @@ export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: R
     case "query_value":
       return queries.length ? <QueryValue queries={queries} range={range} height={height} unit={unit} how={aggregator(w)} /> : <Empty height={height} what="a query" />;
     case "toplist":
-      return queries.length ? <TopList queries={queries} range={range} height={height} unit={unit} how={aggregator(w)} /> : <Empty height={height} what="a query" />;
+      return queries.length ? (
+        <TopList queries={queries} range={range} height={height} unit={unit} how={aggregator(w)} limit={w.options?.limit} ascending={w.options?.order === "asc"} />
+      ) : (
+        <Empty height={height} what="a query" />
+      );
+    case "pie":
+      return queries.length ? <Pie queries={queries} range={range} height={height} unit={unit} how={w.options?.aggregator ?? "sum"} /> : <Empty height={height} what="a query" />;
     case "table":
       return queries.length ? <SeriesTable queries={queries} range={range} height={height} unit={unit} /> : <Empty height={height} what="a query" />;
     case "heatmap":
@@ -81,6 +90,8 @@ export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: R
           <MarkdownBody text={w.text} />
         </div>
       );
+    case "group":
+      return null;
   }
 }
 
@@ -155,14 +166,15 @@ function QueryValue({ queries, range, height, unit, how }: { queries: string[]; 
   );
 }
 
-/** Each series summed over the range, the largest first, as bars. */
-function TopList({ queries, range, height, unit, how }: { queries: string[]; range: Range; height: number; unit?: string; how: string }) {
+/** Each series summed over the range, the largest first (the least, `ascending`), as bars: `limit`
+ * of them, 25 unless the widget says. */
+function TopList({ queries, range, height, unit, how, limit, ascending }: { queries: string[]; range: Range; height: number; unit?: string; how: string; limit?: number; ascending?: boolean }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const rows = answers
     .flatMap((a) => a.series.map((s) => ({ label: seriesLabel(s.tags), v: aggregate(dataOf(s), how) })))
     .filter((r): r is { label: string; v: number } => r.v !== null)
-    .sort((a, b) => b.v - a.v)
-    .slice(0, 25);
+    .sort((a, b) => (ascending ? a.v - b.v : b.v - a.v))
+    .slice(0, Math.max(1, limit ?? 25));
   if (rows.length === 0) return <Empty height={height} what="data in this range" />;
   const top = Math.max(...rows.map((r) => Math.abs(r.v)), Number.MIN_VALUE);
   return (
@@ -176,6 +188,72 @@ function TopList({ queries, range, height, unit, how }: { queries: string[]; ran
       ))}
     </ol>
   );
+}
+
+/** A pie's hues: kiln's violet, blue and rose stepped for its dark panels (OKLCH L 0.52–0.64, C ≥
+ * 0.10). In a ring any two slices may touch, so every pair is held apart, and three are the most
+ * that are: worst CVD ΔE 10.3 (8 the target), worst normal-vision ΔE 16.6 (15 the floor), 15.1
+ * beside the grey "Other", each ≥ 3:1 on the panel (the dataviz validator, all pairs). */
+const PIE_HUES = ["#9f71dc", "#416aa2", "#994e5d"];
+/** Slices a pie draws at the most: the largest three, the rest one ("Other", grey). */
+const SLICES = PIE_HUES.length + 1;
+
+/** Each series over the range (summed unless the widget says) as its share of a ring, each slice
+ * named in the legend with its value and share; a slice's hue follows its series, not its rank. */
+function Pie({ queries, range, height, unit, how }: { queries: string[]; range: Range; height: number; unit?: string; how: string }) {
+  const answers = useRes(queriesRes(queries, range)).data;
+  const rows = answers
+    .flatMap((a) => a.series.map((s) => ({ label: seriesLabel(s.tags), v: aggregate(dataOf(s), how) })))
+    .filter((r): r is { label: string; v: number } => r.v !== null && r.v > 0)
+    .sort((a, b) => b.v - a.v);
+  if (rows.length === 0) return <Empty height={height} what="data in this range" />;
+  const shown = rows.length > SLICES ? [...rows.slice(0, SLICES - 1), { label: "Other", v: rows.slice(SLICES - 1).reduce((x, r) => x + r.v, 0) }] : rows;
+  const total = shown.reduce((x, r) => x + r.v, 0);
+  const hue = hues(shown.filter((r) => !(r.label === "Other" && rows.length > SLICES)).map((r) => r.label));
+  const size = Math.max(64, Math.min(height, 168));
+  const outer = size / 2;
+  let at = 0;
+  const slices = shown.map((r) => {
+    const from = at;
+    at += r.v / total;
+    return { ...r, d: ring(outer, outer * 0.62, from, at), color: r.label === "Other" && rows.length > SLICES ? SERIES.grey : (hue.get(r.label) ?? SERIES.grey) };
+  });
+  return (
+    <div className="flex flex-wrap items-center gap-4 overflow-y-auto" style={{ maxHeight: height }}>
+      <svg width={size} height={size} viewBox={`${-outer} ${-outer} ${size} ${size}`} role="img" aria-label={queries.join("; ")} className="shrink-0">
+        {slices.map((sl) => (
+          <path key={sl.label} d={sl.d} fill={sl.color} stroke="#0a0c0f" strokeWidth={2}>
+            <title>{`${sl.label}: ${formatValue(sl.v, unit)}`}</title>
+          </path>
+        ))}
+      </svg>
+      <ul className="min-w-0 flex-1 space-y-1">
+        {slices.map((sl) => (
+          <li key={sl.label} className="flex items-center gap-2">
+            <span className="size-2 shrink-0 rounded-full" style={{ background: sl.color }} aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[#c8cad0]">{sl.label}</span>
+            <span className="font-mono text-[11px] text-[#e4e5e7] tabular-nums">{formatValue(sl.v, unit)}</span>
+            <span className="w-9 text-right font-mono text-[11px] text-[#8c8f98] tabular-nums">{Math.round((100 * sl.v) / total)}%</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** The hued slices' hues, in their labels' order: a series keeps its hue as its rank moves (a
+ * change of which series are shown may move them). */
+function hues(labels: string[]): Map<string, string> {
+  return new Map([...labels].sort().map((label, i) => [label, PIE_HUES[i] ?? SERIES.grey]));
+}
+
+/** A ring's slice from share `a` to share `b` of the turn, clockwise from the top; a whole ring as
+ * two halves (an arc cannot end where it starts). */
+function ring(outer: number, inner: number, a: number, b: number): string {
+  if (b - a > 0.9999) return `${ring(outer, inner, a, a + 0.5)} ${ring(outer, inner, a + 0.5, a + 0.9999)}`;
+  const at = (t: number, rad: number) => `${(rad * Math.sin(2 * Math.PI * t)).toFixed(2)} ${(-rad * Math.cos(2 * Math.PI * t)).toFixed(2)}`;
+  const large = b - a > 0.5 ? 1 : 0;
+  return `M${at(a, outer)} A${outer} ${outer} 0 ${large} 1 ${at(b, outer)} L${at(b, inner)} A${inner} ${inner} 0 ${large} 0 ${at(a, inner)} Z`;
 }
 
 /** Each series' last, average, least and most over the range. */

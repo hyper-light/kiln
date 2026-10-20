@@ -170,7 +170,7 @@ fn main() {
         sel_ns.push(s.elapsed().as_nanos() as u64);
     }
     println!("select a metric ({} metrics):           {}", names.len(), tails(sel_ns));
-    let job_sel = Selector { metric: NameMatch::Glob("*".into()), clauses: vec![Clause { key: "job".into(), values: vec![ValueMatch::Exact("apiserver".into())], negate: false }] };
+    let job_sel = Selector { expr: None, metric: NameMatch::Glob("*".into()), clauses: vec![Clause { key: "job".into(), values: vec![ValueMatch::Exact("apiserver".into())], negate: false }] };
     let mut glob_ns = Vec::new();
     for _ in 0..200 {
         let s = Instant::now();
@@ -178,7 +178,14 @@ fn main() {
         glob_ns.push(s.elapsed().as_nanos() as u64);
     }
     println!("select every metric with job:apiserver ({} series): {}", ids.len(), tails(glob_ns));
-    let wild = Selector { metric: NameMatch::Glob("node_*".into()), clauses: vec![Clause { key: "instance".into(), values: vec![ValueMatch::Glob("*:9100".into())], negate: false }, Clause { key: "mode".into(), values: vec![ValueMatch::Exact("idle".into())], negate: true }] };
+    let wild = Selector {
+        expr: None,
+        metric: NameMatch::Glob("node_*".into()),
+        clauses: vec![
+            Clause { key: "instance".into(), values: vec![ValueMatch::Glob("*:9100".into())], negate: false },
+            Clause { key: "mode".into(), values: vec![ValueMatch::Exact("idle".into())], negate: true },
+        ],
+    };
     let mut wild_ns = Vec::new();
     for _ in 0..200 {
         let s = Instant::now();

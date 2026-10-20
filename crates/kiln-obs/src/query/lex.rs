@@ -41,20 +41,24 @@ pub enum LexError {
 pub type Spanned<'a> = (usize, Tok<'a>);
 
 fn name_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '/' | '*' | '?' | '@' | '#' | '~' | '%' | '=' | '<' | '>')
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '/' | '*' | '?' | '@' | '#' | '~' | '%' | '=' | '<' | '>' | '$')
 }
 
 /// Splits a query into tokens.
 ///
-/// A name runs over letters, digits and `_ . - : / * ? @ # ~ % = < >`; a `.` followed by a letter
-/// right after a `)` or `}` is a modifier's dot instead (`{*}.rollup(...)`, `).as_count()`). A
-/// number is a name that parses as one and starts with a digit or a sign-free `.`.
+/// A name runs over letters, digits and `_ . - : / * ? @ # ~ % = < > $` (a dashboard's `$env`); a
+/// `.` followed by a letter right after a `)` or `}` is a modifier's dot instead (`{*}.rollup(...)`,
+/// `).as_count()`). A number is a name that parses as one and starts with a digit or a sign-free
+/// `.`; outside a filter it ends at a `*`, `/` or `-` (`2*a{*}`, `100-a{*}`).
 pub fn lex(q: &str) -> Result<Vec<Spanned<'_>>, LexError> {
     if q.len() > MAX_QUERY_BYTES {
         return Err(LexError::TooLong(q.len()));
     }
     let mut out: Vec<Spanned<'_>> = Vec::new();
     let mut it = q.char_indices().peekable();
+    // The `{` not yet closed: inside a filter, `*` is a wildcard, not a product, and a name may
+    // start with a digit and hold `-`, `*` and `/` (`10.0.0.1:9100`, `2024-05`).
+    let mut braces = 0usize;
     while let Some(&(i, c)) = it.peek() {
         let prev_closes = matches!(out.last(), Some((_, Tok::RParen | Tok::RBrace)));
         match c {
@@ -71,10 +75,12 @@ pub fn lex(q: &str) -> Result<Vec<Spanned<'_>>, LexError> {
             }
             '{' => {
                 it.next();
+                braces += 1;
                 out.push((i, Tok::LBrace));
             }
             '}' => {
                 it.next();
+                braces = braces.saturating_sub(1);
                 out.push((i, Tok::RBrace));
             }
             ',' => {
@@ -130,17 +136,21 @@ pub fn lex(q: &str) -> Result<Vec<Spanned<'_>>, LexError> {
                 it.next();
                 out.push((i, Tok::Minus));
             }
-            '*' if matches!(out.last(), Some((_, Tok::Name(_) | Tok::Number(_) | Tok::RParen | Tok::RBrace))) && !after_filter_open(&out) => {
+            '*' if matches!(out.last(), Some((_, Tok::Name(_) | Tok::Number(_) | Tok::RParen | Tok::RBrace))) && braces == 0 => {
                 it.next();
                 out.push((i, Tok::Star));
             }
             c if name_char(c) => {
                 let start = i;
                 let mut end = i;
+                // Outside a filter a number ends where an operator starts (`100/(a + b)`, `2*a{*}`,
+                // `1e-3` whole); a calendar's `9am`, `21:30`, `15th` stay names.
+                let number = braces == 0 && (c.is_ascii_digit() || (c == '.' && q.get(i + 1..).is_some_and(|r| r.starts_with(|d: char| d.is_ascii_digit()))));
                 while let Some(&(j, c)) = it.peek() {
                     // Inside a name: a `-` or `*` or `/` that an operand could follow is still the
                     // name's own when no space comes first (`web-1`, `node_*`, `/api/*`).
-                    if name_char(c) {
+                    let operator = number && (matches!(c, '*' | '/') || (c == '-' && !q.get(start..j).is_some_and(|t| t.ends_with(['e', 'E']))));
+                    if name_char(c) && !operator {
                         end = j + c.len_utf8();
                         it.next();
                     } else {
@@ -158,20 +168,6 @@ pub fn lex(q: &str) -> Result<Vec<Spanned<'_>>, LexError> {
         }
     }
     Ok(out)
-}
-
-/// Whether the last unclosed bracket is a `{`: inside a filter, `*` is a wildcard, not a product.
-fn after_filter_open(out: &[Spanned<'_>]) -> bool {
-    let mut depth = 0i32;
-    for (_, t) in out.iter().rev() {
-        match t {
-            Tok::RBrace => depth += 1,
-            Tok::LBrace if depth == 0 => return true,
-            Tok::LBrace => depth -= 1,
-            _ => {}
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -211,6 +207,15 @@ mod tests {
         assert_eq!(toks("top(x{*}, 10, 'mean', \"desc\")").get(6..), Some(&[Tok::Comma, Tok::Number(10.0), Tok::Comma, Tok::Str("mean".into()), Tok::Comma, Tok::Str("desc".into()), Tok::RParen][..]));
         assert_eq!(toks("x{route:/api/*}"), vec![Tok::Name("x"), Tok::LBrace, Tok::Name("route:/api/*"), Tok::RBrace]);
         assert_eq!(toks("-1.5e3"), vec![Tok::Minus, Tok::Number(1500.0)]);
+        // A number outside a filter ends at an operator, written without spaces as Datadog's
+        // dashboards write them; inside one it is a name's start.
+        assert_eq!(toks("2*a{*}"), vec![Tok::Number(2.0), Tok::Star, Tok::Name("a"), Tok::LBrace, Tok::Name("*"), Tok::RBrace]);
+        assert_eq!(toks("a{*}*100/(b{*})").get(3..8), Some(&[Tok::RBrace, Tok::Star, Tok::Number(100.0), Tok::Slash, Tok::LParen][..]));
+        assert_eq!(toks("100-1e-3"), vec![Tok::Number(100.0), Tok::Minus, Tok::Number(0.001)]);
+        assert_eq!(toks(".5*a{*}").get(..3), Some(&[Tok::Number(0.5), Tok::Star, Tok::Name("a")][..]));
+        assert_eq!(toks("x{ip:10.0.0.1:9100, d IN (2024-05, 3*4)}").get(2..6), Some(&[Tok::Name("ip:10.0.0.1:9100"), Tok::Comma, Tok::Name("d"), Tok::Name("IN")][..]));
+        assert_eq!(toks("x{d IN (2024-05, 3*4)}").get(5..9), Some(&[Tok::Name("2024-05"), Tok::Comma, Tok::Name("3*4"), Tok::RParen][..]));
+        assert_eq!(toks("rollup(sum, daily, 9:30am)").get(6), Some(&Tok::Name("9:30am")));
     }
 
     #[test]

@@ -432,16 +432,8 @@ fn parse_records(q: &str, name: &str, spans: bool) -> Result<Query, MonitorError
         if let Some((_, r)) = call(rest, "index")? {
             rest = r;
         } else if let Some((a, r)) = call(rest, "rollup")? {
-            let facet = a.get(1).map(|f| f.trim_start_matches('@').to_owned());
-            measure = match (a.first().copied(), facet) {
-                (Some("count") | None, _) => Measure::Count,
-                (Some("cardinality"), Some(f)) => Measure::Cardinality(facet_of(&f)),
-                (Some("sum"), Some(f)) => Measure::Sum(f),
-                (Some("avg"), Some(f)) => Measure::Avg(f),
-                (Some("min"), Some(f)) => Measure::Min(f),
-                (Some("max"), Some(f)) => Measure::Max(f),
-                (Some(m), _) => return Err(syntax(format!("a log rollup: {m} (count; cardinality, sum, avg, min, max of a facet)"))),
-            };
+            measure = Measure::parse(a.first().copied(), a.get(1).copied(), spans)
+                .ok_or_else(|| syntax(format!("a log rollup: {} (count; cardinality, sum, avg, min, max of a facet)", a.first().copied().unwrap_or(""))))?;
             rest = r;
         } else if let Some((a, r)) = call(rest, "by")? {
             by = a.iter().flat_map(|s| s.split(',')).filter(|s| !s.trim().is_empty()).map(facet_of).collect();

@@ -5,7 +5,7 @@
 
 use super::calendar::{self, Calendar};
 use super::lex::{LexError, Spanned, Tok, lex};
-use crate::index::{Clause, NameMatch, ValueMatch};
+use crate::index::{Clause, FilterExpr, FilterNode, NameMatch, ValueMatch};
 
 /// A node's place in the arena.
 pub type NodeId = usize;
@@ -62,6 +62,8 @@ pub struct MetricQuery {
     pub space: SpaceAgg,
     pub metric: NameMatch,
     pub filters: Vec<Clause>,
+    /// A filter beyond conditions ANDed (`OR`, `NOT`, brackets): its expression, besides `filters`.
+    pub filter: Option<FilterExpr>,
     pub by: Vec<String>,
     pub rollup: Option<(Rollup, Option<i64>)>,
     /// A calendar rollup's periods (`.rollup(sum, daily|weekly|monthly[, alignment][, 'tz'])`).
@@ -158,6 +160,10 @@ pub enum Func {
     CalendarShift,
     /// `top5`, `bottom10_max`, ... (`[top|bottom][5|10|15|20][_measure]`): `top` and `bottom` in one.
     Ranked { n: u8, bottom: bool, by: Rank },
+    /// `max(a, b, ...)`, `min(...)`: at each point the largest (least) value of its arguments,
+    /// queries or numbers.
+    Max,
+    Min,
 }
 
 /// How `top` and `bottom` rank series: by their mean (Datadog's unless said), least, most, last,
@@ -236,6 +242,8 @@ impl Func {
             "week_before" => Self::WeekBefore,
             "month_before" => Self::MonthBefore,
             "calendar_shift" => Self::CalendarShift,
+            "max" => Self::Max,
+            "min" => Self::Min,
             other => return Self::spanned(other),
         })
     }
@@ -281,9 +289,33 @@ impl Func {
             // The query and its algorithm; deviations; then named arguments.
             Self::Forecast => (2, 8),
             Self::Outliers => (1, 4),
+            Self::Max | Self::Min => (2, 64),
             _ => (1, 1),
         }
     }
+}
+
+/// What a records query reads: logs, spans, or events (kiln's events are records of their own
+/// source, `crate::monitor::EVENTS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordSource {
+    Logs,
+    Spans,
+    Events,
+}
+
+/// A log, span or event analytics query as a query's operand: Datadog's monitor syntax of one
+/// without its window, `logs("status:error").rollup("count").by("service")`, its measure each
+/// bucket, by its facets. A log search reads logs, not events, unless it names them
+/// (`crate::monitor::logs_only`); `events("…")` reads events alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordQuery {
+    pub of: RecordSource,
+    /// The search as it was written.
+    pub text: String,
+    pub search: crate::logs::search::Search,
+    pub measure: crate::logs::store::Measure,
+    pub by: Vec<crate::logs::store::Facet>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +323,7 @@ pub enum Node {
     Num(f64),
     Str(String),
     Metric(MetricQuery),
+    Records(RecordQuery),
     Neg(NodeId),
     Bin(BinOp, NodeId, NodeId),
     Call(Func, Vec<NodeId>),
@@ -299,11 +332,14 @@ pub enum Node {
     Named(String, String),
 }
 
-/// A parsed query: its nodes, children before their parents, and the root.
+/// A parsed query: its nodes, children before their parents, and the root; and where each metric
+/// or records query is in the query's text, so the query can be said again with each of them
+/// named (Datadog's formulas of named queries).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ast {
     pub nodes: Vec<Node>,
     pub root: NodeId,
+    pub leaves: Vec<(NodeId, std::ops::Range<usize>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -376,6 +412,13 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
         return Err(ParseError::Empty);
     }
     let mut b = Builder { nodes: Vec::new(), operands: Vec::new() };
+    let mut leaves: Vec<(NodeId, std::ops::Range<usize>)> = Vec::new();
+    // A leaf's text: from its first token to the next token (or the end), its spaces after left off.
+    let text_of = |from: usize, next: usize| {
+        let start = toks.get(from).map_or(q.len(), |t| t.0);
+        let end = toks.get(next).map_or(q.len(), |t| t.0);
+        start..start + q.get(start..end).map_or(0, |t| t.trim_end().len())
+    };
     let mut ops: Vec<Op> = Vec::new();
     let mut expect_operand = true;
     let mut i = 0usize;
@@ -423,6 +466,14 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
                     expect_operand = false;
                     i = at_value + 1;
                 }
+                // A records query: `logs("…")`, `spans("…")` (or `trace-analytics("…")`), `events("…")`.
+                Tok::Name(name) if record_source(name).is_some() && matches!(toks.get(i + 1), Some((_, Tok::LParen))) && matches!(toks.get(i + 2), Some((_, Tok::Str(_)))) => {
+                    let (rq, next) = record_query(&toks, i)?;
+                    leaves.push((b.nodes.len(), text_of(i, next)));
+                    b.push(Node::Records(rq));
+                    expect_operand = false;
+                    i = next;
+                }
                 Tok::Name(name) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) && Func::by_name(&name.to_ascii_lowercase()).is_some() => {
                     let f = Func::by_name(&name.to_ascii_lowercase()).ok_or_else(|| syntax(at, "a function"))?;
                     ops.push(Op::Call(f, b.operands.len(), at));
@@ -430,6 +481,7 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
                 }
                 Tok::Name(_) => {
                     let (mq, next) = metric_query(&toks, i)?;
+                    leaves.push((b.nodes.len(), text_of(i, next)));
                     b.push(Node::Metric(mq));
                     expect_operand = false;
                     i = next;
@@ -512,7 +564,7 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
         b.reduce(op, q.len())?;
     }
     match b.operands.as_slice() {
-        [root] => Ok(Ast { root: *root, nodes: b.nodes }),
+        [root] => Ok(Ast { root: *root, nodes: b.nodes, leaves }),
         _ => Err(syntax(0, "more than one expression")),
     }
 }
@@ -574,10 +626,11 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
         return Err(syntax(at, "a metric's name"));
     }
     let metric = if metric.contains(['*', '?']) { NameMatch::Glob(metric.to_owned()) } else { NameMatch::Exact(metric.to_owned()) };
-    let mut q = MetricQuery { space, metric, filters: Vec::new(), by: Vec::new(), rollup: None, calendar: None, mode: None, fill: None, weighted: false };
+    let mut q = MetricQuery { space, metric, filters: Vec::new(), filter: None, by: Vec::new(), rollup: None, calendar: None, mode: None, fill: None, weighted: false };
     i += 1;
     if let Some((_, Tok::LBrace)) = toks.get(i) {
-        i = filters(toks, i + 1, &mut q.filters)?;
+        let (next, expr) = filters(toks, i + 1, &mut q.filters)?;
+        (i, q.filter) = (next, expr);
     }
     if let Some((by_at, Tok::Name(n))) = toks.get(i)
         && n.eq_ignore_ascii_case("by")
@@ -652,7 +705,12 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
             "as_count" if args.is_empty() => q.mode = Some(CountMode::Count),
             "as_rate" if args.is_empty() => q.mode = Some(CountMode::Rate),
             "fill" => {
-                let how = name_arg(args.first()).ok_or_else(|| syntax(m_at, "fill(null|zero|linear|last[, seconds])"))?;
+                // `fill(0)`, as Datadog's own dashboards write it: with zero.
+                let how = match args.first() {
+                    Some(Tok::Number(n)) if *n == 0.0 => Some("zero".to_owned()),
+                    a => name_arg(a),
+                }
+                .ok_or_else(|| syntax(m_at, "fill(null|zero|linear|last[, seconds])"))?;
                 let limit = match args.get(1) {
                     None => None,
                     a => Some(num_arg(a).ok_or_else(|| syntax(m_at, "a fill's seconds"))?),
@@ -714,55 +772,176 @@ fn calendar(unit: &Tok<'_>, rest: &[&Tok<'_>]) -> Result<Calendar, String> {
     Ok(Calendar { unit, align, zone })
 }
 
-/// Filters after `{`: `*`, `key:value`, `!key:value`, `key:*`, `key:(a OR b)`, `key IN (a, b)`,
-/// `key NOT IN (a, b)`, comma-separated (AND); the index after `}`.
-fn filters(toks: &[Spanned<'_>], mut i: usize, out: &mut Vec<Clause>) -> Result<usize, ParseError> {
+/// Filters after `{`, Datadog's: conditions (`key:value`, `key:*`, `key:` any value, `key:(a OR b)`,
+/// `key:"quoted"`, `key IN (a, b)`, `key NOT IN (a, b)`) joined by `,` or `AND` (or set side by
+/// side), alternatives by `OR`, negated by `!` or `NOT`, in brackets; `*`, and a template variable
+/// left unfilled (`$env`), every series. Conditions ANDed alone, the plain and common case, are its
+/// clauses (`out`); any other filter is a boolean expression of them (its second answer), read
+/// without recursion (a shunting yard: NOT binds tightest, then AND, then OR). And the index after
+/// `}`.
+fn filters(toks: &[Spanned<'_>], mut i: usize, out: &mut Vec<Clause>) -> Result<(usize, Option<FilterExpr>), ParseError> {
+    #[derive(Clone, Copy)]
+    enum Op {
+        And,
+        Or,
+        Not,
+        Group(usize),
+    }
+    fn reduce(op: Op, nodes: &mut Vec<FilterNode>, operands: &mut Vec<usize>, at: usize) -> Result<(), ParseError> {
+        let node = match op {
+            Op::And | Op::Or => {
+                let (Some(r), Some(l)) = (operands.pop(), operands.pop()) else { return Err(syntax(at, "AND or OR without what it joins")) };
+                if matches!(op, Op::And) { FilterNode::And(l, r) } else { FilterNode::Or(l, r) }
+            }
+            Op::Not => FilterNode::Not(operands.pop().ok_or_else(|| syntax(at, "NOT without what it negates"))?),
+            Op::Group(g) => return Err(syntax(g, "an unclosed (")),
+        };
+        operands.push(nodes.len());
+        nodes.push(node);
+        Ok(())
+    }
     let open = toks.get(i.saturating_sub(1)).map_or(0, |t| t.0);
+    let word = |at: usize, w: &str| matches!(toks.get(at), Some((_, Tok::Name(n))) if n.eq_ignore_ascii_case(w));
+    let (mut nodes, mut operands, mut ops): (Vec<FilterNode>, Vec<usize>, Vec<Op>) = (Vec::new(), Vec::new(), Vec::new());
+    let mut expect_operand = true;
     loop {
-        let mut negate = false;
-        if let Some((_, Tok::Bang)) = toks.get(i) {
-            negate = true;
-            i += 1;
-        }
-        match toks.get(i) {
-            Some((_, Tok::RBrace)) => return Ok(i + 1),
-            Some((_, Tok::Comma)) => i += 1,
-            Some((_, Tok::Name("*"))) => i += 1,
-            Some((at, Tok::Name(item))) => {
-                let at = *at;
-                // `key IN (...)` and `key NOT IN (...)`.
-                let in_list = match (toks.get(i + 1), toks.get(i + 2)) {
-                    (Some((_, Tok::Name(w))), _) if w.eq_ignore_ascii_case("in") => Some((false, i + 2)),
-                    (Some((_, Tok::Name(w))), Some((_, Tok::Name(w2)))) if w.eq_ignore_ascii_case("not") && w2.eq_ignore_ascii_case("in") => Some((true, i + 3)),
-                    _ => None,
-                };
-                if let Some((not, j)) = in_list {
-                    let (values, next) = value_list(toks, j, false)?;
-                    out.push(Clause { key: (*item).to_owned(), values, negate: negate ^ not });
-                    i = next;
-                    continue;
-                }
-                let Some((key, value)) = item.split_once(':') else { return Err(syntax(at, format!("a filter is key:value, found {item:?}"))) };
-                if key.is_empty() {
-                    return Err(syntax(at, "a filter's key"));
-                }
-                if let (true, Some((_, Tok::Str(quoted)))) = (value.is_empty(), toks.get(i + 1)) {
-                    // `key:"a value"`: any value, spaces and all, exactly (no wildcards).
-                    out.push(Clause { key: key.to_owned(), values: vec![ValueMatch::Exact(quoted.clone())], negate });
-                    i += 2;
-                } else if value.is_empty() {
-                    // `key:(a OR b)`.
-                    let (values, next) = value_list(toks, i + 1, true)?;
-                    out.push(Clause { key: key.to_owned(), values, negate });
-                    i = next;
-                } else {
-                    out.push(Clause { key: key.to_owned(), values: vec![value_match(value)], negate });
+        let Some((at, tok)) = toks.get(i) else { return Err(syntax(open, "an unclosed {")) };
+        let at = *at;
+        if expect_operand {
+            match tok {
+                Tok::Bang => {
+                    ops.push(Op::Not);
                     i += 1;
                 }
+                Tok::Name(_) if word(i, "not") && !word(i + 1, "in") => {
+                    ops.push(Op::Not);
+                    i += 1;
+                }
+                Tok::LParen => {
+                    ops.push(Op::Group(at));
+                    i += 1;
+                }
+                Tok::Name(item) if *item == "*" || (item.starts_with('$') && !item.contains(':')) => {
+                    operands.push(nodes.len());
+                    nodes.push(FilterNode::All);
+                    expect_operand = false;
+                    i += 1;
+                }
+                Tok::Name(_) => {
+                    let (c, next) = clause(toks, i)?;
+                    operands.push(nodes.len());
+                    nodes.push(FilterNode::Clause(c));
+                    expect_operand = false;
+                    i = next;
+                }
+                Tok::RBrace if nodes.is_empty() && ops.is_empty() => return Ok((i + 1, None)),
+                t => return Err(syntax(at, format!("a filter expected, found {t:?}"))),
             }
-            Some((at, t)) => return Err(syntax(*at, format!("a filter expected, found {t:?}"))),
-            None => return Err(syntax(open, "an unclosed {")),
+            continue;
         }
+        // An operator; a condition right after one is ANDed with it, nothing read.
+        let binary = match tok {
+            Tok::Comma => Some((Op::And, 1)),
+            Tok::Name(_) if word(i, "and") => Some((Op::And, 1)),
+            Tok::Name(_) if word(i, "or") => Some((Op::Or, 1)),
+            Tok::Name(_) | Tok::Bang | Tok::LParen => Some((Op::And, 0)),
+            _ => None,
+        };
+        if let Some((op, read)) = binary {
+            while let Some(&top) = ops.last() {
+                if !matches!((top, op), (Op::Not | Op::And, _) | (Op::Or, Op::Or)) {
+                    break;
+                }
+                ops.pop();
+                reduce(top, &mut nodes, &mut operands, at)?;
+            }
+            ops.push(op);
+            expect_operand = true;
+            i += read;
+            continue;
+        }
+        match tok {
+            Tok::RParen => loop {
+                match ops.pop() {
+                    Some(Op::Group(_)) => {
+                        i += 1;
+                        break;
+                    }
+                    Some(op) => reduce(op, &mut nodes, &mut operands, at)?,
+                    None => return Err(syntax(at, "an unopened )")),
+                }
+            },
+            Tok::RBrace => {
+                while let Some(op) = ops.pop() {
+                    reduce(op, &mut nodes, &mut operands, at)?;
+                }
+                let [root] = operands.as_slice() else { return Err(syntax(at, "a filter's conditions without AND or OR between them")) };
+                let expr = FilterExpr { nodes, root: *root };
+                if let Some(clauses) = anded(&expr) {
+                    out.extend(clauses);
+                    return Ok((i + 1, None));
+                }
+                return Ok((i + 1, Some(expr)));
+            }
+            t => return Err(syntax(at, format!("AND, OR or the filter's end expected, found {t:?}"))),
+        }
+    }
+}
+
+/// An expression's conditions where it is conditions ANDed alone (each negated or not, `*` none),
+/// in the order they were written; none where it is not.
+fn anded(e: &FilterExpr) -> Option<Vec<Clause>> {
+    let mut out = Vec::new();
+    let mut todo = vec![e.root];
+    while let Some(id) = todo.pop() {
+        match e.nodes.get(id)? {
+            FilterNode::And(l, r) => {
+                todo.push(*r);
+                todo.push(*l);
+            }
+            FilterNode::Clause(c) => out.push(c.clone()),
+            FilterNode::Not(x) => match e.nodes.get(*x)? {
+                FilterNode::Clause(c) => out.push(Clause { negate: !c.negate, ..c.clone() }),
+                _ => return None,
+            },
+            FilterNode::All => {}
+            FilterNode::Or(..) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// One condition from its key at `i`: `key:value`, `key:*`, `key:` (any value), `key:"quoted"`,
+/// `key:(a OR b)`, `key IN (a, b)`, `key NOT IN (a, b)`; and where it ends.
+fn clause(toks: &[Spanned<'_>], i: usize) -> Result<(Clause, usize), ParseError> {
+    let Some((at, Tok::Name(item))) = toks.get(i) else { return Err(syntax(toks.get(i).map_or(0, |t| t.0), "a filter's condition")) };
+    let at = *at;
+    let in_list = match (toks.get(i + 1), toks.get(i + 2)) {
+        (Some((_, Tok::Name(w))), _) if w.eq_ignore_ascii_case("in") => Some((false, i + 2)),
+        (Some((_, Tok::Name(w))), Some((_, Tok::Name(w2)))) if w.eq_ignore_ascii_case("not") && w2.eq_ignore_ascii_case("in") => Some((true, i + 3)),
+        _ => None,
+    };
+    if let Some((negate, j)) = in_list {
+        let (values, next) = value_list(toks, j, false)?;
+        return Ok((Clause { key: (*item).to_owned(), values, negate }, next));
+    }
+    let Some((key, value)) = item.split_once(':') else { return Err(syntax(at, format!("a filter is key:value, found {item:?}"))) };
+    if key.is_empty() {
+        return Err(syntax(at, "a filter's key"));
+    }
+    if !value.is_empty() {
+        return Ok((Clause { key: key.to_owned(), values: vec![value_match(value)], negate: false }, i + 1));
+    }
+    match toks.get(i + 1) {
+        // `key:"a value"`: any value, spaces and all, exactly (no wildcards).
+        Some((_, Tok::Str(quoted))) => Ok((Clause { key: key.to_owned(), values: vec![ValueMatch::Exact(quoted.clone())], negate: false }, i + 2)),
+        // `key:(a OR b)`.
+        Some((_, Tok::LParen)) => {
+            let (values, next) = value_list(toks, i + 1, true)?;
+            Ok((Clause { key: key.to_owned(), values, negate: false }, next))
+        }
+        // `key:` alone: any value of it (`!key:`, none).
+        _ => Ok((Clause { key: key.to_owned(), values: vec![ValueMatch::Any], negate: false }, i + 1)),
     }
 }
 
@@ -797,6 +976,80 @@ fn value_list(toks: &[Spanned<'_>], i: usize, ors: bool) -> Result<(Vec<ValueMat
         return Err(syntax(*open, "an empty list of values"));
     }
     Ok((values, j + 1))
+}
+
+/// The records a name reads: `logs`, `spans` (or Datadog's `trace-analytics`), `events`.
+fn record_source(name: &str) -> Option<RecordSource> {
+    match name {
+        "logs" => Some(RecordSource::Logs),
+        "spans" | "trace-analytics" => Some(RecordSource::Spans),
+        "events" => Some(RecordSource::Events),
+        _ => None,
+    }
+}
+
+/// A records query from its name at `i`: `logs("search")`, then `.rollup("count")` (or
+/// `cardinality`, `sum`, `avg`, `min`, `max` of a facet), `.by("service,@route")` and `.index("*")`
+/// (one index: taken, kiln has one), as a log monitor's; and where it ends.
+fn record_query(toks: &[Spanned<'_>], i: usize) -> Result<(RecordQuery, usize), ParseError> {
+    let (at, name, of) = match toks.get(i) {
+        Some((at, Tok::Name(n))) => (*at, *n, record_source(n).ok_or_else(|| syntax(*at, "logs, spans or events"))?),
+        _ => return Err(syntax(0, "a records query")),
+    };
+    let (Some((_, Tok::Str(raw))), Some((_, Tok::RParen))) = (toks.get(i + 2), toks.get(i + 3)) else {
+        return Err(syntax(at, format!("{name}(\"search\"): one search, quoted")));
+    };
+    let spans = of == RecordSource::Spans;
+    let search = match of {
+        RecordSource::Logs => crate::logs::search::parse(&crate::monitor::logs_only(raw)),
+        RecordSource::Spans => crate::logs::search::parse_spans(raw),
+        RecordSource::Events => crate::logs::search::parse(&match raw.trim() {
+            "" | "*" => format!("source:{}", crate::monitor::EVENTS),
+            s => format!("({s}) source:{}", crate::monitor::EVENTS),
+        }),
+    }
+    .map_err(|e| syntax(at, format!("{name}(\"…\"): {e}")))?;
+    let (mut measure, mut by) = (crate::logs::store::Measure::Count, Vec::new());
+    let mut j = i + 4;
+    while let Some((_, Tok::Dot)) = toks.get(j) {
+        let (Some((mat, Tok::Name(m))), Some((_, Tok::LParen))) = (toks.get(j + 1), toks.get(j + 2)) else {
+            return Err(syntax(at, format!("after {name}(…): .rollup(…) or .by(…)")));
+        };
+        // Its arguments: quoted, a comma between.
+        let mut args: Vec<&str> = Vec::new();
+        let mut k = j + 3;
+        loop {
+            match toks.get(k) {
+                Some((_, Tok::RParen)) => break,
+                Some((_, Tok::Str(s))) => {
+                    args.push(s);
+                    k += 1;
+                    if let Some((_, Tok::Comma)) = toks.get(k) {
+                        k += 1;
+                    }
+                }
+                _ => return Err(syntax(*mat, format!(".{m}(…): its arguments quoted"))),
+            }
+        }
+        match *m {
+            "index" => {}
+            "rollup" => {
+                measure = crate::logs::store::Measure::parse(args.first().copied(), args.get(1).copied(), spans)
+                    .ok_or_else(|| syntax(*mat, format!("a rollup: {} (count; cardinality, sum, avg, min, max of a facet)", args.first().copied().unwrap_or(""))))?;
+            }
+            "by" => {
+                let facet = |f: &str| if spans { crate::logs::store::Facet::parse_span(f) } else { crate::logs::store::Facet::parse(f) };
+                by = args.iter().flat_map(|s| s.split(',')).map(str::trim).filter(|s| !s.is_empty()).map(facet).collect();
+                if by.len() > crate::logs::store::MAX_BY {
+                    return Err(syntax(*mat, format!(".by(…): {} facets at the most", crate::logs::store::MAX_BY)));
+                }
+            }
+            "last" => return Err(syntax(*mat, "a query's window is its range: .last() is a monitor's")),
+            other => return Err(syntax(*mat, format!("after {name}(…): .{other}() (rollup, by, index)"))),
+        }
+        j = k + 1;
+    }
+    Ok((RecordQuery { of, text: raw.clone(), search, measure, by }, j))
 }
 
 fn number_text(toks: &[Spanned<'_>], j: usize) -> String {
@@ -850,6 +1103,30 @@ mod tests {
         );
     }
 
+    /// Datadog's boolean filters: conditions ANDed alone, however written, are plain conditions (the
+    /// index's fast path); a filter with OR, or NOT of more than one condition, is kept as an
+    /// expression.
+    #[test]
+    fn conditions_anded_are_plain_and_the_rest_an_expression() {
+        let read = |q: &str| match parse(q).unwrap().nodes.into_iter().next() {
+            Some(Node::Metric(m)) => (m.filters, m.filter),
+            n => panic!("{n:?}"),
+        };
+        let plain = vec![
+            Clause { key: "a".into(), values: vec![ValueMatch::Exact("x".into())], negate: false },
+            Clause { key: "b".into(), values: vec![ValueMatch::Any], negate: true },
+            Clause { key: "c".into(), values: vec![ValueMatch::Exact("y".into()), ValueMatch::Exact("z".into())], negate: true },
+        ];
+        for q in ["m{a:x, !b:, c NOT IN (y, z)}", "m{a:x AND NOT b: and !c IN (y, z)}", "m{* a:x (!b:) $env NOT c:(y OR z)}"] {
+            assert_eq!(read(q), (plain.clone(), None), "{q}");
+        }
+        for q in ["m{a:x OR b:y}", "m{NOT (a:x, b:y)}", "m{(a:x or b:y) AND c:z}", "m{c:z, (type:vsmart OR type:vbond) AND $hostname}"] {
+            let (filters, filter) = read(q);
+            assert!(filters.is_empty() && filter.is_some(), "{q}");
+        }
+        assert_eq!(metric(&parse("m{*}.fill(0)").unwrap(), 0).fill, Some(Fill::Zero(None)));
+    }
+
     #[test]
     fn precedence_signs_groups_and_calls() {
         let ast = parse("100 * a{*} / b{*} - -c{*}").unwrap();
@@ -874,7 +1151,34 @@ mod tests {
 
     #[test]
     fn mistakes_are_errors_that_say_where() {
-        for bad in ["", "a{", "a{host}", "a{*} +", "(a{*}", "a{*})", "top()", "top(a{*}, 1, 2, 3, 4)", "a{*}.rollup(median)", "a{*}.nope()", "a{*} a{*}", "a by host", "abs(a{*}, 2)", "a{host:()}"] {
+        for bad in [
+            "",
+            "a{",
+            "a{host}",
+            "a{*} +",
+            "(a{*}",
+            "a{*})",
+            "top()",
+            "top(a{*}, 1, 2, 3, 4)",
+            "a{*}.rollup(median)",
+            "a{*}.nope()",
+            "a{*} a{*}",
+            "a by host",
+            "abs(a{*}, 2)",
+            "a{host:()}",
+            "a{x:y AND}",
+            "a{OR x:y}",
+            "a{x:y OR OR z:w}",
+            "a{NOT}",
+            "a{!}",
+            "a{(x:y}",
+            "a{x:y)}",
+            "a{()}",
+            "a{x:y AND (z:w OR v:u}",
+            "a{x:y z}",
+            "a{x:y,}",
+            "a{*}.fill(1)",
+        ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }
         assert!(matches!(parse("a{*} + + b{*}"), Ok(_) | Err(ParseError::Syntax { .. })));
@@ -891,6 +1195,46 @@ mod tests {
         for _ in 0..20_000 {
             let q: String = (0..rng.below(16)).map(|_| words[rng.below(words.len() as u64) as usize]).collect();
             let _ = parse(&q);
+        }
+    }
+
+    /// Logs, spans and events as operands, in Datadog's log monitor syntax without its window; what
+    /// such a query cannot say is refused.
+    #[test]
+    fn records_queries_are_operands() {
+        use crate::logs::store::{Facet, Measure};
+        let records = |ast: &Ast| ast.nodes.iter().filter_map(|n| if let Node::Records(r) = n { Some(r.clone()) } else { None }).collect::<Vec<_>>();
+        let ast = parse(r#"100 * logs("status:error").rollup("count").by("service, @route") / logs("*").index("*")"#).unwrap();
+        let r = records(&ast);
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].of, &r[0].measure, &r[0].by), (RecordSource::Logs, &Measure::Count, &vec![Facet::Service, Facet::Attr("route".into())]));
+        assert!(matches!(ast.nodes[ast.root], Node::Bin(BinOp::Div, ..)));
+        let r = records(&parse(r#"trace-analytics("service:web @duration:>1s").rollup("avg", "@duration").by("resource_name")"#).unwrap());
+        assert_eq!((r[0].of, &r[0].measure, &r[0].by), (RecordSource::Spans, &Measure::Avg("duration".into()), &vec![Facet::Name]));
+        let r = records(&parse(r#"default_zero(spans("*").rollup("cardinality", "@trace_id")) + events("deploy")"#).unwrap());
+        assert_eq!((r[0].measure.clone(), r[1].of, r[1].text.as_str()), (Measure::Cardinality(Facet::Attr("trace_id".into())), RecordSource::Events, "deploy"));
+        // Each metric and records query's place in the text, as written.
+        let q = r#"100 * sum:a{x:y, z:w} by {h}.as_count() / default_zero(logs("s \"t\"").by("h"))  "#;
+        let ast = parse(q).unwrap();
+        let texts: Vec<&str> = ast.leaves.iter().map(|(_, r)| &q[r.clone()]).collect();
+        assert_eq!(texts, ["sum:a{x:y, z:w} by {h}.as_count()", r#"logs("s \"t\"").by("h")"#]);
+        assert!(ast.leaves.iter().all(|(id, _)| matches!(ast.nodes[*id], Node::Metric(_) | Node::Records(_))));
+        // A dashboard's template variable left unfilled reads as Datadog's `*`; `$env.value` is a value.
+        let filters = |q: &str| parse(q).unwrap().nodes.into_iter().find_map(|n| if let Node::Metric(m) = n { Some(m.filters) } else { None }).unwrap();
+        assert_eq!(filters("avg:cpu{$env, host:a} by {host}"), vec![Clause { key: "host".into(), values: vec![ValueMatch::Exact("a".into())], negate: false }]);
+        assert!(parse("avg:cpu{env:$env.value}").is_ok());
+        for bad in [
+            r#"logs("x").last("5m")"#,
+            r#"logs("x").rollup("median", "@d")"#,
+            r#"logs("x").rollup("sum")"#,
+            r#"logs("(x")"#,
+            r#"logs("x").by(service)"#,
+            r#"logs("x", "y")"#,
+            r#"logs("x").limit("5")"#,
+            r#"logs("x").by("a,b,c,d,e,f,g,h,i")"#,
+            "logs(x)",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
     }
 }

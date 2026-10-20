@@ -306,7 +306,40 @@ impl Index {
             subtract(&acc, &u, &mut tmp);
             std::mem::swap(&mut acc, &mut tmp);
         }
+        if let Some(e) = &sel.expr
+            && !acc.is_empty()
+        {
+            acc = self.select_expr(symbols, e, &acc);
+        }
         *out = acc;
+    }
+
+    /// The series of `universe` (sorted) that `e` holds of: each node's set from its children's, in
+    /// the order the nodes are kept (no recursion, however deep the brackets).
+    fn select_expr(&self, symbols: &Symbols, e: &FilterExpr, universe: &[u32]) -> Vec<u32> {
+        let n = self.series.len();
+        let mut sets: Vec<Vec<u32>> = Vec::with_capacity(e.nodes.len());
+        let mut u: Vec<u32> = Vec::new();
+        for node in &e.nodes {
+            let set = |i: usize| sets.get(i).map_or(&[][..], Vec::as_slice);
+            let mut held = Vec::new();
+            match node {
+                FilterNode::All => held.extend_from_slice(universe),
+                FilterNode::Clause(c) => {
+                    union_lists(&self.clause_lists(symbols, c), n, &mut u);
+                    if c.negate {
+                        subtract(universe, &u, &mut held);
+                    } else {
+                        intersect(universe, &u, &mut held);
+                    }
+                }
+                FilterNode::And(a, b) => intersect(set(*a), set(*b), &mut held),
+                FilterNode::Or(a, b) => union_lists(&[set(*a), set(*b)], n, &mut held),
+                FilterNode::Not(a) => subtract(universe, set(*a), &mut held),
+            }
+            sets.push(held);
+        }
+        sets.into_iter().nth(e.root).unwrap_or_default()
     }
 
     fn clause_lists<'s>(&'s self, symbols: &Symbols, c: &Clause) -> Vec<&'s [u32]> {
@@ -381,16 +414,36 @@ pub enum ValueMatch {
     Any,
 }
 
-/// A metric and the conditions on its tags (AND).
+/// A boolean expression of tag conditions, Datadog's `{(a:x OR a:y) AND NOT b:z}`: its nodes,
+/// children before their parents, and its root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterExpr {
+    pub nodes: Vec<FilterNode>,
+    pub root: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterNode {
+    /// One tag's condition (negated, where it says).
+    Clause(Clause),
+    And(usize, usize),
+    Or(usize, usize),
+    Not(usize),
+    /// Every series: `*`, or a template variable left unfilled.
+    All,
+}
+
+/// A metric and the conditions on its tags (AND), and a boolean expression of more besides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selector {
     pub metric: NameMatch,
     pub clauses: Vec<Clause>,
+    pub expr: Option<FilterExpr>,
 }
 
 impl Selector {
     pub fn metric(name: &str) -> Self {
-        Self { metric: NameMatch::Exact(name.to_owned()), clauses: Vec::new() }
+        Self { metric: NameMatch::Exact(name.to_owned()), clauses: Vec::new(), expr: None }
     }
 
     pub fn tag(mut self, key: &str, value: &str) -> Self {
@@ -594,13 +647,44 @@ mod tests {
         assert!(out.is_empty());
         idx.select(&sym, &Selector::metric("nothere"), &mut out);
         assert!(out.is_empty());
-        let sel = Selector { metric: NameMatch::Glob("cpu*".into()), clauses: vec![Clause { key: "host".into(), values: vec![ValueMatch::Exact("web-1".into()), ValueMatch::Exact("db-1".into())], negate: false }] };
+        let sel = Selector {
+            expr: None,
+            metric: NameMatch::Glob("cpu*".into()),
+            clauses: vec![Clause { key: "host".into(), values: vec![ValueMatch::Exact("web-1".into()), ValueMatch::Exact("db-1".into())], negate: false }],
+        };
         idx.select(&sym, &sel, &mut out);
         assert_eq!(out, vec![0, 2, 5]);
         idx.select(&sym, &Selector::metric("cpu.idle").tag("host", "*"), &mut out);
         assert_eq!(out, vec![5]);
         idx.select(&sym, &Selector::metric("cpu").not_tag("host", "*"), &mut out);
         assert!(out.is_empty());
+    }
+
+    /// A boolean expression of tags (Datadog's `{(host:db-1 OR env:dev) AND NOT host:web-3}`), within
+    /// the metric and the clauses beside it.
+    #[test]
+    fn selection_by_a_boolean_expression_of_tags() {
+        let (idx, sym) = index_of(&[
+            ("cpu", &[("host", "web-1"), ("env", "prod")]),
+            ("cpu", &[("host", "web-2"), ("env", "prod")]),
+            ("cpu", &[("host", "db-1"), ("env", "prod")]),
+            ("cpu", &[("host", "web-3"), ("env", "dev")]),
+            ("mem", &[("host", "web-1"), ("env", "prod")]),
+        ]);
+        let c = |k: &str, v: &str, negate: bool| FilterNode::Clause(Clause { key: k.into(), values: vec![ValueMatch::Exact(v.into())], negate });
+        let e = FilterExpr { nodes: vec![c("host", "db-1", false), c("env", "dev", false), FilterNode::Or(0, 1), c("host", "web-3", false), FilterNode::Not(3), FilterNode::And(2, 4)], root: 5 };
+        let mut out = Vec::new();
+        idx.select(&sym, &Selector { expr: Some(e.clone()), ..Selector::metric("cpu") }, &mut out);
+        assert_eq!(out, vec![2]);
+        idx.select(&sym, &Selector { expr: Some(e), ..Selector::metric("cpu").tag("env", "prod") }, &mut out);
+        assert_eq!(out, vec![2]);
+        let all = FilterExpr { nodes: vec![FilterNode::All, c("env", "prod", true), FilterNode::And(0, 1)], root: 2 };
+        idx.select(&sym, &Selector { expr: Some(all), ..Selector::metric("cpu") }, &mut out);
+        assert_eq!(out, vec![3]);
+        // NOT is of the metric's series, never another metric's.
+        let not = FilterExpr { nodes: vec![c("host", "db-1", false), c("host", "web-2", false), FilterNode::Or(0, 1), FilterNode::Not(2)], root: 3 };
+        idx.select(&sym, &Selector { expr: Some(not), ..Selector::metric("cpu") }, &mut out);
+        assert_eq!(out, vec![0, 3]);
     }
 
     #[test]

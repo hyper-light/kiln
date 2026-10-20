@@ -329,6 +329,28 @@ pub enum Measure {
     Max(String),
 }
 
+impl Measure {
+    /// Datadog's rollup of records, as a log monitor's `.rollup()` names it: `count` (or none), or
+    /// `cardinality`, `sum`, `avg`, `min`, `max` of a facet (`@duration`), a span's with `spans`.
+    pub fn parse(name: Option<&str>, facet: Option<&str>, spans: bool) -> Option<Self> {
+        let facet = facet.map(|f| f.trim().trim_start_matches('@'));
+        Some(match (name.map(str::trim), facet) {
+            (Some("count") | None, _) => Self::Count,
+            (Some("cardinality"), Some(f)) => Self::Cardinality(if spans { Facet::parse_span(f) } else { Facet::parse(f) }),
+            (Some("sum"), Some(f)) => Self::Sum(f.to_owned()),
+            (Some("avg"), Some(f)) => Self::Avg(f.to_owned()),
+            (Some("min"), Some(f)) => Self::Min(f.to_owned()),
+            (Some("max"), Some(f)) => Self::Max(f.to_owned()),
+            _ => return None,
+        })
+    }
+
+    /// Whether it counts (records, or values), so a bucket nothing fell in is 0 rather than none.
+    pub fn counts(&self) -> bool {
+        matches!(self, Self::Count | Self::Cardinality(_))
+    }
+}
+
 /// Groups an aggregation keeps at the most: a query's answer's (`crate::query::eval`'s).
 pub const MAX_GROUPS: usize = 10_000;
 /// Facets an aggregation groups by at the most (Datadog's log analytics takes four).

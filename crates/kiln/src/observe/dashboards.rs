@@ -1,11 +1,14 @@
 //! Dashboards (`docs/observe.md` §11): what the server keeps of them, and the ones kiln brings.
 //!
 //! A dashboard is Datadog's, near enough: a title, template variables (`$host` in a widget's query
-//! stands for `host:<value>`, or `*`), and widgets on a 12-column grid, each a kind with its queries
-//! (`timeseries`, `query_value`, `toplist`, `table`), a log search (`logs`), an event search
-//! (`events`), monitors' states (`monitors`), or text (`note`). The UI draws them; the API keeps
-//! them (`<observe>/dashboards.json`). kiln's own dashboards (`builtin:…`: its hosts, CI and CD)
-//! are always there and read-only: a copy is the way to change one.
+//! stands for `host:<value>`, or `*`; `$host.value` for the value alone), and widgets on a
+//! 12-column grid, each a kind with its queries (`timeseries`, `query_value`, `toplist`, `table`,
+//! `heatmap`, `distribution`, `pie`), a log search (`logs`), an event search (`events`), monitors'
+//! states (`monitors`), text (`note`), or widgets of its own (`group`, Datadog's: a titled set of
+//! widgets on a grid of their own, no group among them). The UI draws them; the API keeps them
+//! (`<observe>/dashboards.json`), and takes and gives Datadog's dashboard JSON (`super::ddash`).
+//! kiln's own dashboards (`builtin:…`: its hosts, CI and CD) are always there and read-only: a copy
+//! is the way to change one.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,10 +17,11 @@ use std::sync::{Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Widgets a dashboard holds at the most, and bytes it may be.
-const WIDGETS: usize = 100;
+/// Widgets a dashboard holds at the most, its groups' among them: the largest of Datadog's 678
+/// integration dashboards holds 126 (`super::ddash`'s corpus). And bytes it may be.
+pub const WIDGETS: usize = 200;
 pub const BYTES: usize = 1 << 20;
-const KINDS: &[&str] = &["timeseries", "query_value", "toplist", "table", "heatmap", "distribution", "logs", "events", "monitors", "note"];
+pub const KINDS: &[&str] = &["timeseries", "query_value", "toplist", "table", "heatmap", "distribution", "pie", "logs", "events", "monitors", "note", "group"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dashboard {
@@ -70,10 +74,14 @@ pub struct Widget {
     pub text: String,
     #[serde(default)]
     pub layout: Layout,
-    /// What the kind takes besides: a unit, a display (`line`, `bars`, `area`), how a query value or
-    /// a toplist sums a series over the range (`aggregator`: `avg`, `sum`, `min`, `max`, `last`).
+    /// What the kind takes besides: a unit, a display (`line`, `bars`, `area`), how a query value, a
+    /// toplist or a pie sums a series over the range (`aggregator`: `avg`, `sum`, `min`, `max`,
+    /// `last`), how many a toplist shows (`limit`) and in which `order` (`desc`, `asc`).
     #[serde(default)]
     pub options: Value,
+    /// A group's widgets, on its own grid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widgets: Vec<Widget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,8 +130,9 @@ impl Dashboards {
         lock(&self.all).get(id).cloned()
     }
 
-    /// Creates or replaces a dashboard, checked: widgets of known kinds on the grid, at most
-    /// [`WIDGETS`], each with an id.
+    /// Creates or replaces a dashboard, checked: widgets of known kinds on the grid (a group's on
+    /// its own, no group in a group), at most [`WIDGETS`] with its groups', each with an id of its
+    /// own.
     pub fn put(&self, mut d: Dashboard) -> Result<Dashboard, String> {
         if d.id.starts_with("builtin:") {
             return Err("kiln's own dashboards are read-only: copy one to change it".into());
@@ -131,28 +140,20 @@ impl Dashboards {
         if d.title.trim().is_empty() {
             return Err("a dashboard's title".into());
         }
-        if d.widgets.len() > WIDGETS {
-            return Err(format!("{} widgets: at most {WIDGETS}", d.widgets.len()));
+        let n = d.widgets.iter().map(|w| 1 + w.widgets.len()).sum::<usize>();
+        if n > WIDGETS {
+            return Err(format!("{n} widgets: at most {WIDGETS}"));
         }
-        let mut ids: std::collections::HashSet<String> = d.widgets.iter().map(|w| w.id.clone()).filter(|id| !id.is_empty()).collect();
-        if ids.len() != d.widgets.iter().filter(|w| !w.id.is_empty()).count() {
+        let every = || d.widgets.iter().flat_map(|w| std::iter::once(w).chain(&w.widgets));
+        let mut ids: std::collections::HashSet<String> = every().map(|w| w.id.clone()).filter(|id| !id.is_empty()).collect();
+        if ids.len() != every().filter(|w| !w.id.is_empty()).count() {
             return Err("two widgets of one id".into());
         }
+        let vars = d.template_variables.clone();
         for w in &mut d.widgets {
-            if !KINDS.contains(&w.kind.as_str()) {
-                return Err(format!("a widget of kind {:?}: one of {}", w.kind, KINDS.join(", ")));
-            }
-            if w.layout.w == 0 || w.layout.h == 0 || w.layout.x + w.layout.w > 12 {
-                return Err("a widget's layout: on the grid's 12 columns, at least 1×1".into());
-            }
-            for q in &w.queries {
-                // A query with template variables in it is checked once they are filled with `*`.
-                let filled = d.template_variables.iter().fold(q.clone(), |q, v| q.replace(&format!("${}", v.name), "*"));
-                kiln_obs::query::parse::parse(&filled).map_err(|e| format!("a widget's query {q:?}: {e}"))?;
-            }
-            if w.id.is_empty() {
-                w.id = super::fresh_id("w", |id| ids.contains(id));
-                ids.insert(w.id.clone());
+            check(w, &vars, false, &mut ids)?;
+            for c in &mut w.widgets {
+                check(c, &vars, true, &mut ids)?;
             }
         }
         if serde_json::to_vec(&d).map_or(0, |b| b.len()) > BYTES {
@@ -188,12 +189,57 @@ impl Dashboards {
     }
 }
 
+/// A widget checked (`in_group`: a group's): of a known kind, on its grid's 12 columns, its queries
+/// parsed (template variables filled with `*`), a group's widgets a group's alone; given an id
+/// when it has none.
+fn check(w: &mut Widget, vars: &[TemplateVariable], in_group: bool, ids: &mut std::collections::HashSet<String>) -> Result<(), String> {
+    if !KINDS.contains(&w.kind.as_str()) {
+        return Err(format!("a widget of kind {:?}: one of {}", w.kind, KINDS.join(", ")));
+    }
+    if w.layout.w == 0 || w.layout.h == 0 || w.layout.x + w.layout.w > 12 {
+        return Err("a widget's layout: on the grid's 12 columns, at least 1×1".into());
+    }
+    if w.kind == "group" && in_group {
+        return Err("a group in a group: a group's widgets are of other kinds".into());
+    }
+    if w.kind != "group" && !w.widgets.is_empty() {
+        return Err(format!("a {} widget with widgets of its own: a group's alone", w.kind));
+    }
+    for q in &w.queries {
+        let filled = filled_with_any(q, vars);
+        kiln_obs::query::parse::parse(&filled).map_err(|e| format!("a widget's query {q:?}: {e}"))?;
+    }
+    if w.id.is_empty() {
+        w.id = super::fresh_id("w", |id| ids.contains(id));
+        ids.insert(w.id.clone());
+    }
+    Ok(())
+}
+
+/// A query with its template variables filled with `*` (`$host.value` and `$host` alike), to be
+/// checked.
+pub fn filled_with_any(q: &str, vars: &[TemplateVariable]) -> String {
+    let mut by_length: Vec<&TemplateVariable> = vars.iter().collect();
+    by_length.sort_by_key(|v| std::cmp::Reverse(v.name.len()));
+    by_length.iter().fold(q.to_owned(), |q, v| q.replace(&format!("${}.value", v.name), "*").replace(&format!("${}", v.name), "*"))
+}
+
 fn widget(title: &str, kind: &str, queries: &[&str], (x, y, w, h): (u32, u32, u32, u32), options: Value) -> Widget {
-    Widget { id: format!("{}-{x}-{y}", kind), title: title.into(), kind: kind.into(), queries: queries.iter().map(|q| (*q).to_owned()).collect(), search: String::new(), text: String::new(), layout: Layout { x, y, w, h }, options }
+    Widget {
+        id: format!("{}-{x}-{y}", kind),
+        title: title.into(),
+        kind: kind.into(),
+        queries: queries.iter().map(|q| (*q).to_owned()).collect(),
+        search: String::new(),
+        text: String::new(),
+        layout: Layout { x, y, w, h },
+        options,
+        widgets: Vec::new(),
+    }
 }
 
 fn search_widget(title: &str, kind: &str, search: &str, (x, y, w, h): (u32, u32, u32, u32)) -> Widget {
-    Widget { id: format!("{}-{x}-{y}", kind), title: title.into(), kind: kind.into(), queries: Vec::new(), search: search.into(), text: String::new(), layout: Layout { x, y, w, h }, options: Value::Null }
+    Widget { id: format!("{}-{x}-{y}", kind), title: title.into(), kind: kind.into(), queries: Vec::new(), search: search.into(), text: String::new(), layout: Layout { x, y, w, h }, options: Value::Null, widgets: Vec::new() }
 }
 
 /// kiln's own dashboards: its hosts, its CI, its CD, its repositories' sync.
@@ -295,7 +341,7 @@ mod tests {
             anyhow::ensure!(d.put(b.clone()).is_err(), "a builtin is read-only");
         }
         anyhow::ensure!(d.list().len() == builtins().len() * 2);
-        let bad = Dashboard { id: String::new(), title: "x".into(), description: String::new(), template_variables: Vec::new(), widgets: vec![Widget { kind: "pie".into(), ..widget("", "note", &[], (0, 0, 1, 1), Value::Null) }], builtin: false, created: 0, modified: 0 };
+        let bad = Dashboard { id: String::new(), title: "x".into(), description: String::new(), template_variables: Vec::new(), widgets: vec![Widget { kind: "flame_graph".into(), ..widget("", "note", &[], (0, 0, 1, 1), Value::Null) }], builtin: false, created: 0, modified: 0 };
         anyhow::ensure!(d.put(bad).is_err(), "an unknown kind is refused");
         let reopened = Dashboards::open(dir.path());
         anyhow::ensure!(reopened.list().len() == builtins().len() * 2, "kept across a restart");

@@ -332,6 +332,115 @@ const scenarios = {
     expect((await api("DELETE", `/api/observe/v1/monitors/${id}`)).status < 300, "the monitor deleted");
   },
 
+  /** A Datadog dashboard imported from its JSON (pasted into the dialog): its group, its pie of logs
+   * by status, its formula of logs over a metric and its log list drawn; a widget kiln does not draw
+   * kept as a note that says what it was; given back as Datadog's JSON. */
+  async "a Datadog dashboard is imported from its JSON, its groups, pies and log formulas drawn"() {
+    const service = `e2e-${run}-shop`;
+    const logs = Array.from({ length: 24 }, (_, i) => ({ message: i % 3 ? "ok" : "boom", status: i % 3 ? "info" : "error", service, hostname: "e2e", source: "app" }));
+    expect((await api("POST", "/api/observe/v1/logs", logs)).status === 202, "posting the logs");
+    const metric = `e2e.dd.requests.${run}`;
+    const now = Math.floor(Date.now() / 1000);
+    expect((await api("POST", "/api/observe/v1/series", { series: [{ metric, type: "count", tags: [`service:${service}`], points: [[now - 60, 12]] }] })).status === 202, "writing the requests");
+    await until(
+      "the logs stored",
+      async () => (await api("POST", "/api/observe/v1/logs/search", { query: `service:${service}`, from: Date.now() - 3_600_000, to: Date.now() + 60_000, limit: 100 })).body?.records?.length === 24,
+    );
+    const title = `E2E Datadog ${run}`;
+    const datadog = {
+      title,
+      layout_type: "ordered",
+      template_variables: [{ name: "svc", prefix: "service", default: service }],
+      widgets: [
+        { definition: { type: "note", content: "**Imported** from Datadog" }, layout: { x: 0, y: 0, width: 12, height: 1 } },
+        {
+          definition: {
+            type: "timeseries",
+            title: "Errors a request",
+            requests: [
+              {
+                queries: [
+                  { data_source: "logs", name: "query1", search: { query: "status:(error OR critical) $svc" }, compute: { aggregation: "count" }, group_by: [] },
+                  { data_source: "metrics", name: "query2", query: `sum:${metric}{$svc AND (service:nope OR NOT service:other)}.as_count()` },
+                ],
+                formulas: [{ formula: "100 * default_zero(query1) / query2" }],
+                response_format: "timeseries",
+                display_type: "bars",
+              },
+            ],
+          },
+          layout: { x: 0, y: 1, width: 6, height: 3 },
+        },
+        { definition: { type: "slo", title: "Checkout SLO", slo_id: "abc" }, layout: { x: 6, y: 1, width: 6, height: 3 } },
+        {
+          definition: {
+            type: "group",
+            title: "Its logs",
+            layout_type: "ordered",
+            widgets: [
+              {
+                definition: {
+                  type: "sunburst",
+                  title: "By status",
+                  requests: [
+                    {
+                      queries: [{ data_source: "logs", name: "q", search: { query: `service:${service}` }, compute: { aggregation: "count" }, group_by: [{ facet: "status", limit: 5 }] }],
+                      formulas: [{ formula: "q" }],
+                      response_format: "scalar",
+                    },
+                  ],
+                },
+                layout: { x: 0, y: 0, width: 6, height: 4 },
+              },
+              {
+                definition: {
+                  type: "list_stream",
+                  title: "Its errors",
+                  requests: [{ query: { data_source: "logs_stream", query_string: `service:${service} status:error` }, columns: [], response_format: "event_list" }],
+                },
+                layout: { x: 6, y: 0, width: 6, height: 4 },
+              },
+            ],
+          },
+          layout: { x: 0, y: 4, width: 12, height: 5 },
+        },
+      ],
+    };
+    await page.goto(`${BASE}/observe/dashboards`);
+    await page.getByRole("button", { name: "Import from Datadog", exact: true }).click();
+    await fillIn(page.getByLabel("Dashboard JSON"), JSON.stringify(datadog));
+    await page.getByRole("dialog").getByRole("button", { name: "Import", exact: true }).click();
+    await page.waitForURL(/\/observe\/dashboards\/d[0-9a-f]+/);
+    const id = decodeURIComponent(page.url().split("/").pop().split("?")[0]);
+    await page.getByRole("heading", { name: title }).waitFor();
+    // Its group, under its title; its pie of the service's logs by status, the errors a third of them.
+    const group = page.getByRole("region", { name: "Its logs" });
+    await group.waitFor();
+    await group.getByRole("img", { name: /logs\("service:/ }).waitFor();
+    await group.getByText("status:error", { exact: true }).waitFor();
+    await group.getByText("33%", { exact: true }).waitFor();
+    await group.getByText("boom").first().waitFor();
+    // The formula's chart; the widget kiln does not draw kept, saying what it was.
+    await page.getByRole("img", { name: /default_zero/ }).waitFor();
+    await page.getByText("widget, not drawn", { exact: false }).first().waitFor();
+    await fitsAcross("an imported dashboard");
+    if (process.env.SHOTS) await page.screenshot({ path: `${process.env.SHOTS}/imported-${which}${phone ? "-phone" : ""}.png`, fullPage: true });
+    // Its boolean filter selects the service's requests, and its opposite none.
+    const counted = async (filter) => {
+      const a = await api("POST", "/api/observe/v1/query", { query: `sum:${metric}{${filter}}.as_count()`, from: Date.now() - 3_600_000, to: Date.now() + 60_000 });
+      return JSON.stringify(a.body?.series?.map((x) => x.values.reduce((sum, v) => sum + (v ?? 0), 0)));
+    };
+    expect((await counted(`service:${service} AND (service:nope OR NOT service:other)`)) === "[12]", "the boolean filter selecting the requests");
+    expect((await counted(`service:${service} AND NOT (service:nope OR service:${service})`)) === "[]", "its opposite selecting none");
+    const d = await api("GET", `/api/observe/v1/dashboards/${id}`);
+    const kinds = d.body.widgets.map((w) => w.kind).join(",");
+    expect(d.status === 200 && kinds === "note,timeseries,note,group" && d.body.widgets[3].widgets.map((w) => w.kind).join(",") === "pie,logs", `its widgets: ${kinds}`);
+    // Given back as Datadog's.
+    const back = await api("GET", `/api/observe/v1/dashboards/${id}/datadog`);
+    expect(back.status === 200 && back.body.title === title && back.body.widgets.length === 4 && back.body.widgets[3].definition.type === "group", "given back as Datadog's JSON");
+    expect((await api("DELETE", `/api/observe/v1/dashboards/${id}`)).status < 300, "the dashboard deleted");
+  },
+
   /** Logs searched, narrowed by a facet, a record opened and one of its attributes searched. */
   async "a log search narrows by a facet and by an attribute of a record"() {
     // Records of its own (whatever else the server holds): two services, errors and not, each with a route.

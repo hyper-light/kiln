@@ -182,6 +182,8 @@ fn term(text: &str, quoted: bool, at: usize, spans: bool) -> Result<Leaf, Search
             "service" => return Ok(Leaf::Field(Field::Service, Text::of(value))),
             "host" => return Ok(Leaf::Field(Field::Host, Text::of(value))),
             "source" => return Ok(Leaf::Field(Field::Source, Text::of(value))),
+            // `status:*`: any status, and every record has one.
+            "status" | "level" if value == "*" => return Ok(Leaf::All),
             "status" | "level" => {
                 let r = severities(value).ok_or_else(|| syntax(at, format!("no status {value:?}")))?;
                 return Ok(Leaf::Status(*r.start(), *r.end()));
@@ -218,6 +220,8 @@ fn lex(q: &str, spans: bool) -> Result<Vec<(usize, Tok)>, SearchError> {
     }
     let mut out = Vec::new();
     let mut it = q.char_indices().peekable();
+    // Inside a value list (`service:(web OR api)`): its key, and the brackets opened within it.
+    let mut list: Option<(String, usize)> = None;
     while let Some(&(i, c)) = it.peek() {
         match c {
             c if c.is_whitespace() => {
@@ -225,10 +229,17 @@ fn lex(q: &str, spans: bool) -> Result<Vec<(usize, Tok)>, SearchError> {
             }
             '(' => {
                 it.next();
+                if let Some((_, depth)) = &mut list {
+                    *depth += 1;
+                }
                 out.push((i, Tok::Open));
             }
             ')' => {
                 it.next();
+                list = match list.take() {
+                    Some((key, depth)) if depth > 0 => Some((key, depth - 1)),
+                    _ => None,
+                };
                 out.push((i, Tok::Close));
             }
             // A `-` that starts a term is NOT (`timeout -env:dev`, `(a) -b`); one inside a term is
@@ -258,7 +269,11 @@ fn lex(q: &str, spans: bool) -> Result<Vec<(usize, Tok)>, SearchError> {
                 if !closed {
                     return Err(syntax(i, "an unterminated quote"));
                 }
-                out.push((i, Tok::Term(term(&s, true, i, spans)?)));
+                let t = match &list {
+                    Some((key, _)) => term(&format!("{key}:{s}"), false, i, spans)?,
+                    None => term(&s, true, i, spans)?,
+                };
+                out.push((i, Tok::Term(t)));
             }
             _ => {
                 // A term runs to whitespace or a bracket; `key:"quoted value"` and `[a TO b]`
@@ -316,11 +331,26 @@ fn lex(q: &str, spans: bool) -> Result<Vec<(usize, Tok)>, SearchError> {
                 if text.is_empty() {
                     continue;
                 }
+                if list.is_none()
+                    && text.ends_with(':')
+                    && let Some(&(open, '(')) = it.peek()
+                {
+                    // A value list, `key:(a OR b)`: the key's condition on each value, as
+                    // `(key:a OR key:b)` would be.
+                    it.next();
+                    text.pop();
+                    list = Some((text, 0));
+                    out.push((open, Tok::Open));
+                    continue;
+                }
                 match text.as_str() {
                     "AND" => out.push((start, Tok::And)),
                     "OR" => out.push((start, Tok::Or)),
                     "NOT" => out.push((start, Tok::Not)),
-                    _ => out.push((start, Tok::Term(term(&text, false, start, spans)?))),
+                    _ => match &list {
+                        Some((key, _)) => out.push((start, Tok::Term(term(&format!("{key}:{text}"), false, start, spans)?))),
+                        None => out.push((start, Tok::Term(term(&text, false, start, spans)?))),
+                    },
                 }
             }
         }
@@ -361,6 +391,9 @@ pub fn parse_spans(q: &str) -> Result<Search, SearchError> {
 
 fn parse_as(q: &str, spans: bool) -> Result<Search, SearchError> {
     let toks = lex(q, spans)?;
+    if toks.is_empty() {
+        return Ok(Search { nodes: vec![Node::Leaf(Leaf::All)], root: 0 });
+    }
     let mut nodes: Vec<Node> = Vec::new();
     let mut vals: Vec<usize> = Vec::new();
     let mut ops: Vec<Op> = Vec::new();
@@ -440,9 +473,6 @@ fn parse_as(q: &str, spans: bool) -> Result<Search, SearchError> {
                 expect_term = true;
             }
         }
-    }
-    if nodes.is_empty() {
-        return Ok(Search { nodes: vec![Node::Leaf(Leaf::All)], root: 0 });
     }
     if expect_term {
         return Err(syntax(q.len(), "the search ends where a term is expected"));
@@ -798,6 +828,8 @@ mod tests {
             ("service:w*", true),
             ("status:error", true),
             ("status:info", false),
+            ("status:*", true),
+            ("-status:* reset", false),
             ("level:ERROR", true),
             ("@http.status_code:>=500", true),
             ("@http.status_code:<500", false),
@@ -827,8 +859,25 @@ mod tests {
             ("*", true),
             ("", true),
             ("@route:\"/api/runs\"", true),
+            // Value lists: the key's condition on each value.
+            ("status:(error OR critical)", true),
+            ("status:(info OR warn)", false),
+            ("service:(api OR web) @http.status_code:(500 OR 503)", true),
+            ("service:(api OR w*)", true),
+            ("-service:(api OR web)", false),
+            ("@route:(\"/api/jobs\" OR \"/api/runs\")", true),
+            ("@route:(/api/jobs OR (/api/runs AND /api/*))", true),
+            ("@route:(/api/jobs OR /api/x) reset", false),
+            ("@http.status_code:(404 OR 503) OR timeout", true),
+            ("NOT @http.status_code:(404 OR 503)", false),
         ] {
             assert_eq!(matches(q, &r), want, "{q:?}");
+        }
+        // A value list reads as its values ORed in brackets, each the key's.
+        for (list, written) in
+            [("@evt.name:(a OR \"b c\" OR d*) x", "(@evt.name:a OR @evt.name:\"b c\" OR @evt.name:d*) x"), ("status:(error OR (warn AND -info))", "(status:error OR (status:warn AND -status:info))")]
+        {
+            assert_eq!(parse(list).unwrap(), parse(written).unwrap(), "{list}");
         }
         // A quoted value holds anything, a quote and a backslash escaped.
         let odd = rec("my \"odd\" app\\x", 9, "m", &[("note", "say \"hi\"")]);
@@ -880,7 +929,9 @@ mod tests {
 
     #[test]
     fn mistakes_are_errors_and_nesting_costs_no_stack() {
-        for bad in ["(a", "a)", "a AND", "OR a", "\"open", "status:nonsense", "@a:>=x", "@a:[1 TO]", ":v"] {
+        for bad in
+            ["(a", "a)", "a AND", "OR a", "\"open", "status:nonsense", "@a:>=x", "@a:[1 TO]", ":v", "(", "NOT", "-", "(NOT", "service:(", "service:()", "status:(error OR nonsense)", "service:(a OR b"]
+        {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         let deep = format!("{}a{}", "(".repeat(3000), ")".repeat(3000));

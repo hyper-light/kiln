@@ -7,6 +7,7 @@ pub mod apm;
 pub mod cloud;
 pub mod collect;
 pub mod dashboards;
+pub mod ddash;
 pub mod ddagent;
 pub mod ddtrace;
 pub mod downtimes;

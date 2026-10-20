@@ -1108,25 +1108,49 @@ fn schemas() -> Map<String, Value> {
             &["ok"],
         ),
     );
-    let widget = object(
-        &[
-            ("id", string()),
-            ("title", string()),
-            ("kind", one_of(&["timeseries", "query_value", "toplist", "table", "heatmap", "distribution", "logs", "events", "monitors", "note"])),
-            ("queries", array(string())),
-            ("search", string()),
-            ("text", describe(string(), "a note's Markdown")),
-            ("layout", object(&[("x", integer()), ("y", integer()), ("w", integer()), ("h", integer())], &["x", "y", "w", "h"])),
-            ("options", any()),
-        ],
-        &["kind"],
+    put(
+        "Widget",
+        object(
+            &[
+                ("id", string()),
+                ("title", string()),
+                ("kind", one_of(super::dashboards::KINDS)),
+                ("queries", describe(array(string()), "metric queries, and log, span and event queries as operands (`logs(\"status:error\").by(\"service\")`)")),
+                ("search", string()),
+                ("text", describe(string(), "a note's Markdown")),
+                ("layout", object(&[("x", integer()), ("y", integer()), ("w", integer()), ("h", integer())], &["x", "y", "w", "h"])),
+                ("options", any()),
+                ("widgets", describe(array(schema("Widget")), "a group's widgets, on its own grid (no group among them)")),
+            ],
+            &["kind"],
+        ),
     );
     let dashboard_fields = [
         ("title", string()),
         ("description", string()),
         ("template_variables", array(object(&[("name", string()), ("tag", string()), ("default", string())], &["name", "tag"]))),
-        ("widgets", array(widget)),
+        ("widgets", array(schema("Widget"))),
     ];
+    put(
+        "DatadogDashboard",
+        describe(
+            object(&[("title", string()), ("description", string()), ("layout_type", one_of(&["ordered", "free"])), ("template_variables", array(any())), ("widgets", array(any()))], &["title", "widgets"]),
+            "Datadog's dashboard JSON, as its API (`/api/v1/dashboard/{id}`) gives one",
+        ),
+    );
+    let said = object(&[("title", string()), ("type", describe(string(), "Datadog's widget type")), ("why", string())], &["title", "type", "why"]);
+    put(
+        "DashboardImport",
+        object(
+            &[
+                ("widgets", describe(integer(), "Datadog's widgets, its groups' among them")),
+                ("drawn", describe(integer(), "those kiln draws as Datadog does")),
+                ("otherwise", describe(array(said.clone()), "those kiln draws otherwise (a change as a top list of the changes, ...)")),
+                ("not_drawn", describe(array(said), "those kept as notes that say what they were, or left out (Datadog's own images)")),
+            ],
+            &["widgets", "drawn", "otherwise", "not_drawn"],
+        ),
+    );
     let slo_fields = [
         ("name", string()),
         ("description", string()),
@@ -1423,6 +1447,15 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: vec![name()], ..op("post", "/clouds/{name}/test", "Pulls a configuration once, nothing written: what it would read", "observe.manage", Some(body("CloudIn")), vec![ok("CloudTest")]) },
         op("get", "/dashboards", "Lists dashboards, without their widgets", "observe.read", None, vec![("200", answer_of("the dashboards", object(&[("dashboards", array(schema("DashboardSummary")))], &["dashboards"])))]),
         op("post", "/dashboards", "Makes a dashboard", "observe.write", Some(body("DashboardIn")), vec![("201", answer("made", Some("Dashboard")))]),
+        op(
+            "post",
+            "/dashboards/import",
+            "Makes a dashboard of Datadog's dashboard JSON: its widgets kiln's, and what became of each said",
+            "observe.write",
+            Some(body("DatadogDashboard")),
+            vec![("201", answer_of("made", object(&[("dashboard", schema("Dashboard")), ("report", schema("DashboardImport"))], &["dashboard", "report"])))],
+        ),
+        Op { params: vec![id()], ..op("get", "/dashboards/{id}/datadog", "A dashboard as Datadog's dashboard JSON", "observe.read", None, vec![ok("DatadogDashboard")]) },
         Op { params: vec![id()], ..op("get", "/dashboards/{id}", "A dashboard, its widgets", "observe.read", None, vec![ok("Dashboard")]) },
         Op { params: vec![id()], ..op("put", "/dashboards/{id}", "Changes a dashboard", "observe.write", Some(body("DashboardIn")), vec![ok("Dashboard")]) },
         Op { params: vec![id()], ..op("delete", "/dashboards/{id}", "Deletes a dashboard", "observe.write", None, vec![no_content()]) },

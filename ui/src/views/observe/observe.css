@@ -21,6 +21,31 @@
   height: 100%;
 }
 
+/* A group: its title over a rule, then its widgets on a grid of its own. */
+.obs-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.obs-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #2a3039;
+}
+.obs-group-head h2 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: #e4e5e7;
+}
+
 .obs-note {
   font-size: 13px;
   line-height: 1.65;

@@ -786,7 +786,7 @@ export interface CloudTest {
   warnings?: string[];
 }
 
-export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "heatmap" | "distribution" | "logs" | "events" | "monitors" | "note";
+export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "heatmap" | "distribution" | "pie" | "logs" | "events" | "monitors" | "note" | "group";
 
 /** A query's heatmap: each row's `[lo, hi]`, and each bucket of time's count in each row (a
  * distribution's rows its buckets). */
@@ -805,7 +805,18 @@ export interface Widget {
   search: string;
   text: string;
   layout: { x: number; y: number; w: number; h: number };
-  options: { unit?: string; display?: "line" | "bars" | "area" } | null;
+  options: { unit?: string; display?: "line" | "bars" | "area"; aggregator?: string; limit?: number; order?: "asc" | "desc" } | null;
+  /** A group's widgets, on a grid of its own. */
+  widgets?: Widget[];
+}
+
+/** What became of a Datadog dashboard's widgets as kiln took it: those drawn as Datadog draws
+ * them, those drawn otherwise, and those kept as notes (or left out), each with why. */
+export interface DashboardImport {
+  widgets: number;
+  drawn: number;
+  otherwise: { title: string; type: string; why: string }[];
+  not_drawn: { title: string; type: string; why: string }[];
 }
 
 export interface TemplateVariable {
@@ -1081,18 +1092,26 @@ export const observeApi = {
   createDashboard: (d: Omit<Dashboard, "id" | "builtin" | "created" | "modified">) => request<Dashboard>("POST", `${BASE}/dashboards`, d),
   updateDashboard: (d: Dashboard) => request<Dashboard>("PUT", `${BASE}/dashboards/${enc(d.id)}`, d),
   deleteDashboard: (id: string) => request<void>("DELETE", `${BASE}/dashboards/${enc(id)}`),
+  /** Datadog's dashboard JSON, as its API gives one, made a dashboard of kiln's. */
+  importDashboard: (datadog: unknown) => request<{ dashboard: Dashboard; report: DashboardImport }>("POST", `${BASE}/dashboards/import`, datadog),
+  /** Where a dashboard is given as Datadog's dashboard JSON. */
+  datadogUrl: (id: string) => `${BASE}/dashboards/${enc(id)}/datadog`,
 };
 
 /**
  * A template variable's value in a query: `$host` stands for `host:<value>`, or for `any` (`*` in a
- * metric query's filter; nothing in a log search) when it is `*`.
+ * metric query's filter; nothing in a log search) when it is `*`; `$host.value` (Datadog's) for the
+ * value alone, `*` for any.
  */
 export function fillVariables(query: string, vars: TemplateVariable[], values: Record<string, string>, any = "*"): string {
   let q = query;
   // Longest names first, so `$hostname` is not read as `$host` and `name`.
   for (const v of [...vars].sort((a, b) => b.name.length - a.name.length)) {
     const value = values[v.name] ?? v.default;
-    q = q.split(`$${v.name}`).join(!value || value === "*" ? any : `${v.tag}:${/^[\w.\-/:]+$/.test(value) ? value : `"${value.replace(/["\\]/g, "\\$&")}"`}`);
+    const all = !value || value === "*";
+    const plain = /^[\w.\-/:]+$/.test(value) ? value : `"${value.replace(/["\\]/g, "\\$&")}"`;
+    q = q.split(`$${v.name}.value`).join(all ? "*" : plain);
+    q = q.split(`$${v.name}`).join(all ? any : `${v.tag}:${plain}`);
   }
   return q;
 }

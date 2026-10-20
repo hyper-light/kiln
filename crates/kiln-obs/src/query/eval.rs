@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use super::calendar::{self, Calendar};
-use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, Rollup, SpaceAgg, parse};
+use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, RecordQuery, RecordSource, Rollup, SpaceAgg, parse};
 use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
 use crate::index::{NameMatch, Selector};
@@ -278,6 +278,14 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                 let edges = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
                 Value::Set(metric(store, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?)
             }
+            Node::Records(r) => {
+                let g = at(ext.get(id).copied().unwrap_or(0));
+                let (off, edges) = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
+                if edges.is_some() {
+                    return Err(QueryError::Invalid("a log, span or event query is read in even buckets: no calendar rollup or calendar shift of one".into()));
+                }
+                Value::Set(records(store, r, g, off, req.max_series, &mut scanned)?)
+            }
             Node::Neg(x) => match take(&mut values, *x)? {
                 Value::Scalar(a) => Value::Scalar(-a),
                 Value::Set(mut s) => {
@@ -309,6 +317,8 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                     let mut it = taken.into_iter();
                     let (Some(a), Some(b)) = (it.next(), it.next()) else { return Err(QueryError::Invalid("pow(a, b)".into())) };
                     binary(BinOp::Pow, a, b)?
+                } else if let Func::Max | Func::Min = f {
+                    extreme(*f == Func::Max, taken)?
                 } else {
                     if taken.iter().any(|v| matches!(v, Value::Named(..))) {
                         return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() does)")));
@@ -1052,7 +1062,7 @@ fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<(&'q str, Pa
     let NameMatch::Exact(name) = &q.metric else { return None };
     let has = |suffix: &str| {
         let mut ids = Vec::new();
-        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{suffix}")), clauses: q.filters.clone() }, &mut ids);
+        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{suffix}")), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
         !ids.is_empty()
     };
     if has(crate::dist::SUFFIX) || (has(".count") && has(".sum") && !has("")) {
@@ -1121,7 +1131,7 @@ fn explicit_quantile(store: &Store, q: &MetricQuery, bucket: &str, grid: Grid, s
 fn buckets_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
     let NameMatch::Exact(name) = &q.metric else { return None };
     let mut ids = Vec::new();
-    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
     (!ids.is_empty()).then_some(name.as_str())
 }
 
@@ -1156,7 +1166,7 @@ fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans:
         SpaceAgg::Max => return parts.max.map_or(Ok(Vec::new()), |max| metric(store, &MetricQuery { mode: None, ..part(max, SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned)),
     };
     let mut ids = Vec::new();
-    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
     if ids.is_empty() {
         // No exponential buckets: an explicit histogram's, if it has them.
         return explicit_quantile(store, q, parts.bucket, grid, spans, p, max_series, scratch, scanned);
@@ -1373,7 +1383,7 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
         let edges = grid.edges(0);
         let spans = Spans::new(grid, 0, edges.as_deref());
         let mut ids = Vec::new();
-        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
         ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
         let members: Vec<(u32, i32, crate::dist::Bucket)> = ids.iter().filter_map(|&id| store.series(id)?.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value).map(|(s, b)| (id, s, b))).collect();
         let (mut table, mut coarser) = (DistTable::default(), DistTable::default());
@@ -1418,13 +1428,55 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
     Ok(Heatmap { grid: a.grid, rows: edges, counts, distribution: false })
 }
 
+/// A records query's series on the grid, read `off` ms from it (a time shift's): its measure each
+/// bucket, by its facets (each group's tags its facets' names, an attribute's without its `@`, and
+/// values). A count's bucket nothing fell in is 0, as a count of nothing is, and a count by nothing
+/// of nothing is one series of 0; another measure's is none. A shift by a part of the step reads
+/// the buckets it falls in (the store's buckets are the step's own).
+fn records(store: &Store, r: &RecordQuery, grid: Grid, off: i64, max_series: usize, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+    const NS: i64 = 1_000_000;
+    let step = grid.step.max(1);
+    let (from, to) = (grid.from.saturating_add(off), grid.time(grid.n).saturating_add(off));
+    let (from_ns, to_ns, step_ns) = (from.saturating_mul(NS), to.saturating_mul(NS).saturating_sub(1), step.saturating_mul(NS));
+    let found = match r.of {
+        RecordSource::Spans => store.aggregate_spans_buckets(&r.search, from_ns, to_ns, step_ns, &r.by, &r.measure),
+        RecordSource::Logs | RecordSource::Events => store.aggregate_logs_buckets(&r.search, from_ns, to_ns, step_ns, &r.by, &r.measure),
+    }
+    .map_err(|e| QueryError::Invalid(e.to_string()))?;
+    scanned.1 = scanned.1.saturating_add(found.rows_scanned);
+    if found.groups.len() > max_series {
+        return Err(QueryError::TooManySeries(found.groups.len(), max_series));
+    }
+    let empty = if r.measure.counts() { 0.0 } else { f64::NAN };
+    let names: Vec<String> = r.by.iter().map(|f| f.name().trim_start_matches('@').to_owned()).collect();
+    // The store's bucket `k` is the grid's `lead + k`.
+    let lead = found.buckets.start.saturating_sub(from_ns).div_euclid(step_ns);
+    let mut out: Vec<Series> = Vec::with_capacity(found.groups.len().max(1));
+    for (values, cells) in found.groups {
+        let mut v = vec![empty; grid.n];
+        for (k, cell) in cells.into_iter().enumerate() {
+            let i = lead.saturating_add(i64::try_from(k).unwrap_or(i64::MAX));
+            if let (Some(slot), Some(x)) = (usize::try_from(i).ok().and_then(|i| v.get_mut(i)), cell) {
+                *slot = x;
+            }
+        }
+        let mut tags: Vec<(String, String)> = names.iter().cloned().zip(values).collect();
+        tags.sort();
+        out.push(Series { tags, values: v, bounds: None, outlier: None });
+    }
+    if out.is_empty() && r.by.is_empty() && r.measure.counts() {
+        out.push(Series { tags: Vec::new(), values: vec![0.0; grid.n], bounds: None, outlier: None });
+    }
+    Ok(out)
+}
+
 /// A metric query's series on the grid.
 fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     if let Some((_, parts)) = distribution_of(store, q) {
         return distribution(store, q, parts, grid, spans, max_series, scratch, scanned);
     }
     let mut ids = Vec::new();
-    store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone() }, &mut ids);
+    store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
     // In the order of the series' fingerprints, the same on every replica (ids are each one's
     // own), so a group's values are summed in one order everywhere: floating-point addition does
     // not associate, and every replica answers to the bit.
@@ -2364,7 +2416,7 @@ fn binary(op: BinOp, a: Value, b: Value) -> Result<Value, QueryError> {
                 }
             } else {
                 let index: HashMap<&Vec<(String, String)>, usize> = r.iter().enumerate().map(|(i, s)| (&s.tags, i)).collect();
-                for mut s in l.clone() {
+                for mut s in l {
                     if let Some(rs) = index.get(&s.tags).and_then(|&i| r.get(i)) {
                         for (v, w) in s.values.iter_mut().zip(&rs.values) {
                             *v = f(*v, *w);
@@ -2377,6 +2429,66 @@ fn binary(op: BinOp, a: Value, b: Value) -> Result<Value, QueryError> {
         }
         _ => return Err(QueryError::Invalid("arithmetic on a string".into())),
     })
+}
+
+/// `max(a, b, ...)` (`min`): at each point the largest (least) value its arguments have there, none
+/// where none has one. A query's groups are matched by their tags, as arithmetic matches them, but a
+/// group only some arguments have keeps theirs (Datadog's own dashboards take the most of the
+/// OpenTelemetry and the Agent's names for one figure, `max(default_zero(a), default_zero(b))`,
+/// whichever a host sends); a lone ungrouped series and a number are every group's.
+fn extreme(max: bool, args: Vec<Value>) -> Result<Value, QueryError> {
+    let pick = |a: f64, b: f64| if max { a.max(b) } else { a.min(b) };
+    let fold = |into: &mut [f64], from: &[f64]| {
+        for (a, b) in into.iter_mut().zip(from) {
+            *a = pick(*a, *b);
+        }
+    };
+    let (mut scalar, mut lone, mut grouped, mut sets): (Option<f64>, Option<Series>, Vec<Series>, bool) = (None, None, Vec::new(), false);
+    for v in args {
+        match v {
+            Value::Scalar(x) => scalar = Some(scalar.map_or(x, |s| pick(s, x))),
+            Value::Set(s) => {
+                sets = true;
+                if !matches!(s.as_slice(), [one] if one.tags.is_empty()) {
+                    grouped.extend(s);
+                } else if let Some(l) = &mut lone {
+                    for one in &s {
+                        fold(&mut l.values, &one.values);
+                    }
+                } else {
+                    lone = s.into_iter().next();
+                }
+            }
+            Value::Str(_) | Value::Named(..) => return Err(QueryError::Invalid("max() and min() take queries and numbers".into())),
+        }
+    }
+    if !sets {
+        return Ok(Value::Scalar(scalar.unwrap_or(f64::NAN)));
+    }
+    // A group's series from each argument side by side, folded into its first in place.
+    let mut out = grouped;
+    out.sort_unstable_by(|a, b| a.tags.cmp(&b.tags));
+    out.dedup_by(|s, kept| {
+        let same = s.tags == kept.tags;
+        if same {
+            fold(&mut kept.values, &s.values);
+        }
+        same
+    });
+    if out.is_empty() {
+        out.extend(lone.take());
+    }
+    for s in &mut out {
+        if let Some(l) = &lone {
+            fold(&mut s.values, &l.values);
+        }
+        if let Some(x) = scalar {
+            for v in &mut s.values {
+                *v = pick(*v, x);
+            }
+        }
+    }
+    Ok(Value::Set(out))
 }
 
 fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> {
@@ -2458,8 +2570,8 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
             set = ranked(set, n, by, desc);
         }
         // Evaluated apart (`anomalies`, `forecast`: they read their query's history; the shifts:
-        // they move their query's reading; `pow`: either side a query or a number).
-        Func::Timeshift | Func::Anomalies | Func::Forecast | Func::Pow | Func::HourBefore | Func::DayBefore | Func::WeekBefore | Func::MonthBefore | Func::CalendarShift => {}
+        // they move their query's reading; `pow`, `max`, `min`: any argument a query or a number).
+        Func::Timeshift | Func::Anomalies | Func::Forecast | Func::Pow | Func::Max | Func::Min | Func::HourBefore | Func::DayBefore | Func::WeekBefore | Func::MonthBefore | Func::CalendarShift => {}
         Func::Round => {
             let places = match args.first() {
                 Some(v) => num(Some(v), "the decimal places")?,
@@ -3818,5 +3930,241 @@ mod tests {
         assert_eq!(asap_span(&clean), 1);
         let wave: Vec<f64> = (0..300).map(|i| (f64::from(i) / 50.0).sin() * 5.0 + noise()).collect();
         assert_eq!(asap_span(&wave), 1);
+    }
+
+    /// Logs, spans and events as operands: each bucket's count (or measure) by their facets, a
+    /// count of nothing 0 and a measure of nothing none; in a formula with each other and with a
+    /// metric; under a function; shifted a week before; a span's mean duration by resource; events
+    /// apart from logs; a calendar rollup refused.
+    #[test]
+    fn logs_spans_and_events_are_operands_bucketed_by_their_facets() {
+        use crate::logs::record::Record;
+        let mut s = store();
+        let rec = |ts_ms: i64, service: &str, severity: u8, attrs: &[(&str, String)]| Record {
+            ts: ts_ms * 1_000_000,
+            severity,
+            service: service.into(),
+            host: "a".into(),
+            source: "app".into(),
+            message: "it".into(),
+            attrs: attrs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect(),
+            ..Record::default()
+        };
+        // Each minute of ten: web's error and three of its requests (10, 20 and 30 ms); in the first
+        // five, two of api's errors; and an event, kiln's own.
+        let mut logs = Vec::new();
+        for m in 0..10i64 {
+            logs.push(rec(m * 60_000 + 30_000, "web", 17, &[("route", "/cart".into())]));
+            for k in 0..3i64 {
+                logs.push(rec(m * 60_000 + 10_000 + k * 1_000, "web", 9, &[("route", "/cart".into()), ("ms", (10 * (k + 1)).to_string())]));
+            }
+            if m < 5 {
+                logs.extend((0..2).map(|k| rec(m * 60_000 + 20_000 + k * 1_000, "api", 17, &[])));
+            }
+        }
+        logs.push(Record { source: crate::monitor::EVENTS.into(), ..rec(90_000, "kiln.monitor", 17, &[]) });
+        let mut b = Builder::new();
+        b.logs(&logs);
+        s.apply(&b.finish()).unwrap();
+
+        let a = q(&s, r#"logs("status:error").rollup("count").by("service")"#);
+        assert_eq!(a.series.len(), 2, "the event is not a log");
+        assert_eq!(by_tag(&a, "service", "web").values, vec![1.0; 10]);
+        assert_eq!(by_tag(&a, "service", "api").values, [2.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(q(&s, r#"logs("service:web")"#).series[0].values, vec![4.0; 10]);
+        let none = q(&s, r#"logs("service:nothing")"#);
+        assert_eq!((none.series.len(), &none.series[0].values), (1, &vec![0.0; 10]));
+        let avg = q(&s, r#"logs("service:web").rollup("avg", "@ms").by("route")"#);
+        assert_eq!(by_tag(&avg, "route", "/cart").values, vec![20.0; 10]);
+        assert!(q(&s, r#"logs("service:api").rollup("avg", "@ms")"#).series.iter().all(|x| x.values.iter().all(|v| v.is_nan())), "a mean of nothing is none");
+        // In formulas: with each other, with a metric (18 errors a minute, three hosts' one each
+        // ten seconds), under a function.
+        assert_eq!(q(&s, r#"100 * logs("service:web status:error") / logs("service:web")"#).series[0].values, vec![25.0; 10]);
+        assert_eq!(q(&s, r#"logs("status:error").rollup("count") + sum:errors{*}.as_count()"#).series[0].values, [21.0, 21.0, 21.0, 21.0, 21.0, 19.0, 19.0, 19.0, 19.0, 19.0]);
+        assert_eq!(q(&s, r#"cumsum(logs("service:api"))"#).series[0].values, [2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]);
+        assert_eq!(q(&s, r#"events("*")"#).series[0].values.iter().sum::<f64>(), 1.0);
+        assert!(q(&s, r#"week_before(logs("status:error"))"#).series.iter().all(|x| x.values.iter().all(|v| *v == 0.0)), "a week before, nothing");
+        // Spans: each minute two of GET /cart (2 and 4 ms) and one of POST /pay (9 ms).
+        let (mut raw, mut prev, mut n) = (Vec::new(), 0i64, 0u32);
+        for m in 0..10i64 {
+            for (resource, d) in [("GET /cart", 2_000_000i64), ("GET /cart", 4_000_000), ("POST /pay", 9_000_000)] {
+                let r = Record { message: resource.into(), source: "span".into(), ..rec(m * 60_000 + 5_000, "web", 9, &[("duration", d.to_string())]) };
+                crate::logs::record::put_row(&mut raw, &r, prev);
+                prev = r.ts;
+                n += 1;
+            }
+        }
+        let mut b = Builder::new();
+        b.spans(&raw, n);
+        s.apply(&b.finish()).unwrap();
+        let sp = q(&s, r#"spans("service:web").rollup("avg", "@duration").by("resource_name")"#);
+        assert_eq!(by_tag(&sp, "resource_name", "GET /cart").values, vec![3_000_000.0; 10]);
+        assert_eq!(by_tag(&sp, "resource_name", "POST /pay").values, vec![9_000_000.0; 10]);
+        // A calendar's periods are not even buckets.
+        let r = Request::new(r#"sum:errors{*}.rollup(sum, daily) + logs("*")"#, 0, 600_000);
+        assert!(eval(&s, &r).is_err());
+    }
+
+    /// `max` and `min` of queries and numbers, as Datadog's own dashboards use them: the most of two
+    /// names for one figure whichever a host sends, a ratio capped at 100; and arithmetic written
+    /// without spaces (`*100/(`), which reads as with them.
+    #[test]
+    fn max_and_min_take_the_extreme_of_what_is_there() {
+        let s = store();
+        let values = |a: &Answer| -> Vec<(String, f64)> { a.series.iter().map(|x| (x.tags.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(","), x.values[0])).collect() };
+        assert_eq!(values(&q(&s, "max(avg:cpu{host:a}, avg:cpu{host:b})")), [(String::new(), 20.0)]);
+        assert_eq!(values(&q(&s, "min(100, 3 * avg:cpu{host:c})")), [(String::new(), 100.0)]);
+        assert_eq!(values(&q(&s, "min(100, avg:cpu{*} by {host})")), [("a".into(), 10.0), ("b".into(), 20.0), ("c".into(), 60.0)]);
+        // A group of one argument alone keeps its values; groups in both, the larger.
+        assert_eq!(values(&q(&s, "max(avg:cpu{env:prod} by {host}, avg:cpu{env:dev} by {host})")), [("a".into(), 10.0), ("b".into(), 20.0), ("c".into(), 60.0)]);
+        assert_eq!(values(&q(&s, "max(avg:cpu{*} by {host}, 2 * avg:cpu{host:b} by {host}, 0)")), [("a".into(), 10.0), ("b".into(), 40.0), ("c".into(), 60.0)]);
+        assert_eq!(values(&q(&s, "min(avg:cpu{*} by {host}, avg:cpu{host:b})")), [("a".into(), 10.0), ("b".into(), 20.0), ("c".into(), 20.0)]);
+        // A name with no data: the other's figure, as the OpenTelemetry dashboards mean.
+        assert_eq!(values(&q(&s, "max(default_zero((avg:otel.cpu{host:a})), default_zero((avg:cpu{host:a})))")), [(String::new(), 10.0)]);
+        assert!(q(&s, "max(avg:nothing{*}, avg:none{*})").series.is_empty());
+        assert_eq!(q(&s, "max(1, 2) + min(3, 4, 5)").scalar, Some(5.0));
+        // Written without spaces, as with them.
+        assert_eq!(values(&q(&s, "2*avg:cpu{host:a}")), [(String::new(), 20.0)]);
+        assert_eq!(values(&q(&s, "avg:cpu{host:c}*100/(avg:cpu{host:a}+avg:cpu{host:b})")), [(String::new(), 200.0)]);
+        assert_eq!(values(&q(&s, "100-avg:cpu{host:a}")), [(String::new(), 90.0)]);
+        for bad in ["max(avg:cpu{*})", "max('x', 1)", "min()"] {
+            let r = Request::new(bad, 0, 600_000);
+            assert!(eval(&s, &r).is_err(), "{bad}");
+        }
+    }
+
+    /// Datadog's boolean tag filters select what they say: random filters of every spelling (`AND`,
+    /// `and`, `,` or side by side; `OR`, `or`; `NOT`, `not`, `!`; brackets where precedence needs
+    /// them and some where it does not; `IN`, `NOT IN`, `key:(a OR b)`, `key:`, `key:*`, quoted
+    /// values, globs, `*`, a template variable left unfilled) each select, of 64 series (three tags,
+    /// each one of three values or absent), exactly those a direct reading of the filter holds of;
+    /// and none of another metric's 64 tagged the same.
+    #[test]
+    fn boolean_filters_select_the_series_their_tags_say() {
+        type Tags = [Option<&'static str>; 3];
+        enum F {
+            Leaf(String, Box<dyn Fn(&Tags) -> bool>),
+            Not(Box<F>),
+            And(Box<F>, Box<F>),
+            Or(Box<F>, Box<F>),
+        }
+        fn holds(f: &F, t: &Tags) -> bool {
+            match f {
+                F::Leaf(_, test) => test(t),
+                F::Not(x) => !holds(x, t),
+                F::And(l, r) => holds(l, t) && holds(r, t),
+                F::Or(l, r) => holds(l, t) || holds(r, t),
+            }
+        }
+        fn leaf(rng: &mut crate::testkit::Rng) -> F {
+            const OF: [&str; 4] = ["x1", "x2", "y1", "zz"];
+            let k = rng.below(3) as usize;
+            let key = ["a", "b", "c"][k];
+            let (v, w) = (OF[rng.below(4) as usize], OF[rng.below(4) as usize]);
+            let is = move |t: &Tags, x: &str| t[k] == Some(x);
+            match rng.below(10) {
+                0 => F::Leaf(format!("{key}:{v}"), Box::new(move |t| is(t, v))),
+                1 => F::Leaf(format!("{key}:\"{v}\""), Box::new(move |t| is(t, v))),
+                2 => F::Leaf(format!("{key}:*"), Box::new(move |t| t[k].is_some())),
+                3 => F::Leaf(format!("{key}:"), Box::new(move |t| t[k].is_some())),
+                4 => F::Leaf(format!("{key}:x*"), Box::new(move |t| t[k].is_some_and(|x| x.starts_with('x')))),
+                5 => F::Leaf(format!("{key}:({v} {} {w})", ["OR", "or"][rng.below(2) as usize]), Box::new(move |t| is(t, v) || is(t, w))),
+                6 => F::Leaf(format!("{key} {} ({v}, {w})", ["IN", "in"][rng.below(2) as usize]), Box::new(move |t| is(t, v) || is(t, w))),
+                7 => F::Leaf(format!("{key} NOT IN ({v},{w})"), Box::new(move |t| !(is(t, v) || is(t, w)))),
+                8 => F::Leaf("*".into(), Box::new(|_| true)),
+                _ => F::Leaf("$env".into(), Box::new(|_| true)),
+            }
+        }
+        fn grow(rng: &mut crate::testkit::Rng, depth: u32) -> F {
+            if depth == 0 || rng.below(4) == 0 {
+                return leaf(rng);
+            }
+            match rng.below(5) {
+                0 => F::Not(Box::new(grow(rng, depth - 1))),
+                1 | 2 => F::And(Box::new(grow(rng, depth - 1)), Box::new(grow(rng, depth - 1))),
+                _ => F::Or(Box::new(grow(rng, depth - 1)), Box::new(grow(rng, depth - 1))),
+            }
+        }
+        // Brackets where the operator binds looser than its place needs (NOT 3, AND 2, OR 1; both
+        // left-associative), and a fifth of the time where it does not.
+        fn write(f: &F, least: u8, rng: &mut crate::testkit::Rng, out: &mut String) {
+            let binds = match f {
+                F::Or(..) => 1,
+                F::And(..) => 2,
+                F::Not(_) => 3,
+                F::Leaf(..) => 4,
+            };
+            let bracket = binds < least || (binds < 4 && rng.below(5) == 0);
+            if bracket {
+                out.push('(');
+            }
+            match f {
+                F::Leaf(text, _) => out.push_str(text),
+                F::Not(x) => {
+                    out.push_str(["NOT ", "not ", "!"][rng.below(3) as usize]);
+                    write(x, 3, rng, out);
+                }
+                F::And(l, r) => {
+                    write(l, 2, rng, out);
+                    // Side by side but after `key:`, whose values a bracket would be.
+                    let and = [" AND ", " and ", ", ", ",", " "][rng.below(5) as usize];
+                    out.push_str(if and == " " && out.ends_with(':') { " AND " } else { and });
+                    write(r, 3, rng, out);
+                }
+                F::Or(l, r) => {
+                    write(l, 1, rng, out);
+                    out.push_str([" OR ", " or "][rng.below(2) as usize]);
+                    write(r, 2, rng, out);
+                }
+            }
+            if bracket {
+                out.push(')');
+            }
+        }
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        let mut tags_of: Vec<Tags> = Vec::new();
+        for n in 0..64usize {
+            let tags: Tags = [n % 4, n / 4 % 4, n / 16 % 4].map(|p| ["x1", "x2", "y1"].get(p).copied());
+            let id = n.to_string();
+            let mut kv: Vec<(&str, &str)> = ["a", "b", "c"].into_iter().zip(tags).filter_map(|(k, v)| Some((k, v?))).collect();
+            kv.push(("id", &id));
+            let key = SeriesKey::new("m", kv.iter().copied(), Kind::Gauge).unwrap();
+            let other_id = (n + 100).to_string();
+            if let Some(last) = kv.last_mut() {
+                *last = ("id", &other_id);
+            }
+            let other = SeriesKey::new("other", kv, Kind::Gauge).unwrap();
+            for k in [&key, &other] {
+                b.define(k);
+                b.run(k.fp, (0..10).map(|i| (i * 60_000, 1.0)));
+            }
+            tags_of.push(tags);
+        }
+        s.apply(&b.finish()).unwrap();
+        let selected = |filter: &str| -> Vec<usize> {
+            let q = format!("sum:m{{{filter}}} by {{id}}");
+            let mut r = Request::new(&q, 0, 600_000);
+            r.step = Some(60_000);
+            let a = eval(&s, &r).unwrap_or_else(|e| panic!("{filter}: {e}"));
+            let mut ids: Vec<usize> = a.series.iter().map(|x| x.tags.iter().find(|(k, _)| k == "id").unwrap().1.parse().unwrap()).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let held = |test: &dyn Fn(&Tags) -> bool| -> Vec<usize> { (0..64).filter(|&n| test(&tags_of[n])).collect() };
+        // As Datadog's own dashboards write them.
+        assert_eq!(selected("(a:x1 OR a:x2) AND $hostname"), held(&|t| t[0].is_some_and(|v| v.starts_with('x'))));
+        assert_eq!(selected("not b:y1 and $x"), held(&|t| t[1] != Some("y1")));
+        assert_eq!(selected("* AND c IN (x1)"), held(&|t| t[2] == Some("x1")));
+        assert_eq!(selected("a:x1,!b:"), held(&|t| t[0] == Some("x1") && t[1].is_none()));
+        assert_eq!(selected("a:x1 OR b:x1 AND c:x1"), held(&|t| t[0] == Some("x1") || (t[1] == Some("x1") && t[2] == Some("x1"))));
+        let mut rng = crate::testkit::Rng::new(20);
+        let mut text = String::new();
+        for _ in 0..3_000 {
+            let f = grow(&mut rng, 4);
+            text.clear();
+            write(&f, 0, &mut rng, &mut text);
+            assert_eq!(selected(&text), held(&|t| holds(&f, t)), "{text}");
+        }
     }
 }

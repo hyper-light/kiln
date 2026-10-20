@@ -1,10 +1,12 @@
 /**
  * A dashboard: its widgets on a grid of twelve columns over one time range, its template variables
- * above them (each a tag, chosen from the values it has). A dashboard of your own is edited in
- * place (add, change, move, resize or remove widgets, then save); kiln's own are copied first.
+ * above them (each a tag, chosen from the values it has); a group's widgets on a grid of its own,
+ * under its title. A dashboard of your own is edited in place (add, change, move, resize or remove
+ * widgets, a group's within it, then save); kiln's own are copied first. Any is given as Datadog's
+ * dashboard JSON.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, Copy, Pencil, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Copy, Download, Pencil, Plus, Trash2 } from "lucide-react";
 import { useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { fillVariables, observeApi, type Dashboard, type TemplateVariable, type Widget, type WidgetKind } from "@/api/observe";
 import { Button } from "@/components/ui/button";
@@ -31,8 +33,18 @@ export default function DashboardPage() {
   );
 }
 
-/** Widgets in reading order: by row, then column. */
-const ordered = (ws: Widget[]) => [...ws].sort((a, b) => a.layout.y - b.layout.y || a.layout.x - b.layout.x);
+/** Widgets in reading order: by row, then column; a group's within it too. */
+const ordered = (ws: Widget[]): Widget[] =>
+  [...ws].sort((a, b) => a.layout.y - b.layout.y || a.layout.x - b.layout.x).map((w) => (w.kind === "group" ? { ...w, widgets: ordered(w.widgets ?? []) } : w));
+
+/** A widget's columns on its grid. */
+const span = (w: Widget) => Math.min(12, Math.max(1, w.layout.w));
+
+/** Widgets changed by `fn`: the dashboard's own, or (`group`) a group's. */
+const within = (ws: Widget[], fn: (ws: Widget[]) => Widget[], group?: string): Widget[] => (group ? ws.map((g) => (g.id === group ? { ...g, widgets: fn(g.widgets ?? []) } : g)) : fn(ws));
+
+/** Widget `id` made `w`, wherever it is. */
+const replaced = (ws: Widget[], id: string, w: Widget): Widget[] => ws.map((o) => (o.id === id ? w : o.kind === "group" ? { ...o, widgets: replaced(o.widgets ?? [], id, w) } : o));
 
 /** Widgets laid out in their order: each placed after the last, a new row when a row is full. */
 function reflow(ws: Widget[]): Widget[] {
@@ -46,7 +58,7 @@ function reflow(ws: Widget[]): Widget[] {
       x = 0;
       rowH = 0;
     }
-    const placed = { ...w, layout: { x, y, w: width, h: Math.max(1, w.layout.h) } };
+    const placed = { ...w, layout: { x, y, w: width, h: Math.max(1, w.layout.h) }, ...(w.kind === "group" ? { widgets: reflow(w.widgets ?? []) } : {}) };
     x += width;
     rowH = Math.max(rowH, placed.layout.h);
     return placed;
@@ -71,13 +83,64 @@ function DashboardView({ id }: { id: string }) {
   const fillSearch = (q: string) => fillVariables(q, d.template_variables, values, "");
   const widgets = draft ? draft.widgets : ordered(d.widgets);
   const change = (fn: (d: Dashboard) => Dashboard) => setDraft((x) => fn(x ?? saved.data));
-  const move = (i: number, by: number) =>
-    change((x) => {
-      const ws = [...x.widgets];
-      const [w] = ws.splice(i, 1);
-      if (w) ws.splice(Math.max(0, Math.min(ws.length, i + by)), 0, w);
-      return { ...x, widgets: ws };
-    });
+  const move = (i: number, by: number, group?: string) =>
+    change((x) => ({
+      ...x,
+      widgets: within(
+        x.widgets,
+        (ws) => {
+          const moved = [...ws];
+          const [w] = moved.splice(i, 1);
+          if (w) moved.splice(Math.max(0, Math.min(moved.length, i + by)), 0, w);
+          return moved;
+        },
+        group,
+      ),
+    }));
+  const remove = (id: string, group?: string) => change((x) => ({ ...x, widgets: within(x.widgets, (ws) => ws.filter((o) => o.id !== id), group) }));
+  /** A widget on its grid: its title, in editing its moves (a group's within it), change and
+   * removal; its body, or a group's widgets under its title. */
+  const frame = (w: Widget, i: number, siblings: Widget[], group?: string): React.ReactNode => {
+    const actions = draft ? (
+      <>
+        <Button variant="ghost" size="xs" aria-label="Move earlier" disabled={i === 0} onClick={() => move(i, -1, group)}>
+          <ArrowUp />
+        </Button>
+        <Button variant="ghost" size="xs" aria-label="Move later" disabled={i === siblings.length - 1} onClick={() => move(i, 1, group)}>
+          <ArrowDown />
+        </Button>
+        <Button variant="ghost" size="xs" aria-label={`Change ${w.title || "the widget"}`} onClick={() => setEditing(w)}>
+          <Pencil />
+        </Button>
+        <Button variant="ghost-danger" size="xs" aria-label={`Remove ${w.title || "the widget"}`} onClick={() => remove(w.id, group)}>
+          <Trash2 />
+        </Button>
+      </>
+    ) : undefined;
+    if (w.kind === "group") {
+      const inner = w.widgets ?? [];
+      return (
+        <section key={w.id || i} className="obs-widget obs-group" style={{ "--w": span(w) } as React.CSSProperties} aria-label={w.title || KIND_WORDS.group}>
+          <div className="obs-group-head">
+            <h2>{w.title || KIND_WORDS.group}</h2>
+            {actions && <div className="flex items-center gap-1">{actions}</div>}
+          </div>
+          {inner.length ? <div className="obs-grid">{inner.map((c, j) => frame(c, j, inner, w.id))}</div> : <p className="empty-line py-6 text-center">No widgets in this group.</p>}
+        </section>
+      );
+    }
+    return (
+      <div key={w.id || i} className="obs-widget" style={{ "--w": span(w) } as React.CSSProperties}>
+        <Panel title={w.title || KIND_WORDS[w.kind]} actions={actions}>
+          <div style={{ minHeight: Math.max(ROW, w.layout.h * ROW - 58) }}>
+            <Loadable key={`${w.kind}/${w.queries.join("\n")}/${w.search}`} label="the widget" fallback={<Hold height={Math.max(ROW, w.layout.h * ROW - 58)} />}>
+              <WidgetBody w={w} range={range} fill={fill} fillSearch={fillSearch} />
+            </Loadable>
+          </div>
+        </Panel>
+      </div>
+    );
+  };
 
   const save = async () => {
     if (!draft) return;
@@ -140,6 +203,11 @@ function DashboardView({ id }: { id: string }) {
             </>
           ) : (
             <>
+              <Button variant="ghost" asChild>
+                <a href={observeApi.datadogUrl(d.id)} download={`${d.title}.json`} title="This dashboard as Datadog's dashboard JSON">
+                  <Download /> Datadog JSON
+                </a>
+              </Button>
               <Button variant="secondary" onClick={() => setDraft({ ...saved.data, widgets: ordered(saved.data.widgets) })}>
                 <Pencil /> Edit
               </Button>
@@ -186,37 +254,7 @@ function DashboardView({ id }: { id: string }) {
         <p className="empty-line py-16 text-center">This dashboard has no widgets yet. Edit it to add some.</p>
       ) : (
         <div className="obs-grid">
-          {widgets.map((w, i) => (
-            <div key={w.id || i} className="obs-widget" style={{ "--w": Math.min(12, Math.max(1, w.layout.w)) } as React.CSSProperties}>
-              <Panel
-                title={w.title || KIND_WORDS[w.kind]}
-                actions={
-                  draft ? (
-                    <>
-                      <Button variant="ghost" size="xs" aria-label="Move earlier" disabled={i === 0} onClick={() => move(i, -1)}>
-                        <ArrowUp />
-                      </Button>
-                      <Button variant="ghost" size="xs" aria-label="Move later" disabled={i === widgets.length - 1} onClick={() => move(i, 1)}>
-                        <ArrowDown />
-                      </Button>
-                      <Button variant="ghost" size="xs" aria-label={`Change ${w.title || "the widget"}`} onClick={() => setEditing(w)}>
-                        <Pencil />
-                      </Button>
-                      <Button variant="ghost-danger" size="xs" aria-label={`Remove ${w.title || "the widget"}`} onClick={() => change((x) => ({ ...x, widgets: x.widgets.filter((o) => o !== w) }))}>
-                        <Trash2 />
-                      </Button>
-                    </>
-                  ) : undefined
-                }
-              >
-                <div style={{ minHeight: Math.max(ROW, w.layout.h * ROW - 58) }}>
-                  <Loadable key={`${w.kind}/${w.queries.join("\n")}/${w.search}`} label="the widget" fallback={<Hold height={Math.max(ROW, w.layout.h * ROW - 58)} />}>
-                    <WidgetBody w={w} range={range} fill={fill} fillSearch={fillSearch} />
-                  </Loadable>
-                </div>
-              </Panel>
-            </div>
-          ))}
+          {widgets.map((w, i) => frame(w, i, widgets))}
           {draft && (
             <div className="obs-widget" style={{ "--w": 12 } as React.CSSProperties}>
               <button
@@ -236,7 +274,7 @@ function DashboardView({ id }: { id: string }) {
           w={editing}
           onClose={() => setEditing(null)}
           onSave={(w) => {
-            change((x) => ({ ...x, widgets: editing.id ? x.widgets.map((o) => (o.id === editing.id ? w : o)) : [...x.widgets, { ...w, id: freshId() }] }));
+            change((x) => ({ ...x, widgets: editing.id ? replaced(x.widgets, editing.id, w) : [...x.widgets, { ...w, id: freshId() }] }));
             setEditing(null);
           }}
         />
@@ -280,7 +318,8 @@ function VariablePicker({ v, value, onChange }: { v: TemplateVariable; value: st
   return <SelectField label={`$${v.name}`} value={value} onChange={onChange} options={options.map((o) => ({ value: o, label: o === "*" ? `${v.tag}: any` : o }))} className="w-44" />;
 }
 
-const KINDS = Object.keys(KIND_WORDS) as WidgetKind[];
+/** The kinds a widget is made of here: a group comes of Datadog's dashboards (`Import`). */
+const KINDS = (Object.keys(KIND_WORDS) as WidgetKind[]).filter((k) => k !== "group");
 const UNITS = [
   { value: "", label: "None" },
   { value: "%", label: "Percent" },
@@ -289,7 +328,7 @@ const UNITS = [
   { value: "B/s", label: "Bytes a second" },
   { value: "s", label: "Seconds" },
 ];
-const isMetric = (k: WidgetKind) => k === "timeseries" || k === "query_value" || k === "toplist" || k === "table" || k === "heatmap" || k === "distribution";
+const isMetric = (k: WidgetKind) => k === "timeseries" || k === "query_value" || k === "toplist" || k === "table" || k === "heatmap" || k === "distribution" || k === "pie";
 
 /** A widget's kind, title, what it shows, and its size. */
 function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; onSave: (w: Widget) => void }) {
@@ -316,7 +355,9 @@ function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; 
           }}
         >
           <div className="grid gap-3 sm:grid-cols-2">
-            <SelectField label="Kind" value={x.kind} onChange={(k) => setX((o) => ({ ...o, kind: k as WidgetKind }))} options={KINDS.map((k) => ({ value: k, label: KIND_WORDS[k] }))} />
+            {x.kind !== "group" && (
+              <SelectField label="Kind" value={x.kind} onChange={(k) => setX((o) => ({ ...o, kind: k as WidgetKind }))} options={KINDS.map((k) => ({ value: k, label: KIND_WORDS[k] }))} />
+            )}
             <TextField label="Title" value={x.title} onChange={(e) => setX((o) => ({ ...o, title: e.target.value }))} />
           </div>
           {isMetric(x.kind) && (
@@ -362,14 +403,16 @@ function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; 
               label="Width"
               value={String(x.layout.w)}
               onChange={(v) => setX((o) => ({ ...o, layout: { ...o.layout, w: Number(v) } }))}
-              options={[3, 4, 6, 8, 12].map((n) => ({ value: String(n), label: n === 12 ? "Whole row" : `${n} of 12 columns` }))}
+              options={[...new Set([3, 4, 6, 8, 12, x.layout.w])].sort((a, b) => a - b).map((n) => ({ value: String(n), label: n === 12 ? "Whole row" : `${n} of 12 columns` }))}
             />
-            <SelectField
-              label="Height"
-              value={String(x.layout.h)}
-              onChange={(v) => setX((o) => ({ ...o, layout: { ...o.layout, h: Number(v) } }))}
-              options={[2, 3, 4, 5, 6, 8].map((n) => ({ value: String(n), label: `${n} rows` }))}
-            />
+            {x.kind !== "group" && (
+              <SelectField
+                label="Height"
+                value={String(x.layout.h)}
+                onChange={(v) => setX((o) => ({ ...o, layout: { ...o.layout, h: Number(v) } }))}
+                options={[...new Set([2, 3, 4, 5, 6, 8, x.layout.h])].sort((a, b) => a - b).map((n) => ({ value: String(n), label: `${n} rows` }))}
+              />
+            )}
             {isMetric(x.kind) && <SelectField label="Unit" value={options.unit ?? ""} onChange={(v) => setOption("unit", v)} options={UNITS} />}
             {x.kind === "timeseries" && (
               <SelectField
@@ -383,7 +426,7 @@ function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; 
                 ]}
               />
             )}
-            {(x.kind === "query_value" || x.kind === "toplist") && (
+            {(x.kind === "query_value" || x.kind === "toplist" || x.kind === "pie") && (
               <SelectField
                 label="Over the range, each series'"
                 value={options.aggregator ?? "avg"}

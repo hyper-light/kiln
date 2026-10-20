@@ -1174,8 +1174,24 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         }
         (&Method::GET, ["dashboards"]) => {
             // The list without the widgets: what a dashboard is, and how many it holds.
-            let list: Vec<Value> = dashboards()?.list().iter().map(|d| json!({ "id": d.id, "title": d.title, "description": d.description, "builtin": d.builtin, "widgets": d.widgets.len(), "modified": d.modified })).collect();
+            let list: Vec<Value> = dashboards()?
+                .list()
+                .iter()
+                .map(|d| json!({ "id": d.id, "title": d.title, "description": d.description, "builtin": d.builtin, "widgets": d.widgets.iter().map(|w| 1 + w.widgets.len()).sum::<usize>(), "modified": d.modified }))
+                .collect();
             Ok(srv::json(StatusCode::OK, &json!({ "dashboards": list })))
+        }
+        (&Method::POST, ["dashboards", "import"]) => {
+            // Datadog's dashboard JSON, as its API gives one: kept as kiln's, and what became of its
+            // widgets said (`super::ddash`).
+            let v: Value = read_json(req.into_body(), super::dashboards::BYTES).await?;
+            let (d, report) = super::ddash::import(&v).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let d = dashboards()?.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::CREATED, &json!({ "dashboard": d, "report": report })))
+        }
+        (&Method::GET, ["dashboards", id, "datadog"]) => {
+            let d = dashboards()?.get(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such dashboard"))?;
+            Ok(srv::json(StatusCode::OK, &super::ddash::export(&d)))
         }
         (&Method::POST, ["dashboards"]) => {
             let mut d: super::dashboards::Dashboard = read_json(req.into_body(), super::dashboards::BYTES).await?;

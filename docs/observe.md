@@ -31,6 +31,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
 | O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Datadog's Agent's traces (§8.7: its indexed and inline forms, 532 ns a span, §12.23) and its stats as the trace metrics (every span counted before it sampled, its DDSketches' four mappings read within their accuracy; 6 µs and 0.2 allocations a grouped stat), checked live against Agent 7.84 and ddtrace 4.16 with traces kept and dropped (§13). Datadog's tracers straight to kiln on every runner (kiln in the Agent's place on its port: `/v0.4/traces`, `/v0.5/traces`, `/info`; 490 ns a span), every span counted by the runner's concentrator before a dropped trace is let go, as the Agent counts (133 ns a span); checked live with ddtrace 4.16, no Agent (§13). The Agent's priority sampler on every runner (each tracer told its services' rates, `rate_by_service`: ten traces a second a node, each service its share by water-filling), checked live: a busy service's rate falling to its share, every trace counted, kept or not (§13). A runner's last spans and buckets written as it stops, a bucket two of its lives write added and not written over, checked live across a stop (§13). The map's figures from the trace metrics, each edge its share of the groups that count its calls (the ratio estimator), so a sampled service's calls are every call: checked live through the Agent, straight to a runner under the sampler, and with OpenTelemetry's SDK (§13). CI runs as traces, span monitors | in progress |
 | O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24); Datadog's Error Tracking monitors (new issues and regressions, impact; §9) telling integrations, an ignored issue muted, checked live and in browsers (§13); reading an error without allocating, 0.6 to 1.1 µs (§12.24) | done |
+| O-20 | Datadog's dashboards (§7, §11): their JSON imported as kiln's and any dashboard given back as Datadog's, every widget kept (drawn as Datadog draws it, drawn otherwise and said, or a note saying what it was); groups, pies; logs, spans and events as operands of formulas, as Datadog's formulas mix them (§6); Datadog's boolean filters, a search's value lists, `max` and `min`, arithmetic without spaces; Datadog's 678 integration dashboards taken and given back the same, 89.9% of their widgets drawn as Datadog draws them, 107 µs an import (§12.25); checked in browsers (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -115,7 +116,10 @@ Postings: for the metric and for each tag (`key:value`) a sorted list of series 
 filter is an intersection (and unions for `OR`, wildcards, `IN`) evaluated smallest list first with
 galloping search (Bentley and Yao 1976; Demaine, López-Ortiz and Munro, SODA 2000): `O(m log(n/m))`
 for lists of sizes `m ≤ n`. Negations subtract. Wildcard values (`host:web-*`) expand through the
-symbol table's sorted value index per key.
+symbol table's sorted value index per key. A boolean filter (`OR`, `NOT` of more than one condition,
+§6) is evaluated within the series the metric and its ANDed conditions leave: each node's set from
+its children's (intersection, union, the universe less it), the nodes in the order kept, so no
+recursion however deep its brackets.
 
 ### 4.3 Samples: Gorilla chunks
 
@@ -382,12 +386,17 @@ users know:
 query      := expr ( "," expr )*
 expr       := term (("+" | "-") term)*
 term       := factor (("*" | "/") factor)*
-factor     := number | "(" expr ")" | function "(" args ")" | metric_q
+factor     := number | "(" expr ")" | function "(" args ")" | metric_q | records_q
 metric_q   := [agg ":"] metric ["{" filters "}"] ["by" "{" tags "}"] modifier*
+records_q  := ("logs" | "spans" | "trace-analytics" | "events") "(" '"' search '"' ")"
+              [".rollup(" '"' measure '"' ["," '"' facet '"'] ")"] [".by(" '"' facets '"' ")"] [".index(" '"' * '"' ")"]
 agg        := avg | sum | min | max | count | p50 | p75 | p90 | p95 | p99 | pNN.N
-filters    := filter ("," filter)*            // AND; "*" = all
-filter     := ["!"] key ":" value             // value: exact, wildcard "web-*", (a OR b), or
-                                              // "quoted" (any characters, exactly; \" and \\ within)
+filters    := cond (("," | "AND" | " ") cond | "OR" cond)*   // NOT binds tightest, then AND, then OR
+cond       := ("!" | "NOT")* (filter | "(" filters ")" | "*" | "$" variable)   // "*", a variable: all
+filter     := key ":" value | key ":" | key ["NOT"] "IN" "(" value ("," value)* ")"
+                                              // value: exact, wildcard "web-*", (a OR b), or
+                                              // "quoted" (any characters, exactly; \" and \\ within);
+                                              // key ":" alone: any value of it
 modifier   := ".rollup(" fn ["," seconds | "," calendar] ")" | ".as_count()" | ".as_rate()"
             | ".fill(" how ["," seconds] ")" | ".weighted()"
 calendar   := ("daily" | "weekly" | "monthly") ["," alignment] ["," timezone]
@@ -410,10 +419,10 @@ The functions are Datadog's, every one its pages list, by its categories:
 | Category | Functions |
 | --- | --- |
 | Algorithmic | `anomalies`, `forecast`, `outliers` (below; §9.1) |
-| Arithmetic | `abs`, `round(q[, places])`, `ceil`, `floor`, `pow(a, b)` (each a query or a number), `log2`, `log10`, `cumsum`, `integral`; `+ - * /` between queries and numbers |
+| Arithmetic | `abs`, `round(q[, places])`, `ceil`, `floor`, `pow(a, b)` (each a query or a number), `log2`, `log10`, `cumsum`, `integral`; `+ - * /` between queries and numbers, spaces or none (`a*100/(b+c)`); `max(a, b, ...)`, `min(...)` of queries and numbers: at each point the largest (least) value present, a group only some arguments have keeping theirs (Datadog's own dashboards take `max(default_zero(otel), default_zero(agent))` for one figure under either name) |
 | Count | `count_nonzero`, `count_not_null` |
 | Exclusion | `exclude_null`, `clamp_min(q, n)`, `clamp_max(q, n)`, `cutoff_min(q, n)`, `cutoff_max(q, n)`; kiln's `clamp(q, lo, hi)` |
-| Interpolation | `.fill(null\|zero\|linear\|last[, seconds])`, `default_zero` |
+| Interpolation | `.fill(null\|zero\|linear\|last[, seconds])` (`.fill(0)` is zero), `default_zero` |
 | Rank | `top(q, n, 'mean'\|'min'\|'max'\|'sum'\|'last'\|'area'\|'l2norm', 'desc'\|'asc')`, `bottom`; the shortcuts `[top\|bottom][5\|10\|15\|20][_mean\|_min\|_max\|_last\|_area\|_l2norm]` |
 | Rate | `per_second`, `per_minute`, `per_hour`, `dt`, `diff`, `monotonic_diff`, `derivative`, `rate`, `throughput` |
 | Regression | `robust_trend`, `trend_line`, `piecewise_constant` |
@@ -519,7 +528,20 @@ in view for two fixations (200–250 ms each in reading; Rayner 1998), 25 / 0.5 
 
 Log search follows Datadog's log syntax: `service:web status:error @http.status_code:>=500
 "connection reset" -host:old-*`, with `AND`, `OR`, `NOT`, parentheses, wildcards and ranges, and
-log analytics `count() by {service}` over a search. A `-` that starts a term is NOT wherever it
+log analytics `count() by {service}` over a search. Logs, spans and events are operands of a query
+as metrics are (`records_q`, Datadog's log monitor syntax without its window, as its formulas mix
+`data_source: logs` with metrics): each bucket's count, or the cardinality, sum, mean, least or most
+of a facet, by facets, `100 * logs("status:error").by("service") / logs("*").by("service")`, under
+any function (`default_zero`, `top`, `week_before`, ...); a count's bucket nothing fell in 0, another
+measure's none. A log search reads logs, not events, unless it names them; `events("…")` reads events
+alone. They are read in even buckets (no calendar rollup), the bucketed analytics' 1,500 at the
+most. A dashboard's template variable left unfilled in a filter (`{$env}`) is Datadog's `*`. A
+metric's filter is Datadog's boolean one: conditions joined by `,`, `AND` or set side by side, `OR`,
+negated by `!` or `NOT`, in brackets, the words in any case (`{(type:vsmart OR type:vbond) AND
+$host}`, `{not status:done and env:prod}`). Conditions ANDed alone, the common case, are postings
+intersected (§4.2); any other filter is an expression of them evaluated within the metric's series.
+A value list in a search, `service:(web OR api)` or `@evt.name:(a OR "b c")`, is the key's condition
+on each value, `(service:web OR service:api)`. A `-` that starts a term is NOT wherever it
 stands (`(a OR b) -env:dev`); one inside a term is the term's (`web-1`). A quoted value holds any
 characters (`@note:"say \"hi\""`), so a facet's every value can be searched for. Events take the
 same search syntax. `trace_id:<32 hex digits>` and `span_id:<16>` are a record's ids (logs' and
@@ -563,6 +585,7 @@ its schema (§13). Built:
 | `POST logs/patterns` | `{query, from, to}` → the search's newest records (10,000 at the most) grouped by their template (Drain, §12.13): each its count, first and last seen, newest message and its records by status, the most common first |
 | `GET logs/tail?query=&rate=` | live tail (§6), a WebSocket: each 200 ms, `{type: "records", records, read, matched, missed, ms}`, the tick's records (all the search matched, or a uniform sample past `rate` a second: 50 unless said, 1 to 1,000) and how many rows it read, matched and missed (missed: it fell more than the feed's bound behind); idle, one a second, its counts 0. `{type: "error", message}`, then closed, for a search that does not parse, a rate out of bounds, or a node that 16 tails follow already |
 | `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, `builtin:sync`, read-only) and yours, kept in `<observe>/dashboards.json` |
+| `POST dashboards/import`, `GET dashboards/{id}/datadog` | a dashboard made of Datadog's dashboard JSON (as its API gives one), what became of each of its widgets said; and any dashboard given as Datadog's (§11) |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
@@ -1722,8 +1745,20 @@ time range and the search in the address (a page is a link).
   is and whether it holds the same (its full digest at the server's index; "Compare replicas" asks
   for them).
 - **Dashboards**: Datadog's model near enough. Widgets on a grid of twelve columns (one column on a
-  phone): timeseries (lines, areas or bars), query value, top list, table, heatmap, distribution,
-  log stream, event stream, monitors, note (Markdown). A heatmap is its query's values counted in
+  phone): timeseries (lines, areas or bars), query value, top list (its limit and order), table,
+  heatmap, distribution, pie, log stream, event stream, monitors, note (Markdown), and groups (a
+  title over widgets of their own on a grid of their own, edited in place as the dashboard's). A
+  pie is its series over the range as shares of a ring, the three largest in hues and the rest one
+  grey slice ("Other"), each named in its legend with its value and share: in a ring any two slices
+  may touch, so every pair of hues is held apart, and three of kiln's own (violet, blue, rose,
+  stepped for its dark panels: OKLCH L 0.52 to 0.64, C at least 0.10) are the most that are (worst
+  colour-blind ΔE 10.3, worst normal-vision ΔE 16.6, 15.1 beside the grey; the dataviz validator
+  over every pair), a slice's hue its series' among them, not its rank's. **Datadog's dashboards**
+  are imported from their JSON (as Datadog exports one, or its API gives one, pasted or a file):
+  every widget kiln draws drawn, those it draws otherwise said (a change as a top list of the
+  changes), those it cannot kept as notes in their places that say what they were, and the import
+  said in a line; any dashboard is given back as Datadog's JSON. `$env.value` (Datadog's) stands
+  for the variable's value alone. A heatmap is its query's values counted in
   each bucket of time by the row they fall in (a distribution's rows its buckets, §4.4; another
   query's equal ranges of its series' values), each cell in one hue, brighter for more, on a log
   scale (a few busy cells do not wash the rest out), its scale beside it; a distribution widget is
@@ -2800,6 +2835,46 @@ kept by their tags' values as they are, their text made once, for the answer (4 
 to 3). At the bound, the registry's read every ten seconds holds the store's read lock some 25 ms (the
 metric's read and its own).
 
+### 12.25 Datadog's dashboards
+
+Datadog's own dashboards, every one its integrations carry (`DataDog/integrations-core`'s
+`assets/dashboards`, 688 files at tree `fdcc0bc`), imported as kiln's and given back as Datadog's
+(`observe::ddash`; its test `datadog_s_integration_dashboards_are_taken_and_come_back_the_same`,
+`KILN_DD_DASHBOARDS=<their folder>`): 678 taken, 9 of the files not JSON as they stand. Each is
+kept as kiln keeps a dashboard (its checks passed), given back as Datadog's, and taken again the
+same: every widget's kind, title, search, text and queries (their syntax trees compared), its
+columns exactly and its rows within one (Datadog's rows are coarser than kiln's). Of their 21,424
+widgets:
+
+| widgets | count | share |
+| --- | --- | --- |
+| drawn as Datadog draws them | 19,267 | 89.9% |
+| drawn otherwise, as said | 715 | 3.3% |
+| kept as a note saying what they were, not drawn | 1,442 | 6.7% |
+
+Drawn otherwise: an image of the web as a link to it (325), a geomap as a top list of its places
+(235), a bar chart, a change and a host map as top lists (118), a treemap as a pie (37). Not
+drawn, nearly all data kiln does not hold: Cloud SIEM's security signals (762), the status of
+Datadog's service checks (180), Datadog's own images, its integrations' logos (165), cloud costs
+(97), network paths and device flows (142), database queries, LLM observability and processes (16);
+widgets kiln has no form of (flame graphs, Sankey diagrams, topology maps, Vega's wildcard, an
+iframe, a scatter plot: 25); lists kiln does not keep (infrastructure, log patterns, trace streams
+and two more: 31); requests of a form kiln does not read (11). Queries kiln cannot read: 12
+(Datadog's threshold counts of distributions, `count(v: v>=0):…`, 8; `reduce(…)`, 3; a filter of
+Datadog's own that is not one, `{(status:400 OR s) …}`, 1).
+
+The first import drew 89.0% and could not read 60 queries. What moved it, each checked against a
+reading of its own (§6): Datadog's boolean filters (a differential test, 3,000 random filters in
+every spelling against each series' tags read directly); `max` and `min`; arithmetic without
+spaces (a number outside a filter ends where an operator starts: before, `2*avg:cpu{*}` lexed as a
+metric named `2*avg:cpu`, a glob matching nothing, and answered nothing without an error); a log
+search's value lists (before, `@evt.name:(a OR b)` was read as the attribute empty and a word of
+the message, a wrong answer and no error); `status:*`; `.fill(0)`. Now 89.9%, 12 unread.
+
+An import costs 107 to 112 µs a dashboard (three runs, a release build, fedora), from 133 to 157
+µs: the lexer tells a filter's `*` from a product by the braces it has open, counted as it goes,
+where it scanned its tokens back each time.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -2924,8 +2999,18 @@ scrolls in its own box; the check itself tried on a page too wide, which it name
 box that scrolls, which it lets be); then a monitor of the service's new issues made from the form,
 checked as Datadog's Error Tracking monitor (`Alerts when an issue's error count is > 0`), kept as
 made, its issues' errors drawn by issue on its page, which fits the screen too (2026-10-20: passes
-in Chromium at 1,440 px and as a phone, and in WebKit as a phone, on fedora).
-Each makes its own records and checks through the API, not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
+in Chromium at 1,440 px and as a phone, and in WebKit as a phone, on fedora); a Datadog dashboard
+pasted into the import dialog as its JSON (a note; a timeseries whose formula divides a count of
+error logs, searched by a value list, by a metric's requests under a boolean filter; an SLO widget
+kiln does not draw; a group of a sunburst and a log stream): its group drawn under its title, the
+sunburst a pie of the service's logs by status (the errors a third), the formula's chart, the SLO
+kept as a note saying what it was, the page within the screen's width; the boolean filter selecting
+the requests through the query API and its opposite none; the dashboard given back as Datadog's JSON
+(2026-10-20: passes in Chromium at 1,440 px and as a phone, and in WebKit as a phone, on fedora).
+Each makes its own records and checks through the API, not the page. 2026-10-20, after Datadog's
+boolean filters and the lexer's numbers: all 31 pass in Chromium at 1,440 px and in WebKit as a
+phone, on fedora (a server seeded with three services' latency and 300 logs, a receiver and a logs
+folder of the scenarios'). 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
 webhook and to Slack. Run again and again, two flakes showed and are gone: WebKit, a moment after a
