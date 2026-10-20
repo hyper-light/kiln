@@ -18,7 +18,7 @@ use hyper_raft::{Config, Elections, Limits, Stated};
 use serde::{Deserialize, Serialize};
 
 use super::scan::Limits as CopyLimits;
-use super::{Blobs, Change, Copy, Outcome, State, Step, Tree};
+use super::{Blobs, Change, Copy, Decision, Outcome, State, Step, Tree};
 
 /// The server's member of every group: its one voter.
 pub const SERVER: u64 = 1;
@@ -174,8 +174,16 @@ pub struct Index {
     durable: Point,
     /// Where the tree is saved; none: kept in memory alone.
     file: Option<PathBuf>,
-    /// Steps taken since the owner last looked, with their index: what the copies are told.
-    pub taken: Vec<(u64, Step)>,
+    /// Steps taken since the owner last looked: what the repo's activity shows.
+    pub taken: Vec<Taken>,
+}
+
+/// A step the server's member took, at `index` of the log: what it decided for each change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Taken {
+    pub index: u64,
+    pub step: Step,
+    pub decisions: Vec<Decision>,
 }
 
 impl Index {
@@ -215,9 +223,9 @@ impl StateMachine for Index {
     fn apply(&mut self, entry: &EntryRef<'_>, _answers: &mut Vec<()>) -> Result<(), Fatal> {
         self.applied = Point { index: entry.index, term: entry.term };
         if let Some(step) = step_of(entry)
-            && self.tree.take(&step).is_some()
+            && let Some(decisions) = self.tree.take(&step)
         {
-            self.taken.push((entry.index, step));
+            self.taken.push(Taken { index: entry.index, step, decisions });
         }
         Ok(())
     }
@@ -301,6 +309,38 @@ pub struct Feed {
     install: Option<Tree>,
     /// What the folder did, newest last.
     pub outcomes: VecDeque<Outcome>,
+    /// Steps the folder took since the runner last looked (its metrics and status).
+    pub took: Vec<Took>,
+}
+
+/// A committed step a copy's folder took: whose, when its machine saw it, and what it did to the
+/// files here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Took {
+    pub by: String,
+    /// Unix milliseconds, the clock of the machine that made it.
+    pub at: i64,
+    /// This copy's own step, back from the log.
+    pub ours: bool,
+    pub applied: usize,
+    pub conflicts: usize,
+    pub kept: usize,
+    pub refused: usize,
+}
+
+impl Took {
+    fn of(step: &Step, ours: bool, outcomes: &[Outcome]) -> Self {
+        let mut t = Self { by: step.by.clone(), at: step.at, ours, ..Self::default() };
+        for o in outcomes {
+            match o {
+                Outcome::Applied { .. } => t.applied += 1,
+                Outcome::Conflict { .. } => t.conflicts += 1,
+                Outcome::Kept { .. } => t.kept += 1,
+                Outcome::Refused { .. } => t.refused += 1,
+            }
+        }
+        t
+    }
 }
 
 impl Feed {
@@ -321,6 +361,7 @@ impl Feed {
             reached_conf: conf,
             install: saved.install,
             outcomes: VecDeque::new(),
+            took: Vec::new(),
         })
     }
 
@@ -368,6 +409,8 @@ impl Feed {
                     }
                     let at = *at;
                     let outcomes = self.copy.apply(step, blobs)?;
+                    let ours = step.member != 0 && step.member == self.copy.member;
+                    self.took.push(Took::of(step, ours, &outcomes));
                     self.note(outcomes);
                     self.reached = at;
                 }

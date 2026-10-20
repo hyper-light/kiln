@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use futures::{FutureExt as _, StreamExt as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use super::core::{Core, Update};
 use super::kinds::{Kind, Protocol};
@@ -905,6 +906,25 @@ fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bo
     Some((String::from_utf8_lossy(&buf).into_owned(), start + buf.len() as u64, start > want || (since.is_none() && start > 0)))
 }
 
+/// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
+/// still in it ended at once, then the group removed.
+fn end_group(g: crate::os::contain::Group, after: Duration) {
+    crate::rt::spawn(async move {
+        crate::rt::sleep(after).await;
+        let _ = crate::rt::blocking(move || {
+            g.kill();
+            for _ in 0..20 {
+                if g.pids().is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            g.remove();
+        })
+        .await;
+    });
+}
+
 /// The processes under `root`, newest first: (pid, command line). Blocking.
 fn descendants(root: u32) -> Vec<(u32, Vec<String>)> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -1547,11 +1567,20 @@ const FILES_OUT_FOR: Duration = Duration::from_secs(600);
 /// How often a session leaving, or arriving, asks how its folder's copy stands.
 const FILES_EVERY: Duration = Duration::from_millis(250);
 
+/// Where a leaving session's synced folder stood once its last changes were in the log: the index
+/// the machine it goes to takes the log to before it goes on there, its copy's folder here, and
+/// the repo's name.
+struct Synced {
+    mark: crate::sync::runner::Mark,
+    folder: String,
+    name: String,
+}
+
 /// Before a session leaves: its folder's last changes into its repo's sync log (looked at now,
 /// sent, their contents on the server, the log having brought them back), then where the copy
 /// stands, for the machine it goes to to take the log that far before it goes on there. None: its
 /// folder isn't a synced copy here. An error, and it doesn't leave: it would leave work behind.
-async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<(crate::sync::runner::Mark, String)>, String> {
+async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<Synced>, String> {
     let Some(sync) = crate::sync::runner::global() else { return Ok(None) };
     let folder = std::path::Path::new(cwd);
     let started = Instant::now();
@@ -1561,7 +1590,7 @@ async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<(crate::sy
         let st = sync.standing(folder).await.unwrap_or_default();
         if looked.looked && looked.proposed == 0 && st.unsent == 0 && st.behind == 0 {
             left_behind(cwd, &st).await?;
-            return Ok(Some((crate::sync::runner::Mark { repo: looked.repo, index: st.reached }, st.folder)));
+            return Ok(Some(Synced { mark: crate::sync::runner::Mark { repo: looked.repo, index: st.reached }, folder: st.folder, name: st.name }));
         }
         let why = match (&st.error, st.connected) {
             (Some(e), _) => format!(" ({e})"),
@@ -1786,7 +1815,19 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
     loop {
         let now = match sync.standing(folder).await {
             Some(st) if st.repo == mark.repo && st.reached >= mark.index => {
-                note(format!("Its folder's last changes are here (in {}s); it goes on", started.elapsed().as_secs()), Level::Info);
+                let waited = started.elapsed();
+                note(format!("Its folder's last changes are here (in {}s); it goes on", waited.as_secs()), Level::Info);
+                crate::metrics::sync().move_files_wait.observe(waited.as_secs_f64());
+                tracing::Span::current().record("repo", st.name.as_str());
+                // The server knows this machine as the one it arrived on.
+                tell_move(crate::sync::wire::MoveNews {
+                    repo: st.repo.clone(),
+                    index: mark.index,
+                    session: s.id.clone(),
+                    phase: "arrived".into(),
+                    waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                    ..crate::sync::wire::MoveNews::default()
+                });
                 flush(s, sink, None).await;
                 return Arrived::GoOn;
             }
@@ -1889,22 +1930,102 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
     };
     // Its folder's last changes go first, so it goes on there from them; then its repository's
     // state besides its files (only a synced folder's: there's a repository there to take it).
-    let synced = files_out(s, &from_cwd, &mv.to).await?;
-    let out = match &synced {
-        Some((_, copy)) => git_out(s, &from_cwd, copy, &mv.to, &mv.cwd).await?,
-        None => GitOut::default(),
+    let barrier = tracing::info_span!(target: "kiln.sync", "move.barrier", repo = tracing::field::Empty, machine = %mv.to, result = tracing::field::Empty);
+    let started = Instant::now();
+    let synced = files_out(s, &from_cwd, &mv.to).instrument(barrier.clone()).await;
+    let waited = started.elapsed();
+    barrier.record("result", if synced.is_ok() { "ok" } else { "failed" });
+    if let Ok(Some(x)) = &synced {
+        barrier.record("repo", x.name.as_str());
+        tracing::Span::current().record("repo", x.name.as_str());
+        crate::metrics::sync().move_barrier.observe(waited.as_secs_f64());
+    }
+    drop(barrier);
+    // How this machine's part went, for the repo's activity on the server.
+    let news = |repo: &str, index: u64, phase: &str, error: Option<&str>| crate::sync::wire::MoveNews {
+        repo: repo.to_owned(),
+        index,
+        session: s.id.clone(),
+        from: me.clone(),
+        to: mv.to.clone(),
+        phase: phase.to_owned(),
+        waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        error: error.map(str::to_owned),
     };
+    let synced = match synced {
+        Ok(x) => x,
+        Err(why) => {
+            if let Some(st) = standing(&from_cwd).await {
+                tell_move(news(&st.repo, st.reached, "failed", Some(&why)));
+            }
+            return Err(why);
+        }
+    };
+    // Said now, before the machine it goes to says it went on there.
+    if let Some(x) = &synced {
+        tell_move(news(&x.mark.repo, x.mark.index, "left", None));
+    }
+    let out = match &synced {
+        Some(x) => git_out(s, &from_cwd, &x.folder, &mv.to, &mv.cwd).await,
+        None => Ok(GitOut::default()),
+    };
+    let out = match out {
+        Ok(o) => o,
+        Err(why) => {
+            if let Some(x) = &synced {
+                tell_move(news(&x.mark.repo, x.mark.index, "failed", Some(&why)));
+            }
+            return Err(why);
+        }
+    };
+    let carried = carried_bytes(&out);
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
     pkg.picks_up = mv.picks_up || cut;
-    pkg.synced = synced.map(|(m, _)| m);
+    pkg.synced = synced.as_ref().map(|x| x.mark.clone());
     pkg.git = out.git;
     pkg.ignored = out.ignored;
     pkg.worktree = out.worktree;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
-    reach.adopt(&mv.to, &bytes).await
+    let handed = reach.adopt(&mv.to, &bytes).await;
+    if let (Some(x), Err(e)) = (&synced, &handed) {
+        tell_move(news(&x.mark.repo, x.mark.index, "failed", Some(e)));
+    }
+    if handed.is_ok() {
+        for (what, n) in carried {
+            if n > 0 {
+                crate::metrics::sync().move_carried_bytes.add(&[what], n);
+            }
+        }
+    }
+    handed
+}
+
+/// How the synced copy a folder is in stands, if this machine syncs one.
+async fn standing(cwd: &str) -> Option<crate::sync::runner::Standing> {
+    crate::sync::runner::global()?.standing(std::path::Path::new(cwd)).await
+}
+
+/// Tells the server how this machine's part of a move went, for the repo's activity.
+fn tell_move(news: crate::sync::wire::MoveNews) {
+    if let Some(sync) = crate::sync::runner::global() {
+        sync.tell(crate::sync::wire::Msg::Move(news));
+    }
+}
+
+/// What a leaving session's repository carries besides its synced files, in bytes: what the
+/// machine it goes to lacks of its git history, the files git ignores, and its worktree.
+fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
+    // Base64, as the package carries them: three bytes in four.
+    let b64 = |s: &str| u64::try_from(s.len() / 4 * 3).unwrap_or(u64::MAX);
+    let files = |c: &super::carry::Carried| c.files.iter().map(|f| b64(&f.data)).sum::<u64>();
+    [
+        ("git", out.git.as_ref().and_then(|g| g.bundle.as_deref()).map_or(0, b64)),
+        ("ignored", out.ignored.as_ref().map_or(0, files)),
+        ("worktree", out.worktree.as_ref().map_or(0, |w| files(&w.changed).saturating_add(files(&w.ignored)))),
+    ]
 }
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
@@ -1954,7 +2075,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // Moved here: on once its folder's last changes are (after a restart too: its state says so).
     let arriving = s.core.lock().state.arriving.clone();
     if let Some(mark) = arriving {
-        if let Arrived::End { let_go } = files_in(&s, &sink, &mark, &ctl_rx, &mut carry, &files).await {
+        let span = tracing::info_span!(target: "kiln.sync", "move.files", repo = tracing::field::Empty, session = %s.id, result = tracing::field::Empty);
+        let arrived = files_in(&s, &sink, &mark, &ctl_rx, &mut carry, &files).instrument(span.clone()).await;
+        span.record("result", if arrived == Arrived::GoOn { "ok" } else { "ended" });
+        drop(span);
+        if let Arrived::End { let_go } = arrived {
             if let_go {
                 (files.release)(&s.id);
             } else {
@@ -1991,7 +2116,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
         if let Some(mv) = moving.take() {
-            match hand_over(&s, kind, &mv).await {
+            let span = tracing::info_span!(target: "kiln.sync", "move", repo = tracing::field::Empty, machine = %mv.to, session = %s.id, result = tracing::field::Empty);
+            let handed = hand_over(&s, kind, &mv).instrument(span.clone()).await;
+            let result = if handed.is_ok() { "ok" } else { "failed" };
+            span.record("result", result);
+            drop(span);
+            crate::metrics::sync().moves.inc(&[result]);
+            match handed {
                 Ok(()) => {
                     tracing::info!(session = %s.id, to = %mv.to, "agent session moved");
                     (files.release)(&s.id);
@@ -2054,14 +2185,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
-                    // Marked as this session's, and so is everything it starts (`survivors`).
+                    // In the session's group of processes where the machine has them, and marked as
+                    // its, and so is everything it starts (`survivors`).
                     None => kind
                         .launch(&spec, &s.id)
                         .map(|mut p| {
                             p.env(super::survivors::MARK, &s.id);
                             p
                         })
-                        .and_then(crate::proc::spawn_duplex),
+                        .and_then(|p| crate::proc::spawn_duplex_in(p, crate::os::contain::Group::of(&s.id).as_ref())),
                 };
                 (adapter, spawned, Vec::new(), false)
             }
@@ -2340,8 +2472,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             let root = p.pid;
                             let left = std::mem::take(&mut *s.left.lock());
+                            let group = crate::os::contain::Group::existing(&s.id);
+                            let members = group.clone();
                             let _ = crate::rt::blocking(move || {
-                                let pids: Vec<u32> = descendants(root).into_iter().map(|(pid, _)| pid).collect();
+                                // Everything in its group where it has one (what left its tree
+                                // too), else what's under it now.
+                                let pids: Vec<u32> = match &members {
+                                    Some(g) => g.pids().into_iter().filter(|p| *p != root).collect(),
+                                    None => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                };
                                 crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
                                 for r in &left {
                                     super::survivors::stop_tree(r);
@@ -2350,6 +2489,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
+                            if let Some(g) = group {
+                                end_group(g, Duration::from_millis(3500));
+                            }
                             if matches!(ctl, Some(Ctl::LetGo)) {
                                 tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                                 (files.release)(&s.id);
@@ -2561,10 +2703,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     let _ = reply.send(None);
                 }
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
-                    // Ending the agent ends what it left running that kiln took back over.
+                    // Ending the agent ends what it left running that kiln took back over, and the
+                    // rest of its group of processes, which then goes.
                     let left = std::mem::take(&mut *s.left.lock());
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
+                    }
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                        end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {
                         tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");

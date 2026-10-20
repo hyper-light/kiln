@@ -18,6 +18,7 @@ import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, shortSh
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { IncidentCard } from "@/views/attach/card";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
 import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
@@ -161,6 +162,7 @@ function RunBody({ id }: { id: string }) {
               <ErrorState error={run.error} compact />
             </div>
           )}
+          <IncidentCard run={id} />
         </div>
         {ciDetail ? (
           <div className="flex flex-col items-start gap-3 md:items-end">

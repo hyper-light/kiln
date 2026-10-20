@@ -95,6 +95,12 @@ pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String
     if sessions.is_empty() {
         return None;
     }
+    // In a session's group of processes: one look says whose it is.
+    if let Some(id) = crate::os::contain::session_of(pid)
+        && sessions.iter().any(|(s, _)| *s == id)
+    {
+        return Some(id);
+    }
     let sys = system(None);
     let mut at = Pid::from_u32(pid);
     // Up the tree: a tool's command runs under its harness.
@@ -125,30 +131,47 @@ pub struct Seen {
     pub apart: Vec<Ran>,
 }
 
-/// One look at the machine's processes (blocking): for each session (its id, and its harness's
+/// One look at the sessions' processes (blocking): for each session (its id, and its harness's
 /// process when it runs), what runs under its harness and what it started that runs apart from
-/// it, its helpers (and what runs under them) left out.
+/// it, its helpers (and what runs under them) left out. A session with a group of processes
+/// (`crate::os::contain`) is what's in its group, and only those processes are looked at; one
+/// without is found by its mark, which takes looking at every process on the machine.
 pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
     use sysinfo::Pid;
     if sessions.is_empty() {
         return HashMap::new();
     }
-    let sys = refreshed(None, true);
+    let groups: HashMap<&str, Vec<Pid>> =
+        sessions.iter().filter_map(|(id, _)| crate::os::contain::Group::existing(id).map(|g| (id.as_str(), g.pids().into_iter().map(Pid::from_u32).collect()))).collect();
+    let marks = sessions.iter().any(|(id, _)| !groups.contains_key(id.as_str()));
+    let sys = if marks {
+        refreshed(None, true)
+    } else {
+        let pids: Vec<u32> = groups.values().flatten().map(|p| p.as_u32()).chain(sessions.iter().filter_map(|(_, h)| *h)).collect();
+        refreshed(Some(&pids), false)
+    };
     let mut kids: HashMap<Pid, Vec<Pid>> = HashMap::new();
     let mut marked: HashMap<String, Vec<Pid>> = HashMap::new();
-    let wanted: HashSet<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+    let wanted: HashSet<&str> = sessions.iter().map(|(id, _)| id.as_str()).filter(|id| !groups.contains_key(id)).collect();
     let prefix = format!("{MARK}=");
     for (pid, p) in sys.processes() {
         if let Some(parent) = p.parent() {
             kids.entry(parent).or_default().push(*pid);
         }
-        if let Some(id) = p.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str())))
+        if marks
+            && let Some(id) = p.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str())))
             && wanted.contains(id)
         {
             marked.entry(id.to_owned()).or_default().push(*pid);
         }
     }
-    let skip = |pid: Pid| sys.process(pid).is_none_or(|p| helper(&command_of(p.cmd())) || p.parent().and_then(|pp| sys.process(pp)).is_some_and(|pp| helper(&command_of(pp.cmd()))));
+    for (id, pids) in &groups {
+        marked.insert((*id).to_owned(), pids.clone());
+    }
+    // PID 1 may be kiln itself in a container: what it adopted needn't be a helper's child.
+    let skip = |pid: Pid| {
+        sys.process(pid).is_none_or(|p| helper(&command_of(p.cmd())) || p.parent().filter(|pp| pp.as_u32() != 1).and_then(|pp| sys.process(pp)).is_some_and(|pp| helper(&command_of(pp.cmd()))))
+    };
     sessions
         .iter()
         .map(|(id, harness)| {

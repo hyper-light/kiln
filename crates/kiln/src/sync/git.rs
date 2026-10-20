@@ -428,7 +428,15 @@ mod tests {
     use super::*;
 
     fn sh(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=k@k", "-c", "user.name=k", "-c", "init.defaultBranch=main"]).args(args).output()?;
+        // Free of this machine's git config: one that signs tags and commits would ask for a key.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=k@k", "-c", "user.name=k", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()?;
         anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }

@@ -140,6 +140,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
         }
         child!("sampler", h => h.sampler_loop());
+        child!("conversation-stores", h => crate::harness::stores::run(h));
         child!("retention", h => h.retention_loop());
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
@@ -155,6 +156,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("ci-providers", h => crate::ci::providers::sync_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
+        child!("attachments", h => crate::ci::attach::run(h));
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
@@ -325,6 +327,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     shutdown.cancelled().await;
     tracing::info!("shutting down");
     hub.disconnect_all().await;
+    // Sync's activity of the last few seconds, which it saves now and then.
+    hub.sync.flush().await;
     // Lets the close frames go out and in-flight responses finish.
     crate::rt::sleep(Duration::from_millis(300)).await;
     Ok(())

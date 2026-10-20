@@ -53,11 +53,7 @@ pub fn starter(cx: &Cx) -> Result<Starter, Fail> {
 
 /// An agent calling may steer, interrupt or end only itself and the agents it started (and theirs).
 fn may_steer(cx: &Cx, id: &str) -> Result<(), Fail> {
-    let Some(me) = cx.caller.agent.as_deref() else { return Ok(()) };
-    if me == id || lineage::descends(&cx.hub.harness.list(), id, me) {
-        return Ok(());
-    }
-    Err((StatusCode::FORBIDDEN, format!("an agent steers and ends only the agents it started (and theirs): {} isn't one of {}'s", lineage::short(id), lineage::short(me))))
+    lineage::may_steer(&cx.hub, &cx.caller, id)
 }
 
 async fn list(cx: Cx, v: Value) -> Out {
@@ -163,7 +159,18 @@ async fn wait_for(cx: Cx, v: Value) -> Out {
         other => return Err((StatusCode::BAD_REQUEST, format!("`until` is settled or change, not {other:?}"))),
     };
     let secs = number(&v, "timeout_s").unwrap_or(wait::DEFAULT.as_secs_f64()).clamp(0.0, wait::MAX.as_secs_f64());
-    Ok(wait::wait(&cx.hub, &ids, until, flag(&v, "any"), std::time::Duration::from_secs_f64(secs)).await)
+    let out = wait::wait(&cx.hub, &ids, until, flag(&v, "any"), std::time::Duration::from_secs_f64(secs)).await;
+    // What a parent saw settle here, it isn't told of again (`told`).
+    for id in &ids {
+        if let Some(info) = cx.hub.harness.info(id)
+            && info.parent.is_some()
+            && info.parent == cx.caller.agent
+            && wait::settled(wait::stand(&info))
+        {
+            super::told::saw(&info);
+        }
+    }
+    Ok(out)
 }
 
 /// The text of a reply event, and when it was said.
@@ -175,6 +182,10 @@ fn reply_of(e: &Value) -> Option<Value> {
 async fn result(cx: Cx, v: Value) -> Out {
     let info = known(&cx, &agent_of(&v)?)?;
     let id = info.id.clone();
+    // Its parent reading it now isn't told of it again (`told`).
+    if info.parent.is_some() && info.parent == cx.caller.agent {
+        super::told::saw(&info);
+    }
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
@@ -341,7 +352,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.start",
-            summary: "Start agents to do part of the work: `kind` (claude, codex, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Then agents.wait and agents.result.",
+            summary: "Start agents to do part of the work: `kind` (claude, codex, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
             read_only: false,
             destructive: false,
             input: || {
@@ -375,7 +386,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.wait",
-            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn.",
+            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
             read_only: true,
             destructive: false,
             input: || {
@@ -428,14 +439,14 @@ pub fn list_ops() -> Vec<Op> {
             input: || {
                 schema(
                     json!({
-                        "agent": {"type": "string", "description": AGENT},
+                        "agent": {"type": "string", "description": "The agent whose work it is (as agents.list gives it); leave it out for your own."},
                         "title": {"type": "string"},
                         "body": {"type": "string", "description": "What it changes and why, for reviewers."},
                         "draft": {"type": "boolean", "description": "Not ready for review yet (kiln's own review)."},
                         "trunk": {"type": "string", "description": "The branch it goes into."},
                         "fix_checks": {"type": "boolean", "description": "Failing checks go to the agent to fix (the default)."}
                     }),
-                    &["agent"],
+                    &[],
                 )
             },
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "change"]))),

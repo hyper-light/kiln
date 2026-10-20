@@ -161,7 +161,8 @@ pub fn capture(root: &Path, theirs: &[String]) -> Result<GitState, String> {
     let staged = if born { !git_ok(root, &["diff", "--cached", "--quiet"]) } else { !git(root, &["ls-files", "--cached"]).unwrap_or_default().is_empty() };
     let index = if staged {
         let tree = git(root, &["write-tree"])?;
-        let mut args = vec!["commit-tree", tree.as_str(), "-m", "kiln: what was staged when the session moved"];
+        // kiln's own commit: never signed (a machine that signs commits would ask for a key here).
+        let mut args = vec!["commit-tree", "--no-gpg-sign", tree.as_str(), "-m", "kiln: what was staged when the session moved"];
         if born {
             args.extend(["-p", "HEAD"]);
         }
@@ -371,8 +372,22 @@ fn fetch_bundle(root: &Path, b64: &str, from: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Git for the tests' own repositories, as `git` runs it but free of this machine's config
+    /// (one that signs commits and tags would ask for a key).
     fn sh(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-        git(dir, args).map_err(anyhow::Error::msg)
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "kiln")
+            .env("GIT_AUTHOR_EMAIL", "kiln@localhost")
+            .env("GIT_COMMITTER_NAME", "kiln")
+            .env("GIT_COMMITTER_EMAIL", "kiln@localhost")
+            .output()?;
+        anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
     }
 
     fn write(dir: &Path, name: &str, text: &str) -> anyhow::Result<()> {
@@ -390,7 +405,7 @@ mod tests {
         sh(&a, &["add", "README"])?;
         sh(&a, &["commit", "-qm", "first"])?;
         let b = t.path().join("b");
-        let out = Command::new("git").args(["clone", "-q"]).arg(&a).arg(&b).output()?;
+        let out = Command::new("git").args(["clone", "-q"]).arg(&a).arg(&b).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output()?;
         anyhow::ensure!(out.status.success(), "clone: {}", String::from_utf8_lossy(&out.stderr));
         Ok((t, a, b))
     }

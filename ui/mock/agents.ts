@@ -434,8 +434,103 @@ const changes = new Map<string, Record<string, unknown>>([
 ]);
 
 /** The `agents.*` routes. True when it answered. */
+/* ------------------------------------------------------------------ attached agents (W20-R08) */
+
+const now = () => Math.floor(Date.now() / 1000);
+family.set(
+  "att-ci",
+  member("att-ci", "claude", "agent:metal-ryzen-01", "ci-doctor: CI failed on main: assertion failed in sync::reconnect", "running", "default", "You are ci-doctor, attached to repo:hyper-light/kiln in kiln, and this woke you (failure): CI failed on main.", "Reproducing the reconnect failure locally.", {
+    doing: "Running cargo test -p kiln sync::reconnect",
+  }),
+);
+const attached = new Map<string, Record<string, unknown>>([
+  [
+    "a1",
+    { id: "a1", name: "ci-doctor", on: "repo:hyper-light/kiln", branches: ["main"], harness: { kind: "claude", on: "metal-ryzen-01", cwd: "/home/ada/src/kiln" }, wake: ["failure", "flaky", "mention"], can: ["read", "rerun", "fix"], limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 }, playbook: "Rerun what's flaky once; for a regression, open a revert as a diff.", reviewers: ["ada"], by: "owner", paused: false, created_at: now() - 86_400, updated_at: now() - 86_400 },
+  ],
+  [
+    "a2",
+    { id: "a2", name: "runner-doctor", on: "runners", branches: [], harness: { kind: "codex" }, wake: ["offline", "upgrade"], can: ["read", "diagnose", "manage-runners"], limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 }, playbook: "", reviewers: [], by: "owner", paused: false, created_at: now() - 3 * 86_400, updated_at: now() - 3 * 86_400 },
+  ],
+  [
+    "hyper-light__kiln.release-watch",
+    {
+      id: "hyper-light__kiln.release-watch",
+      name: "release-watch",
+      on: "repo:hyper-light/kiln",
+      branches: [],
+      workflows: ["release"],
+      source: "hyper-light/kiln:.kiln/agents.yaml",
+      harness: { kind: "claude" },
+      wake: ["failure"],
+      can: ["read", "rerun"],
+      limits: { sessions_per_day: 5, reruns_per_failure: 1, stuck_minutes: 15 },
+      playbook: "",
+      reviewers: [],
+      by: "owner",
+      paused: false,
+      created_at: 0,
+      updated_at: 0,
+    },
+  ],
+  [
+    "a3",
+    { id: "a3", name: "nightly-gardener", on: "workflow:hyper-light/kiln:.github/workflows/nightly.yml", branches: [], harness: { kind: "codex" }, wake: ["schedule"], schedule: "0 6 * * 1", can: ["read", "edit-pipelines"], limits: { sessions_per_day: 1, reruns_per_failure: 0, stuck_minutes: 15 }, playbook: "Shorten the critical path.", reviewers: ["ada"], by: "owner", paused: true, created_at: now() - 7 * 86_400, updated_at: now() - 2 * 86_400 },
+  ],
+]);
+const incidentList: Record<string, unknown>[] = [
+  { id: "i3", attachment: "a1", name: "ci-doctor", on: "repo:hyper-light/kiln", wake: "failure", repo: "hyper-light/kiln", title: "CI failed on main: assertion failed in sync::reconnect", state: "open", agent: "att-ci", class: null, report: null, links: [], why: null, times: 2, last: { at: now() - 240, what: "CI #412" }, at: now() - 900, updated_at: now() - 240 },
+  { id: "i2", attachment: "a2", name: "runner-doctor", on: "runners", wake: "upgrade", runner: "metal-epyc-01", title: "Upgrading metal-epyc-01 failed: cargo build exited 101", state: "waiting", agent: null, class: null, report: null, links: [], why: "its agent couldn't start: no machine suits codex: none is connected", times: 1, last: { at: now() - 7200, what: "upgrade u9 (build)" }, at: now() - 7200, updated_at: now() - 7200 },
+  { id: "i1", attachment: "a1", name: "ci-doctor", on: "repo:hyper-light/kiln", wake: "flaky", title: "Flaky in CI #409: retry::backoff_caps", state: "resolved", agent: "fam-tests", class: "flaky", report: "retry::backoff_caps races the clock; quarantined it (D41) and opened a fix as D44.", links: ["D41", "D44"], why: null, times: 1, last: { at: now() - 86_000, what: "CI #409" }, at: now() - 86_000, updated_at: now() - 80_000 },
+];
+
+/** The attachments' and incidents' routes. True when it answered. */
+async function handleAttached(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
+  const p = url.pathname;
+  const m = req.method ?? "GET";
+  const rows = () =>
+    [...attached.values()]
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+      .map((a) => {
+        const mine = incidentList.filter((i) => i.attachment === a.id);
+        return { attachment: a, open: mine.filter((i) => i.state === "open").length, today: mine.filter((i) => i.agent && Number(i.at) > now() - 86_400).length, latest: mine[0] ?? null };
+      });
+  if (p === "/api/attachments" && m === "GET") return (json(res, 200, { attachments: rows() }), true);
+  if (p === "/api/incidents" && m === "GET") {
+    // A run's: those it happened in.
+    const run = url.searchParams.get("run");
+    return (json(res, 200, { incidents: run ? incidentList.filter((i) => (i.last as { run?: string } | undefined)?.run === run) : incidentList }), true);
+  }
+  if (p === "/api/attachments/pause" && m === "POST") {
+    const b = await body<{ attachment?: string; paused?: boolean }>(req);
+    const a = b.attachment ? attached.get(b.attachment) : undefined;
+    if (!a) return (json(res, 404, { error: "no such attachment" }), true);
+    a.paused = b.paused ?? true;
+    emitEvent({ type: "attachment", attachment: a });
+    return (json(res, 200, { paused: a.paused, attachments: [a.name] }), true);
+  }
+  if (p === "/api/attachments" && m === "POST") {
+    const b = await body<Record<string, unknown>>(req);
+    if (!String(b.name ?? "").trim()) return (json(res, 400, { error: "`name`: up to 40 letters, digits and `-` (people mention it as @name)" }), true);
+    if ([...attached.values()].some((a) => a.name === b.name)) return (json(res, 409, { error: `an attachment is called ${String(b.name)} already` }), true);
+    const id = `a${attached.size + 1}`;
+    const a = { ...b, id, by: "owner", paused: false, created_at: now(), updated_at: now() };
+    attached.set(id, a);
+    emitEvent({ type: "attachment", attachment: a });
+    return (json(res, 200, { attachment: a, grants: [] }), true);
+  }
+  const am = p.match(/^\/api\/attachments\/([^/]+)$/);
+  if (am && m === "DELETE") {
+    attached.delete(decodeURIComponent(am[1] ?? ""));
+    emitEvent({ type: "attachment", removed: am[1] });
+    return (json(res, 200, { removed: am[1] }), true);
+  }
+  return false;
+}
+
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
   if (await handleRun(req, res, url)) return true;
+  if (await handleAttached(req, res, url)) return true;
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];

@@ -44,6 +44,16 @@ externalService:
   nodePorts:
     http: 30070
     quic: 30071
+    webrtc: 30072
+
+# WebRTC to live pages' viewers (docs/previews.md, "WebRTC"): UDP 7072 in the pod, its NodePort
+# forwarded from this host's 7072/udp (`KILN_LAN_WEBRTC=1 deploy/cluster/expose-lan.sh up`), and
+# viewers told this host's LAN and Tailscale addresses. Out of reach, they stay on their sockets.
+ports:
+  webrtc: 7072
+webrtcAdvertise:
+  - 192.168.1.77:7072
+  - 100.107.111.49:7072
 
 metrics:
   serviceMonitor:

@@ -124,6 +124,15 @@ impl Caller {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.allows(capability, target)))
     }
 
+    /// An agent session's caller (which has no token, so no limit of its own), doing at most what
+    /// `limit` allows too: an attached agent's capabilities (`crate::ci::attach`).
+    pub fn limited_to(mut self, limit: Rights) -> Caller {
+        if self.limit.is_none() {
+            self.limit = Some(limit);
+        }
+        self
+    }
+
     /// Whether it has `capability` anywhere (a route that narrows by itself).
     pub fn has_somewhere(&self, capability: &str) -> bool {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.somewhere(capability)))

@@ -720,7 +720,7 @@ pub(crate) fn when(t: Option<i64>) -> String {
 }
 
 /// `NAME=value` lines of a dotenv file (comments, blank lines and `export` skipped; quotes removed).
-fn dotenv(text: &str) -> Vec<(String, String)> {
+pub(crate) fn dotenv(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
             let l = l.trim();

@@ -184,6 +184,8 @@ pub struct Remote {
     process: Mutex<Option<std::process::Child>>,
     /// A clean profile's folder, removed as it stops.
     scratch: Option<PathBuf>,
+    /// The display of its own a WebKitGTK browser draws on (Linux), stopped with it.
+    display: Mutex<Option<Display>>,
     pages: AtomicUsize,
 }
 
@@ -197,6 +199,9 @@ impl Remote {
     fn stop(&self) {
         if let Some(p) = self.process.lock().take() {
             stop_process(p);
+        }
+        if let Some(d) = self.display.lock().take() {
+            d.stop();
         }
         if let Some(d) = &self.scratch {
             let _ = std::fs::remove_dir_all(d);
@@ -283,7 +288,7 @@ async fn remote(dir: &Path, engine: Engine, profile: &str, sim: Option<&super::s
     }
     let r = Arc::new(match engine {
         Engine::Firefox => start_firefox(dir, profile).await?,
-        Engine::Webkit => start_webdriver(sim).await?,
+        Engine::Webkit => start_webdriver(dir, sim).await?,
         Engine::Chromium => anyhow::bail!("Chromium's pages are the capture extension's"),
     });
     g.insert(key, r.clone());
@@ -373,7 +378,7 @@ async fn start_firefox(dir: &Path, profile: &str) -> anyhow::Result<Remote> {
     if bidi.call("session.subscribe", json!({"events": all})).await.is_err() {
         bidi.call("session.subscribe", json!({"events": wanted})).await?;
     }
-    Ok(Remote { conn: Conn::Bidi(bidi), process: Mutex::new(started.take()), scratch: clean.then_some(folder), pages: AtomicUsize::new(0) })
+    Ok(Remote { conn: Conn::Bidi(bidi), process: Mutex::new(started.take()), scratch: clean.then_some(folder), display: Mutex::new(None), pages: AtomicUsize::new(0) })
 }
 
 /// The engines this machine has, besides Chromium: whether it has Firefox, and a WebDriver for
@@ -422,19 +427,25 @@ fn webdriver() -> Option<(PathBuf, bool)> {
     candidates.into_iter().find(|p| p.is_file()).map(|p| (p, false))
 }
 
-async fn start_webdriver(sim: Option<&super::simulators::Sim>) -> anyhow::Result<Remote> {
+async fn start_webdriver(dir: &Path, sim: Option<&super::simulators::Sim>) -> anyhow::Result<Remote> {
     let Some((bin, safari)) = webdriver() else {
         anyhow::bail!(
             "{}",
             if cfg!(target_os = "macos") { "this Mac has no safaridriver" } else { "WebKit's WebDriver isn't installed on this machine (Debian and Ubuntu: apt install webkit2gtk-driver)" }
         );
     };
+    let asked = std::env::var("KILN_WEBDRIVER_CAPS").ok().and_then(|c| serde_json::from_str::<Value>(&c).ok());
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let mut cmd = std::process::Command::new(&bin);
     if safari {
         cmd.arg("-p").arg(port.to_string());
     } else {
         cmd.arg(format!("--port={port}"));
+    }
+    // WebKitGTK's browser draws on a display of its own (none of it on this machine's screen).
+    let display = if safari { None } else { Display::start(dir, &bin, asked.as_ref()).await? };
+    if let Some(d) = &display {
+        d.give(&mut cmd);
     }
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(unix)]
@@ -453,7 +464,6 @@ async fn start_webdriver(sim: Option<&super::simulators::Sim>) -> anyhow::Result
         crate::rt::sleep(Duration::from_millis(100)).await;
     }
     anyhow::ensure!(up, "{} didn't answer", bin.display());
-    let asked = std::env::var("KILN_WEBDRIVER_CAPS").ok().and_then(|c| serde_json::from_str::<Value>(&c).ok());
     let caps = match (asked, sim) {
         (Some(c), _) => json!({"capabilities": {"alwaysMatch": c}}),
         // An iPhone's or iPad's Mobile Safari, in kiln's simulator of it.
@@ -469,7 +479,197 @@ async fn start_webdriver(sim: Option<&super::simulators::Sim>) -> anyhow::Result
         }
     })?;
     let id = made.pointer("/value/sessionId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("the WebDriver started no session: {made}"))?;
-    Ok(Remote { conn: Conn::Classic(format!("{root}/session/{id}")), process: Mutex::new(started.take()), scratch: None, pages: AtomicUsize::new(0) })
+    Ok(Remote { conn: Conn::Classic(format!("{root}/session/{id}")), process: Mutex::new(started.take()), scratch: None, display: Mutex::new(display), pages: AtomicUsize::new(0) })
+}
+
+/// A display of its own for the WebKitGTK browser a WebDriver starts (Linux), so no window of it
+/// comes up on this machine's screen, and a machine without one runs it all the same: Xvfb where
+/// it's installed (no port, and only those holding its key in kiln's folder may draw on it), else
+/// GTK's broadway backend, drawn in memory, its sockets in that folder (its pictures come a second
+/// apart there: WebKit waits on a frame clock broadway doesn't keep).
+pub struct Display {
+    daemon: std::process::Child,
+    dir: PathBuf,
+    kind: Screen,
+}
+
+enum Screen {
+    /// Xvfb's display `:n`.
+    X(u32),
+    Broadway,
+}
+
+/// Broadway's display (one each, in a folder of its own).
+const BROADWAY: &str = ":1";
+
+/// A program on `PATH` (or in /usr/bin).
+fn program(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").map(|p| std::env::split_paths(&p).map(|d| d.join(name)).collect::<Vec<_>>()).unwrap_or_default().into_iter().chain([PathBuf::from("/usr/bin").join(name)]).find(|p| p.is_file())
+}
+
+impl Display {
+    /// One for the browser `driver` starts (`caps` may name it): None off Linux, or with this
+    /// machine's own display when neither Xvfb nor GTK's broadway daemon is installed.
+    async fn start(dir: &Path, driver: &Path, caps: Option<&Value>) -> anyhow::Result<Option<Self>> {
+        if !cfg!(target_os = "linux") {
+            return Ok(None);
+        }
+        let root = dir.join("browser").join("displays");
+        sweep_displays(&root);
+        // GTK 4's browser (WebKitGTK 6.0) or GTK 3's (4.1): broadway's daemon is its GTK's.
+        let named = caps.and_then(|c| c.pointer("/webkitgtk:browserOptions/binary")).and_then(Value::as_str).map(str::to_owned);
+        let gtk4 = match named {
+            Some(b) => b.contains("webkitgtk-6.0"),
+            None => std::fs::read(driver).is_ok_and(|bin| bin.windows(14).any(|w| w == b"webkitgtk-6.0/")),
+        };
+        let broadwayd = if gtk4 { "gtk4-broadwayd" } else { "broadwayd" };
+        let (xvfb, broadway) = (program("Xvfb"), program(broadwayd));
+        if xvfb.is_none() && broadway.is_none() {
+            let screen = std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+            anyhow::ensure!(screen, "WebKit draws on a display, and this machine has none: install Xvfb (Debian and Ubuntu: apt install xvfb), and kiln gives it one of its own");
+            tracing::warn!("WebKit's browser opens on this machine's screen: install Xvfb to keep it off");
+            return Ok(None);
+        }
+        let at = root.join(hex::encode(rand::random::<[u8; 6]>()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&at)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&at)?;
+        let made = match (xvfb, broadway) {
+            (Some(x), _) => Self::xvfb(&x, &at).await,
+            (None, Some(b)) => Self::broadway(&b, &at).await,
+            (None, None) => Err(anyhow::anyhow!("no display")),
+        };
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&at);
+        }
+        made.map(Some)
+    }
+
+    /// Xvfb on a display nobody has (its lock and socket in /tmp), its key written into `at`.
+    async fn xvfb(bin: &Path, at: &Path) -> anyhow::Result<Self> {
+        let key: [u8; 16] = rand::random();
+        let auth = at.join("Xauthority");
+        let mut last = anyhow::anyhow!("no display free");
+        for _ in 0..4 {
+            let Some(n) = (0..200).map(|_| 100 + rand::random::<u32>() % 900).find(|n| !Path::new(&format!("/tmp/.X11-unix/X{n}")).exists() && !Path::new(&format!("/tmp/.X{n}-lock")).exists()) else { break };
+            std::fs::write(&auth, xauthority(n, &key))?;
+            let mut cmd = std::process::Command::new(bin);
+            cmd.arg(format!(":{n}")).args(["-nolisten", "tcp", "-nolisten", "local", "-noreset", "-screen", "0", "2560x1600x24", "-auth"]).arg(&auth);
+            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.process_group(0);
+            }
+            let mut started = Started(Some(cmd.spawn().map_err(|e| anyhow::anyhow!("{} didn't start: {e}", bin.display()))?));
+            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{n}"));
+            let mut up = false;
+            for _ in 0..100 {
+                if started.0.as_mut().is_some_and(|p| p.try_wait().ok().flatten().is_some()) {
+                    break;
+                }
+                if socket.exists() {
+                    up = true;
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            }
+            if up {
+                let pid = started.0.as_ref().map_or(0, std::process::Child::id);
+                let _ = std::fs::write(at.join(OWNER), format!("{} {pid}", std::process::id()));
+                let daemon = started.take().ok_or_else(|| anyhow::anyhow!("Xvfb went"))?;
+                return Ok(Self { daemon, dir: at.to_path_buf(), kind: Screen::X(n) });
+            }
+            last = anyhow::anyhow!("Xvfb made no display :{n}");
+        }
+        Err(last)
+    }
+
+    /// GTK's broadway daemon, its sockets (its web server's too, never a port) in `at`.
+    async fn broadway(bin: &Path, at: &Path) -> anyhow::Result<Self> {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--unixsocket").arg(at.join("www.sock")).arg(BROADWAY).env("XDG_RUNTIME_DIR", at).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+        let mut started = Started(Some(cmd.spawn().map_err(|e| anyhow::anyhow!("{} didn't start: {e}", bin.display()))?));
+        let pid = started.0.as_ref().map_or(0, std::process::Child::id);
+        let _ = std::fs::write(at.join(OWNER), format!("{} {pid}", std::process::id()));
+        // Display :1's socket is broadway2.socket.
+        let socket = at.join("broadway2.socket");
+        for _ in 0..60 {
+            if socket.exists() {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(socket.exists(), "{} made no display", bin.display());
+        let daemon = started.take().ok_or_else(|| anyhow::anyhow!("broadway went"))?;
+        Ok(Self { daemon, dir: at.to_path_buf(), kind: Screen::Broadway })
+    }
+
+    /// The WebDriver (and the browser it starts) draws on it, and nowhere else.
+    fn give(&self, cmd: &mut std::process::Command) {
+        cmd.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        match self.kind {
+            Screen::X(n) => {
+                cmd.env("GDK_BACKEND", "x11").env("DISPLAY", format!(":{n}")).env("XAUTHORITY", self.dir.join("Xauthority"));
+            }
+            Screen::Broadway => {
+                cmd.env("GDK_BACKEND", "broadway").env("BROADWAY_DISPLAY", BROADWAY).env("XDG_RUNTIME_DIR", &self.dir);
+            }
+        }
+    }
+
+    fn stop(self) {
+        stop_process(self.daemon);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// An X authority file of one key (MIT-MAGIC-COOKIE-1) for display `n`, any host.
+fn xauthority(n: u32, key: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut field = |b: &[u8]| {
+        out.extend_from_slice(&u16::try_from(b.len()).unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(b);
+    };
+    // Family "wild" (any address): its own two bytes, then the fields.
+    let mut file = 0xffff_u16.to_be_bytes().to_vec();
+    field(b"");
+    field(n.to_string().as_bytes());
+    field(b"MIT-MAGIC-COOKIE-1");
+    field(key);
+    file.append(&mut out);
+    file
+}
+
+/// Displays a runner that's gone left (a crash): their daemons stopped, their folders removed.
+fn sweep_displays(root: &Path) {
+    for f in std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()) {
+        let Ok(text) = std::fs::read_to_string(f.join(OWNER)) else { continue };
+        let mut it = text.split_whitespace().filter_map(|n| n.parse::<u32>().ok());
+        let (Some(runner), Some(daemon)) = (it.next(), it.next()) else { continue };
+        if runner == std::process::id() || super::alive(runner) {
+            continue;
+        }
+        // Still that daemon (its command names this folder), not a process since given its id.
+        #[cfg(target_os = "linux")]
+        if std::fs::read(format!("/proc/{daemon}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains(&*f.to_string_lossy()))
+            && let Ok(pid) = i32::try_from(daemon)
+        {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = daemon;
+        let _ = std::fs::remove_dir_all(&f);
+    }
 }
 
 /// A WebDriver HTTP command: its answer's JSON (an error's, as an error).

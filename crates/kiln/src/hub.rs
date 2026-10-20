@@ -1131,6 +1131,8 @@ impl Hub {
                 // restore it from, when asked for. Else the runner's own store's feed.
                 let msg = crate::convo::feed::decode(&json);
                 match (&self.harness.copies, msg) {
+                    // What a runner's store is doing, for the board.
+                    (_, Some(crate::convo::feed::Msg::Stats { store, report })) => self.harness.board.heard(&agent, &store, *report, crate::util::now_ms()),
                     (_, Some(crate::convo::feed::Msg::Hello { store, restore: true })) => {
                         if self.harness.restore_accepts(&agent, &store)
                             && let Some(f) = &self.harness.feed

@@ -116,6 +116,11 @@ function CellView({ cell }: { cell: Cell | undefined }) {
       ) : (
         <span className="rel-quiet">nothing runs</span>
       )}
+      {reg.degraded && (
+        <span className="rel-tag rel-tag-alert" title={reg.degraded}>
+          needs a person
+        </span>
+      )}
       {in_flight && (
         <Link to={releaseHref(in_flight.id)} className="rel-flight">
           <StatusDot status={STATE_DOT[in_flight.state]} title={STATE_WORDS[in_flight.state]} />

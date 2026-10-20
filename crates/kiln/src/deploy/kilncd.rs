@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kiln_cd::apps::{self, AppDef, Destination, Engine, Helm, HelmParam, Origin, ProviderSource, Source};
+use kiln_cd::apps::{self, AppDef, Destination, Engine, Helm, HelmParam, Origin, ProviderSource, SecretsRef, Source};
 use kiln_cd::model::{SyncOptions, SyncPolicy, Tracking};
 use serde_json::{Value, json};
 
@@ -22,8 +22,50 @@ pub fn app_id(app: &App, env: &str) -> String {
     format!("{}/{}-{env}", app.project, app.name)
 }
 
-/// The definition KilnCD deploys a release from.
-pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, commit: &str, release_url: &str) -> Result<AppDef, String> {
+/// Whether a git package is a Helm chart at `version` (its path holds a `Chart.yaml`): then it
+/// renders as a Helm package does, named as the app and with the environment's values; else as
+/// its files say (a kustomization, or manifests). Looked at in KilnCD's mirror of the repository.
+pub async fn git_chart(cd: &Arc<Cd>, package: &Package, version: &str) -> bool {
+    let Package::Git { repo, path, .. } = package else { return false };
+    let (dir, auth, url, at) = (cd.mirror_dir(repo), cd.git_auth(repo), repo.clone(), version.to_owned());
+    let chart = format!("{}Chart.yaml", if path.trim_matches('/').is_empty() { String::new() } else { format!("{}/", path.trim_matches('/')) });
+    let found = crate::rt::blocking(move || -> anyhow::Result<bool> {
+        let m = kiln_cd::git::Mirror::open(&dir, &url, auth)?;
+        let commit = match m.resolve(&at) {
+            Ok(c) => c,
+            Err(_) => {
+                m.fetch()?;
+                m.resolve(&at)?
+            }
+        };
+        Ok(m.read(&commit, &chart)?.is_some())
+    })
+    .await
+    .and_then(|r| r);
+    found.unwrap_or_else(|e| {
+        tracing::debug!(repo = %repo, version, error = %format!("{e:#}"), "deploy: whether a git package is a chart can't be told; KilnCD detects it");
+        false
+    })
+}
+
+/// Makes sure KilnCD's mirror of `repo` holds `commit`, fetching once if it doesn't: a render of
+/// it reads it.
+pub async fn fetched(cd: &Arc<Cd>, repo: &str, commit: &str) -> anyhow::Result<()> {
+    let (dir, auth, url, commit) = (cd.mirror_dir(repo), cd.git_auth(repo), repo.to_owned(), commit.to_owned());
+    crate::rt::blocking(move || -> anyhow::Result<()> {
+        let m = kiln_cd::git::Mirror::open(&dir, &url, auth)?;
+        if !m.has(&commit) {
+            m.fetch()?;
+        }
+        Ok(())
+    })
+    .await
+    .and_then(|r| r)
+}
+
+/// The definition KilnCD deploys a release from. `chart`: a git package is a Helm chart (see
+/// [`git_chart`]).
+pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, commit: &str, release_url: &str, chart: bool) -> Result<AppDef, String> {
     let version = file.version.clone().ok_or("the release names no version")?;
     let values = format!("$release/{}", repo::values_file(&env.release_repo, app, &env.name));
     let set = repo::filled_set(&app.package, file)?;
@@ -78,10 +120,20 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
             revision: version,
             chart: None,
             as_ref: None,
-            engine: if parameters.is_empty() { Engine::Auto } else { Engine::Helm(helm(vec![values])) },
+            engine: if parameters.is_empty() && !chart { Engine::Auto } else { Engine::Helm(helm(vec![values])) },
         }, kubernetes),
     };
     let platform = matches!(app.package, Package::Platform { .. });
+    // Its secrets, at the versions the release pinned, as one Secret (§3.5). A platform takes them
+    // its own way, later.
+    let secrets = match (platform, file.secrets.as_str()) {
+        (true, _) | (_, "") => None,
+        (false, pinned) => Some(SecretsRef {
+            scope: crate::secrets::Scope::of(&app.name, &env.name).key(),
+            name: secret_name(app),
+            versions: crate::secrets::parse_versions(pinned).map_err(|e| format!("release.json's secrets: {e:#}"))?.into_iter().collect(),
+        }),
+    };
     let release = Source { repo: release_url.to_owned(), path: String::new(), revision: commit.to_owned(), chart: None, as_ref: Some("release".into()), engine: Engine::Auto };
     // A namespace is Kubernetes'.
     let (options, _) = SyncOptions::parse(if platform { Vec::new() } else { vec!["CreateNamespace=true"] });
@@ -102,7 +154,13 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
         artifacts: BTreeMap::new(),
         rollout: None,
         checks: BTreeMap::new(),
+        secrets,
     })
+}
+
+/// The Secret an app's secrets become in its namespace: `<app>-kiln`.
+pub fn secret_name(app: &App) -> String {
+    format!("{}-kiln", app.name)
 }
 
 fn cx(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str) -> crate::cd::ops::Cx {
@@ -117,7 +175,7 @@ async fn op(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, name: &str, input: Value)
 /// take is refused.
 pub async fn deliver(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, def: &AppDef) -> Result<(), Undelivered> {
     let id = def.id();
-    crate::cd::ops::call(cx(hub, cd, actor), "cd.apps.create", json!({ "definition": def }))
+    crate::cd::ops::put_released(cx(hub, cd, actor), def.clone())
         .await
         .map_err(|(code, msg)| Undelivered::of_status(code.as_u16(), format!("KilnCD cd.apps.create: {msg} ({code})")))?;
     // Registered just now, KilnCD may not hold it yet: a refresh that misses is no failure.
@@ -137,7 +195,7 @@ pub async fn remove(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str, keep: b
 pub async fn automation(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str, on: bool) -> Result<(), String> {
     let Some(mut def) = cd.apps.read().get(id).map(|e| e.def.clone()) else { return Ok(()) };
     def.sync.auto = on;
-    op(hub, cd, actor, "cd.apps.create", json!({ "definition": def })).await.map(|_| ())
+    crate::cd::ops::put_released(cx(hub, cd, actor), def).await.map(|_| ()).map_err(|(code, msg)| format!("KilnCD cd.apps.create: {msg} ({code})"))
 }
 
 /// What KilnCD says of an app, as a release follows it: whether the commit has landed, and the
@@ -162,16 +220,37 @@ pub fn landed(cd: &Cd, id: &str, commit: &str, since_ms: u64) -> (Landed, Value)
         "last_sync": ran.as_ref().map(|h| json!({ "succeeded": h.succeeded, "message": h.message, "at_ms": h.at_ms, "id": h.id })),
     });
     let settled = s("sync") == "Synced" && s("health") == "Healthy";
+    let degraded = (s("health") == "Degraded").then(|| Some(s("message")).filter(|m| !m.is_empty()).unwrap_or_else(|| "KilnCD says its health is Degraded".to_owned()));
     let syncing = status.pointer("/operation/phase").and_then(Value::as_str).is_some_and(|p| matches!(p, "DryRun" | "Running" | "Failing" | "Terminating"));
-    let landed = match (ran, refused) {
-        (Some(h), _) if !h.succeeded => Landed::Failed(if h.message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { h.message }),
-        (Some(_), _) if settled => Landed::Yes,
+    let ran = ran.map(|h| (h.succeeded, h.message));
+    (verdict(ran, refused, Seen { at_commit, settled, syncing }, degraded), view)
+}
+
+/// Where KilnCD's app stands, for [`verdict`].
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    /// KilnCD read the release's commit.
+    at_commit: bool,
+    /// Synced and healthy.
+    settled: bool,
+    /// A sync is running.
+    syncing: bool,
+}
+
+/// What KilnCD's state says of a release: its sync since it began (whether it succeeded, its
+/// message), why its sources don't read or render, where the app stands, and why it's Degraded.
+fn verdict(ran: Option<(bool, String)>, refused: Option<String>, seen: Seen, degraded: Option<String>) -> Landed {
+    match (ran, refused) {
+        (Some((false, message)), _) => Landed::Failed(if message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { message }),
+        (Some(_), _) if seen.settled => Landed::Yes,
+        // Synced from this commit, and Degraded: what the release runs doesn't.
+        (Some(_), _) if !seen.syncing && degraded.is_some() => Landed::Degraded(degraded.unwrap_or_default()),
         (None, Some(why)) => Landed::Refused(why),
         // Nothing to sync: KilnCD read the release's commit, and what it renders runs already.
-        (None, None) if at_commit && settled && !syncing => Landed::Yes,
+        (None, None) if seen.at_commit && seen.settled && !seen.syncing => Landed::Yes,
+        (None, None) if seen.at_commit && !seen.syncing && degraded.is_some() => Landed::Degraded(degraded.unwrap_or_default()),
         _ => Landed::No,
-    };
-    (landed, view)
+    }
 }
 
 #[cfg(test)]
@@ -224,13 +303,14 @@ mod tests {
             requested_by: "ada".into(),
             at: String::new(),
             rollback_of: None,
+            secrets: String::new(),
         }
     }
 
     #[test]
     fn a_release_becomes_a_definition_pinned_to_its_commit() -> Result<(), String> {
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
-        let def = definition(&app(), &env(), &reg, &file(), "abc123", "file:///data/releases.git")?;
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
+        let def = definition(&app(), &env(), &reg, &file(), "abc123", "file:///data/releases.git", false)?;
         assert_eq!(def.id(), "shop/web-staging");
         assert_eq!((def.destination.cluster.as_str(), def.destination.namespace.as_str()), ("dev", "shop-web"));
         let [package, release] = def.sources.as_slice() else { return Err("two sources".into()) };
@@ -243,8 +323,43 @@ mod tests {
         let replicas = h.parameters.iter().find(|p| p.name == "replicas").ok_or("replicas")?;
         assert!(!replicas.force_string, "a literal is Helm's to read");
         assert!(def.sync.auto && def.sync.options.create_namespace == Some(true));
+        assert_eq!(def.secrets, None, "no secrets pinned, no Secret");
+        let with = definition(&app(), &env(), &reg, &ReleaseFile { secrets: "DB_PASSWORD@4,API_KEY@1".into(), ..file() }, "abc123", "file:///x", false)?;
+        let s = with.secrets.ok_or("the secrets the release pinned")?;
+        assert_eq!((s.scope.as_str(), s.name.as_str(), s.versions_text().as_str()), ("app/web/staging", "web-kiln", "API_KEY@1,DB_PASSWORD@4"));
         let paused = Registration { paused: true, ..reg };
-        assert!(!definition(&app(), &env(), &paused, &file(), "abc123", "file:///x")?.sync.auto, "a paused registration isn't synced automatically");
+        assert!(!definition(&app(), &env(), &paused, &file(), "abc123", "file:///x", false)?.sync.auto, "a paused registration isn't synced automatically");
+        Ok(())
+    }
+
+    #[test]
+    fn a_release_lands_synced_and_healthy_and_fails_on_evidence() {
+        let seen = |at_commit, settled, syncing| Seen { at_commit, settled, syncing };
+        let degraded = || Some("Deployment \"web\" exceeded its progress deadline".to_owned());
+        assert_eq!(verdict(Some((true, String::new())), None, seen(true, true, false), None), Landed::Yes);
+        assert!(matches!(verdict(Some((false, "apply failed".into())), None, seen(true, false, false), None), Landed::Failed(m) if m == "apply failed"));
+        assert!(matches!(verdict(Some((true, String::new())), None, seen(true, false, false), degraded()), Landed::Degraded(m) if m.contains("progress deadline")));
+        assert_eq!(verdict(Some((true, String::new())), None, seen(true, false, true), degraded()), Landed::No, "a sync still running decides nothing yet");
+        assert_eq!(verdict(Some((true, String::new())), None, seen(true, false, false), None), Landed::No, "progressing");
+        assert!(matches!(verdict(None, Some("render failed".into()), seen(false, false, false), None), Landed::Refused(_)));
+        assert_eq!(verdict(None, None, seen(true, true, false), None), Landed::Yes, "nothing to sync: it runs already");
+        assert!(matches!(verdict(None, None, seen(true, false, false), degraded()), Landed::Degraded(_)));
+        assert_eq!(verdict(None, None, seen(false, false, false), degraded()), Landed::No, "what's Degraded isn't this release's yet");
+    }
+
+    #[test]
+    fn a_git_chart_renders_as_the_app_with_the_environments_values() -> Result<(), String> {
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
+        let git = App { package: Package::Git { repo: "file:///repos/web.git".into(), path: "charts/web".into(), set: BTreeMap::new() }, ..app() };
+        let f = ReleaseFile { package: git.package.clone(), ..file() };
+        let auto = definition(&git, &env(), &reg, &f, "abc", "file:///x", false)?;
+        let [package, _] = auto.sources.as_slice() else { return Err("two sources".into()) };
+        assert_eq!(package.engine, Engine::Auto, "a kustomization, or manifests: as its files say");
+        let chart = definition(&git, &env(), &reg, &f, "abc", "file:///x", true)?;
+        let [package, _] = chart.sources.as_slice() else { return Err("two sources".into()) };
+        let Engine::Helm(h) = &package.engine else { return Err("a chart renders with Helm".into()) };
+        assert_eq!(h.release_name.as_deref(), Some("web"), "named as the app, as the Secret of its secrets is");
+        assert_eq!(h.value_files, ["$release/shop/web/staging/values.yaml"], "with the environment's values");
         Ok(())
     }
 
@@ -263,9 +378,9 @@ mod tests {
         let a = App { package: lambda, ..app() };
         let mut e = env();
         e.targets.platforms.insert("aws-lambda".into(), serde_json::from_value(json!({ "account": "aws-prod", "region": "us-east-1" })).map_err(|e| e.to_string())?);
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
         let f = ReleaseFile { package: a.package.clone(), ..file() };
-        let def = definition(&a, &e, &reg, &f, "abc123", "file:///data/hosted/kiln/releases.git")?;
+        let def = definition(&a, &e, &reg, &f, "abc123", "file:///data/hosted/kiln/releases.git", false)?;
         assert_eq!(def.destination.cluster, "aws-lambda/aws-prod/us-east-1", "the target is the engine's cluster");
         let [package, release] = def.sources.as_slice() else { return Err("two sources".into()) };
         let Engine::Provider(p) = &package.engine else { return Err("a provider's source".into()) };
@@ -280,14 +395,14 @@ mod tests {
         let objects = kiln_cd::providers::render("aws-lambda", &input)?;
         assert!(objects.iter().any(|o| o.get("kind").and_then(Value::as_str) == Some("Function")), "{objects:?}");
         // An environment without the target says so.
-        assert!(definition(&a, &env(), &reg, &f, "abc", "file:///x").is_err_and(|m| m.contains("no aws-lambda target")));
+        assert!(definition(&a, &env(), &reg, &f, "abc", "file:///x", false).is_err_and(|m| m.contains("no aws-lambda target")));
         Ok(())
     }
 
     #[test]
     fn a_release_without_a_version_has_nothing_to_deploy() {
-        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0 };
+        let reg = Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
         let unversioned = ReleaseFile { version: None, ..file() };
-        assert!(definition(&app(), &env(), &reg, &unversioned, "abc", "file:///x").is_err());
+        assert!(definition(&app(), &env(), &reg, &unversioned, "abc", "file:///x", false).is_err());
     }
 }

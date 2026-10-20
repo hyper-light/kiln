@@ -149,4 +149,29 @@ mod tests {
         assert_eq!(kept(&devices, "kiln iPhone 15", "r.iOS-18-2"), Some(("U1".into(), true)));
         assert!(kept(&devices, "kiln iPad Air 11-inch (M3)", "r.iOS-18-2").is_none());
     }
+
+    /// The real thing, on a Mac with Xcode and an iOS runtime: kiln's simulator of an iPhone 15
+    /// made (or found), booted with no window, its Safari open to automation; asked again, the
+    /// same one at once.
+    #[test]
+    #[ignore = "needs a Mac with Xcode and an iOS simulator runtime (it makes and boots a simulator)"]
+    fn a_macs_simulator_is_made_booted_and_open_to_automation() -> anyhow::Result<()> {
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        crate::rt::block_on(async {
+            let sim = ensure(&device("iPhone 15")).await?;
+            assert!(sim.name.starts_with("kiln iPhone") && sim.runtime.starts_with("iOS"), "{sim:?}");
+            let devices = list("devices").await?;
+            let booted = devices.get("devices").and_then(Value::as_object).into_iter().flat_map(|m| m.values()).filter_map(Value::as_array).flatten().any(|d| d.get("udid").and_then(Value::as_str) == Some(sim.udid.as_str()) && d.get("state").and_then(Value::as_str) == Some("Booted"));
+            assert!(booted, "{sim:?} isn't booted");
+            let on = simctl(&["spawn", &sim.udid, "defaults", "read", "com.apple.WebInspector", "RemoteAutomationEnabled"]).await?;
+            assert_eq!(on.trim(), "1", "its Safari's remote automation");
+            let t0 = std::time::Instant::now();
+            let again = ensure(&device("iPhone 15")).await?;
+            assert_eq!(again.udid, sim.udid);
+            assert!(t0.elapsed() < Duration::from_secs(20), "found again, not made again: {:?}", t0.elapsed());
+            Ok(())
+        })
+    }
 }

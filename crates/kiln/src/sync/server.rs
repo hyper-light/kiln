@@ -11,16 +11,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Wake, Waker};
 use std::time::{Duration, Instant, SystemTime};
 
-use hyper_durable::{LogStore as _, Output, Replica, Unbounded};
+use hyper_durable::{LogStore as _, Output, Replica, ReplicaError, Unbounded};
 use hyper_raft::proto::{Message, MessageType};
 use hyper_raft::wire::Record as _;
 use serde::{Deserialize, Serialize};
 
+use super::activity::{self, Activity, Event, Kind, Tone};
 use super::blobs::Blobs;
 use super::disk::{self, Store, SyncLog};
-use super::group::{self, Index, SERVER, TICK};
-use super::wire::{self, CopySpec, CopyStatus, Joiner, Msg};
-use super::{Change, STEP_CHANGES, Step, Version};
+use super::group::{self, Index, SERVER, TICK, Taken};
+use super::wire::{self, CopySpec, CopyStatus, Joiner, MoveNews, Msg};
+use super::{Change, Decision, STEP_CHANGES, Step, Version};
+use crate::metrics;
 
 /// A log entry's bytes at the most (the log holds one up to 1 MiB).
 const ENTRY: usize = 900 << 10;
@@ -31,6 +33,16 @@ const SWEEP: Duration = Duration::from_secs(600);
 const SWEEP_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// How often the view the API shows is made again, at the most.
 const VIEW_EVERY: Duration = Duration::from_millis(500);
+/// How often new activity is saved, at the most, and the copies' gauges measured at the least.
+const SAVE_EVERY: Duration = Duration::from_secs(5);
+const GAUGE_EVERY: Duration = Duration::from_secs(5);
+/// The same trouble from the same machine shows in a repo's activity (and the log) once in this
+/// long; the metrics count every time.
+const QUIET: Duration = Duration::from_secs(60);
+/// Steps' arrival times a group keeps for their commits' latency, at the most.
+const ARRIVED: usize = 4096;
+/// A copy's states, as the API and the metrics name them.
+const STATES: [&str; 7] = ["in step", "catching up", "fetching", "sending", "starting", "offline", "error"];
 
 /// A synced repo, as the server keeps it (`<data>/sync/repos.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +93,26 @@ pub struct RepoView {
     /// Synced only for a move under way: that task's batch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transient: Option<String>,
+    /// What its sync did since the server started.
+    pub stats: RepoStats,
+}
+
+/// What a repo's sync did since the server started (`since`, unix milliseconds).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoStats {
+    pub since: i64,
+    /// Steps committed, the files they changed and the bytes of the contents they brought.
+    pub steps: u64,
+    pub files: u64,
+    pub bytes: u64,
+    /// Changes that met another machine's.
+    pub conflicts: u64,
+    /// Steps and messages let go, things done again, and errors.
+    pub dropped: u64,
+    pub retries: u64,
+    pub errors: u64,
+    /// When the newest step was committed (unix milliseconds).
+    pub last_step: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -92,6 +124,10 @@ pub struct CopyView {
     /// `in step`, `catching up`, `fetching`, `sending`, `starting`, `offline`, `error`.
     pub state: &'static str,
     pub status: Option<CopyStatus>,
+    /// When the server last heard how it is (unix milliseconds).
+    pub heard: Option<i64>,
+    /// Log entries its folder hasn't taken yet.
+    pub lag: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -146,12 +182,15 @@ enum Input {
     From { machine: String, msg: Msg, raft: Vec<u8> },
     Machine { machine: String, up: bool },
     Ask { ask: Ask, reply: futures::channel::oneshot::Sender<Result<String, String>> },
+    /// Save what isn't saved yet: the server is stopping.
+    Flush(futures::channel::oneshot::Sender<()>),
 }
 
 /// The hub's handle on the server's side of sync.
 pub struct Sync {
     tx: Sender<Input>,
     view: Arc<Mutex<View>>,
+    activity: Arc<Mutex<Activity>>,
     out: async_channel::Receiver<Out>,
     /// What others send a machine's syncing runner process on the sync lane (`crate::sync::tasks`).
     say: async_channel::Sender<Out>,
@@ -165,6 +204,7 @@ impl Sync {
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();
         let view = Arc::new(Mutex::new(View::default()));
+        let activity = Arc::new(Mutex::new(Activity::default()));
         let blobs = Blobs::new(&dir.join("blobs")).map(Arc::new);
         let blobs = match blobs {
             Ok(b) => Some(b),
@@ -175,9 +215,9 @@ impl Sync {
         };
         let say = out_tx.clone();
         if let Some(b) = blobs.clone() {
-            let (v, wake_tx) = (view.clone(), tx.clone());
+            let (v, a, wake_tx) = (view.clone(), activity.clone(), tx.clone());
             let k = key.clone();
-            let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::open(&dir, b, out_tx, v.clone(), wake_tx, k) {
+            let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::open(&dir, b, out_tx, v.clone(), a, wake_tx, k) {
                 Ok(owner) => owner.run(&rx),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "repo sync is off");
@@ -188,11 +228,26 @@ impl Sync {
                 lock(&view).error = Some(format!("sync is off: {e}"));
             }
         }
-        Self { tx, view, out, say, blobs, key }
+        Self { tx, view, activity, out, say, blobs, key }
     }
 
     pub fn view(&self) -> View {
         lock(&self.view).clone()
+    }
+
+    /// Saves the activity not saved yet, waiting a second at the most: the server is stopping.
+    pub async fn flush(&self) {
+        let (reply, done) = futures::channel::oneshot::channel();
+        if self.tx.send(Input::Flush(reply)).is_ok() {
+            let _ = crate::rt::timeout(Duration::from_secs(1), done).await;
+        }
+    }
+
+    /// What happened in the synced repos: the events numbered `since` on, of `repo` alone if given,
+    /// the newest `limit` first; and the number the next event gets.
+    pub fn activity(&self, since: u64, repo: Option<&str>, limit: usize) -> (Vec<Event>, u64) {
+        let a = lock(&self.activity);
+        (a.since(since, repo, limit), a.next())
     }
 
     /// The server's contents.
@@ -279,6 +334,8 @@ struct Group {
     /// A change of configuration proposed and not yet seen applied: the member, added or not.
     changing: Option<(u64, bool, Instant)>,
     error: Option<String>,
+    /// When each step proposed and not yet committed arrived: its member and number.
+    arrived: HashMap<(u64, u64), Instant>,
 }
 
 pub struct Owner {
@@ -300,10 +357,31 @@ pub struct Owner {
     key: String,
     start: Instant,
     swept: Instant,
+    /// What happened in each repo, shared with the API; saved now and then.
+    activity: Arc<Mutex<Activity>>,
+    saved: Instant,
+    /// The copies' gauges, last measured.
+    gauged: Instant,
+    /// Each copy's state as last seen, and when the server last heard how it is (and the unix
+    /// milliseconds then).
+    states: HashMap<(String, u64), &'static str>,
+    heard_at: HashMap<(String, u64), (Instant, i64)>,
+    /// When each kind of trouble from a machine last showed in a repo's activity.
+    quiet: HashMap<(String, String, &'static str), Instant>,
+    /// The copies, by repo and machine, noted going offline (now, or before the server started):
+    /// their coming back is news; a copy merely connecting (as each does when the server starts)
+    /// isn't.
+    away: HashSet<(String, String)>,
+    /// Each repo's steps through this log index are on record (in its activity, or committed
+    /// before the server started): taken again, as the log is replayed when the server starts,
+    /// they aren't news, and aren't counted again.
+    recorded: HashMap<String, u64>,
+    stats: HashMap<String, RepoStats>,
+    started: i64,
 }
 
 impl Owner {
-    fn open(dir: &Path, blobs: Arc<Blobs>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
+    fn open(dir: &Path, blobs: Arc<Blobs>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let repos: Vec<Repo> = match std::fs::read(dir.join("repos.json")) {
             Ok(b) => serde_json::from_slice(&b)?,
@@ -311,6 +389,10 @@ impl Owner {
             Err(e) => return Err(e.into()),
         };
         let log = disk::open(&dir.join("sync.log"))?;
+        let loaded = Activity::load(dir, repos.iter().map(|r| r.id.as_str()));
+        let away = loaded.away();
+        let recorded = loaded.recorded();
+        *lock(&activity) = loaded;
         let wakeup = Arc::new(Wakeup { tx, pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut owner = Self {
@@ -332,6 +414,16 @@ impl Owner {
             key,
             start: Instant::now(),
             swept: Instant::now(),
+            activity,
+            saved: Instant::now(),
+            gauged: Instant::now(),
+            states: HashMap::new(),
+            heard_at: HashMap::new(),
+            quiet: HashMap::new(),
+            away,
+            recorded,
+            stats: HashMap::new(),
+            started: now_ms(),
         };
         for repo in repos {
             if let Err(e) = owner.open_group(&repo) {
@@ -349,7 +441,10 @@ impl Owner {
         let mut r = Replica::open(&group::settings(SERVER, depth)?, store, index, Unbounded).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         r.campaign().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let compacted = r.applied().index;
-        self.groups.insert(repo.id.clone(), Group { r, out: Output::default(), compacted, next: HashMap::new(), changing: None, error: None });
+        // What the log committed before now is replayed into the tree: no news.
+        let before = self.recorded.entry(repo.id.clone()).or_default();
+        *before = (*before).max(r.durable_commit());
+        self.groups.insert(repo.id.clone(), Group { r, out: Output::default(), compacted, next: HashMap::new(), changing: None, error: None, arrived: HashMap::new() });
         Ok(())
     }
 
@@ -396,11 +491,12 @@ impl Owner {
                 let answer = self.ask(ask).map_err(|e| format!("{e:#}"));
                 // The view shows what was asked before the asker hears back (a task looks for the
                 // copy it just added).
-                self.changed = false;
-                self.viewed = Instant::now();
-                let view = self.make_view();
-                *lock(&self.view) = view;
+                self.publish();
                 let _ = reply.send(answer);
+            }
+            Input::Flush(reply) => {
+                self.save_activity();
+                let _ = reply.send(());
             }
         }
     }
@@ -409,13 +505,18 @@ impl Owner {
         match msg {
             Msg::Raft { repo, id, part, parts } => {
                 let Some(bytes) = self.joiner.add(machine, id, part, parts, raft) else { return };
-                let Ok(m) = Message::decode(&bytes) else { return };
+                let Ok(m) = Message::decode(&bytes) else {
+                    self.dropped(&repo, machine, "message", "undecodable", format!("a message from {machine} didn't decode: let go"));
+                    return;
+                };
                 let mine = self.members_on(&repo, machine);
                 if m.to != SERVER || !mine.contains(&m.from) {
+                    self.dropped(&repo, machine, "message", "not_member", format!("a message from {machine} for a member that isn't its: let go"));
                     return;
                 }
-                if let Some(g) = self.groups.get_mut(&repo) {
-                    let _ = g.r.step(m);
+                let refused = self.groups.get_mut(&repo).and_then(|g| g.r.step(m).err());
+                if let Some(e) = refused {
+                    self.dropped(&repo, machine, "message", why(&e), format!("the log didn't take a message from {machine} ({e}): it comes again"));
                 }
             }
             Msg::Steps { repo, steps } => self.steps(machine, &repo, steps),
@@ -424,13 +525,39 @@ impl Owner {
                     if status.looked && !status.adopting {
                         self.settled(&status.repo, status.member);
                     }
-                    self.statuses.insert((status.repo.clone(), status.member), status);
+                    self.heard_at.insert((status.repo.clone(), status.member), (Instant::now(), now_ms()));
+                    self.statuses.insert((status.repo.clone(), status.member), *status);
                     self.changed = true;
                 }
             }
+            Msg::Move(news) => self.moved(machine, news),
             // Only the server says these, or they aren't for the groups (`crate::sync::places`).
             Msg::Copies { .. } | Msg::Release | Msg::Want { .. } | Msg::Repos(_) | Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } | Msg::Task(_) => {}
         }
+    }
+
+    /// An agent session moving with a repo's files, as one of its machines saw its part: in the
+    /// repo's activity, if that machine holds a copy of it.
+    fn moved(&mut self, machine: &str, mut news: MoveNews) {
+        if self.members_on(&news.repo, machine).is_empty() {
+            return;
+        }
+        // Each machine speaks for its own part alone.
+        if news.phase == "arrived" {
+            machine.clone_into(&mut news.to);
+        } else {
+            machine.clone_into(&mut news.from);
+        }
+        let waited = secs_text(news.waited_ms);
+        let session = if news.session.is_empty() { "an agent session".to_owned() } else { format!("agent session {}", short(&news.session)) };
+        let (tone, text) = match news.phase.as_str() {
+            "left" => (Tone::Info, format!("{session} is leaving {} for {}: its folder's last changes are in the log through #{} (that took {waited})", news.from, news.to, news.index)),
+            "arrived" => (Tone::Ok, format!("{session} went on on {} once its folder there had #{} (it waited {waited})", news.to, news.index)),
+            _ => (Tone::Warn, format!("{session} couldn't move from {} to {}, and stays: {}", news.from, news.to, news.error.as_deref().unwrap_or("it didn't say why"))),
+        };
+        let name = self.name_of(&news.repo);
+        tracing::info!(target: "kiln.sync", event = "sync.move", repo = %name, machine = %machine, phase = %news.phase, from = %news.from, to = %news.to, index = news.index, waited_ms = news.waited_ms, "{text}");
+        self.note(&news.repo, Kind::Move, machine, tone, text);
     }
 
     /// A copy that was to take the group's files has: it is a copy like any other from now on, and
@@ -438,9 +565,11 @@ impl Owner {
     fn settled(&mut self, repo: &str, member: u64) {
         let Some(c) = self.repos.iter_mut().filter(|r| r.id == repo).flat_map(|r| r.copies.iter_mut()).find(|c| c.member == member && c.adopt.is_some()) else { return };
         c.adopt = None;
+        let machine = c.machine.clone();
         if let Err(e) = self.save() {
             tracing::warn!(error = %format!("{e:#}"), "the synced repos could not be saved");
         }
+        self.note(repo, Kind::Copy, &machine, Tone::Ok, format!("the new copy on {machine} has the repo's files: it syncs like the others now"));
     }
 
     /// The members of `repo` whose copies are on `machine`.
@@ -454,18 +583,28 @@ impl Owner {
         let mine = self.members_on(repo, machine);
         let Some(g) = self.groups.get_mut(repo) else { return };
         let mut want: Vec<String> = Vec::new();
+        // What was let go (and why), and how many came again, taken already.
+        let mut dropped: Vec<(&'static str, String)> = Vec::new();
+        let mut again = 0u64;
         for mut step in steps {
-            if !mine.contains(&step.member) || step.changes.len() > STEP_CHANGES {
+            if !mine.contains(&step.member) {
+                dropped.push(("not_member", format!("a step from {machine} for a copy that isn't on it: let go")));
+                continue;
+            }
+            if step.changes.len() > STEP_CHANGES {
+                dropped.push(("too_many_changes", format!("a step from {machine} of {} changes, more than {STEP_CHANGES}: let go", step.changes.len())));
                 continue;
             }
             step.by = machine.to_owned();
             let taken = g.r.machine().tree.seqs.get(&step.member).copied().unwrap_or(0);
             let next = g.next.get(&step.member).copied().unwrap_or(0).max(taken.saturating_add(1));
             if step.seq < next {
+                again += 1;
                 continue;
             }
             if step.seq > next {
                 // One before it went missing: they all come again.
+                dropped.push(("out_of_order", format!("steps from {machine} came out of order (#{} before #{next}): they come again", step.seq)));
                 break;
             }
             let lacking: Vec<String> = step
@@ -482,18 +621,35 @@ impl Owner {
             }
             let entry = group::entry(&step);
             if entry.len() > ENTRY {
-                tracing::warn!(%repo, %machine, bytes = entry.len(), "a step too big for the log was left out");
+                dropped.push(("too_big", format!("a step from {machine} too big for the log ({} KiB, {} changes): left out", entry.len() >> 10, step.changes.len())));
                 g.next.insert(step.member, step.seq.saturating_add(1));
                 continue;
             }
-            if g.r.propose(Vec::new(), entry).is_err() {
+            if let Err(e) = g.r.propose(Vec::new(), entry) {
+                dropped.push((why(&e), format!("the log didn't take a step from {machine} ({e}): it comes again")));
                 break;
             }
+            if g.arrived.len() >= ARRIVED {
+                g.arrived.clear();
+            }
+            g.arrived.insert((step.member, step.seq), Instant::now());
             g.next.insert(step.member, step.seq.saturating_add(1));
+        }
+        let name = self.name_of(repo);
+        if again > 0 {
+            metrics::sync().retries.add(&[&name, "step_again"], again);
+            self.stats_of(repo).retries += again;
+        }
+        for (reason, text) in dropped {
+            self.dropped(repo, machine, "step", reason, text);
         }
         if !want.is_empty() {
             want.sort();
             want.dedup();
+            let n = want.len();
+            metrics::sync().retries.add(&[&name, "contents_asked"], u64::try_from(n).unwrap_or(u64::MAX));
+            self.stats_of(repo).retries += 1;
+            self.note_quietly(repo, Kind::Retry, machine, "contents_asked", Tone::Info, format!("asked {machine} again for the contents of {n} file{} its steps name", if n == 1 { "" } else { "s" }));
             self.send(machine, Msg::Want { repo: repo.to_owned(), hashes: want }, Vec::new());
         }
     }
@@ -537,21 +693,24 @@ impl Owner {
             if let Err(e) = group::pump(&mut g.r, now, &self.waker, &mut g.out, &mut messages) {
                 let why = format!("{e:?}");
                 if g.error.as_deref() != Some(why.as_str()) {
-                    tracing::warn!(repo = %repo.name, error = %why, "a synced repo's group stopped");
-                    g.error = Some(why);
+                    tracing::warn!(target: "kiln.sync", event = "sync.error", repo = %repo.name, kind = "group", error = %why, "a synced repo's group stopped");
+                    g.error = Some(why.clone());
                     self.changed = true;
+                    metrics::sync().errors.inc(&[&repo.name, "group"]);
+                    self.stats_of(&id).errors += 1;
+                    self.note(&id, Kind::Error, "kiln", Tone::Fail, format!("the repo's log stopped: {why}"));
                 }
                 continue;
             }
-            if !g.r.machine().taken.is_empty() {
-                g.r.machine_mut().taken.clear();
-                self.changed = true;
-            }
+            let taken = std::mem::take(&mut g.r.machine_mut().taken);
+            let arrived: Vec<Option<Instant>> = taken.iter().map(|t| g.arrived.remove(&(t.step.member, t.step.seq))).collect();
+            let mut offline = 0u64;
             for m in messages {
                 let to = m.to;
                 let Some(copy) = repo.copies.iter().find(|c| c.member == to) else { continue };
                 if !self.up.contains(&copy.machine) {
                     let _ = g.r.report_unreachable(to);
+                    offline += 1;
                     continue;
                 }
                 let snapshot = m.msg_type == MessageType::MsgSnapshot;
@@ -568,6 +727,14 @@ impl Owner {
                 g.compacted = g.r.applied().index;
                 freed = true;
             }
+            if offline > 0 {
+                // A machine away misses its messages: the log sends them again once it's back.
+                metrics::sync().dropped.add(&[&repo.name, "message", "offline"], offline);
+            }
+            if !taken.is_empty() {
+                self.changed = true;
+                self.committed(&repo, taken, &arrived);
+            }
         }
         // Room in the shared log for any group stalled for it.
         if freed {
@@ -579,11 +746,189 @@ impl Owner {
             self.swept = Instant::now();
             self.sweep();
         }
-        if self.changed && self.viewed.elapsed() >= VIEW_EVERY {
-            self.changed = false;
-            self.viewed = Instant::now();
-            let view = self.make_view();
-            *lock(&self.view) = view;
+        if (self.changed && self.viewed.elapsed() >= VIEW_EVERY) || self.gauged.elapsed() >= GAUGE_EVERY {
+            self.publish();
+        }
+        if self.saved.elapsed() >= SAVE_EVERY {
+            self.save_activity();
+        }
+    }
+
+    /// Saves the repos' new activity.
+    fn save_activity(&mut self) {
+        self.saved = Instant::now();
+        if let Err(e) = lock(&self.activity).save(&self.dir) {
+            tracing::warn!(error = %e, "the synced repos' activity could not be saved");
+        }
+    }
+
+    /// Steps `repo`'s log committed, each with when it arrived (if the server saw it arrive): its
+    /// counts, latency, conflicts, and its event in the repo's activity.
+    fn committed(&mut self, repo: &Repo, taken: Vec<Taken>, arrived: &[Option<Instant>]) {
+        let m = metrics::sync();
+        let name = repo.name.as_str();
+        let on_record = self.recorded.get(&repo.id).copied().unwrap_or(0);
+        if let Some(last) = taken.last() {
+            self.recorded.insert(repo.id.clone(), on_record.max(last.index));
+        }
+        for (t, came) in taken.iter().zip(arrived) {
+            if t.index <= on_record {
+                continue;
+            }
+            let commit = came.map(|c| c.elapsed());
+            if let Some(d) = commit {
+                m.commit_seconds.observe(&[name], d.as_secs_f64());
+            }
+            let blobs = self.blobs.clone();
+            let step = activity::step_event(t.index, &t.step, &t.decisions, commit.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)), |hash| {
+                blobs.path(hash).and_then(|p| std::fs::metadata(p).ok()).map(|md| md.len())
+            });
+            m.steps_committed.inc(&[name]);
+            for (kind, n) in [("added", step.added), ("changed", step.changed), ("deleted", step.deleted)] {
+                if n > 0 {
+                    m.changes.add(&[name, kind], u64::try_from(n).unwrap_or(u64::MAX));
+                }
+            }
+            if step.conflicts > 0 {
+                m.conflicts.add(&[name], u64::try_from(step.conflicts).unwrap_or(u64::MAX));
+            }
+            if step.refused > 0 {
+                m.dropped.add(&[name, "change", "unsafe_path"], u64::try_from(step.refused).unwrap_or(u64::MAX));
+            }
+            for (c, d) in t.step.changes.iter().zip(&t.decisions) {
+                if let Decision::Beside(beside) = d {
+                    tracing::warn!(target: "kiln.sync", event = "sync.conflict", repo = %name, machine = %t.step.by, path = %c.path, beside = %beside.as_deref().unwrap_or(""), index = t.index, "another machine's change got there first: this one went beside it");
+                }
+            }
+            tracing::info!(target: "kiln.sync", event = "sync.step", repo = %name, machine = %t.step.by, index = t.index, added = step.added, changed = step.changed, deleted = step.deleted, conflicts = step.conflicts, bytes = step.bytes, commit_ms = step.commit_ms.unwrap_or(0), "a step committed");
+            let now = now_ms();
+            let s = self.stats_of(&repo.id);
+            s.steps += 1;
+            s.files += u64::try_from(step.added + step.changed + step.deleted).unwrap_or(u64::MAX);
+            s.bytes = s.bytes.saturating_add(step.bytes);
+            s.conflicts += u64::try_from(step.conflicts).unwrap_or(u64::MAX);
+            s.last_step = Some(now);
+            let tone = if step.conflicts > 0 { Tone::Warn } else { Tone::Info };
+            lock(&self.activity).push(Event { seq: 0, repo: repo.id.clone(), at: now, kind: Kind::Step, machine: t.step.by.clone(), text: String::new(), tone, step: Some(step), state: None });
+        }
+    }
+
+    /// The view the API shows, made again now; each copy's change of state noted; the gauges
+    /// measured.
+    fn publish(&mut self) {
+        self.changed = false;
+        self.viewed = Instant::now();
+        self.gauged = Instant::now();
+        let view = self.make_view();
+        self.watch(&view);
+        *lock(&self.view) = view;
+    }
+
+    /// Each copy's state, as the view has it: a change worth knowing of noted in its repo's
+    /// activity and logged (going offline and coming back, an error and getting over it; not the
+    /// coming and going of steps), and every copy's gauges set.
+    fn watch(&mut self, view: &View) {
+        let m = metrics::sync();
+        let (mut lag, mut unsent, mut waiting, mut state, mut age, mut conflicts) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut seen: HashSet<(String, u64)> = HashSet::new();
+        for r in &view.repos {
+            conflicts.push((vec![r.name.clone()], i64::try_from(r.conflicts.len()).unwrap_or(i64::MAX)));
+            for c in &r.copies {
+                let key = (r.id.clone(), c.member);
+                seen.insert(key.clone());
+                let labels = vec![r.name.clone(), c.machine.clone()];
+                let s = c.status.as_ref();
+                lag.push((labels.clone(), i64::try_from(c.lag).unwrap_or(i64::MAX)));
+                unsent.push((labels.clone(), s.map_or(0, |s| i64::try_from(s.unsent).unwrap_or(i64::MAX))));
+                waiting.push((labels.clone(), s.map_or(0, |s| i64::try_from(s.waiting).unwrap_or(i64::MAX))));
+                for st in STATES {
+                    state.push((vec![r.name.clone(), c.machine.clone(), st.replace(' ', "_")], i64::from(st == c.state)));
+                }
+                if let Some((at, _)) = self.heard_at.get(&key) {
+                    age.push((labels, i64::try_from(at.elapsed().as_secs()).unwrap_or(i64::MAX)));
+                }
+                let before = self.states.insert(key, c.state);
+                let gone = (r.id.clone(), c.machine.clone());
+                // Out of offline: news only for a copy noted going away, not one merely connecting.
+                let before = before.filter(|b| *b != "offline" || self.away.contains(&gone));
+                if let Some(text) = state_change(before, c.state, &c.machine, s.and_then(|s| s.error.as_deref())) {
+                    let tone = match c.state {
+                        "error" => Tone::Fail,
+                        "offline" => Tone::Warn,
+                        _ => Tone::Ok,
+                    };
+                    let from = before.unwrap_or("");
+                    if tone == Tone::Ok {
+                        tracing::info!(target: "kiln.sync", event = "sync.copy_state", repo = %r.name, machine = %c.machine, from = %from, to = %c.state, "{text}");
+                    } else {
+                        tracing::warn!(target: "kiln.sync", event = "sync.copy_state", repo = %r.name, machine = %c.machine, from = %from, to = %c.state, "{text}");
+                    }
+                    if c.state == "error" {
+                        self.stats_of(&r.id).errors += 1;
+                    }
+                    if c.state == "offline" {
+                        self.away.insert(gone);
+                    } else {
+                        self.away.remove(&gone);
+                    }
+                    lock(&self.activity).push(Event { seq: 0, repo: r.id.clone(), at: now_ms(), kind: Kind::State, machine: c.machine.clone(), text, tone, step: None, state: Some(c.state.to_owned()) });
+                }
+            }
+        }
+        // Copies no longer synced: forgotten.
+        self.states.retain(|k, _| seen.contains(k));
+        self.heard_at.retain(|k, _| seen.contains(k));
+        m.copy_lag_steps.replace(lag);
+        m.copy_unsent_steps.replace(unsent);
+        m.copy_waiting_blobs.replace(waiting);
+        m.copy_state.replace(state);
+        m.copy_heard_age.replace(age);
+        m.conflict_files.replace(conflicts);
+    }
+
+    /// The repo's name, as metrics and logs label it.
+    fn name_of(&self, repo: &str) -> String {
+        self.repos.iter().find(|r| r.id == repo).map_or_else(|| repo.to_owned(), |r| r.name.clone())
+    }
+
+    fn stats_of(&mut self, repo: &str) -> &mut RepoStats {
+        let since = self.started;
+        self.stats.entry(repo.to_owned()).or_insert_with(|| RepoStats { since, ..RepoStats::default() })
+    }
+
+    /// Something happened in `repo`: in its activity.
+    fn note(&self, repo: &str, kind: Kind, machine: &str, tone: Tone, text: String) {
+        lock(&self.activity).push(Event { seq: 0, repo: repo.to_owned(), at: now_ms(), kind, machine: machine.to_owned(), text, tone, step: None, state: None });
+    }
+
+    /// As [`Owner::note`], once in [`QUIET`] for the same trouble (`what`) from the same machine:
+    /// whether it was noted.
+    fn note_quietly(&mut self, repo: &str, kind: Kind, machine: &str, what: &'static str, tone: Tone, text: String) -> bool {
+        let key = (repo.to_owned(), machine.to_owned(), what);
+        if self.quiet.get(&key).is_some_and(|t| t.elapsed() < QUIET) {
+            return false;
+        }
+        if self.quiet.len() > 1024 {
+            self.quiet.retain(|_, t| t.elapsed() < QUIET);
+        }
+        self.quiet.insert(key, Instant::now());
+        self.note(repo, kind, machine, tone, text);
+        true
+    }
+
+    /// The server let go of a step or a message from `machine` (`what`) for `reason`: counted
+    /// always; noted and logged once in a while.
+    fn dropped(&mut self, repo: &str, machine: &str, what: &'static str, reason: &'static str, text: String) {
+        let name = self.name_of(repo);
+        metrics::sync().dropped.inc(&[&name, what, reason]);
+        if !self.repos.iter().any(|r| r.id == repo) {
+            return;
+        }
+        self.stats_of(repo).dropped += 1;
+        // Out of order or refused for now, it comes again: worth knowing, not alarming.
+        let tone = if matches!(reason, "out_of_order" | "stalled" | "budget") { Tone::Info } else { Tone::Warn };
+        if self.note_quietly(repo, Kind::Dropped, machine, reason, tone, text.clone()) {
+            tracing::warn!(target: "kiln.sync", event = "sync.dropped", repo = %name, machine = %machine, what, reason, "{text}");
         }
     }
 
@@ -626,6 +971,8 @@ impl Owner {
                 let id = repo.id.clone();
                 self.repos.push(repo);
                 self.save()?;
+                let on = if machines.is_empty() { "no copies yet".to_owned() } else { format!("copies on {}", machines.join(", ")) };
+                self.note(&id, Kind::Copy, "kiln", Tone::Info, format!("syncing started: {on}"));
                 for m in machines {
                     self.tell_copies(&m);
                 }
@@ -636,13 +983,13 @@ impl Owner {
                 let index = self.groups.get(&repo).map_or(0, |g| g.r.applied().index);
                 let r = self.repos.iter_mut().find(|r| r.id == repo).ok_or_else(|| anyhow::anyhow!("no such synced repo"))?;
                 let member = add_copy(r, &machine, &path)?;
-                if adopt
-                    && index > 0
-                    && let Some(c) = r.copies.iter_mut().find(|c| c.member == member)
-                {
+                let adopting = adopt && index > 0;
+                if adopting && let Some(c) = r.copies.iter_mut().find(|c| c.member == member) {
                     c.adopt = Some(index);
                 }
                 self.save()?;
+                let first = if adopting { ": it takes the repo's files first" } else { "" };
+                self.note(&repo, Kind::Copy, &machine, Tone::Info, format!("a copy added on {machine}, in {path}{first}"));
                 self.tell_copies(&machine);
                 Ok(member.to_string())
             }
@@ -650,8 +997,9 @@ impl Owner {
                 let r = self.repos.iter_mut().find(|r| r.id == repo).ok_or_else(|| anyhow::anyhow!("no such synced repo"))?;
                 let at = r.copies.iter().position(|c| c.member == member).ok_or_else(|| anyhow::anyhow!("no such copy"))?;
                 let copy = r.copies.remove(at);
-                self.statuses.remove(&(repo, member));
+                self.statuses.remove(&(repo.clone(), member));
                 self.save()?;
+                self.note(&repo, Kind::Copy, &copy.machine, Tone::Info, format!("the copy on {} was removed: its files stay in {}", copy.machine, copy.path));
                 self.tell_copies(&copy.machine);
                 Ok(String::new())
             }
@@ -663,6 +1011,10 @@ impl Owner {
                 disk::remove(&self.log, u128::from(r.group))?;
                 let _ = std::fs::remove_file(self.dir.join(format!("{}.tree.json", r.id)));
                 self.statuses.retain(|(id, _), _| *id != r.id);
+                lock(&self.activity).forget(&self.dir, &r.id);
+                self.stats.remove(&r.id);
+                self.away.retain(|(id, _)| *id != r.id);
+                self.recorded.remove(&r.id);
                 let machines: HashSet<String> = r.copies.iter().map(|c| c.machine.clone()).collect();
                 for m in machines {
                     self.tell_copies(&m);
@@ -676,19 +1028,22 @@ impl Owner {
                 let theirs = tree.files.get(&path).cloned();
                 let ours = tree.files.get(&beside).cloned();
                 let gone = Change { path: path.clone(), to: None, base: theirs.clone() };
-                let changes = match keep {
-                    Keep::Name => vec![gone],
-                    Keep::Copy => vec![Change { path: beside, to: theirs, base: ours }, gone],
+                let (changes, said) = match keep {
+                    Keep::Name => (vec![gone], format!("{beside} kept its version; the conflict copy {path} went")),
+                    Keep::Copy => (vec![Change { path: beside.clone(), to: theirs, base: ours }, gone], format!("{beside} took the conflict copy's version; {path} went")),
                     Keep::Both => {
                         let kept = path.replacen(".conflict-", ".kept-", 1);
-                        vec![Change { path: kept.clone(), to: theirs, base: tree.files.get(&kept).cloned() }, gone]
+                        let said = format!("both kept: {beside} as it was, and the conflict copy as {kept}");
+                        (vec![Change { path: kept.clone(), to: theirs, base: tree.files.get(&kept).cloned() }, gone], said)
                     }
                 };
                 let taken = tree.seqs.get(&SERVER).copied().unwrap_or(0);
                 let seq = g.next.get(&SERVER).copied().unwrap_or(0).max(taken.saturating_add(1));
                 let step = Step { by: "kiln".into(), member: SERVER, seq, at: now_ms(), changes };
                 g.r.propose(Vec::new(), group::entry(&step)).map_err(|e| anyhow::anyhow!("the repo's log would not take it now: {e:?}"))?;
+                g.arrived.insert((SERVER, seq), Instant::now());
                 g.next.insert(SERVER, seq.saturating_add(1));
+                self.note(&repo, Kind::Resolved, "kiln", Tone::Ok, format!("a conflict resolved: {said}"));
                 Ok(String::new())
             }
         }
@@ -738,7 +1093,9 @@ impl Owner {
                             Some(s) if s.unsent > 0 => "sending",
                             Some(_) => "in step",
                         };
-                        CopyView { member: c.member, machine: c.machine.clone(), path: c.path.clone(), added: c.added, state, status }
+                        let heard = self.heard_at.get(&(r.id.clone(), c.member)).map(|(_, ms)| *ms);
+                        let lag = status.as_ref().map_or(0, |s| index.saturating_sub(s.applied));
+                        CopyView { member: c.member, machine: c.machine.clone(), path: c.path.clone(), added: c.added, state, status, heard, lag }
                     })
                     .collect();
                 RepoView {
@@ -755,11 +1112,53 @@ impl Owner {
                         Some(g) => g.error.clone(),
                     },
                     transient: r.transient.clone(),
+                    stats: self.stats.get(&r.id).cloned().unwrap_or_else(|| RepoStats { since: self.started, ..RepoStats::default() }),
                 }
             })
             .collect();
         View { repos, error: None }
     }
+}
+
+/// A refusal of a repo's log, as the metrics' `reason` names it.
+fn why(e: &ReplicaError) -> &'static str {
+    match e {
+        ReplicaError::Refused(_) => "refused",
+        ReplicaError::Stalled => "stalled",
+        ReplicaError::Marked => "marked",
+        ReplicaError::Budget(_) => "budget",
+        ReplicaError::Fenced(_) => "fenced",
+    }
+}
+
+/// A copy's change of state worth noting, in words: going offline and coming back, an error and
+/// getting over it. Not a copy first seen, nor the coming and going of steps.
+fn state_change(before: Option<&str>, now: &str, machine: &str, error: Option<&str>) -> Option<String> {
+    let before = before?;
+    if before == now {
+        return None;
+    }
+    match (before, now) {
+        (_, "offline") => Some(format!("{machine} went offline: its copy takes what it missed once it's back")),
+        (_, "error") => Some(format!("{machine}'s copy has an error: {}", error.unwrap_or("it didn't say what"))),
+        ("offline", _) => Some(format!("{machine} is back ({now})")),
+        ("error", _) => Some(format!("{machine}'s copy is over its error ({now})")),
+        _ => None,
+    }
+}
+
+/// Milliseconds, as a person reads them.
+fn secs_text(ms: u64) -> String {
+    match ms {
+        0..1_000 => format!("{ms} ms"),
+        1_000..60_000 => format!("{:.1} s", Duration::from_millis(ms).as_secs_f64()),
+        _ => format!("{} min {} s", ms / 60_000, (ms % 60_000) / 1_000),
+    }
+}
+
+/// An id's first characters, as the activity names a session.
+fn short(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 /// Adds a copy at `path` on `machine` to `repo`: its member.
@@ -783,6 +1182,80 @@ impl std::fmt::Debug for Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `f` comes to hold within ten seconds.
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_committed_step_shows_with_its_files_and_a_stray_one_as_let_go() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sync = Sync::start(dir.path().join("sync"), "key".into());
+        let name = "activity-test";
+        let create = Ask::Create { name: name.into(), copies: vec![("mac".into(), "/src/kiln".into()), ("box".into(), "/src/kiln".into())], exclude: Vec::new(), transient: None };
+        let id = futures::executor::block_on(sync.ask(create)).map_err(anyhow::Error::msg)?;
+        let hash = sync.blobs().ok_or_else(|| anyhow::anyhow!("sync is off"))?.put_bytes(b"hello")?;
+        let step = Step { by: String::new(), member: 2, seq: 1, at: now_ms(), changes: vec![Change { path: "src/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None }] };
+        // From a machine with no copy of it: let go.
+        sync.from_runner("elsewhere", Msg::Steps { repo: id.clone(), steps: vec![step.clone()] }, Vec::new());
+        // Sent again until taken, as a runner does.
+        let shown = eventually(|| {
+            sync.from_runner("mac", Msg::Steps { repo: id.clone(), steps: vec![step.clone()] }, Vec::new());
+            sync.activity(0, Some(&id), 50).0.iter().any(|e| e.kind == Kind::Step)
+        });
+        anyhow::ensure!(shown, "the step shows in the activity");
+        let (events, next) = sync.activity(0, Some(&id), 50);
+        let e = events.iter().find(|e| e.kind == Kind::Step).ok_or_else(|| anyhow::anyhow!("no step"))?;
+        let s = e.step.as_ref().ok_or_else(|| anyhow::anyhow!("a step event without its step"))?;
+        assert_eq!(e.machine, "mac", "the machine that made it");
+        assert_eq!((s.added, s.changed, s.deleted, s.bytes), (1, 0, 0, 5));
+        assert_eq!(s.files.first().map(|f| (f.path.as_str(), f.size)), Some(("src/a.txt", Some(5))));
+        assert!(s.commit_ms.is_some(), "its commit was timed");
+        assert!(events.iter().any(|e| e.kind == Kind::Dropped && e.machine == "elsewhere"), "the stray step is noted: {events:?}");
+        assert!(events.iter().any(|e| e.kind == Kind::Copy), "the start is noted");
+        assert!(next > e.seq);
+        assert!(sync.activity(next, None, 50).0.is_empty(), "nothing after the newest");
+        let counted = eventually(|| sync.view().repos.iter().any(|r| r.id == id && r.stats.steps == 1 && r.stats.files == 1 && r.stats.dropped >= 1));
+        anyhow::ensure!(counted, "the view counts them: {:?}", sync.view().repos.first().map(|r| r.stats.clone()));
+        let text = crate::metrics::render();
+        assert!(text.contains(&format!("kiln_sync_steps_committed_total{{repo=\"{name}\"}} 1")), "committed");
+        assert!(text.contains(&format!("kiln_sync_changes_total{{repo=\"{name}\",kind=\"added\"}} 1")), "its change");
+        assert!(text.contains(&format!("kiln_sync_dropped_total{{repo=\"{name}\",what=\"step\",reason=\"not_member\"}} 1")), "the stray step");
+        assert!(text.contains(&format!("kiln_sync_commit_seconds_count{{repo=\"{name}\"}} 1")), "its commit timed");
+        // No runner is connected: each copy is offline, and every other state reads 0.
+        let states = eventually(|| {
+            let t = crate::metrics::render();
+            t.contains(&format!("kiln_sync_copy_state{{repo=\"{name}\",machine=\"mac\",state=\"offline\"}} 1")) && t.contains(&format!("kiln_sync_copy_state{{repo=\"{name}\",machine=\"mac\",state=\"in_step\"}} 0"))
+        });
+        anyhow::ensure!(states, "every state of each copy, 1 for the one it's in");
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_copy_going_away_or_wrong_and_coming_back_is_news() {
+        assert_eq!(state_change(None, "offline", "mac", None), None, "first seen");
+        assert_eq!(state_change(Some("in step"), "sending", "mac", None), None, "steps coming and going");
+        assert_eq!(state_change(Some("catching up"), "in step", "mac", None), None);
+        assert!(state_change(Some("in step"), "offline", "mac", None).is_some_and(|t| t.contains("went offline")));
+        assert!(state_change(Some("offline"), "catching up", "mac", None).is_some_and(|t| t.contains("back")));
+        assert!(state_change(Some("in step"), "error", "mac", Some("disk full")).is_some_and(|t| t.contains("disk full")));
+        assert!(state_change(Some("error"), "in step", "mac", None).is_some_and(|t| t.contains("over its error")));
+    }
+
+    #[test]
+    fn waits_read_as_a_person_says_them() {
+        assert_eq!(secs_text(340), "340 ms");
+        assert_eq!(secs_text(2_500), "2.5 s");
+        assert_eq!(secs_text(125_000), "2 min 5 s");
+    }
 
     #[test]
     fn a_copy_is_a_full_path_on_a_named_machine() {

@@ -19,6 +19,9 @@
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
 //! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
 //! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment |
+//! | `GET /apps/{app}/environments/{env}/secrets`; `PUT`, `DELETE …/secrets/{name}` (`?release=false`) | an app's secrets there (§3.5): names and versions; a value is set (`{value}` or `{base64}`), never read back; a change is released |
+//! | `GET …/secrets/{name}/versions`, `GET …/secret-uses?limit` | a secret's versions; each read of the secrets for a delivery |
+//! | `POST /secret-keys/rotate` | every app's secrets re-sealed under a new data key |
 //!
 //! A release, rollback or cancel asked for with an `Idempotency-Key` header (or
 //! `idempotency_key`) is the same one when asked for again.
@@ -33,10 +36,11 @@ use hyper::body::Incoming;
 use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
-use super::model::{App, Environment, State, Template};
+use super::model::{App, Environment, Release, State, Template};
 use super::{Deploy, argocd, kilncd, reads, store};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
+use crate::secrets::{self, Scope};
 
 const LIMIT: usize = 4 << 20;
 
@@ -204,6 +208,25 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             ok(&boxed(|| reads::read(&d, &a, &environment, read)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": boxed(|| versions(&d, app, env)).await? })),
+        (&Method::GET, ["apps", app, "environments", env, "secrets"]) => ok(&boxed(|| secrets_list(&d, &who, app, env)).await?),
+        (&Method::PUT, ["apps", app, "environments", env, "secrets", name]) => {
+            let value = secret_value(req.into_body()).await?;
+            let how = Change::of(q);
+            ok(&boxed(|| secret_put(&d, &who, app, env, name, value, how)).await?)
+        }
+        (&Method::DELETE, ["apps", app, "environments", env, "secrets", name]) => {
+            let how = Change::of(q);
+            ok(&boxed(|| secret_delete(&d, &who, app, env, name, how)).await?)
+        }
+        (&Method::GET, ["apps", app, "environments", env, "secrets", name, "versions"]) => ok(&boxed(|| secret_versions(&d, &who, app, env, name)).await?),
+        (&Method::POST, ["secret-keys", "rotate"]) => {
+            let n = secrets::of(&d.hub).rotate(&caller(&who)).await.map_err(refused)?;
+            ok(&json!({ "resealed": n }))
+        }
+        (&Method::GET, ["apps", app, "environments", env, "secret-uses"]) => {
+            let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+            ok(&boxed(|| secret_uses(&d, &who, app, env, limit)).await?)
+        }
         (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": boxed(|| flow::candidates(&d, app, env)).await? })),
 
         (&Method::GET, ["releases"]) => {
@@ -343,4 +366,229 @@ pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Resul
         }
     };
     Ok(json!({ "registration": reg, "running": running, "in_flight": in_flight, "releases": recent, "provider": provider }))
+}
+
+/// An app's secrets in an environment (§3.5) belong to an app and an environment that are there.
+async fn secret_scope(d: &Deploy, app: &str, env: &str) -> Result<Scope, Fail> {
+    store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    Ok(Scope::of(app, env))
+}
+
+fn caller(who: &Who) -> secrets::Caller {
+    secrets::Caller { name: who.name.clone(), agent: who.agent }
+}
+
+fn refused(r: secrets::Refused) -> Fail {
+    match r {
+        secrets::Refused::Bad(m) => (StatusCode::BAD_REQUEST, m),
+        secrets::Refused::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+        secrets::Refused::Missing(m) => (StatusCode::NOT_FOUND, m),
+        secrets::Refused::Failed(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+    }
+}
+
+/// A secret's value as sent: `{value}` (text) or `{base64}` (bytes). What doesn't read is refused
+/// without saying what it was, which may be the value.
+async fn secret_value(body: Incoming) -> Result<secrets::Value, Fail> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Put {
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        base64: Option<String>,
+    }
+    let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
+    let put: Put = serde_json::from_slice(&bytes).map_err(|_| bad("a secret is set with `{\"value\": \"…\"}`, or `{\"base64\": \"…\"}` for bytes"))?;
+    match (put.value, put.base64) {
+        (Some(v), None) => Ok(secrets::Value::new(v.into_bytes())),
+        (None, Some(b)) => {
+            use base64::Engine as _;
+            let v = base64::engine::general_purpose::STANDARD.decode(b.trim()).map_err(|_| bad("`base64` isn't base64"))?;
+            Ok(secrets::Value::new(v))
+        }
+        _ => Err(bad("a secret is set with `value` or `base64`: one of them")),
+    }
+}
+
+/// The secrets of an app in an environment: names, versions, who set each and when; never values.
+pub(super) async fn secrets_list(d: &Deploy, who: &Who, app: &str, env: &str) -> Result<Value, Fail> {
+    let at = secret_scope(d, app, env).await?;
+    let service = secrets::of(&d.hub);
+    let list = service.list(&at, &caller(who)).await.map_err(refused)?;
+    Ok(json!({ "app": app, "environment": env, "backend": service.backend_name(), "secrets": list }))
+}
+
+/// Sets a secret's next version, and releases it unless `release` is false: the version, and the
+/// release that delivers it (made, or joined) with what happens next.
+async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, how: Change) -> Result<Value, Fail> {
+    let at = secret_scope(d, app, env).await?;
+    let meta = secrets::of(&d.hub).put(&at, name, value, &caller(who)).await.map_err(refused)?;
+    let (release, next) = released(d, who, app, env, format!("{name} v{}", meta.version), how).await;
+    let mut v = serde_json::to_value(&meta).map_err(|e| internal(e.into()))?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("release".into(), json!(release));
+        o.insert("next".into(), json!(next));
+    }
+    Ok(v)
+}
+
+async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, how: Change) -> Result<Value, Fail> {
+    let at = secret_scope(d, app, env).await?;
+    secrets::of(&d.hub).delete(&at, name, &caller(who)).await.map_err(refused)?;
+    let (release, next) = released(d, who, app, env, format!("{name} deleted"), how).await;
+    Ok(json!({ "name": name, "deleted": true, "release": release, "next": next }))
+}
+
+/// A secret's change on its way to what runs (§3.5): a secrets release, when something runs there
+/// on KilnCD to take it; a release still waiting takes it instead, as it commits (and says so, for
+/// whoever approves it). The release, and what happens next in words.
+/// How a secret's change goes out: `?release=false` keeps it for a later release, `?revert=false`
+/// asks that the release delivering it isn't reverted if it fails (a rotation after a leak: a
+/// revert would deliver the old value again).
+#[derive(Debug, Clone, Copy)]
+struct Change {
+    release: bool,
+    revert: bool,
+}
+
+impl Change {
+    fn of(q: &HashMap<String, String>) -> Change {
+        let yes = |k: &str| q.get(k).is_none_or(|v| v != "false" && v != "0");
+        Change { release: yes("release"), revert: yes("revert") }
+    }
+}
+
+async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how: Change) -> (Option<Release>, String) {
+    let st = &d.hub.store;
+    let later = format!("release it with `kiln deploy {app} --to {env} --secrets`");
+    if !how.release {
+        return (None, format!("not released: {later}"));
+    }
+    match store::environment(st, env).await {
+        Ok(Some(e)) if e.provider.starts_with("argocd/") => return (None, "kept: Argo CD can't take secrets from kiln yet".to_owned()),
+        Ok(_) => {}
+        Err(e) => return (None, format!("not released ({e:#}): {later}")),
+    }
+    match store::registration(st, app, env).await {
+        Ok(Some(reg)) if reg.running.is_some() => {}
+        Ok(_) => return (None, format!("nothing of {app} runs in {env} yet: its first release there delivers it")),
+        Err(e) => return (None, format!("not released ({e:#}): {later}")),
+    }
+    if let Ok(Some(mut r)) = store::newest_in_flight(st, app, env).await
+        && matches!(r.state, State::Waiting | State::WaitingApproval)
+    {
+        let was = r.state;
+        r.secrets = Some(r.secrets.take().map_or_else(|| what.clone(), |s| format!("{s}, {what}")));
+        // A change that mustn't come back makes the release delivering it one not reverted.
+        r.no_revert |= !how.revert;
+        if store::update_release(st, &r, was).await.unwrap_or(false) {
+            flow::emit_release(d, &r);
+            let id = r.id;
+            return (Some(r), format!("release {id}, waiting, delivers it as it goes"));
+        }
+    }
+    let ask = Ask { app: app.to_owned(), environment: env.to_owned(), secrets: Some(what), no_revert: !how.revert, ..Ask::default() };
+    match flow::release(d, who, ask).await {
+        Ok(r) => {
+            let id = r.id;
+            (Some(r), format!("release {id} delivers it"))
+        }
+        Err((_, why)) => (None, format!("not released ({why}): {later}")),
+    }
+}
+
+async fn secret_versions(d: &Deploy, who: &Who, app: &str, env: &str, name: &str) -> Result<Value, Fail> {
+    let at = secret_scope(d, app, env).await?;
+    let versions = secrets::of(&d.hub).versions(&at, name, &caller(who)).await.map_err(refused)?;
+    Ok(json!({ "name": name, "versions": versions }))
+}
+
+async fn secret_uses(d: &Deploy, who: &Who, app: &str, env: &str, limit: usize) -> Result<Value, Fail> {
+    let at = secret_scope(d, app, env).await?;
+    let reads = secrets::of(&d.hub).reads(&at, limit, &caller(who)).await.map_err(refused)?;
+    Ok(json!({ "reads": reads }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deploy::model::{AgentPolicy, Contacts, KILNCD, Kind, Package, Registration};
+
+    fn env(name: &str, provider: &str) -> Environment {
+        Environment {
+            name: name.into(),
+            provider: provider.into(),
+            release_repo: Default::default(),
+            targets: Default::default(),
+            gates: Default::default(),
+            sync: Default::default(),
+            watch: Default::default(),
+            concurrency: Default::default(),
+            agents: AgentPolicy::default(),
+        }
+    }
+
+    /// Sets a secret as a person would over the API: what the answer says.
+    async fn set(d: &Deploy, env: &str, name: &str, release: bool) -> anyhow::Result<Value> {
+        let ada = Who { name: "ada".into(), agent: false };
+        secret_put(d, &ada, "web", env, name, secrets::Value::new(b"value".to_vec()), Change { release, revert: true }).await.map_err(|(code, m)| anyhow::anyhow!("{code}: {m}"))
+    }
+
+    fn next(v: &Value) -> &str {
+        v.get("next").and_then(Value::as_str).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_secrets_change_is_released_where_something_runs_or_joins_a_release_still_waiting() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), hub: Arc::clone(&hub) };
+            let st = &hub.store;
+            store::put_environment(st, &env("staging", KILNCD)).await?;
+            store::put_environment(st, &env("argo", "argocd/prod")).await?;
+            let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+            let web = App {
+                name: "web".into(),
+                project: "shop".into(),
+                owners: vec!["payments".into()],
+                package,
+                namespace: None,
+                properties: Default::default(),
+                template: None,
+                contacts: Contacts::default(),
+                source: None,
+                archived: false,
+            };
+            store::put_app(st, &web).await?;
+
+            // Nothing runs there yet: kept, for the first release to deliver.
+            let v = set(&d, "staging", "DB_PASSWORD", true).await?;
+            anyhow::ensure!(v.get("version") == Some(&json!(1)) && v.get("release") == Some(&Value::Null) && next(&v).contains("first release"), "{v}");
+
+            // Something runs: a secrets release, through the environment's gates.
+            store::put_registration(st, &Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: Some(1), created_at: 0, degraded: None }).await?;
+            let v = set(&d, "staging", "DB_PASSWORD", true).await?;
+            let r: Release = serde_json::from_value(v.get("release").cloned().unwrap_or_default())?;
+            anyhow::ensure!(r.kind == Kind::Config && r.values.is_none() && r.secrets.as_deref() == Some("DB_PASSWORD v2") && r.state == State::Committing, "{r:?}");
+
+            // While it commits, another change can't join it, and the environment takes one release at a time.
+            let v = set(&d, "staging", "API_KEY", true).await?;
+            anyhow::ensure!(v.get("release") == Some(&Value::Null) && next(&v).contains("in flight") && next(&v).contains("--secrets"), "{v}");
+
+            // One still waiting takes changes on, and says so.
+            let mut waiting = r.clone();
+            waiting.state = State::Waiting;
+            anyhow::ensure!(store::update_release(st, &waiting, State::Committing).await?);
+            let v = set(&d, "staging", "API_KEY", true).await?;
+            anyhow::ensure!(v.pointer("/release/id") == Some(&json!(r.id)) && v.pointer("/release/secrets") == Some(&json!("DB_PASSWORD v2, API_KEY v2")), "{v}");
+
+            // Kept without releasing, when asked; and where Argo CD deploys, which can't take them yet.
+            anyhow::ensure!(next(&set(&d, "staging", "OTHER", false).await?).starts_with("not released"));
+            anyhow::ensure!(next(&set(&d, "argo", "DB_PASSWORD", true).await?).contains("Argo CD"));
+            Ok(())
+        })
+    }
 }

@@ -4,6 +4,7 @@
 
 pub mod actions;
 pub mod api;
+pub mod attach;
 pub mod attest;
 pub mod bench;
 pub mod cd_events;

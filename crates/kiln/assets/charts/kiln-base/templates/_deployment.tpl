@@ -11,10 +11,13 @@ spec:
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   revisionHistoryLimit: 5
-  {{- with .Values.strategy }}
+  {{- /* No old pod goes before a new one is ready: a version that can't start costs no capacity,
+         and what ran before still serves while the release fails and is put back. */}}
   strategy:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- toYaml (.Values.strategy | default (dict "type" "RollingUpdate" "rollingUpdate" (dict "maxUnavailable" 0 "maxSurge" "25%"))) | nindent 4 }}
+  {{- /* No new pod ready for this long: Kubernetes calls the rollout stuck (Degraded), and kiln
+         fails the release on it (docs/deploy-api.md §8.1). */}}
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds | default 300 }}
   selector:
     matchLabels:
       {{- include "kiln-base.selectorLabels" . | nindent 6 }}

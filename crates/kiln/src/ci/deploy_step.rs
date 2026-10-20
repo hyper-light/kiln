@@ -117,6 +117,8 @@ async fn create(hub: &Arc<Hub>, leg: &str, repo_id: &str, req: Request) -> Resul
         promote_from: None,
         keep: false,
         idempotency_key: Some(format!("ci:{leg}:{}:{app}:{}", ask.attempt, ask.environment)),
+        secrets: None,
+        no_revert: false,
     };
     match crate::deploy::flow::release(&d, &who, flow_ask).await {
         Ok(r) => Ok(srv::json(StatusCode::CREATED, &release_json(&r))),

@@ -364,6 +364,146 @@ export interface SystemInfo {
   config: Record<string, unknown>;
 }
 
+/** What a conversation store's writer last saw of its file (docs/conversations.md, "Telemetry"). Times are unix ms. */
+export interface ConvoFile {
+  at: number;
+  bytes: number;
+  /** The part of the file free for what comes next. */
+  free: number;
+  wal: number;
+  /** Its last write number: how many writes it has had. */
+  top: number;
+  /** When it last saw `top` change (0: not since its kiln started). */
+  wrote_at: number;
+  sessions?: number;
+  upkeep: ConvoUpkeep;
+  compacted?: { at: number; before: number; after: number; ms: number };
+  pruned?: { at: number; lines: number };
+}
+
+/** What a store does to its file while it has nothing else to do. */
+export type ConvoUpkeep =
+  | { state: "idle" }
+  | { state: "squeezing" }
+  | { state: "pruning"; lines: number }
+  | { state: "compacting"; phase: "copy" | "catch_up" | "count" | "swap"; table?: string; copied: number; of: number; began: number };
+
+/** A store's counters since its kiln started, and its file. */
+export interface ConvoStoreReport {
+  id: string;
+  commits: number;
+  rows: number;
+  jobs: number;
+  busy_ms: number;
+  dropped: number;
+  timeouts: number;
+  /** Reads by how long they waited: under 1 ms, 2, 4, … ms. */
+  waits: number[];
+  file: ConvoFile;
+}
+
+/** Where a feed's sending side stands. */
+export interface ConvoShip {
+  up: boolean;
+  acked: number | null;
+  sent: number;
+  flight: number;
+  batches: number;
+  rows: number;
+  bytes: number;
+  last_sent: number | null;
+  last_ack: number | null;
+  hellos: number;
+  stalls: number;
+}
+
+/** Where the server's side of a runner's feed stands. */
+export interface ConvoPeer {
+  machine: string;
+  store: string;
+  rev: number;
+  hello_at: number;
+  batches: number;
+  rows: number;
+  fenced: number;
+  left: number;
+  bytes: number;
+  gaps: number;
+  errors: number;
+  last_batch: number;
+  take_ms: number;
+  copy?: boolean;
+}
+
+export type ConvoState = "live" | "in_sync" | "catching_up" | "behind" | "offline" | "feeding" | "no_store";
+
+/** One conversation store as the server's board shows it: its own, a runner's, or a mirror's copy. */
+export interface ConvoStore {
+  /** `server`, `<machine>/<store>`, `mirror:<machine>`, or `<machine>/` (a machine that keeps none). */
+  key: string;
+  role: "server" | "runner" | "mirror";
+  machine: string;
+  id: string | null;
+  version: string | null;
+  connected: boolean;
+  state: ConvoState;
+  heard: number | null;
+  report: ConvoStoreReport | null;
+  feed?: { rev: number; top: number | null; behind: number | null; at: number; intake: ConvoPeer | null; ship: ConvoShip | null };
+  mirror?: { chosen_at: number; last_seen: number; ship: ConvoShip; behind: number | null };
+  /** Per second over the last minute; `busy` 0–1. */
+  rates: { writes: number | null; batches: number | null; wire: number | null; busy: number | null };
+  /** Writes per second over the last ten minutes. */
+  spark: (number | null)[];
+}
+
+export interface ConvoNote {
+  at: number;
+  key: string;
+  level: "info" | "warn" | "error";
+  text: string;
+}
+
+export type ConvoRestore =
+  | { state: "idle" }
+  | { state: "asked"; from: string; at: number }
+  | { state: "copying"; from: string; store: string; at: number }
+  | { state: "done"; from: string; sessions: number; at: number }
+  | { state: "failed"; from: string; error: string; at: number };
+
+/** `GET /api/conversations/status`. */
+export interface ConvoStatus {
+  at: number;
+  on: boolean;
+  mirrors_wanted: number;
+  restore: ConvoRestore;
+  stores: ConvoStore[];
+  /** Newest first. */
+  notes: ConvoNote[];
+}
+
+/** `GET /api/conversations/series`: one store's series, a column each; `t` in unix seconds. */
+export interface ConvoSeries {
+  key: string;
+  step: number;
+  t: number[];
+  bytes: (number | null)[];
+  free: (number | null)[];
+  wal: (number | null)[];
+  sessions: (number | null)[];
+  writes: (number | null)[];
+  commits: (number | null)[];
+  busy: (number | null)[];
+  p50: (number | null)[];
+  p99: (number | null)[];
+  timeouts: (number | null)[];
+  dropped: (number | null)[];
+  behind: (number | null)[];
+  batches: (number | null)[];
+  wire: (number | null)[];
+  up: number[];
+}
+
 /** A row of the audit log (docs/ci.md W19-R05). `actor` is v1's: the principal, and for whom. */
 export interface AuditEntry {
   id: number;
@@ -1432,6 +1572,28 @@ export interface SyncCopyStatus {
   looked?: boolean;
   /** It waits to take the group's files (a folder kiln just cloned). */
   adopting?: boolean;
+  /** The contents it moved with the server since its runner started (older runners: none). */
+  traffic?: SyncTraffic;
+  /** How long the last change from another machine took to reach its folder, in ms. */
+  lag_ms?: number | null;
+}
+
+/** What a copy moved with the server since its runner started. */
+export interface SyncTraffic {
+  sent: number;
+  sent_bytes: number;
+  fetched: number;
+  fetched_bytes: number;
+  /** Transfers that failed, and those tried again after. */
+  failed: number;
+  retried: number;
+  /** Contents the server no longer had: versions later steps replaced. */
+  gone: number;
+  /** Steps sent again, the log not having brought them back yet. */
+  resent: number;
+  last_failure: string | null;
+  /** Unix seconds. */
+  failed_at: number;
 }
 
 export type SyncCopyState = "in step" | "catching up" | "fetching" | "sending" | "starting" | "offline" | "error";
@@ -1443,6 +1605,10 @@ export interface SyncCopy {
   added: number;
   state: SyncCopyState;
   status: SyncCopyStatus | null;
+  /** When the server last heard how it is (unix ms). */
+  heard?: number | null;
+  /** Log entries its folder hasn't taken yet. */
+  lag?: number;
 }
 
 export interface SyncConflict {
@@ -1464,6 +1630,76 @@ export interface SyncRepo {
   error: string | null;
   /** Synced only while a move is under way (that task's batch). */
   transient?: string | null;
+  /** What its sync did since the server started (older servers: none). */
+  stats?: SyncStats;
+}
+
+/** What a repo's sync did since the server started (`since`, unix ms). */
+export interface SyncStats {
+  since: number;
+  steps: number;
+  files: number;
+  bytes: number;
+  conflicts: number;
+  dropped: number;
+  retries: number;
+  errors: number;
+  /** When the newest step was committed (unix ms). */
+  last_step: number | null;
+}
+
+export type SyncEventKind = "step" | "copy" | "state" | "error" | "dropped" | "retry" | "resolved" | "move";
+export type SyncTone = "info" | "ok" | "warn" | "fail";
+
+/** One of a committed step's changes. */
+export interface SyncFileEvent {
+  path: string;
+  kind: "added" | "changed" | "deleted";
+  /** What the log did with it. */
+  outcome: "taken" | "same" | "conflict" | "refused";
+  size?: number;
+  /** A conflict: the name its version went under beside the path. */
+  beside?: string;
+  link?: boolean;
+}
+
+/** A step the log committed. */
+export interface SyncStepEvent {
+  /** Its log index: a copy whose `applied` is this far has it. */
+  index: number;
+  /** When its machine looked and saw the changes (unix ms, that machine's clock). */
+  seen: number;
+  /** From its arrival at the server to its commit (ms). */
+  commit_ms: number | null;
+  /** The first 40 of its changes. */
+  files: SyncFileEvent[];
+  added: number;
+  changed: number;
+  deleted: number;
+  conflicts: number;
+  refused: number;
+  bytes: number;
+}
+
+/** Something that happened in a synced repo (GET /api/sync/activity). */
+export interface SyncEvent {
+  seq: number;
+  repo: string;
+  /** Unix ms, the server's clock. */
+  at: number;
+  kind: SyncEventKind;
+  /** The machine it's about: a step's maker ("kiln" for the server's own). */
+  machine: string;
+  text?: string;
+  tone: SyncTone;
+  step?: SyncStepEvent;
+}
+
+export interface SyncActivity {
+  /** Newest first. */
+  events: SyncEvent[];
+  /** The number the next event gets: ask `since` it for what's new. */
+  next: number;
 }
 
 export interface SyncView {

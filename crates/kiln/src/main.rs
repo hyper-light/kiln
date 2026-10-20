@@ -1,6 +1,8 @@
 //! The single kiln binary: server, agent, supervisor, installer and CLI.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -445,6 +447,13 @@ fn main() -> ExitCode {
     }
 }
 
+/// A future made and boxed in a frame of its own (as `kiln::api` boxes its handlers): a debug
+/// build gave `real_main` a stack slot for every command's future it awaited inline, 1.3 MiB of a
+/// shard's 2 MiB before the server had started.
+fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>> {
+    Box::pin(make())
+}
+
 async fn real_main(cli: Cli) -> anyhow::Result<()> {
     let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
     // Make the resolved config path visible to children (supervise → server).
@@ -465,7 +474,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
             shutdown_on_signals(shutdown.clone());
-            kiln::server::run(cfg, shutdown).await
+            boxed(|| kiln::server::run(cfg, shutdown)).await
         }
         Cmd::Agent(a) => {
             // What the supervisor handed this process (its handover channel), before anything
@@ -499,21 +508,22 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                     Some(s) => s,
                     None => {
                         tracing::info!("not enrolled yet: looking for kiln servers on this network");
-                        let found = kiln::join::servers_in(&ann.table, std::time::Duration::from_secs(5)).await;
+                        let found = boxed(|| kiln::join::servers_in(&ann.table, std::time::Duration::from_secs(5))).await;
                         let interactive = kiln::join::interactive();
                         if found.len() == 1 || (found.len() > 1 && interactive) {
-                            kiln::join::choose(found, true, interactive, &shutdown).await?
+                            boxed(|| kiln::join::choose(found, true, interactive, &shutdown)).await?
                         } else {
                             // No server yet, or several and nobody to ask: wait until one invites
                             // this machine (or, never having heard more than one, the only one).
                             let say = |m: &str| tracing::info!("{m}");
-                            kiln::discovery::invite::wait_for_invitation(&ann.table, &ann.id(), true, &shutdown, &say).await?
+                            let id = ann.id();
+                            boxed(|| kiln::discovery::invite::wait_for_invitation(&ann.table, &id, true, &shutdown, &say)).await?
                         }
                     }
                 };
                 let me = kiln::join::Machine::this(name.clone(), &a.labels);
                 let say = |m: &str| tracing::info!("{m}");
-                let joined = kiln::join::request(&url, &me, &state_dir, &say, &shutdown).await?;
+                let joined = boxed(|| kiln::join::request(&url, &me, &state_dir, &say, &shutdown)).await?;
                 ann.enrolled(&joined.ca_der);
                 server = Some(joined.server);
                 quic = Some(joined.quic);
@@ -543,9 +553,9 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 // `[agent.facts]` and `[agent.probes]` of its config file (docs/ci.md W13-R02).
                 declared: kiln::runner::probe::Declared::from_file(&config_path),
             };
-            let result = run_agent(opts, shutdown).await;
+            let result = boxed(|| run_agent(opts, shutdown)).await;
             if let Some(ann) = announcer {
-                ann.finish().await;
+                boxed(|| ann.finish()).await;
             }
             result
         }
@@ -561,7 +571,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             // after comparing the code); the certificate it gets is kept for the next time.
             if !enrolled && token.is_none() {
                 let me = kiln::join::Machine::this(Some(name.clone()), &[kiln::proto::OUTPOST_LABEL.to_owned()]);
-                let joined = kiln::join::request(&a.server, &me, &state_dir, &kiln::join::say_stderr, &shutdown).await?;
+                let joined = boxed(|| kiln::join::request(&a.server, &me, &state_dir, &kiln::join::say_stderr, &shutdown)).await?;
                 name = joined.name;
             }
             let opts = kiln::agent::Opts {
@@ -586,7 +596,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 outpost: true,
                 declared: kiln::runner::probe::Declared::default(),
             };
-            run_agent(opts, shutdown).await
+            boxed(|| run_agent(opts, shutdown)).await
         }
         Cmd::Join(mut j) => {
             shutdown_on_signals(shutdown.clone());
@@ -594,17 +604,17 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             let mut waiting = None;
             if j.server.is_none() {
                 let cfg = config::Config::load(&config_path).unwrap_or_default();
-                if let Some((url, w)) = kiln::discovery::invite::server_for_join(&j, &cfg.discovery, &shutdown).await? {
+                if let Some((url, w)) = boxed(|| kiln::discovery::invite::server_for_join(&j, &cfg.discovery, &shutdown)).await? {
                     j.server = Some(url);
                     waiting = w;
                 }
             }
-            let joined = kiln::join::cli(j, shutdown.clone()).await;
+            let joined = boxed(|| kiln::join::cli(j, shutdown.clone())).await;
             if let Some(w) = waiting {
-                w.end().await;
+                boxed(|| w.end()).await;
             }
             match joined? {
-                Some(opts) => run_agent(opts, shutdown).await,
+                Some(opts) => boxed(|| run_agent(opts, shutdown)).await,
                 None => Ok(()),
             }
         }
@@ -623,21 +633,21 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             if detach {
                 return supervise::detach(&args, &state_dir, exe.as_deref());
             }
-            supervise::run(supervise::Options { args, state_dir, exe }).await
+            boxed(|| supervise::run(supervise::Options { args, state_dir, exe })).await
         }
         Cmd::Up => {
             let cfg = config::Config::load(&config_path)?;
             // A machine that never ran a server may rather join the one already on the network.
-            if kiln::join::offer_instead_of_server(&config_path, &cfg).await? {
+            if boxed(|| kiln::join::offer_instead_of_server(&config_path, &cfg)).await? {
                 return Ok(());
             }
-            supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None }).await
+            boxed(|| supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None })).await
         }
-        Cmd::Install(a) => install::install(a).await,
+        Cmd::Install(a) => boxed(|| install::install(a)).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
         Cmd::Login { print, server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            let t = server.resolve(&cfg).await?;
+            let t = boxed(|| server.resolve(&cfg)).await?;
             let url = kiln::api::otp_url(&t.token, &t.url);
             out(&format!("Sign in on this machine (valid 5 minutes):\n  {url}"));
             if let Some(public) = t.public_url.as_deref().filter(|p| !kiln::access::is_loopback(p) && p.trim_end_matches('/') != t.url) {
@@ -651,16 +661,16 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Token { server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            out(&server.resolve(&cfg).await?.token);
+            out(&boxed(|| server.resolve(&cfg)).await?.token);
             Ok(())
         }
         Cmd::Passwd { stdin, clear, server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            let t = server.resolve(&cfg).await?;
+            let t = boxed(|| server.resolve(&cfg)).await?;
             let client = kiln::http::client::Client::public()?;
             let endpoint = format!("{}/api/settings/password", t.url);
             if clear {
-                let resp = client.request(kiln::http::client::Method::Delete, &endpoint).bearer(&t.token).send().await?;
+                let resp = boxed(|| client.request(kiln::http::client::Method::Delete, &endpoint).bearer(&t.token).send()).await?;
                 anyhow::ensure!(resp.is_success(), "the server answered HTTP {}", resp.status());
                 out("Password sign-in removed. Use the admin token or `kiln login` links to sign in.");
                 return Ok(());
@@ -678,9 +688,9 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             if let Err(why) = kiln::password::validate(&pw) {
                 anyhow::bail!("password not accepted: {why}");
             }
-            let resp = client.put(&endpoint).bearer(&t.token).json(&serde_json::json!({ "password": pw })).send().await?;
+            let resp = boxed(|| client.put(&endpoint).bearer(&t.token).json(&serde_json::json!({ "password": pw })).send()).await?;
             if !resp.is_success() {
-                let body = resp.bytes(64 << 10).await.unwrap_or_default();
+                let body = boxed(|| resp.bytes(64 << 10)).await.unwrap_or_default();
                 anyhow::bail!("the server refused the password: {}", String::from_utf8_lossy(&body));
             }
             out(&format!("Password set. Sign in at {} from any device.", t.public_url.as_deref().unwrap_or(&t.url)));
@@ -745,39 +755,42 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Agents(a) => kiln::harness::cli::agents(a),
         Cmd::Run(a) => {
             shutdown_on_signals(shutdown.clone());
-            kiln::reach::cli::run(a, shutdown).await
+            boxed(|| kiln::reach::cli::run(a, shutdown)).await
         }
         Cmd::Runners(a) => kiln::reach::cli::runners(a),
         Cmd::Reach(a) => kiln::reach::cli::reach(a),
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::cd::cli::run(a, &cfg).await
+            boxed(|| kiln::cd::cli::run(a, &cfg)).await
         }
         Cmd::Deploy(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::deploy::cli::deploy(a, &cfg).await
+            boxed(|| kiln::deploy::cli::deploy(a, &cfg)).await
         }
         Cmd::App(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::deploy::cli::app(a, &cfg).await
+            boxed(|| kiln::deploy::cli::app(a, &cfg)).await
         }
         Cmd::Secrets(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::ci::cli::secrets(a, &cfg).await
+            boxed(|| kiln::ci::cli::secrets(a, &cfg)).await
         }
         Cmd::Vars(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::ci::cli::vars(a, &cfg).await
+            boxed(|| kiln::ci::cli::vars(a, &cfg)).await
         }
         Cmd::Oidc(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::ci::cli::oidc(a, &cfg).await
+            boxed(|| kiln::ci::cli::oidc(a, &cfg)).await
         }
         Cmd::Actions(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            kiln::ci::cli::actions(a, &cfg).await
+            boxed(|| kiln::ci::cli::actions(a, &cfg)).await
         }
-        Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Runs(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::runs(a, &cfg)).await
+        }
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
         Cmd::Ci(a) => {
             // On a task of its own, as `kiln workflow run`: not beneath this frame.
@@ -787,56 +800,114 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Auth(a) => kiln::runner::auth::cli(a).await,
-        Cmd::Sbom(a) => kiln::ci::sbom::cli(a).await,
+        Cmd::Auth(a) => boxed(|| kiln::runner::auth::cli(a)).await,
+        Cmd::Sbom(a) => boxed(|| kiln::ci::sbom::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();
             shutdown_on_signals(stop.clone());
-            kiln::ci::local::workflow(a, &config::Config::load(&config_path).unwrap_or_default(), stop).await
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::local::workflow(a, &cfg, stop)).await
         }
-        Cmd::Logs(a) => kiln::ci::cli::logs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Dispatch(a) => kiln::ci::cli::dispatch(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Rerun(a) => kiln::ci::cli::rerun(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Repo(a) => kiln::ci::cli::repo(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Clone(a) => kiln::ci::review_cli::clone(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Logs(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::logs(a, &cfg)).await
+        }
+        Cmd::Dispatch(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::dispatch(a, &cfg)).await
+        }
+        Cmd::Rerun(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::rerun(a, &cfg)).await
+        }
+        Cmd::Cancel(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::cancel(a, &cfg)).await
+        }
+        Cmd::Routing(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::routing(a, &cfg)).await
+        }
+        Cmd::Env(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::env(a, &cfg)).await
+        }
+        Cmd::Repo(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::repo(a, &cfg)).await
+        }
+        Cmd::Clone(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::clone(a, &cfg)).await
+        }
         Cmd::Submit(a) => kiln::ci::review_cli::submit(a),
         Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
         Cmd::Absorb(a) => kiln::ci::review_cli::absorb(a),
-        Cmd::Diffs(a) => kiln::ci::review_cli::diffs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Diffs(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::diffs(a, &cfg)).await
+        }
         Cmd::Checkout(a) => kiln::ci::review_cli::checkout(a),
         Cmd::Cr(a) => kiln::ci::review_cli::cr(a),
-        Cmd::Land(a) => kiln::ci::review_cli::land(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Review(a) => kiln::ci::review_cli::review(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Land(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::land(a, &cfg)).await
+        }
+        Cmd::Review(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::review(a, &cfg)).await
+        }
         Cmd::Hook(a) => kiln::ci::review_cli::hook(a),
-        Cmd::GitCredential(a) => kiln::ci::review_cli::git_credential(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Debug(a) => kiln::ci::cli::debug(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Tokens(a) => kiln::authz::cli::tokens(a, &config::Config::load(&config_path).unwrap_or_default()).await,
-        Cmd::Updates(a) => kiln::updates_cli::run(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::GitCredential(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::git_credential(a, &cfg)).await
+        }
+        Cmd::Approve(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::approve(a, &cfg)).await
+        }
+        Cmd::Debug(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::debug(a, &cfg)).await
+        }
+        Cmd::Users(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::users(a, &cfg)).await
+        }
+        Cmd::Grants(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::grants(a, &cfg)).await
+        }
+        Cmd::Roles(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::roles(a, &cfg)).await
+        }
+        Cmd::Tokens(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::tokens(a, &cfg)).await
+        }
+        Cmd::Updates(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::updates_cli::run(a, &cfg)).await
+        }
         Cmd::Config(a) => kiln::config_cli::run(a, &config_path),
         Cmd::Signing(a) => kiln::os::macsign::run(a),
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            let t = server.resolve(&cfg).await?;
+            let t = boxed(|| server.resolve(&cfg)).await?;
             match print_token {
                 Some(label) => {
                     println!("{}", kiln::mcp::token(&t.token, &label));
                     Ok(())
                 }
-                None => kiln::mcp::stdio(t.url, t.token).await,
+                None => boxed(|| kiln::mcp::stdio(t.url, t.token)).await,
             }
         }
         Cmd::Status { server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
-            let t = server.resolve(&cfg).await?;
+            let t = boxed(|| server.resolve(&cfg)).await?;
             let resp = kiln::http::client::Client::public()?
                 .get(&format!("{}/api/overview", t.url))
                 .bearer(&t.token)
@@ -846,7 +917,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             if !resp.is_success() {
                 anyhow::bail!("server answered HTTP {}", resp.status());
             }
-            let v: serde_json::Value = resp.json(8 << 20).await?;
+            let v: serde_json::Value = boxed(|| resp.json(8 << 20)).await?;
             out(&serde_json::to_string_pretty(&v)?);
             Ok(())
         }

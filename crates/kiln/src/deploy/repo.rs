@@ -59,7 +59,7 @@ pub fn release_json(app: &App, env: &str, r: &Release, prior: Option<&ReleaseFil
     let keep = |f: &ReleaseFile| (f.version.clone(), f.artifacts.clone());
     let (version, artifacts) = match r.kind {
         Kind::Deploy | Kind::Rollback => (r.version.clone(), r.artifacts.clone()),
-        Kind::Config | Kind::Enable | Kind::Disable => prior.map(keep).unwrap_or_default(),
+        Kind::Config | Kind::Enable | Kind::Disable | Kind::Revert => prior.map(keep).unwrap_or_default(),
     };
     ReleaseFile {
         schema: SCHEMA,
@@ -74,6 +74,7 @@ pub fn release_json(app: &App, env: &str, r: &Release, prior: Option<&ReleaseFil
         requested_by: r.requested_by.clone(),
         at: rfc3339(r.created_at),
         rollback_of: r.rollback_of,
+        secrets: String::new(),
     }
 }
 
@@ -92,6 +93,7 @@ pub fn registered_json(app: &App, env: &str) -> ReleaseFile {
         requested_by: String::new(),
         at: rfc3339(crate::util::now_unix()),
         rollback_of: None,
+        secrets: String::new(),
     }
 }
 
@@ -109,7 +111,10 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<ReleaseFile> {
 pub fn message(app: &App, env: &str, r: &Release) -> String {
     let what = match r.kind {
         Kind::Deploy => format!("deploy {} {} to {env}", app.name, r.version.as_deref().unwrap_or("?")),
-        Kind::Config => format!("change {}'s values in {env}", app.name),
+        Kind::Config => match &r.secrets {
+            Some(what) if r.values.is_none() => format!("deliver {}'s secrets in {env}: {what}", app.name),
+            _ => format!("change {}'s values in {env}", app.name),
+        },
         Kind::Rollback => format!(
             "roll {} in {env} back to {}{}",
             app.name,
@@ -118,6 +123,7 @@ pub fn message(app: &App, env: &str, r: &Release) -> String {
         ),
         Kind::Enable => format!("enable {} in {env}", app.name),
         Kind::Disable => format!("disable {} in {env}", app.name),
+        Kind::Revert => format!("put back what ran before release {} of {} in {env}", r.reverts.unwrap_or_default(), app.name),
     };
     format!("{what} (release {})\n\n{RELEASE_TRAILER}: {}\n{REQUESTED_BY_TRAILER}: {}\n", r.id, r.id, r.requested_by)
 }
@@ -306,6 +312,11 @@ mod tests {
             created_at: 1_792_356_000,
             committed_at: None,
             ended_at: None,
+            secrets: None,
+            no_revert: false,
+            reverts: None,
+            reverted_by: None,
+            irreversible: None,
         }
     }
 

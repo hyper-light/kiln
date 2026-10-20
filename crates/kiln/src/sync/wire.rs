@@ -47,8 +47,8 @@ pub enum Msg {
     /// Server → runner: contents `repo`'s steps name that the server lacks: the steps are taken
     /// once the contents are there and the steps sent again.
     Want { repo: String, hashes: Vec<String> },
-    /// Runner → server: how a copy is doing.
-    Status(CopyStatus),
+    /// Runner → server: how a copy is doing (boxed: the biggest by far).
+    Status(Box<CopyStatus>),
     /// Runner → server: the git repositories on this machine, whole (see [`Repos`]). Sent when it
     /// connects, when they change, and when asked ([`Msg::Look`]).
     Repos(Repos),
@@ -71,6 +71,31 @@ pub enum Msg {
     Forget { path: String },
     /// Runner → server: how this machine's part of a task goes.
     Task(TaskNews),
+    /// Runner → server: an agent session moving between machines with a synced repo's files, as
+    /// this machine saw its part (`crate::harness::session`), for the repo's activity.
+    Move(MoveNews),
+}
+
+/// An agent session's move, as one of the two machines saw its part.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MoveNews {
+    /// The synced repo its folder is a copy of.
+    pub repo: String,
+    /// The log index its files are in through: the machine it goes to takes the log that far
+    /// before the session goes on there.
+    pub index: u64,
+    pub session: String,
+    /// The machines it leaves and goes to.
+    pub from: String,
+    pub to: String,
+    /// `left` (its folder's last changes are in the log; it is being handed over), `failed` (it
+    /// stays) or `arrived` (its files are in its folder there; it goes on).
+    pub phase: String,
+    /// How long that part waited, in milliseconds.
+    pub waited_ms: u64,
+    /// Why it failed.
+    pub error: Option<String>,
 }
 
 /// The git repositories on a machine, as it last looked: under its usual folders (`~/Projects`,
@@ -212,6 +237,33 @@ pub struct CopyStatus {
     pub looked: bool,
     /// It waits to take the group's files (`CopySpec::adopt`).
     pub adopting: bool,
+    /// The contents it moved with the server, since its runner started.
+    pub traffic: Traffic,
+    /// How long the last change another machine made took to get to its folder, in milliseconds:
+    /// from that machine's look to the file here (the two clocks apart add to it).
+    pub lag_ms: Option<u64>,
+}
+
+/// What a copy moved with the server, since its runner started.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Traffic {
+    /// Contents sent to the server, and their bytes (those it had already count, not their bytes).
+    pub sent: u64,
+    pub sent_bytes: u64,
+    /// Contents fetched from it, and their bytes.
+    pub fetched: u64,
+    pub fetched_bytes: u64,
+    /// Transfers that failed, and those tried again after.
+    pub failed: u64,
+    pub retried: u64,
+    /// Contents the server no longer had: versions later steps replaced.
+    pub gone: u64,
+    /// Steps sent again, the log not having brought them back.
+    pub resent: u64,
+    /// The last failure, and when (unix seconds).
+    pub last_failure: Option<String>,
+    pub failed_at: i64,
 }
 
 /// A message as it goes on the wire: the JSON and the raft bytes beside it.

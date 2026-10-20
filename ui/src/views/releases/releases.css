@@ -52,6 +52,15 @@
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
+.rel-tag-alert {
+  border-color: var(--color-warn);
+  color: var(--color-warn);
+}
+.rel-alert {
+  border-left: 2px solid var(--color-warn);
+  padding-left: 8px;
+  color: var(--color-foreground);
+}
 .rel-answer {
   display: flex;
   flex-wrap: wrap;
@@ -512,4 +521,29 @@
 }
 .rel-windows > button {
   justify-self: start;
+}
+.rel-secret-acts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.rel-secret-form {
+  flex-basis: 100%;
+  margin-top: 4px;
+}
+.rel-secret-versions {
+  display: grid;
+  flex-basis: 100%;
+  gap: 4px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.rel-sub {
+  margin: 24px 0 8px;
+  color: var(--color-foreground);
+  font-size: 13px;
+  font-weight: 600;
 }

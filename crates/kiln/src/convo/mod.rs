@@ -9,7 +9,10 @@
 //! - [`feed`]: a runner's store sent to the server's, over the runner's link.
 //! - [`resume`]: a session packed from the server's store, to go on on another machine.
 //! - [`mirror`]: runners that keep a copy of the server's store.
+//! - [`telemetry`]: what each store and feed is doing, for the System page and its dashboards.
+//! - [`board`]: the server's board of every store: their state, series and what happened lately.
 
+pub mod board;
 pub mod feed;
 pub mod mirror;
 pub mod record;
@@ -17,6 +20,7 @@ pub mod resume;
 pub mod rows;
 pub mod sql;
 pub mod store;
+pub mod telemetry;
 pub mod turso;
 
 /// The store file in a machine's state folder.

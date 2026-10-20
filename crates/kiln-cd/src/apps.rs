@@ -60,6 +60,91 @@ pub struct AppDef {
     /// The checks its rollout uses, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<String, crate::rollout::CheckSpec>,
+    /// Its secrets, from kiln's secrets service (docs/deploy-api.md §3.5): one Secret in its
+    /// namespace, at exactly the versions named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretsRef>,
+}
+
+/// An app's secrets as its definition names them: where kiln's secrets service keeps them, the
+/// Secret they become, and the version of each a render delivers. Never their values.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsRef {
+    /// The service's scope: `app/<app>/<environment>`.
+    pub scope: String,
+    /// The Secret's name: `<app>-kiln`.
+    pub name: String,
+    /// Each secret's version, by name.
+    pub versions: BTreeMap<String, u32>,
+}
+
+impl SecretsRef {
+    /// The versions as text: `API_KEY@1,DB_PASSWORD@4`.
+    pub fn versions_text(&self) -> String {
+        self.versions.iter().map(|(n, v)| format!("{n}@{v}")).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// The annotation that holds an app's secrets' versions (`API_KEY@1,DB_PASSWORD@4`, never their
+/// values) on their Secret and on each pod template that reads it.
+pub const SECRETS: &str = "kiln.dev/secrets";
+
+/// The Secret of an app's secrets (docs/deploy-api.md §3.5), each one a key of its data. It goes
+/// first (wave -10), before what reads it.
+pub fn app_secret<'a>(name: &str, namespace: &str, versions: &str, items: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Value {
+    use base64::Engine as _;
+    let data: serde_json::Map<String, Value> = items.into_iter().map(|(k, v)| (k.to_owned(), Value::String(base64::engine::general_purpose::STANDARD.encode(v)))).collect();
+    let mut annotations = serde_json::Map::new();
+    annotations.insert("argocd.argoproj.io/sync-wave".into(), Value::String("-10".into()));
+    annotations.insert(SECRETS.into(), Value::String(versions.to_owned()));
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": name, "namespace": namespace, "annotations": annotations },
+        "type": "Opaque",
+        "data": data,
+    })
+}
+
+/// Marks each pod template in `namespace` that reads Secret `name` (as env, or as files) with its
+/// `versions`: Kubernetes doesn't restart pods when a Secret they read changes, a new template
+/// does, so a new version rolls them.
+pub fn stamp_secrets(objects: &mut [Value], name: &str, namespace: &str, versions: &str) {
+    for o in objects.iter_mut() {
+        let template: &[&str] = match (obj::group(o), obj::kind(o)) {
+            ("apps", "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet") | ("batch", "Job") => &["spec", "template"],
+            ("batch", "CronJob") => &["spec", "jobTemplate", "spec", "template"],
+            ("", "Pod") => &[],
+            _ => continue,
+        };
+        if !(obj::namespace(o).is_empty() || obj::namespace(o) == namespace) {
+            continue;
+        }
+        let pod: Vec<&str> = template.iter().copied().chain(["spec"]).collect();
+        if !obj::get(o, &pod).is_some_and(|p| reads_secret(p, name)) {
+            continue;
+        }
+        let at: Vec<&str> = template.iter().copied().chain(["metadata", "annotations"]).collect();
+        if let Some(ann) = obj::ensure_map(o, &at) {
+            ann.insert(SECRETS.into(), Value::String(versions.to_owned()));
+        }
+    }
+}
+
+/// Whether a pod's spec reads Secret `name`: a container's env (all of it, or a key) or a volume
+/// (of its own, or projected).
+fn reads_secret(pod: &Value, name: &str) -> bool {
+    let named = |v: Option<&Value>| v.and_then(Value::as_str) == Some(name);
+    let list = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+    let containers = ["containers", "initContainers", "ephemeralContainers"].iter().flat_map(|k| list(pod, k)).collect::<Vec<_>>();
+    let env = containers.iter().any(|c| {
+        list(c, "envFrom").iter().any(|e| named(e.pointer("/secretRef/name"))) || list(c, "env").iter().any(|e| named(e.pointer("/valueFrom/secretKeyRef/name")))
+    });
+    let files = list(pod, "volumes").iter().any(|v| {
+        named(v.pointer("/secret/secretName")) || v.pointer("/projected/sources").and_then(Value::as_array).into_iter().flatten().any(|s| named(s.pointer("/secret/name")))
+    });
+    env || files
 }
 
 /// The annotation a traffic-carrying object holds its app's rollout in: `{ rollout, checks }`.
@@ -669,6 +754,7 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
         artifacts: BTreeMap::new(),
         rollout: None,
         checks: BTreeMap::new(),
+        secrets: None,
     })
 }
 
@@ -1300,6 +1386,7 @@ fn app_from_spec(
             .collect(),
         rollout: spec.rollout.clone(),
         checks,
+        secrets: None,
     })
 }
 
@@ -1544,6 +1631,31 @@ apps:
         // Other expressions pass through.
         assert_eq!(substitute_artifacts("a ${{ env.name }} b", &refs)?, "a ${{ env.name }} b");
         Ok(())
+    }
+
+    #[test]
+    fn an_apps_secrets_are_one_secret_and_the_pods_that_read_them_roll_with_their_versions() {
+        let s = app_secret("web-kiln", "shop", "A@1,B@2", [("A", &b"one"[..]), ("B", &b"two"[..])]);
+        assert_eq!(obj::kind(&s), "Secret");
+        assert_eq!(obj::str_at(&s, &["data", "A"]), Some("b25l"));
+        assert_eq!(obj::annotation(&s, SECRETS), Some("A@1,B@2"));
+        let reads = |spec: Value| json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web"}, "spec": {"template": {"spec": spec}}});
+        let mut objects = vec![
+            reads(json!({"containers": [{"name": "app", "envFrom": [{"secretRef": {"name": "web-kiln", "optional": true}}]}]})),
+            reads(json!({"containers": [{"name": "app", "env": [{"name": "A", "valueFrom": {"secretKeyRef": {"name": "web-kiln", "key": "A"}}}]}]})),
+            reads(json!({"containers": [{"name": "app"}], "volumes": [{"name": "s", "projected": {"sources": [{"secret": {"name": "web-kiln"}}]}}]})),
+            reads(json!({"containers": [{"name": "app", "envFrom": [{"secretRef": {"name": "other"}}]}]})),
+            json!({"apiVersion": "batch/v1", "kind": "CronJob", "metadata": {"name": "nightly"}, "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "c"}], "volumes": [{"name": "s", "secret": {"secretName": "web-kiln"}}]}}}}}}),
+        ];
+        stamp_secrets(&mut objects, "web-kiln", "shop", "A@1,B@2");
+        let stamped: Vec<bool> = objects
+            .iter()
+            .map(|o| {
+                let at: &[&str] = if obj::kind(o) == "CronJob" { &["spec", "jobTemplate", "spec", "template", "metadata", "annotations", SECRETS] } else { &["spec", "template", "metadata", "annotations", SECRETS] };
+                obj::str_at(o, at) == Some("A@1,B@2")
+            })
+            .collect();
+        assert_eq!(stamped, [true, true, true, false, true]);
     }
 
     #[test]
