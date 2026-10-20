@@ -183,6 +183,8 @@ enum Input {
     LogsAcked(Vec<Record>, super::ingest::Ack),
     /// Spans, as rows a request's decoding wrote: segments, each with its rows.
     Spans(Vec<(Vec<u8>, u32)>),
+    /// A sender's wait for everything taken before it to be written (a node stopping).
+    Settle(super::ingest::Ack),
     Staged { generation: u64, msg: Box<Message>, ok: bool },
     Fetched { generation: u64, done: u64, of: u64 },
     /// Cut the store and compact the log now, keeping nothing (an operator's, or a test's).
@@ -247,8 +249,11 @@ impl Spares {
         lock(&self.decoded).pop().unwrap_or_default()
     }
 
-    fn give_decoded(&self, d: kiln_obs::otlp::metrics::Decoded) {
+    fn give_decoded(&self, mut d: kiln_obs::otlp::metrics::Decoded) {
         if d.capacity_bytes() <= SPARE_BYTES {
+            // Handed out empty: what took it last may have left samples (the owner takes their
+            // keys alone).
+            d.clear();
             let mut kept = lock(&self.decoded);
             if kept.len() < SPARES {
                 kept.push(d);
@@ -586,6 +591,14 @@ impl Observe {
         true
     }
 
+    /// Sets `ack` once everything taken before it is written (nothing waits, no write is out), as a
+    /// node stopping waits for its last; at once with no owner to write it.
+    pub fn settle(&self, ack: super::ingest::Ack) {
+        if let Err(std::sync::mpsc::SendError(Input::Settle(a))) = self.tx.send(Input::Settle(ack)) {
+            a.set();
+        }
+    }
+
     /// Cuts the store and compacts the group's log now, keeping nothing: a member behind takes an
     /// image after this.
     pub fn compact(&self) {
@@ -724,6 +737,8 @@ struct Owner {
     touched: Option<(Arc<Touched>, Arc<Touched>)>,
     start: Instant,
     batcher: Batcher,
+    /// Waits for what is taken to be written: each told once nothing waits and no write is out.
+    settles: Vec<super::ingest::Ack>,
     /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
     scrapes: Vec<(String, super::scrape::Target)>,
     synthetics: Vec<(String, super::synthetics::Test)>,
@@ -801,6 +816,7 @@ impl Owner {
             touched,
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
+            settles: Vec::new(),
             scrapes: Vec::new(),
             synthetics: Vec::new(),
             statsd: Vec::new(),
@@ -979,6 +995,11 @@ impl Owner {
             for rows in self.batcher.spent() {
                 self.admission.spares.give_bytes(rows);
             }
+            if !self.settles.is_empty() && self.batcher.backlog() == (0, false) {
+                for a in self.settles.drain(..) {
+                    a.set();
+                }
+            }
             self.admission.congested.store(self.batcher.congested(Instant::now()), Ordering::Release);
         }
     }
@@ -1051,6 +1072,7 @@ impl Owner {
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::LogsAcked(records, ack) => self.batcher.logs_acked(records, ack, Instant::now()),
             Input::Spans(segments) => self.batcher.spans(segments, Instant::now()),
+            Input::Settle(ack) => self.settles.push(ack),
             Input::Staged { generation, msg, ok } => {
                 if self.fetching.as_ref().is_some_and(|f| f.generation == generation) {
                     self.fetching = None;
@@ -1835,6 +1857,20 @@ mod tests {
         assert_eq!(span(3_599_500), "1 h 0 min");
         assert_eq!(span(2_700_000), "45 min");
         assert_eq!(span(7_329_000), "2 h 2 min");
+    }
+
+    /// A decoding handed back still holding samples (the owner takes their keys alone) is handed
+    /// out empty, its room kept: what is written into it next finds nothing of the last one's.
+    #[test]
+    fn a_decoding_handed_back_is_handed_out_empty() {
+        let spares = Spares::default();
+        let mut d = kiln_obs::otlp::metrics::Decoded::default();
+        d.samples.extend((0..100).map(|i| (0u32, i64::from(i), 1.0)));
+        d.points = 100;
+        spares.give_decoded(d);
+        let d = spares.decoded();
+        assert!(d.keys.is_empty() && d.samples.is_empty() && d.points == 0);
+        assert!(d.samples.capacity() >= 100, "its room kept");
     }
 
     /// Eight threads take room as fast as they can while one frees it at its own pace: what is

@@ -188,9 +188,20 @@ impl Decoder {
     /// `/v0.5/traces` (its strings first, in a table, each span an array of twelve). Every span is
     /// counted into `stats` first, as the Agent's concentrator counts them; a trace its tracer
     /// dropped (its priority below zero, or zero and no error in it) is counted and not kept.
-    pub fn decode_tracer<'a>(&mut self, v5: bool, body: &'a [u8], tracer: &Tracer<'a>, now_ns: i64, out: &mut Spans, stats: &mut Vec<SpanStat<'a>>) -> Result<TracerTaken, DdError> {
+    /// Each trace's root into `roots`, as the sampler counts it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_tracer<'a>(
+        &mut self,
+        v5: bool,
+        body: &'a [u8],
+        tracer: &Tracer<'a>,
+        now_ns: i64,
+        out: &mut Spans,
+        stats: &mut Vec<SpanStat<'a>>,
+        roots: &mut Vec<Root<'a>>,
+    ) -> Result<TracerTaken, DdError> {
         let mut taken = TracerTaken::default();
-        self.run(out, |cx, out| cx.tracer(v5, body, tracer, now_ns, out, stats, &mut taken))?;
+        self.run(out, |cx, out| cx.tracer(v5, body, tracer, now_ns, out, stats, roots, &mut taken))?;
         Ok(taken)
     }
 
@@ -906,16 +917,45 @@ fn text<'a>(r: &mut Reader<'a>) -> Result<&'a str, MsgpackError> {
     Ok(std::str::from_utf8(r.bin()?).unwrap_or(""))
 }
 
-/// What a tracer's span's first reading finds: what its chunk's keeping and its spans' tops are
-/// decided by.
+/// What a tracer's span's first reading finds: what its chunk's keeping, its spans' tops and its
+/// root are decided by.
 #[derive(Debug, Default)]
 struct Head<'a> {
     span: u64,
+    parent: u64,
     service: &'a str,
+    env: &'a str,
     error: bool,
     priority: Option<f64>,
+    /// What its tracer sampled it at (`_sample_rate`, `_dd1.sr.rapre`): its weight one over them.
+    rates: (Option<f64>, Option<f64>),
     /// The trace's high 64 bits (`_dd.p.tid`), 0 if not said.
     hi: u64,
+}
+
+impl<'a> Head<'a> {
+    fn meta(&mut self, k: &str, v: &'a str) {
+        match k {
+            "_dd.p.tid" => self.hi = hex64(v).unwrap_or(0),
+            "env" => self.env = v,
+            _ => {}
+        }
+    }
+
+    fn metric(&mut self, k: &str, v: f64) {
+        match k {
+            "_sampling_priority_v1" => self.priority = Some(v),
+            "_sample_rate" => self.rates.0 = Some(v),
+            "_dd1.sr.rapre" => self.rates.1 = Some(v),
+            _ => {}
+        }
+    }
+
+    /// One over what its tracer sampled it at, each rate taken only from (0, 1].
+    fn weight(&self) -> f64 {
+        let r = |v: Option<f64>| v.filter(|r| *r > 0.0 && *r <= 1.0).unwrap_or(1.0);
+        1.0 / (r(self.rates.0) * r(self.rates.1))
+    }
 }
 
 impl<'a> Cx<'a, '_> {
@@ -926,7 +966,17 @@ impl<'a> Cx<'a, '_> {
 
     /// A tracer's payload: its traces, each counted and kept or not.
     #[allow(clippy::too_many_arguments)]
-    fn tracer(&mut self, v5: bool, body: &'a [u8], t: &Tracer<'a>, now_ns: i64, out: &mut Spans, stats: &mut Vec<SpanStat<'a>>, taken: &mut TracerTaken) -> Result<(), DdError> {
+    fn tracer(
+        &mut self,
+        v5: bool,
+        body: &'a [u8],
+        t: &Tracer<'a>,
+        now_ns: i64,
+        out: &mut Spans,
+        stats: &mut Vec<SpanStat<'a>>,
+        roots: &mut Vec<Root<'a>>,
+        taken: &mut TracerTaken,
+    ) -> Result<(), DdError> {
         let mut r = Reader::new(body);
         self.strings.clear();
         if v5 {
@@ -954,6 +1004,8 @@ impl<'a> Cx<'a, '_> {
             let n = r.array()?;
             self.ids.clear();
             let (mut priority, mut erred, mut hi) = (None, false, 0u64);
+            // The trace's root: its first span of no parent, else its first.
+            let mut root: Option<(bool, Root<'a>)> = None;
             for _ in 0..n {
                 let h = self.head(&mut r, v5)?;
                 self.ids.push((h.span, h.service));
@@ -962,6 +1014,14 @@ impl<'a> Cx<'a, '_> {
                 if hi == 0 {
                     hi = h.hi;
                 }
+                let parentless = h.parent == 0;
+                if root.is_none_or(|(was, _)| parentless && !was) {
+                    root = Some((parentless, Root { service: h.service, env: h.env, priority: None, weight: h.weight() }));
+                }
+            }
+            if let Some((_, mut x)) = root {
+                x.priority = priority;
+                roots.push(x);
             }
             self.ids.sort_unstable_by_key(|x| x.0);
             // Dropped by its tracer: a user's rejection, or an automatic one with no error in it
@@ -999,23 +1059,19 @@ impl<'a> Cx<'a, '_> {
             r.skip()?;
             r.skip()?;
             h.span = r.u64()?;
-            r.skip()?;
+            h.parent = r.u64()?;
             r.skip()?;
             r.skip()?;
             h.error = r.i64()? != 0;
             for _ in 0..r.map()? {
                 let k = self.nth(r)?;
                 let v = self.nth(r)?;
-                if k == "_dd.p.tid" {
-                    h.hi = hex64(v).unwrap_or(0);
-                }
+                h.meta(k, v);
             }
             for _ in 0..r.map()? {
                 let k = self.nth(r)?;
                 let v = r.f64()?;
-                if k == "_sampling_priority_v1" {
-                    h.priority = Some(v);
-                }
+                h.metric(k, v);
             }
             r.skip()?;
             return Ok(h);
@@ -1024,23 +1080,20 @@ impl<'a> Cx<'a, '_> {
             match text(r)? {
                 "service" => h.service = text(r)?,
                 "span_id" => h.span = r.u64()?,
+                "parent_id" => h.parent = r.u64()?,
                 "error" => h.error = r.i64()? != 0,
                 "meta" => {
                     for _ in 0..r.map()? {
                         let k = text(r)?;
                         let v = text(r)?;
-                        if k == "_dd.p.tid" {
-                            h.hi = hex64(v).unwrap_or(0);
-                        }
+                        h.meta(k, v);
                     }
                 }
                 "metrics" => {
                     for _ in 0..r.map()? {
                         let k = text(r)?;
                         let v = r.f64()?;
-                        if k == "_sampling_priority_v1" {
-                            h.priority = Some(v);
-                        }
+                        h.metric(k, v);
                     }
                 }
                 _ => r.skip()?,
@@ -1602,10 +1655,7 @@ const NAMES: [[&str; 7]; 2] = [
 /// A `StatsPayload` as kiln's trace metrics into `out` (cleared, its room kept), each series' key
 /// found in or made into `keys`: a series seen before allocates nothing.
 pub fn stats_into(body: &[u8], keys: &Keys, out: &mut Decoded) -> Result<StatsTaken, DdError> {
-    out.keys.clear();
-    out.samples.clear();
-    out.points = 0;
-    out.dropped = Default::default();
+    out.clear();
     let mut taken = StatsTaken::default();
     let mut groups = Groups::default();
     // Where in its bucket this payload's points are: the same for the same payload, on any node.
@@ -1852,6 +1902,184 @@ fn points_more(groups: &mut Groups<'_>, keys: &Keys, out: &mut Decoded) {
     }
 }
 
+/// A trace a tracer sent, as the sampler counts it: its root's service and env, its sampling
+/// priority (none where it says none), its weight (one over what its tracer sampled it at, `_sample_rate`
+/// and the pre-sampler's `_dd1.sr.rapre`, as the Agent's `weightRoot` reads them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Root<'a> {
+    pub service: &'a str,
+    pub env: &'a str,
+    pub priority: Option<f64>,
+    pub weight: f64,
+}
+
+/// A bucket of the sampler's: the Agent's (`pkg/trace/sampler/coresampler.go`).
+const SAMPLER_BUCKET_MS: i64 = 5_000;
+/// Buckets it keeps: the busiest of them is a signature's rate (a moving max, against oscillation).
+const SAMPLER_BUCKETS: usize = 6;
+/// A rate rises at most this much an update (thirteen to rise tenfold, about a minute).
+const MAX_RATE_INCREASE: f64 = 1.2;
+/// Signatures kept at the most (OpenTelemetry's cardinality limit, as metrics from logs keep
+/// groups): past it, a trace of a new one is counted with all, and given the default rate.
+pub const SIGNATURES: usize = 2_000;
+
+/// The Agent's priority sampler (`pkg/trace/sampler`), for tracers that send to kiln: each
+/// signature's (a trace's root's service and env) traces counted in buckets of five seconds, six
+/// kept; at each new bucket, a rate for each so that some `target` traces a second are kept in all:
+/// the target spread evenly over the signatures, what a quiet one leaves spread over the rest
+/// (water-filling), each against its busiest bucket; a rate rising at most 1.2 times an update; a
+/// signature quiet for the whole window forgotten. A tracer applies a rate to the traces it decides
+/// itself (priority 0 or 1), and only those are counted. A signature not known gets the rate the
+/// whole traffic would, but never above the lowest rate given.
+#[derive(Debug)]
+pub struct Sampler {
+    target: f64,
+    /// Each signature's counts by bucket (`bucket % SAMPLER_BUCKETS`), and its rate.
+    sigs: std::collections::HashMap<(String, String), ([f64; SAMPLER_BUCKETS], Option<f64>)>,
+    all: [f64; SAMPLER_BUCKETS],
+    bucket: i64,
+    lowest: f64,
+}
+
+impl Sampler {
+    /// A sampler keeping `target` traces a second (0: every trace, no rate below 1).
+    pub fn new(target: f64) -> Self {
+        Self { target: target.max(0.0), sigs: std::collections::HashMap::new(), all: [0.0; SAMPLER_BUCKETS], bucket: i64::MIN, lowest: 1.0 }
+    }
+
+    fn slot(b: i64) -> usize {
+        usize::try_from(b.rem_euclid(SAMPLER_BUCKETS as i64)).unwrap_or(0)
+    }
+
+    /// A trace counted at `now_ms` (one its tracer decided itself, priority 0 or 1; others are
+    /// not), the rates made again when a new bucket begins.
+    pub fn count(&mut self, root: &Root<'_>, now_ms: i64) {
+        if !matches!(root.priority, Some(p) if (0.0..=1.0).contains(&p)) {
+            return;
+        }
+        let b = now_ms.div_euclid(SAMPLER_BUCKET_MS);
+        if b != self.bucket {
+            self.update(b);
+        }
+        let w = if root.weight.is_finite() && root.weight >= 1.0 { root.weight } else { 1.0 };
+        if let Some(c) = self.all.get_mut(Self::slot(b)) {
+            *c += w;
+        }
+        let key = (root.service.to_owned(), root.env.to_owned());
+        let full = self.sigs.len() >= SIGNATURES;
+        let entry = match self.sigs.get_mut(&key) {
+            Some(e) => Some(e),
+            None if full => None,
+            None => Some(self.sigs.entry(key).or_insert(([0.0; SAMPLER_BUCKETS], None))),
+        };
+        if let Some((counts, _)) = entry
+            && let Some(c) = counts.get_mut(Self::slot(b))
+        {
+            *c += w;
+        }
+    }
+
+    /// The buckets between the last one and `to` emptied, each signature's rate made from the
+    /// busiest of its buckets (`zeroAndGetMax`, `updateRates`).
+    fn update(&mut self, to: i64) {
+        let from = self.bucket;
+        self.bucket = to;
+        if from == i64::MIN {
+            return;
+        }
+        // Each bucket past `from` up to `to`: a whole rotation or more empties them all; the new
+        // one is emptied after its old count is read (the window's last).
+        let rotate = |counts: &mut [f64; SAMPLER_BUCKETS]| -> f64 {
+            let mut most = 0.0f64;
+            for i in from.saturating_add(1)..=from.saturating_add(SAMPLER_BUCKETS as i64) {
+                let slot = Self::slot(i);
+                let Some(c) = counts.get_mut(slot) else { continue };
+                if i < to {
+                    *c = 0.0;
+                    continue;
+                }
+                most = most.max(*c);
+                if i == to {
+                    *c = 0.0;
+                }
+            }
+            most
+        };
+        let mut seen: Vec<((String, String), f64)> = Vec::with_capacity(self.sigs.len());
+        for (sig, (counts, _)) in self.sigs.iter_mut() {
+            seen.push((sig.clone(), rotate(counts) / (SAMPLER_BUCKET_MS as f64 / 1000.0)));
+        }
+        rotate(&mut self.all);
+        let per_sig = tps_per_signature(self.target, seen.iter().map(|s| s.1));
+        self.lowest = 1.0;
+        for (sig, tps) in seen {
+            let Some((_, rate)) = self.sigs.get_mut(&sig) else { continue };
+            let mut r = if self.target > 0.0 && per_sig < tps && tps > 0.0 { per_sig / tps } else { 1.0 };
+            if let Some(prev) = *rate
+                && prev > 0.0
+                && r / prev > MAX_RATE_INCREASE
+            {
+                r = prev * MAX_RATE_INCREASE;
+            }
+            let r = r.min(1.0);
+            if r >= 1.0 && tps == 0.0 {
+                // No traffic the whole window: forgotten.
+                self.sigs.remove(&sig);
+                continue;
+            }
+            self.lowest = self.lowest.min(r);
+            *rate = Some(r);
+        }
+    }
+
+    /// The rate for a signature not known: the whole traffic's against the target, never above the
+    /// lowest given (`defaultRate`).
+    pub fn default_rate(&self) -> f64 {
+        if self.target <= 0.0 {
+            return 1.0;
+        }
+        let seen = self.all.iter().copied().fold(0.0, f64::max) / (SAMPLER_BUCKET_MS as f64 / 1000.0);
+        let rate = if self.target < seen && seen > 0.0 { self.target / seen } else { 1.0 };
+        if self.lowest < rate && self.lowest > 0.0 { self.lowest } else { rate }
+    }
+
+    /// Each known signature's rate, as tracers read them (`rate_by_service`: `service:<s>,env:<e>`),
+    /// and the default's (`service:,env:`).
+    pub fn rates(&self) -> impl Iterator<Item = (String, f64)> + '_ {
+        let known = self.sigs.iter().filter_map(|((service, env), (_, rate))| rate.map(|r| (format!("service:{service},env:{env}"), r)));
+        known.chain(std::iter::once(("service:,env:".to_owned(), self.default_rate())))
+    }
+
+    /// Signatures counted.
+    pub fn signatures(&self) -> usize {
+        self.sigs.len()
+    }
+}
+
+/// The traces a second each signature may keep (`computeTPSPerSig`): `target` spread evenly, what a
+/// signature seen below its share leaves spread over the rest.
+fn tps_per_signature(target: f64, seen: impl Iterator<Item = f64>) -> f64 {
+    let mut sorted: Vec<f64> = seen.collect();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    if n == 0 {
+        return target;
+    }
+    let mut left = target;
+    #[allow(clippy::cast_precision_loss)]
+    let mut each = left / n as f64;
+    for (i, &c) in sorted.iter().enumerate() {
+        if c >= each || i == n - 1 {
+            break;
+        }
+        left -= c;
+        #[allow(clippy::cast_precision_loss)]
+        let rest = (n - i - 1) as f64;
+        each = left / rest;
+    }
+    each
+}
+
 /// A bucket's group as the concentrator keeps it, its strings its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Kept {
@@ -1905,10 +2133,14 @@ struct Open {
 
 /// The trace metrics of spans tracers sent kiln itself (kiln in their Agent's place), counted as
 /// the Agent's concentrator counts them (`pkg/trace/stats`): in buckets of ten seconds of their
-/// starts, each written once twenty seconds past its end (the Agent's buffer of two buckets), a
-/// span later than that counted in the oldest bucket still open, as the Agent shifts it; a span
-/// more than a minute ahead of now in the bucket of now. So each series is written once a bucket
-/// by its one writer, this node (its `host`), and nothing is held past half a minute. A bucket keeps
+/// ends (the Agent's `start + duration`), each written once twenty seconds past its own end (the
+/// Agent's buffer of two buckets), a span later than that (its bucket's wait over) counted in the
+/// oldest bucket not yet due, as the Agent shifts it; a span ending more than a minute ahead of now
+/// in the bucket of now. So nine buckets are open at the most, whatever times the spans say; each
+/// series is written once a bucket by its one writer, this node (its `host`), and nothing is held
+/// past half a minute. Its points are at their buckets' starts and an offset within the bucket drawn
+/// as it starts, so a node started again writes a bucket it wrote before beside that write (the two
+/// add) and not over it (a store keeps the later of two writes at one time). A bucket keeps
 /// [`crate::logs::metrics::GROUPS`] groups at the most (OpenTelemetry's cardinality limit), past them
 /// one whose tags are `N/A`.
 #[derive(Debug)]
@@ -1918,19 +2150,23 @@ pub struct Concentrator {
     open: BTreeMap<i64, Open>,
     /// Buckets that begin before this (ms) are written.
     written: i64,
+    /// Where in its bucket each point is (ms), drawn as it starts (the operating system's
+    /// randomness: two starts of one node share one a time in ten thousand).
+    offset: i64,
 }
 
 /// A bucket's width (ms): the Agent's.
 pub const BUCKET_MS: i64 = 10_000;
 /// How long past its end a bucket waits for its spans: the Agent's two buckets.
 pub const WAIT_MS: i64 = 20_000;
-/// How far ahead of now a span's start is taken as it says.
+/// How far ahead of now a span's end is taken as it says.
 const AHEAD_MS: i64 = 60_000;
 
 impl Concentrator {
     /// A concentrator of this node (`host`, the `host` its series carry).
     pub fn new(host: &str) -> Self {
-        Self { host: host.to_owned(), hash: crate::hash::Keyed::new(), open: BTreeMap::new(), written: i64::MIN }
+        let offset = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), host) % BUCKET_MS.unsigned_abs();
+        Self { host: host.to_owned(), hash: crate::hash::Keyed::new(), open: BTreeMap::new(), written: i64::MIN, offset: i64::try_from(offset).unwrap_or(0) }
     }
 
     /// Buckets open.
@@ -1938,16 +2174,25 @@ impl Concentrator {
         self.open.len()
     }
 
+    /// Where in its bucket each point is written (ms past the bucket's start).
+    pub fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    /// The oldest bucket a span is counted in at `now_ms`: the first neither due nor written.
+    fn oldest(&self, now_ms: i64) -> i64 {
+        let due = now_ms.saturating_sub(BUCKET_MS + WAIT_MS);
+        (due - due.rem_euclid(BUCKET_MS)).saturating_add(BUCKET_MS).max(self.written)
+    }
+
     /// One span counted, at `now_ms`.
     #[allow(clippy::cast_precision_loss)]
     pub fn add(&mut self, s: &SpanStat<'_>, now_ms: i64) {
-        let start = s.start_ns.div_euclid(1_000_000);
-        let mut at = if start > now_ms.saturating_add(AHEAD_MS) { now_ms } else { start };
+        let end = s.start_ns.saturating_add(i64::try_from(s.duration_ns).unwrap_or(i64::MAX)).div_euclid(1_000_000);
+        let mut at = if end > now_ms.saturating_add(AHEAD_MS) { now_ms } else { end };
         at -= at.rem_euclid(BUCKET_MS);
-        if at < self.written {
-            // Late: the oldest bucket open, or the first not written.
-            at = self.open.keys().next().copied().unwrap_or(self.written);
-        }
+        // Late (its bucket's wait over, written or not): the oldest not yet due.
+        at = at.max(self.oldest(now_ms));
         let h = group_hash(&self.hash, s.outbound, s.status, [s.service, s.resource, s.env, s.third, s.kind]);
         let open = self.open.entry(at).or_default();
         let found = open.table.find(h, |&i| open.groups.get(i as usize).is_some_and(|(k, ..)| k.is(s))).copied();
@@ -1993,9 +2238,7 @@ impl Concentrator {
     /// The buckets due at `now_ms` (twenty seconds past their ends; every one with `all`, as a node
     /// stops) written into `out` (cleared), each series' key found in or made into `keys`; how many.
     pub fn flush_into(&mut self, now_ms: i64, all: bool, keys: &Keys, out: &mut Decoded) -> usize {
-        out.keys.clear();
-        out.samples.clear();
-        out.points = 0;
+        out.clear();
         let due: Vec<i64> = self.open.keys().copied().filter(|&at| all || at.saturating_add(BUCKET_MS + WAIT_MS) <= now_ms).collect();
         for &at in &due {
             let Some(open) = self.open.remove(&at) else { continue };
@@ -2003,7 +2246,17 @@ impl Concentrator {
             let mut groups = Groups::default();
             for (i, (k, acc, bins)) in open.groups.iter().enumerate() {
                 let place = u32::try_from(i).unwrap_or(u32::MAX);
-                let g = Group { outbound: k.outbound, service: &k.service, resource: &k.resource, kind: k.kind, env: &k.env, third: &k.third, status: k.status, host: &self.host, ms: at };
+                let g = Group {
+                    outbound: k.outbound,
+                    service: &k.service,
+                    resource: &k.resource,
+                    kind: k.kind,
+                    env: &k.env,
+                    third: &k.third,
+                    status: k.status,
+                    host: &self.host,
+                    ms: at.saturating_add(self.offset),
+                };
                 groups.places.insert(g, place);
                 groups.accs.push(Acc { hits: acc.hits, errors: acc.errors, sum: acc.sum, min: acc.min, max: acc.max });
                 groups.bins.extend(bins.iter().map(|&(b, n)| (place, b, n)));
@@ -2760,7 +3013,11 @@ mod tests {
         for (form, body) in [("v0.4", v04(&tracer_traces())), ("v0.5", v05(&tracer_traces()))] {
             let tracer = Tracer { language: "python", container: "", host: "web-1" };
             let (mut out, mut stats) = (Spans::default(), Vec::new());
-            let taken = Decoder::new().decode_tracer(form == "v0.5", &body, &tracer, 0, &mut out, &mut stats).unwrap();
+            let mut roots = Vec::new();
+            let taken = Decoder::new().decode_tracer(form == "v0.5", &body, &tracer, 0, &mut out, &mut stats, &mut roots).unwrap();
+            // Each trace's root: the request's span, its priority the trace's.
+            let r: Vec<(&str, &str, Option<f64>)> = roots.iter().map(|r| (r.service, r.env, r.priority)).collect();
+            assert_eq!(r, vec![("web", "prod", Some(1.0)), ("web", "prod", Some(-1.0))], "{form}");
             assert_eq!(taken, TracerTaken { traces: 2, dropped: 1 }, "{form}");
             // The kept trace's three spans, none of the dropped one's.
             assert_eq!(out.spans, 3, "{form}");
@@ -2792,31 +3049,72 @@ mod tests {
         let keys = Keys::new();
         let mut d = Decoded::default();
         let mut c = Concentrator::new("web-1");
+        let o = c.offset();
+        assert!((0..BUCKET_MS).contains(&o), "{o}");
         let t = 1_700_000_000_000; // a bucket's start (ms)
+        // Counted in the bucket of their ends, as the Agent counts them: the first two ending in the
+        // first bucket, the third (begun in it) in the next.
         c.add(&stat("web", t + 1_000, false), t + 1_000);
-        c.add(&stat("web", t + 9_999, true), t + 9_999);
-        c.add(&stat("web", t + 10_000, false), t + 10_000);
+        c.add(&stat("web", t + 9_979, true), t + 9_999);
+        c.add(&stat("web", t + 9_990, false), t + 10_010);
         // Not due until twenty seconds past its end.
         assert_eq!(c.flush_into(t + 29_999, false, &keys, &mut d), 0);
         assert_eq!(c.flush_into(t + 30_000, false, &keys, &mut d), 1);
         let hits =
             |d: &Decoded| -> Vec<(i64, f64)> { d.samples.iter().filter(|(i, ..)| d.keys.get(*i as usize).is_some_and(|k| parts(&k.key).0 == "trace.hits")).map(|&(_, ts, v)| (ts, v)).collect() };
-        assert_eq!(hits(&d), vec![(t, 2.0)]);
+        assert_eq!(hits(&d), vec![(t + o, 2.0)]);
         let tags = parts(&d.keys.first().unwrap().key).1;
         assert!(tags.contains(&("host".to_owned(), "web-1".to_owned())) && tags.contains(&("service".to_owned(), "web".to_owned())), "{tags:?}");
         let errors: f64 = d.samples.iter().filter(|(i, ..)| d.keys.get(*i as usize).is_some_and(|k| parts(&k.key).0 == "trace.errors")).map(|s| s.2).sum();
         assert_eq!(errors, 1.0);
-        // A span of the bucket written comes late: into the oldest still open (the next one).
+        // A span of the bucket written comes late: into the oldest not yet due (the next one).
         c.add(&stat("web", t + 5_000, false), t + 30_500);
         assert_eq!(c.flush_into(t + 40_000, false, &keys, &mut d), 1);
-        assert_eq!(hits(&d), vec![(t + 10_000, 2.0)]);
-        // One more late, with no bucket open: the first not written. A span a day ahead: now's.
+        assert_eq!(hits(&d), vec![(t + 10_000 + o, 2.0)]);
+        // One more late, with no bucket open: the first not due. A span a day ahead: now's.
         c.add(&stat("web", t, false), t + 41_000);
         c.add(&stat("web", t + 86_400_000, false), t + 41_000);
         assert_eq!(c.open(), 2);
         assert_eq!(c.flush_into(t + 41_000, true, &keys, &mut d), 2, "every one as the node stops");
-        assert_eq!(hits(&d), vec![(t + 20_000, 1.0), (t + 40_000, 1.0)]);
+        assert_eq!(hits(&d), vec![(t + 20_000 + o, 1.0), (t + 40_000 + o, 1.0)]);
         assert_eq!(c.open(), 0);
+    }
+
+    /// Spans saying any time at all (a tracer's clock wrong, a payload made to hurt) open nine
+    /// buckets at the most, from the oldest not yet due to the one a minute ahead, and every one of
+    /// them is counted; nothing waits for a quiet spell's buckets to be written first.
+    #[test]
+    fn spans_of_any_time_open_nine_buckets_at_the_most_and_are_all_counted() {
+        let keys = Keys::new();
+        let mut d = Decoded::default();
+        let mut c = Concentrator::new("web-1");
+        let now = 1_700_000_005_000;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // Half at any time at all, of any length; half within two minutes of now.
+            let (start_ns, duration_ns) = if x & 1 == 0 { (x as i64, x >> 1) } else { ((now - 120_000 + ((x >> 1) % 240_000) as i64) * 1_000_000, x >> 44) };
+            c.add(&SpanStat { start_ns, duration_ns, ..stat("web", 0, false) }, now);
+            assert!(c.open() <= 9, "{} buckets open", c.open());
+        }
+        assert_eq!(c.flush_into(now, true, &keys, &mut d), 9);
+        let hits: f64 = d.samples.iter().filter(|(i, ..)| d.keys.get(*i as usize).is_some_and(|k| parts(&k.key).0 == "trace.hits")).map(|s| s.2).sum();
+        assert_eq!(hits, 100_000.0);
+        let first = d.samples.iter().map(|s| s.1 - c.offset()).min().unwrap();
+        let last = d.samples.iter().map(|s| s.1 - c.offset()).max().unwrap();
+        assert_eq!((first, last), (now - 25_000, now + 55_000), "the oldest not yet due, and now's bucket a minute on");
+    }
+
+    /// A node started again writes a bucket it wrote before at another point within it: the two
+    /// add, as a store keeps the later of two writes at one time. (Two starts share an offset one
+    /// time in ten thousand: of eight, not all one.)
+    #[test]
+    fn a_node_started_again_writes_beside_what_it_wrote_not_over_it() {
+        let offsets: std::collections::BTreeSet<i64> = (0..8).map(|_| Concentrator::new("web-1").offset()).collect();
+        assert!(offsets.len() > 1, "{offsets:?}");
+        assert!(offsets.iter().all(|o| (0..BUCKET_MS).contains(o)));
     }
 
     #[test]
@@ -2855,7 +3153,7 @@ mod tests {
         // tracer, its decision carried in the request): each order its request and its database's
         // span (a service the tracer named, top-level).
         let (mut out, mut stats) = (Spans::default(), Vec::new());
-        let taken = Decoder::new().decode_tracer(true, TRACER_A, &tracer, 0, &mut out, &mut stats).unwrap();
+        let taken = Decoder::new().decode_tracer(true, TRACER_A, &tracer, 0, &mut out, &mut stats, &mut Vec::new()).unwrap();
         assert_eq!((taken, out.spans, out.invalid), (TracerTaken { traces: 5, dropped: 2 }, 29, 0));
         let rows = rows(&out);
         assert!(rows.iter().all(|r| r.source == SOURCE && r.host == "web-1" && r.attr("language") == Some("python")));
@@ -2870,11 +3168,86 @@ mod tests {
         // The shop's: its requests' spans, and its requests integration's calls out (a service of its
         // own, `requests`), their peer the address they called.
         let (mut out, mut stats) = (Spans::default(), Vec::new());
-        let taken = Decoder::new().decode_tracer(true, TRACER_B, &tracer, 0, &mut out, &mut stats).unwrap();
+        let taken = Decoder::new().decode_tracer(true, TRACER_B, &tracer, 0, &mut out, &mut stats, &mut Vec::new()).unwrap();
         assert_eq!((taken, out.spans, out.invalid), (TracerTaken { traces: 5, dropped: 2 }, 31, 0));
         let calls: Vec<&SpanStat<'_>> = stats.iter().filter(|s| s.outbound).collect();
         assert_eq!(calls.len(), 4);
         assert!(calls.iter().all(|c| (c.service, c.kind, c.third, c.status) == ("requests", "client", "127.0.0.1", 200)), "{calls:?}");
         assert_eq!(stats.iter().filter(|s| (s.service, s.resource, s.third) == ("shop", "GET /checkout/<int:order>", "1.2.3")).count(), 4);
+    }
+
+    #[test]
+    fn the_target_is_spread_evenly_and_what_a_quiet_signature_leaves_goes_to_the_rest() {
+        assert!((tps_per_signature(10.0, [1.0, 2.0, 100.0].into_iter()) - 7.0).abs() < 1e-12);
+        assert!((tps_per_signature(10.0, [50.0, 50.0].into_iter()) - 5.0).abs() < 1e-12);
+        assert!((tps_per_signature(10.0, std::iter::empty()) - 10.0).abs() < 1e-12);
+    }
+
+    fn root(service: &str, priority: f64) -> Root<'_> {
+        Root { service, env: "prod", priority: Some(priority), weight: 1.0 }
+    }
+
+    fn rate_of(s: &Sampler, key: &str) -> Option<f64> {
+        s.rates().find(|(k, _)| k == key).map(|r| r.1)
+    }
+
+    #[test]
+    fn a_busy_service_is_sampled_to_its_share_and_a_quiet_one_kept_whole() {
+        let mut s = Sampler::new(10.0);
+        let t0 = 1_700_000_000_000i64;
+        // Ten seconds: `busy` at 100 traces a second, `quiet` at 1; a user's decisions not counted.
+        for ms in (0..10_000).step_by(10) {
+            s.count(&root("busy", 1.0), t0 + ms);
+            if ms % 1_000 == 0 {
+                s.count(&root("quiet", 0.0), t0 + ms);
+                s.count(&root("ruled", 2.0), t0 + ms);
+                s.count(&root("ruled", -1.0), t0 + ms);
+            }
+        }
+        // The next bucket begins: the rates made.
+        s.count(&root("busy", 1.0), t0 + 10_000);
+        let busy = rate_of(&s, "service:busy,env:prod").unwrap();
+        // Its share: 10 less the quiet one's 1, of its 100 a second.
+        assert!((busy - 0.09).abs() < 1e-9, "{busy}");
+        assert_eq!(rate_of(&s, "service:quiet,env:prod"), Some(1.0));
+        assert_eq!(rate_of(&s, "service:ruled,env:prod"), None, "a user's decisions are not counted");
+        assert_eq!(s.signatures(), 2);
+        // A service not known: the whole traffic's rate, but never above the lowest given.
+        let d = rate_of(&s, "service:,env:").unwrap();
+        assert!((d - busy).abs() < 1e-9, "{d}");
+        // `busy` quiets to 5 a second: its rate holds while its busy buckets are in the window (six
+        // updates), then rises a fifth an update at the most: from 0.09 to all in some fourteen.
+        let mut prev = busy;
+        for step in 0..22 {
+            let base = t0 + 15_000 + step * 5_000;
+            for ms in (0..5_000).step_by(200) {
+                s.count(&root("busy", 1.0), base + ms);
+            }
+            let r = rate_of(&s, "service:busy,env:prod").unwrap();
+            assert!(r <= prev * MAX_RATE_INCREASE + 1e-12 && r >= prev - 1e-12, "step {step}: {prev} to {r}");
+            prev = r;
+        }
+        assert!((prev - 1.0).abs() < 1e-12, "back to all once quiet: {prev}");
+        // A whole window of no traffic: forgotten.
+        s.count(&root("other", 1.0), t0 + 200_000);
+        assert_eq!(rate_of(&s, "service:busy,env:prod"), None);
+    }
+
+    #[test]
+    fn a_trace_weighs_what_its_tracer_sampled_it_at_and_no_target_keeps_everything() {
+        let mut s = Sampler::new(10.0);
+        let t0 = 1_700_000_000_000i64;
+        // Ten a second, each sampled at a tenth by its tracer: a hundred a second.
+        for ms in (0..5_000).step_by(100) {
+            s.count(&Root { weight: 10.0, ..root("pre", 1.0) }, t0 + ms);
+        }
+        s.count(&root("pre", 1.0), t0 + 5_000);
+        let r = rate_of(&s, "service:pre,env:prod").unwrap();
+        assert!((r - 0.1).abs() < 1e-9, "{r}");
+        let mut all = Sampler::new(0.0);
+        for ms in (0..10_000).step_by(1) {
+            all.count(&root("busy", 1.0), t0 + ms);
+        }
+        assert!(all.rates().all(|(_, r)| r == 1.0));
     }
 }

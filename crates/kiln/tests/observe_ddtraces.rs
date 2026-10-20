@@ -408,3 +408,220 @@ fn datadog_s_tracer_straight_to_a_kiln_runner_is_kiln_s_traces_and_their_trace_m
     eprintln!("  ddtrace    {ORDERS} requests across two services straight to a kiln runner: the {kept_n} traces their tracers kept, whole; every request counted by the runner, once");
     Ok(())
 }
+
+/// A tracer's `/v0.4/traces` payload of one trace of `service`: its request's span and a call out,
+/// the request's sampling priority as its tracer decided it.
+fn v04_trace(service: &str, trace: u64, start_ns: i64, priority: f64) -> Vec<u8> {
+    fn s(out: &mut Vec<u8>, v: &str) {
+        out.push(0xd9);
+        out.push(v.len() as u8);
+        out.extend_from_slice(v.as_bytes());
+    }
+    fn u(out: &mut Vec<u8>, v: u64) {
+        out.push(0xcf);
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    let mut b = vec![0x91, 0x92];
+    for (span, parent, kind, name) in [(1u64, 0u64, "server", "GET /a"), (2, 1, "client", "GET")] {
+        b.push(0x8a);
+        for (k, v) in [("service", service), ("name", "web.request"), ("resource", name)] {
+            s(&mut b, k);
+            s(&mut b, v);
+        }
+        s(&mut b, "trace_id");
+        u(&mut b, trace);
+        s(&mut b, "span_id");
+        u(&mut b, trace.wrapping_mul(4) + span);
+        s(&mut b, "parent_id");
+        u(&mut b, if parent == 0 { 0 } else { trace.wrapping_mul(4) + parent });
+        s(&mut b, "start");
+        u(&mut b, start_ns as u64);
+        s(&mut b, "duration");
+        u(&mut b, 2_000_000);
+        s(&mut b, "meta");
+        b.push(0x82);
+        s(&mut b, "span.kind");
+        s(&mut b, kind);
+        s(&mut b, "env");
+        s(&mut b, "sampled");
+        s(&mut b, "metrics");
+        if parent == 0 {
+            b.push(0x81);
+            s(&mut b, "_sampling_priority_v1");
+            b.push(0xcb);
+            b.extend_from_slice(&priority.to_be_bytes());
+        } else {
+            b.push(0x80);
+        }
+    }
+    b
+}
+
+/// Sends `body` to a runner's receiver as a tracer does, sending it again while the runner is
+/// starting (503) or behind on its writes (429: nothing of it taken), for half a minute at the
+/// most; the runner's answer.
+fn put_traces(apm: u16, body: &[u8]) -> anyhow::Result<Value> {
+    let start = Instant::now();
+    loop {
+        let (code, answer) = common::raw(apm, "PUT", "/v0.4/traces", "Content-Type: application/msgpack\r\nDatadog-Meta-Lang: rust\r\n", body)?;
+        if code == 200 {
+            return Ok(serde_json::from_slice(&answer)?);
+        }
+        anyhow::ensure!(matches!(code, 429 | 503) && start.elapsed() < Duration::from_secs(30), "{code}: {}", String::from_utf8_lossy(&answer));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The spans `q` finds from `from` to `to`, counted.
+fn span_count(f: &Fleet, q: &str, from: i64, to: i64) -> anyhow::Result<u64> {
+    let a = f.call("POST", "/api/observe/v1/spans/aggregate", Some(&json!({ "query": q, "from": from, "to": to, "measure": "count" })))?;
+    Ok(at(&a, &["groups"]).as_array().into_iter().flatten().filter_map(|g| at(g, &["value"]).as_f64()).sum::<f64>().round() as u64)
+}
+
+/// Every value of every series `q` gives from `from` to `to`, in steps of `step`, summed.
+fn metric_sum(f: &Fleet, q: &str, from: i64, to: i64, step: i64) -> anyhow::Result<f64> {
+    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": step })))?;
+    Ok(at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum())
+}
+
+/// A runner of the fleet whose receiver takes tracers' traces on `apm`, with `env` besides,
+/// started; [`traced`] waits for it.
+fn start_traced(f: &mut Fleet, name: &str, apm: u16, env: &[(&str, &str)]) -> anyhow::Result<()> {
+    let addr = format!("127.0.0.1:{apm}");
+    let mut all = vec![("KILN_DD_TRACE_ADDR", addr.as_str())];
+    all.extend_from_slice(env);
+    f.start_runner_with(name, &all)
+}
+
+/// Waits for runner `name`'s receiver on `apm` to answer, and for the runner to replicate.
+fn traced(f: &Fleet, name: &str, apm: u16) -> anyhow::Result<()> {
+    until("the runner's receiver", Duration::from_secs(60), || Ok(common::raw(apm, "GET", "/info", "", b"").is_ok_and(|(c, _)| c == 200)), &|| f.logs())?;
+    until(
+        "the runner replicating",
+        Duration::from_secs(60),
+        || Ok(at(&f.call("GET", "/api/observe/v1/status", None)?, &["machines"]).as_array().is_some_and(|m| m.iter().any(|m| at(m, &["machine"]) == name && at(m, &["up"]) == true))),
+        &|| f.logs(),
+    )
+}
+
+/// [`start_traced`], then [`traced`].
+fn traced_runner(f: &mut Fleet, name: &str, apm: u16, env: &[(&str, &str)]) -> anyhow::Result<()> {
+    start_traced(f, name, apm, env)?;
+    traced(f, name, apm)
+}
+
+/// A tracer that keeps what kiln's sampler says (ddtrace's rule: a trace kept when its id times
+/// Knuth's factor, modulo 2^64, is below its rate's share of 2^64), sending straight to a runner whose
+/// target is five traces a second: its service's rate falls to its share; the traces it keeps are
+/// stored, the ones it drops are not; every one is counted by the trace metrics.
+#[test]
+#[ignore = "starts a kiln server and a runner as processes, and sends for half a minute"]
+fn a_tracer_straight_to_kiln_keeps_its_share_and_every_trace_is_counted() -> anyhow::Result<()> {
+    let t0 = now_ms();
+    let mut f = Fleet::new()?;
+    let apm = free_port()?;
+    traced_runner(&mut f, "web-1", apm, &[("KILN_DD_TARGET_TPS", "5")])?;
+    let (mut rate, mut sent, mut kept, mut late_sent, mut late_kept) = (1.0f64, 0u64, Vec::new(), 0u64, 0u64);
+    let started = Instant::now();
+    let mut t = 0u64;
+    while started.elapsed() < Duration::from_secs(26) {
+        t += 1;
+        let trace = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t);
+        let keep = trace.wrapping_mul(1_111_111_111_111_111_111) < (rate * u64::MAX as f64) as u64;
+        let rates = put_traces(apm, &v04_trace("busy", trace, now_ms() * 1_000_000, if keep { 1.0 } else { 0.0 }))?;
+        if let Some(r) = at(&rates, &["rate_by_service", "service:busy,env:sampled"]).as_f64() {
+            rate = r;
+        }
+        sent += 1;
+        if keep {
+            kept.push(trace);
+        }
+        if started.elapsed() > Duration::from_secs(16) {
+            late_sent += 1;
+            late_kept += u64::from(keep);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Some fifty a second against five: its share a tenth, once the window has seen it.
+    anyhow::ensure!((0.05..0.2).contains(&rate), "the rate it was given: {rate}");
+    let share = late_kept as f64 / late_sent.max(1) as f64;
+    anyhow::ensure!((0.03..0.3).contains(&share), "kept at the end: {late_kept} of {late_sent}");
+    // Stored: the traces it kept, whole, and none of those it dropped.
+    let (from, to) = (t0 - 60_000, now_ms() + 60_000);
+    until("the kept traces stored", Duration::from_secs(60), || Ok(span_count(&f, "service:busy", from, to)? >= 2 * kept.len() as u64), &|| f.logs())?;
+    let stored = span_count(&f, "service:busy", from, to)?;
+    anyhow::ensure!(stored == 2 * kept.len() as u64, "{stored} spans stored of {} kept traces", kept.len());
+    // Counted: every trace sent, kept or dropped, its request an entry and its call an exit.
+    let last = std::cell::Cell::new((0.0, 0.0));
+    until(
+        "every trace counted",
+        Duration::from_secs(90),
+        || {
+            let got = (metric_sum(&f, "sum:trace.hits{service:busy}.as_count()", from, to, 10_000)?, metric_sum(&f, "sum:trace.outbound.hits{service:busy}.as_count()", from, to, 10_000)?);
+            last.set(got);
+            Ok(got == (sent as f64, sent as f64))
+        },
+        &|| format!("{sent} sent; trace.hits and trace.outbound.hits {:?}\n{}", last.get(), f.logs()),
+    )?;
+    eprintln!("  sampled    {sent} traces sent, {} kept ({:.0}% at the end, its rate {rate:.3}); every one counted", kept.len(), 100.0 * share);
+    Ok(())
+}
+
+/// A runner stopped (as an operator's stop, or an upgrade's) while its tracer sends, and started
+/// again: what it took before it stopped is written as it stops, its spans and the buckets it was
+/// still counting, and what it counts once back is written beside what it wrote, not over it. Each
+/// half's spans end some forty seconds ahead (taken as they say, within a minute), so the bucket
+/// they are counted in is open across the stop and both of the runner's lives write it. As it
+/// starts again its port is held a moment (as its last build holds it until it retires, after an
+/// upgrade): its receiver takes the port once it is let go.
+#[test]
+#[ignore = "starts a kiln server and a runner as processes, and the runner again"]
+fn a_runner_stopped_and_started_again_counts_every_trace_once() -> anyhow::Result<()> {
+    const HALF: u64 = 200;
+    let t0 = now_ms();
+    let mut f = Fleet::new()?;
+    let apm = free_port()?;
+    let keep_all = [("KILN_DD_TARGET_TPS", "0")];
+    traced_runner(&mut f, "web-1", apm, &keep_all)?;
+    let bucket = (now_ms() + 40_000) / 10_000 * 10_000;
+    let send = |from: u64| -> anyhow::Result<()> {
+        for t in from..from + HALF {
+            put_traces(apm, &v04_trace("restarted", 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1), (bucket + 1_000 + t as i64) * 1_000_000, 1.0))?;
+        }
+        Ok(())
+    };
+    send(0)?;
+    let stopping = Instant::now();
+    f.stop_runner("web-1");
+    let stopped_in = stopping.elapsed();
+    let held = std::net::TcpListener::bind(("127.0.0.1", apm))?;
+    start_traced(&mut f, "web-1", apm, &keep_all)?;
+    until("the runner finding its port held", Duration::from_secs(60), || Ok(f.logs().contains("the receiver's port is held")), &|| f.logs())?;
+    drop(held);
+    traced(&f, "web-1", apm)?;
+    // The bucket is written twenty seconds past its end: the runner must be back before then.
+    let back = now_ms();
+    anyhow::ensure!(back < bucket + 25_000, "the runner was back {} s after the bucket began: too late for this scenario", (back - bucket) / 1000);
+    send(HALF)?;
+    let (from, to) = (t0 - 60_000, now_ms() + 120_000);
+    until("every span stored", Duration::from_secs(60), || Ok(span_count(&f, "service:restarted", from, to)? >= 4 * HALF), &|| f.logs())?;
+    let stored = span_count(&f, "service:restarted", from, to)?;
+    anyhow::ensure!(stored == 4 * HALF, "{stored} spans stored of {}", 4 * HALF);
+    let last = std::cell::Cell::new((0.0, 0.0));
+    until(
+        "every trace counted once",
+        Duration::from_secs(90),
+        || {
+            let got = (metric_sum(&f, "sum:trace.hits{service:restarted}.as_count()", from, to, 10_000)?, metric_sum(&f, "sum:trace.outbound.hits{service:restarted}.as_count()", from, to, 10_000)?);
+            last.set(got);
+            Ok(got == ((2 * HALF) as f64, (2 * HALF) as f64))
+        },
+        &|| format!("{} sent; trace.hits and trace.outbound.hits {:?}\n{}", 2 * HALF, last.get(), f.logs()),
+    )?;
+    // Both lives' writes, in the one bucket: each a point of its own, at its own place in it.
+    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:trace.hits{service:restarted}.as_count()", "from": bucket, "to": bucket + 10_000, "step": 1_000 })))?;
+    let points: Vec<f64> = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).collect();
+    anyhow::ensure!(points == [HALF as f64, HALF as f64] || points.len() == 1 && points.first() == Some(&((2 * HALF) as f64)), "the bucket's points: {points:?}");
+    eprintln!("  restarted  stopped in {:.1} s; {} traces sent across it, {stored} spans stored, every trace counted once ({points:?} in its bucket)", stopped_in.as_secs_f64(), 2 * HALF);
+    Ok(())
+}

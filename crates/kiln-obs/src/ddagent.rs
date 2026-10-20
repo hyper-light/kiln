@@ -87,10 +87,7 @@ fn tags_into<'a>(strings: &[&'a str], host: Option<&'a str>, device: Option<&'a 
 /// A `MetricPayload` into `out` (cleared; its room kept), each series' key found in or made into
 /// `keys`.
 pub fn series_into(body: &[u8], keys: &Keys, out: &mut Decoded) -> Result<Taken, AgentError> {
-    out.keys.clear();
-    out.samples.clear();
-    out.points = 0;
-    out.dropped = Default::default();
+    out.clear();
     let mut taken = Taken::default();
     let (mut strings, mut tags, mut key, mut points): (Vec<&str>, Vec<(&str, &str)>, Vec<u8>, Vec<(i64, f64)>) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for f in Fields::new(body) {

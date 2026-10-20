@@ -718,7 +718,7 @@ fn a_trace_flood_is_taken_or_refused_never_lost_counted_once_and_replicas_agree(
                         Err(e) => errors.push(format!("trace: {e}")),
                     }
                 }
-                if turn % 8 == 0 {
+                if turn.is_multiple_of(8) {
                     let to = common::now_ms();
                     match timed_get(port, &format!("/api/observe/v1/apm/services?from={}&to={to}", to - 900_000), &admin, Duration::from_secs(30)) {
                         Ok(d) => services.push(d.as_micros() as u64),

@@ -253,10 +253,7 @@ pub struct Taken {
 /// Decodes a request (unzipped) into `out` (cleared first; its room kept), its series' keys
 /// found in or made into `keys`, 1.0's metadata learned into `families`.
 pub fn decode_into(body: &[u8], version: Version, keys: &Keys, families: &Families, out: &mut Decoded) -> Result<Taken, WriteError> {
-    out.keys.clear();
-    out.samples.clear();
-    out.points = 0;
-    out.dropped = Default::default();
+    out.clear();
     let mut taken = Taken::default();
     let mut labels: Vec<(&str, &str)> = Vec::new();
     let mut key = Vec::new();

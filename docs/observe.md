@@ -29,7 +29,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
 | O-16 | Synthetic tests (§10.4): Datadog's API tests, HTTP (its time cut into DNS, connection, TLS, first byte, download and redirects), TCP, DNS and TLS (a certificate's days left), from the server and runners as locations; Datadog's assertions and series; a location failing or recovering an event once; alerting by a monitor each test owns (at least N locations failing for a while); tried once from the server, run now everywhere; their page; checked live (a server and a runner, an endpoint switched to 500 and back, a TLS endpoint with a CA of its own) and in browsers (§13) | done |
 | O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
-| O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Datadog's Agent's traces (§8.7: its indexed and inline forms, 532 ns a span, §12.23) and its stats as the trace metrics (every span counted before it sampled, its DDSketches' four mappings read within their accuracy; 6 µs and 0.2 allocations a grouped stat), checked live against Agent 7.84 and ddtrace 4.16 with traces kept and dropped (§13). Datadog's tracers straight to kiln on every runner (kiln in the Agent's place on its port: `/v0.4/traces`, `/v0.5/traces`, `/info`; 490 ns a span), every span counted by the runner's concentrator before a dropped trace is let go, as the Agent counts (133 ns a span); checked live with ddtrace 4.16, no Agent (§13). CI runs as traces, span monitors. Next: the map's calls from stats, an ingest-side sampler for tracers that keep everything (the Agent's target rate) | in progress |
+| O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Datadog's Agent's traces (§8.7: its indexed and inline forms, 532 ns a span, §12.23) and its stats as the trace metrics (every span counted before it sampled, its DDSketches' four mappings read within their accuracy; 6 µs and 0.2 allocations a grouped stat), checked live against Agent 7.84 and ddtrace 4.16 with traces kept and dropped (§13). Datadog's tracers straight to kiln on every runner (kiln in the Agent's place on its port: `/v0.4/traces`, `/v0.5/traces`, `/info`; 490 ns a span), every span counted by the runner's concentrator before a dropped trace is let go, as the Agent counts (133 ns a span); checked live with ddtrace 4.16, no Agent (§13). The Agent's priority sampler on every runner (each tracer told its services' rates, `rate_by_service`: ten traces a second a node, each service its share by water-filling), checked live: a busy service's rate falling to its share, every trace counted, kept or not (§13). A runner's last spans and buckets written as it stops, a bucket two of its lives write added and not written over, checked live across a stop (§13). CI runs as traces, span monitors. Next: the map's calls from stats | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -752,7 +752,14 @@ is taken. So a machine that stops (SIGTERM) waits a moment for its last writes a
 and one killed repeats at most what was written in its last second, and loses nothing it read
 (Vector's end-to-end acknowledgements; Datadog's Agent and Fluent Bit keep their places the same
 way). A runner keeps its loop up for those last writes, three seconds at the most: the supervisor is
-told of a shutdown five seconds after the runner, so it does not drop the runner first.
+told of a shutdown five seconds after the runner, so it does not drop the runner first. Its
+aggregators' last counts wait the same: each DogStatsD listener's bucket under way and the tracers'
+concentrator's open buckets (§8.7) are offered as it stops, each aggregator saying when its last is
+(`crate::observe::owes_last`), and then the runner waits for everything taken before them to be
+written (`Observe::settle`: nothing waiting, no write out). A runner that retires after an
+upgrade (its new build took over) writes its concentrator's buckets the same way before it goes.
+The receivers' ports (OTLP's, the trace agent's) are the new build's once the old one lets them go:
+a port held is tried again every five seconds.
 
 **Files** are known by their identity (device and inode on Unix; elsewhere the creation time, which
 a rename keeps) and by their leading bytes (a hash of the first KiB, kept with the place), looked
@@ -1078,18 +1085,34 @@ sends to the machine's kiln as to its Agent. `/v0.4/traces` and `/v0.5/traces` (
 trace an array of spans, each span a map; or the strings first in a table, each span an array of
 twelve) are read as the inline form is (`kiln_obs::ddtrace::Decoder::decode_tracer`), the trace's
 high bits from its `_dd.p.tid`, its host the runner's; `/info` says those two alone (no `/v0.6/stats`,
-`client_drop_p0s` false), so a tracer computes no stats of its own and drops no trace for them; each
-answer gives every service the rate 1 (`rate_by_service`), so a tracer keeps every trace its own
-rules do not drop; its other products' paths are answered and passed over. Every span is counted
-first by the runner's concentrator (`kiln_obs::ddtrace::Concentrator`), as the Agent's counts
-them: entries, exits by peer, and spans of no kind that are top-level (marked so by the tracer, or
-their parent none of their trace's, or another service's), in buckets of ten seconds of their
-starts, each written once twenty seconds past its end (the Agent's buffer), a span later than that
-in the oldest bucket still open (as the Agent shifts it), one more than a minute ahead in now's;
-2,000 groups a bucket at the most, the rest in one of `N/A`. Then a trace its tracer dropped (its
-priority below zero, `manual.drop`, a rule's rejection; or zero and no error in it) is not kept.
-The series carry the runner's name as their `host`, the one writer of each, so each is written once
-a bucket; the spans are `source:datadog-agent`, so no span is counted twice.
+`client_drop_p0s` false), so a tracer computes no stats of its own and drops no trace for them; its
+other products' paths are answered and passed over. Each answer gives each service its sampling
+rate (`rate_by_service`, `service:<name>,env:<env>`), the Agent's priority sampler's
+(`kiln_obs::ddtrace::Sampler`, `pkg/trace/sampler` read and followed): a node's traces counted by
+their root's service and env in buckets of five seconds, six kept; at each new bucket, the target
+(ten traces a second, the Agent's `target_traces_per_second`; `KILN_DD_TARGET_TPS`, 0 to keep every
+trace) spread evenly over them, what a quiet one leaves spread over the rest (water-filling), each
+against its busiest bucket (a moving max, against oscillation), a rate rising at most 1.2 times an
+update (some thirteen updates, a minute, to rise tenfold), a quiet signature forgotten; a service
+not known the rate the whole traffic would have, never above the lowest given. Only a tracer's own
+decisions (priority 0 or 1) are counted, each weighed by what its tracer sampled it at, as the
+Agent's `weightRoot` weighs it; a user's rules and `manual.keep`/`manual.drop` stand, and a trace
+with an error is kept whatever its priority (the Agent keeps some ten a second of those). Every span
+of a payload taken is counted by the runner's concentrator (`kiln_obs::ddtrace::Concentrator`; a
+payload refused, the runner behind on its writes, is counted as its tracer sends it again: once), as
+the Agent's counts them: entries, exits by peer, and spans of no kind that are top-level (marked so
+by the tracer, or their parent none of their trace's, or another service's), in buckets of ten
+seconds of their ends (the Agent's `start + duration`), each written once twenty seconds past its
+own end (the Agent's buffer), a span later than that (its bucket's wait over, written or not) in the
+oldest bucket not yet due (as the Agent shifts it), one ending more than a minute ahead in now's:
+nine buckets open at the most, whatever times a payload's spans say; 2,000 groups a bucket at the
+most, the rest in one of `N/A`. A bucket's points are at its start and an offset within it the
+runner draws as it starts, so a runner started again writes a bucket it wrote before beside that
+write, the two adding, not over it (a series keeps the later of two writes at one time, §4.5). Then
+a trace its tracer dropped (its priority below zero, `manual.drop`, a rule's rejection; or zero and
+no error in it) is not kept. The series carry the runner's name as their `host`, the one writer of
+each, so each is written once a bucket; the spans are `source:datadog-agent`, so no span is counted
+twice.
 
 Rows go in segments of 256 KiB (a log block's text, LZ4's ratio plateau, §12.6), each a write's
 item of its own (`SPANS`, as `LOGS` is), packed whole beside points and records and refused at the
@@ -2565,6 +2588,9 @@ trace's top-level spans and its keeping are known before its spans are written),
 reads faster than OTLP's: its strings are in one table, each a reference. Its spans' counting by the
 runner's concentrator (`kiln_obs::ddtrace::Concentrator::add`, two spans of a trace's ten: its
 request and its database's) is 133 ns a span counted, nothing allocated once its group is made.
+Counting a span by its end and a late one in the oldest bucket not yet due (§8.7) cost nothing
+measurable: the build before and this one in turn, ten times each on one core of a machine others
+were building on, 142 and 143 ns at their fastest, the median of their ten differences 0.5 ns.
 
 Its stats (`kiln_obs::ddtrace::stats_into`): a grouped stat a service's resource of 50 hits, its
 sketch twenty bins, each written as some 23 series (its counts, its durations' sum, least, most and
@@ -2854,9 +2880,12 @@ only the aggregates its listener asked); an event in the event stream, a service
 (`status:error`, `@check_status:critical`); a count that stopped falling to zero; two lines that do
 not read counted, nothing else lost. Then Datadog's own client (datadog-py 0.55: increments,
 decrements, gauges, sets, 100 timings, distributions, `gauge_with_timestamp`, an event and a service
-check, over UDP and the Unix socket): every one as sent. What the API refuses (a TCP address, the
-99.9th percentile, an unknown aggregate) is refused; removed, a listener closes where it was opened,
-its socket file with it. 2026-10-19: passes (141 s). The flood beside it is §12.20's.
+check, over UDP and the Unix socket): every one as sent. The runner stopped (SIGTERM) a moment after
+a count came, early in its bucket: the bucket under way written as it stops and waited for, the
+count all there (the runner gone in 0.4 s; without the wait, none of it). What the API refuses (a
+TCP address, the 99.9th percentile, an unknown aggregate) is refused; removed, a listener closes
+where it was opened, its socket file with it. 2026-10-20: passes (129 s). The flood beside it is
+§12.20's.
 
 **Prometheus's remote write** (`crates/kiln/tests/observe_remote_write.rs`; Docker): a kiln server
 and a runner, and Prometheus 3.7 itself scraping its own `/metrics` every 2 s, writing what it
@@ -2918,6 +2947,26 @@ and `/v0.5/traces` and no client drops; the same 20 kept traces whole and none o
 every request counted by the runner's concentrator (40 and 8, the database's 40 and 8), `host` the
 runner's. (The services flush their tracers and say they are up on control ports of their own,
 untraced, so no driver's call is a trace.) 2026-10-20: both pass (136 s, on fedora).
+
+Kiln's own sampler, against a tracer straight to a runner whose target is five traces a second (no
+Docker): the tracer keeps by ddtrace's own rule (a trace kept when its id times Knuth's factor,
+modulo 2^64, is under its rate's share of 2^64), against the rates the runner answers, sending some
+fifty traces a second for 26 s. The service's rate falls to 0.104 and the last ten seconds keep 9%;
+the 293 kept stored whole and none of those dropped; `trace.hits` and `trace.outbound.hits` 1,198
+each, every trace sent, kept or dropped. Its first runs found a fault since fixed: a decoding handed
+back to the receivers' spares kept its samples (the owner takes their keys alone), so the
+concentrator's task took the next one it was handed for one refused and offered it again, its keys
+gone, every second after: only the first bucket was ever written (15 and 179 counted of some 1,200).
+Spares are handed out empty now (`Decoded::clear`), and the task keeps what is refused itself, and a
+payload refused (429) is counted as it comes again, not twice. Then a runner stopped (SIGTERM)
+while its tracer sends, and started again, its port held a moment as it starts (as its last build
+holds it until it retires after an upgrade): 200 traces before and 200 after, their spans ending
+forty seconds ahead, so one bucket is open across the stop. The runner gone in 1.7 s; its receiver
+on its port once let go; every span stored (800), every trace counted once (400 hits, 400 calls
+out), the bucket's two writes points of their own (200 and 200, each life's offset within it).
+Without the stop's wait (`crate::observe::last_written` answering at once, an A/B), the scenario
+fails: spans taken just before the stop are lost, and so is DogStatsD's count below. 2026-10-20:
+all four pass (373 s, on fedora).
 
 **Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
 KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and

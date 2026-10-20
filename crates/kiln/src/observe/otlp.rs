@@ -747,14 +747,29 @@ fn addr_of(var: &str, port: u16) -> Option<std::net::SocketAddr> {
     }
 }
 
-/// Serves the runner's receiver until `shutdown`. A port another collector holds is said and left.
+/// Serves the runner's receiver until `shutdown`. A port held is said once and tried again.
 pub async fn serve_local(addr: std::net::SocketAddr, o: Observe, shutdown: crate::rt::Shutdown) {
     use futures::FutureExt as _;
-    let listener = match std::net::TcpListener::bind(addr).map_err(anyhow::Error::from).and_then(|l| hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(l), 128).map_err(|e| anyhow::anyhow!("{e}"))) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(%addr, error = %format!("{e:#}"), "the receiver did not start (another collector or Agent on the port?)");
-            return;
+    let bind = || {
+        std::net::TcpListener::bind(addr)
+            .map_err(anyhow::Error::from)
+            .and_then(|l| hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(l), 128).map_err(|e| anyhow::anyhow!("{e}")))
+    };
+    // A port held (another collector or Agent on it, or this machine's last build, which keeps its
+    // own until it retires after an upgrade) is tried again every five seconds: taken once let go.
+    let mut said = false;
+    let listener = loop {
+        match bind() {
+            Ok(l) => break l,
+            Err(e) => {
+                if !said {
+                    tracing::warn!(%addr, error = %format!("{e:#}"), "the receiver's port is held (another collector or Agent, or this machine's last build retiring): tried again every 5 s");
+                    said = true;
+                }
+                if !shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return;
+                }
+            }
         }
     };
     tracing::info!(%addr, "OTLP receiver listening (HTTP/1.1 and HTTP/2: OTLP/HTTP and OTLP/gRPC)");

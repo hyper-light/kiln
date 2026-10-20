@@ -617,9 +617,9 @@ fn main() {
         let body = tracer_v05(traces, 1, at as i64);
         let tracer = kiln_obs::ddtrace::Tracer { language: "python", container: "", host: "web-1" };
         let mut d = kiln_obs::ddtrace::Decoder::new();
-        let mut stats = Vec::new();
+        let (mut stats, mut roots) = (Vec::new(), Vec::new());
         let mut out = Spans::default();
-        d.decode_tracer(true, &body, &tracer, 0, &mut out, &mut stats).unwrap();
+        d.decode_tracer(true, &body, &tracer, 0, &mut out, &mut stats, &mut roots).unwrap();
         let spans = out.spans as usize;
         assert_eq!(spans, traces * 10);
         d.give(out);
@@ -628,8 +628,9 @@ fn main() {
                 .map(|_| {
                     let mut o = Spans::default();
                     stats.clear();
+                    roots.clear();
                     let t = Instant::now();
-                    d.decode_tracer(true, &body, &tracer, 0, &mut o, &mut stats).unwrap();
+                    d.decode_tracer(true, &body, &tracer, 0, &mut o, &mut stats, &mut roots).unwrap();
                     let took = t.elapsed().as_nanos() as u64;
                     d.give(o);
                     took
@@ -640,7 +641,8 @@ fn main() {
         alloc::begin();
         let mut o = Spans::default();
         stats.clear();
-        d.decode_tracer(true, &body, &tracer, 0, &mut o, &mut stats).unwrap();
+        roots.clear();
+        d.decode_tracer(true, &body, &tracer, 0, &mut o, &mut stats, &mut roots).unwrap();
         let c = alloc::end();
         let f1 = faults::read().unwrap();
         d.give(o);

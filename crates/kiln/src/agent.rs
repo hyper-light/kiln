@@ -987,7 +987,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
 
     loop {
         if let Some(until) = lingering
-            && (crate::observe::collect::get().is_none_or(|c| c.stopped()) || Instant::now() >= until)
+            && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
         {
             return Ok(());
         }
@@ -1005,6 +1005,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         if retiring && jobs.is_empty() && terms.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
+            // What its tracers' spans counted, written before it goes, as a stop's is.
+            crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
             if let Some(job) = retire_job.take() {
                 uplink.msg(AgentMsg::UpgradeLog { job, line: "the old runner's last jobs are done: it retired".to_owned() }).await;
                 crate::rt::sleep(Duration::from_millis(300)).await;
@@ -1042,13 +1044,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 for r in jobs.values() {
                     r.cancel.cancel();
                 }
-                match crate::observe::collect::get() {
+                // What this machine collected and counted written before it goes: three seconds
+                // at the most.
+                let collecting = match crate::observe::collect::get() {
                     Some(c) if !c.stopped() => {
                         c.stop_signal();
-                        lingering = Some(Instant::now() + Duration::from_secs(3));
+                        true
                     }
-                    _ => return Ok(()),
+                    _ => false,
+                };
+                if !collecting && crate::observe::last_written() {
+                    return Ok(());
                 }
+                lingering = Some(Instant::now() + Duration::from_secs(3));
             }
             #[cfg(not(unix))]
             Ev::Bg(b) => match b {},

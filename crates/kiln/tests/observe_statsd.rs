@@ -305,6 +305,19 @@ fn dogstatsd_is_taken_as_datadog_s_agent_takes_it_on_every_machine() -> anyhow::
         None => eprintln!("  Datadog's client: no Python with the datadog package (KOBS_DOGSTATSD_PYTHON); the protocol's datagrams only"),
     }
 
+    // The runner stopped (SIGTERM, as an operator's stop or an upgrade's) a moment after a count
+    // came, its bucket under way: written as it stops, and waited for, so none of it is lost.
+    early_in_bucket();
+    let t2 = now_ms();
+    udp.send_to(b"e2e.stopping:9|c|#phase:stop", ("127.0.0.1", p_runner))?;
+    std::thread::sleep(Duration::from_millis(300));
+    let stopping = Instant::now();
+    f.stop_runner("r1");
+    let stopped_in = stopping.elapsed();
+    anyhow::ensure!(now_ms().rem_euclid(10_000) >= t2.rem_euclid(10_000), "the runner stopped within the bucket the count came in");
+    until_total(&f, "sum:e2e.stopping{host:r1}.as_count()", 9.0, t2 - 60_000, within)?;
+    eprintln!("  stopped    the runner stopped in {:.1} s, its bucket under way written", stopped_in.as_secs_f64());
+
     // Removed, a listener is closed where it was opened: its socket file goes too.
     let (code, _) = f.request("DELETE", "/api/observe/v1/statsd/edge", None)?;
     anyhow::ensure!(code == 204);

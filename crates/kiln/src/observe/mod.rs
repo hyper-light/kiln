@@ -34,6 +34,37 @@ pub mod wire;
 
 pub use owner::{Observe, Out, Role, SERVER, Settings, View};
 
+/// What a node's aggregators owe as it stops (the tracers' concentrator, each DogStatsD listener):
+/// each registered as it starts and told done once its last offer is made; then one wait for all of
+/// it to be written.
+static LAST: std::sync::Mutex<(Vec<ingest::Ack>, Option<ingest::Ack>)> = std::sync::Mutex::new((Vec::new(), None));
+
+/// An aggregator's debt to a node stopping: set once its last offer is made.
+pub(crate) fn owes_last() -> ingest::Ack {
+    let ack = ingest::Ack::new();
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.0.retain(|a| !a.done());
+    last.0.push(ack.clone());
+    ack
+}
+
+/// Whether what the node's aggregators owed as it stops is written: each one's last offer made, and
+/// then everything taken before them written (asked once, the first time they all are).
+pub fn last_written() -> bool {
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !last.0.iter().all(ingest::Ack::done) {
+        return false;
+    }
+    if let Some(written) = &last.1 {
+        return written.done();
+    }
+    let Some(o) = api::get() else { return true };
+    let written = ingest::Ack::new();
+    o.settle(written.clone());
+    last.1 = Some(written);
+    false
+}
+
 /// An id for something kept by name (`m…` a monitor, `d…` a dashboard): 64 random bits, none of
 /// those `taken`. (A UUIDv7's first digits are its millisecond: two made in one would be the same.)
 pub(crate) fn fresh_id(prefix: &str, taken: impl Fn(&str) -> bool) -> String {

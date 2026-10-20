@@ -71,6 +71,15 @@ struct Scratch {
 }
 
 impl Decoded {
+    /// Emptied of what it held, its room kept: as a decoder starts, and as it is handed back to be
+    /// decoded into again.
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.samples.clear();
+        self.points = 0;
+        self.dropped = Dropped::default();
+    }
+
     /// The bytes its buffers hold room for (what keeping it for the next request keeps).
     pub fn capacity_bytes(&self) -> usize {
         let s = &self.scratch;
@@ -455,10 +464,7 @@ pub fn decode_with(body: &[u8], now_ms: i64, keys: &Keys) -> Result<Decoded, Otl
 /// for them.
 pub fn decode_into(body: &[u8], now_ms: i64, keys: &Keys, out: &mut Decoded) -> Result<(), OtlpError> {
     let mut d = std::mem::take(out);
-    d.keys.clear();
-    d.samples.clear();
-    d.points = 0;
-    d.dropped = Dropped::default();
+    d.clear();
     // A sample takes some 32 bytes of a request: room for them all at once, most of the time.
     d.keys.reserve(body.len() / 32);
     d.samples.reserve(body.len() / 32);

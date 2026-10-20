@@ -515,6 +515,8 @@ fn offer_records(shared: &Shared, records: Vec<Record>) {
 fn flush_loop(shared: &Shared, stop: &crate::rt::Shutdown, server: &crate::rt::Shutdown) {
     let mut held: VecDeque<kiln_obs::otlp::metrics::Decoded> = VecDeque::new();
     let mut seen = 0u64;
+    // Its last bucket, owed as the node stops (it lingers for it to be written).
+    let owed = super::owes_last();
     loop {
         let ending = stop.is_cancelled() || server.is_cancelled();
         if ending {
@@ -581,6 +583,7 @@ fn flush_loop(shared: &Shared, stop: &crate::rt::Shutdown, server: &crate::rt::S
             }
         }
         if ending {
+            owed.set();
             return;
         }
         std::thread::sleep(TICK);
