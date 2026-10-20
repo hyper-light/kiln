@@ -191,7 +191,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, microVM containment (W13) left |
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
-| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); attachments, experiments left |
+| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); attachments' own isolation, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
@@ -1849,6 +1849,9 @@ W20.
     their steps and logs), and the plan takes their reports as they were.
     - Debug reruns turn on step and runner debug.
     - Legs and the plan log are kept per attempt.
+    - Who started each attempt after the first is kept (`ci_run_attempts`), and is its
+      `github.triggering_actor`: a person by their name, an agent by the person it acts for,
+      GitHub's Re-run by the login that pressed it (`w05_r17_triggering_actor_is_who_reran_it`).
     - Checked end to end on a local server: `kiln rerun --failed` kept `a`'s output for `b`, and
       `--job a --debug` reran the chain with debug lines.
   - Replay (R25) goes on from the run's last log entry across attempts. It hands the plan the
@@ -5469,9 +5472,53 @@ R04, R05's skills, and R06's rights.
   The dispatcher has the change before it answers. Settings → CI's routing rules and the
   Runners page's pools show a save's warnings. Checked end to end
   (`w20_r03_writes_say_what_they_do`), and in Chromium and WebKit.
+- *R02's* `images.build` (`ci.images.build`, W21-R08's image builder): a runner image's
+  definition, saved or not, built by `kiln/build-image@v1` where `runs_on` names, and with `push`
+  pushed and registered (the server owner's only). Checked by `tests/registry.rs`
+  (`w21_r08_an_image_built_from_its_editor`).
+- *R07* (`POST /api/ci/repos/:repo/agent`, `ci.runs.ask`): an agent asks for a run of a workflow
+  whose `on: agent` names it (or `*`), with inputs typed as `workflow_dispatch`'s are; a workflow
+  that doesn't name it refuses it (403). Checked with W03-R09's events
+  (`w03_r09_native_activity_and_kiln_events`).
+- *R08 to R10* (`crate::ci::attach`; docs/agents.md, "Attached agents"): attachments and
+  incidents, by API, on Agents → Attached and in trunk's `.kiln/agents.yaml`. Since:
+  - the rest of R08's wakes:
+    - `slow`: a green run whose critical path took longer than the median of its workflow's last
+      ten green runs on its branch (three at least) by more than `limits.slow_percent` (25%);
+    - `unroutable`: a job no runner meets what it asks for, a minute on, one incident for each
+      set of unmet requirements;
+    - `degraded`: an app kiln CD deploys turning degraded wakes what looks after its environment.
+  - "Attach agent" on a repository (its details), a workflow (its file in the editor), a run (its
+    header: its workflow), an environment (its page) and a runner pool (its detail). Each opens
+    Agents → Attached with the form filled in for it, offering what can wake an agent there (an
+    environment's: its deployments failing, its apps degrading, mentions, a schedule).
+  - R10's other daily limits:
+    - tokens (`tokens_per_day`, 5,000,000: its incidents' sessions together);
+    - runner minutes (`runner_minutes_per_day`, 300): the runs its agents asked for, and the
+      attempts they reran. kiln now records who started each rerun (`ci_run_attempts`, and
+      GitHub's `github.triggering_actor`: the person, for an agent the one it acts for).
+
+    Past either, an incident waits for a person, saying which. `.kiln/agents.yaml`'s `per-day:
+    { tokens, runner-minutes }` are held to (tokens as `5M`, `500k` or a number).
+
+  Checked by `w20_r08_unroutable_is_what_no_runner_meets`,
+  `w20_r08_slow_is_its_critical_path_past_the_median`, `w20_r10_runner_minutes_a_day` and
+  `w05_r17_triggering_actor_is_who_reran_it`. The end-to-end
+  `w20_r08_what_happens_wakes_the_agent_attached_to_it` now has a degraded app too. The run
+  page's Attach agent is checked in Chromium and WebKit (`ci/ui/pages_check.mjs`).
+- *AC03* (`tests/ops.rs`, `w20_ac03_authority`), on a server with a failed run. Two agents are
+  refused its rerun through every surface: the route, the operation over HTTP, its MCP tool,
+  code mode, `kiln rerun` and `kiln op`, each refusal naming `runs.rerun`:
+  - one whose grant only reads, acting for a developer who may rerun;
+  - one with the owner's grant, acting for a viewer.
+
+  Both read the run through the same surfaces, and nothing reran it. An agent with a
+  developer's grant reruns it.
 - *Left*:
-  - R02's `images.build` (with W13-R11's API);
-  - R07 to R11, AC01 to AC04, and AC06.
+  - R08's isolation (`container`, `firecracker`, `shards` with an Agentfile): an incident's agent
+    works in the folder its attachment names. Workspaces of their own wait on Slates and shards
+    (docs/agentic.md);
+  - R11, AC01, AC02, AC04 and AC06.
 
 ### W21 UI
 

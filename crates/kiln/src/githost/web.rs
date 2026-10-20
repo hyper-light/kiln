@@ -36,14 +36,16 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         ("check_run", "rerequested") => {
             let run = v.pointer("/check_run/external_id").and_then(Value::as_str).unwrap_or_default().to_owned();
             if !run.is_empty() {
-                let r = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "all" })).await;
+                let by = v.pointer("/sender/login").and_then(Value::as_str).unwrap_or("github").to_owned();
+                let r = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "all" }), &by).await;
                 hub.store.audit("github".into(), "ci.runs.rerun".into(), format!("{run} from GitHub's Re-run ({})", if r.is_ok() { "started" } else { "refused" })).await;
             }
         }
         ("check_suite", "rerequested") => {
             let (sha, full) = (v.pointer("/check_suite/head_sha").and_then(Value::as_str).unwrap_or_default().to_owned(), v.pointer("/repository/full_name").and_then(Value::as_str).unwrap_or_default().to_owned());
             for run in runs_of(hub, &full, &sha).await {
-                let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" })).await;
+                let by = v.pointer("/sender/login").and_then(Value::as_str).unwrap_or("github").to_owned();
+                let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" }), &by).await;
             }
         }
         // GitHub Actions' runs, for repositories whose CI provider it is (W23-R03).

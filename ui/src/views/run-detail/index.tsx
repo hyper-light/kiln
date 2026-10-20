@@ -21,7 +21,7 @@ import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { IncidentCard } from "@/views/attach/card";
 import { EventIcon, LiveDuration, RelTime } from "../shared";
-import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
+import { AttachAgentLink, AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
 
 const LogViewer = React.lazy(() => import("./log-viewer"));
@@ -177,6 +177,7 @@ function RunBody({ id }: { id: string }) {
               <EditWorkflowLink detail={ciDetail} />
               <WorkflowInsightsLink detail={ciDetail} />
               <CompareLink detail={ciDetail} />
+              <AttachAgentLink detail={ciDetail} />
             </div>
             {shownAttempt === ciDetail.run.attempt && <CiRunActions detail={ciDetail} jobs={[...new Set(ciDetail.legs.map((l) => (l.job ?? "").split("/")[0] ?? "").filter((j) => j !== ""))]} />}
           </div>

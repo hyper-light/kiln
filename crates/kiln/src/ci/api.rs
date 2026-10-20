@@ -166,7 +166,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::GET, ["runs", id, "artifacts"]) => super::runs_api::part(hub, id, "artifacts", q).await,
         (&Method::GET, ["runs", id, "artifacts", artifact, "download"]) => super::runs_api::download(hub, id, artifact).await,
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
-        (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body).await,
+        (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
         (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["environments"]) => super::environments::route(hub, method, &[], q, body, caller).await,

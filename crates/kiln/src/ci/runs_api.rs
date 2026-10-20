@@ -480,7 +480,7 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
 /// was (a new run; `{ mode: "all" }`, the default).
-pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> {
+pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
     // Another provider's run (W23): its provider reruns it.
     if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
@@ -515,7 +515,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
     // "Run anyway" (W08-R10): no leg takes an earlier result over.
     let no_reuse = body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, by: by.to_owned(), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),

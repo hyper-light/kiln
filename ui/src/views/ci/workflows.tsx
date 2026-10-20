@@ -9,6 +9,7 @@
 import * as React from "react";
 import { Download } from "lucide-react";
 import { api } from "@/api/client";
+import { attachHref } from "@/api/attach";
 import { ci, type CiCatalogEntry, type CiMatrix, type CiOutline, type CiPreview, type CiSave } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
@@ -361,6 +362,11 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         title={path}
         actions={
           <>
+            {!isAction && (
+              <Button asChild size="xs" variant="ghost">
+                <Link to={attachHref(`workflow:${repo}:${path}`)}>Attach agent</Link>
+              </Button>
+            )}
             <CopyButton text={text} label="Copy" />
             <Button size="xs" variant="ghost" onClick={download}>
               <Download /> Download

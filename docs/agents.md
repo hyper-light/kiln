@@ -490,18 +490,23 @@ one; `attachments.*` and `incidents.*` do the same for agents and code mode. An 
   tells instead (`session`).
 - **What wakes it** (`wake`): `failure` (a run of what it looks after failed, or a deployment to its
   environment), `flaky` (a run had flaky tests), `ejected` (the land queue took a change out),
-  `stuck` (a job waited for a runner past `limits.stuck_minutes`), `mention` (`@name` in a comment),
-  `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two minutes), `upgrade`
-  (an upgrade failed) and `check` (kiln's checks of the machine, every half hour, found something
-  failing).
+  `stuck` (a job waited for a runner past `limits.stuck_minutes`), `slow` (a green run's critical
+  path took longer than the median of its workflow's last green runs on its branch by more than
+  `limits.slow_percent`), `unroutable` (a job no runner meets what it asks for, a minute on),
+  `degraded` (an app kiln CD deploys to its environment turned degraded), `mention` (`@name` in a
+  comment), `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two
+  minutes), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine, every half
+  hour, found something failing).
 - **What it may do** (`can`, W20-R09): it always reads what it looks after; beyond that `rerun`,
   `cancel`, `diagnose`, `fix`, `edit-pipelines`, `quarantine`, `comment`, `experiment`,
   `manage-runners`, `deploy`, `land`. Its agent acts for whoever attached it (who needs
   `agents.attach` there), and its calls to kiln are held to these capabilities on what it looks
   after: kiln refuses it the rest.
-- **Its limits** (`limits`): incidents a day (`sessions_per_day`, 10), reruns per failure
-  (`reruns_per_failure`, 2), when a job is stuck (`stuck_minutes`, 15); **its playbook**, and
-  **who reviews** what it opens.
+- **Its limits** (`limits`): incidents a day (`sessions_per_day`, 10), tokens a day
+  (`tokens_per_day`, 5,000,000, its agents' sessions together), runner minutes a day
+  (`runner_minutes_per_day`, 300, the runs its agents asked for and the attempts they reran),
+  reruns per failure (`reruns_per_failure`, 2), when a job is stuck (`stuck_minutes`, 15), when a
+  run is slow (`slow_percent`, 25); **its playbook**, and **who reviews** what it opens.
 
 What wakes it opens an **incident**, or adds to the open one with the same signature (what failed
 and how, with numbers, paths and hashes taken out), so one cause never starts two agents. Its
@@ -511,7 +516,8 @@ and how to report. It says what it found with `incidents.report`: `class` (flaky
 infrastructure, regression, pipeline, dependency, other), `summary`, `links`, `state` (reported,
 resolved; dismissing is a person's). A failure that keeps coming back from reruns past its limit
 tells the agent to stop rerunning. An incident waits for a person instead (`waiting`, saying why)
-while its attachment is paused, past its limit for the day, or when its agent couldn't start.
+while its attachment is paused, past one of its limits for the day, or when its agent couldn't
+start.
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
 its workflows' and environments' too. Mission Control puts the agents an attachment woke under it,
 and their questions come to Needs you and to notifications as any agent's do. A runner doctor's
@@ -529,7 +535,9 @@ open incident shows in the runner's row in Settings → Updates.
 | `incidents.report` | `POST /api/incidents/:id/report` | `{class?, summary?, links?, state?}`: its agent, or a person who may attach there |
 
 A run that woke an attached agent shows the incident on its page: who looks after it, where it
-stands, what its agent found and opened, and a link to the agent.
+stands, what its agent found and opened, and a link to the agent. **Attach agent** on a
+repository, a workflow, a run, an environment or a runner pool opens Agents → Attached with the
+form filled in for it.
 
 **In the repository.** A repository can keep its attachments in trunk's `.kiln/agents.yaml`, read
 like the rest of its policy (from trunk, never from a change, within a minute of landing):
@@ -545,7 +553,7 @@ agents:
     attach: { pipelines: [ci], branches: [main] }   # or environments: [production]
     wake: [failure, flaky, stuck, ejected]          # or { schedule: "0 6 * * 1" }
     can: [read, rerun, diagnose, fix, comment, quarantine]
-    limits: { per-day: { sessions: 10 }, reruns-per-failure: 2 }
+    limits: { per-day: { sessions: 10, tokens: 5M, runner-minutes: 300 }, reruns-per-failure: 2 }
     instructions: .kiln/agents/ci-doctor.md         # its playbook: a file on trunk, or the words
     reviewers: [ada]
 ```
@@ -557,7 +565,7 @@ one) is left out, and the server's log says why. `@name` in a comment calls a re
 attachment only on that repository's diffs.
 
 Not yet: a workspace of its own per incident (its agent works in the folder named; workspaces wait
-on Slates), and the file's per-day runner minutes and tokens, which are read but not held to.
+on Slates).
 
 ## Commands
 

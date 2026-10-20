@@ -86,7 +86,7 @@ pub enum Msg {
     /// it is cancelled. `false` when the run waits for no approval.
     ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
-    Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, reply: async_channel::Sender<Result<u32, String>> },
+    Rerun { run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, by: String, reply: async_channel::Sender<Result<u32, String>> },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
     Executor { agent: String, json: String },
     /// The stored pools changed: read them again.
@@ -750,8 +750,8 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse).await.map_err(|e| format!("{e:#}"));
+            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, by, reply } => {
+                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, &by).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(r);
                 Ok(())
             }
@@ -1243,7 +1243,8 @@ impl Dispatch {
     /// A new attempt of a finished run (W05-R17): the same run, `github.run_attempt` one more,
     /// planned again from its saved workflow and input. The jobs `mode` selects run again; the
     /// others keep the last attempt's legs and results, which the plan takes as they were.
-    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, keep_failed: Option<u32>, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool) -> anyhow::Result<u32> {
+    #[allow(clippy::too_many_arguments)]
+    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, keep_failed: Option<u32>, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>, no_reuse: bool, by: &str) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
         }
@@ -1274,10 +1275,12 @@ impl Dispatch {
             .filter(|(_, _, j, _)| j.as_deref().is_some_and(|j| !again.contains(&top(j))))
             .filter_map(|(id, key, _, _)| last.get(key).map(|rep| (key.clone(), (report_from_json(rep), id.clone()))))
             .collect();
-        let attempt = runs::start_attempt(&self.hub, run).await?;
+        let attempt = runs::start_attempt(&self.hub, run, by).await?;
         let mut github = v.get("github").cloned().unwrap_or_default();
         if let Some(o) = github.as_object_mut() {
             o.insert("run_attempt".into(), serde_json::Value::String(attempt.to_string()));
+            // Whoever reran it, GitHub-exact: the person (for an agent, whom it acts for).
+            o.insert("triggering_actor".into(), serde_json::Value::String(login_of(by)));
         }
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
@@ -2434,6 +2437,13 @@ fn conclusion_of(s: Option<&str>) -> PlanC {
     }
 }
 
+/// A principal as GitHub's contexts name people: `user:lead`, or `agent:… for user:lead`, is `lead`.
+fn login_of(by: &str) -> String {
+    let who = by.rsplit(" for ").next().unwrap_or(by);
+    let who = who.rsplit(" of ").next().unwrap_or(who);
+    who.strip_prefix("user:").unwrap_or(who).to_owned()
+}
+
 fn report_json(r: &LegReport) -> String {
     serde_json::json!({
         "conclusion": r.conclusion,
@@ -2516,5 +2526,18 @@ fn graphql_of(api: &str) -> String {
     match api.trim_end_matches('/').strip_suffix("/v3") {
         Some(base) => format!("{base}/graphql"),
         None => format!("{}/graphql", api.trim_end_matches('/')),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
+    /// agent's is the person it acts for.
+    #[test]
+    fn w05_r17_triggering_actor_is_who_reran_it() {
+        assert_eq!(super::login_of("user:lead"), "lead");
+        assert_eq!(super::login_of("agent:abcdefgh for user:lead"), "lead");
+        assert_eq!(super::login_of("agent:abcdefgh@mac for user:lead"), "lead");
+        assert_eq!(super::login_of("octocat"), "octocat", "GitHub's Re-run, by its login");
     }
 }

@@ -186,7 +186,7 @@ pub fn ops() -> &'static [Op] {
                     "keep_failed": {"type": "integer", "description": "Minutes a failed leg is kept to look into (W17-R02)."}
                 }), &["run"]),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &v).await).await }),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &v, &cx.caller.name).await).await }),
             op!("ci.runs.approve", "Approve or reject a run's deployments waiting on environments' reviewers.", ro: false, destructive: false,
                 input: || schema(json!({
                     "run": {"type": "string", "description": RUN}, "state": {"type": "string", "enum": ["approved", "rejected"]},
@@ -282,7 +282,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("failed"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body).await).await
+                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
                 }),
             op!("ci.runs.rerun_job", "A new attempt of a finished run with one job and the jobs that need it.", ro: false, destructive: false,
                 input: || schema(json!({"run": {"type": "string", "description": RUN}, "job": {"type": "string", "description": "The job's id."}, "debug": {"type": "boolean"}, "keep_failed": {"type": "integer"}}), &["run", "job"]),
@@ -292,7 +292,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("job"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body).await).await
+                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
                 }),
             op!("ci.artifacts.list", "A run's artifacts: names, sizes, digests, expiry.", ro: true, destructive: false,
                 input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),

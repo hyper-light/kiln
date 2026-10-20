@@ -11,6 +11,7 @@
 import * as React from "react";
 import { Link, useSearchParams } from "@/lib/router";
 import { AlertTriangle, ArrowUpRight, FolderSync, HardDriveDownload, Play, Plus, RefreshCw, ScanSearch, GitBranch, Trash2 } from "lucide-react";
+import { attachHref } from "@/api/attach";
 import { api } from "@/api/client";
 import type { PlaceMachine, PlacesView, PlaceTask, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -555,6 +556,11 @@ function Details({
           {r && (
             <Button size="xs" variant="ghost" asChild>
               <Link to={`/runs?repo=${encodeURIComponent(r.id)}`}>Its runs</Link>
+            </Button>
+          )}
+          {r && (
+            <Button size="xs" variant="ghost" asChild>
+              <Link to={attachHref(`repo:${r.name}`)}>Attach agent</Link>
             </Button>
           )}
           <Button size="xs" variant="ghost" onClick={onClose}>

@@ -67,9 +67,14 @@ for (const [name, type, phone] of [
         const row = (env) => rows.getByRole("listitem").filter({ has: page.getByRole("link", { name: env, exact: true }) });
         check(who, "the board: acme/stages's environments, a row each", await until(async () => (await rows.getByRole("listitem").count()) >= 5), await text(rows));
         check(who, "production waits for its review", await until(async () => /Waiting for a review to deploy to production/.test(await text(row("production")))), await text(row("production")));
-        check(who, "production's rules", /owner reviews/.test(await text(row("production"))) && /main only/.test(await text(row("production"))), await text(row("production")));
-        check(who, "web deploys on its runners", /Host · label deploy-web/.test(await text(row("web"))), await text(row("web")));
-        check(who, "the file's environment, its kind from its clusters", /Kubernetes · in-cluster \/ web/.test(await text(row("cluster"))), await text(row("cluster")));
+        check(
+          who,
+          "production's rules",
+          await until(async () => /owner reviews/.test(await text(row("production"))) && /main only/.test(await text(row("production")))),
+          await text(row("production")),
+        );
+        check(who, "web deploys on its runners", await until(async () => /Host · label deploy-web/.test(await text(row("web")))), await text(row("web")));
+        check(who, "the file's environment, its kind from its clusters", await until(async () => /Kubernetes · in-cluster \/ web/.test(await text(row("cluster")))), await text(row("cluster")));
         await checkLayout(check, `${who}: the board`, page);
         await shot("environments-board");
       });

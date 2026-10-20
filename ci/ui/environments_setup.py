@@ -78,4 +78,10 @@ while run is None:
         if time.time() > deadline:
             sys.exit(f"{REPO}: no deployment waiting for its review")
         time.sleep(1)
+# The file's environment, once kiln reads trunk's file again (it keeps what it read for a while).
+deadline = time.time() + 90
+while "cluster" not in [e.get("name") for e in call("GET", f"/api/ci/environments?repo={REPO}").get("environments") or []]:
+    if time.time() > deadline:
+        sys.exit(f"{REPO}: its file's environment never showed")
+    time.sleep(1)
 print(json.dumps({"base": base, "admin": admin, "repo": REPO, "run": run, "fresh": fresh}))

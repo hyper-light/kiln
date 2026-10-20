@@ -4,6 +4,8 @@
 // - A leg's page: its step's log opened and searched for what the step printed.
 // - A run's data flow (W04-R23): an output from its step to the job that reads it and where, and
 //   an exported environment and the job that takes it.
+// - Attaching an agent from a run's page (W20-R08): the form open on its workflow, offering what
+//   wakes a workflow's agent.
 // - Comparing two runs: what differs, the files changed between them, the steps side by side.
 // - Log search: what every run printed, found among the repository's runs.
 // - The land queue, and a diff's stack.
@@ -44,6 +46,7 @@ const run = cfg.runs[cfg.runs.length - 1];
 const base = cfg.runs[0];
 const NOTE = "a note from the repository's own action";
 const diff = await (await fetch(`${cfg.base}/api/diffs/D1`, { headers: { Authorization: `Bearer ${cfg.admin}` } })).json();
+const runWorkflow = (await (await fetch(`${cfg.base}/api/ci/runs/${run}`, { headers: { Authorization: `Bearer ${cfg.admin}` } })).json()).run.workflow;
 
 for (const [name, type, phone] of [
   ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
@@ -96,6 +99,26 @@ for (const [name, type, phone] of [
         check(who, "and the exported environment, the job that takes it", /make\.exports\.env/.test(await text(panel)) && /TOOL_HOME/.test(await text(panel)) && /env-from/.test(await text(panel)), await text(panel));
         await checkLayout(check, `${who}: a run's data flow`, page);
         await shot("flow");
+      });
+
+      await flow(`${who}: attaching an agent from a run`, async () => {
+        await page.goto(`${cfg.base}/runs/${run}`);
+        await page.getByRole("link", { name: "Attach agent" }).first().click();
+        await page.waitForURL(/\/agents\/attached\?on=workflow/, { timeout: 15000 });
+        const form = page.locator("form.attach-form");
+        const asked = async () => `${await form.getByLabel("Repository", { exact: true }).inputValue()} ${await form.getByLabel("Workflow", { exact: true }).inputValue()}`;
+        check(who, "attaching an agent from a run: the form open on its workflow", await until(async () => (await asked()) === `acme/app ${runWorkflow}`, 20000), await asked());
+        const wakes = await text(form.locator("fieldset").first());
+        check(
+          who,
+          "and what wakes a workflow's agent: a slow run, a job that can't run anywhere; not an app degrading",
+          /slower than usual/.test(wakes) && /can't run anywhere/.test(wakes) && !/degrades/.test(wakes),
+          wakes,
+        );
+        await form.getByLabel("a run is slower than usual").check();
+        check(who, "and by how much, once it wakes on it", await until(async () => (await form.getByLabel("Slower than usual by").inputValue()) === "25"), await text(form));
+        await checkLayout(check, `${who}: attaching an agent`, page);
+        await shot("attach");
       });
 
       await flow(`${who}: comparing runs`, async () => {

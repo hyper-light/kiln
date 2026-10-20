@@ -17,9 +17,12 @@
 //!
 //! What wakes one: `failure` (a run of what it looks after failed, or a deployment to its
 //! environment), `ejected` (the land queue took a change out), `flaky` (a run had flaky tests),
-//! `stuck` (a job has waited past its limit for a runner), `schedule` (cron, UTC), `mention`
-//! (`@<name>` in a comment); for runners, `offline` (gone past its grace), `upgrade` (an upgrade
-//! failed) and `check` (kiln's checks of the machine found something failing).
+//! `stuck` (a job has waited past its limit for a runner), `slow` (a run's critical path took
+//! longer than its workflow's recent median by more than its margin), `unroutable` (a job no
+//! runner can take, W05), `degraded` (an app kiln CD deploys to its environment turned degraded,
+//! W15), `schedule` (cron, UTC), `mention` (`@<name>` in a comment); for runners, `offline` (gone
+//! past its grace), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine found
+//! something failing).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -35,7 +38,7 @@ use crate::ops::{Cx, Fail, Op, Out, path, schema};
 use crate::store::Repo;
 
 /// What wakes an attachment.
-pub const WAKES: &[&str] = &["failure", "ejected", "flaky", "stuck", "schedule", "mention", "offline", "upgrade", "check"];
+pub const WAKES: &[&str] = &["failure", "ejected", "flaky", "stuck", "slow", "unroutable", "degraded", "schedule", "mention", "offline", "upgrade", "check"];
 /// What wakes one on runners.
 const RUNNER_WAKES: &[&str] = &["offline", "upgrade", "check", "schedule"];
 /// What an attachment's agent may do (W20-R09).
@@ -144,11 +147,19 @@ pub struct Limits {
     pub reruns_per_failure: u32,
     /// How long a job waits for a runner before `stuck` wakes it.
     pub stuck_minutes: u32,
+    /// How much longer than its workflow's recent median a run's critical path takes, in percent,
+    /// before `slow` wakes it.
+    pub slow_percent: u32,
+    /// Tokens its agents spend in a day (UTC), its incidents' sessions together: past them, an
+    /// incident waits for a person.
+    pub tokens_per_day: u64,
+    /// Runner minutes the runs its agents ask for and rerun take in a day: past them, the same.
+    pub runner_minutes_per_day: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 }
+        Limits { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15, slow_percent: 25, tokens_per_day: 5_000_000, runner_minutes_per_day: 300 }
     }
 }
 
@@ -351,12 +362,28 @@ struct FileLimits {
     per_day: PerDay,
     reruns_per_failure: Option<u32>,
     stuck_minutes: Option<u32>,
+    slow_percent: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct PerDay {
     sessions: Option<u32>,
+    runner_minutes: Option<u64>,
+    /// `5000000`, `500k`, `5M`.
+    tokens: Option<serde_yaml::Value>,
+}
+
+/// A number of tokens as a file writes it: `5000000`, `500k`, `5M`, `1.5M`.
+fn amount(v: &serde_yaml::Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    let s = v.as_str()?.trim().replace('_', "");
+    let (digits, times) =
+        [("k", 1e3), ("K", 1e3), ("m", 1e6), ("M", 1e6), ("b", 1e9), ("B", 1e9)].iter().find_map(|(suffix, times)| s.strip_suffix(suffix).map(|d| (d.to_owned(), *times))).unwrap_or((s.clone(), 1.0));
+    let n: f64 = digits.trim().parse().ok()?;
+    (n.is_finite() && n >= 0.0).then(|| (n * times).round() as u64)
 }
 
 /// The attachments `.kiln/agents.yaml` of repository `repo` keeps, each made right as
@@ -380,6 +407,12 @@ pub fn parse_file(repo: &str, file: &str, text: &str) -> (Vec<Attachment>, Vec<S
             }
         }
         let kind = e.harness.trim().trim_start_matches("acp:").to_owned();
+        let tokens = e.limits.per_day.tokens.as_ref().map(amount);
+        if tokens == Some(None) {
+            errors.push(format!("{name}: `limits.per-day.tokens`: a number of tokens (5000000, 500k, 5M)"));
+            continue;
+        }
+        let d = Limits::default();
         let mut a = Attachment {
             id: format!("{}.{}", repo.replace('/', "__"), name.trim().to_ascii_lowercase()),
             name: name.clone(),
@@ -393,7 +426,14 @@ pub fn parse_file(repo: &str, file: &str, text: &str) -> (Vec<Attachment>, Vec<S
             wake,
             schedule,
             can: e.can,
-            limits: Limits { sessions_per_day: e.limits.per_day.sessions.unwrap_or(10), reruns_per_failure: e.limits.reruns_per_failure.unwrap_or(2), stuck_minutes: e.limits.stuck_minutes.unwrap_or(15) },
+            limits: Limits {
+                sessions_per_day: e.limits.per_day.sessions.unwrap_or(d.sessions_per_day),
+                reruns_per_failure: e.limits.reruns_per_failure.unwrap_or(d.reruns_per_failure),
+                stuck_minutes: e.limits.stuck_minutes.unwrap_or(d.stuck_minutes),
+                slow_percent: e.limits.slow_percent.unwrap_or(d.slow_percent),
+                tokens_per_day: tokens.flatten().unwrap_or(d.tokens_per_day),
+                runner_minutes_per_day: e.limits.per_day.runner_minutes.unwrap_or(d.runner_minutes_per_day),
+            },
             playbook: e.instructions.unwrap_or_default(),
             reviewers: e.reviewers,
             // Kept in the repository's trunk, as its policy is: it acts for kiln's owner, held to
@@ -537,8 +577,17 @@ pub fn check(a: &mut Attachment) -> Result<(), String> {
         _ => {}
     }
     let l = &a.limits;
-    if l.sessions_per_day == 0 || l.sessions_per_day > 500 || l.reruns_per_failure > 20 || l.stuck_minutes == 0 || l.stuck_minutes > 24 * 60 {
-        return Err("`limits`: 1 to 500 incidents a day, at most 20 reruns per failure, a job stuck after 1 minute to a day".into());
+    if l.sessions_per_day == 0
+        || l.sessions_per_day > 500
+        || l.reruns_per_failure > 20
+        || l.stuck_minutes == 0
+        || l.stuck_minutes > 24 * 60
+        || l.slow_percent == 0
+        || l.slow_percent > 1000
+        || l.tokens_per_day == 0
+        || l.runner_minutes_per_day == 0
+    {
+        return Err("`limits`: 1 to 500 incidents a day, at most 20 reruns per failure, a job stuck after 1 minute to a day, a run slow from 1% to 1000% over its median, and some tokens and runner minutes a day".into());
     }
     a.branches.retain(|b| !b.trim().is_empty());
     if a.playbook.len() > 20_000 {
@@ -1029,6 +1078,9 @@ pub async fn wake(hub: &Arc<Hub>, a: &Attachment, t: &Trigger) -> Option<Inciden
     } else if u32::try_from(today).unwrap_or(u32::MAX) >= a.limits.sessions_per_day {
         i.state = "waiting".to_owned();
         i.why = Some(format!("{} has taken on {today} incidents today, its limit: a person takes this one, or raises the limit", a.name));
+    } else if let Some(why) = over_budget(hub, a, &all).await {
+        i.state = "waiting".to_owned();
+        i.why = Some(why);
     } else {
         match start(hub, a, &i).await {
             Ok(agent) => i.agent = Some(agent),
@@ -1042,6 +1094,43 @@ pub async fn wake(hub: &Arc<Hub>, a: &Attachment, t: &Trigger) -> Option<Inciden
     hub.store.audit(format!("attachment:{}", a.name), "incident.open".into(), format!("{} {}: {}{}", i.id, a.on, i.title, i.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default())).await;
     prune(hub).await;
     Some(i)
+}
+
+/// Whether `a`'s agents have spent today (UTC) what its limits give them, and how: the tokens of
+/// its incidents' sessions, and the runner minutes of the runs they asked for and the attempts
+/// they reran (an agent acts as `agent:<its first eight>…`).
+async fn over_budget(hub: &Arc<Hub>, a: &Attachment, all: &[Incident]) -> Option<String> {
+    let since = today();
+    let agents: Vec<String> = all.iter().filter(|x| x.attachment == a.id && x.at >= since).filter_map(|x| x.agent.clone()).collect();
+    let tokens: u64 = agents.iter().filter_map(|id| hub.harness.state(id)).map(|s| s.usage.input_tokens + s.usage.output_tokens).sum();
+    if tokens >= a.limits.tokens_per_day {
+        return Some(format!("{}'s agents have spent {tokens} tokens today, past its limit of {}: a person takes this one, or raises the limit", a.name, a.limits.tokens_per_day));
+    }
+    let likes: Vec<String> = agents.iter().map(|id| format!("agent:{}%", id.chars().take(8).collect::<String>())).collect();
+    let seconds: i64 = hub
+        .store
+        .call(move |c| {
+            let mut total = 0;
+            for like in &likes {
+                total += c.query_row(
+                    "SELECT COALESCE(SUM(j.finished_at - j.started_at), 0) FROM jobs j JOIN runs r ON r.id = j.run_id
+                     WHERE j.job_id IS NOT NULL AND j.started_at >= ?2 AND j.finished_at IS NOT NULL
+                       AND ((j.run_attempt = 1 AND r.actor LIKE ?1) OR EXISTS (SELECT 1 FROM ci_run_attempts t WHERE t.run_id = j.run_id AND t.attempt = j.run_attempt AND t.actor LIKE ?1))",
+                    rusqlite::params![like, since],
+                    |r| r.get::<_, i64>(0),
+                )?;
+            }
+            Ok(total)
+        })
+        .await
+        .unwrap_or(0);
+    let minutes = u64::try_from(seconds / 60).unwrap_or(0);
+    (minutes >= a.limits.runner_minutes_per_day).then(|| {
+        format!(
+            "the runs {}'s agents asked for and reran took {minutes} runner minutes today, past its limit of {}: a person takes this one, or raises the limit",
+            a.name, a.limits.runner_minutes_per_day
+        )
+    })
 }
 
 /// What an incident's agent is given: who it is, what happened, what it may do, its playbook, and
@@ -1143,6 +1232,9 @@ async fn ticks(hub: Arc<Hub>) {
         for t in stuck(&hub, &attached).await {
             fire(&hub, &t).await;
         }
+        for t in unroutable(&hub, &attached).await {
+            fire(&hub, &t).await;
+        }
         // kiln's checks of the runners attachments wake on, every half hour each.
         let mut runners: Vec<String> = Vec::new();
         for a in attached.iter().filter(|a| !a.paused && a.wake.iter().any(|w| w == "check")) {
@@ -1224,6 +1316,158 @@ async fn stuck(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
         .collect()
 }
 
+/// How many of a workflow's last green runs (on the run's branch) say how long its critical path
+/// usually takes, and the fewest that do.
+const SLOW_RUNS: i64 = 10;
+const SLOW_FEWEST: usize = 3;
+
+/// A run's critical path: how long it took, in seconds (each of its jobs from its first leg's
+/// start to its last's end), and its jobs.
+async fn critical_path(hub: &Hub, run: &str) -> Option<(i64, Vec<String>)> {
+    let g = super::runs_api::graph_json(hub, run, None).await.ok()?;
+    let path: Vec<String> = g.get("critical_path")?.as_array()?.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    let nodes = g.get("nodes")?.as_array()?;
+    let span =
+        |j: &str| nodes.iter().find(|n| n.get("job").and_then(Value::as_str) == Some(j)).and_then(|n| Some(n.get("finished_at")?.as_i64()? - n.get("started_at")?.as_i64()?)).unwrap_or(0).max(0);
+    let took: i64 = path.iter().map(|j| span(j)).sum();
+    (took > 0).then_some((took, path))
+}
+
+/// A green run (`run.succeeded`): the attachments that look after it and wake on `slow`, each with
+/// what wakes it, when its critical path took longer than the median of its workflow's last green
+/// runs on its branch by more than their margin (`slow_percent`).
+async fn slow(hub: &Hub, v: &Value) -> Vec<(Attachment, Trigger)> {
+    let repo = s(v, "/repo/name").or_else(|| s(v, "/run/repo")).unwrap_or_default().to_owned();
+    let workflow = s(v, "/run/workflow").unwrap_or_default().to_owned();
+    let branch = s(v, "/run/branch").unwrap_or_default().to_owned();
+    let about = About { repo: Some(repo.clone()), workflow: Some(workflow.clone()), branch: Some(branch.clone()), ..About::default() };
+    let watching: Vec<Attachment> = all(hub).await.into_iter().filter(|a| !a.paused && a.wake.iter().any(|w| w == "slow") && looks_after(a, &about)).collect();
+    let Some(run) = s(v, "/run/id").map(str::to_owned) else { return Vec::new() };
+    if watching.is_empty() {
+        return Vec::new();
+    }
+    let Some((took, path)) = critical_path(hub, &run).await else { return Vec::new() };
+    let (repo_id, wf, br, this) = (s(v, "/repo/id").unwrap_or_default().to_owned(), workflow.clone(), branch.clone(), run.clone());
+    let before: Vec<String> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT id FROM runs WHERE repo_id = ?1 AND COALESCE(workflow_id, '') = ?2 AND branch = ?3 AND conclusion = 'success' AND id != ?4
+                   AND created_at < (SELECT created_at FROM runs WHERE id = ?4) ORDER BY created_at DESC LIMIT ?5",
+            )?;
+            let rows = st.query_map(rusqlite::params![repo_id, wf, br, this, SLOW_RUNS], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default();
+    let mut past: Vec<i64> = Vec::new();
+    for r in &before {
+        if let Some((t, _)) = critical_path(hub, r).await {
+            past.push(t);
+        }
+    }
+    if past.len() < SLOW_FEWEST {
+        return Vec::new();
+    }
+    past.sort_unstable();
+    let median = past.get(past.len() / 2).copied().unwrap_or(0);
+    if median <= 0 {
+        return Vec::new();
+    }
+    let over = (took - median) * 100 / median;
+    let number = v.pointer("/run/number").and_then(Value::as_i64).unwrap_or_default();
+    let name = s(v, "/run/name").unwrap_or(&workflow).to_owned();
+    let url = s(v, "/run/url").map(str::to_owned);
+    watching
+        .into_iter()
+        .filter(|a| over > i64::from(a.limits.slow_percent))
+        .map(|a| {
+            let t = Trigger {
+                wake: "slow",
+                about: about.clone(),
+                signature: format!("slow:{repo}:{workflow}:{branch}"),
+                title: format!("{name} on {branch}: its critical path took {took} s, {over}% over its median of {median} s"),
+                seen: Seen { at: crate::util::now_unix(), what: format!("{name} #{number}"), url: url.clone(), run: Some(run.clone()) },
+                detail: format!(
+                    "{name} #{number} on {branch} ({repo}) succeeded, but its critical path ({}) took {took} s: {over}% more than the median of its last {} green runs on {branch}, {median} s, past {}'s margin of {}%. Its insights say where the time goes (`ci.insights.workflows`), and its graph which jobs wait on which.",
+                    path.join(" → "),
+                    past.len(),
+                    a.name,
+                    a.limits.slow_percent
+                ),
+            };
+            (a, t)
+        })
+        .collect()
+}
+
+/// An app kiln CD deploys turned degraded (W15): what looks after `environment` of `repo` (whose
+/// deploy file makes the app) and wakes on `degraded` is woken.
+pub async fn degraded(hub: &Arc<Hub>, repo: &str, app: &str, environment: &str, status: &Value) {
+    if environment.is_empty() || all(hub).await.is_empty() {
+        return;
+    }
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let said = status.get("message").and_then(Value::as_str).filter(|m| !m.is_empty()).map(|m| format!(": {m}")).unwrap_or_default();
+    let revision = status.get("revision").and_then(Value::as_str).map(|r| format!(" It runs revision {}.", r.get(..12).unwrap_or(r))).unwrap_or_default();
+    let t = Trigger {
+        wake: "degraded",
+        about: About { repo: Some(repo.to_owned()), environment: Some(environment.to_owned()), ..About::default() },
+        signature: format!("degraded:{repo}:{environment}:{app}"),
+        title: format!("{app} is degraded in {environment}"),
+        seen: Seen { at: crate::util::now_unix(), what: app.to_owned(), url: Some(format!("{base}/deployments/apps/{app}")), run: None },
+        detail: format!(
+            "kiln CD's app {app}, which {repo} deploys to {environment}, turned degraded{said}.{revision} Its resources and their health are on its page; CD's operations (`cd.apps.*`) say what it synced last."
+        ),
+    };
+    fire(hub, &t).await;
+}
+
+/// How long a job may be unroutable before `unroutable` wakes on it: a runner that's on its way
+/// (joining, coming back) isn't news.
+const UNROUTABLE_GRACE: i64 = 60;
+
+/// Jobs no runner can take (W05's `unroutable`: no runner meets what they ask for), past a
+/// minute, when an attachment wakes on them. One incident a set of unmet requirements.
+async fn unroutable(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
+    if !attached.iter().any(|a| !a.paused && a.wake.iter().any(|w| w == "unroutable")) {
+        return Vec::new();
+    }
+    let before = crate::util::now_unix() - UNROUTABLE_GRACE;
+    let rows: Vec<(String, String, String, String, String, i64, Option<String>)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT j.id, j.display, r.id, p.name, COALESCE(r.workflow_id, ''), r.number, j.wait_reason FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
+                 WHERE j.status = 'queued' AND j.job_id IS NOT NULL AND json_extract(j.wait_reason, '$.reason') = 'unroutable' AND COALESCE(j.wait_since, j.queued_at) < ?1
+                 ORDER BY COALESCE(j.wait_since, j.queued_at) LIMIT 50",
+            )?;
+            let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default();
+    let now = crate::util::now_unix();
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    rows.into_iter()
+        .map(|(job, display, run, repo, workflow, number, why)| {
+            let failing: Vec<String> = why
+                .and_then(|w| serde_json::from_str::<Value>(&w).ok())
+                .and_then(|w| w.get("failing").and_then(Value::as_array).map(|f| f.iter().filter_map(Value::as_str).map(str::to_owned).collect()))
+                .unwrap_or_default();
+            let unmet = if failing.is_empty() { "what it asks for".to_owned() } else { failing.join(", ") };
+            Trigger {
+                wake: "unroutable",
+                about: About { repo: Some(repo.clone()), workflow: Some(workflow.clone()), ..About::default() },
+                signature: format!("unroutable:{repo}:{workflow}:{unmet}"),
+                title: format!("{display} can't run anywhere: no runner meets {unmet}"),
+                seen: Seen { at: now, what: format!("run #{number}, {display}"), url: Some(format!("{base}/runs/{run}")), run: Some(run) },
+                detail: format!("Job {display} (job {job}) of run #{number} of {repo} waits for a runner none of kiln's can be: none meets {unmet}. Its leg's routing (`ci.legs.routing`) says, runner by runner, what each lacks."),
+            }
+        })
+        .collect()
+}
+
 /// Listens to kiln's events and wakes what they wake, for as long as the server runs.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
@@ -1239,7 +1483,11 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
                 Ok(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
-                    if matches!(kind, "run.failed" | "deploy.failed" | "leg.flaky" | "land.ejected" | "runner.offline" | "updates" | "comment") && !all(&hub).await.is_empty() {
+                    if kind == "run.succeeded" {
+                        for (a, t) in slow(&hub, &v).await {
+                            wake(&hub, &a, &t).await;
+                        }
+                    } else if matches!(kind, "run.failed" | "deploy.failed" | "leg.flaky" | "land.ejected" | "runner.offline" | "updates" | "comment") && !all(&hub).await.is_empty() {
                         for t in trigger_of(&hub, &v).await {
                             fire(&hub, &t).await;
                         }
@@ -1479,10 +1727,10 @@ fn attachment_schema() -> Value {
             "branches": {"type": "array", "items": {"type": "string"}, "description": "Only runs on these branches wake it (none: any)."},
             "harness": {"type": "object", "description": "The agent kiln starts for each incident: {kind, on?, cwd?, model?, effort?, mode?} (on and cwd: the machine and the checkout it works in).", "properties": {"kind": {"type": "string"}, "on": {"type": "string"}, "cwd": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}, "mode": {"type": "string"}}},
             "session": {"type": "string", "description": "Or a live agent's id, told of each incident instead."},
-            "wake": {"type": "array", "items": {"type": "string", "enum": WAKES}, "description": "What wakes it: failure, ejected, flaky, stuck, schedule, mention; on runners: offline, upgrade, check."},
+            "wake": {"type": "array", "items": {"type": "string", "enum": WAKES}, "description": "What wakes it: failure, ejected, flaky, stuck, slow, unroutable, degraded, schedule, mention; on runners: offline, upgrade, check."},
             "schedule": {"type": "string", "description": "Five-field cron (UTC), for wake: schedule."},
             "can": {"type": "array", "items": {"type": "string", "enum": CAN}, "description": "What its agent may do (W20-R09); kiln refuses it the rest."},
-            "limits": {"type": "object", "properties": {"sessions_per_day": {"type": "integer"}, "reruns_per_failure": {"type": "integer"}, "stuck_minutes": {"type": "integer"}}},
+            "limits": {"type": "object", "properties": {"sessions_per_day": {"type": "integer"}, "reruns_per_failure": {"type": "integer"}, "stuck_minutes": {"type": "integer"}, "slow_percent": {"type": "integer"}, "tokens_per_day": {"type": "integer"}, "runner_minutes_per_day": {"type": "integer"}}},
             "playbook": {"type": "string", "description": "What its agent does when it wakes."},
             "reviewers": {"type": "array", "items": {"type": "string"}},
             "paused": {"type": "boolean"}
@@ -1685,6 +1933,7 @@ agents:
         assert_eq!(doctor.source.as_deref(), Some("acme/app:.kiln/agents.yaml"));
         assert_eq!(doctor.harness, Some(Harness { kind: "claude".into(), on: Some("linux/amd64".into()), cwd: Some("~/src/app".into()), model: Some("opus".into()), effort: Some("high".into()), mode: None }));
         assert_eq!((doctor.limits.sessions_per_day, doctor.limits.reruns_per_failure), (10, 2));
+        assert_eq!((doctor.limits.runner_minutes_per_day, doctor.limits.tokens_per_day), (600, 5_000_000), "its day's runner minutes and tokens");
         assert_eq!((doctor.playbook.as_str(), doctor.by.as_str()), (".kiln/agents/ci-doctor.md", "owner"));
         assert_eq!((gardener.wake.clone(), gardener.schedule.as_deref()), (vec!["schedule".to_owned()], Some("0 6 * * 1")));
         // Its pipelines narrow what wakes it: a run of ci.yml does, release.yml's doesn't.
@@ -1804,6 +2053,160 @@ mod end_to_end {
         })
     }
 
+    fn acme() -> crate::store::Repo {
+        crate::store::Repo {
+            id: "r1".into(),
+            name: "acme/app".into(),
+            clone_url: "https://example.com/acme/app.git".into(),
+            branches: Vec::new(),
+            poll_seconds: 60,
+            enabled: true,
+            created_at: 0,
+            last_polled_at: None,
+            last_error: None,
+            mode: "upstream".into(),
+            default_branch: None,
+            mirror: None,
+        }
+    }
+
+    /// `unroutable`: a job no runner meets what it asks for, a minute on (a runner on its way isn't
+    /// news), one incident for each set of unmet requirements, saying what nothing meets.
+    #[test]
+    fn w20_r08_unroutable_is_what_no_runner_meets() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo_id = hub.store.upsert_repo(acme()).await?.id;
+            let now = crate::util::now_unix();
+            hub.store
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id) VALUES ('run1', ?1, 7, 'ci', 'push', 'main', 'abc', 'running', ?2, '.github/workflows/ci.yml')",
+                        rusqlite::params![repo_id, now - 600],
+                    )?;
+                    let legs: [(&str, i64, &str); 3] = [
+                        ("windows", now - 300, r#"{"reason":"unroutable","failing":["os == windows"]}"#),
+                        ("just-now", now - 10, r#"{"reason":"unroutable","failing":["os == macos"]}"#),
+                        ("full-pool", now - 300, r#"{"reason":"capacity"}"#),
+                    ];
+                    for (leg, since, reason) in legs {
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, wait_since, wait_reason, job_id) VALUES (?1, 'run1', ?1, ?1, 'queued', '[]', '[]', '{}', ?2, ?2, ?3, ?1)",
+                            rusqlite::params![leg, since, reason],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            let on = super::Attachment { wake: vec!["unroutable".into()], ..super::Attachment::default() };
+            let found = super::unroutable(&hub, std::slice::from_ref(&on)).await;
+            let [t] = found.as_slice() else { anyhow::bail!("{found:?}") };
+            anyhow::ensure!(t.seen.what == "run #7, windows" && t.title.contains("no runner meets os == windows") && t.signature.ends_with(":os == windows"), "{t:?}");
+            anyhow::ensure!(t.about.repo.as_deref() == Some("acme/app") && t.about.workflow.as_deref() == Some(".github/workflows/ci.yml"), "{t:?}");
+            let paused = super::Attachment { paused: true, ..on };
+            anyhow::ensure!(super::unroutable(&hub, &[paused]).await.is_empty(), "nothing it wakes is awake");
+            Ok(())
+        })
+    }
+
+    /// `slow`: a green run whose critical path took longer than its workflow's median on its
+    /// branch, over its last green runs, by more than the attachment's margin; the jobs beside the
+    /// path don't count.
+    #[test]
+    fn w20_r08_slow_is_its_critical_path_past_the_median() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo_id = hub.store.upsert_repo(acme()).await?.id;
+            let rid = repo_id.clone();
+            hub.store
+                .call(move |c| {
+                    // build (100 s), then test; lint (50 s) beside them.
+                    for (n, test) in [(1, 200), (2, 190), (3, 210), (4, 200), (5, 330), (6, 420)] {
+                        let (run, at) = (format!("run{n}"), 10_000 * n);
+                        c.execute(
+                            "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'success', ?4, '.github/workflows/ci.yml')",
+                            rusqlite::params![run, rid, n, at],
+                        )?;
+                        for (job, start, took, needs) in [("build", at, 100, "[]"), ("lint", at, 50, "[]"), ("test", at + 100, test, r#"["build"]"#)] {
+                            c.execute(
+                                "INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, queued_at, started_at, finished_at, job_id) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', ?4, '{}', ?5, ?5, ?6, ?3)",
+                                rusqlite::params![format!("{run}-{job}"), run, job, needs, start, start + took],
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            let a = super::Attachment { id: "a1".into(), name: "ci-doctor".into(), on: "repo:acme/app".into(), wake: vec!["slow".into()], ..super::Attachment::default() };
+            hub.store.kv_set(super::akey(&a.id), serde_json::to_string(&a)?).await?;
+            let green = |n: i64| json!({"type": "run.succeeded", "repo": {"id": repo_id, "name": "acme/app"}, "run": {"repo": "acme/app", "id": format!("run{n}"), "number": n, "workflow": ".github/workflows/ci.yml", "name": "CI", "branch": "main", "url": format!("https://kiln.example/runs/run{n}")}});
+            // Run 4: three runs before it, a median of 300 s; it took 300 s.
+            anyhow::ensure!(super::slow(&hub, &green(4)).await.is_empty(), "as long as usual");
+            // Run 5: 430 s against a median of 300 s (runs 1 to 4), 43% over: past the 25% margin.
+            let found = super::slow(&hub, &green(5)).await;
+            let [(woken, t)] = found.as_slice() else { anyhow::bail!("{found:?}") };
+            anyhow::ensure!(woken.name == "ci-doctor" && t.wake == "slow" && t.title.contains("took 430 s, 43% over its median of 300 s"), "{t:?}");
+            anyhow::ensure!(t.detail.contains("build → test") && !t.detail.contains("lint") && t.seen.run.as_deref() == Some("run5"), "{}", t.detail);
+            // A wider margin: 43% is within it. Too few green runs before it: nothing to go by.
+            let wide = super::Attachment { limits: super::Limits { slow_percent: 50, ..super::Limits::default() }, ..a };
+            hub.store.kv_set(super::akey(&wide.id), serde_json::to_string(&wide)?).await?;
+            anyhow::ensure!(super::slow(&hub, &green(5)).await.is_empty(), "within its margin");
+            anyhow::ensure!(super::slow(&hub, &green(3)).await.is_empty(), "two runs before it say nothing");
+            Ok(())
+        })
+    }
+
+    /// W20-R10's daily budgets: past the runner minutes its agents' runs and reruns took today (a
+    /// person's don't count), an attachment's next incident waits for a person; a rerun says whom
+    /// it was started by.
+    #[test]
+    fn w20_r10_runner_minutes_a_day() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo_id = hub.store.upsert_repo(acme()).await?.id;
+            let day = super::today();
+            hub.store
+                .call(move |c| {
+                    // A person's run (8 min), and a run an agent asked for (6 min).
+                    for (n, actor, minutes) in [(1, "user:ada", 8), (2, "agent:abcdefgh for user:ada", 6)] {
+                        let run = format!("run{n}");
+                        c.execute(
+                            "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id, actor) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'failure', ?4, 'ci.yml', ?5)",
+                            rusqlite::params![run, repo_id, n, day, actor],
+                        )?;
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, started_at, finished_at, job_id) VALUES (?1, ?2, 'test', 'test', 'completed', '[]', '[]', '{}', ?3, ?3, ?4, 'test')",
+                            rusqlite::params![format!("{run}-1"), run, day + 1, day + 1 + minutes * 60],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            let a = super::Attachment { id: "a1".into(), name: "ci-doctor".into(), limits: super::Limits { runner_minutes_per_day: 10, ..super::Limits::default() }, ..super::Attachment::default() };
+            let opened = super::Incident { id: "i1".into(), attachment: "a1".into(), agent: Some("abcdefgh12345678".into()), at: day, ..super::Incident::default() };
+            anyhow::ensure!(super::over_budget(&hub, &a, std::slice::from_ref(&opened)).await.is_none(), "6 of its 10 minutes");
+            // The agent reruns the person's run: its second attempt (5 min) is the agent's.
+            let attempt = crate::ci::runs::start_attempt(&hub, "run1", "agent:abcdefgh for user:ada").await?;
+            anyhow::ensure!(attempt == 2, "{attempt}");
+            hub.store
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, started_at, finished_at, job_id, run_attempt) VALUES ('run1-2', 'run1', 'test', 'test', 'completed', '[]', '[]', '{}', ?1, ?1, ?2, 'test', 2)",
+                        rusqlite::params![day + 1, day + 1 + 5 * 60],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            let why = super::over_budget(&hub, &a, std::slice::from_ref(&opened)).await.unwrap_or_default();
+            anyhow::ensure!(why.contains("took 11 runner minutes today, past its limit of 10"), "{why}");
+            // Another attachment's agent, or yesterday's incident, isn't this one's to count.
+            let theirs = super::Incident { attachment: "a2".into(), ..opened.clone() };
+            let yesterday = super::Incident { at: day - 1, ..opened };
+            anyhow::ensure!(super::over_budget(&hub, &a, &[theirs, yesterday]).await.is_none(), "not its");
+            Ok(())
+        })
+    }
+
     fn failed(n: i64, workflow: &str) -> Value {
         json!({"type": "run.failed", "repo": {"id": "r1", "name": "acme/app"}, "run": {"repo": "acme/app", "id": format!("run{n}"), "number": n, "workflow": workflow, "name": "CI", "branch": "main", "sha": "0123456789abcdef", "actor": "ada", "conclusion": "failure", "url": format!("https://kiln.example/runs/run{n}")}, "environments": []})
     }
@@ -1892,10 +2295,26 @@ mod end_to_end {
             let doc = crate::mcp::session_caller(&hub, gone.agent.as_deref().unwrap_or_default(), None).await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(doc.can("runners.manage", &Scope::Runner { runner: "metal-1".into() }) && !doc.can("runs.rerun", &app), "a runner doctor manages runners, not runs");
 
+            // An app kiln CD deploys turning degraded wakes what looks after its environment.
+            call(
+                cx.clone(),
+                "attachments.save",
+                json!({"name": "deploy-doctor", "on": "environment:acme/app:production", "harness": {"kind": "claude", "on": "local", "cwd": cwd}, "wake": ["degraded"], "can": ["diagnose"]}),
+            )
+            .await
+            .map_err(fail)?;
+            super::degraded(&hub, "acme/app", "app-staging", "staging", &json!({"health": "Degraded"})).await;
+            super::degraded(&hub, "acme/app", "app-production", "production", &json!({"health": "Degraded", "message": "2 of 3 pods fail their readiness probe", "revision": "0123456789abcdef"}))
+                .await;
+            let sick = wait_for(&hub, "for the environment", |i| i.name == "deploy-doctor").await?;
+            anyhow::ensure!(sick.wake == "degraded" && sick.title == "app-production is degraded in production" && sick.agent.is_some(), "{sick:?}");
+            anyhow::ensure!(sick.bundle.contains("readiness probe") && sick.bundle.contains("revision 0123456789ab."), "{}", sick.bundle);
+            anyhow::ensure!(incidents(&hub).await.iter().filter(|i| i.wake == "degraded").count() == 1, "staging isn't what it looks after");
+
             // Listed, with what each is doing.
             let list = call(cx, "attachments.list", json!({})).await.map_err(fail)?;
             let names: Vec<&str> = list.get("attachments").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.pointer("/attachment/name").and_then(Value::as_str)).collect();
-            anyhow::ensure!(names == ["ci-doctor", "runner-doctor"], "{names:?}");
+            anyhow::ensure!(names == ["ci-doctor", "deploy-doctor", "runner-doctor"], "{names:?}");
             Ok(())
         })
     }

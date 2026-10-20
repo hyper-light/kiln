@@ -2,10 +2,11 @@
 //! apps' statuses (`cd_apps`), an app that turns `synced` (in sync and healthy, or a sync of it
 //! succeeding), `degraded`, or whose sync `failed`, raises `deploy` in the repository whose
 //! `.kiln/deploy.yaml` defines it: that repository's default-branch workflows that take it run
-//! (smoke tests after staging turns healthy, diagnostics when it degrades).
+//! (smoke tests after staging turns healthy, diagnostics when it degrades); one that turns
+//! degraded wakes the agents attached to its environment (W20-R08's `degraded`).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use kiln_ci::trigger::{Event, Source};
 use parking_lot::Mutex;
@@ -54,7 +55,7 @@ fn moved(before: Option<&Seen>, now: &Seen) -> Option<&'static str> {
 static SEEN: LazyLock<Mutex<HashMap<String, Seen>>> = LazyLock::new(Default::default);
 
 /// A `cd_apps` event from the hub: each app's move, as `deploy`.
-pub async fn observe(hub: &Hub, v: &Value) {
+pub async fn observe(hub: &Arc<Hub>, v: &Value) {
     let Some(apps) = v.get("apps").and_then(Value::as_array) else { return };
     let mut fired = Vec::new();
     {
@@ -69,10 +70,32 @@ pub async fn observe(hub: &Hub, v: &Value) {
         }
     }
     for (app, state, a) in fired {
+        if state == "degraded"
+            && let Some((repo, environment)) = home(hub, &app).await
+        {
+            super::attach::degraded(hub, &repo.name, &app, &environment, &a).await;
+        }
         if let Err(e) = raise(hub, &app, state, &a).await {
             tracing::warn!(%app, %state, error = %format!("{e:#}"), "`deploy` started no workflows");
         }
     }
+}
+
+/// The repository whose `.kiln/deploy.yaml` makes `app`, and the environment it deploys to; none
+/// for an app made otherwise (by API, or Argo CD's).
+async fn home(hub: &Hub, app: &str) -> Option<(crate::store::Repo, String)> {
+    let cd = crate::cd::get()?;
+    let (origin, environment) = {
+        let apps = cd.apps.read();
+        let entry = apps.get(app)?;
+        let origin = match &entry.def.origin {
+            kiln_cd::apps::Origin::Deploy { repo } => repo.clone(),
+            _ => return None,
+        };
+        (origin, entry.def.environment.clone().unwrap_or_default())
+    };
+    let repo = hub.store.repos().await.ok()?.into_iter().find(|r| r.name == origin || r.id == origin)?;
+    Some((repo, environment))
 }
 
 /// `deploy` for `app` moving into `state`, in the repository that defines it.
@@ -80,18 +103,7 @@ async fn raise(hub: &Hub, app: &str, state: &str, status: &Value) -> anyhow::Res
     if !hub.ci.enabled() {
         return Ok(());
     }
-    let Some(cd) = crate::cd::get() else { return Ok(()) };
-    let (origin, environment) = {
-        let apps = cd.apps.read();
-        let Some(entry) = apps.get(app) else { return Ok(()) };
-        let origin = match &entry.def.origin {
-            kiln_cd::apps::Origin::Deploy { repo } => Some(repo.clone()),
-            _ => None,
-        };
-        (origin, entry.def.environment.clone().unwrap_or_default())
-    };
-    let Some(origin) = origin else { return Ok(()) };
-    let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name == origin || r.id == origin) else { return Ok(()) };
+    let Some((repo, environment)) = home(hub, app).await else { return Ok(()) };
     let f = super::events::facts(hub, &repo).await;
     let Ok((full_ref, sha)) = super::events::named_ref(hub, &repo, &f.default_branch).await else { return Ok(()) };
     let commit = super::load::load(hub, &repo, &sha).await?;

@@ -1,14 +1,17 @@
 //! W20-R01 (docs/ci.md): every operation over HTTP, in the OpenAPI document, and as `kiln op`,
 //! all from the registry the MCP tools and code mode are made of. Each is listed with its input's
 //! schema; run as its caller, it's checked as its own route is, and a change is audited once.
+//! W20-AC03: an agent's authority is the same on every one of them.
 
 #![cfg(unix)]
 
 mod common;
 
+use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use common::{Options, http, start};
+use common::{Options, Server, http, start};
 use serde_json::{Value, json};
 
 #[test]
@@ -128,5 +131,124 @@ fn w20_r03_writes_say_what_they_do() -> anyhow::Result<()> {
     assert!(prod.pointer("/preview/a_deployment_from_the_trunk").and_then(Value::as_str).is_some_and(|m| m.contains("a review by one of ghost")), "{prod}");
     let staging = env("staging", json!({ "branches": ["release/*"] }))?;
     assert!(staging.to_string().contains("may not deploy to staging"), "{staging}");
+    Ok(())
+}
+
+fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let o = Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper="])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    anyhow::ensure!(o.status.success(), "git {args:?}: {out}");
+    Ok(out)
+}
+
+/// A token for `body`'s principal (`/api/tokens`).
+fn token(s: &Server, body: Value) -> anyhow::Result<String> {
+    let (st, out) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&body))?;
+    anyhow::ensure!((200..300).contains(&st), "token: {st} {out}");
+    serde_json::from_str::<Value>(&out)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {out}"))
+}
+
+/// One MCP call (`tools/call`) with `token`: whether it failed, and what it said.
+fn mcp(s: &Server, token: &str, tool: &str, arguments: Value) -> anyhow::Result<(bool, String)> {
+    let (st, body) = http(s.port, "POST", "/api/mcp", token, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": arguments } })))?;
+    anyhow::ensure!(st == 200, "{tool}: {st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    Ok((v.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(true), v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default().to_owned()))
+}
+
+/// W20-AC03: an agent whose grant only reads can't rerun, through any surface: the route, the
+/// operation over HTTP, its MCP tool, code mode and the CLI (`kiln rerun`, `kiln op`), each
+/// refusing it for the capability it lacks. Nor can an agent acting for a viewer, though its
+/// own grant is the owner's. What they read, they read; an agent with the grant reruns.
+#[test]
+fn w20_ac03_authority() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("work"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    // The trunk, and once kiln has read it, a failing workflow pushed to it.
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        if !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::write(work.join(".kiln/ci.yaml"), "on: push\njobs:\n  test:\n    runs-on: local\n    steps:\n      - run: exit 1\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "ci"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let run = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        let done = serde_json::from_str::<Value>(&body)?
+            .pointer("/runs/0")
+            .filter(|r| r.get("conclusion").and_then(Value::as_str) == Some("failure"))
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(id) = done {
+            break id;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no failed run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    for (name, grants) in [("dev", json!(["developer@repo:acme/app"])), ("vera", json!(["viewer"]))] {
+        let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": name, "grants": grants })))?;
+        anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    }
+    // An agent whose grant reads, for a developer who may rerun; an agent with the owner's grant
+    // acting for a viewer; and an agent with a developer's grant, for the developer.
+    let reader = token(&s, json!({ "kind": "agent", "agent": "reader", "user": "dev", "grants": ["viewer@repo:acme/app"] }))?;
+    let broad = token(&s, json!({ "kind": "agent", "agent": "broad", "user": "vera", "grants": ["owner"] }))?;
+    let fixer = token(&s, json!({ "kind": "agent", "agent": "fixer", "user": "dev", "grants": ["developer@repo:acme/app"] }))?;
+    let url = format!("http://127.0.0.1:{}", s.port);
+    let cli = |token: &str, args: &[&str]| -> anyhow::Result<(bool, String)> {
+        let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(args).args(["--url", &url, "--token", token]).env("HOME", dir.path()).output()?;
+        Ok((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+    };
+    let program = "return await kiln.ci.runs.rerun({ run: input.run })";
+    for (who, t) in [("an agent that only reads", &reader), ("an agent acting for a viewer", &broad)] {
+        let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/rerun"), t, Some(&json!({ "mode": "all" })))?;
+        assert!(st == 403 && body.contains("runs.rerun"), "{who}, the route: {st} {body}");
+        let (st, body) = http(s.port, "POST", "/api/ops/ci.runs.rerun", t, Some(&json!({ "run": run })))?;
+        assert!(st == 403 && body.contains("runs.rerun"), "{who}, the operation: {st} {body}");
+        let (failed, said) = mcp(&s, t, "ci_runs_rerun", json!({ "run": run }))?;
+        assert!(failed && said.contains("runs.rerun"), "{who}, its tool: {said}");
+        let (failed, said) = mcp(&s, t, "code_run", json!({ "program": program, "input": { "run": run } }))?;
+        assert!(failed && said.contains("runs.rerun"), "{who}, code mode: {said}");
+        let (ok, said) = cli(t, &["rerun", &run])?;
+        assert!(!ok && said.contains("runs.rerun"), "{who}, kiln rerun: {said}");
+        let (ok, said) = cli(t, &["op", "ci.runs.rerun", &format!("run={run}")])?;
+        assert!(!ok && said.contains("runs.rerun"), "{who}, kiln op: {said}");
+        // What it reads, it reads.
+        assert_eq!(http(s.port, "GET", &format!("/api/ci/runs/{run}"), t, None)?.0, 200, "{who} reads the run");
+        let (failed, said) = mcp(&s, t, "ci_runs_get", json!({ "run": run }))?;
+        assert!(!failed && said.contains(&run), "{who} reads it by its tool: {said}");
+    }
+    let (st, body) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body)?.pointer("/run/attempt"), Some(&json!(1)), "nothing reran it");
+    // With the grant, it reruns.
+    let (failed, said) = mcp(&s, &fixer, "ci_runs_rerun", json!({ "run": run }))?;
+    assert!(!failed && said.contains("\"attempt\":2"), "an agent that may: {said}");
     Ok(())
 }
