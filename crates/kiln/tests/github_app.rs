@@ -107,6 +107,13 @@ fn fake_github(public_key: Vec<u8>) -> anyhow::Result<(u16, Calls)> {
                 }
                 ("PATCH", p) if token_ok && p.starts_with("/repos/acme/app/check-runs/") => (200, json!({})),
                 ("GET", "/repos/acme/app/issues") if token_ok => (200, json!([])),
+                // The Git Data API and pulls, for what kiln saves to GitHub (W21-R06).
+                ("GET", p) if token_ok && p.starts_with("/repos/acme/app/git/commits/") => (200, json!({ "sha": p.rsplit('/').next().unwrap_or_default(), "tree": { "sha": "tree0" } })),
+                ("POST", "/repos/acme/app/git/blobs") if token_ok => (201, json!({ "sha": "blob1" })),
+                ("POST", "/repos/acme/app/git/trees") if token_ok => (201, json!({ "sha": "tree1" })),
+                ("POST", "/repos/acme/app/git/commits") if token_ok => (201, json!({ "sha": "c".repeat(40) })),
+                ("POST", "/repos/acme/app/git/refs") if token_ok => (201, json!({ "ref": body.get("ref").cloned().unwrap_or_default() })),
+                ("POST", "/repos/acme/app/pulls") if token_ok => (201, json!({ "number": 12, "html_url": "https://github.example/acme/app/pull/12" })),
                 (_, _) if !jwt_ok && !token_ok => (401, json!({ "message": "Bad credentials" })),
                 _ => (404, json!({ "message": "Not Found" })),
             };
@@ -314,6 +321,28 @@ jobs:
     assert_eq!(runs.len(), 1, "one run for the opened issue, none for its redelivery or an edit: {runs:?}");
     let run = runs.first().cloned().unwrap_or_default();
     assert!(run.get("workflow").and_then(Value::as_str).is_some_and(|w| w.ends_with("triage.yml")) && run.get("branch") == Some(&json!("main")), "{run}");
+
+    // W21-R06: a workflow saved in kiln's editor goes to GitHub through the App: a branch off the
+    // default branch's head, written with a token that may write workflows, and its pull request.
+    let changed = std::fs::read_to_string(work.join(".github/workflows/ci.yml"))?.replace("echo \"server: $GITHUB_SERVER_URL\"", "echo \"server: $GITHUB_SERVER_URL, again\"");
+    let (st, body) = http(s.port, "POST", "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/edit", &s.admin, Some(&json!({ "content": changed })))?;
+    let saved: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let branch = saved.get("branch").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert!(
+        st == 200 && saved.get("to") == Some(&json!("change")) && branch.starts_with("kiln/edit-ci-") && saved.pointer("/change/url") == Some(&json!("https://github.example/acme/app/pull/12")),
+        "{st} {body}"
+    );
+    let sent = |what: &str| calls.lock().map(|c| c.iter().filter(|(m, p, _, _)| m == "POST" && p == what).map(|(_, _, _, b)| b.clone()).collect::<Vec<_>>()).unwrap_or_default();
+    let tokens = sent("/app/installations/7/access_tokens");
+    assert!(tokens.iter().any(|t| t.pointer("/permissions/workflows") == Some(&json!("write")) && t.pointer("/permissions/contents") == Some(&json!("write"))), "{tokens:?}");
+    let commit = sent("/repos/acme/app/git/commits").first().cloned().unwrap_or_default();
+    assert_eq!(commit.get("parents"), Some(&json!([sha])), "on the default branch's head: {commit}");
+    let tree = sent("/repos/acme/app/git/trees").first().cloned().unwrap_or_default();
+    assert_eq!((tree.get("base_tree"), tree.pointer("/tree/0/path")), (Some(&json!("tree0")), Some(&json!(".github/workflows/ci.yml"))), "{tree}");
+    let made = sent("/repos/acme/app/git/refs").first().cloned().unwrap_or_default();
+    assert_eq!((made.get("ref"), made.get("sha")), (Some(&json!(format!("refs/heads/{branch}"))), Some(&json!("c".repeat(40)))), "a new branch: {made}");
+    let pull = sent("/repos/acme/app/pulls").first().cloned().unwrap_or_default();
+    assert_eq!((pull.get("head"), pull.get("base")), (Some(&json!(branch)), Some(&json!("main"))), "{pull}");
 
     // W23-R03: acme/gha's CI is GitHub Actions'. Its runs come into kiln, logs, reruns, cancels
     // and dispatches go to GitHub.

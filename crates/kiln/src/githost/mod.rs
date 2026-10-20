@@ -223,6 +223,28 @@ impl GitHost {
         }
     }
 
+    /// [`GitHost::commit`], the commit made on `base` and the branch at `expected` (`None`: the
+    /// branch is new): a branch off another's head, as a change to propose is.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_on(
+        &self,
+        hub: &Hub,
+        repo: &Repo,
+        branch: &str,
+        base: Option<&str>,
+        expected: Option<&str>,
+        files: &[Change],
+        message: &str,
+        author: &Author,
+    ) -> Result<Committed, CommitError> {
+        match self {
+            GitHost::Kiln => kiln_commit_on(hub, repo, branch, base, expected, files, message, author).await,
+            GitHost::Github(app) => app.commit_on(repo, branch, base, expected, files, message, author).await,
+            GitHost::Gitlab(g) => remote_commit_on(hub, repo, &g.push_url(repo)?, branch, base, expected, files, message, author).await,
+            GitHost::Bitbucket(b) => remote_commit_on(hub, repo, &b.push_url(repo)?, branch, base, expected, files, message, author).await,
+        }
+    }
+
     /// Pushes `sha` (made in the repository at `local`) to `branch`, if it's still at `expected`.
     pub async fn push(&self, hub: &Hub, repo: &Repo, local: &str, sha: &str, branch: &str, expected: Option<&str>) -> Result<(), CommitError> {
         let target = match self {
@@ -346,9 +368,15 @@ async fn push_lease(hub: &Hub, local: &str, url: &str, sha: &str, branch: &str, 
 
 /// A commit in kiln's own repository: made on `expected`, then the branch moved by compare-and-swap.
 async fn kiln_commit(hub: &Hub, repo: &Repo, branch: &str, expected: Option<&str>, files: &[Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
+    kiln_commit_on(hub, repo, branch, expected, expected, files, message, author).await
+}
+
+/// [`kiln_commit`], made on `base`.
+#[allow(clippy::too_many_arguments)]
+async fn kiln_commit_on(hub: &Hub, repo: &Repo, branch: &str, base: Option<&str>, expected: Option<&str>, files: &[Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
     let path = crate::ci::hosting::native_path(hub, repo).ok_or_else(|| anyhow::anyhow!("{} isn't hosted here", repo.name))?;
     let p = path.to_string_lossy().into_owned();
-    let made = build_commit(hub, &p, expected, files, message, author).await?;
+    let made = build_commit(hub, &p, base, files, message, author).await?;
     let Committed::New(sha) = &made else { return Ok(made) };
     let r = crate::ci::diffs::git_run(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), sha, expected.unwrap_or(NO_COMMIT)], &[], Vec::new()).await?;
     if !r.ok {
@@ -362,13 +390,29 @@ async fn kiln_commit(hub: &Hub, repo: &Repo, branch: &str, expected: Option<&str
 /// lands on a head it wasn't made on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remote_commit(hub: &Hub, repo: &Repo, url: &str, branch: &str, expected: Option<&str>, files: &[Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
-    let path = match expected {
+    remote_commit_on(hub, repo, url, branch, expected, expected, files, message, author).await
+}
+
+/// [`remote_commit`], made on `base`.
+#[allow(clippy::too_many_arguments)]
+async fn remote_commit_on(
+    hub: &Hub,
+    repo: &Repo,
+    url: &str,
+    branch: &str,
+    base: Option<&str>,
+    expected: Option<&str>,
+    files: &[Change],
+    message: &str,
+    author: &Author,
+) -> Result<Committed, CommitError> {
+    let path = match base {
         Some(e) => crate::gitops::ensure_commit(hub, repo, e).await?,
         None if crate::gitops::mirror_path(hub, &repo.name).join("HEAD").exists() => crate::gitops::mirror_path(hub, &repo.name),
         None => crate::gitops::sync_mirror(hub, repo).await?,
     };
     let p = path.to_string_lossy().into_owned();
-    let made = build_commit(hub, &p, expected, files, message, author).await?;
+    let made = build_commit(hub, &p, base, files, message, author).await?;
     let Committed::New(sha) = &made else { return Ok(made) };
     push_lease(hub, &p, url, sha, branch, expected).await?;
     Ok(made)

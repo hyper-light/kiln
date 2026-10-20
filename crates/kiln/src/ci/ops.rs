@@ -64,7 +64,7 @@ const LEG: &str = "The leg's id (a job of a run, one matrix combination of it)."
 const REPO: &str = "The repository, `owner/name`.";
 
 /// A handler's response as an operation's answer.
-async fn answer(r: Result<Response, Fail>) -> Out {
+pub(super) async fn answer(r: Result<Response, Fail>) -> Out {
     let resp = r?;
     let status = resp.status();
     let json = resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("json"));
@@ -238,10 +238,10 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}, "path": {"type": "string"}, "ref": {"type": "string"}}), &["repo", "path"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?]), query(v, &["ref"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::workflows::get(&cx.hub, &text(&v, "repo")?, &text(&v, "path")?, &query(&v, &["ref"])).await).await }),
-            op!("ci.workflows.validate", "Check a workflow's text: diagnostics with codes and positions, before proposing it.", ro: true, destructive: false,
-                input: || schema(json!({"path": {"type": "string", "description": "Where it would live, e.g. `.github/workflows/ci.yml`."}, "content": {"type": "string"}, "dialect": {"type": "string", "enum": ["gha", "kiln"]}}), &["content"]),
+            op!("ci.workflows.validate", "Check a workflow's text: diagnostics with codes and positions, before proposing it. With `repo`, against what its run would meet too: labels no runner, rule or pool has (KCI6007), actions its policies refuse.", ro: true, destructive: false,
+                input: || schema(json!({"path": {"type": "string", "description": "Where it would live, e.g. `.github/workflows/ci.yml`."}, "content": {"type": "string"}, "dialect": {"type": "string", "enum": ["gha", "kiln"]}, "repo": {"type": "string", "description": REPO}}), &["content"]),
                 route: |_| Ok((Method::POST, path(&["validate"]), HashMap::new())),
-                run: |_cx: Cx, v: Value| async move { answer(super::workflows::validate_value(v).await).await }),
+                run: |cx: Cx, v: Value| async move { answer(super::workflows::validate_value(&cx.hub, Some(&cx.caller), v).await).await }),
             op!("ci.workflows.plan_preview", "The plan a workflow would make for an event, without a run: legs, matrix values, routing, what waits on outputs.", ro: true, destructive: false,
                 input: || schema(json!({
                     "repo": {"type": "string", "description": REPO}, "path": {"type": "string"}, "content": {"type": "string", "description": "Text to plan instead of the file at the ref."},
@@ -444,31 +444,18 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "strategy": {"type": "string", "enum": ["stack", "stack-squash", "ff-only"]}}), &["diff"]),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "land"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "land"], &HashMap::new(), &v).await }),
-            op!("ci.workflows.edit", "Propose a workflow's new text as a diff, never a direct write: checked first (refused with its errors), then a diff on the trunk that lands through review. Validate and preview it before, and watch its run after.", base: "", ro: false, destructive: false,
+            op!("ci.workflows.edit", "Save a workflow's new text, never straight onto a trunk: checked first (refused with its errors), then as `to` says: `diff`, a diff on the trunk of a repository kiln hosts that lands through review; `change`, a new branch and its pull or merge request on GitHub (the App), GitLab or Bitbucket; `branch`, a commit to `branch`, refused as a push of it would be; `patch`, only the patch. By default the first the repository takes. Validate and preview it before, and watch its run after.", ro: false, destructive: false,
                 input: || schema(json!({
                     "repo": {"type": "string", "description": REPO}, "path": {"type": "string", "description": "The workflow's path, e.g. `.github/workflows/ci.yml`."},
-                    "content": {"type": "string", "description": "Its whole new text."}, "title": {"type": "string", "description": "The diff's title (`Edit <path>` when left out)."},
+                    "content": {"type": "string", "description": "Its whole new text."}, "to": {"type": "string", "enum": ["diff", "change", "branch", "patch"]},
+                    "branch": {"type": "string", "description": "For `branch`, the branch to commit to; for `change`, the new branch's name (one is made up when left out)."},
+                    "title": {"type": "string", "description": "The diff's, change's or commit's title (`Edit <path>` when left out)."},
                     "draft": {"type": "boolean"}, "reviewers": {"type": "array", "items": {"type": "string"}}, "topic": {"type": "string"}
                 }), &["repo", "path", "content"]),
-                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "submit"]), HashMap::new())),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?, "edit"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
-                    let (repo, file, content) = (text(&v, "repo")?, text(&v, "path")?, text(&v, "content")?);
-                    let (f, c) = (file.clone(), content.clone());
-                    let checked = crate::rt::blocking(move || kiln_ci::wf::check(&f, &c, None)).await.map_err(internal)?;
-                    let errors: Vec<String> = checked.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&file)).collect();
-                    if !errors.is_empty() {
-                        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't proposed:\n{}", errors.join("\n"))));
-                    }
-                    let title = v.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()).map_or_else(|| format!("Edit {file}"), str::to_owned);
-                    let shown = content.clone();
-                    let mut out = super::diffs::propose_file(&cx.hub, &repo, &cx.caller, &file, &title, &v, move |_| Ok(content)).await?;
-                    // W20-R03: its effect too, as a push to the trunk plans it once it lands.
-                    let preview = answer(super::preview::of(&cx.hub, Some(&cx.caller), json!({ "repo": repo, "path": file, "content": shown, "event": "push" })).await).await.unwrap_or(Value::Null);
-                    if let Some(o) = out.as_object_mut() {
-                        o.insert("diagnostics".into(), serde_json::to_value(&checked.diagnostics).unwrap_or(Value::Null));
-                        o.insert("preview".into(), preview);
-                    }
-                    Ok(out)
+                    let (repo, file) = (text(&v, "repo")?, text(&v, "path")?);
+                    super::workflows::edit(&cx.hub, &cx.caller, &repo, &file, &v).await
                 }),
             op!("ci.oidc.token", "Your own workload token, as the agent kiln started (W10-R11): `sub` kiln:agent:<session>, acting for whoever started you, for `audience` (a model provider, a secret store, a cloud's STS). Federate with it instead of a stored key.", ro: false, destructive: false,
                 input: || schema(json!({"audience": {"type": "string", "description": "Who it's for, as their trust policy names it."}, "ttl": {"type": "integer", "minimum": 60, "maximum": 3600, "description": "Seconds it lasts (600 by default)."}}), &["audience"]),

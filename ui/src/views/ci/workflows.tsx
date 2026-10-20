@@ -1,14 +1,15 @@
 /**
  * The workflow editor (docs/ci.md W21-R01, W21-R06): a repository's workflow in the code editor,
  * checked as you type, with the plan it would make for an event beside it (W04-R29). The YAML is
- * the source. An edit opens a diff on the trunk of a repository kiln hosts (`ci.workflows.edit`),
- * and for any repository the patch, Copy and Download take it away. Below, the workflow's own
- * secrets and variables (W09-R11).
+ * the source. An edit is saved as its repository takes it (`ci.workflows.edit`): a diff on the
+ * trunk of a repository kiln hosts, a pull or merge request on GitHub, GitLab or Bitbucket, or a
+ * commit to a branch; for any repository the patch, Copy and Download take it away. Below, the
+ * workflow's own secrets and variables (W09-R11).
  */
 import * as React from "react";
 import { Download } from "lucide-react";
 import { api } from "@/api/client";
-import { ci, type CiMatrix, type CiOutline, type CiPreview } from "@/api/ci";
+import { ci, type CiMatrix, type CiOutline, type CiPreview, type CiSave } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -134,11 +135,14 @@ function jobAt(text: string): string | null {
 
 function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitRef: string }) {
   const file = useSuspenseResource(`ci-workflow/${repo}/${path}/${gitRef}`, (s) => ci.workflow(repo, path, gitRef, s)).data;
-  // Saving (W21-R06): a diff on the trunk of a repository kiln hosts; the patch for any other.
-  const hosted = useSuspenseResource("repos/", (s) => api.repos(s)).data.some((r) => r.name === repo && r.mode === "native");
+  // Saving (W21-R06): what the repository takes, from where it is kept; the patch for any.
+  const saves = file.saves ?? ["patch"];
+  const change = file.host === "gitlab" ? { one: "a merge request", title: "Merge request" } : { one: "a pull request", title: "Pull request" };
   const [text, setText] = React.useState(file.source);
   const [saving, setSaving] = React.useState(false);
-  const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string } | null>(null);
+  const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string; url?: string } | null>(null);
+  // The branch a commit goes to, while it's being named.
+  const [branch, setBranch] = React.useState<string | null>(null);
   const [counts, setCounts] = React.useState<{ errors: number; warnings: number } | null>(null);
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
@@ -193,7 +197,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
 
   const lint = async (content: string): Promise<Diagnostic[]> => {
     schema();
-    const r = await ci.validate(path, content);
+    const r = await ci.validate(path, content, repo);
     known.current.outline = r.outline ?? known.current.outline;
     const errors = r.diagnostics.filter((d) => d.severity === "error").length;
     setCounts({ errors, warnings: r.diagnostics.length - errors });
@@ -272,12 +276,19 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   };
 
   const changed = text !== file.source;
-  const propose = async () => {
+  const blocked = saving || (counts?.errors ?? 0) > 0;
+  const save = async (to: CiSave, onto?: string) => {
     setSaving(true);
     setSaved(null);
     try {
-      const d = (await ci.proposeWorkflow(repo, path, text)).diffs[0];
-      setSaved(d ? { text: `${d.name} opened: it lands through review.`, diff: d.name } : { text: "Proposed." });
+      const r = await ci.saveWorkflow(repo, path, { content: text, to, branch: onto });
+      const d = r.diffs?.[0];
+      if (d) setSaved({ text: `${d.name} opened: it lands through review.`, diff: d.name });
+      else if (r.change) setSaved({ text: ` #${r.change.number} opened on ${r.branch ?? "a new branch"}.`, url: r.change.url });
+      else if (r.branch) {
+        setSaved({ text: `Committed to ${r.branch} (${(r.sha ?? "").slice(0, 7)}).` });
+        setBranch(null);
+      } else setSaved({ text: "Saved." });
     } catch (e) {
       setSaved({ tone: "error", text: errorMessage(e) });
     } finally {
@@ -326,7 +337,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         {/* Under the edit, so a phone's header keeps to Copy and Download. */}
         {(changed || saved) && (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-5 pt-3">
-            <p className={`min-w-0 flex-1 text-[12.5px] leading-[1.55] [overflow-wrap:anywhere] ${saved?.tone === "error" ? "text-[var(--color-fail)]" : "text-[#a1a4ad]"}`} role="status">
+            <p className={`min-w-0 flex-1 basis-64 text-[12.5px] leading-[1.55] [overflow-wrap:anywhere] ${saved?.tone === "error" ? "text-[var(--color-fail)]" : "text-[#a1a4ad]"}`} role="status">
               {saved?.diff ? (
                 <>
                   <Link to={`/review/${encodeURIComponent(saved.diff)}`} className="text-link">
@@ -334,21 +345,55 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
                   </Link>{" "}
                   opened: it lands through review.
                 </>
+              ) : saved?.url ? (
+                <>
+                  <a href={saved.url} target="_blank" rel="noreferrer" className="text-link">
+                    {change.title}
+                  </a>
+                  {saved.text}
+                </>
               ) : (
                 saved?.text
               )}
             </p>
             {changed && (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <Button size="xs" variant="ghost" onClick={patch}>
                   The patch
                 </Button>
-                {hosted && (
-                  <Button size="xs" variant="secondary" disabled={saving || (counts?.errors ?? 0) > 0} onClick={() => void propose()}>
+                {saves.includes("branch") && branch === null && (
+                  <Button size="xs" variant="ghost" disabled={blocked} onClick={() => setBranch("")}>
+                    To a branch
+                  </Button>
+                )}
+                {saves.includes("change") && (
+                  <Button size="xs" variant="secondary" disabled={blocked} onClick={() => void save("change")}>
+                    Open {change.one}
+                  </Button>
+                )}
+                {saves.includes("diff") && (
+                  <Button size="xs" variant="secondary" disabled={blocked} onClick={() => void save("diff")}>
                     Open a diff
                   </Button>
                 )}
               </div>
+            )}
+            {changed && branch !== null && (
+              <form
+                className="flex w-full flex-wrap items-end gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (branch.trim()) void save("branch", branch.trim());
+                }}
+              >
+                <TextField id="wf-save-branch" label="Branch" className="min-w-0 flex-1" value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="ci/faster-tests" autoFocus />
+                <Button size="xs" type="submit" variant="secondary" disabled={blocked || !branch.trim()}>
+                  Commit
+                </Button>
+                <Button size="xs" type="button" variant="ghost" onClick={() => setBranch(null)}>
+                  Cancel
+                </Button>
+              </form>
             )}
           </div>
         )}

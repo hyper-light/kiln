@@ -432,6 +432,7 @@ pub static ROUTES: &[Rule] = &[
     r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
     // What notification rules sent (W19-R06), every repository's.
     r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),
@@ -544,7 +545,9 @@ fn matches(pattern: &str, segs: &[&str]) -> bool {
     let pat: Vec<&str> = pattern.trim_matches('/').split('/').collect();
     for (n, p) in pat.iter().enumerate() {
         if *p == "**" {
-            return segs.len() > n;
+            // One segment or more, then the pattern's own after it, at the end.
+            let after = pat.get(n + 1..).unwrap_or_default();
+            return segs.len() > n + after.len() && after.iter().rev().zip(segs.iter().rev()).all(|(p, s)| *p == "*" || p == s);
         }
         match segs.get(n) {
             Some(s) if *p == "*" || p == s => {}
@@ -728,6 +731,8 @@ mod tests {
             (Method::GET, "/api/ci/actions/policy", "runs.read"),
             (Method::PUT, "/api/ci/actions/policy", "settings.manage"),
             (Method::POST, "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/dispatches", "runs.trigger"),
+            (Method::POST, "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/edit", "workflows.edit"),
+            (Method::POST, "/api/ci/repos/acme%2Fapp/workflows/edit", "runs.trigger"),
             (Method::DELETE, "/api/ci/repos/r/caches/9", "caches.write"),
             (Method::DELETE, "/api/updates/binaries/x86_64-linux", "settings.manage"),
             (Method::HEAD, "/api/ci/runs/r1", "runs.read"),

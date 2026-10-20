@@ -7,7 +7,8 @@
 // - W10-R12: Settings → OIDC says how the issuer is reached, and fits a phone.
 // - W09-R11: a repository's secrets on the Repositories page, a workflow's variables in its
 //   editor, each set and removed in place.
-// - W21-R06: the editor's saving, the patch of an edit and a diff opened on the trunk.
+// - W21-R06: the editor's saving, the patch of an edit, a diff opened on the trunk and a commit to
+//   a branch; W02-R12: a label no runner has, warned of where it is.
 // - W21-R01: the editor's keys from the schema, on hover (desktop) and as one is typed; W21-R06:
 //   the plan preview's matrix as written.
 //
@@ -189,6 +190,9 @@ for (const [name, type, phone] of [
         await page.screenshot({ path: `${shots}/workflow-secrets-${name}-${tag}.png`, fullPage: true });
         await vars.getByRole("button", { name: "Remove", exact: true }).first().click();
         check(name, `${tag}: and removed`, await until(async () => (await vars.count()) === 0 || !/STAGE/.test(await text(vars))), await text(wfPanel));
+        // What only the server knows (W02-R12): no runner here has `local`, said where it is.
+        const warned = page.locator(".cm-lintRange-warning", { hasText: "local" });
+        check(name, `${tag}: a label no runner has, warned of in place`, await until(async () => (await warned.count()) > 0, 20000), await text(page.locator("section.panel").first()));
         // The editor's saving (W21-R06): the patch of what changed, and a diff opened on the trunk.
         await page.locator(".cm-content").first().click();
         await page.keyboard.press("Control+End");
@@ -201,6 +205,16 @@ for (const [name, type, phone] of [
         await page.getByRole("button", { name: "Open a diff", exact: true }).click();
         const opened = page.getByRole("status").filter({ hasText: "opened: it lands through review" });
         check(name, `${tag}: a diff opened on the trunk`, await until(async () => (await opened.count()) > 0, 30000), await text(page.locator("main").first()));
+        // Or a commit to a branch, taken as a push of it would be.
+        await page.getByRole("button", { name: "To a branch", exact: true }).click();
+        const onto = `edit-${name}-${tag}`;
+        await page.locator("#wf-save-branch").fill(onto);
+        await page.getByRole("button", { name: "Commit", exact: true }).click();
+        const committed = page.getByRole("status").filter({ hasText: `Committed to ${onto}` });
+        check(name, `${tag}: committed to a branch`, await until(async () => (await committed.count()) > 0, 30000), await text(page.getByRole("status").first()));
+        // Said on a line of its own width, the buttons beside it or below.
+        const said = await committed.first().boundingBox();
+        check(name, `${tag}: and said in a line that reads`, (said?.width ?? 0) >= 200, JSON.stringify(said));
         check(name, `${tag}: the editor fits, saved`, (await overflow(page)) <= 0, String(await overflow(page)));
         const cut = await page.locator("section.panel").first().evaluate((el) => el.scrollWidth - el.clientWidth);
         check(name, `${tag}: nothing in the editor's panel is cut off`, cut <= 0, String(cut));

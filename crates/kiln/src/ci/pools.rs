@@ -53,7 +53,7 @@ pub async fn sources(hub: &Hub) -> (Vec<Pool>, Vec<Reservation>) {
 }
 
 /// The pools' settings: the configuration's, then the stored ones.
-async fn specs(hub: &Hub) -> Vec<PoolSpec> {
+pub(crate) async fn specs(hub: &Hub) -> Vec<PoolSpec> {
     let mut specs: Vec<PoolSpec> = hub.cfg.ci.pools.clone();
     let stored: Vec<String> = hub.store.call(|c| {
         let mut s = c.prepare("SELECT spec FROM ci_pools ORDER BY created_at, name")?;

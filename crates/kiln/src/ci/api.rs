@@ -102,7 +102,7 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (_, ["repos", _, "providers", "sync" | "workflows"])
             | (&Method::GET, ["repos", _, "commits", _, "checks"])
             | (_, ["repos", _, "pulls", ..])
-            | (&Method::POST, ["repos", _, "workflows", .., "dispatches"])
+            | (&Method::POST, ["repos", _, "workflows", .., "dispatches" | "edit"])
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
             | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
@@ -129,7 +129,9 @@ fn owned(rest: &[&str]) -> Vec<String> {
 /// future a slot of its own).
 async fn reach_out(hub: &Arc<Hub>, method: Method, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let caller = req.extensions().get::<crate::authz::Caller>().cloned();
-    let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT) { crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+    // A workflow's new text is up to 1 MiB (W02-R03), and JSON's escapes on top.
+    let limit = if matches!(rest, ["repos", _, "workflows", .., "edit"]) { 2 << 20 } else { 1 << 20 };
+    let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT) { crate::http::server::body_json(req.into_body(), limit).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
     let (hub, rest, q) = (Arc::clone(hub), rest.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>(), q.clone());
     crate::rt::spawn(async move {
         let segs: Vec<&str> = rest.iter().map(String::as_str).collect();
@@ -142,6 +144,11 @@ async fn reach_out(hub: &Arc<Hub>, method: Method, rest: &[&str], q: &HashMap<St
 async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<String, String>, body: serde_json::Value, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
     let ok = |v: &serde_json::Value| crate::http::server::json(StatusCode::OK, v);
     match (method, rest) {
+        // W02-R12, W21-R06: a workflow's new text, saved as its repository takes it.
+        (&Method::POST, ["repos", repo, "workflows", path @ .., "edit"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::workflows::edit(hub, &caller, repo, &path.join("/"), &body).await?))
+        }
         // W23: what a repository's CI runs on, and the rest of the providers' contract (R01).
         (&Method::GET, ["repos", repo, "providers"]) => Ok(ok(&super::providers::show(hub, repo).await?)),
         (&Method::PUT, ["repos", repo, "providers"]) => {
@@ -181,7 +188,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             boxed(|| crate::githost::web::start(hub, &by, &body)).await
         }
         // W02: workflows.
-        (&Method::POST, ["validate"]) => boxed(|| workflows::validate(req.into_body())).await,
+        (&Method::POST, ["validate"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            boxed(|| workflows::validate(hub, caller.as_ref(), req.into_body())).await
+        }
         // W13-R11: an image's definition, checked; or proposed for the repository ("Save to repo").
         (&Method::POST, ["images", "validate"]) => boxed(|| super::images::validate(req.into_body())).await,
         (&Method::POST, ["images"]) => {

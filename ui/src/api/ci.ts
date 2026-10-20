@@ -385,6 +385,21 @@ export interface CiWorkflowSource {
   source: string;
   diagnostics: CiDiagnostic[];
   outline: CiOutline | null;
+  /** Where the repository is kept (none: nowhere kiln writes), and what an edit of it may be saved as, the first its default (W21-R06). */
+  host?: "kiln" | "github" | "gitlab" | "bitbucket" | null;
+  saves?: CiSave[];
+}
+
+/** How an edited workflow is saved (W21-R06): a diff through review, a change (pull or merge request) on its host, a commit to a branch, or only the patch. */
+export type CiSave = "diff" | "change" | "branch" | "patch";
+
+export interface CiSaved {
+  to: CiSave;
+  diffs?: { name: string; title: string; kind: string; url: string }[];
+  branch?: string;
+  sha?: string;
+  change?: { number: number; url: string };
+  patch?: string;
 }
 
 export interface CiCatalogEntry {
@@ -668,12 +683,13 @@ export const ci = {
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
   /** A leg's attempts, oldest first, each with its failure class, and its outputs (W21-R05). */
   legDetail: (leg: string, signal?: AbortSignal) => request<{ attempts: CiAttempt[]; outputs: Record<string, string> }>("GET", `/api/ci/legs/${enc(leg)}`, undefined, { signal }),
-  validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
+  /** A file checked; with `repo`, against what its run would meet too (W02-R12: labels no runner has, actions its policies refuse). */
+  validate: (path: string, content: string, repo?: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, repo ? { path, content, repo } : { path, content }, { signal }),
   /** The JSON Schema of a kind of file (W02-R09): `gha`, `kiln`, `overlay` or `action`, for the editor's key completion and hover. */
   schema: (kind: "gha" | "kiln" | "overlay" | "action") => request<Schema>("GET", `/api/ci/schema/${kind}`),
-  /** A workflow's new text proposed as a diff on the trunk of a repository kiln hosts (W21-R06, `ci.workflows.edit`), checked first. */
-  proposeWorkflow: (repo: string, path: string, content: string) =>
-    request<{ diffs: { name: string; title: string; kind: string; url: string }[] }>("POST", "/api/ops/ci.workflows.edit", { repo, path, content }),
+  /** A workflow's new text saved as `to` says (W21-R06, `ci.workflows.edit`), checked first. */
+  saveWorkflow: (repo: string, path: string, body: { content: string; to: CiSave; branch?: string; title?: string }) =>
+    request<CiSaved>("POST", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}/edit`, body),
   workflows: (repo: string, ref: string, signal?: AbortSignal) =>
     request<{ ref: string; sha: string; workflows: CiWorkflowFile[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   workflow: (repo: string, path: string, ref: string, signal?: AbortSignal) =>

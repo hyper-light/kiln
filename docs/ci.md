@@ -893,7 +893,7 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   `POST /api/ci/validate { path, content, dialect?, repo? }` answers `{ kind, dialect,
   diagnostics, outline?: { name, dialect, events, jobs: [{ id, name, needs, runs_on, uses,
   legs_estimate, steps }] } }`: the file is read as what its path says (workflow, overlay, action,
-  policy file), and `repo` is reserved for checks that need the repository (routing, actions).
+  policy file), and `repo` adds the checks that need the repository (routing, actions).
   `GET /api/ci/repos/:repo/workflows?ref=` lists a ref's workflows, each with `runs` and the
   reason GitHub's run or don't; `GET /api/ci/repos/:repo/workflows/:path?ref=` gives one workflow's
   source, model and diagnostics. `:repo` is the repository's id or its name, URL-encoded.
@@ -987,10 +987,20 @@ took: the kiln dialect's outputs, exports and implicit checkout run on it end to
     - `snapshot`, kept as written.
   - Where GitHub's context table has no row for a key, the key is checked as the closest key that
     has one (Appendix B).
-- *Left to other workstreams.*
-  - `KCI6007` needs routing rules and runner facts (W05, W13).
-  - `POST /api/ci/repos/:repo/workflows/:path/edit` comes with W14 and W21.
-  - Repository-aware checks behind `/api/ci/validate`'s `repo` come with W05 and W07.
+- *Done.* The checks that need the server, and saving:
+  - `KCI6007`. With `repo`, `/api/ci/validate` (and the editor, which sends it) warns of each
+    `runs-on` label that no routing rule maps under any of the workflow's events, no runner
+    carries (its labels, its name alone, and those GitHub gives every self-hosted runner, from its
+    facts) and no pool gives its runners, at the label. Labels written as expressions are the
+    run's to know.
+  - The repository's action policies (W07-R04): a use they refuse is the error its run would
+    meet (`KCI4020`, `KCI4021`, at the step), and a pin they require takes the place of
+    `KCI6002`'s hint. Both checks apply only where kiln runs the workflow: KilnCI among the
+    repository's providers (W23-R01), and for a GitHub workflow, one kiln runs (W02-R02).
+  - `POST /api/ci/repos/:repo/workflows/:path/edit` (W21-R06): checked as `validate` checks it
+    with its repository, refused with its errors, then saved as a diff, a change on the
+    repository's host, a commit to a branch, or a patch.
+  - Tests: `crates/kiln/tests/workflow_edit.rs`; the App's part in `tests/github_app.rs`.
 
 ### W03 Triggers and events
 
@@ -5620,9 +5630,23 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   their values as a table, `include`, `exclude` and `where` as rows, `platforms`), the legs it
   makes counted, and the combinations removed with why. The preview's answer carries each job's
   matrix (`matrices`). Checked in Chromium and WebKit, desktop and phone.
+- *Done.* R06's saving, the rest. A workflow comes with what its repository takes (`saves`, from
+  where it is kept), and the editor offers just that (`POST …/workflows/:path/edit`, W02-R12):
+  - a repository kiln hosts: a diff, or a commit to a branch, made as a push of it would be
+    (`hosting::commit_branch`): refused for what a push is refused for (the trunk is the land
+    queue's), its pusher kept for its runs' secrets (W10-R02), and the push's run;
+  - one on GitHub (through the App), GitLab or Bitbucket: a new branch off the default branch and
+    its pull or merge request, or a commit to a branch. GitHub's token for it may write workflows,
+    as GitHub refuses a workflow file otherwise;
+  - any: the patch, as before.
+
+  Checked by `crates/kiln/tests/workflow_edit.rs` (labels, policies, the patch, a diff, the trunk
+  refused, a branch and its run, who may save), `tests/github_app.rs` (the branch and pull request
+  through the App, against a fake GitHub) and in Chromium and WebKit, desktop and phone
+  (`ci/ui/people_check.mjs`: a commit to a branch, and `runs-on: local` warned of on a server
+  with no runner).
 - *Left.*
-  - R06's flow view, editing the matrix in its table, and saving's commit to a branch and push
-    through the App.
+  - R06's flow view, and editing the matrix in its table.
   - R01's Dockerfile and Agentfile modes.
   - R07; R08's image builder and the pools' scaling history; R10 (with W15's pages, the CD
     board's). R09 is the review pages W14-AC06 checks.
@@ -6101,7 +6125,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | POST | `/api/ci/validate` | `ci.workflows.validate` | runs.read | W02 |
 | POST | `/api/ci/plan-preview` | `ci.workflows.plan_preview` | runs.read | W04 |
 | GET | `/api/ci/schema/:kind` | `ci.workflows.schema` | none (public within the API) | W02 |
-| POST | `/api/ci/repos/:repo/workflows/:path/edit` | `ci.workflows.edit` (→ a branch, diff or patch) | workflows.edit | W02, W14 |
+| POST | `/api/ci/repos/:repo/workflows/:path/edit` | `ci.workflows.edit` (→ a diff, a change on the repository's host, a commit to a branch, or a patch) | workflows.edit | W02, W14, W21 |
 | GET | `/api/ci/runs?repo=&workflow=&branch=&event=&conclusion=&actor=&runner=` | `ci.runs.list` | runs.read | W04 |
 | GET | `/api/ci/runs/:id` | `ci.runs.get` | runs.read | W04 |
 | GET | `/api/ci/runs/:id/graph` | `ci.runs.graph` (with critical path) | runs.read | W04, W19 |
