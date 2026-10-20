@@ -499,14 +499,29 @@ mod end_to_end {
             }
             let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let fail = |(c, m): crate::ops::Fail| anyhow::anyhow!("{c}: {m}");
+            // What the agent changed, as its runner would report it. The runner's own reports go on
+            // as its session settles (its harness gone), and one arriving after this replaces it:
+            // set again, and asked again, until the change request takes it.
+            let change = |input: Value| {
+                let (cx, hub, id, cwd) = (cx.clone(), Arc::clone(&hub), id.clone(), cwd.clone());
+                async move {
+                    for _ in 0..50 {
+                        anyhow::ensure!(hub.harness.set_changes(&id, json!([{"path": format!("{cwd}/a"), "added": 1, "removed": 1}])), "no agent to set the changes of");
+                        match call(cx.clone(), "agents.change", input.clone()).await {
+                            Err((_, m)) if m.contains("hasn't changed any files") => crate::rt::sleep(Duration::from_millis(100)).await,
+                            r => return r.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}")),
+                        }
+                    }
+                    anyhow::bail!("the agent's changes kept being replaced")
+                }
+            };
             // Nothing changed yet: nothing to open.
             let none = call(cx.clone(), "agents.change", json!({"agent": id})).await.err().map(|(_, m)| m).unwrap_or_default();
             assert!(none.contains("hasn't changed any files"), "{none}");
             // It changed a; the person has a file of their own beside it.
             sh(work.path(), "echo a2 > a && echo mine > b")?;
             let status = sh(work.path(), "git status --porcelain")?;
-            anyhow::ensure!(hub.harness.set_changes(&id, json!([{"path": format!("{cwd}/a"), "added": 1, "removed": 1}])), "no agent to set the changes of");
-            let out = call(cx.clone(), "agents.change", json!({"agent": id, "title": "Fix a", "fix_checks": false})).await.map_err(fail)?;
+            let out = change(json!({"agent": id, "title": "Fix a", "fix_checks": false})).await?;
             let branch = get(&out, "/change_request/branch").as_str().unwrap_or_default().to_owned();
             assert!(branch.starts_with("agents/fix-a-"), "{out}");
             assert_eq!(get(&out, "/change_request/provider"), &json!("git"), "a remote kiln has no integration with");
@@ -525,7 +540,7 @@ mod end_to_end {
             assert_eq!(get(&list, "/changes/0/agent"), &json!(id));
             // More work: a new version on the same branch.
             sh(work.path(), "echo a3 > a")?;
-            let again = call(cx, "agents.change", json!({"agent": id})).await.map_err(fail)?;
+            let again = change(json!({"agent": id})).await?;
             assert_eq!(get(&again, "/change_request/version"), &json!(2));
             assert_eq!(get(&again, "/change_request/branch"), &json!(branch));
             assert_eq!(get(&again, "/change_request/fix_checks"), &json!(false), "as it was opened");

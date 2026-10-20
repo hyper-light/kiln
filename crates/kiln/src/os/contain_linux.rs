@@ -207,7 +207,14 @@ fn remove_tree(dir: &Path, depth: usize) {
             }
         }
     }
-    let _ = fs::remove_dir(dir);
+    // A group whose last processes were just killed counts them until they're reaped: busy for
+    // a moment, then removable.
+    for _ in 0..40 {
+        match fs::remove_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => std::thread::sleep(Duration::from_millis(25)),
+            _ => return,
+        }
+    }
 }
 
 /// A group in a folder of its own (`kiln-agents-test-<pid>` beside the runner's), so tests never

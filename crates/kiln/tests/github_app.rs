@@ -1,5 +1,5 @@
-//! The GitHub App (docs/ci.md W14-R10, R12), against a fake GitHub API and a `git daemon` that
-//! stands for GitHub's git: a KilnCI run of a repository on GitHub gets a check run there, made
+//! The GitHub App (docs/ci.md W14-R10, R12), against a fake GitHub API and a smart HTTP git server
+//! (`git http-backend`) that stands for GitHub's git: a KilnCI run of a repository on GitHub gets a check run there, made
 //! when the run starts and done with its conclusion, through installation tokens the App's JWT
 //! (checked against its key) gets for that one repository; a job of a `github_api: github`
 //! repository calls GitHub's API with such a token, its permissions the job's; GitHub's "Re-run"
@@ -12,13 +12,13 @@ mod common;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aws_lc_rs::signature::KeyPair as _;
 use base64::Engine as _;
-use common::{Options, free_port, http, start};
+use common::{Options, http, start};
 use serde_json::{Value, json};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -132,13 +132,109 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
 }
 
-struct Daemon(Child);
+/// GitHub's git over smart HTTP, as GitHub serves it: `git http-backend` (core git, wherever git
+/// is) as a CGI behind a server of this test's, each request on a thread of its own. Its port.
+fn git_http(root: &Path) -> anyhow::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let _ = serve_git(stream, &root);
+            });
+        }
+    });
+    Ok(port)
+}
 
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+/// One request, answered by `git http-backend`.
+fn serve_git(stream: std::net::TcpStream, root: &Path) -> anyhow::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut w = stream;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("GET").to_owned(), parts.next().unwrap_or("/").to_owned());
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h)? == 0 || h.trim_end().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.trim_end().split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_owned()));
+        }
     }
+    let header = |k: &str| headers.iter().find(|(h, _)| h == k).map(|(_, v)| v.clone());
+    if header("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) {
+        w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+    }
+    let mut body = Vec::new();
+    if header("transfer-encoding").is_some_and(|t| t.contains("chunked")) {
+        loop {
+            let mut size = String::new();
+            reader.read_line(&mut size)?;
+            let n = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16)?;
+            // Each chunk ends with CRLF, the last (empty) one too.
+            let mut chunk = vec![0; n + 2];
+            reader.read_exact(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            body.extend(chunk.get(..n).unwrap_or_default());
+        }
+    } else if let Some(n) = header("content-length").and_then(|n| n.parse::<usize>().ok()) {
+        body.resize(n, 0);
+        reader.read_exact(&mut body)?;
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    let mut cgi = Command::new("git");
+    cgi.arg("http-backend")
+        .env("GIT_PROJECT_ROOT", root)
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("REQUEST_METHOD", &method)
+        .env("PATH_INFO", path)
+        .env("QUERY_STRING", query)
+        .env("CONTENT_LENGTH", body.len().to_string())
+        .env("REMOTE_ADDR", "127.0.0.1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (h, var) in [("content-type", "CONTENT_TYPE"), ("content-encoding", "HTTP_CONTENT_ENCODING"), ("git-protocol", "GIT_PROTOCOL")] {
+        if let Some(v) = header(h) {
+            cgi.env(var, v);
+        }
+    }
+    let mut child = cgi.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&body)?;
+    }
+    let out = child.wait_with_output()?.stdout;
+    // The CGI's own headers (its status among them), a blank line, then the body.
+    let (head, rest) = match out.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => (out.get(..i).unwrap_or_default(), out.get(i + 4..).unwrap_or_default()),
+        None => match out.windows(2).position(|w| w == b"\n\n") {
+            Some(i) => (out.get(..i).unwrap_or_default(), out.get(i + 2..).unwrap_or_default()),
+            None => (&[][..], out.as_slice()),
+        },
+    };
+    let mut status = "200 OK".to_owned();
+    let mut response = Vec::new();
+    for h in String::from_utf8_lossy(head).lines().map(str::trim).filter(|h| !h.is_empty()) {
+        match h.strip_prefix("Status:") {
+            Some(s) => status = s.trim().to_owned(),
+            None => response.extend_from_slice(format!("{h}\r\n").as_bytes()),
+        }
+    }
+    write!(w, "HTTP/1.1 {status}\r\n")?;
+    w.write_all(&response)?;
+    write!(w, "Content-Length: {}\r\nConnection: close\r\n\r\n", rest.len())?;
+    w.write_all(rest)?;
+    Ok(())
 }
 
 fn until(secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<String>>) -> anyhow::Result<()> {
@@ -164,7 +260,7 @@ fn w14_r10_github_app() -> anyhow::Result<()> {
     std::fs::write(&secret, "s3cret\n")?;
     let (api, calls) = fake_github(kp.public_key().as_ref().to_vec())?;
 
-    // GitHub's git: a bare repository `git daemon` serves, with a workflow and `github_api: github`.
+    // GitHub's git: a bare repository it serves, with a workflow and `github_api: github`.
     let gh = dir.path().join("gh");
     std::fs::create_dir_all(gh.join("acme"))?;
     git(&gh, &["init", "-q", "--bare", "acme/app.git"])?;
@@ -196,29 +292,15 @@ jobs:
     git(&work, &["add", "."])?;
     git(&work, &["commit", "-qm", "first"])?;
     git(&work, &["push", "-q", &gh.join("acme/app.git").to_string_lossy(), "HEAD:main"])?;
-    let port = free_port()?;
-    // The daemon dies with this test, however it ends (`setpriv --pdeathsig`, where there is one).
-    // `git daemon` would run it as a child that outlives a killed `git`: git-daemon itself.
-    let exec_path = String::from_utf8(Command::new("git").arg("--exec-path").output()?.stdout)?.trim().to_owned();
-    let git_daemon = Path::new(&exec_path).join("git-daemon");
-    let tied = Command::new("setpriv").arg("--help").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("pdeathsig"));
-    let mut cmd = if tied {
-        let mut c = Command::new("setpriv");
-        c.args(["--pdeathsig", "KILL"]).arg(&git_daemon);
-        c
-    } else {
-        Command::new(&git_daemon)
-    };
-    let daemon = cmd.args(["--reuseaddr", "--export-all", &format!("--port={port}"), "--listen=127.0.0.1"]).arg(format!("--base-path={}", gh.display())).arg(&gh).spawn()?;
-    let _daemon = Daemon(daemon);
-    std::thread::sleep(Duration::from_millis(500));
+    // Served over smart HTTP, as GitHub serves it, for as long as this test runs.
+    let port = git_http(&gh)?;
 
     let ci = format!(
         "github = {{ app_id = 99, private_key_file = \"{}\", webhook_secret_file = \"{}\", api_url = \"http://127.0.0.1:{api}\", web_url = \"http://127.0.0.1:{port}\" }}",
         key.display(),
         secret.display()
     );
-    let extra = format!("[[repos]]\nname = \"acme/app\"\nclone_url = \"git://127.0.0.1:{port}/acme/app.git\"\n\n[[repos]]\nname = \"acme/gha\"\nclone_url = \"git://127.0.0.1:{port}/acme/gha.git\"\n");
+    let extra = format!("[[repos]]\nname = \"acme/app\"\nclone_url = \"http://127.0.0.1:{port}/acme/app.git\"\n\n[[repos]]\nname = \"acme/gha\"\nclone_url = \"http://127.0.0.1:{port}/acme/gha.git\"\n");
     let s = start(dir.path(), &Options { agent: true, ci: &ci, extra: &extra })?;
     let (st, app) = http(s.port, "GET", "/api/ci/github/app", &s.admin, None)?;
     assert!(st == 200 && app.contains("\"configured\":true") && app.contains("\"source\":\"config\""), "{st} {app}");

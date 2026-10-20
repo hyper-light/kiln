@@ -258,8 +258,8 @@ pub fn shown(command: &str) -> String {
     super::model::clip_middle(inner.trim(), 160).0
 }
 
-/// Stop processes (blocking): asked to end, then killed if they haven't in a few seconds. Only
-/// these: a stopped harness's children stay.
+/// Stop processes (blocking): asked to end, then killed if they haven't in a few seconds, and
+/// waited for (a few seconds more at most). Only these: a stopped harness's children stay.
 pub fn stop(pids: &[u32]) {
     use sysinfo::{Pid, Signal};
     if pids.is_empty() {
@@ -281,10 +281,15 @@ pub fn stop(pids: &[u32]) {
         }
         if std::time::Instant::now() >= end {
             let sys = system(Some(&left));
-            for p in left {
-                if let Some(proc_) = sys.process(Pid::from_u32(p)) {
+            for p in &left {
+                if let Some(proc_) = sys.process(Pid::from_u32(*p)) {
                     proc_.kill();
                 }
+            }
+            // Gone once each is next given the CPU: on a busy machine, not at once.
+            let end = std::time::Instant::now() + GRACE;
+            while !alive_pids(&left).is_empty() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(50));
             }
             return;
         }

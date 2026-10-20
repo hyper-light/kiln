@@ -351,7 +351,9 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>) -> 
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if hyper_rt::readiness::readable(fd).await.is_err() {
+                    // Woken when a connection waits, and looked at again each second regardless:
+                    // a wakeup missed costs a second, never an asker left waiting.
+                    if let Ok(Err(_)) = crate::rt::timeout(std::time::Duration::from_secs(1), hyper_rt::readiness::readable(fd)).await {
                         crate::rt::sleep(std::time::Duration::from_millis(200)).await;
                     }
                 }
@@ -384,7 +386,8 @@ mod tests {
         crate::rt::blocking(move || -> anyhow::Result<Value> {
             use std::io::{BufRead as _, Write as _};
             let mut s = std::os::unix::net::UnixStream::connect(&path)?;
-            s.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+            // A loaded machine (the whole suite at once) takes its time: an answer, not a race.
+            s.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
             let mut line = req.to_string().into_bytes();
             line.push(b'\n');
             s.write_all(&line)?;
@@ -437,7 +440,7 @@ mod tests {
             });
             let _ = tx.send(r);
         });
-        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        match rx.recv_timeout(std::time::Duration::from_secs(180)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("the socket hung"),
         }

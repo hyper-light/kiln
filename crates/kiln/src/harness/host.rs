@@ -424,6 +424,13 @@ impl Host {
                 }
                 return 0;
             }
+            // Their pipes kept open across the exec that comes next, only now: a process started
+            // while they were handed over would hold them for good.
+            for (id, h) in &out {
+                if let Err(e) = h.process.keep_across_exec() {
+                    tracing::warn!(session = %id, error = %e, "an agent session's pipes can't be kept across the upgrade: it starts again after it");
+                }
+            }
         }
         n
     }
@@ -875,13 +882,13 @@ mod tests {
                 program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
                 ..Spec::default()
             };
-            let s = host.open(Some("a".into()), spec.clone())?;
-            assert_eq!(s.id, "a");
+            let s = host.open(Some("limits".into()), spec.clone())?;
+            assert_eq!(s.id, "limits");
             // The same id again is the same session; another one is over the limit.
-            assert_eq!(host.open(Some("a".into()), spec.clone())?.id, "a");
+            assert_eq!(host.open(Some("limits".into()), spec.clone())?.id, "limits");
             assert!(host.open(None, spec).is_err());
-            assert_eq!(host.inventory().sessions, vec!["a".to_owned()]);
-            assert!(host.close("a"));
+            assert_eq!(host.inventory().sessions, vec!["limits".to_owned()]);
+            assert!(host.close("limits"));
             assert!(host.list().is_empty());
             Ok(())
         })
@@ -904,21 +911,21 @@ mod tests {
             {
                 let (tx, _rx) = async_channel::unbounded();
                 let host = Host::new(tx, Some(file.clone()), Limits::default());
-                host.open(Some("a".into()), spec)?;
+                host.open(Some("timeline".into()), spec)?;
                 host.save_now();
             }
             let (_dir, store) = crate::convo::store::scratch()?;
             let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
-            store.send("a", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
-            store.send("a", &said("m1", 1, "first"));
-            store.send("a", &said("n1", 2, "a notice only kiln has"));
-            store.send("a", &said("m2", 3, "second"));
+            store.send("timeline", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
+            store.send("timeline", &said("m1", 1, "first"));
+            store.send("timeline", &said("n1", 2, "a notice only kiln has"));
+            store.send("timeline", &said("m2", 3, "second"));
             store.sync()?;
             // After it: the session comes back with that timeline, in order, by id.
             let (tx, _rx) = async_channel::unbounded();
             let again = Host::new(tx, Some(file.clone()), Limits::default());
             again.restore_from(Some(&store));
-            let back = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let back = again.sessions.lock().get("timeline").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
             let core = back.core.lock();
             assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
             assert_eq!(core.state.title, "the parser");
@@ -1003,7 +1010,15 @@ mod tests {
                 let _ = recorded.kill();
                 return Ok(());
             };
-            let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_62} >/dev/null 2>&1 & echo $!")).env(survivors::MARK, "a").output()?;
+            // Started as an agent's processes start: in the session's group of processes where
+            // this machine has them (found by it), by its mark elsewhere.
+            let group = crate::os::contain::Group::of("left-running");
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(format!("{sleep_62} >/dev/null 2>&1 & echo $!")).env(survivors::MARK, "left-running");
+            if let Some(g) = &group {
+                g.enter(&mut cmd);
+            }
+            let out = cmd.output()?;
             let marked: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
             let mine = survivors::scan(&[("me".to_owned(), Some(std::process::id()))]).remove("me").unwrap_or_default().under;
             let ran = |pid: u32| -> anyhow::Result<Ran> { mine.iter().find(|r| r.pid == pid).cloned().ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
@@ -1011,7 +1026,7 @@ mod tests {
             {
                 let (tx, _rx) = async_channel::unbounded();
                 let host = Host::new(tx, Some(file.clone()), Limits::default());
-                let s = host.open(Some("a".into()), spec.clone())?;
+                let s = host.open(Some("left-running".into()), spec.clone())?;
                 s.turn_open.store(true, Ordering::Relaxed);
                 *s.ran.lock() = (Some(h.clone()), vec![r.clone()]);
                 host.save_now();
@@ -1023,7 +1038,7 @@ mod tests {
             let _ = harness.wait();
             assert!(survivors::alive(std::slice::from_ref(&h)).is_empty(), "the harness that outlived its runner is stopped");
             assert_eq!(survivors::alive(std::slice::from_ref(&r)).len(), 1);
-            let s = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let s = again.sessions.lock().get("left-running").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
             let (tasks, queue) = {
                 let core = s.core.lock();
                 (core.state.tasks.clone(), core.state.queue.clone())
@@ -1047,6 +1062,10 @@ mod tests {
             assert!(survivors::alive(std::slice::from_ref(&r)).is_empty(), "and it ended");
             let _ = recorded.wait();
             survivors::stop(&[marked]);
+            if let Some(g) = group {
+                g.kill();
+                g.remove();
+            }
             Ok(())
         })
     }
@@ -1064,7 +1083,7 @@ mod tests {
                 program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
                 ..Spec::default()
             };
-            let s = host.open(Some("a".into()), spec)?;
+            let s = host.open(Some("paused".into()), spec)?;
             {
                 let mut core = s.core.lock();
                 core.state.harness_session = Some("h1".into());
@@ -1088,7 +1107,7 @@ mod tests {
             let (tx2, _rx2) = async_channel::unbounded();
             let again = Host::new(tx2, Some(file.clone()), Limits::default());
             again.restore();
-            let back = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let back = again.sessions.lock().get("paused").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
             let p = back.core.lock().state.pause.clone().ok_or_else(|| anyhow::anyhow!("pause not restored"))?;
             assert_eq!((p.since, p.checking), (7, None));
             assert_eq!(back.core.lock().state.pause_at, Some(90));

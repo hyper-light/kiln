@@ -3732,73 +3732,85 @@ jobs:
       - id: n0
         background: true
         run: |
-          mkdir -p running && touch running/n0 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n0 started/n0 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n0
       - id: n1
         background: true
         run: |
-          mkdir -p running && touch running/n1 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n1 started/n1 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n1
       - id: n2
         background: true
         run: |
-          mkdir -p running && touch running/n2 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n2 started/n2 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n2
       - id: n3
         background: true
         run: |
-          mkdir -p running && touch running/n3 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n3 started/n3 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n3
       - id: n4
         background: true
         run: |
-          mkdir -p running && touch running/n4 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n4 started/n4 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n4
       - id: n5
         background: true
         run: |
-          mkdir -p running && touch running/n5 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n5 started/n5 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n5
       - id: n6
         background: true
         run: |
-          mkdir -p running && touch running/n6 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n6 started/n6 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n6
       - id: n7
         background: true
         run: |
-          mkdir -p running && touch running/n7 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n7 started/n7 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n7
       - id: n8
         background: true
         run: |
-          mkdir -p running && touch running/n8 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n8 started/n8 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n8
       - id: n9
         background: true
         run: |
-          mkdir -p running && touch running/n9 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n9 started/n9 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n9
       - id: n10
         background: true
         run: |
-          mkdir -p running && touch running/n10 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n10 started/n10 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n10
       - id: n11
         background: true
         run: |
-          mkdir -p running && touch running/n11 && ls running | wc -l >> counts
+          mkdir -p running started && touch running/n11 started/n11 && ls running | wc -l >> counts
+          for i in $(seq 300); do [ "$(ls started | wc -l)" -ge 10 ] && break; sleep 0.1; done
           sleep 1
           rm running/n11
       - wait-all: true
@@ -3830,6 +3842,8 @@ jobs:
         assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Success), "continue-on-error: the wait succeeds");
         assert_eq!(finished(&events, 6).map(|f| f.1), Some(Conclusion::Cancelled), "cancelled");
         assert!(t.elapsed() >= BACKGROUND_GRACE, "SIGTERM was ignored: SIGKILL after the grace period");
+        // Each counted step holds until ten have started: ten overlap however slowly a busy
+        // machine starts them.
         let most = all.lines().find_map(|l| l.trim().strip_prefix("most at once ")).and_then(|n| n.trim().parse::<u32>().ok());
         assert_eq!(most, Some(10), "12 background steps, 10 at once: {all}");
         assert!(all.contains("parallel gave one two"), "{all}");
@@ -3850,7 +3864,7 @@ jobs:
       - run: echo skipped
       - if: always()
         timeout-minutes: 0.02
-        run: sleep 30
+        run: sleep 120
       - if: failure()
         run: echo ran-after-failure
 ";
@@ -3862,7 +3876,9 @@ jobs:
         assert!(events.iter().any(|e| matches!(e, JobEventV2::Annotation { message, .. } if message == "The action has timed out.")));
         assert!(events.iter().any(|e| matches!(e, JobEventV2::Annotation { message, .. } if message == "Process completed with exit code 2.")));
         assert!(logs.get(&3).is_some_and(|l| l.contains("ran-after-failure")));
-        assert!(t.elapsed() < Duration::from_secs(20), "the timeout cut the sleep short: {:?}", t.elapsed());
+        // Cut at 1.2 s, the whole job takes seconds; a loaded machine (the suite at once) takes
+        // longer, and still nothing near the two minutes the sleep would have.
+        assert!(t.elapsed() < Duration::from_secs(60), "the timeout cut the sleep short: {:?}", t.elapsed());
         Ok(())
     }
 
