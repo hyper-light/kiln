@@ -5193,7 +5193,7 @@ mod tests {
             Ok(super::super::session::codex_task_output(core, task))
         };
         let pending = read(&core, "child")?;
-        assert_eq!((pending["data"].as_str(), pending["pending"].as_bool(), pending["live"].as_bool()), (Some(""), Some(true), Some(true)));
+        assert_eq!((pending.get("data").and_then(serde_json::Value::as_str), pending.get("pending").and_then(serde_json::Value::as_bool), pending.get("live").and_then(serde_json::Value::as_bool)), (Some(""), Some(true), Some(true)));
         c.child_history(&mut core, "child", &[json!({"id": "child-turn", "status": "completed", "items": [
             {"type": "userMessage", "id": "assignment", "content": [{"type": "text", "text": "Private assignment"}]},
             {"type": "reasoning", "id": "thought", "summary": [{"text": "Private reasoning"}]},
@@ -5206,25 +5206,25 @@ mod tests {
         core.upsert("parent-answer", None, Body::Assistant { text: "Parent result".into(), streaming: false });
         core.upsert("child:grandchild:answer", Some("grandchild-spawn".into()), Body::Assistant { text: "Grandchild result".into(), streaming: false });
         let completed = read(&core, "child")?;
-        assert_eq!(completed["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed."));
-        assert_eq!((completed["live"].as_bool(), completed["reset"].as_bool(), completed["truncated"].as_bool()), (Some(false), Some(true), Some(false)));
-        assert_eq!(read(&core, "sibling")?["data"].as_str(), Some("Sibling result"));
+        assert_eq!(completed.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed."));
+        assert_eq!((completed.get("live").and_then(serde_json::Value::as_bool), completed.get("reset").and_then(serde_json::Value::as_bool), completed.get("truncated").and_then(serde_json::Value::as_bool)), (Some(false), Some(true), Some(false)));
+        assert_eq!(read(&core, "sibling")?.get("data").and_then(serde_json::Value::as_str), Some("Sibling result"));
         // Starting more work and streamed text updates are visible without reopening an
         // executor, waiting for a final answer, or appending an earlier snapshot twice.
         feed(&mut c, &mut core, &[
             json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "follow-up"}}}),
             json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "progress", "delta": "Checking"}})
         ]);
-        assert_eq!(read(&core, "child")?["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking"));
+        assert_eq!(read(&core, "child")?.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking"));
         feed(&mut c, &mut core, &[json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "progress", "delta": " again"}})]);
         let running = read(&core, "child")?;
-        assert_eq!(running["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking again"));
-        assert_eq!(running["live"].as_bool(), Some(true));
+        assert_eq!(running.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking again"));
+        assert_eq!(running.get("live").and_then(serde_json::Value::as_bool), Some(true));
         // Repeated history import updates the same events, never duplicating their output.
         c.child_history(&mut core, "child", &[json!({"id": "follow-up", "status": "completed", "items": [
             {"type": "agentMessage", "id": "progress", "text": "Rechecked successfully.", "phase": "final_answer"}
         ]})]);
-        assert_eq!(read(&core, "child")?["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nRechecked successfully."));
+        assert_eq!(read(&core, "child")?.get("data").and_then(serde_json::Value::as_str), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nRechecked successfully."));
         Ok(())
     }
 
