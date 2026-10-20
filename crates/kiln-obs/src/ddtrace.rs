@@ -124,6 +124,8 @@ pub struct Decoder {
     attrs: Vec<Attr<'static>>,
     /// A span's links and events, each with its kind.
     parts: Vec<(u32, &'static [u8])>,
+    /// A tracer's chunk's spans' ids and services, to tell its top-level spans.
+    ids: Vec<(u64, &'static str)>,
     /// Row buffers handed back ([`Decoder::give`]).
     spare: Vec<Vec<u8>>,
 }
@@ -160,19 +162,7 @@ impl Decoder {
 
     /// The spans of an `AgentPayload` into `out`; `now_ns` stands for a span that says no time.
     pub fn decode(&mut self, body: &[u8], now_ns: i64, out: &mut Spans) -> Result<(), DdError> {
-        let mut cx = Cx {
-            text: std::mem::take(&mut self.text),
-            tmp: std::mem::take(&mut self.tmp),
-            strings: strs_for(std::mem::take(&mut self.strings)),
-            payload: attrs_for(std::mem::take(&mut self.payload)),
-            chunk: attrs_for(std::mem::take(&mut self.chunk)),
-            tags: attrs_for(std::mem::take(&mut self.tags)),
-            attrs: attrs_for(std::mem::take(&mut self.attrs)),
-            parts: parts_for(std::mem::take(&mut self.parts)),
-            spare: &mut self.spare,
-            seg: None,
-        };
-        let r = (|| {
+        self.run(out, |cx, out| -> Result<(), OtlpError> {
             // The Agent's own first: what its tracers' payloads fall back on.
             let mut agent = Agent { host: "", env: "" };
             for f in Fields::new(body) {
@@ -189,10 +179,42 @@ impl Decoder {
                     _ => {}
                 }
             }
-            Ok::<(), OtlpError>(())
-        })();
+            Ok(())
+        })
+    }
+
+    /// A tracer's own payload, as it sends its Agent (kiln in the Agent's place):
+    /// `/v0.4/traces` (`v5` false: MessagePack, each trace an array of spans, each span a map) or
+    /// `/v0.5/traces` (its strings first, in a table, each span an array of twelve). Every span is
+    /// counted into `stats` first, as the Agent's concentrator counts them; a trace its tracer
+    /// dropped (its priority below zero, or zero and no error in it) is counted and not kept.
+    pub fn decode_tracer<'a>(&mut self, v5: bool, body: &'a [u8], tracer: &Tracer<'a>, now_ns: i64, out: &mut Spans, stats: &mut Vec<SpanStat<'a>>) -> Result<TracerTaken, DdError> {
+        let mut taken = TracerTaken::default();
+        self.run(out, |cx, out| cx.tracer(v5, body, tracer, now_ns, out, stats, &mut taken))?;
+        Ok(taken)
+    }
+
+    /// Runs `f` with the decoder's room lent for one payload's borrows, its last segment then done.
+    fn run<'a, E>(&mut self, out: &mut Spans, f: impl FnOnce(&mut Cx<'a, '_>, &mut Spans) -> Result<(), E>) -> Result<(), DdError>
+    where
+        DdError: From<E>,
+    {
+        let mut cx = Cx {
+            text: std::mem::take(&mut self.text),
+            tmp: std::mem::take(&mut self.tmp),
+            strings: strs_for(std::mem::take(&mut self.strings)),
+            payload: attrs_for(std::mem::take(&mut self.payload)),
+            chunk: attrs_for(std::mem::take(&mut self.chunk)),
+            tags: attrs_for(std::mem::take(&mut self.tags)),
+            attrs: attrs_for(std::mem::take(&mut self.attrs)),
+            parts: parts_for(std::mem::take(&mut self.parts)),
+            ids: ids_for(std::mem::take(&mut self.ids)),
+            spare: &mut self.spare,
+            seg: None,
+        };
+        let r = f(&mut cx, out);
         finish_segment(&mut cx.seg, out);
-        let Cx { mut text, mut tmp, strings, payload, chunk, tags, attrs, parts, .. } = cx;
+        let Cx { mut text, mut tmp, strings, payload, chunk, tags, attrs, parts, ids, .. } = cx;
         text.clear();
         tmp.clear();
         (self.text, self.tmp) = (text, tmp);
@@ -202,8 +224,50 @@ impl Decoder {
         self.tags = attrs_for(tags);
         self.attrs = attrs_for(attrs);
         self.parts = parts_for(parts);
+        self.ids = ids_for(ids);
         r.map_err(DdError::from)
     }
+}
+
+fn ids_for<'b>(mut v: Vec<(u64, &str)>) -> Vec<(u64, &'b str)> {
+    v.clear();
+    v.into_iter().map(|_| (0, "")).collect()
+}
+
+/// What a tracer's request says of it beyond its spans: its headers, and where it came.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Tracer<'a> {
+    /// `Datadog-Meta-Lang`.
+    pub language: &'a str,
+    /// `Datadog-Container-ID`.
+    pub container: &'a str,
+    /// The host its Agent is: the machine kiln took it on.
+    pub host: &'a str,
+}
+
+/// What a tracer's payload held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TracerTaken {
+    pub traces: u64,
+    /// Traces its tracer dropped: counted, not kept.
+    pub dropped: u64,
+}
+
+/// A span as the Agent's concentrator counts it ([`Concentrator`]): of a service's entries or its
+/// exits, by what its trace metrics are by. Its strings the payload's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanStat<'a> {
+    pub outbound: bool,
+    pub service: &'a str,
+    pub resource: &'a str,
+    pub kind: &'static str,
+    pub env: &'a str,
+    /// An entry's version, an exit's peer.
+    pub third: &'a str,
+    pub status: u64,
+    pub start_ns: i64,
+    pub duration_ns: u64,
+    pub error: bool,
 }
 
 /// One payload's decoding: the decoder's room, lent for its borrows.
@@ -216,6 +280,7 @@ struct Cx<'a, 'd> {
     tags: Vec<Attr<'a>>,
     attrs: Vec<Attr<'a>>,
     parts: Vec<(u32, &'a [u8])>,
+    ids: Vec<(u64, &'a str)>,
     spare: &'d mut Vec<Vec<u8>>,
     seg: Option<Seg>,
 }
@@ -835,6 +900,273 @@ impl<'a> Cx<'a, '_> {
     }
 }
 
+/// A string a tracer's MessagePack holds, as a string or as bytes (some tracers send them so); one
+/// not UTF-8 is none.
+fn text<'a>(r: &mut Reader<'a>) -> Result<&'a str, MsgpackError> {
+    Ok(std::str::from_utf8(r.bin()?).unwrap_or(""))
+}
+
+/// What a tracer's span's first reading finds: what its chunk's keeping and its spans' tops are
+/// decided by.
+#[derive(Debug, Default)]
+struct Head<'a> {
+    span: u64,
+    service: &'a str,
+    error: bool,
+    priority: Option<f64>,
+    /// The trace's high 64 bits (`_dd.p.tid`), 0 if not said.
+    hi: u64,
+}
+
+impl<'a> Cx<'a, '_> {
+    /// A `/v0.5/traces` string by its place in the table.
+    fn nth(&self, r: &mut Reader<'a>) -> Result<&'a str, MsgpackError> {
+        Ok(usize::try_from(r.u64()?).ok().and_then(|i| self.strings.get(i)).copied().unwrap_or(""))
+    }
+
+    /// A tracer's payload: its traces, each counted and kept or not.
+    #[allow(clippy::too_many_arguments)]
+    fn tracer(&mut self, v5: bool, body: &'a [u8], t: &Tracer<'a>, now_ns: i64, out: &mut Spans, stats: &mut Vec<SpanStat<'a>>, taken: &mut TracerTaken) -> Result<(), DdError> {
+        let mut r = Reader::new(body);
+        self.strings.clear();
+        if v5 {
+            if r.array()? != 2 {
+                return Err(MsgpackError::Unexpected { found: "an array not of two", wanted: "a table of strings and the traces" }.into());
+            }
+            for _ in 0..r.array()? {
+                let s = text(&mut r)?;
+                self.strings.push(s);
+            }
+        }
+        self.text.clear();
+        self.payload.clear();
+        self.chunk.clear();
+        for (key, v) in [("language", t.language), ("container_id", t.container)] {
+            if !v.is_empty() {
+                self.payload.push(Attr { key, val: Val::Str(cut(v, MAX_VALUE_BYTES)) });
+            }
+        }
+        let (pl, agent) = (Payload { host: t.host, env: "" }, Agent { host: t.host, env: "" });
+        for _ in 0..r.array()? {
+            taken.traces += 1;
+            // The trace's spans' ids and services, its priority, its high bits, whether it erred.
+            let at = r.pos();
+            let n = r.array()?;
+            self.ids.clear();
+            let (mut priority, mut erred, mut hi) = (None, false, 0u64);
+            for _ in 0..n {
+                let h = self.head(&mut r, v5)?;
+                self.ids.push((h.span, h.service));
+                priority = priority.or(h.priority);
+                erred |= h.error;
+                if hi == 0 {
+                    hi = h.hi;
+                }
+            }
+            self.ids.sort_unstable_by_key(|x| x.0);
+            // Dropped by its tracer: a user's rejection, or an automatic one with no error in it
+            // (the Agent's error sampler keeps those; kiln keeps every one).
+            let keep = match priority {
+                Some(p) if p < 0.0 => false,
+                Some(p) if p < 0.5 => erred,
+                _ => true,
+            };
+            taken.dropped += u64::from(!keep);
+            let mut again = r.at(at);
+            again.array()?;
+            for _ in 0..n {
+                let (span, marked) = self.tracer_span(&mut again, v5, hi)?;
+                if let Some(st) = self.stat_of(&span, marked) {
+                    stats.push(st);
+                }
+                if keep {
+                    self.row(&span, Form::Inline, &pl, &agent, now_ns, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A span's id, service, error, priority and trace's high bits, the rest passed over.
+    fn head(&self, r: &mut Reader<'a>, v5: bool) -> Result<Head<'a>, MsgpackError> {
+        let mut h = Head::default();
+        if v5 {
+            if r.array()? != 12 {
+                return Err(MsgpackError::Unexpected { found: "a span not of twelve", wanted: "a v0.5 span" });
+            }
+            h.service = self.nth(r)?;
+            r.skip()?;
+            r.skip()?;
+            r.skip()?;
+            h.span = r.u64()?;
+            r.skip()?;
+            r.skip()?;
+            r.skip()?;
+            h.error = r.i64()? != 0;
+            for _ in 0..r.map()? {
+                let k = self.nth(r)?;
+                let v = self.nth(r)?;
+                if k == "_dd.p.tid" {
+                    h.hi = hex64(v).unwrap_or(0);
+                }
+            }
+            for _ in 0..r.map()? {
+                let k = self.nth(r)?;
+                let v = r.f64()?;
+                if k == "_sampling_priority_v1" {
+                    h.priority = Some(v);
+                }
+            }
+            r.skip()?;
+            return Ok(h);
+        }
+        for _ in 0..r.map()? {
+            match text(r)? {
+                "service" => h.service = text(r)?,
+                "span_id" => h.span = r.u64()?,
+                "error" => h.error = r.i64()? != 0,
+                "meta" => {
+                    for _ in 0..r.map()? {
+                        let k = text(r)?;
+                        let v = text(r)?;
+                        if k == "_dd.p.tid" {
+                            h.hi = hex64(v).unwrap_or(0);
+                        }
+                    }
+                }
+                "metrics" => {
+                    for _ in 0..r.map()? {
+                        let k = text(r)?;
+                        let v = r.f64()?;
+                        if k == "_sampling_priority_v1" {
+                            h.priority = Some(v);
+                        }
+                    }
+                }
+                _ => r.skip()?,
+            }
+        }
+        Ok(h)
+    }
+
+    /// A tracer's span's fields, its `meta` and `metrics` into `tags`; and whether its tracer
+    /// marked it top-level (`_dd.top_level`, or the Agent's `_top_level`).
+    fn tracer_span(&mut self, r: &mut Reader<'a>, v5: bool, hi: u64) -> Result<(Span<'a>, bool), DdError> {
+        self.text.clear();
+        self.tags.clear();
+        self.parts.clear();
+        let (mut s, mut lo, mut marked) = (Span::default(), 0u64, false);
+        let meta = |cx: &mut Self, k: &'a str, v: &'a str| {
+            if !k.is_empty() {
+                cx.tags.push(Attr { key: cut(k, MAX_NAME_BYTES), val: Val::Str(cut(v, MAX_VALUE_BYTES)) });
+            }
+        };
+        let metric = |cx: &mut Self, k: &'a str, v: f64, marked: &mut bool| {
+            if k.is_empty() {
+                return;
+            }
+            *marked |= (k == "_dd.top_level" || k == "_top_level") && v == 1.0;
+            let at = cx.text.len();
+            push_f64(&mut cx.text, v);
+            cx.tags.push(Attr { key: cut(k, MAX_NAME_BYTES), val: Val::Text(at, cx.text.len()) });
+        };
+        let time = |v: i64| u64::try_from(v).unwrap_or(0);
+        if v5 {
+            if r.array()? != 12 {
+                return Err(MsgpackError::Unexpected { found: "a span not of twelve", wanted: "a v0.5 span" }.into());
+            }
+            s.service = self.nth(r)?;
+            s.name = self.nth(r)?;
+            s.resource = self.nth(r)?;
+            lo = r.u64()?;
+            s.span = id64(r.u64()?);
+            s.parent = r.u64()?;
+            s.start = time(r.i64()?);
+            s.duration = time(r.i64()?);
+            s.error = r.i64()? != 0;
+            for _ in 0..r.map()? {
+                let (k, v) = (self.nth(r)?, self.nth(r)?);
+                meta(self, k, v);
+            }
+            for _ in 0..r.map()? {
+                let k = self.nth(r)?;
+                let v = r.f64()?;
+                metric(self, k, v, &mut marked);
+            }
+            s.ty = self.nth(r)?;
+        } else {
+            for _ in 0..r.map()? {
+                match text(r)? {
+                    "service" => s.service = text(r)?,
+                    "name" => s.name = text(r)?,
+                    "resource" => s.resource = text(r)?,
+                    "type" => s.ty = text(r)?,
+                    "trace_id" => lo = r.u64()?,
+                    "span_id" => s.span = id64(r.u64()?),
+                    "parent_id" => s.parent = r.u64()?,
+                    "start" => s.start = time(r.i64()?),
+                    "duration" => s.duration = time(r.i64()?),
+                    "error" => s.error = r.i64()? != 0,
+                    "meta" => {
+                        for _ in 0..r.map()? {
+                            let (k, v) = (text(r)?, text(r)?);
+                            meta(self, k, v);
+                        }
+                    }
+                    "metrics" => {
+                        for _ in 0..r.map()? {
+                            let k = text(r)?;
+                            let v = r.f64()?;
+                            metric(self, k, v, &mut marked);
+                        }
+                    }
+                    _ => r.skip()?,
+                }
+            }
+        }
+        s.trace = id128(hi, lo);
+        Ok((s, marked))
+    }
+
+    /// A span as the concentrator counts it, if it does: a server's or a consumer's (an entry), a
+    /// client's or a producer's (an exit), or another kind's that is top-level (marked so, or its
+    /// parent none of its trace's, or another service's).
+    fn stat_of(&self, s: &Span<'a>, marked: bool) -> Option<SpanStat<'a>> {
+        let tag = |k: &str| {
+            self.tags.iter().find(|a| a.key == k).and_then(|a| match a.val {
+                Val::Str(v) => Some(v),
+                Val::Text(..) => None,
+            })
+        };
+        let kind = tag("span.kind").and_then(|t| KINDS.iter().find(|k| k.eq_ignore_ascii_case(t.trim())).copied()).unwrap_or("internal");
+        let top = marked
+            || s.parent == 0
+            || match self.ids.binary_search_by_key(&s.parent, |x| x.0) {
+                Ok(i) => self.ids.get(i).is_some_and(|x| x.1 != s.service),
+                Err(_) => true,
+            };
+        let outbound = match kind {
+            "server" | "consumer" => false,
+            "client" | "producer" => true,
+            _ if top => false,
+            _ => return None,
+        };
+        let third = if outbound { PEER_SOURCES.iter().find_map(|k| tag(k).filter(|v| !v.is_empty())).unwrap_or("") } else { tag("version").unwrap_or("") };
+        Some(SpanStat {
+            outbound,
+            service: s.service,
+            resource: if s.resource.is_empty() { s.name } else { s.resource },
+            kind,
+            env: tag("env").unwrap_or(""),
+            third,
+            status: tag("http.status_code").and_then(|c| c.trim().parse().ok()).unwrap_or(0),
+            start_ns: i64::try_from(s.start).unwrap_or(i64::MAX),
+            duration_ns: s.duration,
+            error: s.error,
+        })
+    }
+}
+
 /// The high 64 bits of an inline chunk's trace id: the `_dd.p.tid` a tracer sets on one span of it
 /// (its local root's).
 fn trace_high(chunk: &[u8]) -> Result<Option<u64>, OtlpError> {
@@ -1227,6 +1559,12 @@ struct Acc {
     max: f64,
 }
 
+impl Acc {
+    fn new() -> Self {
+        Self { hits: 0.0, errors: 0.0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY }
+    }
+}
+
 /// A payload's groups: each one's place in `accs`, and every group's buckets' counts in one list
 /// (its place, the bucket), so a group allocates nothing of its own.
 #[derive(Debug, Default)]
@@ -1413,7 +1751,7 @@ fn grouped<'a>(r: &mut Reader<'a>, c: &Client<'a>, ms: i64, groups: &mut Groups<
     let next = u32::try_from(groups.accs.len()).unwrap_or(u32::MAX);
     let place = *groups.places.entry(key).or_insert(next);
     if place == next {
-        groups.accs.push(Acc { hits: 0.0, errors: 0.0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY });
+        groups.accs.push(Acc::new());
     }
     let Groups { accs, bins, counts, .. } = groups;
     let Some(acc) = accs.get_mut(place as usize) else { return Ok(()) };
@@ -1441,6 +1779,11 @@ fn grouped<'a>(r: &mut Reader<'a>, c: &Client<'a>, ms: i64, groups: &mut Groups<
 /// payload has is made once; a group's tags are on the stack, so a series seen before allocates
 /// nothing.
 fn points_into(groups: &mut Groups<'_>, keys: &Keys, out: &mut Decoded) {
+    points_more(groups, keys, out);
+}
+
+/// [`points_into`]'s, appended to what `out` holds.
+fn points_more(groups: &mut Groups<'_>, keys: &Keys, out: &mut Decoded) {
     use crate::logs::metrics::{NONE, tag_value};
     groups.bins.sort_unstable_by_key(|b| (b.0, b.1.order()));
     let mut statuses: BTreeMap<u64, String> = BTreeMap::new();
@@ -1506,6 +1849,168 @@ fn points_into(groups: &mut Groups<'_>, keys: &Keys, out: &mut Decoded) {
                 put(dist_name, with.get(..=tags.len()).unwrap_or_default(), Kind::Count, total);
             }
         }
+    }
+}
+
+/// A bucket's group as the concentrator keeps it, its strings its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kept {
+    outbound: bool,
+    service: String,
+    resource: String,
+    kind: &'static str,
+    env: String,
+    third: String,
+    status: u64,
+}
+
+impl Kept {
+    fn of(s: &SpanStat<'_>) -> Self {
+        let own = |v: &str| tag_cut(v).to_owned();
+        Self { outbound: s.outbound, service: own(s.service), resource: own(s.resource), kind: s.kind, env: own(s.env), third: own(s.third), status: s.status }
+    }
+
+    fn is(&self, s: &SpanStat<'_>) -> bool {
+        self.outbound == s.outbound
+            && self.kind == s.kind
+            && self.status == s.status
+            && self.service == tag_cut(s.service)
+            && self.resource == tag_cut(s.resource)
+            && self.env == tag_cut(s.env)
+            && self.third == tag_cut(s.third)
+    }
+}
+
+/// A group's hash: its kind of series, its status, its tags' values as a series keeps them.
+fn group_hash(h: &crate::hash::Keyed, outbound: bool, status: u64, fields: [&str; 5]) -> u64 {
+    fields.iter().fold(h.word(u64::from(outbound) ^ status.rotate_left(17)), |acc, v| h.word(acc ^ h.bytes(tag_cut(v).as_bytes())))
+}
+
+/// A tag's value as a series keeps it ([`crate::logs::metrics::TAG_CHARS`] at the most).
+fn tag_cut(v: &str) -> &str {
+    match v.char_indices().nth(crate::logs::metrics::TAG_CHARS) {
+        Some((i, _)) => v.get(..i).unwrap_or(v),
+        None => v,
+    }
+}
+
+/// A bucket being counted.
+#[derive(Debug, Default)]
+struct Open {
+    table: hashbrown::HashTable<u32>,
+    groups: Vec<(Kept, Acc, Vec<(Bucket, f64)>)>,
+    /// A group for spans past [`crate::logs::metrics::GROUPS`] groups (its tags `N/A`).
+    overflow: Option<u32>,
+}
+
+/// The trace metrics of spans tracers sent kiln itself (kiln in their Agent's place), counted as
+/// the Agent's concentrator counts them (`pkg/trace/stats`): in buckets of ten seconds of their
+/// starts, each written once twenty seconds past its end (the Agent's buffer of two buckets), a
+/// span later than that counted in the oldest bucket still open, as the Agent shifts it; a span
+/// more than a minute ahead of now in the bucket of now. So each series is written once a bucket
+/// by its one writer, this node (its `host`), and nothing is held past half a minute. A bucket keeps
+/// [`crate::logs::metrics::GROUPS`] groups at the most (OpenTelemetry's cardinality limit), past them
+/// one whose tags are `N/A`.
+#[derive(Debug)]
+pub struct Concentrator {
+    host: String,
+    hash: crate::hash::Keyed,
+    open: BTreeMap<i64, Open>,
+    /// Buckets that begin before this (ms) are written.
+    written: i64,
+}
+
+/// A bucket's width (ms): the Agent's.
+pub const BUCKET_MS: i64 = 10_000;
+/// How long past its end a bucket waits for its spans: the Agent's two buckets.
+pub const WAIT_MS: i64 = 20_000;
+/// How far ahead of now a span's start is taken as it says.
+const AHEAD_MS: i64 = 60_000;
+
+impl Concentrator {
+    /// A concentrator of this node (`host`, the `host` its series carry).
+    pub fn new(host: &str) -> Self {
+        Self { host: host.to_owned(), hash: crate::hash::Keyed::new(), open: BTreeMap::new(), written: i64::MIN }
+    }
+
+    /// Buckets open.
+    pub fn open(&self) -> usize {
+        self.open.len()
+    }
+
+    /// One span counted, at `now_ms`.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn add(&mut self, s: &SpanStat<'_>, now_ms: i64) {
+        let start = s.start_ns.div_euclid(1_000_000);
+        let mut at = if start > now_ms.saturating_add(AHEAD_MS) { now_ms } else { start };
+        at -= at.rem_euclid(BUCKET_MS);
+        if at < self.written {
+            // Late: the oldest bucket open, or the first not written.
+            at = self.open.keys().next().copied().unwrap_or(self.written);
+        }
+        let h = group_hash(&self.hash, s.outbound, s.status, [s.service, s.resource, s.env, s.third, s.kind]);
+        let open = self.open.entry(at).or_default();
+        let found = open.table.find(h, |&i| open.groups.get(i as usize).is_some_and(|(k, ..)| k.is(s))).copied();
+        let place = match found {
+            Some(i) => i,
+            None if open.groups.len() >= crate::logs::metrics::GROUPS => match open.overflow {
+                Some(i) => i,
+                None => {
+                    let i = u32::try_from(open.groups.len()).unwrap_or(u32::MAX);
+                    open.groups.push((
+                        Kept { outbound: s.outbound, service: String::new(), resource: String::new(), kind: s.kind, env: String::new(), third: String::new(), status: 0 },
+                        Acc::new(),
+                        Vec::new(),
+                    ));
+                    open.overflow = Some(i);
+                    i
+                }
+            },
+            None => {
+                let i = u32::try_from(open.groups.len()).unwrap_or(u32::MAX);
+                open.groups.push((Kept::of(s), Acc::new(), Vec::new()));
+                let hash = &self.hash;
+                open.table.insert_unique(h, i, |&j| open.groups.get(j as usize).map_or(0, |(k, ..)| group_hash(hash, k.outbound, k.status, [&k.service, &k.resource, &k.env, &k.third, k.kind])));
+                i
+            }
+        };
+        if let Some((_, acc, bins)) = open.groups.get_mut(place as usize) {
+            let d = s.duration_ns as f64 / 1e9;
+            acc.hits += 1.0;
+            acc.errors += f64::from(u8::from(s.error));
+            acc.sum += d;
+            if let Some(b) = dist::bucket_of(d, dist::SCALE) {
+                acc.min = acc.min.min(d);
+                acc.max = acc.max.max(d);
+                match bins.iter_mut().find(|(x, _)| *x == b) {
+                    Some((_, n)) => *n += 1.0,
+                    None => bins.push((b, 1.0)),
+                }
+            }
+        }
+    }
+
+    /// The buckets due at `now_ms` (twenty seconds past their ends; every one with `all`, as a node
+    /// stops) written into `out` (cleared), each series' key found in or made into `keys`; how many.
+    pub fn flush_into(&mut self, now_ms: i64, all: bool, keys: &Keys, out: &mut Decoded) -> usize {
+        out.keys.clear();
+        out.samples.clear();
+        out.points = 0;
+        let due: Vec<i64> = self.open.keys().copied().filter(|&at| all || at.saturating_add(BUCKET_MS + WAIT_MS) <= now_ms).collect();
+        for &at in &due {
+            let Some(open) = self.open.remove(&at) else { continue };
+            self.written = self.written.max(at.saturating_add(BUCKET_MS));
+            let mut groups = Groups::default();
+            for (i, (k, acc, bins)) in open.groups.iter().enumerate() {
+                let place = u32::try_from(i).unwrap_or(u32::MAX);
+                let g = Group { outbound: k.outbound, service: &k.service, resource: &k.resource, kind: k.kind, env: &k.env, third: &k.third, status: k.status, host: &self.host, ms: at };
+                groups.places.insert(g, place);
+                groups.accs.push(Acc { hits: acc.hits, errors: acc.errors, sum: acc.sum, min: acc.min, max: acc.max });
+                groups.bins.extend(bins.iter().map(|&(b, n)| (place, b, n)));
+            }
+            points_more(&mut groups, keys, out);
+        }
+        due.len()
     }
 }
 
@@ -2055,5 +2560,321 @@ mod tests {
         assert_eq!(point(&series, "trace.errors", &half).map(|p| p.1), Some(0.5));
         let consumer = [("service", "api"), ("resource_name", "GET /x"), ("span.kind", "consumer"), ("env", "prod"), ("version", "N/A"), ("http.status_code", "N/A"), ("host", "h1")];
         assert_eq!(point(&series, "trace.hits", &consumer).map(|p| p.1), Some(4.0));
+    }
+
+    /// MessagePack as tracers write it, for the tests.
+    #[derive(Default)]
+    struct Mp(Vec<u8>);
+
+    impl Mp {
+        fn head(&mut self, fix: u8, wide: u8, n: usize) -> &mut Self {
+            if n < 16 {
+                self.0.push(fix | n as u8);
+            } else {
+                self.0.push(wide);
+                self.0.extend_from_slice(&(n as u32).to_be_bytes());
+            }
+            self
+        }
+        fn map(&mut self, n: usize) -> &mut Self {
+            self.head(0x80, 0xdf, n)
+        }
+        fn arr(&mut self, n: usize) -> &mut Self {
+            self.head(0x90, 0xdd, n)
+        }
+        fn s(&mut self, v: &str) -> &mut Self {
+            self.0.push(0xd9);
+            self.0.push(v.len() as u8);
+            self.0.extend_from_slice(v.as_bytes());
+            self
+        }
+        fn u(&mut self, v: u64) -> &mut Self {
+            self.0.push(0xcf);
+            self.0.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn i(&mut self, v: i64) -> &mut Self {
+            self.0.push(0xd3);
+            self.0.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn f(&mut self, v: f64) -> &mut Self {
+            self.0.push(0xcb);
+            self.0.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+    }
+
+    /// A tracer's span: its fields, its meta and its metrics.
+    struct TSpan {
+        service: &'static str,
+        name: &'static str,
+        resource: &'static str,
+        trace: u64,
+        span: u64,
+        parent: u64,
+        start: i64,
+        duration: i64,
+        error: i64,
+        meta: Vec<(&'static str, &'static str)>,
+        metrics: Vec<(&'static str, f64)>,
+        ty: &'static str,
+    }
+
+    /// Two traces: one kept (a request, its call out, and the span of the service it calls),
+    /// one its tracer dropped (`manual.drop`), failing.
+    fn tracer_traces() -> Vec<Vec<TSpan>> {
+        let t0 = 1_700_000_000_000_000_000;
+        vec![
+            vec![
+                TSpan {
+                    service: "web",
+                    name: "flask.request",
+                    resource: "GET /",
+                    trace: 0x11,
+                    span: 1,
+                    parent: 0,
+                    start: t0,
+                    duration: 30_000_000,
+                    error: 0,
+                    meta: vec![("span.kind", "server"), ("env", "prod"), ("version", "1.0"), ("http.status_code", "200"), ("_dd.p.tid", "aabbccdd00000000")],
+                    metrics: vec![("_sampling_priority_v1", 1.0), ("_dd.top_level", 1.0)],
+                    ty: "web",
+                },
+                TSpan {
+                    service: "web",
+                    name: "requests.request",
+                    resource: "GET",
+                    trace: 0x11,
+                    span: 2,
+                    parent: 1,
+                    start: t0 + 1_000_000,
+                    duration: 20_000_000,
+                    error: 0,
+                    meta: vec![("span.kind", "client"), ("env", "prod"), ("out.host", "db-1")],
+                    metrics: vec![],
+                    ty: "http",
+                },
+                TSpan {
+                    service: "db",
+                    name: "postgres.query",
+                    resource: "SELECT 1",
+                    trace: 0x11,
+                    span: 3,
+                    parent: 2,
+                    start: t0 + 2_000_000,
+                    duration: 10_000_000,
+                    error: 0,
+                    meta: vec![("env", "prod")],
+                    metrics: vec![],
+                    ty: "sql",
+                },
+            ],
+            vec![TSpan {
+                service: "web",
+                name: "flask.request",
+                resource: "GET /",
+                trace: 0x22,
+                span: 9,
+                parent: 0,
+                start: t0,
+                duration: 5_000_000,
+                error: 1,
+                meta: vec![("span.kind", "server"), ("env", "prod"), ("version", "1.0"), ("http.status_code", "500")],
+                metrics: vec![("_sampling_priority_v1", -1.0)],
+                ty: "web",
+            }],
+        ]
+    }
+
+    fn v04(traces: &[Vec<TSpan>]) -> Vec<u8> {
+        let mut m = Mp::default();
+        m.arr(traces.len());
+        for t in traces {
+            m.arr(t.len());
+            for s in t {
+                m.map(12);
+                m.s("service").s(s.service).s("name").s(s.name).s("resource").s(s.resource).s("type").s(s.ty);
+                m.s("trace_id").u(s.trace).s("span_id").u(s.span).s("parent_id").u(s.parent);
+                m.s("start").i(s.start).s("duration").i(s.duration).s("error").i(s.error);
+                m.s("meta").map(s.meta.len());
+                for (k, v) in &s.meta {
+                    m.s(k).s(v);
+                }
+                m.s("metrics").map(s.metrics.len());
+                for (k, v) in &s.metrics {
+                    m.s(k).f(*v);
+                }
+            }
+        }
+        m.0
+    }
+
+    fn v05(traces: &[Vec<TSpan>]) -> Vec<u8> {
+        let mut strings: Vec<&str> = vec![""];
+        let at = |v: &'static str, strings: &mut Vec<&'static str>| -> u64 {
+            match strings.iter().position(|s| *s == v) {
+                Some(i) => i as u64,
+                None => {
+                    strings.push(v);
+                    (strings.len() - 1) as u64
+                }
+            }
+        };
+        let mut body = Mp::default();
+        body.arr(traces.len());
+        for t in traces {
+            body.arr(t.len());
+            for s in t {
+                body.arr(12);
+                for v in [s.service, s.name, s.resource] {
+                    let i = at(v, &mut strings);
+                    body.u(i);
+                }
+                body.u(s.trace).u(s.span).u(s.parent).i(s.start).i(s.duration).i(s.error);
+                body.map(s.meta.len());
+                for &(k, v) in &s.meta {
+                    let (k, v) = (at(k, &mut strings), at(v, &mut strings));
+                    body.u(k).u(v);
+                }
+                body.map(s.metrics.len());
+                for &(k, v) in &s.metrics {
+                    let k = at(k, &mut strings);
+                    body.u(k).f(v);
+                }
+                let ty = at(s.ty, &mut strings);
+                body.u(ty);
+            }
+        }
+        let mut m = Mp::default();
+        m.arr(2).arr(strings.len());
+        for v in &strings {
+            m.s(v);
+        }
+        m.0.extend_from_slice(&body.0);
+        m.0
+    }
+
+    #[test]
+    fn a_tracer_s_traces_are_kept_or_dropped_as_it_says_and_every_span_counted() {
+        for (form, body) in [("v0.4", v04(&tracer_traces())), ("v0.5", v05(&tracer_traces()))] {
+            let tracer = Tracer { language: "python", container: "", host: "web-1" };
+            let (mut out, mut stats) = (Spans::default(), Vec::new());
+            let taken = Decoder::new().decode_tracer(form == "v0.5", &body, &tracer, 0, &mut out, &mut stats).unwrap();
+            assert_eq!(taken, TracerTaken { traces: 2, dropped: 1 }, "{form}");
+            // The kept trace's three spans, none of the dropped one's.
+            assert_eq!(out.spans, 3, "{form}");
+            let rows = rows(&out);
+            let root = span(&rows, "0000000000000001");
+            assert_eq!(hex(&root.trace_id.unwrap()), "aabbccdd000000000000000000000011", "{form}: the high bits of the chunk's _dd.p.tid");
+            assert_eq!((root.host, root.source, root.message, root.attr("language")), ("web-1", SOURCE, "GET /", Some("python")), "{form}");
+            assert_eq!((root.attr("span.kind"), root.attr("operation_name"), root.attr("_dd.top_level")), (Some("server"), Some("flask.request"), Some("1")), "{form}");
+            let call = span(&rows, "0000000000000002");
+            assert_eq!((call.attr("span.kind"), call.attr("peer.service"), call.attr("parent_id")), (Some("client"), Some("db-1"), Some("0000000000000001")), "{form}");
+            // Counted: the request (an entry), its call out (an exit, by its peer), the span of the
+            // service it called (no kind said, its parent another service's: top-level, an entry),
+            // and the dropped trace's failed request.
+            let got: Vec<(bool, &str, &str, &str, u64, bool)> = stats.iter().map(|s| (s.outbound, s.service, s.kind, s.third, s.status, s.error)).collect();
+            assert_eq!(
+                got,
+                vec![(false, "web", "server", "1.0", 200, false), (true, "web", "client", "db-1", 0, false), (false, "db", "internal", "", 0, false), (false, "web", "server", "1.0", 500, true)],
+                "{form}"
+            );
+        }
+    }
+
+    fn stat(service: &'static str, start_ms: i64, error: bool) -> SpanStat<'static> {
+        SpanStat { outbound: false, service, resource: "GET /", kind: "server", env: "prod", third: "1.0", status: 200, start_ns: start_ms * 1_000_000, duration_ns: 20_000_000, error }
+    }
+
+    #[test]
+    fn a_concentrator_writes_each_bucket_once_when_due_a_late_span_in_the_oldest_open() {
+        let keys = Keys::new();
+        let mut d = Decoded::default();
+        let mut c = Concentrator::new("web-1");
+        let t = 1_700_000_000_000; // a bucket's start (ms)
+        c.add(&stat("web", t + 1_000, false), t + 1_000);
+        c.add(&stat("web", t + 9_999, true), t + 9_999);
+        c.add(&stat("web", t + 10_000, false), t + 10_000);
+        // Not due until twenty seconds past its end.
+        assert_eq!(c.flush_into(t + 29_999, false, &keys, &mut d), 0);
+        assert_eq!(c.flush_into(t + 30_000, false, &keys, &mut d), 1);
+        let hits =
+            |d: &Decoded| -> Vec<(i64, f64)> { d.samples.iter().filter(|(i, ..)| d.keys.get(*i as usize).is_some_and(|k| parts(&k.key).0 == "trace.hits")).map(|&(_, ts, v)| (ts, v)).collect() };
+        assert_eq!(hits(&d), vec![(t, 2.0)]);
+        let tags = parts(&d.keys.first().unwrap().key).1;
+        assert!(tags.contains(&("host".to_owned(), "web-1".to_owned())) && tags.contains(&("service".to_owned(), "web".to_owned())), "{tags:?}");
+        let errors: f64 = d.samples.iter().filter(|(i, ..)| d.keys.get(*i as usize).is_some_and(|k| parts(&k.key).0 == "trace.errors")).map(|s| s.2).sum();
+        assert_eq!(errors, 1.0);
+        // A span of the bucket written comes late: into the oldest still open (the next one).
+        c.add(&stat("web", t + 5_000, false), t + 30_500);
+        assert_eq!(c.flush_into(t + 40_000, false, &keys, &mut d), 1);
+        assert_eq!(hits(&d), vec![(t + 10_000, 2.0)]);
+        // One more late, with no bucket open: the first not written. A span a day ahead: now's.
+        c.add(&stat("web", t, false), t + 41_000);
+        c.add(&stat("web", t + 86_400_000, false), t + 41_000);
+        assert_eq!(c.open(), 2);
+        assert_eq!(c.flush_into(t + 41_000, true, &keys, &mut d), 2, "every one as the node stops");
+        assert_eq!(hits(&d), vec![(t + 20_000, 1.0), (t + 40_000, 1.0)]);
+        assert_eq!(c.open(), 0);
+    }
+
+    #[test]
+    fn a_bucket_past_its_groups_counts_the_rest_in_one_of_no_names() {
+        let keys = Keys::new();
+        let mut d = Decoded::default();
+        let mut c = Concentrator::new("web-1");
+        let t = 1_700_000_000_000;
+        let names: Vec<String> = (0..crate::logs::metrics::GROUPS + 10).map(|i| format!("svc-{i}")).collect();
+        for n in &names {
+            c.add(&SpanStat { service: n, ..stat("x", t, false) }, t);
+        }
+        c.flush_into(t + 30_000, false, &keys, &mut d);
+        let hits: Vec<(String, f64)> = d
+            .samples
+            .iter()
+            .filter_map(|&(i, _, v)| {
+                let (metric, tags) = parts(&d.keys.get(i as usize)?.key);
+                (metric == "trace.hits").then(|| (tags.into_iter().find(|(k, _)| k == "service").map(|(_, v)| v).unwrap_or_default(), v))
+            })
+            .collect();
+        assert_eq!(hits.len(), crate::logs::metrics::GROUPS + 1);
+        assert_eq!(hits.iter().find(|(s, _)| s == "N/A").map(|h| h.1), Some(10.0));
+        assert_eq!(hits.iter().map(|h| h.1).sum::<f64>(), names.len() as f64);
+    }
+
+    /// What ddtrace 4.16 (Python, its libdatadog writer) sent its Agent's port (`/v0.5/traces`),
+    /// recorded: a Flask service's requests, a dropped one among them.
+    const TRACER_A: &[u8] = include_bytes!("fixtures/datadog/tracer-v05-4.16-a.msgpack");
+    const TRACER_B: &[u8] = include_bytes!("fixtures/datadog/tracer-v05-4.16-b.msgpack");
+
+    #[test]
+    fn ddtrace_s_own_v0_5_payloads_read_whole() {
+        let tracer = Tracer { language: "python", container: "", host: "web-1" };
+        // The cart's: its flush's trace, then four orders' (the odd ones dropped by the shop's
+        // tracer, its decision carried in the request): each order its request and its database's
+        // span (a service the tracer named, top-level).
+        let (mut out, mut stats) = (Spans::default(), Vec::new());
+        let taken = Decoder::new().decode_tracer(true, TRACER_A, &tracer, 0, &mut out, &mut stats).unwrap();
+        assert_eq!((taken, out.spans, out.invalid), (TracerTaken { traces: 5, dropped: 2 }, 29, 0));
+        let rows = rows(&out);
+        assert!(rows.iter().all(|r| r.source == SOURCE && r.host == "web-1" && r.attr("language") == Some("python")));
+        assert!(rows.iter().all(|r| r.trace_id.is_some_and(|t| hex(&t).starts_with("6ad6efc0"))), "the high bits of each chunk's _dd.p.tid");
+        let db = rows.iter().find(|r| r.service == "cart-db").unwrap();
+        assert_eq!((db.message, db.attr("span.type"), db.attr("span.kind"), db.attr("db.system")), ("SELECT carts", Some("sql"), Some("internal"), Some("postgresql")));
+        let counted: Vec<(&str, &str, &str, bool)> = stats.iter().map(|s| (s.service, s.resource, s.kind, s.outbound)).collect();
+        assert_eq!(counted.len(), 9);
+        assert_eq!(counted.first(), Some(&("cart", "GET /flush", "server", false)));
+        assert_eq!(counted.iter().filter(|c| **c == ("cart", "GET /cart/<int:order>", "server", false)).count(), 4);
+        assert_eq!(counted.iter().filter(|c| **c == ("cart-db", "SELECT carts", "internal", false)).count(), 4, "top-level: its parent another service's");
+        // The shop's: its requests' spans, and its requests integration's calls out (a service of its
+        // own, `requests`), their peer the address they called.
+        let (mut out, mut stats) = (Spans::default(), Vec::new());
+        let taken = Decoder::new().decode_tracer(true, TRACER_B, &tracer, 0, &mut out, &mut stats).unwrap();
+        assert_eq!((taken, out.spans, out.invalid), (TracerTaken { traces: 5, dropped: 2 }, 31, 0));
+        let calls: Vec<&SpanStat<'_>> = stats.iter().filter(|s| s.outbound).collect();
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|c| (c.service, c.kind, c.third, c.status) == ("requests", "client", "127.0.0.1", 200)), "{calls:?}");
+        assert_eq!(stats.iter().filter(|s| (s.service, s.resource, s.third) == ("shop", "GET /checkout/<int:order>", "1.2.3")).count(), 4);
     }
 }

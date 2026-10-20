@@ -52,7 +52,7 @@ thread_local! {
     static ZSTD: std::cell::RefCell<kiln_obs::zstd::Decoder> = std::cell::RefCell::new(kiln_obs::zstd::Decoder::new());
 }
 
-fn unzip(encoding: &str, body: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+pub(super) fn unzip(encoding: &str, body: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     out.clear();
     match encoding.trim().to_ascii_lowercase().as_str() {
         "zstd" => ZSTD
@@ -224,7 +224,7 @@ fn take(o: &Observe, what: What, body: &[u8]) -> srv::Response {
 
 /// Runs `f` with this thread's decoder of the Agent's traces (its room kept from one payload to
 /// the next), or a new one were it in use.
-fn with_trace_decoder<T>(f: impl FnOnce(&mut kiln_obs::ddtrace::Decoder) -> T) -> T {
+pub(super) fn with_trace_decoder<T>(f: impl FnOnce(&mut kiln_obs::ddtrace::Decoder) -> T) -> T {
     thread_local! {
         static DECODER: std::cell::RefCell<kiln_obs::ddtrace::Decoder> = std::cell::RefCell::new(kiln_obs::ddtrace::Decoder::new());
     }

@@ -766,8 +766,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // and its moves among it), as the server's is read, of its host.
         crate::observe::kiln::start_registry(obs.clone(), name.clone(), every);
         // Apps on this machine send OTLP here, as to a collector: OTLP/HTTP's port and OTLP/gRPC's,
-        // each taking either.
-        for addr in [crate::observe::otlp::local_addr(), crate::observe::otlp::local_grpc_addr()].into_iter().flatten() {
+        // each taking either; and Datadog's tracers, as to their Agent, on its port too.
+        crate::observe::ddtrace::start(obs.clone(), name.clone(), shutdown.clone());
+        for addr in [crate::observe::otlp::local_addr(), crate::observe::otlp::local_grpc_addr(), crate::observe::otlp::local_dd_addr()].into_iter().flatten() {
             crate::rt::spawn(crate::observe::otlp::serve_local(addr, obs.clone(), shutdown.clone()));
         }
         let (up, out) = (up_tx.clone(), obs.outgoing());

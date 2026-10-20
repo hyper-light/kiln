@@ -8,6 +8,7 @@ pub mod cloud;
 pub mod collect;
 pub mod dashboards;
 pub mod ddagent;
+pub mod ddtrace;
 pub mod downtimes;
 pub mod github;
 pub mod host;

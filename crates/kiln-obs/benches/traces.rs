@@ -291,6 +291,141 @@ fn dd_payload(traces: usize, r: u64, at: u64) -> Vec<u8> {
     w.buf
 }
 
+/// A tracer's own `/v0.5/traces` payload (MessagePack: its strings first in a table, each span an
+/// array of twelve) of `traces` traces of a ddtrace Flask app's ten spans, as ddtrace 4.16 was
+/// recorded sending its Agent's port; payload `r` of a run.
+fn tracer_v05(traces: usize, r: u64, at: i64) -> Vec<u8> {
+    fn st(out: &mut Vec<u8>, v: &str) {
+        out.push(0xdb);
+        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        out.extend_from_slice(v.as_bytes());
+    }
+    fn u(out: &mut Vec<u8>, v: u64) {
+        out.push(0xcf);
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    fn i(out: &mut Vec<u8>, v: i64) {
+        out.push(0xd3);
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    fn head(out: &mut Vec<u8>, fix: u8, wide: u8, n: usize) {
+        if n < 16 {
+            out.push(fix | n as u8);
+        } else {
+            out.push(wide);
+            out.extend_from_slice(&(n as u32).to_be_bytes());
+        }
+    }
+    let mut strings: Vec<String> = vec![String::new()];
+    let mut index = std::collections::HashMap::new();
+    let mut s = |v: &str| -> u64 {
+        *index.entry(v.to_owned()).or_insert_with(|| {
+            strings.push(v.to_owned());
+            (strings.len() - 1) as u64
+        })
+    };
+    let ops = [
+        "flask.request",
+        "flask.application",
+        "flask.preprocess_request",
+        "flask.dispatch_request",
+        "__main__.cart",
+        "postgres.query",
+        "flask.process_response",
+        "flask.do_teardown_request",
+        "flask.do_teardown_appcontext",
+        "flask.response",
+    ];
+    let parents = [usize::MAX, 0, 1, 1, 3, 4, 1, 1, 1, 0];
+    let (shop, db, web, sql, route, select) = (s("shop"), s("shop-db"), s("web"), s("sql"), s("GET /cart/<int:n>"), s("SELECT carts"));
+    let op_refs: Vec<u64> = ops.iter().map(|o| s(o)).collect();
+    let common: Vec<(u64, u64)> = [("component", "flask"), ("env", "e2e"), ("version", "1.2.3"), ("language", "python")].iter().map(|(k, v)| (s(k), s(v))).collect();
+    let root_meta: Vec<(u64, u64)> = [
+        ("span.kind", "server"),
+        ("http.method", "GET"),
+        ("http.route", "/cart/<int:n>"),
+        ("http.useragent", "Python-urllib/3.12"),
+        ("flask.endpoint", "cart"),
+        ("flask.url_rule", "/cart/<int:n>"),
+        ("flask.version", "3.1.3"),
+        ("runtime-id", "c40ca5aa3a1d4398b41a8cf497c86f86"),
+        ("_dd.p.dm", "-0"),
+        ("_dd.p.tid", "6ad6d85600000000"),
+    ]
+    .iter()
+    .map(|(k, v)| (s(k), s(v)))
+    .collect();
+    let (status_k, ok, failed, url_k) = (s("http.status_code"), s("200"), s("500"), s("http.url"));
+    let metrics: Vec<u64> = ["_dd.top_level", "_dd.measured", "_sampling_priority_v1", "process_id"].iter().map(|k| s(k)).collect();
+    let (db_system, postgres) = (s("db.system"), s("postgresql"));
+    let mut body = Vec::new();
+    head(&mut body, 0x90, 0xdd, traces);
+    for t in 0..traces as u64 {
+        let fail = t % 20 == 7;
+        let url = s(&format!("http://127.0.0.1:18180/cart/{}", r * 100_000 + t));
+        let (trace, base) = ((r * 100_000 + t + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15), (r * 100_000 + t) * 16);
+        let start = at + t as i64 * 25_000_000;
+        head(&mut body, 0x90, 0xdd, ops.len());
+        for (n, op) in op_refs.iter().enumerate() {
+            body.push(0x9c);
+            u(&mut body, if n == 5 { db } else { shop });
+            u(&mut body, *op);
+            u(
+                &mut body,
+                match n {
+                    0 | 1 => route,
+                    5 => select,
+                    _ => *op,
+                },
+            );
+            u(&mut body, trace);
+            u(&mut body, base + n as u64 + 1);
+            u(&mut body, parents.get(n).filter(|p| **p != usize::MAX).map_or(0, |p| base + *p as u64 + 1));
+            i(&mut body, start + n as i64 * 200_000);
+            i(&mut body, 14_000_000 - n as i64 * 1_000_000);
+            i(&mut body, i64::from(fail && matches!(n, 0 | 3 | 4 | 5)));
+            let mut meta: Vec<(u64, u64)> = common.clone();
+            match n {
+                0 => {
+                    meta.extend(root_meta.iter().copied());
+                    meta.push((status_k, if fail { failed } else { ok }));
+                    meta.push((url_k, url));
+                }
+                5 => meta.push((db_system, postgres)),
+                _ => {}
+            }
+            head(&mut body, 0x80, 0xdf, meta.len());
+            for (k, v) in meta {
+                u(&mut body, k);
+                u(&mut body, v);
+            }
+            let m: &[u64] = if n == 0 { &metrics } else { &[] };
+            head(&mut body, 0x80, 0xdf, m.len());
+            for k in m {
+                u(&mut body, *k);
+                body.push(0xcb);
+                body.extend_from_slice(&1.0f64.to_be_bytes());
+            }
+            u(
+                &mut body,
+                match n {
+                    0 => web,
+                    5 => sql,
+                    _ => 0,
+                },
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(body.len() + strings.len() * 24);
+    head(&mut out, 0x90, 0xdd, 2);
+    head(&mut out, 0x90, 0xdd, strings.len());
+    for v in &strings {
+        st(&mut out, v);
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
 /// An Agent's `StatsPayload` of `groups` grouped stats in one bucket: as msgp writes it.
 fn dd_stats(groups: usize) -> Vec<u8> {
     fn head(out: &mut Vec<u8>, base: u8, wide: u8, n: usize) {
@@ -476,6 +611,85 @@ fn main() {
             f1.since(&f0).total()
         );
     }
+    // A tracer's own payloads, straight to kiln (kiln in its Agent's place): decoded, every span
+    // counted by the node's concentrator (some 2 of a trace's 10: its request and its database's).
+    for traces in [52usize, 410] {
+        let body = tracer_v05(traces, 1, at as i64);
+        let tracer = kiln_obs::ddtrace::Tracer { language: "python", container: "", host: "web-1" };
+        let mut d = kiln_obs::ddtrace::Decoder::new();
+        let mut stats = Vec::new();
+        let mut out = Spans::default();
+        d.decode_tracer(true, &body, &tracer, 0, &mut out, &mut stats).unwrap();
+        let spans = out.spans as usize;
+        assert_eq!(spans, traces * 10);
+        d.give(out);
+        let ns = median(
+            (0..51)
+                .map(|_| {
+                    let mut o = Spans::default();
+                    stats.clear();
+                    let t = Instant::now();
+                    d.decode_tracer(true, &body, &tracer, 0, &mut o, &mut stats).unwrap();
+                    let took = t.elapsed().as_nanos() as u64;
+                    d.give(o);
+                    took
+                })
+                .collect(),
+        );
+        let f0 = faults::read().unwrap();
+        alloc::begin();
+        let mut o = Spans::default();
+        stats.clear();
+        d.decode_tracer(true, &body, &tracer, 0, &mut o, &mut stats).unwrap();
+        let c = alloc::end();
+        let f1 = faults::read().unwrap();
+        d.give(o);
+        let n = spans as f64;
+        println!(
+            "{:<30} {:>6} {:>9} {:>10} {:>10} {:>11.0} {:>10.4} {:>8}",
+            format!("{spans} spans, a tracer's own"),
+            spans,
+            body.len(),
+            "",
+            "",
+            ns as f64 / n,
+            c.calls() as f64 / n,
+            f1.since(&f0).total()
+        );
+        // The concentrator: the payload's spans counted (a group made once, found after).
+        let mut conc = kiln_obs::ddtrace::Concentrator::new("web-1");
+        let now = (at / 1_000_000) as i64;
+        for st in &stats {
+            conc.add(st, now);
+        }
+        let ns = median(
+            (0..51)
+                .map(|_| {
+                    let t = Instant::now();
+                    for st in &stats {
+                        conc.add(st, now);
+                    }
+                    t.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        );
+        alloc::begin();
+        for st in &stats {
+            conc.add(st, now);
+        }
+        let c = alloc::end();
+        println!(
+            "{:<30} {:>6} {:>9} {:>10} {:>10} {:>11.0} {:>10.4}",
+            format!("{} spans counted", stats.len()),
+            stats.len(),
+            "",
+            "",
+            "",
+            ns as f64 / stats.len() as f64,
+            c.calls() as f64 / stats.len() as f64
+        );
+    }
+
     // Its stats: the receivers' keys kept (a series seen before found, not made), the decoding's
     // room kept from payload to payload.
     for groups in [100usize, 2000] {

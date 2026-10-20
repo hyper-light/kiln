@@ -1,14 +1,16 @@
-//! Datadog's traces, live (docs/observe.md §8.6, §8.7, §13): a kiln server as a process, Datadog's
-//! Agent itself (7.84, in Docker) with its trace agent pointed at it (`DD_APM_DD_URL`), and two
-//! services traced by Datadog's own Python tracer (ddtrace 4.16, Flask's and requests'
-//! integrations): a shop that calls a cart, the cart's database span failing one order in five.
-//! The shop keeps the trace of every even order and drops every odd one, as a sampling rule does
-//! (`manual.keep`, `manual.drop`).
+//! Datadog's traces, live (docs/observe.md §8.6, §8.7, §13): two services traced by Datadog's own
+//! Python tracer (ddtrace 4.16, Flask's and requests' integrations): a shop that calls a cart, the
+//! cart's database span failing one order in five. The shop keeps the trace of every even order and
+//! drops every odd one, as a sampling rule does (`manual.keep`, `manual.drop`). Their tracers send
+//! to Datadog's Agent itself (7.84, in Docker) with its trace agent pointed at a kiln server
+//! (`DD_APM_DD_URL`); or straight to a kiln runner's receiver, on the Agent's port, no Agent
+//! anywhere.
 //!
-//! What a user relies on: the traces the Agent keeps are in kiln whole, across both services, found
-//! by their ids, placed as their waterfall draws them, their errors where they happened; those it
-//! drops are not; and the services' requests, errors and latency are of every request, kept or not
-//! (the Agent's stats, as Datadog counts them), none counted twice.
+//! What a user relies on, either way: the traces kept are in kiln whole, across both services,
+//! found by their ids, placed as their waterfall draws them, their errors where they happened;
+//! those dropped are not; and the services' requests, errors and latency are of every request, kept
+//! or not (the Agent's stats, or the runner's own count, as Datadog counts them), none counted
+//! twice, each series of the host that counted it.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_ddtraces -- --ignored --nocapture`.
 #![cfg(unix)]
@@ -31,7 +33,7 @@ const ORDERS: u64 = 40;
 const DOCKERFILE: &str = "FROM python:3.12-slim\nRUN pip install --no-cache-dir ddtrace==4.16.0 flask==3.1.3 requests\n";
 
 const APPS: &str = r#"
-import json, os, subprocess, sys, time, urllib.error, urllib.request
+import http.server, json, os, socket, subprocess, sys, threading, time, urllib.error, urllib.request
 
 # The services are traced, the driver not (its calls are not the shop's callers).
 if sys.argv[1] != "all":
@@ -41,6 +43,26 @@ if sys.argv[1] != "all":
     except ImportError:
         from ddtrace import tracer
     from ddtrace.constants import MANUAL_DROP_KEY, MANUAL_KEEP_KEY
+
+def control(port, app_port):
+    # Untraced (ddtrace patches no http.server): whether the app listens, and its tracer flushed.
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            ok = True
+            if self.path == "/ready":
+                try:
+                    socket.create_connection(("127.0.0.1", app_port), timeout=1).close()
+                except OSError:
+                    ok = False
+            elif self.path == "/flush":
+                tracer.flush()
+            self.send_response(200 if ok else 503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        def log_message(self, *a):
+            pass
+    s = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    threading.Thread(target=s.serve_forever, daemon=True).start()
 
 def shop():
     from flask import Flask, jsonify
@@ -55,11 +77,7 @@ def shop():
         r = requests.get(cart + "/cart/" + str(order))
         return jsonify(trace_id=format(root.trace_id, "032x"), cart=r.status_code), (200 if r.status_code < 500 else 502)
 
-    @app.route("/flush")
-    def flush():
-        tracer.flush()
-        return "ok"
-
+    control(int(os.environ["SHOP_CTL"]), int(os.environ["SHOP_PORT"]))
     app.run(host="127.0.0.1", port=int(os.environ["SHOP_PORT"]))
 
 def cart():
@@ -75,11 +93,7 @@ def cart():
                 raise ValueError("cart %d is locked" % order)
         return "ok"
 
-    @app.route("/flush")
-    def flush():
-        tracer.flush()
-        return "ok"
-
+    control(int(os.environ["CART_CTL"]), int(os.environ["CART_PORT"]))
     app.run(host="127.0.0.1", port=int(os.environ["CART_PORT"]))
 
 def get(url):
@@ -90,10 +104,11 @@ def get(url):
         return e.code, e.read()
 
 def drive():
-    shop, cart, agent = ("http://127.0.0.1:" + os.environ[p] for p in ("SHOP_PORT", "CART_PORT", "APM_PORT"))
+    url = lambda p: "http://127.0.0.1:" + os.environ[p]
+    shop, shop_ctl, cart_ctl, agent = url("SHOP_PORT"), url("SHOP_CTL"), url("CART_CTL"), url("APM_PORT")
     for _ in range(600):
         try:
-            if get(agent + "/info")[0] == 200 and get(shop + "/flush")[0] == 200 and get(cart + "/flush")[0] == 200:
+            if get(agent + "/info")[0] == 200 and get(shop_ctl + "/ready")[0] == 200 and get(cart_ctl + "/ready")[0] == 200:
                 break
         except Exception:
             pass
@@ -102,8 +117,8 @@ def drive():
     for i in range(int(os.environ["ORDERS"])):
         code, body = get(shop + "/checkout/" + str(i))
         ids[i] = [code, json.loads(body)["trace_id"]]
-    get(cart + "/flush")
-    get(shop + "/flush")
+    get(cart_ctl + "/flush")
+    get(shop_ctl + "/flush")
     time.sleep(2)
     print("IDS " + json.dumps(ids), flush=True)
 
@@ -151,7 +166,6 @@ impl Agent {
             ("DD_APM_DD_URL", kiln),
             ("DD_APM_RECEIVER_PORT", apm.to_string()),
             ("DD_APM_DEBUG_PORT", free_port()?.to_string()),
-            ("DD_APM_IGNORE_RESOURCES", "GET /flush".to_owned()),
             ("DD_DOGSTATSD_PORT", free_port()?.to_string()),
             ("DD_CMD_PORT", free_port()?.to_string()),
             ("DD_EXPVAR_PORT", free_port()?.to_string()),
@@ -181,13 +195,13 @@ impl Drop for Agent {
     }
 }
 
-fn until(what: &str, within: Duration, mut done: impl FnMut() -> anyhow::Result<bool>, agent: &Agent, f: &Fleet) -> anyhow::Result<()> {
+fn until(what: &str, within: Duration, mut done: impl FnMut() -> anyhow::Result<bool>, logs: &dyn Fn() -> String) -> anyhow::Result<()> {
     let start = Instant::now();
     loop {
         if done()? {
             return Ok(());
         }
-        anyhow::ensure!(start.elapsed() < within, "{what}\n--- agent\n{}\n{}", agent.logs(), f.logs());
+        anyhow::ensure!(start.elapsed() < within, "{what}\n{}", logs());
         std::thread::sleep(Duration::from_millis(500));
     }
 }
@@ -201,27 +215,27 @@ fn attr<'a>(span: &'a Value, key: &str) -> &'a str {
     at(span, &["attributes", key]).as_str().unwrap_or("")
 }
 
-#[test]
-#[ignore = "needs Docker: runs Datadog's Agent and its Python tracer, and a kiln server as a process"]
-fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trace_metrics() -> anyhow::Result<()> {
-    let t0 = now_ms() - 60_000;
-    let dir = tempfile::tempdir()?;
+/// The tracer's image built, its versions said.
+fn image() -> anyhow::Result<()> {
     docker(&["build", "-q", "-t", IMAGE, "-"], Some(DOCKERFILE))?;
     let versions = docker(&["run", "--rm", IMAGE, "sh", "-c", "pip list 2>/dev/null | grep -i -E '^(ddtrace|flask|requests) '"], None)?;
     eprintln!("  tracer     {}", versions.split_whitespace().collect::<Vec<_>>().join(" "));
-    let f = Fleet::new()?;
-    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
-    let apm = free_port()?;
-    let agent = Agent::start(f.http, &ingest, apm)?;
+    Ok(())
+}
 
-    // The services, and the driver's requests through them.
+/// The services and the driver's orders through them, their tracers sending to `apm` (an Agent's
+/// receiver, or kiln's): each order's answer and trace id.
+fn orders(apm: u16) -> anyhow::Result<Value> {
+    let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("apps.py"), APPS)?;
     Command::new("chmod").args(["-R", "a+rX"]).arg(dir.path()).output()?;
-    let (shop, cart) = (free_port()?, free_port()?);
+    let (shop, cart, shop_ctl, cart_ctl) = (free_port()?, free_port()?, free_port()?, free_port()?);
     let mut args: Vec<String> = ["run", "--rm", "--network", "host", "-v", &format!("{}:/e2e:ro", dir.path().display())].iter().map(|s| (*s).to_owned()).collect();
     for (k, v) in [
         ("SHOP_PORT", shop.to_string()),
         ("CART_PORT", cart.to_string()),
+        ("SHOP_CTL", shop_ctl.to_string()),
+        ("CART_CTL", cart_ctl.to_string()),
         ("APM_PORT", apm.to_string()),
         ("ORDERS", ORDERS.to_string()),
         ("DD_AGENT_HOST", "127.0.0.1".to_owned()),
@@ -237,25 +251,37 @@ fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trac
     args.extend([IMAGE, "python", "-u", "/e2e/apps.py", "all"].map(str::to_owned));
     let out = docker(&args.iter().map(String::as_str).collect::<Vec<_>>(), None)?;
     let ids: Value = out.lines().find_map(|l| l.strip_prefix("IDS ")).map(serde_json::from_str).transpose()?.ok_or_else(|| anyhow::anyhow!("the driver's trace ids:\n{out}"))?;
-    let failing = |i: u64| i % 5 == 4;
-    let kept = |i: u64| i % 2 == 0;
     for i in 0..ORDERS {
         let code = at(&ids, &[&i.to_string()]).get(0).and_then(Value::as_u64);
         anyhow::ensure!(code == Some(if failing(i) { 502 } else { 200 }), "order {i}: {code:?}");
     }
-    let trace_of = |i: u64| at(&ids, &[&i.to_string()]).get(1).and_then(Value::as_str).unwrap_or("").to_owned();
+    Ok(ids)
+}
 
+fn failing(i: u64) -> bool {
+    i % 5 == 4
+}
+
+fn kept(i: u64) -> bool {
+    i.is_multiple_of(2)
+}
+
+/// What a user relies on of the orders' traces, wherever they came in: the kept whole and the
+/// dropped not, a trace by its id as its waterfall draws it, every request counted once (`host` the
+/// series' and the spans' host: the Agent's, or the kiln runner's that was the Agent).
+fn the_traces_and_their_metrics(f: &Fleet, t0: i64, ids: &Value, host: &str, logs: &dyn Fn() -> String) -> anyhow::Result<f64> {
+    let trace_of = |i: u64| at(ids, &[&i.to_string()]).get(1).and_then(Value::as_str).unwrap_or("").to_owned();
     // The kept traces, whole: each of the shop's, the cart's and its database's spans.
     let traces = |service: &str| -> anyhow::Result<std::collections::BTreeSet<String>> {
-        Ok(spans(&f, &format!("service:{service} source:datadog-agent"), t0)?.iter().filter_map(|s| at(s, &["trace_id"]).as_str().map(str::to_owned)).collect())
+        Ok(spans(f, &format!("service:{service} source:datadog-agent"), t0)?.iter().filter_map(|s| at(s, &["trace_id"]).as_str().map(str::to_owned)).collect())
     };
     let want: std::collections::BTreeSet<String> = (0..ORDERS).filter(|&i| kept(i)).map(trace_of).collect();
-    until("the kept traces, through the Agent", Duration::from_secs(120), || Ok(traces("shop")? == want && traces("cart")? == want && traces("cart-db")? == want), &agent, &f)?;
+    until("the kept traces", Duration::from_secs(120), || Ok(traces("shop")? == want && traces("cart")? == want && traces("cart-db")? == want), logs)?;
     // The dropped ones are not.
     let dropped = trace_of(9);
-    anyhow::ensure!(spans(&f, &format!("trace_id:{dropped}"), t0)?.is_empty(), "a dropped trace is not kept");
+    anyhow::ensure!(spans(f, &format!("trace_id:{dropped}"), t0)?.is_empty(), "a dropped trace is not kept");
     // The trace explorer's syntax on them: the database's kept failures, each 20 ms or more.
-    let db_errors = spans(&f, "service:cart-db resource_name:\"SELECT carts\" status:error @duration:>=20ms", t0)?;
+    let db_errors = spans(f, "service:cart-db resource_name:\"SELECT carts\" status:error @duration:>=20ms", t0)?;
     anyhow::ensure!(db_errors.len() == (0..ORDERS).filter(|&i| failing(i) && kept(i)).count(), "{} database errors", db_errors.len());
 
     // A kept failing order's trace, by its id: the shop's request, its call, the cart's request, the
@@ -290,15 +316,15 @@ fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trac
         "{failed}"
     );
     let first = nth(root);
-    anyhow::ensure!(attr(&first, "env") == "e2e" && attr(&first, "version") == "1.2.3" && at(&first, &["host"]) == HOST, "the unified service tags, the Agent's host: {first}");
+    anyhow::ensure!(attr(&first, "env") == "e2e" && attr(&first, "version") == "1.2.3" && at(&first, &["host"]) == host, "the unified service tags, the Agent's host: {first}");
     anyhow::ensure!(at(&t, &["roots"]) == 1 && at(&t, &["truncated"]) == false, "{t}");
 
-    // The services, from the Agent's stats: every request, kept or dropped, once.
+    // The services, from the stats: every request, kept or dropped, once.
     let range = format!("from={t0}&to={}", now_ms() + 120_000);
     let errors = (0..ORDERS).filter(|&i| failing(i)).count() as f64;
     let resource = |svc: &Value, name: &str| at(svc, &["resources"]).as_array().and_then(|a| a.iter().find(|r| at(r, &["resource_name"]) == name).cloned()).unwrap_or(Value::Null);
     until(
-        "the services' requests and errors, from the Agent's stats",
+        "the services' requests and errors, from the stats",
         Duration::from_secs(120),
         || {
             // A service none of whose stats have come yet is not found.
@@ -311,8 +337,7 @@ fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trac
                 && at(&c, &["hits"]).as_f64() == Some(ORDERS as f64)
                 && at(&c, &["errors"]).as_f64() == Some(errors))
         },
-        &agent,
-        &f,
+        logs,
     )?;
     // The database, a service of its tracer's naming: its spans top-level, so its own requests.
     let db_svc = f.call("GET", &format!("/api/observe/v1/apm/services/cart-db?{range}"), None)?;
@@ -323,6 +348,10 @@ fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trac
     let list = f.call("GET", &format!("/api/observe/v1/apm/services?{range}"), None)?;
     let listed: Vec<&str> = at(&list, &["services"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["service"]).as_str()).collect();
     anyhow::ensure!(["shop", "cart", "cart-db"].iter().all(|s| listed.contains(s)), "{listed:?}");
+    // The series of the host the stats came from.
+    let by_host = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:trace.hits{service:cart-db} by {host}.as_count()", "from": t0, "to": now_ms() + 120_000 })))?;
+    let hosts: Vec<&str> = at(&by_host, &["series"]).as_array().into_iter().flatten().filter_map(|s| at(s, &["tags", "host"]).as_str()).collect();
+    anyhow::ensure!(hosts == vec![host], "{by_host}");
 
     // The map: who calls whom from the spans kept (the shop by way of its requests integration,
     // which ddtrace names a service of its own, as Datadog's map shows it), each service's requests
@@ -337,6 +366,45 @@ fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trac
     for name in ["shop", "cart", "cart-db"] {
         anyhow::ensure!(at(&node(name), &["hits"]).as_f64() == Some(ORDERS as f64) && at(&node(name), &["errors"]).as_f64() == Some(errors), "{name}: {m}");
     }
+    Ok(kept_n)
+}
+
+#[test]
+#[ignore = "needs Docker: runs Datadog's Agent and its Python tracer, and a kiln server as a process"]
+fn datadog_s_tracer_through_its_agent_is_kiln_s_traces_and_its_stats_kiln_s_trace_metrics() -> anyhow::Result<()> {
+    let t0 = now_ms() - 60_000;
+    image()?;
+    let f = Fleet::new()?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let apm = free_port()?;
+    let agent = Agent::start(f.http, &ingest, apm)?;
+    let ids = orders(apm)?;
+    let kept_n = the_traces_and_their_metrics(&f, t0, &ids, HOST, &|| format!("--- agent\n{}\n{}", agent.logs(), f.logs()))?;
     eprintln!("  ddtrace    {ORDERS} requests across two services through the Agent: the {kept_n} traces it kept, whole; every request counted from its stats, once");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker: runs Datadog's Python tracer, and a kiln server and runner as processes"]
+fn datadog_s_tracer_straight_to_a_kiln_runner_is_kiln_s_traces_and_their_trace_metrics() -> anyhow::Result<()> {
+    let t0 = now_ms() - 60_000;
+    image()?;
+    let mut f = Fleet::new()?;
+    // The runner, its trace agent's receiver on a port of the test's: no Agent anywhere.
+    let apm = free_port()?;
+    f.start_runner_with("web-1", &[("KILN_DD_TRACE_ADDR", &format!("127.0.0.1:{apm}"))])?;
+    until("the runner's receiver", Duration::from_secs(60), || Ok(common::raw(apm, "GET", "/info", "", b"").is_ok_and(|(c, _)| c == 200)), &|| f.logs())?;
+    until(
+        "the runner replicating",
+        Duration::from_secs(60),
+        || Ok(at(&f.call("GET", "/api/observe/v1/status", None)?, &["machines"]).as_array().is_some_and(|m| m.iter().any(|m| at(m, &["up"]) == true))),
+        &|| f.logs(),
+    )?;
+    let (code, info) = common::raw(apm, "GET", "/info", "", b"")?;
+    let info: Value = serde_json::from_slice(&info)?;
+    anyhow::ensure!(code == 200 && at(&info, &["endpoints"]) == &json!(["/v0.4/traces", "/v0.5/traces"]) && at(&info, &["client_drop_p0s"]) == false, "{info}");
+    let ids = orders(apm)?;
+    let kept_n = the_traces_and_their_metrics(&f, t0, &ids, "web-1", &|| f.logs())?;
+    eprintln!("  ddtrace    {ORDERS} requests across two services straight to a kiln runner: the {kept_n} traces their tracers kept, whole; every request counted by the runner, once");
     Ok(())
 }

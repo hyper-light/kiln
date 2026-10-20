@@ -693,8 +693,8 @@ pub async fn grpc(o: &Observe, signal: Signal, req: crate::http::server::Request
 }
 
 /// A runner's OTLP receiver on its loopback (`127.0.0.1:4318`, OTLP/HTTP's port, unless
-/// `KILN_OTLP_ADDR` says another, or `off`): what an app on the machine sends to, as to a collector.
-/// Loopback alone, so it asks no token.
+/// `KILN_OTLP_ADDR` says another, or `off`): what an app on the machine sends to, as to a collector,
+/// and Datadog's tracers as to their Agent (`super::ddtrace`). Loopback alone, so it asks no token.
 struct Local {
     o: Observe,
 }
@@ -713,7 +713,11 @@ impl crate::http::server::Handler for Local {
                 None => grpc_answer(grpc_code::UNIMPLEMENTED, "an OTLP service: metrics, logs or traces"),
             },
             (Method::GET, "/healthz") => srv::text(StatusCode::OK, "ok"),
-            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics, /v1/logs or /v1/traces; OTLP/gRPC: the metrics, logs and trace services' Export; Prometheus's remote write: POST /api/v1/write"),
+            (_, path) if super::ddtrace::is_tracer(path) => super::ddtrace::answer(&self.o, req).await,
+            _ => srv::text(
+                StatusCode::NOT_FOUND,
+                "OTLP/HTTP: POST /v1/metrics, /v1/logs or /v1/traces; OTLP/gRPC: the metrics, logs and trace services' Export; Prometheus's remote write: POST /api/v1/write; Datadog's tracers: /v0.4/traces, /v0.5/traces",
+            ),
         }
     }
 }
@@ -727,6 +731,12 @@ pub fn local_addr() -> Option<std::net::SocketAddr> {
 /// unless `KILN_OTLP_GRPC_ADDR` says another, or `off`): either address takes either protocol.
 pub fn local_grpc_addr() -> Option<std::net::SocketAddr> {
     addr_of("KILN_OTLP_GRPC_ADDR", 4317)
+}
+
+/// The address it listens on for Datadog's tracers too, their Agent's port (`127.0.0.1:8126`
+/// unless `KILN_DD_TRACE_ADDR` says another, or `off`; `super::ddtrace`).
+pub fn local_dd_addr() -> Option<std::net::SocketAddr> {
+    addr_of("KILN_DD_TRACE_ADDR", 8126)
 }
 
 fn addr_of(var: &str, port: u16) -> Option<std::net::SocketAddr> {
@@ -743,7 +753,7 @@ pub async fn serve_local(addr: std::net::SocketAddr, o: Observe, shutdown: crate
     let listener = match std::net::TcpListener::bind(addr).map_err(anyhow::Error::from).and_then(|l| hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(l), 128).map_err(|e| anyhow::anyhow!("{e}"))) {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(%addr, error = %format!("{e:#}"), "the OTLP receiver did not start (another collector on the port?)");
+            tracing::warn!(%addr, error = %format!("{e:#}"), "the receiver did not start (another collector or Agent on the port?)");
             return;
         }
     };
