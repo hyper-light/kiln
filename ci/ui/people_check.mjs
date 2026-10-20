@@ -7,10 +7,12 @@
 // - W10-R12: Settings → OIDC says how the issuer is reached, and fits a phone.
 // - W09-R11: a repository's secrets on the Repositories page, a workflow's variables in its
 //   editor, each set and removed in place.
+// - W21-R06: the editor's saving, the patch of an edit and a diff opened on the trunk.
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/people_check.mjs
+import { readFileSync } from "node:fs";
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
@@ -46,10 +48,6 @@ const flow = async (label, f) => {
   }
 };
 const text = async (loc) => (await loc.innerText().catch(() => "")).replace(/\s+/g, " ");
-
-// A repository of kiln's own, for its page's secrets and variables (W09-R11).
-const made = await fetch(`${cfg.base}/api/repos`, { method: "POST", headers: { Authorization: `Bearer ${cfg.admin}`, "Content-Type": "application/json" }, body: JSON.stringify({ name: "acme/people", mode: "native" }) });
-if (!made.ok && made.status !== 409) throw new Error(`a repository: ${made.status} ${await made.text()}`);
 
 for (const [name, type, phone] of [
   ["chromium", chromium, devices["Pixel 7"]],
@@ -189,6 +187,22 @@ for (const [name, type, phone] of [
         await page.screenshot({ path: `${shots}/workflow-secrets-${name}-${tag}.png`, fullPage: true });
         await vars.getByRole("button", { name: "Remove", exact: true }).first().click();
         check(name, `${tag}: and removed`, await until(async () => (await vars.count()) === 0 || !/STAGE/.test(await text(vars))), await text(wfPanel));
+        // The editor's saving (W21-R06): the patch of what changed, and a diff opened on the trunk.
+        await page.locator(".cm-content").first().click();
+        await page.keyboard.press("Control+End");
+        await page.keyboard.type(`# checked in ${name} ${tag}\n`);
+        const patchButton = page.getByRole("button", { name: "The patch", exact: true });
+        await patchButton.waitFor({ timeout: 15000 });
+        const [download] = await Promise.all([page.waitForEvent("download"), patchButton.click()]);
+        const patch = readFileSync(await download.path(), "utf8");
+        check(name, `${tag}: the patch of what changed`, /^\+\+\+ b\/\.kiln\/ci\.yaml$/m.test(patch) && new RegExp(`^\\+# checked in ${name} ${tag}$`, "m").test(patch), patch.slice(0, 300));
+        await page.getByRole("button", { name: "Open a diff", exact: true }).click();
+        const opened = page.getByRole("status").filter({ hasText: "opened: it lands through review" });
+        check(name, `${tag}: a diff opened on the trunk`, await until(async () => (await opened.count()) > 0, 30000), await text(page.locator("main").first()));
+        check(name, `${tag}: the editor fits, saved`, (await overflow(page)) <= 0, String(await overflow(page)));
+        const cut = await page.locator("section.panel").first().evaluate((el) => el.scrollWidth - el.clientWidth);
+        check(name, `${tag}: nothing in the editor's panel is cut off`, cut <= 0, String(cut));
+        await page.screenshot({ path: `${shots}/workflow-saved-${name}-${tag}.png`, fullPage: true });
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();
 

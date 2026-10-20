@@ -5588,9 +5588,15 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 - *Done.* R03's runner and executor facets: each run in the list says the runners and executors
   its legs ran on (a run may have several of each), and the facet box offers both, a run shown
   when any of its legs ran on the one chosen.
+- *Done.* R06's saving, in the editor: an edit opens a diff on the trunk of a repository kiln
+  hosts (`ci.workflows.edit`: checked first, refused with its errors), the diff linked from the
+  page; and for any repository, the patch of the edit, a unified diff `git apply` takes
+  (`ui/src/lib/patch.ts`, checked against `git apply` in ten cases by `ci/ui/patch_check.ts`),
+  beside Copy and Download. Checked in Chromium and WebKit, desktop and phone
+  (`ci/ui/people_check.mjs`).
 - *Left.*
   - R03's list windowed to 1,000,000 rows (AC04).
-  - R06's flow view and matrix editor, saving.
+  - R06's flow view and matrix editor, and saving's commit to a branch and push through the App.
   - R01's hover, schema completion of keys, and the Dockerfile and Agentfile modes.
   - R07 to R10, and AC01's Playwright scripts in kiln's own CI, AC02 to AC04.
 

@@ -656,6 +656,9 @@ export const ci = {
   /** A leg's attempts, oldest first, each with its failure class, and its outputs (W21-R05). */
   legDetail: (leg: string, signal?: AbortSignal) => request<{ attempts: CiAttempt[]; outputs: Record<string, string> }>("GET", `/api/ci/legs/${enc(leg)}`, undefined, { signal }),
   validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
+  /** A workflow's new text proposed as a diff on the trunk of a repository kiln hosts (W21-R06, `ci.workflows.edit`), checked first. */
+  proposeWorkflow: (repo: string, path: string, content: string) =>
+    request<{ diffs: { name: string; title: string; kind: string; url: string }[] }>("POST", "/api/ops/ci.workflows.edit", { repo, path, content }),
   workflows: (repo: string, ref: string, signal?: AbortSignal) =>
     request<{ ref: string; sha: string; workflows: CiWorkflowFile[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   workflow: (repo: string, path: string, ref: string, signal?: AbortSignal) =>

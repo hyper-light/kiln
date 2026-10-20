@@ -52,6 +52,8 @@ export interface Repo {
   created_at: number;
   last_polled_at: number | null;
   last_error: string | null;
+  /** `native`: kiln hosts it (W14); `upstream`: kiln follows another host's. */
+  mode?: string;
 }
 
 export interface Run {

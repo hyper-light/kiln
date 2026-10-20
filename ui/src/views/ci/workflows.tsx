@@ -1,8 +1,9 @@
 /**
  * The workflow editor (docs/ci.md W21-R01, W21-R06): a repository's workflow in the code editor,
  * checked as you type, with the plan it would make for an event beside it (W04-R29). The YAML is
- * the source; Copy and Download take it away until saving to the repository arrives (W14). Below,
- * the workflow's own secrets and variables (W09-R11).
+ * the source. An edit opens a diff on the trunk of a repository kiln hosts (`ci.workflows.edit`),
+ * and for any repository the patch, Copy and Download take it away. Below, the workflow's own
+ * secrets and variables (W09-R11).
  */
 import * as React from "react";
 import { Download } from "lucide-react";
@@ -12,7 +13,9 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
-import { useSearchParams } from "@/lib/router";
+import { Link, useSearchParams } from "@/lib/router";
+import { unifiedPatch } from "@/lib/patch";
+import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
 import { ScopeSecrets } from "@/views/settings-ci";
@@ -130,7 +133,11 @@ function jobAt(text: string): string | null {
 
 function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitRef: string }) {
   const file = useSuspenseResource(`ci-workflow/${repo}/${path}/${gitRef}`, (s) => ci.workflow(repo, path, gitRef, s)).data;
+  // Saving (W21-R06): a diff on the trunk of a repository kiln hosts; the patch for any other.
+  const hosted = useSuspenseResource("repos/", (s) => api.repos(s)).data.some((r) => r.name === repo && r.mode === "native");
   const [text, setText] = React.useState(file.source);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string } | null>(null);
   const [counts, setCounts] = React.useState<{ errors: number; warnings: number } | null>(null);
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
@@ -227,6 +234,28 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     return null;
   };
 
+  const changed = text !== file.source;
+  const propose = async () => {
+    setSaving(true);
+    setSaved(null);
+    try {
+      const d = (await ci.proposeWorkflow(repo, path, text)).diffs[0];
+      setSaved(d ? { text: `${d.name} opened: it lands through review.`, diff: d.name } : { text: "Proposed." });
+    } catch (e) {
+      setSaved({ tone: "error", text: errorMessage(e) });
+    } finally {
+      setSaving(false);
+    }
+  };
+  const patch = () => {
+    const url = URL.createObjectURL(new Blob([unifiedPatch(path, file.source, text)], { type: "text/x-diff" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${path.split("/").pop() ?? "workflow"}.patch`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const download = () => {
     const url = URL.createObjectURL(new Blob([text], { type: "text/yaml" }));
     const a = document.createElement("a");
@@ -257,6 +286,35 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         <React.Suspense fallback={<Hold height={420} />}>
           <CodeEditor value={file.source} onChange={setText} lint={lint} complete={complete} label={`Editing ${path}`} />
         </React.Suspense>
+        {/* Under the edit, so a phone's header keeps to Copy and Download. */}
+        {(changed || saved) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-5 pt-3">
+            <p className={`min-w-0 flex-1 text-[12.5px] leading-[1.55] [overflow-wrap:anywhere] ${saved?.tone === "error" ? "text-[var(--color-fail)]" : "text-[#a1a4ad]"}`} role="status">
+              {saved?.diff ? (
+                <>
+                  <Link to={`/review/${encodeURIComponent(saved.diff)}`} className="text-link">
+                    {saved.diff}
+                  </Link>{" "}
+                  opened: it lands through review.
+                </>
+              ) : (
+                saved?.text
+              )}
+            </p>
+            {changed && (
+              <div className="flex gap-2">
+                <Button size="xs" variant="ghost" onClick={patch}>
+                  The patch
+                </Button>
+                {hosted && (
+                  <Button size="xs" variant="secondary" disabled={saving || (counts?.errors ?? 0) > 0} onClick={() => void propose()}>
+                    Open a diff
+                  </Button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </Panel>
       <PreviewPane
         preview={preview}
