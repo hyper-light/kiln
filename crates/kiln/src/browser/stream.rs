@@ -1442,11 +1442,11 @@ mod tests {
     }
 
     /// An iPhone's Mobile Safari in kiln's simulator of it (`super::super::simulators`), on a Mac
-    /// with Xcode, an iOS runtime and Safari's remote automation on (`safaridriver --enable`): a
-    /// page from this Mac streams from it, laid out as the phone lays it out, and a tap on it is a
-    /// touch where it was.
+    /// with Xcode and an iOS runtime: a page from this Mac streams from it (its 1179 pixels a
+    /// column less, H.264's sizes being even), laid out as the phone lays it out, and a tap on it
+    /// is a touch where it was.
     #[test]
-    #[ignore = "needs a Mac with Xcode, an iOS simulator runtime and `safaridriver --enable` (it boots a simulator)"]
+    #[ignore = "needs a Mac with Xcode and an iOS simulator runtime (it boots a simulator)"]
     fn an_iphone_streams_from_its_simulator() -> anyhow::Result<()> {
         if !cfg!(target_os = "macos") {
             return Ok(());
