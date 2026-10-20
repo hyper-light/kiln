@@ -80,12 +80,20 @@ pub struct Red {
 /// `[from, to)` (ms), of the series whose tags hold `filter`, by tag `by`: totals of their counts,
 /// and percentiles merged from their buckets over the whole range (as exact as their scale, the
 /// windows of ten seconds they are counted in holding a range to within one); the most hits first.
+///
+/// A long range is read from the series' rollups (`crate::rollup`): the coarsest tier at most a
+/// twelfth of the range wide, so its edges, the two windows at most it reads as samples, are at
+/// most a sixth of it; a week of a series is 168 hours' sums, not 60,480 samples. A count's total is
+/// its windows' sums and its samples' added, the most the greatest of its windows' and samples'.
 pub fn red(store: &crate::store::Store, outbound: bool, filter: &[(&str, &str)], by: &str, from: i64, to: i64) -> Result<Vec<Red>, crate::store::StoreError> {
     use crate::dist::{Merged, SCALE, parse_tag_value};
+    use crate::rollup::{Col, Rolled, TIERS};
     let prefix = if outbound { "trace.outbound" } else { "trace" };
     let mut groups: BTreeMap<String, (Red, Merged)> = BTreeMap::new();
     let (mut ids, mut ts, mut vs) = (Vec::new(), Vec::new(), Vec::new());
     let mut scratch = crate::store::Scratch::default();
+    let width = TIERS.iter().rev().copied().find(|&w| w.saturating_mul(RED_WINDOWS) <= to.saturating_sub(from));
+    let mut rolled = Rolled::default();
     for part in ["hits", "errors", "duration.sum", "duration.max", "duration.dist"] {
         let name = format!("{prefix}.{part}");
         let mut sel = crate::index::Selector::metric(&name);
@@ -94,26 +102,36 @@ pub fn red(store: &crate::store::Store, outbound: bool, filter: &[(&str, &str)],
         }
         ids.clear();
         store.select(&sel, &mut ids);
+        let most = part == "duration.max";
+        let cols: &[Col] = if most { &[Col::Max] } else { &[Col::Sum] };
         for &id in &ids {
             let Some(series) = store.series(id) else { continue };
             let group = series.tag(by).unwrap_or(crate::logs::metrics::NONE).to_owned();
             let bucket = if part == "duration.dist" { series.tag(crate::dist::BUCKET_TAG).and_then(parse_tag_value) } else { None };
             ts.clear();
             vs.clear();
-            store.read_with(id, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?;
+            rolled.clear();
+            match width {
+                Some(width) => {
+                    let roll = crate::store::Roll { width, from, to, kind: series.kind(), cols };
+                    store.read_rolled(id, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
+                }
+                None => store.read_with(id, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
+            }
+            let total = || vs.iter().sum::<f64>() + rolled.sum.iter().sum::<f64>();
             let (r, m) = groups.entry(group.clone()).or_insert_with(|| (Red { group, ..Red::default() }, Merged::new(SCALE)));
             match part {
-                "hits" => r.hits += vs.iter().sum::<f64>(),
-                "errors" => r.errors += vs.iter().sum::<f64>(),
-                "duration.sum" => r.duration_sum += vs.iter().sum::<f64>(),
+                "hits" => r.hits += total(),
+                "errors" => r.errors += total(),
+                "duration.sum" => r.duration_sum += total(),
                 "duration.max" => {
-                    if let Some(x) = vs.iter().copied().filter(|v| v.is_finite()).reduce(f64::max) {
+                    if let Some(x) = vs.iter().chain(&rolled.max).copied().filter(|v| v.is_finite()).reduce(f64::max) {
                         r.max = Some(r.max.map_or(x, |m| m.max(x)));
                     }
                 }
                 _ => {
                     if let Some((scale, b)) = bucket {
-                        m.add(b, scale, vs.iter().sum());
+                        m.add(b, scale, total());
                     }
                 }
             }
@@ -130,6 +148,10 @@ pub fn red(store: &crate::store::Store, outbound: bool, filter: &[(&str, &str)],
     out.sort_by(|a, b| b.hits.total_cmp(&a.hits).then_with(|| a.group.cmp(&b.group)));
     Ok(out)
 }
+
+/// Windows of a tier a range holds at the least for [`red`] to read the tier: so the two it reads
+/// as samples at its edges at the most are a sixth of it.
+pub const RED_WINDOWS: i64 = 12;
 
 /// A span's id in hex (`parent_id`'s), read.
 pub fn span_id_of(hex: &str) -> Option<[u8; 8]> {
@@ -593,5 +615,62 @@ mod tests {
         assert_eq!(calls.iter().map(|r| (r.group.as_str(), r.hits, r.errors)).collect::<Vec<_>>(), vec![("cart.internal", 1.0, 0.0), ("kafka", 1.0, 1.0)]);
         // A range without its window: nothing.
         assert!(red(&st, false, &[], "service", ms + 10_000, ms + 20_000).unwrap().iter().all(|r| r.hits == 0.0));
+    }
+
+    #[test]
+    fn a_long_range_s_figures_read_from_rollups_are_its_samples_figures() {
+        use crate::batch::{Builder, Kind, SeriesKey};
+        use crate::rollup::{Col, Rolled};
+        use crate::store::{Roll, Scratch, Store};
+        // Two days of a service's trace metrics, a point each ten seconds as metrics from spans
+        // write them, written six hours at a time, each six hours a block.
+        // A whole hour.
+        let start = 1_800_000_000_000;
+        let hours = 48i64;
+        let mut rng = crate::testkit::Rng::new(11);
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = Store::open(dir.path(), crate::hash::Keyed::with_keys(1, 2)).unwrap();
+        let tags = [("env", "prod"), ("resource_name", "GET /"), ("service", "web"), ("span.kind", "server")];
+        let key = |name: &str, kind: Kind, extra: Option<(&'static str, &str)>| SeriesKey::new(name, tags.iter().copied().chain(extra), kind).unwrap();
+        let (hits, errors, sum, max) =
+            (key("trace.hits", Kind::Count, None), key("trace.errors", Kind::Count, None), key("trace.duration.sum", Kind::Count, None), key("trace.duration.max", Kind::Gauge, None));
+        let buckets: Vec<(SeriesKey, u64)> =
+            [30i64, 35, 40, -20].iter().map(|&b| (key("trace.duration.dist", Kind::Count, Some((crate::dist::BUCKET_TAG, &format!("5:p{b}").replace("p-", "n")))), b.unsigned_abs())).collect();
+        for chunk in 0..hours / 6 {
+            let mut b = Builder::new();
+            for k in [&hits, &errors, &sum, &max].into_iter().chain(buckets.iter().map(|(k, _)| k)) {
+                b.define(k);
+            }
+            let times: Vec<i64> = (0..6 * 360).map(|i| start + chunk * 6 * 3_600_000 + i * 10_000).collect();
+            let mut col = |k: &SeriesKey, f: &mut dyn FnMut() -> f64| b.run(k.fp, times.iter().map(|&t| (t, f())).collect::<Vec<_>>());
+            col(&hits, &mut || rng.below(20) as f64);
+            col(&errors, &mut || rng.below(3) as f64);
+            col(&sum, &mut || rng.f64() * 2.0);
+            col(&max, &mut || rng.f64() * 0.5);
+            for (k, n) in &buckets {
+                col(k, &mut || rng.below(*n) as f64);
+            }
+            st.apply(&b.finish()).unwrap();
+            st.cut(crate::manifest::Point { index: chunk as u64 + 1, term: 1 }).unwrap();
+            st.compact().unwrap();
+        }
+        // The hour's tier is there to be read.
+        let mut ids = Vec::new();
+        st.select(&crate::index::Selector::metric("trace.hits"), &mut ids);
+        let (mut ts, mut vs, mut rolled) = (Vec::new(), Vec::new(), Rolled::default());
+        let roll = Roll { width: 3_600_000, from: start, to: start + hours * 3_600_000, kind: Kind::Count, cols: &[Col::Sum] };
+        st.read_rolled(ids[0], start, start + hours * 3_600_000 - 1, &roll, &mut Scratch::default(), &mut ts, &mut vs, &mut rolled).unwrap();
+        assert!(rolled.len() > 40, "{} hours read rolled up", rolled.len());
+        // Edges inside windows, read as samples; the middle from the hour's sums.
+        for (from, to) in [(start + 1_234, start + hours * 3_600_000 - 5_678), (start + 7 * 3_600_000 + 10_000, start + 31 * 3_600_000 + 20_000)] {
+            st.set_read_rollups(true);
+            let up = red(&st, false, &[("service", "web")], "service", from, to).unwrap();
+            st.set_read_rollups(false);
+            let raw = red(&st, false, &[("service", "web")], "service", from, to).unwrap();
+            let ([a], [b]) = (up.as_slice(), raw.as_slice()) else { panic!("{up:?} {raw:?}") };
+            assert_eq!((a.hits, a.errors, a.max, a.p50, a.p95, a.p99), (b.hits, b.errors, b.max, b.p50, b.p95, b.p99));
+            assert!((a.duration_sum - b.duration_sum).abs() <= 1e-9 * b.duration_sum, "{} {}", a.duration_sum, b.duration_sum);
+            assert!(a.hits > 0.0);
+        }
     }
 }

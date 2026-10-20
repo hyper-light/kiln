@@ -1135,7 +1135,11 @@ distribution of `@duration` in seconds.
 
 **Services** (`kiln_obs::apm::red`) are read from the trace metrics: over any range, each group's
 counts summed and its durations' buckets merged before a percentile is read, so a p95 over a day is
-the day's, not an average of windows'. **The service map** (`kiln_obs::apm::MapBuilder`) is read
+the day's, not an average of windows'. A long range is read from the series' rollups (§4.7): the
+coarsest tier at most a twelfth of the range wide, so the two windows at its edges it reads as
+samples at the most are a sixth of it; its counts the windows' sums and the samples' added, its
+most the greatest of theirs (the same figures as every sample's, a sum within 1e-9 of it, its
+counts and percentiles to the bit; a test holds the one to the other). **The service map** (`kiln_obs::apm::MapBuilder`) is read
 from the spans: a span whose parent is another service's is a call of that service to its own (the
 caller's client span's duration the call's), a client's or a producer's span no other service's span
 answered is a call to its `peer.service`, named only. Past 200,000 spans in the range (the blocks'
@@ -2551,6 +2555,19 @@ allocations a grouped stat (of 2,000 in a payload; 0.97 of 100), no page faults;
 its series made, 13 µs a group. Written first as a series and its points each (`Vec` a series),
 the same took 14.5 µs and 225 allocations a group. An Agent's 2,000 groups every ten seconds are
 12 ms of a core.
+
+A service's figures over a long range (`kiln_obs::apm::red`, by resource): a week of 20 groups'
+trace metrics (280 series, 16.9 M points, a block a day):
+
+| range | read from rollups | from every sample |
+| --- | --- | --- |
+| an hour | 1.85 ms | 1.93 ms |
+| a day | 29.5 ms | 29.5 ms |
+| a week | 34.4 ms | 216.7 ms (6.3×) |
+
+The last day is read as samples either way: it is in the newest block, which a cut writes without
+rollups (it decodes nothing it need not) and no merge has taken yet; the week's other six days are
+read as their hours' sums.
 
 A trace by its id, in a span store of 1,024,000 spans (341,334 traces) in 2,000 blocks: 1.6 ms, its
 own block and a median of 20 others read (p99 31, the most 37): the 1% each filter is sized for,

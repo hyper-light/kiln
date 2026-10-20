@@ -762,4 +762,63 @@ fn main() {
     let reads = median(read.clone());
     println!("a trace by its id, the whole store: median {:.2} ms, blocks read median {} (most {}) of {}", median(times) as f64 / 1e6, reads, read.iter().max().unwrap(), blocks);
     let _ = std::fs::remove_dir_all(&dir);
+
+    // A service's figures over a long range (`kiln_obs::apm::red`): a week of trace metrics, a point
+    // each ten seconds, of 20 groups (resource and status) of 14 series each (hits, errors, the
+    // durations' sum and most, ten buckets), written a day at a time, a block a day; read from
+    // rollups and from every sample.
+    use kiln_obs::batch::{Builder, Kind, SeriesKey};
+    let days = 7i64;
+    let start = 1_800_000_000_000 - 1_800_000_000_000 % 86_400_000;
+    let dir = std::env::temp_dir().join(format!("kiln-red-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut st = kiln_obs::store::Store::open(&dir, kiln_obs::hash::Keyed::with_keys(1, 2)).unwrap();
+    let mut keys: Vec<SeriesKey> = Vec::new();
+    for g in 0..20 {
+        let resource = format!("GET /r/{}", g / 2);
+        let status = if g % 2 == 0 { "200" } else { "500" };
+        let tags = [("env", "prod"), ("http.status_code", status), ("resource_name", resource.as_str()), ("service", "web"), ("span.kind", "server")];
+        for (name, kind) in [("trace.hits", Kind::Count), ("trace.errors", Kind::Count), ("trace.duration.sum", Kind::Count), ("trace.duration.max", Kind::Gauge)] {
+            keys.push(SeriesKey::new(name, tags.iter().copied(), kind).unwrap());
+        }
+        for b in 0..10 {
+            let v = format!("5:p{}", 150 + b);
+            keys.push(SeriesKey::new("trace.duration.dist", tags.iter().copied().chain([("dist_bucket", v.as_str())]), Kind::Count).unwrap());
+        }
+    }
+    let started = Instant::now();
+    let mut rng = kiln_obs::testkit::Rng::new(3);
+    for day in 0..days {
+        let mut b = Builder::new();
+        for k in &keys {
+            b.define(k);
+        }
+        for k in &keys {
+            let samples: Vec<(i64, f64)> = (0..8_640).map(|i| (start + day * 86_400_000 + i * 10_000, rng.below(20) as f64)).collect();
+            b.run(k.fp, samples);
+        }
+        st.apply(&b.finish()).unwrap();
+        st.cut(kiln_obs::manifest::Point { index: day as u64 + 1, term: 1 }).unwrap();
+        st.compact().unwrap();
+    }
+    println!("\n{} series of a week's trace metrics ({:.1} M points) written in {:.1} s", keys.len(), keys.len() as f64 * days as f64 * 8_640.0 / 1e6, started.elapsed().as_secs_f64());
+    for (name, range) in [("an hour", 3_600_000i64), ("a day", 86_400_000), ("a week", days * 86_400_000)] {
+        let (from, to) = (start + days * 86_400_000 - range + 1_234, start + days * 86_400_000 - 5_678);
+        let mut time = |on: bool| {
+            st.set_read_rollups(on);
+            median(
+                (0..11)
+                    .map(|_| {
+                        let t = Instant::now();
+                        let r = kiln_obs::apm::red(&st, false, &[("service", "web")], "resource_name", from, to).unwrap();
+                        assert_eq!(r.len(), 10);
+                        t.elapsed().as_nanos() as u64
+                    })
+                    .collect(),
+            )
+        };
+        let (up, raw) = (time(true), time(false));
+        println!("{name:<8} by resource: {:>8.2} ms read from rollups, {:>8.2} ms from every sample ({:.1}x)", up as f64 / 1e6, raw as f64 / 1e6, raw as f64 / up as f64);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
