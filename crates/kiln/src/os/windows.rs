@@ -7,9 +7,37 @@ use std::path::{Path, PathBuf};
 
 // ------------------------------------------------------------------------- identity and paths
 
-/// kiln never installs system-wide on Windows (no elevation): everything is per-user.
+/// kiln never installs system-wide on Windows: everything is per-user.
 pub fn is_root() -> bool {
     false
+}
+
+/// Whether this process runs with an administrator's full rights (elevated, or UAC is off): it
+/// may register a Scheduled Task that starts kiln at boot.
+pub fn elevated() -> bool {
+    super::win32::elevated()
+}
+
+/// Run `program` with `parameters` (one command line) as an administrator, its window hidden,
+/// and wait up to `timeout` for its exit code. Windows asks the person at the desktop first
+/// (UAC); an error of kind `PermissionDenied` means they said no.
+pub fn run_elevated(program: &Path, parameters: &str, timeout: std::time::Duration) -> io::Result<u32> {
+    super::win32::run_elevated(program, parameters, timeout).map_err(|e| match e.raw_os_error() {
+        Some(super::win32::ERROR_CANCELLED) => io::Error::new(io::ErrorKind::PermissionDenied, "the administrator prompt was declined"),
+        _ => e,
+    })
+}
+
+/// Put `dir` on the user's PATH (`HKCU\Environment`), for what starts from now on: new
+/// terminals, and Explorer, which is told it changed. `Ok(None)` when it was on it already.
+pub fn add_to_user_path(dir: &Path) -> io::Result<Option<super::PathAdded>> {
+    let (list, kind) = super::win32::user_path()?.unwrap_or((String::new(), super::win32::REG_EXPAND_SZ));
+    let Some(list) = super::path_list_with(&list, &dir.display().to_string(), |name| std::env::var(name).ok()) else {
+        return Ok(None);
+    };
+    super::win32::set_user_path(&list, kind)?;
+    super::win32::announce_environment();
+    Ok(Some(super::PathAdded { file: None, now: None }))
 }
 
 /// Windows identifies users by SID, not a numeric id; nothing on Windows asks for one.
@@ -77,6 +105,14 @@ pub fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Open `path` to read it, sharing it for reading only: until the file is closed nobody can
+/// write, rename or delete it.
+pub fn open_unchangeable(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path)
+}
+
 /// Read at `offset`. (`seek_read` also moves the handle's cursor; kiln never mixes it with
 /// cursor-based I/O on the same handle.)
 pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -141,4 +177,31 @@ pub fn try_reap(_pid: u32) -> io::Result<Option<(Option<i32>, String)>> {
 /// How many PTY masters process `pid` holds open: not something Windows can tell from outside.
 pub fn pty_masters(_pid: u32) -> Option<usize> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The user's PATH for real (by hand): a folder goes on it once, the value keeps its registry
+    /// type, and the PATH is put back as it was.
+    #[test]
+    #[ignore = "changes this user's PATH, then puts it back"]
+    fn a_folder_goes_on_the_users_path_once() -> anyhow::Result<()> {
+        let Some((before, kind)) = super::super::win32::user_path()? else {
+            anyhow::bail!("this user has no PATH of their own to try it on");
+        };
+        let dir = std::env::temp_dir().join(format!("kiln path test {}", std::process::id()));
+        let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(add_to_user_path(&dir)?.is_some(), "not added");
+            let (after, after_kind) = super::super::win32::user_path()?.ok_or_else(|| anyhow::anyhow!("PATH gone"))?;
+            anyhow::ensure!(after_kind == kind, "registry type {kind} became {after_kind}");
+            anyhow::ensure!(after == format!("{};{}", before.trim_end_matches(';'), dir.display()), "PATH is now {after}");
+            anyhow::ensure!(add_to_user_path(&dir)?.is_none(), "added twice");
+            Ok(())
+        })();
+        super::super::win32::set_user_path(&before, kind)?;
+        super::super::win32::announce_environment();
+        result
+    }
 }

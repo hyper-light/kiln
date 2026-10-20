@@ -1,0 +1,18 @@
+[package]
+name = "kilndb-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "KilnDB against clustered MySQL (Vitess) on the conversation workload (docs/kilndb.md, K0)"
+
+# Outside kiln's workspace (its exclude list): the MySQL client it drives Vitess with never enters
+# kiln's build or lock file.
+[workspace]
+
+[dependencies]
+kiln = { path = "../../crates/kiln" }
+mysql = { version = "26", default-features = false, features = ["minimal"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

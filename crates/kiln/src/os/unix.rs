@@ -12,6 +12,99 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
+/// Running with full rights: as root.
+pub fn elevated() -> bool {
+    is_root()
+}
+
+/// Windows only (its UAC prompt): elsewhere installs ask through `sudo`.
+pub fn run_elevated(_program: &Path, _parameters: &str, _timeout: std::time::Duration) -> io::Result<u32> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "only Windows asks for administrator rights this way"))
+}
+
+/// Put `dir` on PATH for this user's new terminals when it isn't on this one's (`~/.local/bin`
+/// isn't on a Mac's, nor on some Linux desktops'): a line in the startup file their shell
+/// (`$SHELL`) reads for each ([`shell_path_line`]), which adds it unless it's there. `Ok(None)`
+/// when it's on PATH, or that line is in the file already. Never as root: a system-wide kiln is in
+/// `/usr/local/bin`, which every PATH has.
+pub fn add_to_user_path(dir: &Path) -> io::Result<Option<super::PathAdded>> {
+    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|e| e == dir));
+    if on_path || is_root() {
+        return Ok(None);
+    }
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let zdotdir = std::env::var_os("ZDOTDIR").map(PathBuf::from);
+    let line = shell_path_line(&shell, cfg!(target_os = "macos"), &home_dir(), zdotdir.as_deref(), dir, Path::exists);
+    Ok(add_marked_line(&line.file, &line.line)?.then_some(super::PathAdded { file: Some(line.file), now: Some(line.now) }))
+}
+
+/// What marks the line [`add_to_user_path`] adds to a shell's startup file.
+const PATH_MARK: &str = "# kiln: its folder on PATH (added by `kiln install`)";
+
+/// Append `line` to shell startup file `file` (made if it isn't there), under [`PATH_MARK`] and
+/// apart from what's above it, unless the mark is in it already: whether it was added.
+fn add_marked_line(file: &Path, line: &str) -> io::Result<bool> {
+    use std::io::Write as _;
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if text.lines().any(|l| l.trim() == PATH_MARK) {
+        return Ok(false);
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let gap = if text.is_empty() { "" } else if text.ends_with('\n') { "\n" } else { "\n\n" };
+    OpenOptions::new().create(true).append(true).open(file)?.write_all(format!("{gap}{PATH_MARK}\n{line}\n").as_bytes())?;
+    Ok(true)
+}
+
+/// How a shell gets a folder on its PATH.
+#[derive(Debug, PartialEq, Eq)]
+struct ShellPathLine {
+    /// The startup file every new terminal of that shell reads.
+    file: PathBuf,
+    /// What goes in it: adds the folder unless PATH has it.
+    line: String,
+    /// What adds it in this terminal.
+    now: String,
+}
+
+/// For login shell `shell` (`$SHELL`), the startup file new terminals read, and what in it puts
+/// `dir` on PATH: zsh's `.zshrc` (in `zdotdir` when set); bash's `.bashrc`, but on macOS, whose
+/// terminals start login shells, the first of `.bash_profile`, `.bash_login` and `.profile` there
+/// is (`.bash_profile` when none is); fish's `conf.d/kiln.fish`; any other shell's `.profile`.
+/// `dir` is written `"$HOME/…"` when it's in `home`, quoted as it is otherwise.
+fn shell_path_line(shell: &str, macos: bool, home: &Path, zdotdir: Option<&Path>, dir: &Path, exists: impl Fn(&Path) -> bool) -> ShellPathLine {
+    let fish = shell.rsplit('/').next() == Some("fish");
+    let in_home = dir.strip_prefix(home).ok().map(|rest| rest.display().to_string()).filter(|rest| !rest.contains(['"', '$', '`', '\\']));
+    let quoted = match in_home {
+        Some(rest) => format!("\"$HOME/{rest}\""),
+        None if fish => format!("'{}'", dir.display().to_string().replace('\\', "\\\\").replace('\'', "\\'")),
+        None => format!("'{}'", dir.display().to_string().replace('\'', "'\\''")),
+    };
+    if fish {
+        return ShellPathLine {
+            file: home.join(".config/fish/conf.d/kiln.fish"),
+            line: format!("contains -- {quoted} $PATH; or set -gx PATH {quoted} $PATH"),
+            now: format!("set -gx PATH {quoted} $PATH"),
+        };
+    }
+    let file = match shell.rsplit('/').next().unwrap_or_default() {
+        "zsh" => zdotdir.unwrap_or(home).join(".zshrc"),
+        "bash" if macos => [".bash_profile", ".bash_login", ".profile"].map(|f| home.join(f)).into_iter().find(|f| exists(f)).unwrap_or_else(|| home.join(".bash_profile")),
+        "bash" => home.join(".bashrc"),
+        _ => home.join(".profile"),
+    };
+    ShellPathLine {
+        file,
+        line: format!("case \":$PATH:\" in *:{quoted}:*) ;; *) export PATH={quoted}:\"$PATH\" ;; esac"),
+        now: format!("export PATH={quoted}:\"$PATH\""),
+    }
+}
+
 /// The real user id (launchd's per-user domains are `gui/<uid>` and `user/<uid>`).
 pub fn uid() -> u32 {
     nix::unistd::getuid().as_raw()
@@ -73,6 +166,12 @@ pub fn with_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
 /// Mark a file executable (`0755`).
 pub fn make_executable(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
+/// Open `path` to read it. (Windows keeps others from changing it meanwhile; Unix has no share
+/// modes, and nothing here hands a file to a more privileged process.)
+pub fn open_unchangeable(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 /// Read at `offset` without moving a shared cursor.
@@ -304,6 +403,61 @@ pub fn pty_masters(pid: u32) -> Option<usize> {
             .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t == Path::new("/dev/ptmx") || t == Path::new("/dev/pts/ptmx")))
             .count(),
     )
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn each_shell_gets_its_startup_file_and_line() {
+        let home = Path::new("/home/me");
+        let dir = home.join(".local/bin");
+        let none = |_: &Path| false;
+        let zsh = shell_path_line("/bin/zsh", true, home, None, &dir, none);
+        assert_eq!(zsh.file, home.join(".zshrc"));
+        assert_eq!(zsh.line, r#"case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) export PATH="$HOME/.local/bin":"$PATH" ;; esac"#);
+        assert_eq!(zsh.now, r#"export PATH="$HOME/.local/bin":"$PATH""#);
+        assert_eq!(shell_path_line("/usr/bin/zsh", false, home, Some(Path::new("/home/me/.zsh")), &dir, none).file, Path::new("/home/me/.zsh/.zshrc"));
+        assert_eq!(shell_path_line("/bin/bash", false, home, None, &dir, none).file, home.join(".bashrc"));
+        // macOS terminals start login shells: bash reads the first of these there is.
+        assert_eq!(shell_path_line("/bin/bash", true, home, None, &dir, none).file, home.join(".bash_profile"));
+        let profile = home.join(".profile");
+        assert_eq!(shell_path_line("/bin/bash", true, home, None, &dir, |p: &Path| p == profile).file, profile);
+        let fish = shell_path_line("/opt/homebrew/bin/fish", true, home, None, &dir, none);
+        assert_eq!(fish.file, home.join(".config/fish/conf.d/kiln.fish"));
+        assert_eq!(fish.line, r#"contains -- "$HOME/.local/bin" $PATH; or set -gx PATH "$HOME/.local/bin" $PATH"#);
+        assert_eq!(shell_path_line("", false, home, None, &dir, none).file, profile);
+        // Outside the home folder: quoted as it is.
+        assert_eq!(shell_path_line("/bin/sh", false, home, None, Path::new("/opt/it's/bin"), none).now, r#"export PATH='/opt/it'\''s/bin':"$PATH""#);
+    }
+
+    #[test]
+    fn the_line_goes_in_a_startup_file_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // A file that isn't there yet, in a folder that isn't either (fish's conf.d).
+        let fresh = dir.path().join("conf.d/kiln.fish");
+        assert!(add_marked_line(&fresh, "the line")?);
+        assert_eq!(std::fs::read_to_string(&fresh)?, format!("{PATH_MARK}\nthe line\n"));
+        assert!(!add_marked_line(&fresh, "the line")?, "once");
+        // Someone's own file: kept, and the line set apart from it.
+        let theirs = dir.path().join(".zshrc");
+        std::fs::write(&theirs, "alias ll='ls -l'")?;
+        assert!(add_marked_line(&theirs, "the line")?);
+        assert_eq!(std::fs::read_to_string(&theirs)?, format!("alias ll='ls -l'\n\n{PATH_MARK}\nthe line\n"));
+        Ok(())
+    }
+
+    /// The line itself, run by `sh`: the folder goes on PATH once, however often it runs.
+    #[test]
+    fn the_line_puts_the_folder_on_path_once() -> anyhow::Result<()> {
+        let home = Path::new("/home/me");
+        let line = shell_path_line("/bin/sh", false, home, None, &home.join(".local/bin"), |_| false).line;
+        let script = format!("{line}\n{line}\nprintf %s \"$PATH\"");
+        let out = std::process::Command::new("sh").arg("-c").arg(script).env("HOME", home).env("PATH", "/usr/bin:/bin").output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/home/me/.local/bin:/usr/bin:/bin");
+        Ok(())
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
