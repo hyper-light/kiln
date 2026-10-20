@@ -9,6 +9,8 @@
 //!   to a live viewer) and the cache's store (W08-AC08: a 1 GiB entry saved, then restored). The
 //!   network's part of those (the runner's link, HTTP, the browser) is the live cluster's to
 //!   confirm, as §1.5 says.
+//! - Against a store on disk of its own: the runs list's first page with a million runs in it
+//!   (W21-AC04's server time).
 //! - Each measure is the median of `--runs` runs, against its target. They're written to
 //!   `target/ci-bench.json` (`--out`), and, in a leg, to `$KILN_METRICS` with their runs as
 //!   samples, where a job's `bench-gate` holds them to their history (W16-R09): kiln's own CI
@@ -52,7 +54,7 @@ pub struct BenchArgs {
     /// The scheduler's alone (W05-AC08).
     #[arg(long)]
     scheduler: bool,
-    /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache` (comma-separated).
+    /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache`, `list` (comma-separated).
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
     /// Pushes for run creation.
@@ -64,6 +66,9 @@ pub struct BenchArgs {
     /// MiB of the cache entry.
     #[arg(long, default_value_t = 1_024)]
     cache_mib: u64,
+    /// Runs in the store the runs list's first page is read from (W21-AC04).
+    #[arg(long, default_value_t = 1_000_000)]
+    list_runs: usize,
     /// Runs of each measure; its median is the result.
     #[arg(long, default_value_t = 5)]
     runs: usize,
@@ -276,6 +281,74 @@ jobs:
     Ok(vec![Measure::new("runs.created_p99", "ms", Better::Lower, 500.0, vec![p99])])
 }
 
+/// W21-AC04: the runs list's first page with `n` runs in a store on disk (twenty repositories, a
+/// leg each), as `GET /api/runs` makes it (the store's query, the legs' runners and executors, the
+/// JSON): newest first as the list opens, one repository's, and oldest first. Each ≤ 100 ms.
+async fn list(dir: &Path, n: usize, runs: usize) -> Result<Vec<Measure>> {
+    let store = crate::store::Store::open(&dir.join("list.db"))?;
+    let mut repos = Vec::new();
+    for i in 0..20 {
+        let r = crate::store::Repo {
+            id: crate::util::new_id(),
+            name: format!("bench/app{i}"),
+            clone_url: String::new(),
+            branches: vec!["main".into()],
+            poll_seconds: 0,
+            enabled: true,
+            created_at: 0,
+            last_polled_at: None,
+            last_error: None,
+            mode: "native".into(),
+            default_branch: Some("main".into()),
+            mirror: None,
+        };
+        repos.push(store.upsert_repo(r).await?.id);
+    }
+    let ids = repos.clone();
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            {
+                let mut run = tx.prepare(
+                    "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, started_at, finished_at)
+                     VALUES (?1, ?2, ?3, '.github/workflows/ci.yml', 'push', 'main', ?4, 'A change', 'bench', 'success', ?5, ?5, ?6)",
+                )?;
+                let mut leg = tx.prepare(
+                    "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, executor) VALUES (?1, ?2, 'build', 'build', 'success', '[]', '[]', '{}', 'runner-1', 'host')",
+                )?;
+                let base = 1_700_000_000i64;
+                for i in 0..n {
+                    let repo = ids.get(i % ids.len()).cloned().unwrap_or_default();
+                    let (at, number) = (base + i64::try_from(i).unwrap_or(0), i64::try_from(i / ids.len()).unwrap_or(0) + 1);
+                    let id = format!("run{i:09}");
+                    run.execute(rusqlite::params![id, repo, number, format!("{i:040x}"), at, at + 60])?;
+                    leg.execute(rusqlite::params![format!("leg{i:09}"), id])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    let one = repos.get(7).cloned();
+    let mut out = Vec::new();
+    for (name, repo, sort) in [("list.first_page", None, None), ("list.first_page_repo", one, None), ("list.first_page_oldest", None, Some("oldest"))] {
+        let mut samples = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t = Instant::now();
+            let page = match sort {
+                Some(s) => store.runs_sorted(None, repo.clone(), s, 50, 0).await?,
+                None => store.runs(repo.clone(), 50, None).await?,
+            };
+            let hosts = store.run_hosts(page.iter().map(|r| r.id.clone()).collect()).await?;
+            let body = serde_json::to_vec(&page)?;
+            anyhow::ensure!(page.len() == 50 && hosts.len() == 50 && !body.is_empty(), "{name}: {} runs, {} with their legs' hosts", page.len(), hosts.len());
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        out.push(Measure::new(name, "ms", Better::Lower, 100.0, samples));
+    }
+    Ok(out)
+}
+
 /// §1.5's log ingest: 16 legs writing `mib` MiB at once (≥ 200 MiB/s together), and a line's
 /// way from its write to a live viewer (p99 < 250 ms; here the server's part of it).
 async fn logs(dir: &Path, mib: u64) -> Result<Vec<Measure>> {
@@ -395,7 +468,7 @@ async fn bench(a: BenchArgs) -> Result<u8> {
         only.push("scheduler".into());
     }
     for o in &only {
-        anyhow::ensure!(matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache"), "`{o}`: scheduler, expressions, parsing, runs, logs or cache");
+        anyhow::ensure!(matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "list"), "`{o}`: scheduler, expressions, parsing, runs, logs, cache or list");
     }
     let want = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
     let runs = a.runs.clamp(1, 100);
@@ -428,6 +501,12 @@ async fn bench(a: BenchArgs) -> Result<u8> {
         }
         .await;
         hub.shutdown.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+        measures.extend(measured?);
+    }
+    if want("list") {
+        let dir = a.data.join(crate::util::new_id());
+        let measured = list(&dir, a.list_runs.max(100), runs).await;
         let _ = std::fs::remove_dir_all(&dir);
         measures.extend(measured?);
     }

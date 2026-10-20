@@ -15,9 +15,14 @@ import { reposRes, useRepos, warm } from "@/lib/data";
 import { firstLine, shortSha, statusLabel } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { useWindowedRows } from "@/lib/virtual";
 import { EventIcon, LiveDuration, RelTime } from "./shared";
 
 const PAGE = 50;
+/** A row's height until the first one is measured (a list of a million scrolls as one of forty: W21-AC04). */
+const ROW = 41;
+/** The table's columns, for the rows that stand in for those not rendered. */
+const COLUMNS = 8;
 
 type StatusFilter = "all" | "active" | "failed" | "succeeded" | "cancelled";
 const STATUS_GROUPS: Record<StatusFilter, Status[] | null> = {
@@ -213,6 +218,17 @@ function RunsBody() {
   );
 
   const filtered = Boolean(Object.keys(chosen).length || status !== "all" || words);
+  // Only the rows near the viewport are rendered (W21-AC04), at the height a row has here.
+  const [rowHeight, setRowHeight] = React.useState(ROW);
+  const [listRef, win] = useWindowedRows(visible.length, rowHeight);
+  // Once: rows a pixel apart where they fall (WebKit rounds by position) would measure again and again.
+  const measured = React.useRef(false);
+  const measureRow = React.useCallback((el: HTMLTableRowElement | null) => {
+    const h = el?.getBoundingClientRect().height ?? 0;
+    if (measured.current || h <= 0) return;
+    measured.current = true;
+    setRowHeight((cur) => (Math.abs(h - cur) > 0.5 ? h : cur));
+  }, []);
 
   return (
     <>
@@ -265,10 +281,16 @@ function RunsBody() {
         <div className="table-wrap">
           <table className="data-table">
             <RunsHead />
-            <tbody>
-              {visible.map((r) => (
+            <tbody ref={listRef}>
+              {win.start > 0 && (
+                <tr aria-hidden="true" style={{ height: win.start * rowHeight, background: "transparent" }}>
+                  <td colSpan={COLUMNS} className="!border-0 !p-0" />
+                </tr>
+              )}
+              {visible.slice(win.start, win.end).map((r, i) => (
                 <tr
                   key={r.id}
+                  ref={i === 0 ? measureRow : undefined}
                   data-href
                   tabIndex={0}
                   onClick={(e) => {
@@ -316,6 +338,11 @@ function RunsBody() {
                   </td>
                 </tr>
               ))}
+              {win.end < visible.length && (
+                <tr aria-hidden="true" style={{ height: (visible.length - win.end) * rowHeight, background: "transparent" }}>
+                  <td colSpan={COLUMNS} className="!border-0 !p-0" />
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

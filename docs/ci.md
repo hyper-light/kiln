@@ -4173,7 +4173,6 @@ is left.
 - *Left.* Everything else:
   - the rest of R11's REST subset and GraphQL;
   - replies by email or chat (R05, with W11-R06);
-  - R06's diffs UI and the review pages (with W21);
   - AC05 as one run of its own (its parts are checked above: `github-script`, the release with
     an asset, `actions/checkout` from the facade; left are a checkout at a diff version with
     submodules and `download-artifact` across runs on a native repository), and AC07, which
@@ -5594,11 +5593,20 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   (`ui/src/lib/patch.ts`, checked against `git apply` in ten cases by `ci/ui/patch_check.ts`),
   beside Copy and Download. Checked in Chromium and WebKit, desktop and phone
   (`ci/ui/people_check.mjs`).
+- *Done.* AC04. The runs list's first page, with 1,000,000 runs in a store on disk, takes 0.37 ms
+  of server time newest first, 0.76 ms for one repository's and 0.33 ms oldest first (a release
+  build, `kiln ci bench --only list`: the store's query, the legs' runners and executors, the
+  JSON; held to 100 ms). The list renders only the rows near the viewport, at the height a row
+  has on that screen (`useWindowedRows`), so it scrolls without blanking. Checked against a mock
+  of a million runs in Chromium and WebKit, desktop and phone (`ci/ui/runs_window_check.mjs`):
+  grown to 5,000 runs as it scrolled, fewer than 200 rows rendered, and rows under the middle of
+  the screen wherever it was scrolled to.
 - *Left.*
-  - R03's list windowed to 1,000,000 rows (AC04).
   - R06's flow view and matrix editor, and saving's commit to a branch and push through the App.
   - R01's hover, schema completion of keys, and the Dockerfile and Agentfile modes.
-  - R07 to R10, and AC01's Playwright scripts in kiln's own CI, AC02 to AC04.
+  - R07; R08's image builder and the pools' scaling history; R10 (with W15's pages, the CD
+    board's). R09 is the review pages W14-AC06 checks.
+  - AC01's Playwright scripts in kiln's own CI, AC02 and AC03.
 
 ### W22 Conformance, end-to-end and performance testing
 
