@@ -8,7 +8,10 @@
 //! Rust's regular expressions do not backtrack: an atomic group `(?>…)` is read as `(?:…)`, which
 //! matches the same where an atomic group would not have to give anything back.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
 use serde_json::Value;
@@ -19,6 +22,12 @@ use kiln_obs::query::calendar::Zone;
 const DEPTH: usize = 16;
 /// Attributes a match extracts at the most.
 const ATTRS: usize = 256;
+/// Rules a thread keeps capture locations for before it forgets them all (pipelines changed
+/// many times over: their old rules' are of rules no longer read).
+const READING: usize = 4096;
+
+/// Each rule's own number, never another's, for what a thread keeps of it ([`Reading`]).
+static RULES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GrokError {
@@ -70,9 +79,17 @@ struct Cap {
 
 #[derive(Debug)]
 struct Rule {
+    id: u64,
     name: String,
     re: Regex,
     caps: Vec<Cap>,
+}
+
+/// What reading values keeps on one thread: each rule's capture locations, made once, a value's
+/// groups read into them with nothing allocated.
+#[derive(Debug, Default)]
+pub struct Reading {
+    locs: HashMap<u64, regex::CaptureLocations>,
 }
 
 /// Rules compiled.
@@ -349,28 +366,37 @@ impl Grok {
             for cap in &mut caps {
                 cap.index = re.capture_names().position(|n| n == Some(cap.group.as_str())).unwrap_or(0);
             }
-            rules.push(Rule { name: name.clone(), re, caps });
+            rules.push(Rule { id: RULES.fetch_add(1, Ordering::Relaxed), name: name.clone(), re, caps });
         }
         Ok(Self { rules })
     }
 
     /// The first rule that matches `value` whole: its name, and its attributes appended to `out`.
     pub fn parse(&self, value: &str, now_ns: i64, out: &mut Vec<(String, String)>) -> Option<&str> {
-        // Each rule told by the fast matcher (a lazy DFA) before its groups are read by the slower
-        // one; the last asked for its groups at once, which tells a value it does not match as fast
-        // (measured: a set of the rules, one pass for all, was no faster than this).
-        let last = self.rules.len().saturating_sub(1);
-        for (i, rule) in self.rules.iter().enumerate() {
-            if i < last && !rule.re.is_match(value) {
+        self.parse_with(value, now_ns, &mut Reading::default(), out)
+    }
+
+    /// [`Grok::parse`], with what this thread keeps of the rules it reads.
+    pub fn parse_with(&self, value: &str, now_ns: i64, reading: &mut Reading, out: &mut Vec<(String, String)>) -> Option<&str> {
+        if reading.locs.len() > READING {
+            reading.locs.clear();
+        }
+        // Each rule asked for its groups at once: its expression finds a match with its lazy DFA
+        // first and reads the groups of that match alone, so a rule that does not match costs that
+        // pass, and one that does no second one (asking `is_match` first scanned a matching value
+        // twice; measured, docs/observe.md §12.17; a set of the rules, one pass for all, was no
+        // faster).
+        for rule in &self.rules {
+            let locs = reading.locs.entry(rule.id).or_insert_with(|| rule.re.capture_locations());
+            if rule.re.captures_read(locs, value).is_none() {
                 continue;
             }
-            let Some(c) = rule.re.captures(value) else { continue };
             for cap in &rule.caps {
-                let Some(m) = c.get(cap.index) else { continue };
+                let Some(text) = locs.get(cap.index).and_then(|(a, b)| value.get(a..b)) else { continue };
                 if out.len() >= ATTRS {
                     break;
                 }
-                extract(cap, m.as_str(), now_ns, out);
+                extract(cap, text, now_ns, out);
             }
             return Some(&rule.name);
         }
@@ -385,6 +411,12 @@ fn number_text(f: f64) -> Option<String> {
 /// A token's value, read and filtered, into `out` (under its name; a filter that makes fields,
 /// under the name too, or at the root without one).
 fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
+    // A text the filter drops (`nullIf("-")`): nothing made of it.
+    if let (Conv::Str, Some(Filter::NullIf(x))) = (&cap.conv, &cap.filter)
+        && raw == x
+    {
+        return;
+    }
     let value: Option<String> = match &cap.conv {
         Conv::Str => Some(raw.to_owned()),
         Conv::Int => raw.trim_start_matches('+').parse::<i64>().ok().map(|i| i.to_string()),
@@ -550,15 +582,15 @@ pub(crate) fn query_pairs(q: &str) -> Vec<(String, String)> {
 }
 
 /// A URL's parts, as Datadog's URL parser names them: `scheme`, `host`, `port`, `path`,
-/// `queryString.<key>`.
-pub(crate) fn url_parts(url: &str) -> Vec<(String, String)> {
+/// `queryString.<key>` (the names but a query's key, written in once).
+pub(crate) fn url_parts(url: &str) -> Vec<(Cow<'static, str>, String)> {
     let mut out = Vec::new();
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) => (Some(s), r),
         _ => (None, url),
     };
     if let Some(s) = scheme {
-        out.push(("scheme".into(), s.to_owned()));
+        out.push((Cow::Borrowed("scheme"), s.to_owned()));
     }
     let (authority, path_query) = if scheme.is_some() {
         match rest.find(['/', '?', '#']) {
@@ -572,21 +604,28 @@ pub(crate) fn url_parts(url: &str) -> Vec<(String, String)> {
         let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
         match host_port.rsplit_once(':').filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
             Some((h, p)) => {
-                out.push(("host".into(), h.trim_start_matches('[').trim_end_matches(']').to_owned()));
-                out.push(("port".into(), p.to_owned()));
+                out.push((Cow::Borrowed("host"), h.trim_start_matches('[').trim_end_matches(']').to_owned()));
+                out.push((Cow::Borrowed("port"), p.to_owned()));
             }
-            None => out.push(("host".into(), host_port.to_owned())),
+            None => out.push((Cow::Borrowed("host"), host_port.to_owned())),
         }
     }
     let path_query = path_query.split('#').next().unwrap_or_default();
     let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
     if !path.is_empty() {
-        out.push(("path".into(), path.to_owned()));
+        out.push((Cow::Borrowed("path"), path.to_owned()));
     }
     for (k, v) in query_pairs(query) {
-        out.push((format!("queryString.{k}"), v));
+        out.push((Cow::Owned(format!("queryString.{k}")), v));
     }
     out
+}
+
+/// Whether `hay` holds `needle` (lowercase ASCII), whatever its case: as a lowered copy's
+/// `contains` would say, with no copy.
+fn holds_any_case(hay: &str, needle: &str) -> bool {
+    let n = needle.as_bytes();
+    n.is_empty() || hay.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// A user agent's browser, operating system and device, as far as its words tell (the families
@@ -594,13 +633,16 @@ pub(crate) fn url_parts(url: &str) -> Vec<(String, String)> {
 pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let has = |s: &str| ua.contains(s);
-    let version = |key: &str| -> Option<String> {
+    // A version's major part: of its digits and dots, those before the first dot (none where
+    // neither follows its key).
+    let version = |key: &str| -> Option<&str> {
         let at = ua.find(key)? + key.len();
-        let v: String = ua.get(at..)?.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-        (!v.is_empty()).then_some(v)
+        let rest = ua.get(at..)?;
+        let run = rest.bytes().take_while(|c| c.is_ascii_digit() || *c == b'.').count();
+        let major = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if run == 0 { None } else { rest.get(..major) }
     };
-    let lower = ua.to_ascii_lowercase();
-    let bot = ["bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-requests", "go-http-client", "okhttp"].iter().any(|b| lower.contains(b));
+    let bot = ["bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-requests", "go-http-client", "okhttp"].iter().any(|b| holds_any_case(ua, b));
     let browser = if has("Edg/") {
         Some(("Edge", version("Edg/")))
     } else if has("OPR/") {
@@ -611,7 +653,7 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
         Some(("Chrome", version("Chrome/")))
     } else if has("Safari/") && has("Version/") {
         Some(("Safari", version("Version/")))
-    } else if lower.starts_with("curl/") {
+    } else if ua.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("curl/")) {
         Some(("curl", version("curl/")))
     } else {
         None
@@ -619,7 +661,7 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
     if let Some((family, v)) = browser {
         out.push(("browser.family", family.to_owned()));
         if let Some(v) = v {
-            out.push(("browser.major", v.split('.').next().unwrap_or_default().to_owned()));
+            out.push(("browser.major", v.to_owned()));
         }
     }
     let os = if has("Windows") {
@@ -673,12 +715,80 @@ enum Part {
     Skip,
 }
 
+/// The most parts a date pattern may have (a date has a dozen at the most).
+const DATE_PARTS: usize = 24;
+
+/// What text one of a date's parts takes, as its expression reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Shape {
+    Digits(u8, u8),
+    Letters(u8, u8),
+    /// `[AaPp][Mm]`
+    AmPm,
+    /// `Z|[+-]\d{4}|[+-]\d{2}`
+    Offset,
+    /// `Z|[+-]\d{2}:\d{2}`
+    OffsetColon,
+    /// `Z|[+-]\d{2}:?\d{2}|[+-]\d{2}`
+    OffsetEither,
+    /// `[A-Za-z_]+(?:/[A-Za-z_+-]+)*`
+    ZoneName,
+}
+
+impl Shape {
+    /// How many of `b`'s first bytes it takes as its expression would, first choice first, each
+    /// part as long as it may be (none: it takes none).
+    fn take(self, b: &[u8]) -> Option<usize> {
+        let run = |from: usize, max: usize, ok: fn(&u8) -> bool| b.get(from..).map_or(0, |r| r.iter().take(max).take_while(|c| ok(c)).count());
+        let digits_at = |from: usize, n: usize| run(from, n, u8::is_ascii_digit) == n;
+        let sign = matches!(b.first(), Some(b'+' | b'-'));
+        match self {
+            Self::Digits(min, max) | Self::Letters(min, max) => {
+                let ok: fn(&u8) -> bool = if let Self::Digits(..) = self { u8::is_ascii_digit } else { u8::is_ascii_alphabetic };
+                let n = run(0, usize::from(max), ok);
+                (n >= usize::from(min)).then_some(n)
+            }
+            Self::AmPm => (matches!(b.first(), Some(b'A' | b'a' | b'P' | b'p')) && matches!(b.get(1), Some(b'M' | b'm'))).then_some(2),
+            Self::Offset | Self::OffsetColon | Self::OffsetEither if b.first() == Some(&b'Z') => Some(1),
+            Self::Offset if sign && digits_at(1, 4) => Some(5),
+            Self::Offset => (sign && digits_at(1, 2)).then_some(3),
+            Self::OffsetColon => (sign && digits_at(1, 2) && b.get(3) == Some(&b':') && digits_at(4, 2)).then_some(6),
+            Self::OffsetEither if sign && digits_at(1, 2) && b.get(3) == Some(&b':') && digits_at(4, 2) => Some(6),
+            Self::OffsetEither if sign && digits_at(1, 4) => Some(5),
+            Self::OffsetEither => (sign && digits_at(1, 2)).then_some(3),
+            Self::ZoneName => {
+                let name = |c: &u8| c.is_ascii_alphabetic() || *c == b'_';
+                let mut at = run(0, usize::MAX, name);
+                if at == 0 {
+                    return None;
+                }
+                while b.get(at) == Some(&b'/') {
+                    let more = run(at + 1, usize::MAX, |c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'+' | b'-'));
+                    if more == 0 {
+                        break;
+                    }
+                    at += 1 + more;
+                }
+                Some(at)
+            }
+        }
+    }
+}
+
+/// A date pattern's pieces, to read a date without its expression: literal text, or a part.
+#[derive(Debug, Clone)]
+enum Piece {
+    Text(String),
+    Part(Shape),
+}
+
 /// A date pattern of Java's (`dd/MMM/yyyy:HH:mm:ss Z`): a regular expression of its parts, in
-/// order, and how each is read.
+/// order, and how each is read; and its pieces, which read most dates without the expression.
 #[derive(Debug, Clone)]
 pub(crate) struct DateFmt {
     pub regex: String,
     parts: Vec<Part>,
+    pieces: Vec<Piece>,
     re: Regex,
     zone: Zone,
 }
@@ -688,6 +798,11 @@ impl DateFmt {
         // Its own expression (a group a part, to read them) and the one a rule holds (no groups).
         let (mut own, mut regex) = (String::new(), String::new());
         let mut parts = Vec::new();
+        let mut pieces: Vec<Piece> = Vec::new();
+        let text = |pieces: &mut Vec<Piece>, t: &str| match pieces.last_mut() {
+            Some(Piece::Text(last)) => last.push_str(t),
+            _ => pieces.push(Piece::Text(t.to_owned())),
+        };
         let chars: Vec<char> = pattern.chars().collect();
         let mut i = 0;
         while let Some(&c) = chars.get(i) {
@@ -712,12 +827,14 @@ impl DateFmt {
                 }
                 own.push_str(&regex::escape(&lit));
                 regex.push_str(&regex::escape(&lit));
+                text(&mut pieces, &lit);
                 i = j + 1;
                 continue;
             }
             if !c.is_ascii_alphabetic() {
                 own.push_str(&regex::escape(&c.to_string()));
                 regex.push_str(&regex::escape(&c.to_string()));
+                text(&mut pieces, &c.to_string());
                 i += 1;
                 continue;
             }
@@ -725,54 +842,99 @@ impl DateFmt {
             while chars.get(i + n) == Some(&c) {
                 n += 1;
             }
-            let (re, part) = match (c, n) {
-                ('y' | 'u', 2) => (r"\d{2}", Part::Year2),
-                ('y' | 'u', _) => (r"\d{4}", Part::Year),
-                ('M', 1 | 2) => (r"\d{1,2}", Part::Month),
-                ('M', 3) => (r"[A-Za-z]{3}", Part::MonthName),
-                ('M', _) => (r"[A-Za-z]{3,9}", Part::MonthName),
-                ('d', _) => (r"\d{1,2}", Part::Day),
-                ('H' | 'k', _) => (r"\d{1,2}", Part::Hour),
-                ('h' | 'K', _) => (r"\d{1,2}", Part::Hour12),
-                ('m', _) => (r"\d{1,2}", Part::Minute),
-                ('s', _) => (r"\d{1,2}", Part::Second),
-                ('S', _) => (r"\d{1,9}", Part::Fraction),
-                ('a', _) => (r"[AaPp][Mm]", Part::AmPm),
-                ('E', 1..=3) => (r"[A-Za-z]{3}", Part::Skip),
-                ('E', _) => (r"[A-Za-z]{3,9}", Part::Skip),
-                ('Z', 1) | ('x', 1 | 2) => (r"Z|[+-]\d{4}|[+-]\d{2}", Part::Offset),
-                ('Z', 2) | ('X' | 'x', 3) => (r"Z|[+-]\d{2}:\d{2}", Part::Offset),
-                ('X', _) => (r"Z|[+-]\d{2}:?\d{2}|[+-]\d{2}", Part::Offset),
-                ('Z', _) | ('V', _) => (r"[A-Za-z_]+(?:/[A-Za-z_+-]+)*", Part::ZoneId),
-                ('z', _) => (r"[A-Za-z]{1,6}", Part::ZoneId),
+            let (re, part, shape) = match (c, n) {
+                ('y' | 'u', 2) => (r"\d{2}", Part::Year2, Shape::Digits(2, 2)),
+                ('y' | 'u', _) => (r"\d{4}", Part::Year, Shape::Digits(4, 4)),
+                ('M', 1 | 2) => (r"\d{1,2}", Part::Month, Shape::Digits(1, 2)),
+                ('M', 3) => (r"[A-Za-z]{3}", Part::MonthName, Shape::Letters(3, 3)),
+                ('M', _) => (r"[A-Za-z]{3,9}", Part::MonthName, Shape::Letters(3, 9)),
+                ('d', _) => (r"\d{1,2}", Part::Day, Shape::Digits(1, 2)),
+                ('H' | 'k', _) => (r"\d{1,2}", Part::Hour, Shape::Digits(1, 2)),
+                ('h' | 'K', _) => (r"\d{1,2}", Part::Hour12, Shape::Digits(1, 2)),
+                ('m', _) => (r"\d{1,2}", Part::Minute, Shape::Digits(1, 2)),
+                ('s', _) => (r"\d{1,2}", Part::Second, Shape::Digits(1, 2)),
+                ('S', _) => (r"\d{1,9}", Part::Fraction, Shape::Digits(1, 9)),
+                ('a', _) => (r"[AaPp][Mm]", Part::AmPm, Shape::AmPm),
+                ('E', 1..=3) => (r"[A-Za-z]{3}", Part::Skip, Shape::Letters(3, 3)),
+                ('E', _) => (r"[A-Za-z]{3,9}", Part::Skip, Shape::Letters(3, 9)),
+                ('Z', 1) | ('x', 1 | 2) => (r"Z|[+-]\d{4}|[+-]\d{2}", Part::Offset, Shape::Offset),
+                ('Z', 2) | ('X' | 'x', 3) => (r"Z|[+-]\d{2}:\d{2}", Part::Offset, Shape::OffsetColon),
+                ('X', _) => (r"Z|[+-]\d{2}:?\d{2}|[+-]\d{2}", Part::Offset, Shape::OffsetEither),
+                ('Z', _) | ('V', _) => (r"[A-Za-z_]+(?:/[A-Za-z_+-]+)*", Part::ZoneId, Shape::ZoneName),
+                ('z', _) => (r"[A-Za-z]{1,6}", Part::ZoneId, Shape::Letters(1, 6)),
                 _ => return Err(format!("a date pattern's letter kiln does not read: {}", c.to_string().repeat(n))),
             };
             let _ = write!(own, "({re})");
             let _ = write!(regex, "(?:{re})");
             parts.push(part);
+            pieces.push(Piece::Part(shape));
             i += n;
         }
+        if parts.len() > DATE_PARTS {
+            return Err(format!("a date pattern of {} parts: {DATE_PARTS} at the most", parts.len()));
+        }
         let re = Regex::new(&format!("^{own}$")).map_err(|e| e.to_string())?;
-        Ok(Self { regex, parts, re, zone })
+        Ok(Self { regex, parts, pieces, re, zone })
+    }
+
+    /// Each part's text in `s`, read by the pieces the way its expression reads them first (each
+    /// part as long as it may be, an alternative's first choice first): where that reads `s` whole,
+    /// the expression's own first reading, the same; else false (the expression is asked).
+    fn scan<'s>(&self, s: &'s str, out: &mut [&'s str; DATE_PARTS]) -> bool {
+        let b = s.as_bytes();
+        let (mut at, mut k) = (0usize, 0usize);
+        for piece in &self.pieces {
+            let rest = b.get(at..).unwrap_or_default();
+            let n = match piece {
+                Piece::Text(t) if rest.starts_with(t.as_bytes()) => t.len(),
+                Piece::Text(_) => return false,
+                Piece::Part(shape) => {
+                    let Some(n) = shape.take(rest) else { return false };
+                    let (Some(slot), Some(text)) = (out.get_mut(k), s.get(at..at + n)) else { return false };
+                    *slot = text;
+                    k += 1;
+                    n
+                }
+            };
+            at += n;
+        }
+        at == b.len()
     }
 
     /// A date read: ms since the epoch. A year left out is the one it is (or the last, should that
     /// put it more than a day ahead); a zone left out is the pattern's timezone.
     pub(crate) fn read(&self, s: &str, now_ns: i64) -> Option<i64> {
+        let mut vals: [&str; DATE_PARTS] = [""; DATE_PARTS];
+        if !self.scan(s, &mut vals) {
+            self.read_expression(s, &mut vals)?;
+        }
+        self.reckon(&vals, now_ns)
+    }
+
+    /// Each part's text in `s` as its expression reads it.
+    fn read_expression<'s>(&self, s: &'s str, vals: &mut [&'s str; DATE_PARTS]) -> Option<()> {
         let c = self.re.captures(s)?;
+        for (k, v) in vals.iter_mut().enumerate().take(self.parts.len()) {
+            *v = c.get(k + 1)?.as_str();
+        }
+        Some(())
+    }
+
+    /// The date its parts' texts say: ms since the epoch.
+    fn reckon(&self, vals: &[&str; DATE_PARTS], now_ns: i64) -> Option<i64> {
         let (mut y, mut mo, mut d, mut h, mut mi, mut sec, mut nanos) = (None, 1i8, 1i8, 0i8, 0i8, 0i8, 0i32);
         let (mut pm, mut twelve) = (None, false);
         let mut offset: Option<i64> = None;
         let mut zone = self.zone;
         for (k, part) in self.parts.iter().enumerate() {
-            let v = c.get(k + 1)?.as_str();
+            let v = *vals.get(k)?;
             match part {
                 Part::Year => y = Some(v.parse::<i16>().ok()?),
                 Part::Year2 => y = Some(2000 + v.parse::<i16>().ok()?),
                 Part::Month => mo = v.parse().ok()?,
                 Part::MonthName => {
-                    let l = v.to_ascii_lowercase();
-                    mo = i8::try_from(MONTH_NAMES.iter().position(|m| m.starts_with(&l) && l.len() >= 3)? + 1).ok()?;
+                    let named = |m: &&str| v.len() >= 3 && m.as_bytes().get(..v.len()).is_some_and(|p| p.eq_ignore_ascii_case(v.as_bytes()));
+                    mo = i8::try_from(MONTH_NAMES.iter().position(named)? + 1).ok()?;
                 }
                 Part::Day => d = v.parse().ok()?,
                 Part::Hour => h = v.parse().ok()?,
@@ -789,13 +951,23 @@ impl DateFmt {
                         0
                     } else {
                         let sign = if v.starts_with('-') { -1 } else { 1 };
-                        let digits: String = v.chars().filter(char::is_ascii_digit).collect();
-                        let (hh, mm) = (digits.get(..2)?.parse::<i64>().ok()?, digits.get(2..).filter(|m| !m.is_empty()).map_or(Some(0), |m| m.parse::<i64>().ok())?);
+                        // Its digits, the colon left out: hours, then minutes when there are more.
+                        let (mut n, mut count, mut hh) = (0i64, 0usize, None);
+                        for d in v.bytes().filter(u8::is_ascii_digit) {
+                            n = n * 10 + i64::from(d - b'0');
+                            count += 1;
+                            if count == 2 {
+                                hh = Some(n);
+                                n = 0;
+                            }
+                        }
+                        let hh = hh?;
+                        let mm = if count > 2 { n } else { 0 };
                         sign * (hh * 3600 + mm * 60)
                     });
                 }
                 Part::ZoneId => {
-                    if ["utc", "gmt", "z"].contains(&v.to_ascii_lowercase().as_str()) {
+                    if ["utc", "gmt", "z"].iter().any(|z| v.eq_ignore_ascii_case(z)) {
                         offset = Some(0);
                     } else if let Ok(z) = Zone::named(v) {
                         zone = z;
@@ -823,11 +995,13 @@ impl DateFmt {
                 return None;
             }
             let days = kiln_obs::query::calendar::days_from_civil(i64::from(year), i64::from(mo), i64::from(d));
-            Some((days * 86_400 + i64::from(h) * 3_600 + i64::from(mi) * 60 + i64::from(sec)) * 1_000_000_000 + i64::from(nanos))
+            // Past what nanoseconds since the epoch hold (the year 2262 on): no date.
+            let seconds = days.checked_mul(86_400)?.checked_add(i64::from(h) * 3_600 + i64::from(mi) * 60 + i64::from(sec))?;
+            seconds.checked_mul(1_000_000_000)?.checked_add(i64::from(nanos))
         };
         let at = |year: i16| -> Option<i64> {
             match offset {
-                Some(off) => utc(year).map(|ns| ns - off * 1_000_000_000),
+                Some(off) => utc(year)?.checked_sub(off.checked_mul(1_000_000_000)?),
                 None if zone == Zone::UTC => utc(year),
                 None => zone.civil_ns(year, mo, d, h, mi, sec, nanos),
             }
@@ -942,6 +1116,79 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
     }
 
     #[test]
+    fn a_date_read_by_its_pieces_is_the_one_its_expression_reads() {
+        // Datadog's parsers' patterns, and texts made of each one's pieces: what a part may hold,
+        // near misses (a digit too many or too few, an offset half written, a zone's slash
+        // dangling), and literal text now and then wrong.
+        let patterns = [
+            "dd/MMM/yyyy:HH:mm:ss Z",
+            "yyyy/MM/dd HH:mm:ss",
+            "EEE MMM dd HH:mm:ss.SSSSSS yyyy",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd HH:mm:ss,SSS",
+            "MMM d HH:mm:ss",
+            "dd/MM/yy h:mm a",
+            "yyyy-MM-dd'T'HH:mm:ssZZ",
+            "yyyy-MM-dd HH:mm:ss z",
+            "yyyy-MM-dd HH:mm:ss VV",
+            "HHmmss",
+            "yyyyMMdd'T'HHmmssX",
+            "MMMM d, yyyy h:mm:ss a xx",
+        ];
+        let mut rng = kiln_obs::testkit::Rng::new(9);
+        let mut pick = |n: usize| rng.below(n as u64) as usize;
+        const NOW: i64 = 1_792_324_800_000_000_000;
+        let (mut read, mut scanned) = (0, 0);
+        for p in patterns {
+            let d = DateFmt::compile(p, Zone::UTC).unwrap();
+            for _ in 0..3000 {
+                let mut s = String::new();
+                for piece in &d.pieces {
+                    match piece {
+                        Piece::Text(t) if pick(20) == 0 => s.push_str(&t[..t.len() / 2]),
+                        Piece::Text(t) => s.push_str(t),
+                        Piece::Part(shape) => {
+                            // Seven times in eight a text the part may hold, else a near miss.
+                            let fits = pick(8) != 0;
+                            let from: &[&str] = match (shape, fits) {
+                                (Shape::Digits(4, 4), true) => &["2026", "1999", "2261", "0001"],
+                                (Shape::Digits(1, 9), true) => &["5", "123", "123456", "123456789"],
+                                (Shape::Digits(..), true) => &["1", "07", "12", "09"],
+                                (Shape::Digits(..), false) => &["", "0", "123", "20261", "1234567891"],
+                                (Shape::Letters(1, 6), true) => &["UTC", "PST", "GMT", "Z"],
+                                (Shape::Letters(3, 3), true) => &["Oct", "mon", "JAN", "Tue"],
+                                (Shape::Letters(..), true) => &["October", "Tuesday", "Oct", "Sept"],
+                                (Shape::Letters(..), false) => &["", "x", "Mo", "Septembers"],
+                                (Shape::AmPm, true) => &["AM", "pm", "Pm"],
+                                (Shape::AmPm, false) => &["A", "xm", ""],
+                                (Shape::Offset, true) => &["Z", "+0530", "-05", "+0000"],
+                                (Shape::OffsetColon, true) => &["Z", "+05:30", "-08:00"],
+                                (Shape::OffsetEither, true) => &["Z", "+0530", "-05:30", "+05"],
+                                (Shape::Offset | Shape::OffsetColon | Shape::OffsetEither, false) => &["-1", "+05:3", "+05:", "Zulu", "+053", ""],
+                                (Shape::ZoneName, true) => &["UTC", "Europe/Paris", "America/Argentina/Buenos_Aires", "Etc/GMT+5"],
+                                (Shape::ZoneName, false) => &["Z", "_", "a/", "/b", "Europe/", "Zulu", ""],
+                            };
+                            s.push_str(from[pick(from.len())]);
+                        }
+                    }
+                }
+                let (mut a, mut b) = ([""; DATE_PARTS], [""; DATE_PARTS]);
+                let by_pieces = d.scan(&s, &mut a);
+                let by_expression = d.read_expression(&s, &mut b).is_some();
+                if by_pieces {
+                    scanned += 1;
+                    assert!(by_expression && a == b, "{p} on {s:?}: {a:?} by its pieces, {b:?} by its expression");
+                }
+                let via_expression = if by_expression { d.reckon(&b, NOW) } else { None };
+                assert_eq!(d.read(&s, NOW), via_expression, "{p} on {s:?}");
+                read += usize::from(via_expression.is_some());
+            }
+        }
+        // Enough of them dates, and read by their pieces, for the comparison to say something.
+        assert!(read > 5_000 && scanned > 8_000, "{read} read, {scanned} by their pieces");
+    }
+
+    #[test]
     fn dates_read_as_java_patterns_say() {
         let now = 1_792_324_800_000_000_000; // 2026-10-18T12:00:00Z
         for (pattern, text, ms) in [
@@ -960,5 +1207,9 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
         let la = DateFmt::compile("yyyy-MM-dd HH:mm:ss", Zone::named("America/Los_Angeles").unwrap()).unwrap();
         assert_eq!(la.read("2026-10-18 05:00:00", now), Some(1_792_324_800_000));
         assert!(DateFmt::compile("yyyy-MM-dd qq", Zone::UTC).is_err());
+        // A year past what nanoseconds since the epoch hold (from 2262): no date, not a wrong one.
+        let far = DateFmt::compile("yyyyMMdd HHmmss Z", Zone::UTC).unwrap();
+        assert_eq!((far.read("22620412 000000 +0000", 0), far.read("71250101 000000 +0000", 0)), (None, None));
+        assert!(far.read("22610101 000000 +0000", 0).is_some());
     }
 }

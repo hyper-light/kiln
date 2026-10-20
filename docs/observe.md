@@ -23,7 +23,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second). Next: records handed over encoded; the Event Log on a Windows machine | in progress |
-| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
+| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). Next: a matcher of grok's own, its groups in one pass | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
@@ -2585,7 +2585,42 @@ reading a matching rule's groups (and a date's again), 14% in their lazy DFAs, 8
 attributes, the rest allocation. A rule is told by the DFA alone before its groups are read, each
 group found by its place (a name looked up hashed it every match: 2.5%), and dates in UTC or with an
 offset reckoned without the zone table's lock; a set of every rule, one pass for all, was tried and
-was no faster. Next: a date read from the rule's own groups, and fewer allocations.
+was no faster.
+
+Then a pass at its allocations and the date (2026-10-20, `KOBS_CASE=pipeline`, 100,000 lines, the
+binaries before and after built alike and run in turn on one core of this machine, which others'
+work held at a load of 20 to 30: instructions and allocations hold whatever the load, cycles and
+rates less so):
+
+| | allocations a line | bytes a line | instructions a line | cycles a line | lines a second |
+| --- | --- | --- | --- | --- | --- |
+| before | 75.0 | 3,735 | 65.5 k | 22.0 k | 237 k |
+| after | 49.0 | 2,329 | 64.0 k | 19.9 k | 257 k |
+
+An attribute's name is moved into the record rather than copied there again (a rule's names, the
+URL's and the user agent's: a copy each); the value a rule reads is read in place, not copied out;
+the user agent is read in place too, without a lowered copy to find a bot's words in; what
+`nullIf("-")` drops is never made; the record's attributes get their room once; a rule's groups are
+read into capture locations each thread keeps (`captures_read`), not into a `Captures` made and
+dropped each line; a rule is asked for its groups at once (its lazy DFA finds the match first, and
+`is_match` first scanned a matching line twice); and a date is read by its pattern's pieces, each
+part taken as its expression takes it first (an alternative's first choice first, each part as
+long as it may be), the expression asked only where that does not read the date whole (a
+differential test: 39,000 texts made of thirteen patterns' pieces, real parts and near misses, read
+alike both ways). The 25 allocations left past a plain line's are the attributes' own strings, a
+record's as `kiln_obs` keeps one; the cycles are the backtracker's still, reading the access rule's
+groups (Datadog's `(?>%{_method} |)` makes the rule no one-pass DFA's), which a matcher of grok's
+own would read in one pass: not done.
+
+The test found a date past what nanoseconds since the epoch hold (the year 2262 on, as a malformed
+`yyyyMMdd` line can say: `71250101`) overflowed its reckoning: a panic in a debug build, a wrong
+time in a release one, by the expression too. It is no date now.
+
+Page faults rose, 10,054 to 13,862 a read: glibc hands the heap's top back between batches of
+records (its trim threshold) and faults it in again, and the smaller allocations leave that top
+free more often. With trimming off (`GLIBC_TUNABLES=glibc.malloc.trim_threshold=1073741824`), the
+pages first touched fell, 6,220 to 5,439: kiln uses the system's allocator, and a long-lived server's
+trimming is left as glibc does it.
 
 ### 12.18 Metrics from logs
 

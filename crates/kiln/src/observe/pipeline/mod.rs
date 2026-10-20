@@ -9,6 +9,7 @@ pub mod expr;
 pub mod grok;
 pub mod kept;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -325,16 +326,28 @@ fn first<'a>(r: &'a Record, sources: &[String]) -> Option<(usize, &'a str)> {
 
 /// An attribute set: the first of its name replaced, or added.
 fn set(r: &mut Record, key: &str, value: String) {
-    match key {
-        "message" => r.message = value,
-        "service" => r.service = value,
-        "host" => r.host = value,
-        "source" => r.source = value,
-        _ => match r.attrs.iter_mut().find(|(k, _)| k == key) {
-            Some(slot) => slot.1 = value,
-            None => r.attrs.push((key.to_owned(), value)),
+    put(r, Cow::Borrowed(key), value);
+}
+
+/// [`set`], its name moved in when it comes owned (copied only when it is borrowed and new).
+fn put(r: &mut Record, key: Cow<'_, str>, value: String) {
+    let slot = match key.as_ref() {
+        "message" => &mut r.message,
+        "service" => &mut r.service,
+        "host" => &mut r.host,
+        "source" => &mut r.source,
+        k => match r.attrs.iter().position(|(a, _)| a == k) {
+            Some(i) => match r.attrs.get_mut(i) {
+                Some(slot) => &mut slot.1,
+                None => return,
+            },
+            None => {
+                r.attrs.push((key.into_owned(), value));
+                return;
+            }
         },
-    }
+    };
+    *slot = value;
 }
 
 fn remove(r: &mut Record, key: &str) {
@@ -453,6 +466,7 @@ fn hex_into(s: &str, out: &mut [u8]) -> bool {
 pub struct Scratch {
     search: RowScratch,
     attrs: Vec<(String, String)>,
+    grok: grok::Reading,
 }
 
 impl Pipeline {
@@ -473,13 +487,14 @@ impl Pipeline {
 fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
     match p {
         Proc::Grok { source, grok } => {
-            let Some(value) = get(r, source) else { return };
             s.attrs.clear();
-            // The value copied out: a rule may set the attribute it read.
-            let value = value.to_owned();
-            if grok.parse(&value, now_ns, &mut s.attrs).is_some() {
+            // Read where it is: what a rule extracts is its own, every attribute of it read before
+            // any is set (one may be the attribute it read).
+            let Some(value) = get(r, source) else { return };
+            if grok.parse_with(value, now_ns, &mut s.grok, &mut s.attrs).is_some() {
+                r.attrs.reserve(s.attrs.len());
                 for (k, v) in s.attrs.drain(..) {
-                    set(r, &k, v);
+                    put(r, Cow::Owned(k), v);
                 }
             }
         }
@@ -536,15 +551,21 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
                     }
                 }
             }
+            r.attrs.reserve(parts.len());
             for (k, v) in parts {
-                set(r, &format!("{target}.{k}"), v);
+                put(r, Cow::Owned(format!("{target}.{k}")), v);
             }
         }
         Proc::UserAgent { sources, target, encoded } => {
-            let Some((_, v)) = first(r, sources) else { return };
-            let ua = if *encoded { grok::decode_uri(v) } else { v.to_owned() };
-            for (k, v) in grok::user_agent(&ua) {
-                set(r, &format!("{target}.{k}"), v);
+            // Read where it is (decoded first when it says): its parts are their own strings.
+            let parts = match first(r, sources) {
+                Some((_, v)) if *encoded => grok::user_agent(&grok::decode_uri(v)),
+                Some((_, v)) => grok::user_agent(v),
+                None => return,
+            };
+            r.attrs.reserve(parts.len());
+            for (k, v) in parts {
+                put(r, Cow::Owned(format!("{target}.{k}")), v);
             }
         }
         Proc::Category { target, categories } => {
