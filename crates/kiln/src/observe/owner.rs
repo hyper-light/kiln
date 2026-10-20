@@ -481,6 +481,37 @@ impl Observe {
         let _taken = self.log_within(records, WAITING_LOG_BYTES as u64, true);
     }
 
+    /// Spans of kiln's own (its CI runs', `super::kiln`): their rows in segments as a decoder cuts
+    /// them, taken up to the bound itself, else refused and counted as dropped.
+    pub fn spans(&self, records: &[Record]) {
+        let mut segments: Vec<(Vec<u8>, u32)> = Vec::new();
+        let (mut rows, mut n, mut prev) = (Vec::new(), 0u32, 0i64);
+        for r in records {
+            if rows.len() >= kiln_obs::otlp::traces::SEGMENT_BYTES {
+                segments.push((std::mem::take(&mut rows), n));
+                (n, prev) = (0, 0);
+            }
+            kiln_obs::logs::record::put_row(&mut rows, r, prev);
+            prev = r.ts;
+            n += 1;
+        }
+        if n > 0 {
+            segments.push((rows, n));
+        }
+        let bytes: u64 = segments.iter().map(|(r, _)| r.len() as u64).sum();
+        if bytes == 0 {
+            return;
+        }
+        let a = &self.admission;
+        if !reserve(&a.log_bytes, &a.left_log_bytes, bytes, WAITING_LOG_BYTES as u64) {
+            a.refused.fetch_add(records.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        if self.tx.send(Input::Spans(segments)).is_err() {
+            a.left_log_bytes.fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
     /// Log records an exporter or a client sent: as [`Observe::offer`].
     #[must_use]
     pub fn offer_logs(&self, records: Vec<Record>) -> bool {

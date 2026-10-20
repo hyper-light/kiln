@@ -20,7 +20,7 @@ import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
 import { invalidate } from "@/lib/resource";
-import { Histogram, QueryChart, RangePicker, StateBadge, histogramRes, integrationsRes, logsOnly, monitorRes, monitorsRes, useRange, type Mark, type Range } from "./parts";
+import { Histogram, QueryChart, RangePicker, StateBadge, histogramRes, integrationsRes, logsOnly, monitorRes, monitorsRes, spanHistogramRes, useRange, type Mark, type Range } from "./parts";
 import { Stream } from "./widgets";
 
 const checkRes = (query: string): Res<MonitorCheck> => ({ key: `observe/monitor-check/${query}`, fetch: (s) => observeApi.validateMonitor(query, s) });
@@ -232,6 +232,7 @@ function Watched({ m, range }: { m: Monitor; range: Range }) {
   const check = useRes(checkRes(m.query)).data;
   if (!check.ok) return <p className="empty-line py-10 text-center">{check.error}</p>;
   if (check.kind === "logs") return <LogsWatched search={check.watched?.search ?? ""} range={range} />;
+  if (check.kind === "spans") return <SpansWatched search={check.watched?.search ?? ""} range={range} />;
   const t = m.options.thresholds;
   // A change monitor's thresholds are of the change, not of the series drawn.
   const marks: Mark[] =
@@ -244,6 +245,11 @@ function Watched({ m, range }: { m: Monitor; range: Range }) {
 
 function LogsWatched({ search, range }: { search: string; range: Range }) {
   const h = useRes(histogramRes(logsOnly(search), range)).data;
+  return <Histogram h={h} range={range} height={200} />;
+}
+
+function SpansWatched({ search, range }: { search: string; range: Range }) {
+  const h = useRes(spanHistogramRes(search || "*", range)).data;
   return <Histogram h={h} range={range} height={200} />;
 }
 
@@ -420,8 +426,9 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
                 {check ? (
                   check.ok ? (
                     <span>
-                      Alerts when {check.kind === "logs" ? "the count" : check.kind === "change" ? "the change" : check.kind === "forecast" ? "the forecast's edge" : "the value"} is {check.op}{" "}
-                      {check.threshold}.
+                      Alerts when{" "}
+                      {check.kind === "logs" || check.kind === "spans" ? "the count" : check.kind === "change" ? "the change" : check.kind === "forecast" ? "the forecast's edge" : "the value"} is{" "}
+                      {check.op} {check.threshold}.
                     </span>
                   ) : (
                     <span className="text-[#e2c4c6]">{check.error}</span>

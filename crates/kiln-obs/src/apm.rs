@@ -306,14 +306,18 @@ struct Seen {
     answered: bool,
 }
 
+/// A span's place in the map: its trace's id and its own (a span id is its trace's, not unique
+/// across traces: tracers that number spans in order reuse them in every trace).
+type SpanKey = ([u8; 16], [u8; 8]);
+
 /// Builds a service map from spans, one at a time ([`MapBuilder::take`]).
 #[derive(Default)]
 pub struct MapBuilder {
     names: Vec<String>,
     by_name: HashMap<String, u32>,
-    spans: HashMap<[u8; 8], Seen>,
-    /// Spans with a parent: the parent's id, the span's service, whether it erred, its duration.
-    links: Vec<([u8; 8], u32, bool, u64)>,
+    spans: HashMap<SpanKey, Seen>,
+    /// Spans with a parent: the parent's place, the span's service, whether it erred, its duration.
+    links: Vec<(SpanKey, u32, bool, u64)>,
     entries: HashMap<u32, (u64, u64)>,
     read: u64,
 }
@@ -352,11 +356,12 @@ impl MapBuilder {
             e.1 += u64::from(error);
         }
         let peer = if call { r.attr("peer.service").filter(|p| !p.is_empty()).map(|p| self.name(p)) } else { None };
+        let trace = r.trace_id.unwrap_or([0; 16]);
         if let Some(id) = r.span_id {
-            self.spans.entry(id).or_insert(Seen { service, duration, error, call, peer, answered: false });
+            self.spans.entry((trace, id)).or_insert(Seen { service, duration, error, call, peer, answered: false });
         }
         if let Some(p) = parent {
-            self.links.push((p, service, error, duration));
+            self.links.push(((trace, p), service, error, duration));
         }
     }
 
@@ -490,6 +495,33 @@ mod tests {
         let nodes: Vec<(&str, u64, u64, bool)> = map.nodes.iter().map(|n| (n.service.as_str(), n.hits, n.errors, n.inferred)).collect();
         assert_eq!(nodes, vec![("cart", 1, 0, false), ("checkout", 1, 1, false), ("kafka", 0, 0, true), ("postgresql", 0, 0, true)]);
         assert_eq!(map.spans, 7);
+    }
+
+    /// Two traces whose spans are numbered alike (as tracers that count spans in order number
+    /// them): each span's parent is its own trace's, no call drawn between the traces' services.
+    #[test]
+    fn spans_numbered_alike_in_two_traces_are_not_each_other_s_parents() {
+        let mut m = MapBuilder::new();
+        let mut raw = Vec::new();
+        let mut prev = 0;
+        let mut spans = Vec::new();
+        for (t, (front, back)) in [("web-a", "db-a"), ("web-b", "db-b")].into_iter().enumerate() {
+            let mut a = span(front, 1, None, "client", 0, 10, false, &[]);
+            let mut b = span(back, 2, Some(1), "server", 1, 5, false, &[]);
+            a.trace_id = Some([t as u8 + 1; 16]);
+            b.trace_id = Some([t as u8 + 1; 16]);
+            spans.extend([a, b]);
+        }
+        for s in &spans {
+            put_row(&mut raw, s, prev);
+            prev = s.ts;
+        }
+        let mut rows = Rows::new(&raw, spans.len());
+        while let Some(r) = rows.next_row().unwrap() {
+            m.take(&r);
+        }
+        let edges: Vec<(String, String)> = m.finish().edges.into_iter().map(|e| (e.from, e.to)).collect();
+        assert_eq!(edges, vec![("web-a".into(), "db-a".into()), ("web-b".into(), "db-b".into())]);
     }
 
     #[test]

@@ -169,6 +169,16 @@ export const histogramRes = (query: string, range: Range): Res<LogHistogram> => 
   opts: { pollMs: pollFor(range) },
 });
 
+/** A span search's spans over the range, by status, as `histogramRes` has a log search's. */
+export const spanHistogramRes = (query: string, range: Range): Res<LogHistogram> => ({
+  key: `observe/span-histogram/${range}/${query}`,
+  fetch: (signal) => {
+    const to = Date.now();
+    return observeApi.spanHistogram({ query, from: to - RANGES[range], to, step: niceStep(RANGES[range] / 60), by: ["status"] }, signal);
+  },
+  opts: { pollMs: pollFor(range) },
+});
+
 const STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400].map((s) => s * 1000);
 
 /** The smallest round step (1 s, 5 s, 1 min, 1 h, ...) of at least `ms`. */

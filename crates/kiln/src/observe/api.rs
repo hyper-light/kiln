@@ -691,13 +691,15 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                     Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
                 });
             }
-            // What it watches besides, to draw: the metric query, or the log search, and its window.
+            // What it watches besides, to draw: the metric query, or the log or span search, and its
+            // window.
             Ok(match kiln_obs::monitor::parse(&v.query) {
                 Ok(q) => {
                     let (kind, watched, window_ms) = match &q.kind {
                         kiln_obs::monitor::Kind::Metric { query, window_ms, .. } => ("metric", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Change { query, window_ms, .. } => ("change", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Logs { search, window_ms, .. } => ("logs", json!({ "search": search }), window_ms),
+                        kiln_obs::monitor::Kind::Spans { search, window_ms, .. } => ("spans", json!({ "search": search }), window_ms),
                         // A forecast's window is ahead: `window_ms` its horizon.
                         kiln_obs::monitor::Kind::Forecast { query, ahead_ms, .. } => ("forecast", json!({ "query": query }), ahead_ms),
                         kiln_obs::monitor::Kind::Slo { id, burn } => ("slo", json!({ "slo": id }), &burn.map_or(3_600_000, |b| b.0)),

@@ -636,7 +636,11 @@ time, sent again until answered; §5), from:
   `sum(last_15m):sum:kiln_sync_errors_total{*} by {repo,kind}.as_count() > 0`; and a log monitor
   on `source:kiln.event service:kiln.sync @event.type:sync.conflict`.
 - **kiln CI**: each job's and run's duration, queue time, footprint and count by repo, pipeline,
-  job, status, runner, branch and trigger, and each an event.
+  job, status, runner, branch and trigger, and each an event; and each run a trace (§8.7, Datadog's
+  CI visibility's model): the run its root span (service `kiln.ci`, named by its pipeline, a
+  server's span, so the trace metrics read each pipeline's runs, failures and durations), each job a
+  span under it and each step under its job, their ids derived from the run's and the job's so that
+  spans written as each job ends join the run's; the events carry the trace's ids.
 - **kiln CD**: each deploy (by app, trigger, result) and each change of an app's health or sync as
   events; apps counted by health and sync.
 - **GitHub's webhooks**: pushes, pull requests, workflow runs and jobs (durations, conclusions),
@@ -1087,8 +1091,11 @@ options, so a monitor written for Datadog reads here.
   `avg(last_15m):anomalies(<metric query>, 'robust', 3) >= 0.5`, whose value a group is the share of
   its window's buckets past the band on the side asked (Datadog's: `>= 1`, all of them); log monitors
   `logs("service:web status:error").rollup("count").by("host").last("5m") > 10` (count,
-  cardinality, sum, avg, min, max of a facet). A window is whole buckets of a step that divides it,
-  aligned to the step.
+  cardinality, sum, avg, min, max of a facet); trace analytics monitors, Datadog's, the same of a
+  span search (`trace-analytics("service:checkout status:error").by("resource_name").last("5m") > 5`,
+  or `spans(...)`; §8.7). A string's `\"` is a quote within it, as Datadog's monitor API has it
+  (`logs("\"connection refused\"")`). A window is whole buckets of a step that divides it, aligned
+  to the step.
 - **States** move with hysteresis: a group alerts past the critical threshold and recovers only
   past the recovery threshold (warnings the same), so a value at a threshold does not flap; NO DATA
   after a timeframe when asked; groups silent a day are forgotten.
@@ -2559,8 +2566,15 @@ Chromium and WebKit as a phone); an email
 integration added from the form (its recipients, sender, relay, security and port) and tested, an
 SMTP sink in the scenario sent the test's message to both recipients, and an Opsgenie one added
 (its key never shown) and tested, its Alert API hearing the key, both removed (2026-10-19: passes
-in Chromium and WebKit as a phone). Each makes its own records and checks through the API,
-not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
+in Chromium and WebKit as a phone); ten orders' traces sent over OTLP's JSON (a frontend calling a
+cart, whose database call fails once), the failing span found in the trace explorer by service,
+status and resource, its trace opened from it, its four spans in the waterfall's order, the picked
+span's error its exception's (`ValueError: cart 3 is locked`), another picked and the address
+saying it; the cart in APM once its trace metrics were counted (10 requests, 1 error), its page
+listing its resource and its call to postgresql; the map drawing the three services and the
+frontend's 10 calls to the cart as answered (their span ids numbered alike in every run: each
+span's parent its own trace's) (2026-10-19: passes in Chromium and WebKit as a phone, on fedora).
+Each makes its own records and checks through the API, not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
 webhook and to Slack. Run again and again, two flakes showed and are gone: WebKit, a moment after a

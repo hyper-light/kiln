@@ -11,11 +11,15 @@
 //! change := ("change" | "pct_change") "(" time_aggr "(" window ")" "," shift ")" ":" query op threshold
 //! logs   := "logs(" '"' search '"' ")" [".index(" '"' * '"' ")"] ".rollup(" '"' measure '"' ["," '"' facet '"'] ")"
 //!           [".by(" '"' facets '"' ")"] ".last(" '"' window '"' ")" op threshold
+//! spans  := ("trace-analytics(" | "spans(") '"' search '"' ")" ... as logs   (a span search, its facets a span's)
 //! slo    := "slo(" '"' id '"' ")" ( ".burn_rate(" '"' long '"' "," '"' short '"' ")" | ".error_budget()" ) op threshold
 //! time_aggr := avg | sum | min | max | last
 //! window := last_<n>(m|h|d|w)  (logs: <n>(m|h|d|w))
 //! op     := > | >= | < | <= | == | !=
 //! ```
+//!
+//! A string's `\"` is a quote within it and `\\` a backslash, as Datadog's monitor API has them:
+//! `logs("service:web \"connection refused\"")`.
 //!
 //! States move as Datadog's do: a group alerts once its value passes the critical threshold, and
 //! recovers only once it no longer passes the recovery threshold (the critical one when none is
@@ -90,6 +94,8 @@ pub enum Kind {
     /// The value now against the value `shift_ms` before (`pct`: as a percent of it).
     Change { aggr: TimeAggr, window_ms: i64, shift_ms: i64, pct: bool, query: String },
     Logs { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
+    /// Datadog's trace analytics monitor: a span search, as a log monitor's is of logs.
+    Spans { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
     /// Datadog's forecast monitor: the edge of a forecast's bounds over the next `ahead_ms`, its
     /// highest upper bound (`max`, alerting above) or its lowest lower one (`min`, below).
     Forecast { highest: bool, ahead_ms: i64, query: String },
@@ -168,14 +174,27 @@ fn aggr(s: &str) -> Result<TimeAggr, MonitorError> {
 /// its threshold, and what comes before.
 fn comparison(s: &str) -> Result<(&str, Op, f64), MonitorError> {
     let b = s.as_bytes();
-    let (mut depth, mut quoted) = (0i32, false);
+    let mut depth = 0i32;
+    // Within a string: the quote that opened it (a quote of the other kind, or one escaped, does
+    // not close it).
+    let (mut quote, mut escaped) = (None::<u8>, false);
     let mut at = None;
     for (i, &c) in b.iter().enumerate() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
         match c {
-            b'"' | b'\'' => quoted = !quoted,
-            b'(' | b'{' if !quoted => depth += 1,
-            b')' | b'}' if !quoted => depth -= 1,
-            b'>' | b'<' | b'=' | b'!' if !quoted && depth == 0 => {
+            b'"' | b'\'' => quote = Some(c),
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth -= 1,
+            b'>' | b'<' | b'=' | b'!' if depth == 0 => {
                 at = Some(i);
                 break;
             }
@@ -203,12 +222,33 @@ fn comparison(s: &str) -> Result<(&str, Op, f64), MonitorError> {
     Ok((s.get(..i).unwrap_or("").trim(), op, threshold))
 }
 
-/// The string literal `"..."` that `s` starts with, and what follows.
+/// The string literal `"..."` that `s` starts with (as written: its escapes kept, [`unescape`]
+/// reads them), and what follows.
 fn literal(s: &str) -> Result<(&str, &str), MonitorError> {
     let s = s.trim_start();
     let body = s.strip_prefix('"').ok_or_else(|| syntax("a quoted string"))?;
-    let end = body.find('"').ok_or_else(|| syntax("an unterminated string"))?;
-    Ok((body.get(..end).unwrap_or(""), body.get(end + 1..).unwrap_or("")))
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => return Ok((body.get(..i).unwrap_or(""), body.get(i + 1..).unwrap_or(""))),
+            _ => escaped = false,
+        }
+    }
+    Err(syntax("an unterminated string"))
+}
+
+/// A string literal's text: `\"` a quote, `\\` a backslash.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => out.extend(it.next()),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// `name(` `"a"` [`, "b"`] `)` at the start of `s`: its arguments, and what follows.
@@ -231,7 +271,12 @@ fn call<'a>(s: &'a str, name: &str) -> Result<Option<(Vec<&'a str>, &'a str)>, M
 pub fn parse(q: &str) -> Result<Query, MonitorError> {
     let q = q.trim();
     if q.starts_with("logs(") {
-        return parse_logs(q);
+        return parse_records(q, "logs", false);
+    }
+    for name in ["trace-analytics", "spans"] {
+        if q.strip_prefix(name).is_some_and(|r| r.starts_with('(')) {
+            return parse_records(q, name, true);
+        }
     }
     if q.starts_with("slo(") {
         return parse_slo(q);
@@ -270,7 +315,7 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     // The metric query must parse as one.
     crate::query::parse::parse(match &kind {
         Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } => query,
-        Kind::Logs { .. } | Kind::Slo { .. } => "",
+        Kind::Logs { .. } | Kind::Spans { .. } | Kind::Slo { .. } => "",
     })
     .map_err(|e| syntax(e.to_string()))?;
     Ok(Query { kind, op, threshold })
@@ -298,11 +343,18 @@ fn parse_slo(q: &str) -> Result<Query, MonitorError> {
     Ok(Query { kind: Kind::Slo { id, burn }, op, threshold })
 }
 
-fn parse_logs(q: &str) -> Result<Query, MonitorError> {
+/// A log monitor's query (`logs(...)`), or with `spans` a trace analytics monitor's (`name(...)`:
+/// its search a span search, its facets a span's).
+fn parse_records(q: &str, name: &str, spans: bool) -> Result<Query, MonitorError> {
     let (left, op, threshold) = comparison(q)?;
-    let Some((args, mut rest)) = call(left, "logs")? else { return Err(syntax("logs(\"search\")")) };
-    let search = args.first().map(|s| (*s).to_owned()).unwrap_or_default();
-    crate::logs::search::parse(&search).map_err(|e| syntax(e.to_string()))?;
+    let Some((args, mut rest)) = call(left, name)? else { return Err(syntax(format!("{name}(\"search\")"))) };
+    let search = args.first().map(|s| unescape(s)).unwrap_or_default();
+    if spans {
+        crate::logs::search::parse_spans(&search).map_err(|e| syntax(e.to_string()))?;
+    } else {
+        crate::logs::search::parse(&search).map_err(|e| syntax(e.to_string()))?;
+    }
+    let facet_of = |f: &str| if spans { Facet::parse_span(f) } else { Facet::parse(f) };
     let (mut measure, mut by, mut window_ms) = (Measure::Count, Vec::new(), None);
     while !rest.trim().is_empty() {
         if let Some((_, r)) = call(rest, "index")? {
@@ -311,7 +363,7 @@ fn parse_logs(q: &str) -> Result<Query, MonitorError> {
             let facet = a.get(1).map(|f| f.trim_start_matches('@').to_owned());
             measure = match (a.first().copied(), facet) {
                 (Some("count") | None, _) => Measure::Count,
-                (Some("cardinality"), Some(f)) => Measure::Cardinality(Facet::parse(&f)),
+                (Some("cardinality"), Some(f)) => Measure::Cardinality(facet_of(&f)),
                 (Some("sum"), Some(f)) => Measure::Sum(f),
                 (Some("avg"), Some(f)) => Measure::Avg(f),
                 (Some("min"), Some(f)) => Measure::Min(f),
@@ -320,16 +372,18 @@ fn parse_logs(q: &str) -> Result<Query, MonitorError> {
             };
             rest = r;
         } else if let Some((a, r)) = call(rest, "by")? {
-            by = a.iter().flat_map(|s| s.split(',')).filter(|s| !s.trim().is_empty()).map(Facet::parse).collect();
+            by = a.iter().flat_map(|s| s.split(',')).filter(|s| !s.trim().is_empty()).map(facet_of).collect();
             rest = r;
         } else if let Some((a, r)) = call(rest, "last")? {
             window_ms = Some(window(a.first().copied().unwrap_or(""))?);
             rest = r;
         } else {
-            return Err(syntax(format!("after logs(...): {}", rest.trim())));
+            return Err(syntax(format!("after {name}(...): {}", rest.trim())));
         }
     }
-    Ok(Query { kind: Kind::Logs { search, measure, by, window_ms: window_ms.ok_or_else(|| syntax(".last(\"5m\")"))? }, op, threshold })
+    let window_ms = window_ms.ok_or_else(|| syntax(".last(\"5m\")"))?;
+    let kind = if spans { Kind::Spans { search, measure, by, window_ms } } else { Kind::Logs { search, measure, by, window_ms } };
+    Ok(Query { kind, op, threshold })
 }
 
 /// Where events are kept: log records of this source (kiln's own, its integrations', the API's).
@@ -448,6 +502,16 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
             let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
             // A count of nothing is a count: an ungrouped monitor of "fewer than 1 a minute" must
             // see zero when nothing came.
+            if out.is_empty() && by.is_empty() && *measure == Measure::Count {
+                out.push(Value { group: Vec::new(), value: 0.0 });
+            }
+            Ok(out)
+        }
+        Kind::Spans { search, measure, by, window_ms } => {
+            let parsed: Search = crate::logs::search::parse_spans(search).map_err(|e| MonitorError::Eval(e.to_string()))?;
+            let ns = |ms: i64| ms.saturating_mul(1_000_000);
+            let agg = store.aggregate_spans(&parsed, ns(to - window_ms), ns(to) - 1, by, measure).map_err(|e| MonitorError::Eval(e.to_string()))?;
+            let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
             if out.is_empty() && by.is_empty() && *measure == Measure::Count {
                 out.push(Value { group: Vec::new(), value: 0.0 });
             }
@@ -663,6 +727,16 @@ mod tests {
         assert_eq!((q.op, q.threshold), (Op::Lt, -50.0));
         let q = parse(r#"logs("service:web status:error").index("*").rollup("count").by("host").last("5m") > 10"#).unwrap();
         assert_eq!(q.kind, Kind::Logs { search: "service:web status:error".into(), measure: Measure::Count, by: vec![Facet::Host], window_ms: 300_000 });
+        // A search's quotes escaped, an apostrophe and a comparison of its own within it.
+        let q = parse(r#"logs("service:web \"can't connect\" @latency:>5").last("5m") > 2"#).unwrap();
+        assert_eq!(q.kind, Kind::Logs { search: r#"service:web "can't connect" @latency:>5"#.into(), measure: Measure::Count, by: Vec::new(), window_ms: 300_000 });
+        assert_eq!((q.op, q.threshold), (Op::Gt, 2.0));
+        // Datadog's trace analytics monitor: a span search, its facets a span's.
+        let q = parse(r#"trace-analytics("service:checkout status:error resource_name:\"GET /cart\" @duration:>250ms").rollup("count").by("resource_name").last("10m") >= 5"#).unwrap();
+        assert_eq!(q.kind, Kind::Spans { search: r#"service:checkout status:error resource_name:"GET /cart" @duration:>250ms"#.into(), measure: Measure::Count, by: vec![Facet::Name], window_ms: 600_000 });
+        let q = parse(r#"spans("*").rollup("avg", "@duration").last("5m") > 1e9"#).unwrap();
+        assert_eq!(q.kind, Kind::Spans { search: "*".into(), measure: Measure::Avg("duration".into()), by: Vec::new(), window_ms: 300_000 });
+        assert!(parse(r#"trace-analytics("resource_name:(").last("5m") > 1"#).is_err());
         let q = parse(r#"logs("*").rollup("cardinality", "@user").by("service,@region").last("1h") >= 100"#).unwrap();
         assert_eq!(q.kind, Kind::Logs { search: "*".into(), measure: Measure::Cardinality(Facet::Attr("user".into())), by: vec![Facet::Service, Facet::Attr("region".into())], window_ms: 3_600_000 });
         for bad in ["avg(last_5m):avg:x{*}", "avg(last_5x):avg:x{*} > 1", "median(last_5m):avg:x{*} > 1", "avg(last_9w):avg:x{*} > 1", "avg(last_5m): > 1", r#"logs("x").last("5m")"#, r#"logs("(x").last("5m") > 1"#, "avg(last_5m):avg:x{ > 1"] {

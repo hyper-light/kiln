@@ -1390,8 +1390,8 @@ const scenarios = {
     // Its spans in the order a waterfall draws them, the picked one opened below.
     const names = (await waterfall.getByRole("listitem").allTextContents()).map((t) => t.replace(/\s+/g, " "));
     expect(names[0].includes("GET /checkout/{order}") && names[3].includes("SELECT carts"), `in order: ${names.join(" | ")}`);
-    await page.getByText("cart 3 is locked").waitFor();
-    await page.getByText("ValueError:", { exact: false }).first().waitFor();
+    // The picked span's error, from its exception event: its type and its message.
+    await page.getByText("ValueError: cart 3 is locked", { exact: true }).waitFor();
     // Another span picked: the address says it.
     await waterfall.getByRole("button", { name: /GET \/cart\/\{order\}/ }).click();
     await page.waitForURL(new RegExp(`span=${spanId(3, 2)}`));

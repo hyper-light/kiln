@@ -11,6 +11,11 @@
 //! - Each is an event too: a record of source `kiln.event` and service `kiln.ci`, its attributes the
 //!   run's (number, sha, author) besides the tags, an error's severity when it failed, so the event
 //!   stream and log monitors see it (`source:kiln.event @event.type:ci.job.finished status:error`).
+//! - Each run is a trace too (§8.7, Datadog's CI visibility's model): its root span the run (service
+//!   `kiln.ci`, its name the pipeline's, a server's span so the trace metrics read each pipeline's
+//!   runs, failures and durations), each job a span under it, each step a span under its job; the
+//!   ids derived from the run's and the job's (SHA-256 of them), so the spans written as each job
+//!   ends and the run's as it ends are one trace, and the same if written twice.
 //! - kiln CD's deploys (`kiln.cd.deploys` by app, trigger and result; objects applied and pruned)
 //!   and every change of an app's health or sync, as events (service `kiln.cd`); its apps counted
 //!   by health and sync each interval (`kiln.cd.apps`).
@@ -38,6 +43,110 @@ fn point(out: &mut Vec<(SeriesKey, Vec<(i64, f64)>)>, metric: &str, kind: Kind, 
 
 fn failed(s: Status) -> bool {
     matches!(s, Status::Failed)
+}
+
+/// An id derived from `what` and `key` (its first bytes of their SHA-256): the same wherever and
+/// whenever made; never all zero (OTLP's invalid id) but with a chance of 2⁻⁶⁴ that is taken as it is.
+fn derived<const N: usize>(what: &str, key: &str) -> [u8; N] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(what.as_bytes());
+    h.update([0]);
+    h.update(key.as_bytes());
+    let d = h.finalize();
+    let mut out = [0u8; N];
+    for (o, b) in out.iter_mut().zip(d.iter()) {
+        *o = *b;
+    }
+    out
+}
+
+/// A CI run's trace id, and its root span's id.
+pub fn run_trace(run_id: &str) -> ([u8; 16], [u8; 8]) {
+    (derived("kiln.ci.run.trace", run_id), derived("kiln.ci.run.span", run_id))
+}
+
+fn ns(s: i64) -> i64 {
+    s.saturating_mul(1_000_000_000)
+}
+
+/// A span's failure: a step, a job or a run that failed or ran out of time.
+fn erred(s: Status) -> bool {
+    matches!(s, Status::Failed | Status::TimedOut)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn span(trace: [u8; 16], id: [u8; 8], parent: Option<[u8; 8]>, name: &str, kind: &str, start_s: i64, end_s: i64, host: &str, failed: bool, mut attrs: Vec<(String, String)>) -> Record {
+    let mut own = vec![("span.kind".to_owned(), kind.to_owned()), ("duration".to_owned(), ns((end_s - start_s).max(0)).to_string())];
+    if let Some(p) = parent {
+        own.push(("parent_id".to_owned(), hex::encode(p)));
+    }
+    if failed {
+        own.push(("otel.status_code".to_owned(), "ERROR".to_owned()));
+    }
+    own.append(&mut attrs);
+    Record { ts: ns(start_s), severity: if failed { 17 } else { 9 }, service: "kiln.ci".into(), host: host.to_owned(), source: "kiln.ci".into(), message: name.to_owned(), attrs: own, trace_id: Some(trace), span_id: Some(id) }
+}
+
+/// A job's spans: itself under its run's root, and its steps under it (those that started).
+pub fn job_spans(job: &Job, run: Option<&Run>, status: Status, finished: i64) -> Vec<Record> {
+    let (trace, root) = run_trace(&job.run_id);
+    let id = derived::<8>("kiln.ci.job.span", &job.id);
+    let start = job.started_at.or(job.queued_at).unwrap_or(finished);
+    let runner = job.agent.as_deref().unwrap_or("");
+    let mut attrs: Vec<(String, String)> = vec![("ci.job.name".into(), job.display.clone()), ("ci.job.id".into(), job.id.clone()), ("ci.status".into(), status.as_str().to_owned()), ("ci.job.attempt".into(), job.attempt.to_string())];
+    for (k, v) in [("runner", runner), ("executor", job.executor.as_deref().unwrap_or(""))] {
+        if !v.is_empty() {
+            attrs.push((k.into(), v.into()));
+        }
+    }
+    if let (Some(q), Some(s)) = (job.queued_at, job.started_at) {
+        attrs.push(("ci.job.queue_s".into(), (s - q).max(0).to_string()));
+    }
+    if let Some(r) = run {
+        attrs.push(("ci.pipeline.name".into(), r.pipeline.clone()));
+        attrs.push(("git.repository".into(), r.repo_name.clone()));
+    }
+    if let Some(c) = job.exit_code {
+        attrs.push(("exit_code".into(), c.to_string()));
+    }
+    if let Some(e) = &job.error {
+        attrs.push(("error.message".into(), e.clone()));
+    }
+    let mut out = vec![span(trace, id, Some(root), &job.key, "internal", start, finished.max(start), runner, erred(status), attrs)];
+    for st in &job.steps {
+        let Some(s0) = st.started_at else { continue };
+        let s1 = st.finished_at.unwrap_or(finished).max(s0);
+        let mut attrs = vec![("ci.step.index".to_owned(), st.idx.to_string()), ("ci.status".to_owned(), st.status.as_str().to_owned())];
+        if let Some(c) = st.exit_code {
+            attrs.push(("exit_code".into(), c.to_string()));
+        }
+        out.push(span(trace, derived("kiln.ci.step.span", &format!("{}\0{}", job.id, st.idx)), Some(id), &st.name, "internal", s0, s1, runner, erred(st.status), attrs));
+    }
+    out
+}
+
+/// A run's root span: the pipeline's run, from its start to its end.
+pub fn run_span(run: &Run, status: Status, finished: i64) -> Record {
+    let (trace, root) = run_trace(&run.id);
+    let start = run.started_at.unwrap_or(run.created_at);
+    let attrs = vec![
+        ("ci.provider.name".into(), "kiln".into()),
+        ("ci.pipeline.name".into(), run.pipeline.clone()),
+        ("ci.pipeline.number".into(), run.number.to_string()),
+        ("ci.pipeline.id".into(), run.id.clone()),
+        ("ci.status".into(), status.as_str().to_owned()),
+        ("ci.event".into(), run.event.clone()),
+        ("git.repository".into(), run.repo_name.clone()),
+        ("git.branch".into(), run.branch.clone()),
+        ("git.commit.sha".into(), run.sha.clone()),
+        ("git.commit.author".into(), run.author.clone()),
+    ];
+    let mut r = span(trace, root, None, &run.pipeline, "server", start, finished.max(start), "", erred(status), attrs);
+    if let Some(e) = &run.error {
+        r.attrs.push(("error.message".into(), e.clone()));
+    }
+    r
 }
 
 /// A job (a leg) that finished with `status` at `finished` (unix s): its points and its event.
@@ -83,7 +192,10 @@ pub fn job_finished(job: &Job, run: Option<&Run>, status: Status, finished: i64)
         attrs.push(("error".into(), e.clone()));
     }
     let message = format!("{} {} of {repo} #{} on {}{}", job.display, status.as_str(), run.map_or(0, |r| r.number), if runner.is_empty() { "—" } else { runner }, duration.map_or_else(String::new, |d| format!(" in {d} s")));
-    o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity: if failed(status) { 17 } else { 9 }, service: "kiln.ci".into(), host: runner.to_owned(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }]);
+    // The event carries the run's trace: its job's span a click away.
+    let (trace, _) = run_trace(&job.run_id);
+    o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity: if failed(status) { 17 } else { 9 }, service: "kiln.ci".into(), host: runner.to_owned(), source: "kiln.event".into(), message, attrs, trace_id: Some(trace), span_id: Some(derived("kiln.ci.job.span", &job.id)) }]);
+    o.spans(&job_spans(job, run, status, finished));
 }
 
 /// A run that finished: its points and its event.
@@ -104,7 +216,9 @@ pub fn run_finished(run: &Run, status: Status, finished: i64) {
         attrs.push(("duration_s".into(), format!("{d}")));
     }
     let message = format!("{} #{} of {} {}{}", run.pipeline, run.number, run.repo_name, status.as_str(), duration.map_or_else(String::new, |d| format!(" in {d} s")));
-    o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity: if failed(status) { 17 } else { 9 }, service: "kiln.ci".into(), host: String::new(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }]);
+    let (trace, root) = run_trace(&run.id);
+    o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity: if failed(status) { 17 } else { 9 }, service: "kiln.ci".into(), host: String::new(), source: "kiln.event".into(), message, attrs, trace_id: Some(trace), span_id: Some(root) }]);
+    o.spans(&[run_span(run, status, finished)]);
 }
 
 /// A CI leg done for good (`crate::ci::runs::finish_leg`): read back and written.
@@ -205,5 +319,81 @@ pub fn start_registry(o: Observe, host: String, every: Duration) {
     });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "observe's scrape of kiln's registry did not start");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Step;
+
+    fn step(idx: u32, name: &str, from: i64, to: i64, status: Status) -> Step {
+        Step { idx, name: name.into(), status, started_at: Some(from), finished_at: Some(to), exit_code: Some(i32::from(status == Status::Failed)), seq: None }
+    }
+
+    fn job(id: &str, key: &str, from: i64, to: i64, status: Status, steps: Vec<Step>) -> Job {
+        Job {
+            id: id.into(),
+            run_id: "run-1".into(),
+            key: key.into(),
+            display: key.into(),
+            status,
+            labels: Vec::new(),
+            needs: Vec::new(),
+            agent: Some("fedora".into()),
+            executor: Some("shell".into()),
+            attempt: 1,
+            queued_at: Some(from - 3),
+            started_at: Some(from),
+            finished_at: Some(to),
+            exit_code: None,
+            error: None,
+            peak_rss: None,
+            cpu_seconds: None,
+            spec: None,
+            steps,
+        }
+    }
+
+    /// A run of two jobs, the second failing at its test step: one trace, the run its root, each job
+    /// under it and each step under its job, as the waterfall draws them; written again (a leg read
+    /// back twice), the same spans.
+    #[test]
+    fn a_run_is_a_trace_of_its_jobs_and_their_steps() -> anyhow::Result<()> {
+        let run = Run {
+            id: "run-1".into(),
+            repo_id: "r".into(),
+            repo_name: "kiln".into(),
+            number: 42,
+            pipeline: "ci".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "abc123".into(),
+            message: "m".into(),
+            author: "ada".into(),
+            status: Status::Failed,
+            created_at: 1_000,
+            started_at: Some(1_002),
+            finished_at: Some(1_100),
+            error: None,
+            concurrency_group: None,
+        };
+        let build = job("job-b", "build", 1_005, 1_050, Status::Succeeded, vec![step(0, "checkout", 1_005, 1_008, Status::Succeeded), step(1, "cargo build", 1_008, 1_050, Status::Succeeded)]);
+        let test = job("job-t", "test", 1_051, 1_100, Status::Failed, vec![step(0, "checkout", 1_051, 1_053, Status::Succeeded), step(1, "cargo test", 1_053, 1_100, Status::Failed)]);
+        let mut spans = job_spans(&build, Some(&run), Status::Succeeded, 1_050);
+        anyhow::ensure!(job_spans(&build, Some(&run), Status::Succeeded, 1_050) == spans, "the same spans written again");
+        spans.extend(job_spans(&test, Some(&run), Status::Failed, 1_100));
+        spans.push(run_span(&run, Status::Failed, 1_100));
+        let (trace, _) = run_trace("run-1");
+        anyhow::ensure!(spans.iter().all(|s| s.trace_id == Some(trace)));
+        let t = kiln_obs::apm::assemble(spans);
+        let shape: Vec<(&str, u32)> = t.spans.iter().map(|p| (p.span.message.as_str(), p.depth)).collect();
+        anyhow::ensure!(shape == vec![("ci", 0), ("build", 1), ("checkout", 2), ("cargo build", 2), ("test", 1), ("checkout", 2), ("cargo test", 2)], "{shape:?}");
+        anyhow::ensure!(t.roots == 1 && t.errors == 3, "the run, its test job and step failed: {}", t.errors);
+        anyhow::ensure!((t.start, t.end) == (1_002_000_000_000, 1_100_000_000_000));
+        let Some(root) = t.spans.first() else { anyhow::bail!("a root") };
+        let attr = |k: &str| root.span.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        anyhow::ensure!(attr("span.kind") == Some("server") && attr("ci.pipeline.number") == Some("42") && attr("git.commit.sha") == Some("abc123") && attr("duration") == Some("98000000000"));
+        Ok(())
     }
 }

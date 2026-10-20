@@ -7,7 +7,7 @@
  * trace beside it.
  */
 import * as React from "react";
-import { observeApi, type LogFacets, type LogHistogram, type LogSearch, type PlacedSpan, type SpanSearch, type Trace } from "@/api/observe";
+import { observeApi, type LogFacets, type LogSearch, type PlacedSpan, type SpanSearch, type Trace } from "@/api/observe";
 import { SERIES } from "@/components/charts/types";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
@@ -18,7 +18,7 @@ import { Link, useParams } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { ApmTabs, latency } from "./apm";
 import { FacetList, SearchForm, toggle } from "./logs";
-import { Histogram, ObserveNav, PALETTE, RANGES, RangePicker, STATUS_COLOR, firstLine, niceStep, pollFor, useParam, useRange, when, type Range } from "./parts";
+import { Histogram, ObserveNav, PALETTE, RANGES, RangePicker, STATUS_COLOR, firstLine, pollFor, spanHistogramRes, useParam, useRange, when, type Range } from "./parts";
 
 /** The newest spans a page shows. */
 const LIMIT = 200;
@@ -29,15 +29,6 @@ const spansRes = (query: string, range: Range): Res<SpanSearch> => ({
   fetch: (signal) => {
     const to = Date.now();
     return observeApi.spans({ query, from: to - RANGES[range], to, limit: LIMIT }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
-});
-
-const spanHistogramRes = (query: string, range: Range): Res<LogHistogram> => ({
-  key: `observe/span-histogram/${range}/${query}`,
-  fetch: (signal) => {
-    const to = Date.now();
-    return observeApi.spanHistogram({ query, from: to - RANGES[range], to, step: niceStep(RANGES[range] / 60), by: ["status"] }, signal);
   },
   opts: { pollMs: pollFor(range) },
 });
