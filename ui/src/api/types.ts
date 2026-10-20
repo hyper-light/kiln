@@ -71,6 +71,9 @@ export interface Run {
   finished_at: number | null;
   error: string | null;
   concurrency_group: string | null;
+  /** The runners and executors its legs ran on (the runs list's facets). */
+  runners?: string[];
+  executors?: string[];
 }
 
 export interface Step {

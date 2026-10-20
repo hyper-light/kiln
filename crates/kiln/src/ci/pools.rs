@@ -112,7 +112,38 @@ pub async fn put(hub: &Hub, name: &str, body: &Value) -> Result<Response, Fail> 
         .await
         .map_err(internal)?;
     hub.ci.send(super::dispatch::Msg::PoolsChanged);
-    Ok(srv::json(StatusCode::OK, &json!({ "name": pool.name, "executor": pool.executor, "labels": pool.labels, "min_idle": pool.min_idle, "max": pool.max })))
+    let (diagnostics, preview) = effect(hub, &pool).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "name": pool.name, "executor": pool.executor, "labels": pool.labels, "min_idle": pool.min_idle, "max": pool.max, "diagnostics": diagnostics, "preview": preview })))
+}
+
+/// What a pool's change does now (W20-R03): warnings when no runner connected now announces its
+/// executor (none of its executors could start) or a runner carries all its labels itself (a leg
+/// asking for them may go there instead); and the pool as the dispatcher has it now (it has the
+/// change before it answers): its executors, the size it's heading for, the legs waiting.
+async fn effect(hub: &Hub, pool: &Pool) -> (Vec<Value>, Value) {
+    let mut diagnostics = Vec::new();
+    let (hosts, carriers): (Vec<String>, Vec<String>) = {
+        let agents = hub.agents.lock();
+        let live: Vec<_> = agents.values().filter(|a| a.connected).collect();
+        (
+            live.iter().filter(|a| a.facts.as_ref().is_some_and(|f| f.executors.contains_key(&pool.executor))).map(|a| a.name.clone()).collect(),
+            live.iter().filter(|a| !pool.labels.is_empty() && pool.labels.iter().all(|l| a.labels.contains(l))).map(|a| a.name.clone()).collect(),
+        )
+    };
+    if hosts.is_empty() {
+        diagnostics.push(json!({ "level": "warning", "message": format!("no runner connected now announces the {} executor: none of {}'s executors can start", pool.executor, pool.name) }));
+    }
+    for r in carriers {
+        diagnostics.push(json!({ "level": "warning", "message": format!("runner {r} carries all of {} itself: a leg asking for them may run there instead of in the pool", pool.labels.join(", ")) }));
+    }
+    let (tx, rx) = async_channel::bounded(1);
+    hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
+    let live: Value = crate::rt::timeout(std::time::Duration::from_secs(5), rx.recv()).await.ok().and_then(Result::ok).unwrap_or_else(|| json!([]));
+    let now = live.as_array().into_iter().flatten().find(|p| p.get("name").and_then(Value::as_str) == Some(pool.name.as_str())).cloned().unwrap_or(Value::Null);
+    let n = |k: &str| now.get(k).and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
+    let (starting, idle, busy, waiting) = (n("starting"), n("idle"), n("busy"), n("waiting"));
+    let heading = starting + idle + busy + kiln_ci::sched::pools::wanted(pool, starting, idle, busy, waiting);
+    (diagnostics, json!({ "hosts": hosts, "now": starting + idle + busy, "heading_for": heading, "waiting": waiting }))
 }
 
 /// `DELETE /api/ci/pools/:name`.

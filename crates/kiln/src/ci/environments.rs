@@ -287,7 +287,13 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
                 .map_err(internal)?;
             hub.store.audit(by, "ci.environments.save".into(), format!("{} {name}", repo.name)).await;
             let d = EnvDef { name, protection, url: b.url, source: "kiln".into(), agents_approve: false, concurrency: b.concurrency };
-            Ok(srv::json(if *method == Method::POST { StatusCode::CREATED } else { StatusCode::OK }, &env_json(&d, None)))
+            let mut v = env_json(&d, None);
+            let (diagnostics, preview) = effect(hub, &repo, &d).await;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("diagnostics".into(), json!(diagnostics));
+                o.insert("preview".into(), preview);
+            }
+            Ok(srv::json(if *method == Method::POST { StatusCode::CREATED } else { StatusCode::OK }, &v))
         }
         (&Method::DELETE, [name]) => {
             let (id, n) = (repo.id.clone(), (*name).to_owned());
@@ -300,6 +306,61 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
         }
         _ => Err((StatusCode::NOT_FOUND, "no such environments route".into())),
     }
+}
+
+/// What an environment's change does now (docs/ci.md W20-R03): warnings for a reviewer who isn't
+/// anyone here, for one reviewer who can't approve their own runs, and for a trunk its branches
+/// rule leaves out; and what a deployment from the trunk would meet now.
+async fn effect(hub: &Hub, repo: &Repo, d: &EnvDef) -> (Vec<Value>, Value) {
+    let p = &d.protection;
+    let mut diagnostics = Vec::new();
+    let people: Vec<String> = hub
+        .store
+        .call(|c| {
+            let mut st = c.prepare("SELECT name FROM users WHERE disabled_at IS NULL")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default();
+    for r in p.reviewers.iter().filter(|r| !r.contains(':') && *r != "admin" && *r != "owner") {
+        if !people.iter().any(|n| n.eq_ignore_ascii_case(r)) {
+            diagnostics.push(json!({ "level": "warning", "message": format!("reviewer {r} isn't anyone here: they can't approve") }));
+        }
+    }
+    if p.prevent_self_review && p.reviewers.len() == 1 && !p.reviewers.iter().any(|r| r.contains(':')) {
+        diagnostics.push(json!({ "level": "warning", "message": format!("{} is the only reviewer and can't approve their own runs: their deployments to {} wait for no one", p.reviewers.join(""), d.name) }));
+    }
+    let trunk = super::events::facts(hub, repo).await.default_branch;
+    let now = crate::util::now_unix();
+    let meets = match kiln_ci::env::gate(&d.name, p, &format!("refs/heads/{trunk}"), now, now, &[]) {
+        kiln_ci::env::Gate::Open => "starts at once".to_owned(),
+        kiln_ci::env::Gate::Refused(why) => {
+            diagnostics.push(json!({ "level": "warning", "message": format!("the trunk ({trunk}) may not deploy to {}: {why}", d.name) }));
+            format!("refused: {why}")
+        }
+        kiln_ci::env::Gate::Rejected { by, .. } => format!("rejected by {by}"),
+        kiln_ci::env::Gate::Waiting { reviewers, until, window, promotion, gate } => {
+            let mut waits: Vec<String> = Vec::new();
+            if !reviewers.is_empty() {
+                waits.push(format!("a review by one of {}", reviewers.join(", ")));
+            }
+            if let Some(w) = window {
+                waits.push(w);
+            }
+            if let Some(pr) = promotion {
+                waits.push(pr);
+            }
+            if let Some(g) = gate {
+                waits.push(g);
+            }
+            if waits.is_empty() && until.is_some() {
+                waits.push(format!("its wait timer ({} minutes)", p.wait_timer));
+            }
+            format!("waits for {}", waits.join("; "))
+        }
+    };
+    (diagnostics, json!({ "trunk": trunk, "a_deployment_from_the_trunk": meets }))
 }
 
 /// A repository's deployments, newest first: of one environment, or (`?environment=`) any.

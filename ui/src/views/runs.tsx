@@ -29,12 +29,15 @@ const STATUS_GROUPS: Record<StatusFilter, Status[] | null> = {
 };
 
 /** The facets the list filters by (W21-R03), each a URL parameter of its own, comma-separated. */
-const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author"; label: string; of: (r: Run) => string }[] = [
-  { id: "repo", label: "Repository", of: (r) => r.repo_name },
-  { id: "workflow", label: "Workflow", of: (r) => r.pipeline },
-  { id: "event", label: "Event", of: (r) => r.event },
-  { id: "branch", label: "Branch", of: (r) => r.branch },
-  { id: "author", label: "Author", of: (r) => r.author },
+const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author" | "runner" | "executor"; label: string; of: (r: Run) => string[] }[] = [
+  { id: "repo", label: "Repository", of: (r) => [r.repo_name] },
+  { id: "workflow", label: "Workflow", of: (r) => [r.pipeline] },
+  { id: "event", label: "Event", of: (r) => [r.event] },
+  { id: "branch", label: "Branch", of: (r) => [r.branch] },
+  { id: "author", label: "Author", of: (r) => [r.author] },
+  // A run's legs may run on several (W21-R03).
+  { id: "runner", label: "Runner", of: (r) => r.runners ?? [] },
+  { id: "executor", label: "Executor", of: (r) => r.executors ?? [] },
 ];
 
 type Sort = "newest" | "oldest" | "longest" | "shortest";
@@ -112,7 +115,8 @@ function RunsBody() {
       const i = cur.findIndex((x) => x.id === r.id);
       if (i !== -1) {
         const copy = cur.slice();
-        copy[i] = r;
+        // What the list knows that an event doesn't say (its runners and executors), kept.
+        copy[i] = { ...cur[i], ...r };
         return copy;
       }
       // A new run leads only the newest-first list; the others find it when they load again.
@@ -174,7 +178,7 @@ function RunsBody() {
   const named = (f: (typeof FACETS)[number], v: string) => (f.id === "repo" ? (repos.find((r) => r.id === v)?.name ?? v) : v);
   const passes = React.useCallback(
     (r: Run, except?: string) =>
-      FACETS.every((f) => f.id === except || !chosen[f.id]?.length || (chosen[f.id] ?? []).some((v) => named(f, v) === f.of(r))) &&
+      FACETS.every((f) => f.id === except || !chosen[f.id]?.length || (chosen[f.id] ?? []).some((v) => f.of(r).includes(named(f, v)))) &&
       (!words || [r.message, r.branch, r.pipeline, r.sha, r.author, r.repo_name].some((x) => x.toLowerCase().includes(words))),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [params, words, repos],
@@ -194,7 +198,7 @@ function RunsBody() {
     () =>
       FACETS.map((f) => {
         const n = new Map<string, number>();
-        for (const r of runs) if ((!group || group.includes(r.status)) && passes(r, f.id)) n.set(f.of(r), (n.get(f.of(r)) ?? 0) + 1);
+        for (const r of runs) if ((!group || group.includes(r.status)) && passes(r, f.id)) for (const v of f.of(r)) n.set(v, (n.get(v) ?? 0) + 1);
         if (f.id === "repo") for (const r of repos) if (!n.has(r.name)) n.set(r.name, 0);
         return {
           id: f.id,

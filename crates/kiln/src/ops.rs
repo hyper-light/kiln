@@ -79,6 +79,13 @@ pub fn all(hub: &Hub) -> Vec<Info> {
     listed(hub.cfg.cd.enabled)
 }
 
+/// The operations as `GET /api/ops` lists them (W20-R01): each one's name, summary, whether it
+/// changes anything, and its input's JSON Schema.
+pub fn catalog(hub: &Hub) -> Value {
+    let ops: Vec<Value> = all(hub).iter().map(|o| json!({ "name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": (o.input)() })).collect();
+    json!({ "operations": ops })
+}
+
 /// CI's operations, deployments' and releases' with `cd`, and kiln's own.
 pub fn listed(cd: bool) -> Vec<Info> {
     let mut out: Vec<Info> = Vec::new();

@@ -148,6 +148,8 @@ enum Cmd {
     EgressRelay,
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
+    /// Any of kiln's operations, as agents have them: `kiln op` lists them, `kiln op <name> …` runs one.
+    Op(kiln::ci::cli::OpArgs),
     /// A CI run's or leg's logs.
     Logs(kiln::ci::cli::LogsArgs),
     /// Start a workflow_dispatch run.
@@ -791,6 +793,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Runs(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::ci::cli::runs(a, &cfg)).await
+        }
+        Cmd::Op(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::op(a, &cfg)).await
         }
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
         Cmd::Ci(a) => {

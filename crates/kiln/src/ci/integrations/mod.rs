@@ -15,6 +15,7 @@ pub mod azure;
 pub mod cloudflare;
 pub mod gcp;
 pub mod oci;
+pub mod stores;
 pub mod vercel;
 
 use std::collections::HashMap;
@@ -160,6 +161,55 @@ pub const KINDS: &[KindInfo] = &[
         mode: Mode::Oidc,
         fields: &[f("tenant_id", true, "the Entra tenant"), f("client_id", true, "the app registration with kiln's federated credential"), f("subscription_id", false, "the default subscription")],
         secret: None,
+        built: true,
+    },
+    // Secret stores legs' secrets come from (W09-R08): `vault:`, `infisical:`, `doppler:`,
+    // `1password:` sources.
+    KindInfo {
+        kind: "vault",
+        title: "HashiCorp Vault",
+        category: "secrets",
+        mode: Mode::Oidc,
+        fields: &[
+            f("address", true, "https://vault.example.com:8200 (one on a private network needs [ci] allow_private_targets)"),
+            f("role", true, "the JWT auth role kiln signs in as"),
+            f("auth_path", false, "where the JWT auth method is mounted (jwt)"),
+            f("namespace", false, "a Vault Enterprise namespace"),
+            f("audience", false, "the audience the role binds (vault)"),
+        ],
+        secret: None,
+        built: true,
+    },
+    KindInfo {
+        kind: "infisical",
+        title: "Infisical",
+        category: "secrets",
+        mode: Mode::Optional,
+        fields: &[
+            f("project_id", true, "the project secrets are read from"),
+            f("identity_id", false, "a machine identity's id, to sign in by OIDC"),
+            f("site", false, "Infisical's address (https://app.infisical.com), or yours"),
+            f("audience", false, "the audience the identity binds (infisical)"),
+        ],
+        secret: Some("a machine identity's universal auth <client id>:<client secret>, when not by OIDC"),
+        built: true,
+    },
+    KindInfo {
+        kind: "doppler",
+        title: "Doppler",
+        category: "secrets",
+        mode: Mode::Optional,
+        fields: &[f("identity", false, "a service account identity's id, to sign in by OIDC"), f("audience", false, "the audience the identity binds (doppler)")],
+        secret: Some("a service token (dp.st…), when not by OIDC"),
+        built: true,
+    },
+    KindInfo {
+        kind: "1password",
+        title: "1Password",
+        category: "secrets",
+        mode: Mode::Token,
+        fields: &[f("connect", true, "your 1Password Connect server: https://op-connect.internal:8080")],
+        secret: Some("a Connect token"),
         built: true,
     },
     // CD providers (docs/deploy-api.md §8.3): an Argo CD instance kiln deploys through.
@@ -323,8 +373,8 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
     {
         return Err(format!("`{e}` is not an OTLP/HTTP endpoint: http:// or https://"));
     }
-    // A tracker's site or API: where kiln's requests go.
-    for (kind, field) in [("jira", "site"), ("linear", "api")] {
+    // A tracker's site or API, a store's address: where kiln's requests go.
+    for (kind, field) in [("jira", "site"), ("linear", "api"), ("vault", "address"), ("infisical", "site"), ("1password", "connect")] {
         if info.kind == kind
             && let Some(u) = obj.get(field).and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty())
             && !(u.starts_with("https://") || u.starts_with("http://"))
@@ -588,7 +638,7 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
             },
             // Each kind's check on the heap: inline, their futures overflowed a shard's stack in a
             // debug build (a webhook's verify took the server down).
-            "aws" | "gcp" | "azure" => Box::pin(verify_federated(hub, &i, as_)).await,
+            "aws" | "gcp" | "azure" | "vault" | "infisical" | "doppler" | "1password" => Box::pin(verify_federated(hub, &i, as_)).await,
             k if crate::ci::notify::CHANNELS.contains(&k) => Box::pin(crate::ci::notify::verify(hub, &i)).await,
             "vercel" => match secret(hub, &i).await {
                 Ok(Some(token)) => Box::pin(vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str))).await.map_err(|e| format!("{e:#}")),
@@ -641,6 +691,7 @@ async fn verify_federated(hub: &Hub, i: &Integration, as_: &VerifyAs) -> Result<
                 Err(explain(e, advice))
             }
         },
+        k if stores::KINDS.contains(&k) => stores::verify(hub, i, &w).await.map(|said| format!("{said} as {subject}")).map_err(|e| explain(anyhow::anyhow!(e), None)),
         _ => match azure::token(hub, i, &w, None).await {
             Ok(_) => Ok(format!("signed in to Azure as {subject}")),
             Err(e) => {

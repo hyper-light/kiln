@@ -541,7 +541,39 @@ export async function ciRun(id: string, attempt: number | undefined, signal?: Ab
   }
 }
 
+/** A pool's executor now (W13-R09). */
+export type CiPoolExecutor = { id: string; pool: string; runner: string; state: "starting" | "idle" | "busy"; leg?: string; since: number };
+/** A pool: its settings, where they come from (the configuration, or kiln's store), and its executors now. */
+export type CiPool = {
+  name: string;
+  executor: string;
+  image: string | null;
+  labels: string[];
+  hosts: string | null;
+  min_idle: number;
+  max: number;
+  per_host_max: number;
+  idle_timeout_ms: number;
+  starting: number;
+  idle: number;
+  busy: number;
+  waiting: number;
+  executors: CiPoolExecutor[];
+  /** The last failure to start one: on which host, and why. */
+  last_error: [string, string] | null;
+  source: "config" | "stored";
+};
+/** A runner image kiln built into its registry (W13-R11). */
+export type CiImage = { id: string; repo: string | null; name: string; reference: string; digest: string; image: string; platforms: string[]; run_id: string | null; created_at: number };
+/** A stored pool, as `PUT /api/ci/pools/:name` takes it. */
+export type CiPoolSpec = { name: string; executor: string; image?: string | null; labels: string[]; min_idle: number; max?: number | null; idle_timeout?: string | null };
+
 export const ci = {
+  pools: (signal?: AbortSignal) => request<{ pools: CiPool[] }>("GET", "/api/ci/pools", undefined, { signal }).then((r) => r.pools),
+  /** The pool, with what it does now (W20-R03): warnings, and the size it heads for. */
+  putPool: (spec: CiPoolSpec) => request<{ diagnostics?: { message: string }[]; preview?: { heading_for: number } }>("PUT", `/api/ci/pools/${enc(spec.name)}`, spec),
+  removePool: (name: string) => request<void>("DELETE", `/api/ci/pools/${enc(name)}`),
+  images: (signal?: AbortSignal) => request<{ images: CiImage[] }>("GET", "/api/ci/images", undefined, { signal }).then((r) => r.images),
   graph: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<CiGraph>("GET", `/api/ci/runs/${enc(id)}/graph${at(attempt)}`, undefined, { signal }),
   annotations: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),
@@ -572,7 +604,8 @@ export const ci = {
   /** Every routing rule in the order they apply, each with where it comes from. */
   routingRules: (signal?: AbortSignal) => request<{ rules: { index: number; source: string; rule: CiRoutingRule }[]; github_labels: boolean }>("GET", "/api/ci/routing/rules", undefined, { signal }),
   /** Replaces a scope's stored rules (`server` or `org:<owner>`; a repository's are its `.kiln/routing.yaml`). */
-  setRoutingRules: (scope: string, rules: CiRoutingRule[]) => request<unknown>("PUT", `/api/ci/routing/rules?scope=${enc(scope)}`, { rules }),
+  /** The rules, with what they do now (W20-R03): a warning for each rule no runner meets. */
+  setRoutingRules: (scope: string, rules: CiRoutingRule[]) => request<{ diagnostics?: { message: string }[] }>("PUT", `/api/ci/routing/rules?scope=${enc(scope)}`, { rules }),
   /** Where a leg with these labels and constraints would go, against the runners connected now. */
   routingExplain: (body: { labels: string[]; repo?: string; requires?: string[] }) => request<CiRouteExplain>("POST", "/api/ci/routing/explain", body),
   /** A scope's secrets (`server`, `org:acme`, `repo:acme/app`, `workflow:acme/app:<path>`, `env:acme/app:<name>`): names, never values. */
@@ -604,8 +637,9 @@ export const ci = {
   /** The run's tests, failures first (W16-R03). */
   tests: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ counts: Record<string, number>; tests: CiTest[] }>("GET", `/api/ci/runs/${enc(id)}/tests${at(attempt)}`, undefined, { signal }),
-  rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false) =>
-    request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed }),
+  /** `fresh`: the actions pinned again now, not as the run pinned them (W07-R02). */
+  rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false, fresh = false) =>
+    request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed, fresh_actions: fresh }),
   /** A review of the run's deployments waiting on their environments (W15-R04), or, with none
    * named, of an outside contributor's run waiting to start (W18-R06). */
   approve: (id: string, environments: string[], state: "approved" | "rejected", comment: string) =>

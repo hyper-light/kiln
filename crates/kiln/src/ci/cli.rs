@@ -551,6 +551,60 @@ pub async fn dispatch(args: DispatchArgs, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// `kiln op`: any of kiln's operations (docs/ci.md W20-R01), as the MCP tools and code mode
+/// have them: `kiln op` lists them, `kiln op <name> --schema` says what one takes, and
+/// `kiln op <name> [<json> | key=value …]` runs it.
+#[derive(clap::Args)]
+pub struct OpArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// The operation (`ci.runs.list`); without, every one is listed.
+    name: Option<String>,
+    /// Its input: a JSON object, or `key=value` pairs (a value that reads as JSON is JSON).
+    input: Vec<String>,
+    /// What it takes, instead of running it.
+    #[arg(long)]
+    schema: bool,
+}
+
+/// An operation's input from the command line: one JSON object, or `key=value` pairs.
+pub fn op_input(args: &[String]) -> Result<Value> {
+    if let [one] = args
+        && one.trim_start().starts_with('{')
+    {
+        return serde_json::from_str(one).map_err(|e| anyhow::anyhow!("the input isn't a JSON object: {e}"));
+    }
+    let mut o = serde_json::Map::new();
+    for a in args {
+        let Some((k, v)) = a.split_once('=') else { bail!("the input is a JSON object or key=value pairs, not `{a}`") };
+        o.insert(k.trim().to_owned(), serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_owned())));
+    }
+    Ok(Value::Object(o))
+}
+
+pub async fn op(args: OpArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let Some(name) = args.name else {
+        let list = api.call_api(Method::Get, "/api/ops", None).await?;
+        for o in list.get("operations").and_then(Value::as_array).into_iter().flatten() {
+            let text = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let changes = if o.get("read_only").and_then(Value::as_bool) == Some(true) { "" } else { " (changes)" };
+            println!("{:<36} {}{changes}", text("name"), text("summary"));
+        }
+        return Ok(());
+    };
+    if args.schema {
+        let list = api.call_api(Method::Get, "/api/ops", None).await?;
+        let o = list.get("operations").and_then(Value::as_array).into_iter().flatten().find(|o| o.get("name").and_then(Value::as_str) == Some(name.as_str())).ok_or_else(|| anyhow::anyhow!("no operation {name}: `kiln op` lists them"))?;
+        println!("{}", o.get("summary").and_then(Value::as_str).unwrap_or_default());
+        println!("{}", serde_json::to_string_pretty(o.get("input").unwrap_or(&Value::Null))?);
+        return Ok(());
+    }
+    let out = api.call_api(Method::Post, &format!("/api/ops/{}", enc(&name)), Some(op_input(&args.input)?)).await?;
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
 /// `kiln rerun`: a new attempt of a run (W05-R17).
 #[derive(clap::Args)]
 pub struct RerunArgs {

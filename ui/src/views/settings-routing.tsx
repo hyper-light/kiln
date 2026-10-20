@@ -83,6 +83,8 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
   const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
   const [saved, setSaved] = React.useState(false);
+  // What the saved rules do now, as the server warns of it (W20-R03).
+  const [warnings, setWarnings] = React.useState<string[]>([]);
   const change = (i: number, f: (r: CiRoutingRule) => CiRoutingRule) => {
     setSaved(false);
     setRules((rs) => rs.map((r, j) => (j === i ? f(r) : r)));
@@ -100,7 +102,8 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
     setBusy(true);
     setProblem(null);
     try {
-      await ci.setRoutingRules("server", rules);
+      const r = await ci.setRoutingRules("server", rules);
+      setWarnings((r.diagnostics ?? []).map((d) => d.message));
       setSaved(true);
       onSaved();
     } catch (e) {
@@ -192,6 +195,12 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
           Save the rules
         </Button>
       </div>
+      {saved &&
+        warnings.map((w) => (
+          <p key={w} className="st-note" data-tone="warn">
+            {w}
+          </p>
+        ))}
       {problem && (
         <p className="st-note" data-tone="error" role="status">
           {problem}

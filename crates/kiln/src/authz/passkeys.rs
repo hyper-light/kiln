@@ -80,17 +80,20 @@ fn pending() -> &'static parking_lot::Mutex<HashMap<String, Pending>> {
     P.get_or_init(Default::default)
 }
 
-/// A new challenge for `purpose` on `origin` (whose host is the relying party).
-fn challenge(purpose: Purpose, origin: &str, rp_id: &str) -> Result<String, Fail> {
+/// A new challenge for `purpose` on `origin` (whose host is the relying party). At the most
+/// under way, the oldest goes: asking for many keeps nobody else from signing in for long.
+fn challenge(purpose: Purpose, origin: &str, rp_id: &str) -> String {
     let c = b64(&rand::random::<[u8; 32]>());
     let mut p = pending().lock();
     let now = Instant::now();
     p.retain(|_, x| x.until > now);
-    if p.len() >= PENDING_MAX {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "too many sign-ins under way: try again in a minute".into()));
+    if p.len() >= PENDING_MAX
+        && let Some(oldest) = p.iter().min_by_key(|(_, x)| x.until).map(|(k, _)| k.clone())
+    {
+        p.remove(&oldest);
     }
     p.insert(c.clone(), Pending { purpose, origin: origin.to_owned(), rp_id: rp_id.to_owned(), until: now + CHALLENGE_TTL });
-    Ok(c)
+    c
 }
 
 /// The ceremony `challenge` (base64url) began, taken: each is used once.
@@ -375,7 +378,7 @@ pub async fn register_options(hub: &Hub, caller: &Caller, asked_origin: Option<&
         Some(id) => (id.to_owned(), caller.name.trim_start_matches("user:").to_owned()),
         None => ("owner".to_owned(), "owner".to_owned()),
     };
-    let c = challenge(Purpose::Register { principal: who }, &origin, &rp_id)?;
+    let c = challenge(Purpose::Register { principal: who }, &origin, &rp_id);
     let algs: Vec<Value> = [ES256, EDDSA, RS256].iter().map(|a| json!({ "type": "public-key", "alg": a })).collect();
     let exclude: Vec<Value> = existing.iter().map(|id| json!({ "type": "public-key", "id": id })).collect();
     Ok(json!({
@@ -487,7 +490,7 @@ pub async fn remove(hub: &Hub, caller: &Caller, id: &str) -> Result<(), Fail> {
 /// domain, which the person picks.
 pub fn sign_in_options(hub: &Hub, asked_origin: Option<&str>) -> Result<Value, Fail> {
     let (origin, rp_id) = origin_of(hub, asked_origin)?;
-    let c = challenge(Purpose::SignIn, &origin, &rp_id)?;
+    let c = challenge(Purpose::SignIn, &origin, &rp_id);
     Ok(json!({ "challenge": c, "rpId": rp_id, "timeout": CHALLENGE_TTL.as_millis(), "userVerification": "required", "allowCredentials": [] }))
 }
 

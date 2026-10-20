@@ -436,6 +436,9 @@
 .st-note[data-tone="success"] {
   color: #a8c9bc;
 }
+.st-note[data-tone="warn"] {
+  color: var(--color-warn);
+}
 .st-feedback {
   display: flex;
   align-items: center;

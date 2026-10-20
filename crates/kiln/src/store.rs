@@ -557,6 +557,31 @@ impl Store {
     /// Runs in another order than newest first (the runs list's sort, W21-R03): `oldest`, or
     /// `longest` and `shortest` (a running one's time so far), from `offset` on; `among` the
     /// repositories a person may read, when narrowed.
+    /// The runners and executors each of `ids`'s legs ran on (W21-R03's facets), by run.
+    pub async fn run_hosts(&self, ids: Vec<String>) -> anyhow::Result<std::collections::HashMap<String, (Vec<String>, Vec<String>)>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT run_id, agent, executor FROM jobs WHERE run_id IN (SELECT value FROM json_each(?1)) AND (agent IS NOT NULL OR executor IS NOT NULL) ORDER BY run_id")?;
+            let rows = st.query_map([serde_json::to_string(&ids)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
+            let mut out: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = std::collections::HashMap::new();
+            for row in rows {
+                let (run, agent, executor) = row?;
+                let hosts = out.entry(run).or_default();
+                for (list, v) in [(&mut hosts.0, agent), (&mut hosts.1, executor)] {
+                    if let Some(v) = v.filter(|v| !v.is_empty())
+                        && !list.contains(&v)
+                    {
+                        list.push(v);
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     pub async fn runs_sorted(&self, among: Option<Vec<String>>, repo: Option<String>, order: &str, limit: u32, offset: u32) -> anyhow::Result<Vec<Run>> {
         const TOOK: &str = "(COALESCE(r.finished_at, CAST(strftime('%s', 'now') AS INTEGER)) - COALESCE(r.started_at, r.created_at))";
         let by = match order {

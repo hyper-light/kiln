@@ -561,8 +561,28 @@ pub fn rule(method: &Method, segs: &[&str]) -> &'static Rule {
 
 /// The OpenAPI 3.1 document of the table (W10-R05): each route's method and path, the capability
 /// it needs (`x-kiln-capability`) and where that is checked (`x-kiln-scope`).
-pub fn openapi(version: &str) -> serde_json::Value {
+pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
     let mut paths = serde_json::Map::new();
+    // Every operation (W20-R01), each a route of its own: its summary and its input's schema.
+    // Its rights are its own route's, which `x-kiln-route` doesn't repeat: the operation says.
+    paths.insert(
+        "/api/ops".into(),
+        serde_json::json!({ "get": { "operationId": "ops", "summary": "Every operation: its name, summary, whether it changes anything, and its input's schema", "security": [{ "bearer": [] }, { "session": [] }], "responses": { "200": { "description": "OK" } } } }),
+    );
+    for o in ops {
+        paths.insert(
+            format!("/api/ops/{}", o.name),
+            serde_json::json!({ "post": {
+                "operationId": o.name,
+                "summary": o.summary,
+                "x-kiln-read-only": o.read_only,
+                "x-kiln-destructive": o.destructive,
+                "requestBody": { "required": false, "content": { "application/json": { "schema": (o.input)() } } },
+                "security": [{ "bearer": [] }, { "session": [] }],
+                "responses": { "200": { "description": "its answer" }, "400": { "description": "the input isn't right" }, "403": { "description": "its route's capability is missing in that scope" }, "404": { "description": "no such operation, or what it names" } },
+            } }),
+        );
+    }
     for r in ROUTES {
         // A parameter is named for the segment before it: `/runs/{run}`, `/repos/{repo}`.
         let segs: Vec<&str> = r.pattern.split('/').collect();
@@ -710,7 +730,7 @@ mod tests {
 
     #[test]
     fn w10_r05_the_openapi_document_comes_from_the_table() {
-        let doc = openapi("0.1.0");
+        let doc = openapi("0.1.0", &[]);
         assert_eq!(doc.pointer("/paths/~1api~1ci~1runs~1{run}~1rerun/post/x-kiln-capability").and_then(serde_json::Value::as_str), Some("runs.rerun"));
         assert_eq!(doc.pointer("/paths/~1api~1tokens/delete/x-kiln-capability").and_then(serde_json::Value::as_str), Some("tokens.manage"));
         assert_eq!(doc.get("openapi").and_then(serde_json::Value::as_str), Some("3.1.0"));

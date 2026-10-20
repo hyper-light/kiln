@@ -234,6 +234,21 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
             };
         }
+        // Every operation over HTTP (docs/ci.md W20-R01): the list, and one run as its caller.
+        // Each is checked as its own route is, and a change audited as that route's would be.
+        (&Method::GET, ["api", "ops"]) => {
+            return match boxed(|| caller_of(&hub, req.headers())).await {
+                Some(_) => Ok(srv::json(StatusCode::OK, &crate::ops::catalog(&hub))),
+                None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
+            };
+        }
+        (&Method::POST, ["api", "ops", name]) => {
+            let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else { return Err(err(StatusCode::UNAUTHORIZED, "authentication required")) };
+            let name = (*name).to_owned();
+            let input: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null);
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller };
+            return boxed(|| crate::ops::call(cx, &name, input)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m));
+        }
         (&Method::POST, ["api", "auth", "login"]) => return boxed(|| login(&hub, req)).await,
         // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
         (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &boxed(|| crate::authz::sso::providers(&hub)).await)),
@@ -389,7 +404,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         };
     }
     match (&method, s.as_slice()) {
-        (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
+        (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION"), &crate::ops::all(&hub)))),
         (&Method::GET, ["api", "peers"]) => boxed(|| crate::peers::list(&hub)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "peers", "open"]) => crate::peers::openable(&hub).map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "peers"]) => boxed(|| crate::peers::register(&hub, &caller.name, req)).await.map_err(|(c, m)| err(c, m)),
@@ -2145,13 +2160,29 @@ async fn runs(hub: &Hub, q: &HashMap<String, String>, caller: &crate::authz::Cal
     if let Some(sort) = q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")) {
         let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
         let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
-        return Ok(srv::json(StatusCode::OK, &hub.store.runs_sorted(among, q.get("repo").cloned(), sort, limit, offset).await?));
+        let list = hub.store.runs_sorted(among, q.get("repo").cloned(), sort, limit, offset).await?;
+        return Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?));
     }
     let list = match crate::authz::gate::readable(hub, caller, "runs.read").await {
         None => hub.store.runs(q.get("repo").cloned(), limit, before).await?,
         Some(names) => hub.store.runs_among(names, q.get("repo").cloned(), limit, before).await?,
     };
-    Ok(srv::json(StatusCode::OK, &list))
+    Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?))
+}
+
+/// Runs, each with the runners and executors its legs ran on (W21-R03's facets).
+async fn with_hosts(hub: &Hub, runs: &[crate::store::Run]) -> anyhow::Result<Vec<serde_json::Value>> {
+    let hosts = hub.store.run_hosts(runs.iter().map(|r| r.id.clone()).collect()).await?;
+    let mut out = Vec::with_capacity(runs.len());
+    for r in runs {
+        let mut v = serde_json::to_value(r)?;
+        if let (Some(o), Some((runners, executors))) = (v.as_object_mut(), hosts.get(&r.id)) {
+            o.insert("runners".into(), json!(runners));
+            o.insert("executors".into(), json!(executors));
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {

@@ -72,10 +72,12 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
   const [mode, setMode] = React.useState<string>(failed ? "failed" : "all");
   const [debug, setDebug] = React.useState(false);
   const [keepFailed, setKeepFailed] = React.useState(false);
+  const [fresh, setFresh] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const debugId = React.useId();
   const keepId = React.useId();
+  const freshId = React.useId();
 
   const go = async (fn: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -137,7 +139,13 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
         <input id={keepId} type="checkbox" className="check" checked={keepFailed} onChange={(e) => setKeepFailed(e.target.checked)} />
         Keep failed legs
       </label>
-      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug, keepFailed), `Attempt ${run.attempt + 1} started`)}>
+      {detail.actions.length > 0 && (
+        <label htmlFor={freshId} className="inline-flex min-h-9 items-center gap-2 text-[12.5px] text-[#b0b4be]" title="The actions' versions looked up again, instead of the ones this run pinned">
+          <input id={freshId} type="checkbox" className="check" checked={fresh} onChange={(e) => setFresh(e.target.checked)} />
+          Fresh actions
+        </label>
+      )}
+      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug, keepFailed, fresh), `Attempt ${run.attempt + 1} started`)}>
         <RotateCcw /> Rerun
       </Button>
     </div>

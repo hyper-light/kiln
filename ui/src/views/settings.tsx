@@ -23,6 +23,8 @@ import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
 import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
 import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswordRes, passkeysRes } from "@/views/settings-signin";
+import { PeopleGroup, PeopleHold, RolesGroup, RolesHold, peopleRes, rolesRes } from "@/views/settings-people";
+import { TokensGroup, TokensHold, tokensRes } from "@/views/settings-tokens";
 import { CiSecretsGroups, CiSecretsHold } from "@/views/settings-ci";
 import { RoutingGroups, RoutingHold } from "@/views/settings-routing";
 import { OidcGroups, OidcHold } from "@/views/settings-oidc";
@@ -40,8 +42,20 @@ export default function Settings() {
   // A person (not the owner): their own password beside their passkeys.
   const person = useAuth((s) => s.kind === "authed" && s.me?.kind === "user");
   const may = (c: string, server = true) => !can || can[c] === "server" || (!server && can[c] === "some");
-  const [pushes, updates, deployments, server] = [may("agents.run"), may("runners.read"), may("integrations.manage"), may("settings.manage")];
-  warm(methodsRes, thisDeviceRes, myNotificationsRes, passkeysRes, ...(person ? [myPasswordRes] : []), ...(updates ? [updatesRes] : []), ...(pushes ? [pushStateRes, pushDevicesRes] : []));
+  const [pushes, updates, deployments, server, manages] = [may("agents.run"), may("runners.read"), may("integrations.manage"), may("settings.manage"), may("users.manage")];
+  // The owner and people keep tokens; others reach Settings through one.
+  const signedIn = useAuth((s) => s.kind === "authed" && (s.me?.kind === "owner" || s.me?.kind === "user" || !s.me?.kind));
+  warm(
+    methodsRes,
+    thisDeviceRes,
+    myNotificationsRes,
+    passkeysRes,
+    ...(signedIn ? [tokensRes, rolesRes] : []),
+    ...(manages ? [peopleRes] : []),
+    ...(person ? [myPasswordRes] : []),
+    ...(updates ? [updatesRes] : []),
+    ...(pushes ? [pushStateRes, pushDevicesRes] : []),
+  );
   // The sections shown, numbered in order.
   let shown = 0;
   const next = () => ++shown;
@@ -114,6 +128,23 @@ export default function Settings() {
           </Loadable>
           <SessionGroup />
         </SettingsSection>
+        {manages && (
+          <SettingsSection id="people" index={next()} title="People" about="Who signs in here, what each may do where, and the roles grants name" words="people users grants roles">
+            <Loadable label="the people" fallback={<PeopleHold />}>
+              <PeopleGroup />
+            </Loadable>
+            <Loadable label="the roles" fallback={<RolesHold />}>
+              <RolesGroup />
+            </Loadable>
+          </SettingsSection>
+        )}
+        {signedIn && (
+          <SettingsSection id="tokens" index={next()} title="Tokens" about="Personal access tokens, for the CLI, scripts and tools" words="tokens pat api cli">
+            <Loadable label="your tokens" fallback={<TokensHold />}>
+              <TokensGroup />
+            </Loadable>
+          </SettingsSection>
+        )}
         {(may("secrets.manage", false) || may("variables.manage", false) || may("routing.manage") || may("settings.manage")) && (
           <SettingsSection
             id="ci"
