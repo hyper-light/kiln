@@ -186,6 +186,11 @@ socket (WebCodecs) otherwise. Nothing changes for the page or its runner: the se
   and keys, is clear over WebRTC's video). If the peer doesn't play within ten seconds (the
   server's port is out of reach), fails, or the server's WebRTC stops, the pictures come over the
   socket again, from a key frame. A page that saw WebRTC fail twice doesn't try it again.
+- **With no WebCodecs, WebRTC alone.** A browser hides WebCodecs on an http:// address other than
+  localhost (kiln at its LAN or Tailscale address), and WebRTC needs no secure context: there the
+  viewer connects as ever and its picture and sound come over WebRTC alone. If WebRTC can't get
+  through, or the server has none, the frame says so, lets its socket go and offers Try again; over
+  https, or on localhost, the socket's pictures would stand in.
 - **Measured** on one machine (server, runner and viewer together): the first picture came over
   the socket 0.3 s after Open and the pictures over WebRTC 0.4 s after. A tap's picture came 22 ms
   after the tap and was shown a millisecond later, on a desktop and a phone alike (the lab notices
@@ -245,10 +250,12 @@ its kind) on the newest iOS runtime there, boots it with no Simulator window, tu
 remote automation, and drives it through `safaridriver` as it does Safari (its picture as it
 changes, touch for every pointer, the device's own window). It stays booted for the next stream.
 
-What a Mac needs once: Xcode, an iOS simulator runtime (`xcodebuild -downloadPlatform iOS`, several
-GB), and `safaridriver --enable` (it asks for an administrator's password). Until then the Tools
-tab says what's missing (`ios` in the preview's `engines`), and a stream asking for one says the
-same.
+What a Mac needs once: Xcode and an iOS simulator runtime (`xcodebuild -downloadPlatform iOS`,
+several GB). `safaridriver --enable` is for Safari on the Mac itself; a simulator's Safari is let be
+automated inside the simulator, by kiln. Until then the Tools tab says what's missing (`ios` in
+the preview's `engines`), and a stream asking for one says the same. A simulator's screen is an
+odd number of pixels wide (an iPhone 15's 1179): H.264 takes only even sizes, so its picture loses
+its last column.
 
 ### Recordings
 
