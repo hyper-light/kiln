@@ -1366,6 +1366,18 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
     let total: f64 = at(&h, &["heatmap", "counts"]).as_array().into_iter().flatten().flat_map(|row| row.as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_f64()).sum();
     let rows = at(&h, &["heatmap", "rows"]);
     anyhow::ensure!(at(&h, &["heatmap", "distribution"]) == true && total == all.len() as f64 && rows.as_array().is_some_and(|r| r.len() <= 40), "{total} of {} in the heatmap: {rows}", all.len());
+    // Datadog's threshold queries: each host's values at or past the 90th percentile of all, within
+    // the one bucket the bound falls in, and a count and its complement every value.
+    let x = exact(&all, 0.9);
+    let (past, short) = (ask(&format!("count(v: v>={x}):e2e.lat{{*}} by {{host}}.as_count()"))?, ask(&format!("count(v: v<{x}):e2e.lat{{*}} by {{host}}"))?);
+    let of = |got: &[(String, f64)], h: &str| got.iter().find(|(x, _)| x == h).map_or(f64::NAN, |x| x.1);
+    for (h, values) in &hosts {
+        let want = values.iter().filter(|&&v| v >= x).count() as f64;
+        let straddle = values.iter().filter(|&&v| kiln_obs::dist::bucket_of(v, kiln_obs::dist::SCALE) == kiln_obs::dist::bucket_of(x, kiln_obs::dist::SCALE)).count() as f64;
+        let (got, below) = (of(&past, h), of(&short, h));
+        anyhow::ensure!((got - want).abs() <= straddle, "host {h}: {got} at or past {x}, exactly {want} (a bucket of {straddle})");
+        anyhow::ensure!((got + below - values.len() as f64).abs() < 1e-6, "host {h}: {got} and {below} of {}", values.len());
+    }
     Ok(())
 }
 

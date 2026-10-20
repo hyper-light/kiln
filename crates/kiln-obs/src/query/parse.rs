@@ -20,6 +20,18 @@ pub enum SpaceAgg {
     Count,
     /// A percentile across the group's series, 0–100.
     Pct(f64),
+    /// Datadog's threshold query of a distribution, `count(v: v>=0.5)`: how many of its values
+    /// pass, each bucket of time.
+    CountWhere(Threshold, f64),
+}
+
+/// How a threshold query compares a value `v` with its bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Threshold {
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// How a series' samples are combined into a bucket.
@@ -65,7 +77,9 @@ pub struct MetricQuery {
     /// A filter beyond conditions ANDed (`OR`, `NOT`, brackets): its expression, besides `filters`.
     pub filter: Option<FilterExpr>,
     pub by: Vec<String>,
-    pub rollup: Option<(Rollup, Option<i64>)>,
+    /// `.rollup(fn[, seconds])`: its function (none, `.rollup(60)`: the kind's own, as with no
+    /// rollup) and its seconds.
+    pub rollup: Option<(Option<Rollup>, Option<i64>)>,
     /// A calendar rollup's periods (`.rollup(sum, daily|weekly|monthly[, alignment][, 'tz'])`).
     pub calendar: Option<Calendar>,
     pub mode: Option<CountMode>,
@@ -474,6 +488,16 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
                     expect_operand = false;
                     i = next;
                 }
+                // Datadog's threshold query of a distribution: `count(v: v>=0.5):metric{…}`.
+                Tok::Name(name)
+                    if name.eq_ignore_ascii_case("count") && matches!(toks.get(i + 1), Some((_, Tok::LParen))) && matches!(toks.get(i + 2), Some((_, Tok::Name(v))) if v.starts_with("v:")) =>
+                {
+                    let (mq, next) = threshold_query(q, &toks, i)?;
+                    leaves.push((b.nodes.len(), text_of(i, next)));
+                    b.push(Node::Metric(mq));
+                    expect_operand = false;
+                    i = next;
+                }
                 Tok::Name(name) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) && Func::by_name(&name.to_ascii_lowercase()).is_some() => {
                     let f = Func::by_name(&name.to_ascii_lowercase()).ok_or_else(|| syntax(at, "a function"))?;
                     ops.push(Op::Call(f, b.operands.len(), at));
@@ -612,15 +636,22 @@ fn value_match(v: &str) -> ValueMatch {
 
 /// A metric query starting at token `i`: `[agg:]metric[{filters}][ by {tags}][.modifier(...)]*`;
 /// the index of the token after it.
-fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usize), ParseError> {
-    let Some((at, Tok::Name(head))) = toks.get(i) else { return Err(syntax(0, "a metric")) };
+fn metric_query(toks: &[Spanned<'_>], i: usize) -> Result<(MetricQuery, usize), ParseError> {
+    metric_query_as(toks, i, None)
+}
+
+/// A metric query at token `i`; with `space` given (a threshold query's), its head `:metric`.
+fn metric_query_as(toks: &[Spanned<'_>], mut i: usize, space: Option<SpaceAgg>) -> Result<(MetricQuery, usize), ParseError> {
+    let Some((at, Tok::Name(head))) = toks.get(i) else { return Err(syntax(toks.get(i).map_or(0, |t| t.0), "a metric")) };
     let at = *at;
-    let (space, metric) = match head.split_once(':') {
-        Some((agg, rest)) if !rest.is_empty() => match space_agg(agg) {
+    let (space, metric) = match (space, head.split_once(':')) {
+        (Some(s), Some(("", rest))) => (s, rest),
+        (Some(_), _) => return Err(syntax(at, "count(v: …):metric — the metric after the colon")),
+        (None, Some((agg, rest))) if !rest.is_empty() => match space_agg(agg) {
             Some(s) => (s, rest),
             None => (SpaceAgg::Avg, *head),
         },
-        _ => (SpaceAgg::Avg, *head),
+        (None, _) => (SpaceAgg::Avg, *head),
     };
     if metric.is_empty() {
         return Err(syntax(at, "a metric's name"));
@@ -686,6 +717,11 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
             }
         };
         match *m {
+            // Its seconds alone (`.rollup(10)`, as Datadog's own dashboards write it): the kind's own
+            // function, as with no rollup.
+            "rollup" if matches!(args.as_slice(), [Tok::Number(_)]) => {
+                q.rollup = Some((None, Some(num_arg(args.first()).filter(|&s| s > 0).ok_or_else(|| syntax(m_at, "a rollup's seconds"))?)));
+            }
             "rollup" => {
                 let f = name_arg(args.first()).and_then(|n| rollup_fn(&n)).ok_or_else(|| syntax(m_at, "rollup(avg|sum|min|max|count|last[, seconds | daily|weekly|monthly[, alignment][, 'timezone']])"))?;
                 let secs = match args.get(1) {
@@ -699,7 +735,7 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
                 if secs.is_some() && args.len() > 2 {
                     return Err(syntax(m_at, "a rollup in seconds takes no alignment: rollup(sum, 60)"));
                 }
-                q.rollup = Some((f, secs));
+                q.rollup = Some((Some(f), secs));
             }
             "weighted" if args.is_empty() => q.weighted = true,
             "as_count" if args.is_empty() => q.mode = Some(CountMode::Count),
@@ -728,10 +764,27 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
     }
     // A gauge's weight is its average's share of a bucket: a sum, a count, an extreme of its
     // samples has no share to weigh.
-    if q.weighted && q.rollup.is_some_and(|r| r.0 != Rollup::Avg) {
+    if q.weighted && q.rollup.is_some_and(|r| r.0.is_some_and(|f| f != Rollup::Avg)) {
         return Err(syntax(at, "weighted() weighs a gauge's averages: rollup(avg), or no rollup"));
     }
     Ok((q, i))
+}
+
+/// Datadog's threshold query of a distribution from its `count` at `i` of `text`'s tokens:
+/// `count(v: v>=0.5)` (a value compared with `<`, `<=`, `>` or `>=` a number) and then
+/// `:metric{…} by {…}…` as any metric query; and where it ends.
+fn threshold_query(text: &str, toks: &[Spanned<'_>], i: usize) -> Result<(MetricQuery, usize), ParseError> {
+    let at = toks.get(i).map_or(0, |t| t.0);
+    let how = "count(v: v>=0.5):metric{…}: a value compared with <, <=, > or >= a number";
+    let close = (i + 2..toks.len()).find(|&j| matches!(toks.get(j), Some((_, Tok::RParen)))).ok_or_else(|| syntax(at, how))?;
+    let (from, to) = (toks.get(i + 2).map_or(0, |t| t.0), toks.get(close).map_or(0, |t| t.0));
+    let cond = text.get(from..to).unwrap_or("").trim().strip_prefix("v:").map(str::trim).and_then(|c| c.strip_prefix('v')).ok_or_else(|| syntax(at, how))?.trim_start();
+    let (t, bound) = [(">=", Threshold::Ge), ("<=", Threshold::Le), (">", Threshold::Gt), ("<", Threshold::Lt)]
+        .into_iter()
+        .find_map(|(op, t)| cond.strip_prefix(op).map(|rest| (t, rest)))
+        .ok_or_else(|| syntax(at, how))?;
+    let x = bound.trim().parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| syntax(at, how))?;
+    metric_query_as(toks, close + 1, Some(SpaceAgg::CountWhere(t, x)))
 }
 
 /// A calendar rollup's periods from its unit and what follows it: an alignment, a timezone, or
@@ -1088,7 +1141,7 @@ mod tests {
             ]
         );
         assert_eq!(m.by, vec!["route", "host"]);
-        assert_eq!(m.rollup, Some((Rollup::Max, Some(60))));
+        assert_eq!(m.rollup, Some((Some(Rollup::Max), Some(60))));
         assert_eq!(m.mode, Some(CountMode::Rate));
         assert_eq!(m.fill, Some(Fill::Linear(Some(300))));
         // A quoted value: spaces, commas, braces and quotes in it, matched exactly.
@@ -1125,6 +1178,22 @@ mod tests {
             assert!(filters.is_empty() && filter.is_some(), "{q}");
         }
         assert_eq!(metric(&parse("m{*}.fill(0)").unwrap(), 0).fill, Some(Fill::Zero(None)));
+    }
+
+    /// Datadog's threshold queries of a distribution, as its own dashboards write them; a rollup's
+    /// seconds alone; what they cannot be.
+    #[test]
+    fn threshold_queries_count_a_distribution_s_values() {
+        let ast = parse("default_zero((count(v: v>=0):data_streams.latency{direction:out,type:kafka,$topic} by {service,env}.as_rate().rollup(10)))").unwrap();
+        let m = ast.nodes.iter().find_map(|n| if let Node::Metric(m) = n { Some(m) } else { None }).unwrap();
+        assert_eq!((m.space, &m.metric, m.by.as_slice()), (SpaceAgg::CountWhere(Threshold::Ge, 0.0), &NameMatch::Exact("data_streams.latency".into()), &["service".to_owned(), "env".to_owned()][..]));
+        assert_eq!((m.mode, m.rollup), (Some(CountMode::Rate), Some((None, Some(10)))));
+        for (q, t, x) in [("count(v: v <= 0.5):m{*}", Threshold::Le, 0.5), ("count(v:v>1e3):m{*}", Threshold::Gt, 1000.0), ("count(v: v < -2):m{*}", Threshold::Lt, -2.0)] {
+            assert_eq!(metric(&parse(q).unwrap(), 0).space, SpaceAgg::CountWhere(t, x), "{q}");
+        }
+        for bad in ["count(v: x>=0):m{*}", "count(v: v=0):m{*}", "count(v: v>=):m{*}", "count(v: v>=0)m{*}", "count(v: v>=0):", "count(v: v>=0", "a{*}.rollup(0)"] {
+            assert!(parse(bad).is_err(), "{bad:?} parsed");
+        }
     }
 
     #[test]

@@ -392,13 +392,14 @@ metric_q   := [agg ":"] metric ["{" filters "}"] ["by" "{" tags "}"] modifier*
 records_q  := ("logs" | "spans" | "trace-analytics" | "events") "(" '"' search '"' ")"
               [".rollup(" '"' measure '"' ["," '"' facet '"'] ")"] [".by(" '"' facets '"' ")"] [".index(" '"' * '"' ")"]
 agg        := avg | sum | min | max | count | p50 | p75 | p90 | p95 | p99 | pNN.N
+            | "count(v: v" ("<" | "<=" | ">" | ">=") number ")"   // a distribution's values that pass
 filters    := cond (("," | "AND" | " ") cond | "OR" cond)*   // NOT binds tightest, then AND, then OR
 cond       := ("!" | "NOT")* (filter | "(" filters ")" | "*" | "$" variable)   // "*", a variable: all
 filter     := key ":" value | key ":" | key ["NOT"] "IN" "(" value ("," value)* ")"
                                               // value: exact, wildcard "web-*", (a OR b), or
                                               // "quoted" (any characters, exactly; \" and \\ within);
                                               // key ":" alone: any value of it
-modifier   := ".rollup(" fn ["," seconds | "," calendar] ")" | ".as_count()" | ".as_rate()"
+modifier   := ".rollup(" fn ["," seconds | "," calendar] ")" | ".rollup(" seconds ")" | ".as_count()" | ".as_rate()"
             | ".fill(" how ["," seconds] ")" | ".weighted()"
 calendar   := ("daily" | "weekly" | "monthly") ["," alignment] ["," timezone]
 function   := name "(" expr ("," arg)* ")"        // Datadog's catalog, below
@@ -542,7 +543,12 @@ negated by `!` or `NOT`, in brackets, the words in any case (`{(type:vsmart OR t
 $host}`, `{not status:done and env:prod}`). Conditions ANDed alone, the common case, are postings
 intersected (§4.2); any other filter is an expression of them evaluated within the metric's series.
 A value list in a search, `service:(web OR api)` or `@evt.name:(a OR "b c")`, is the key's condition
-on each value, `(service:web OR service:api)`. A `-` that starts a term is NOT wherever it
+on each value, `(service:web OR service:api)`. A threshold query of a distribution, Datadog's
+`count(v: v>=0.5):latency{…}`, counts each bucket of time's values that pass from its buckets merged
+as a percentile's are (§4.4): a bucket whole where all of it passes, in part where the bound falls
+within it (its values spread evenly over the logarithm of their magnitude), so within one bucket of
+the truth and exactly at a bucket's edge; none where there is no value, a count a second with
+`.as_rate()`. `.rollup(10)`, its seconds alone, is the kind's own function at those seconds. A `-` that starts a term is NOT wherever it
 stands (`(a OR b) -env:dev`); one inside a term is the term's (`web-1`). A quoted value holds any
 characters (`@note:"say \"hi\""`), so a facet's every value can be searched for. Events take the
 same search syntax. `trace_id:<32 hex digits>` and `span_id:<16>` are a record's ids (logs' and
@@ -2884,9 +2890,9 @@ widgets:
 
 | widgets | count | share |
 | --- | --- | --- |
-| drawn as Datadog draws them | 19,447 | 90.8% |
+| drawn as Datadog draws them | 19,455 | 90.8% |
 | drawn otherwise, as said | 715 | 3.3% |
-| kept as a note saying what they were, not drawn | 1,262 | 5.9% |
+| kept as a note saying what they were, not drawn | 1,254 | 5.9% |
 
 Drawn otherwise: an image of the web as a link to it (325), a geomap as a top list of its places
 (235), a bar chart, a change and a host map as top lists (118), a treemap as a pie (37). Not
@@ -2895,8 +2901,8 @@ images, its integrations' logos (165), cloud costs
 (97), network paths and device flows (142), database queries, LLM observability and processes (16);
 widgets kiln has no form of (flame graphs, Sankey diagrams, topology maps, Vega's wildcard, an
 iframe, a scatter plot: 25); lists kiln does not keep (infrastructure, log patterns, trace streams
-and two more: 31); requests of a form kiln does not read (11). Queries kiln cannot read: 12
-(Datadog's threshold counts of distributions, `count(v: v>=0):…`, 8; `reduce(…)`, 3; a filter of
+and two more: 31); requests of a form kiln does not read (11). Queries kiln cannot read: 4
+(`reduce(…, 'last')` over `sum(…, { * })`, 3, a form no page of Datadog's describes; a filter of
 Datadog's own that is not one, `{(status:400 OR s) …}`, 1).
 
 The first import drew 89.0% and could not read 60 queries. What moved it, each checked against a
@@ -2906,7 +2912,8 @@ spaces (a number outside a filter ends where an operator starts: before, `2*avg:
 metric named `2*avg:cpu`, a glob matching nothing, and answered nothing without an error); a log
 search's value lists (before, `@evt.name:(a OR b)` was read as the attribute empty and a word of
 the message, a wrong answer and no error); `status:*`; `.fill(0)`: 89.9%, 12 unread. Then service
-checks (§9.4): the 180 check status widgets drawn, 90.8%.
+checks (§9.4): the 180 check status widgets drawn; and distributions' threshold counts
+(`count(v: v>=0):…`) and a rollup's seconds alone (`.rollup(10)`): 8 more, 90.8%, 4 unread.
 
 An import costs 105 to 112 µs a dashboard (three runs each, a release build, fedora), from 133 to
 157 µs: the lexer tells a filter's `*` from a product by the braces it has open, counted as it goes,
@@ -3479,7 +3486,9 @@ points (2,000 each, log-normal), a fourth's as an OTLP exponential histogram (de
 fifth's as a cumulative one exported twice (1,000, then 2,500 since it began): `count` all 11,500
 once; p50, p99 and p99.9 across them within 1.09% of the exact percentiles, each host's p99 within it
 of its own; the average exact; a heatmap of it holding every value once in 40 rows at the most.
-2026-10-18: passes (18 s).
+2026-10-18: passes (18 s). And Datadog's threshold queries through the API: each host's values at
+or past the 90th percentile of all (`count(v: v>=x)`) within the one bucket the bound falls in, and
+with its complement (`v<x`) every value. 2026-10-20: passes (16 s).
 
 **Prometheus's scrapes** (`observe_clouds.rs`): an exporter served by the test (a counter climbing
 a hundred a second, a gauge), and four targets: one the server reads, one the runner reads, one

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use super::calendar::{self, Calendar};
-use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, RecordQuery, RecordSource, Rollup, SpaceAgg, parse};
+use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, RecordQuery, RecordSource, Rollup, SpaceAgg, Threshold, parse};
 use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
 use crate::index::{NameMatch, Selector};
@@ -1145,6 +1145,7 @@ fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans:
     let part = |suffix: &str, space: SpaceAgg| MetricQuery { metric: NameMatch::Exact(format!("{name}{suffix}")), space, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, ..q.clone() };
     let p = match q.space {
         SpaceAgg::Pct(p) => p,
+        SpaceAgg::CountWhere(t, x) => return threshold_counts(store, q, name, t, x, grid, spans, max_series, scratch, scanned),
         SpaceAgg::Avg => {
             let sums = metric(store, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
             let counts = metric(store, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
@@ -1234,6 +1235,105 @@ fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans:
     Ok(out)
 }
 
+/// Datadog's threshold query of a distribution (`count(v: v>=0.5):metric`): in each bucket of time,
+/// how many of each group's values pass, its buckets merged as a percentile's are, each bucket's
+/// count whole where all of it passes and in part where the bound falls within it ([`passing`]);
+/// none where the group has no value, and `.as_rate()` a count a second.
+#[allow(clippy::too_many_arguments)]
+fn threshold_counts(
+    store: &Store,
+    q: &MetricQuery,
+    name: &str,
+    t: Threshold,
+    x: f64,
+    grid: Grid,
+    spans: Spans<'_>,
+    max_series: usize,
+    scratch: &mut Scratch,
+    scanned: &mut (u64, u64),
+) -> Result<Vec<Series>, QueryError> {
+    let mut ids = Vec::new();
+    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
+    if ids.is_empty() {
+        return Err(QueryError::Invalid(format!("count(v: …) reads a distribution's values: {name} keeps none (a distribution with percentiles keeps them)")));
+    }
+    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
+    let mut groups: std::collections::BTreeMap<Vec<&str>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
+    let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
+    for &id in &ids {
+        let Some(s) = store.series(id) else { continue };
+        let Some((scale, b)) = s.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value) else { continue };
+        key.clear();
+        key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
+        if let Some(members) = groups.get_mut(key.as_slice()) {
+            members.push((id, scale, b));
+            continue;
+        }
+        if groups.len() >= max_series {
+            return Err(QueryError::TooManySeries(groups.len() + 1, max_series));
+        }
+        groups.insert(key.clone(), vec![(id, scale, b)]);
+    }
+    let rate = q.mode == Some(CountMode::Rate);
+    let mut table = DistTable::default();
+    let mut totals = vec![0.0; grid.n];
+    let mut out = Vec::with_capacity(groups.len());
+    for (values, members) in groups {
+        let scale = dist_counts(store, q, grid, spans, &members, scratch, scanned, &mut table)?;
+        let tags = q.by.iter().zip(values).map(|(k, v)| (k.clone(), v.to_owned())).collect();
+        totals.fill(0.0);
+        let mut passed = vec![0.0; grid.n];
+        for &row in &table.sorted {
+            let share = table.buckets.get(row).map_or(0.0, |b| passing(*b, scale, t, x));
+            for ((p, total), c) in passed.iter_mut().zip(totals.iter_mut()).zip(table.counts(row)) {
+                *total += c;
+                *p += c * share;
+            }
+        }
+        for (i, (p, &total)) in passed.iter_mut().zip(&totals).enumerate() {
+            let seconds = spans.width_ms(i) as f64 / 1000.0;
+            *p = if total <= 0.0 {
+                f64::NAN
+            } else if rate {
+                if seconds > 0.0 { *p / seconds } else { f64::NAN }
+            } else {
+                *p
+            };
+        }
+        out.push(Series { tags, values: passed, bounds: None, outlier: None });
+    }
+    Ok(out)
+}
+
+/// The share of a distribution's bucket at `scale` whose values pass `v <t> x`: all of it, none, or
+/// for the bucket `x` falls within, the part on the passing side, its values taken as spread evenly
+/// over the logarithm of their magnitude (as the bucket's own bounds are: within one bucket of the
+/// truth, as a percentile is). The zero bucket's values are zero.
+fn passing(b: crate::dist::Bucket, scale: i32, t: Threshold, x: f64) -> f64 {
+    let holds = |v: f64| match t {
+        Threshold::Lt => v < x,
+        Threshold::Le => v <= x,
+        Threshold::Gt => v > x,
+        Threshold::Ge => v >= x,
+    };
+    let (lo, hi) = b.bounds(scale);
+    // The bucket's share at or below `x`.
+    let below = match b {
+        crate::dist::Bucket::Zero => return if holds(0.0) { 1.0 } else { 0.0 },
+        crate::dist::Bucket::Pos(_) if x <= lo => 0.0,
+        crate::dist::Bucket::Pos(_) if x >= hi => 1.0,
+        crate::dist::Bucket::Pos(_) => (x / lo).ln() / (hi / lo).ln(),
+        // `[lo, hi)`, both below zero: magnitudes `(-hi, -lo]`.
+        crate::dist::Bucket::Neg(_) if x < lo => 0.0,
+        crate::dist::Bucket::Neg(_) if x >= hi => 1.0,
+        crate::dist::Bucket::Neg(_) => (lo / x).ln() / (lo / hi).ln(),
+    };
+    match t {
+        Threshold::Lt | Threshold::Le => below,
+        Threshold::Gt | Threshold::Ge => 1.0 - below,
+    }
+}
+
 /// A distribution's buckets, each its counts in each bucket of time: one table, its room kept from
 /// group to group (a query by host allocates for its largest group, not for each bucket of each).
 #[derive(Debug, Default)]
@@ -1311,7 +1411,7 @@ impl DistTable {
 /// bucket), each made the coarsest scale's among them, their counts summed; the scale.
 #[allow(clippy::too_many_arguments)]
 fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, members: &[(u32, i32, crate::dist::Bucket)], scratch: &mut Scratch, scanned: &mut (u64, u64), table: &mut DistTable) -> Result<i32, QueryError> {
-    let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Rollup::Sum, None)), calendar: None, weighted: false, fill: None, ..q.clone() };
+    let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Some(Rollup::Sum), None)), calendar: None, weighted: false, fill: None, ..q.clone() };
     let (from, end) = (spans.start(0), spans.start(grid.n));
     let scale = members.iter().map(|m| m.1).min().unwrap_or(crate::dist::SCALE);
     table.clear(grid.n);
@@ -1474,6 +1574,10 @@ fn records(store: &Store, r: &RecordQuery, grid: Grid, off: i64, max_series: usi
 fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     if let Some((_, parts)) = distribution_of(store, q) {
         return distribution(store, q, parts, grid, spans, max_series, scratch, scanned);
+    }
+    if let SpaceAgg::CountWhere(..) = q.space {
+        let (NameMatch::Exact(name) | NameMatch::Glob(name)) = &q.metric;
+        return Err(QueryError::Invalid(format!("count(v: …) reads a distribution's values: {name} is none")));
     }
     let mut ids = Vec::new();
     store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
@@ -1956,7 +2060,7 @@ fn columns_for(kind: Kind, q: &MetricQuery) -> &'static [Col] {
     if kind == Kind::Counter {
         return rollup::columns(Kind::Counter);
     }
-    match q.rollup.map(|r| r.0).unwrap_or(if kind == Kind::Count { Rollup::Sum } else { Rollup::Avg }) {
+    match q.rollup.and_then(|r| r.0).unwrap_or(if kind == Kind::Count { Rollup::Sum } else { Rollup::Avg }) {
         Rollup::Avg | Rollup::Sum => &[Col::Sum],
         Rollup::Min => &[Col::Min],
         Rollup::Max => &[Col::Max],
@@ -1986,7 +2090,7 @@ fn rollup_windows(kind: Kind, q: &MetricQuery, spans: Spans<'_>, width: i64, ts:
     buckets.fill(f64::NAN);
     n.clear();
     n.resize(buckets.len(), 0.0);
-    let f = q.rollup.map(|r| r.0).unwrap_or(match kind {
+    let f = q.rollup.and_then(|r| r.0).unwrap_or(match kind {
         Kind::Count => Rollup::Sum,
         _ => Rollup::Avg,
     });
@@ -2134,7 +2238,7 @@ fn rollup(kind: Kind, q: &MetricQuery, spans: Spans<'_>, ts: &[i64], vs: &[f64],
             }
         }
         _ => {
-            let f = q.rollup.map(|r| r.0).unwrap_or(match kind {
+            let f = q.rollup.and_then(|r| r.0).unwrap_or(match kind {
                 Kind::Count => Rollup::Sum,
                 _ => Rollup::Avg,
             });
@@ -4003,6 +4107,69 @@ mod tests {
         // A calendar's periods are not even buckets.
         let r = Request::new(r#"sum:errors{*}.rollup(sum, daily) + logs("*")"#, 0, 600_000);
         assert!(eval(&s, &r).is_err());
+    }
+
+    /// Datadog's threshold queries of a distribution (`count(v: v>=x)`): each host's values that
+    /// pass, read from its buckets: exactly where the bound is a bucket's edge, within the one bucket
+    /// the bound falls in elsewhere; a count and its complement the whole; `.as_rate()` a count a
+    /// second; a metric without a distribution's buckets refused.
+    #[test]
+    fn a_distribution_s_threshold_counts_its_values_that_pass() {
+        use crate::dist::{BUCKET_TAG, Bucket, SCALE, bucket_of, tag_value};
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        let mut rng = crate::testkit::Rng::new(4);
+        let mut hosts: Vec<(&str, Vec<f64>)> = Vec::new();
+        for (h, level) in [("a", -4.0), ("b", -3.0), ("c", -2.0)] {
+            let values: Vec<f64> = (0..3000)
+                .map(|_| {
+                    let n = (-2.0 * rng.f64().max(1e-300).ln()).sqrt() * (std::f64::consts::TAU * rng.f64()).cos();
+                    (n * 0.5 + level).exp()
+                })
+                .collect();
+            let mut counts: std::collections::BTreeMap<(u8, i64), (Bucket, f64)> = std::collections::BTreeMap::new();
+            for &v in &values {
+                let bk = bucket_of(v, SCALE).unwrap();
+                counts.entry(bk.order()).or_insert((bk, 0.0)).1 += 1.0;
+            }
+            for (bk, n) in counts.values() {
+                let tag = tag_value(SCALE, *bk);
+                let k = SeriesKey::new("lat.dist", [("host", h), (BUCKET_TAG, tag.as_str())], Kind::Count).unwrap();
+                b.define(&k);
+                b.run(k.fp, [(30_000, *n)]);
+            }
+            hosts.push((h, values));
+        }
+        let plain = SeriesKey::new("lat.count", [("host", "a")], Kind::Count).unwrap();
+        b.define(&plain);
+        b.run(plain.fp, [(30_000, 3000.0)]);
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| -> Vec<f64> {
+            let mut r = Request::new(q, 0, 60_000);
+            r.step = Some(60_000);
+            let mut a = eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}")).series;
+            a.sort_by(|x, y| x.tags.cmp(&y.tags));
+            a.iter().map(|x| x.values[0]).collect()
+        };
+        let mut all: Vec<f64> = hosts.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort_by(f64::total_cmp);
+        let edge = Bucket::Pos(bucket_of(all[all.len() / 2], SCALE).map_or(0, |b| if let Bucket::Pos(i) = b { i } else { 0 })).bounds(SCALE).0;
+        for x in [all[all.len() / 10], all[all.len() / 2], all[all.len() * 9 / 10], edge, 0.0, -1.0, 1e9] {
+            let ge = ask(&format!("count(v: v>={x}):lat{{*}} by {{host}}.as_count()"));
+            let lt = ask(&format!("count(v:v<{x}):lat{{*}} by {{host}}"));
+            for ((h, values), (got, below)) in hosts.iter().zip(ge.iter().zip(&lt)) {
+                let exact = values.iter().filter(|&&v| v >= x).count() as f64;
+                let straddle = if x > 0.0 && x < 1e9 && x != edge { values.iter().filter(|&&v| bucket_of(v, SCALE) == bucket_of(x, SCALE)).count() as f64 } else { 0.0 };
+                assert!((got - exact).abs() <= straddle + 1e-9, "{h} v>={x}: {got}, exactly {exact} (a bucket of {straddle})");
+                assert!((got + below - values.len() as f64).abs() < 1e-6, "{h} at {x}: {got} and {below}, of {}", values.len());
+            }
+        }
+        // A count a second over the minute.
+        let rate = ask("count(v: v >= 0):lat{host:a}.as_rate()");
+        assert!((rate[0] - 3000.0 / 60.0).abs() < 1e-9, "{rate:?}");
+        let mut r = Request::new("count(v: v>=1):lat.count{*}", 0, 60_000);
+        r.step = Some(60_000);
+        assert!(eval(&s, &r).is_err(), "a metric without a distribution's buckets");
     }
 
     /// `max` and `min` of queries and numbers, as Datadog's own dashboards use them: the most of two
