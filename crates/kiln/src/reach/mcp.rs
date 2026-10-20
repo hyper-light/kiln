@@ -59,7 +59,8 @@ the other machine first (only what changed; git sees the same state there), and 
 folder, so edit here and build or test there; for a command that isn't about this repository, pass sync: false (it runs \
 in that machine's home folder). `runners` lists the machines, best first. Long commands can run in the background \
 (background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
-`agents_start` them with a clear brief, `agents_wait` for them and read what they concluded with `agents_result`: \
+`agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
+when you can't go on without one), and `agents_result` reads what it concluded: \
 they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
 skill says how). To show the person a file from this machine (a screenshot, a recording, a PDF, a log), write its full \
 path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \

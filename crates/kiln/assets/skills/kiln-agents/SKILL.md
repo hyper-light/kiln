@@ -57,7 +57,13 @@ return { waited: done.agents.map(x => ({ id: x.id, stand: x.stand })),
 
 ## Waiting and reading results
 
-`agents_wait` returns when each agent has **settled** (idle, needs a person, paused for a usage
+**You don't have to wait.** Once your children are started, carry on with other work, or end your
+turn: kiln tells you, in a message after your turn, when each one ends its turn (with its last
+words), needs a person, stops or ends, and starts your next turn with it if you're idle. Children
+that settle together come in one message. Then read what one concluded with `agents_result`.
+
+Wait only when you can't go on without a result: `agents_wait` returns when each agent has
+**settled** (idle, needs a person, paused for a usage
 limit, stopped, or ended), or when its time is up (`timeout_s`, at most 600: call it again to
 wait longer). `until: "change"` returns on any change; `any: true` when the first is done. A
 message you just sent counts: an agent isn't settled until it has had its turn.

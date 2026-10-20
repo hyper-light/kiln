@@ -44,8 +44,10 @@ for the rest the message "Your goal isn't met yet: …". That covers an agent th
   the new session;
 - stopped altogether: a message starts it again.
 
-Reminders wait 30 seconds after the agent stops, then twice as long each time one brings no real
-work (up to 15 minutes); once the agent has worked on the goal for two minutes, they start over.
+Reminders wait while agents it started are at work (it ended its turn to let them, and is told
+when each settles: docs/agents.md, "Told, not made to wait"). They wait 30 seconds after the
+agent stops, then twice as long each time one brings no real work (up to 15 minutes); once the
+agent has worked on the goal for two minutes, they start over.
 The goal under way shows how many times it was sent again, and when. While the agent's machine is
 away, the stack waits for it and goes on when it's back. Only you stop it: **Pause**, **Skip
 this one** or **Clear**; the stack pauses by itself only when the agent is gone (closed).
@@ -107,8 +109,9 @@ the timeline: "Your last turn stopped part-way (stop_sequence). Pick up where yo
 carry on with the work. If it's all done, say so; if you need something from me, ask."
 
 It doesn't when you stopped the turn, the agent waits on you (an approval, a question, last words
-that ask something), a message is queued, a background task of its runs, a usage limit paused it,
-or a goal stack drives it. It keeps an agent going at most five turns in a row since a person last
+that ask something), a message is queued, a background task of its runs or an agent it started is
+at work (it's told when that agent settles: docs/agents.md, "Told, not made to wait"), a usage
+limit paused it, or a goal stack drives it. It keeps an agent going at most five turns in a row since a person last
 said something, and stops after two of its own turns call no tool.
 
 Each turn's end is in the agent's state as `last_turn` (`{at, how: "done" | "cut" | "stopped" |

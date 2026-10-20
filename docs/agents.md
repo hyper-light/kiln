@@ -241,6 +241,29 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
+### Told, not made to wait
+
+Nothing makes a parent wait for its children, or for its own work that runs on its own (a
+subagent or a command its harness started in the background): it decides when to wait.
+
+- **When a child settles** (its turn over, a person needed, stopped, ended, paused at a usage
+  limit), kiln tells its parent (`crate::harness::told`), in a message after the parent's turn
+  that starts its next turn if it's idle, as Claude Code tells an agent of its own background
+  subagents: "Agent “Fix the parser” (01a1b2c3), which you started, ended its turn: … agents_result
+  {"agent": …} has its whole reply and what it changed." Children that settle together come in
+  one message; only a settle after work the server saw is told (not one from before a restart), a
+  few seconds on (a wait under way returns first). What the parent saw itself through
+  `agents_wait` or `agents_result` isn't told again.
+- **Waiting is the parent's choice**: `agents_wait` blocks until its children settle, for one that
+  can't go on without them.
+- **A parent whose children are at work isn't prodded**: keep-going (docs/goals.md) and a goal
+  stack's reminders leave it be until they settle, as keep-going does while its background tasks
+  run.
+- **A Claude Code subagent in the background is its own**: its output (forwarded with its parent
+  call's id) shows under it, and doesn't make its parent's ended turn start again, so a message to
+  the parent goes to it at once rather than after the subagent. Claude Code starts the parent's
+  next turn itself when the subagent is done.
+
 ### Operations
 
 Each is an operation of kiln's one registry: an HTTP route, an MCP tool (`agents_start`, …), a

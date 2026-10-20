@@ -406,9 +406,11 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         let now = now_ms();
         let all = hub.harness.list();
         for info in all.iter().filter(|i| !running.contains(&i.id)) {
-            keep::tick(&hub, info, now).await;
+            keep::tick(&hub, info, now, crate::harness::told::children_working(&all, &info.id)).await;
         }
         keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
+        // Parents told of their children that settled, so none has to wait for them.
+        crate::harness::told::tick(&hub, &all, now).await;
         // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
         crate::harness::elsewhere::tick(&hub, &all, now);
     }
@@ -477,7 +479,7 @@ enum Next {
     Done,
 }
 
-fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
+fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool) -> Next {
     // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
     // server has just started. (A closed agent's stack goes when it's closed.)
     let Some(info) = info else { return Next::Wait };
@@ -487,8 +489,10 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
         return Next::Wait;
     }
     let busy = matches!(info.status, Status::Running | Status::Waiting | Status::Starting);
-    // Nothing waiting on you or in its queue; stopped counts (a message starts it again).
-    let free = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0;
+    // Nothing waiting on you or in its queue; stopped counts (a message starts it again). Not
+    // while agents it started are at work: it ended its turn to let them, and is told when each
+    // settles (`harness::told`).
+    let free = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0 && !children;
     if let Some(item) = stack.items.iter().find(|i| i.status == "active") {
         let id = item.id.clone();
         if busy {
@@ -530,9 +534,11 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
 
 async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
     let stack = get(hub, agent).await?;
-    let info = hub.harness.list().into_iter().find(|i| i.id == agent);
+    let all = hub.harness.list();
+    let children = crate::harness::told::children_working(&all, agent);
+    let info = all.into_iter().find(|i| i.id == agent);
     let now = now_ms();
-    let next = decide(&stack, info.as_ref(), now);
+    let next = decide(&stack, info.as_ref(), now, children);
     let a = agent.to_owned();
     // What its harness last said of the goal it pursues: a verdict on what's sent now must be newer.
     let prior_at = info.as_ref().and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
