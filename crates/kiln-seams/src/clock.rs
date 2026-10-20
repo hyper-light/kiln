@@ -361,15 +361,23 @@ fn c3<F: ClockFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+/// Whether `s` has completed while the clock is still short of `deadline`: polled first, the clock
+/// read after, so a completion it saw happened no later than that reading (a real clock that
+/// stalled past the deadline may have completed it rightly: then there's nothing to say).
+fn early(c: &dyn Clock, s: &mut Sleep, deadline: Instant) -> bool {
+    let completed = done(s);
+    completed && c.now() < deadline
+}
+
 fn c4<F: ClockFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let c = f.clock();
         let q = f.quantum();
         let deadline = later(c.now(), times(q, 8));
         let mut s = c.sleep_until(deadline);
-        ensure(!done(&mut s), || "a sleep completed long before its deadline".into())?;
+        ensure(!early(c.as_ref(), &mut s, deadline), || "a sleep completed long before its deadline".into())?;
         f.pass(q).await;
-        ensure(!done(&mut s), || "a sleep completed before its deadline".into())?;
+        ensure(!early(c.as_ref(), &mut s, deadline), || "a sleep completed before its deadline".into())?;
         f.pass(times(q, 8)).await;
         s.await;
         ensure(c.now() >= deadline, || "a sleep completed while now() was short of its deadline".into())
@@ -391,15 +399,17 @@ fn c6<F: ClockFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         let c = f.clock();
         let q = f.quantum();
         // Started out of order, deadlines 4q apart: each completes in its turn.
-        let mut third = c.sleep(times(q, 9));
-        let mut first = c.sleep(q);
-        let mut second = c.sleep(times(q, 5));
+        let start = c.now();
+        let (d1, d2, d3) = (later(start, q), later(start, times(q, 5)), later(start, times(q, 9)));
+        let mut third = c.sleep_until(d3);
+        let mut first = c.sleep_until(d1);
+        let mut second = c.sleep_until(d2);
         f.pass(times(q, 2)).await;
         ensure(done(&mut first), || "the first deadline passed, its sleep isn't complete".into())?;
-        ensure(!done(&mut second) && !done(&mut third), || "a later sleep completed with the first".into())?;
+        ensure(!early(c.as_ref(), &mut second, d2) && !early(c.as_ref(), &mut third, d3), || "a later sleep completed with the first".into())?;
         f.pass(times(q, 4)).await;
         ensure(done(&mut second), || "the second deadline passed, its sleep isn't complete".into())?;
-        ensure(!done(&mut third), || "the last sleep completed with the second".into())?;
+        ensure(!early(c.as_ref(), &mut third, d3), || "the last sleep completed with the second".into())?;
         f.pass(times(q, 4)).await;
         ensure(done(&mut third), || "the last deadline passed, its sleep isn't complete".into())
     })
