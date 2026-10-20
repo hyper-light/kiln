@@ -294,7 +294,7 @@ export function Inspector({
   onOpenTask?: (toolId: string) => void;
   className?: string;
 }) {
-  const events = useSession(store, (s) => s.events);
+  const events = useSession(store, (s) => (tab === "changes" && s.changes ? NO_EVENTS : s.events));
   const changes = useSession(store, (s) => s.changes);
   // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
   const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));
@@ -303,14 +303,15 @@ export function Inspector({
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
   const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
   const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
-  const runs = useSameList(React.useMemo(() => runsOf(events), [events]));
+  const runs = useSameList(React.useMemo(() => (tab === "tools" ? runsOf(events) : []), [events, tab]));
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
   // The plan it last proposed (plan mode), to read and keep.
   const proposed = React.useMemo(() => {
+    if (tab !== "plan") return "";
     const e = events.findLast((e) => e.kind === "tool" && e.tool === "plan");
     return e?.kind === "tool" ? ((e.input as { plan?: string } | null)?.plan ?? e.output ?? "") : "";
-  }, [events]);
+  }, [events, tab]);
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
   const mcp = state?.mcp ?? [];
   const tabs: { id: InspectorTab; label: string; count?: string }[] = [

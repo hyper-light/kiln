@@ -706,6 +706,13 @@ a.plan-row-main:hover {
 .run-agent .run-what {
   padding-left: 0;
 }
+/* A met step's diff in review, linked as its agent is. */
+.run-review a {
+  color: var(--color-foreground);
+}
+.run-review a:hover {
+  color: var(--color-link);
+}
 .run-goal {
   overflow: hidden;
   text-overflow: ellipsis;

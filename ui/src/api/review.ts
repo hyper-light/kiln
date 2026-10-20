@@ -3,6 +3,7 @@
  * reviews, viewed files, landing, stacks, the inbox and the land queue.
  */
 import type { Res } from "@/lib/data";
+import { apiPath } from "@/lib/peer-base";
 import { request } from "./client";
 
 export type DiffState = "draft" | "needs-review" | "changes-requested" | "accepted" | "landing" | "landed" | "abandoned";
@@ -233,7 +234,7 @@ export const reviewApi = {
   queue: (repo: string, signal?: AbortSignal) => request<{ entries: QueueEntry[] }>("GET", `/api/repos/${enc(repo)}/queue`, undefined, { signal }).then((r) => r.entries),
   dequeue: (entry: string) => request<unknown>("DELETE", `/api/queue/${enc(entry)}`),
   /** A file's bytes at a version, old or new side (images). */
-  blobUrl: (key: string, version: number, path: string, side: "old" | "new") => `/api/diffs/${enc(key)}/versions/${version}/blob?path=${enc(path)}&side=${side}`,
+  blobUrl: (key: string, version: number, path: string, side: "old" | "new") => apiPath(`/api/diffs/${enc(key)}/versions/${version}/blob?path=${enc(path)}&side=${side}`),
 };
 
 /** Events that change what review pages show. */

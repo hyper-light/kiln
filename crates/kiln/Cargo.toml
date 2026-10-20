@@ -79,6 +79,9 @@ socket2 = { version = "0.6.5", features = ["all"] }
 # Process tables everywhere (AI sessions); host and process metrics where there is no procfs.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
 rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+# WebRTC to streams' viewers (docs/previews.md, "Streams"): ICE, DTLS, SRTP and RTP, sans-IO; its
+# crypto aws-lc-rs, already in the tree.
+str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"] }
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]

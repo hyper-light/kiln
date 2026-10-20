@@ -2,8 +2,9 @@
  * kiln's router (TanStack Router, under TanStack Start). Pages move into it from the app it still
  * hosts (`routes/$.tsx`) one at a time.
  */
-import { createRouter } from "@tanstack/react-router";
+import { createRouter, type LocationRewrite } from "@tanstack/react-router";
 import { routeTree } from "./routeTree.gen";
+import { PEER_BASE } from "./lib/peer-base";
 
 /**
  * Search params as plain strings, as the URL has them (TanStack's default reads JSON): what the
@@ -28,8 +29,27 @@ function stringifySearch(o: Record<string, unknown>): string {
  */
 const keepsItsPlace = (path: string) => /^\/agents\/(?!plans(?:\/|$)|sessions(?:\/|$))[^/]+\/?$/.test(path);
 
+/**
+ * Drawing a peered cluster opened by address, every page is under its path (lib/peer-base.ts): the
+ * path comes off the address as the router reads it, and goes back on the addresses it makes. A
+ * rewrite rather than `basepath`, which TanStack Start sets again as it hydrates.
+ */
+const underPeer: LocationRewrite | undefined = PEER_BASE
+  ? {
+      input: ({ url }) => {
+        if (url.pathname === PEER_BASE) url.pathname = "/";
+        else if (url.pathname.startsWith(`${PEER_BASE}/`)) url.pathname = url.pathname.slice(PEER_BASE.length);
+        return url;
+      },
+      output: ({ url }) => {
+        url.pathname = `${PEER_BASE}${url.pathname}`;
+        return url;
+      },
+    }
+  : undefined;
+
 export function getRouter() {
-  return createRouter({ routeTree, scrollRestoration: ({ location }) => !keepsItsPlace(location.pathname), parseSearch, stringifySearch });
+  return createRouter({ routeTree, rewrite: underPeer, scrollRestoration: ({ location }) => !keepsItsPlace(location.pathname), parseSearch, stringifySearch });
 }
 
 declare module "@tanstack/react-router" {

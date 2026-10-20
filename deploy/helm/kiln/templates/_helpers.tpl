@@ -80,6 +80,12 @@ Effective kiln.toml as YAML: derived defaults overlaid with .Values.config.
   "quic_advertise" (default $inQuic .Values.quicAdvertise)
   "tls_names" (uniq $tlsNames)
   "data_dir" .Values.persistence.mountPath -}}
+{{- if .Values.ports.webrtc -}}
+{{- $_ := set $server "webrtc_addr" (printf "0.0.0.0:%v" .Values.ports.webrtc) -}}
+{{- with .Values.webrtcAdvertise -}}
+{{- $_ := set $server "webrtc_advertise" . -}}
+{{- end -}}
+{{- end -}}
 {{- $k8s := dict
   "namespace" (include "kiln.jobsNamespace" .)
   "agent_image" (default (include "kiln.image" .) .Values.jobAgentImage)

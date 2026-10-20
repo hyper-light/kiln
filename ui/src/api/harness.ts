@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { wsUrl } from "@/api/client";
+import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import type { TerminalSessionInfo } from "./types";
 
@@ -891,7 +892,7 @@ export interface Recording {
 }
 
 /** Where a recording's file is read (`video`, `inputs`, `test`). */
-export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => `/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`;
+export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => apiPath(`/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`);
 
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),

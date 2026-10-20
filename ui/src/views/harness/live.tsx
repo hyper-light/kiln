@@ -1,8 +1,9 @@
 /**
  * Live pages agents show in the conversation (docs/previews.md, "Streams"): an agent's
  * `show_live` call, drawn as the page itself running on the agent's machine (its dev server, its
- * files, its network), streamed here. Its picture comes as video (WebCodecs, the size of this frame
- * at this screen's density), its sound as Opus once you turn it on; what you do in it goes back:
+ * files, its network), streamed here. Its picture comes as video (the size of this frame at this
+ * screen's density), its sound as Opus once you turn it on: over WebRTC when the server has it and
+ * it gets through, else over its socket (WebCodecs) as it does until then. What you do in it goes back:
  * taps and the mouse, the wheel, keys by meaning, text from a phone's keyboard, a paste. Out of
  * view it's let go (the stream pauses, nothing is sent) and its last picture stays.
  *
@@ -28,8 +29,13 @@ const macViewer = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(nav
 const touchViewer = typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
 const decodes = typeof window !== "undefined" && "VideoDecoder" in window;
 const plays = typeof window !== "undefined" && "AudioDecoder" in window;
+const rtcs = typeof window !== "undefined" && "RTCPeerConnection" in window;
+/** WebRTC that didn't play here (this server's port out of reach, a codec this browser lacks):
+ *  after two, this page doesn't try it again (the socket does). */
+let rtcMisses = 0;
 
-/** One viewing of a stream: its socket, its decoders, what it draws. */
+/** One viewing of a stream: its socket, its decoders, what it draws; its WebRTC peer, when the
+ *  server has WebRTC (`rtc`: its picture plays in `player`, under the canvas, which is clear then). */
 class Viewing {
   private ws: WebSocket;
   private video: VideoDecoder | null = null;
@@ -40,12 +46,17 @@ class Viewing {
   private parts = new Map<string, Uint8Array[]>();
   private frames = 0;
   private counted = performance.now();
+  private pc: RTCPeerConnection | null = null;
+  private rtc = false;
+  private rtcWait: ReturnType<typeof setTimeout> | undefined;
+  private soundOn = false;
   closed = false;
 
   constructor(
     url: string,
     private canvas: HTMLCanvasElement,
-    private on: { open: () => void; status: (s: Status, why?: string) => void; event: (e: Record<string, unknown>) => void; fps: (n: number) => void },
+    private player: HTMLVideoElement | null,
+    private on: { open: () => void; status: (s: Status, why?: string) => void; event: (e: Record<string, unknown>) => void; fps: (n: number) => void; rtc: (on: boolean) => void },
   ) {
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
@@ -62,6 +73,8 @@ class Viewing {
   }
 
   sound(on: boolean) {
+    this.soundOn = on;
+    if (this.player) this.player.muted = !on;
     if (!plays) return;
     if (on && !this.ctx) {
       this.ctx = new AudioContext({ sampleRate: 48000 });
@@ -74,17 +87,141 @@ class Viewing {
 
   close() {
     this.closed = true;
+    this.unpeer(false);
     this.ws.close(1000);
     for (const d of [this.video, this.audio]) if (d && d.state !== "closed") d.close();
     void this.ctx?.close();
   }
 
   private event(text: string) {
+    let e: Record<string, unknown>;
     try {
-      this.on.event(JSON.parse(text) as Record<string, unknown>);
+      e = JSON.parse(text) as Record<string, unknown>;
     } catch {
-      // Not one kiln sends.
+      return; // Not one kiln sends.
     }
+    const w = e.webrtc as { can?: boolean; answer?: string; error?: string; gone?: string } | undefined;
+    if (!w) return this.on.event(e);
+    if (w.can) void this.offer();
+    else if (w.answer && this.pc) this.pc.setRemoteDescription({ type: "answer", sdp: w.answer }).catch(() => this.unpeer(true));
+    else if (w.error !== undefined || w.gone !== undefined) this.unpeer(false);
+  }
+
+  /** A peer offered to the server: the picture and sound come over it once it plays. */
+  private async offer() {
+    const player = this.player;
+    if (!rtcs || !player || this.pc || this.closed || rtcMisses >= 2) return;
+    let pc: RTCPeerConnection;
+    try {
+      pc = new RTCPeerConnection({ bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" });
+    } catch {
+      return;
+    }
+    this.pc = pc;
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    const media = new MediaStream();
+    pc.ontrack = (e) => {
+      media.addTrack(e.track);
+      // Each picture as soon as it comes: there's nothing to smooth (a page changes when it does).
+      const r = e.receiver as { jitterBufferTarget?: number | null; playoutDelayHint?: number };
+      if ("jitterBufferTarget" in e.receiver) r.jitterBufferTarget = 0;
+      else r.playoutDelayHint = 0;
+      if (player.srcObject !== media) player.srcObject = media;
+      player.muted = true;
+      void player
+        .play()
+        .then(() => {
+          if (!this.soundOn) return;
+          // A browser that wants a gesture for sound (Safari) pauses it as it's unmuted: the
+          // picture goes on without it, until Sound is pressed again.
+          const keep = () => {
+            player.muted = true;
+            void player.play().catch(() => undefined);
+          };
+          player.addEventListener("pause", keep, { once: true });
+          setTimeout(() => player.removeEventListener("pause", keep), 1000);
+          player.muted = false;
+        })
+        .catch(() => undefined);
+    };
+    pc.onconnectionstatechange = () => {
+      if (this.pc === pc && (pc.connectionState === "failed" || pc.connectionState === "closed")) this.unpeer(true);
+    };
+    this.watch(pc, player);
+    // It plays soon or not at all (this server's port out of reach): the socket goes on either way.
+    this.rtcWait = setTimeout(() => {
+      if (this.pc === pc && !this.rtc) this.unpeer(true);
+    }, 10_000);
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      if (this.pc === pc) this.send({ webrtc: { offer: pc.localDescription?.sdp } });
+    } catch {
+      if (this.pc === pc) this.unpeer(false);
+    }
+  }
+
+  /** Its pictures as they're shown: the first makes it what's seen here; each is counted. */
+  private watch(pc: RTCPeerConnection, player: HTMLVideoElement) {
+    const v = player as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number };
+    if (v.requestVideoFrameCallback) {
+      const each = () => {
+        if (this.pc !== pc || this.closed) return;
+        if (player.videoWidth > 0) this.shown(player, 1);
+        v.requestVideoFrameCallback?.(each);
+      };
+      v.requestVideoFrameCallback(each);
+      return;
+    }
+    // No frame callbacks (an older Firefox): its count of pictures, a few times a second.
+    let seen = 0;
+    const t = setInterval(() => {
+      if (this.pc !== pc || this.closed) return clearInterval(t);
+      const n = player.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+      if (n > seen && player.videoWidth > 0) this.shown(player, n - seen);
+      seen = n;
+    }, 250);
+  }
+
+  /** A picture WebRTC showed: the canvas is clear over it (and the size of it, for where taps go). */
+  private shown(player: HTMLVideoElement, n: number) {
+    const c = this.canvas;
+    if (!this.rtc) {
+      this.rtc = true;
+      rtcMisses = 0;
+      clearTimeout(this.rtcWait);
+      this.send({ webrtc: { playing: true } });
+      c.getContext("2d")?.clearRect(0, 0, c.width, c.height);
+      this.on.rtc(true);
+    }
+    if (c.width !== player.videoWidth || c.height !== player.videoHeight) {
+      c.width = player.videoWidth;
+      c.height = player.videoHeight;
+    }
+    this.count(n);
+  }
+
+  /** WebRTC gone, or never there: the socket's pictures are drawn here again (`tell`: the server's
+   *  told, when it didn't say so itself). */
+  private unpeer(tell: boolean) {
+    const pc = this.pc;
+    if (!pc) return;
+    this.pc = null;
+    clearTimeout(this.rtcWait);
+    pc.close();
+    const was = this.rtc;
+    this.rtc = false;
+    const v = this.player;
+    if (v) {
+      // Its last picture stays until the socket's first.
+      if (was && v.videoWidth > 0) this.canvas.getContext("2d")?.drawImage(v, 0, 0, this.canvas.width, this.canvas.height);
+      v.srcObject = null;
+    }
+    if (was) {
+      this.needKey = true;
+      this.on.rtc(false);
+    } else rtcMisses++;
+    if (tell) this.send({ webrtc: { playing: false, close: true } });
   }
 
   private chunk(buf: ArrayBuffer) {
@@ -113,7 +250,11 @@ class Viewing {
       return;
     }
     if (c.kind === "a") {
-      if (this.ctx && this.audio?.state === "configured") this.audio.decode(new EncodedAudioChunk({ type: "key", timestamp: c.ts, data }));
+      if (this.ctx && !this.rtc && this.audio?.state === "configured") this.audio.decode(new EncodedAudioChunk({ type: "key", timestamp: c.ts, data }));
+      return;
+    }
+    if (this.rtc) {
+      this.needKey = true;
       return;
     }
     if (!this.video || this.video.state !== "configured") return;
@@ -146,13 +287,22 @@ class Viewing {
 
   private draw(f: VideoFrame) {
     const c = this.canvas;
+    if (this.rtc) {
+      f.close();
+      return;
+    }
     if (c.width !== f.displayWidth || c.height !== f.displayHeight) {
       c.width = f.displayWidth;
       c.height = f.displayHeight;
     }
     c.getContext("2d")?.drawImage(f, 0, 0, c.width, c.height);
     f.close();
-    this.frames++;
+    this.count(1);
+  }
+
+  /** Pictures shown, said each second as a rate. */
+  private count(n: number) {
+    this.frames += n;
     const now = performance.now();
     if (now - this.counted >= 1000) {
       this.on.fps(Math.round((this.frames * 1000) / (now - this.counted)));
@@ -235,6 +385,9 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const [marks, setMarks] = React.useState<{ n: number; x: number; y: number }[]>([]);
   const quiet = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const canvas = React.useRef<HTMLCanvasElement | null>(null);
+  /** WebRTC's picture, and whether it's what's seen (else the socket's, drawn on the canvas). */
+  const player = React.useRef<HTMLVideoElement | null>(null);
+  const [path, setPath] = React.useState<"webrtc" | "socket">("socket");
   /** The page's field that has the focus, and where its fields are; text selected in it. */
   const [field, setField] = React.useState<PageField | null>(null);
   const places = React.useRef<FieldPlace[]>([]);
@@ -275,7 +428,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     if (!c || !decodes || viewing.current) return;
     const s = live.current.stream;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const v = new Viewing(`${proto}//${location.host}/api/harness/sessions/${encodeURIComponent(s.session)}/streams/${s.id}/ws`, c, {
+    const v = new Viewing(`${proto}//${location.host}/api/harness/sessions/${encodeURIComponent(s.session)}/streams/${s.id}/ws`, c, player.current, {
       // Its size first, before anything done in it: the page lays out at this frame's.
       open: () => {
         resize();
@@ -287,6 +440,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         if (st === "ended" && viewing.current === v) viewing.current = null;
       },
       fps: setFps,
+      rtc: (on) => setPath(on ? "webrtc" : "socket"),
       event: (e) => {
         const opened = e.opened as { platform?: string; engine?: string; device?: { name: string; width: number; height: number } | null } | undefined;
         if (opened) {
@@ -525,7 +679,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const what = [engine !== "chromium" ? engine : "", held?.name ?? ""].filter(Boolean).join(" · ");
   const word = (what ? `${what} · ` : "") + (status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended");
   return (
-    <div className="pg lv" data-ev={ev} data-ev-live={stream.id} data-status={status}>
+    <div className="pg lv" data-ev={ev} data-ev-live={stream.id} data-status={status} data-path={path}>
       <div className="pg-head">
         <PrismLabel live={status === "live"} className="pg-title">
           {title}
@@ -638,6 +792,9 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         />
       </div>
       <div className="pg-box lv-box" ref={box}>
+        {/* WebRTC's picture, once it plays: under the canvas, which takes what's done in the page
+            and is clear then. */}
+        <video ref={player} className="lv-video" muted playsInline autoPlay aria-hidden="true" tabIndex={-1} />
         <canvas
           ref={canvas}
           className="lv-canvas"
