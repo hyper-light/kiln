@@ -662,8 +662,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "harness", "files"]) => boxed(|| harness_upload(&hub, &q, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
         // A page it showed: its heights, as its machine and its viewers' own browsers measured them.
-        (&Method::GET, ["api", "harness", "sessions", id, "pages", page, "heights"]) => page_heights(&hub, id, page).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "pages", page, "heights"]) => page_seen(&hub, id, page, req).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "pages", page, "heights"]) => boxed(|| page_heights(&hub, id, page)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "pages", page, "heights"]) => boxed(|| page_seen(&hub, id, page, req)).await,
         // Pages streamed from its machine (`crate::harness::streams`).
         (&Method::GET, ["api", "harness", "sessions", id, "streams"]) => {
             let me = person(&req);
