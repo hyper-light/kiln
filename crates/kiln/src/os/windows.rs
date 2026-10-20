@@ -29,15 +29,15 @@ pub fn run_elevated(program: &Path, parameters: &str, timeout: std::time::Durati
 }
 
 /// Put `dir` on the user's PATH (`HKCU\Environment`), for what starts from now on: new
-/// terminals, and Explorer, which is told it changed. `Ok(false)` when it was on it already.
-pub fn add_to_user_path(dir: &Path) -> io::Result<bool> {
+/// terminals, and Explorer, which is told it changed. `Ok(None)` when it was on it already.
+pub fn add_to_user_path(dir: &Path) -> io::Result<Option<super::PathAdded>> {
     let (list, kind) = super::win32::user_path()?.unwrap_or((String::new(), super::win32::REG_EXPAND_SZ));
     let Some(list) = super::path_list_with(&list, &dir.display().to_string(), |name| std::env::var(name).ok()) else {
-        return Ok(false);
+        return Ok(None);
     };
     super::win32::set_user_path(&list, kind)?;
     super::win32::announce_environment();
-    Ok(true)
+    Ok(Some(super::PathAdded { file: None, now: None }))
 }
 
 /// Windows identifies users by SID, not a numeric id; nothing on Windows asks for one.
@@ -193,11 +193,11 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("kiln path test {}", std::process::id()));
         let result = (|| -> anyhow::Result<()> {
-            anyhow::ensure!(add_to_user_path(&dir)?, "not added");
+            anyhow::ensure!(add_to_user_path(&dir)?.is_some(), "not added");
             let (after, after_kind) = super::super::win32::user_path()?.ok_or_else(|| anyhow::anyhow!("PATH gone"))?;
             anyhow::ensure!(after_kind == kind, "registry type {kind} became {after_kind}");
             anyhow::ensure!(after == format!("{};{}", before.trim_end_matches(';'), dir.display()), "PATH is now {after}");
-            anyhow::ensure!(!add_to_user_path(&dir)?, "added twice");
+            anyhow::ensure!(add_to_user_path(&dir)?.is_none(), "added twice");
             Ok(())
         })();
         super::super::win32::set_user_path(&before, kind)?;

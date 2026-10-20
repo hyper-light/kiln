@@ -54,7 +54,7 @@ binaries and `SHA256SUMS` for `x86_64`/`aarch64-unknown-linux-musl` (fully stati
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | `kiln install` starts on boot with | systemd (else cron `@reboot`, else XDG autostart) | launchd (LaunchAgent; LaunchDaemon as root) | a Scheduled Task at boot that runs as you, whether or not anyone signs in (administrator rights, asked for once; without them, at sign-in) |
-| binary | `~/.local/bin` (`/usr/local/bin` as root) | same | `%LOCALAPPDATA%\Programs\kiln`, put on your PATH |
+| binary | `~/.local/bin` (`/usr/local/bin` as root), put on your PATH (a line in your shell's startup file, when it isn't) | same | `%LOCALAPPDATA%\Programs\kiln`, put on your PATH |
 | config / data | `~/.config/kiln`, `~/.local/share/kiln` (`/etc/kiln`, `/var/lib/kiln` as root) | same | `%APPDATA%\kiln`, `%LOCALAPPDATA%\kiln` |
 | job steps (no `shell:`) | `bash -eo pipefail`, else `sh -e` | same | PowerShell 7 (`pwsh`), else Windows PowerShell |
 | job process trees | process groups | process groups | job objects (they die with the agent) |

@@ -78,6 +78,16 @@ pub fn have(name: &str) -> bool {
     which(name).is_some()
 }
 
+/// Where [`add_to_user_path`] put a folder on the user's PATH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathAdded {
+    /// The shell startup file that puts it there (Unix); none where the system keeps the user's
+    /// PATH itself (Windows).
+    pub file: Option<PathBuf>,
+    /// What puts it on this terminal's PATH too: only new terminals read that file.
+    pub now: Option<String>,
+}
+
 /// A Windows `Path` value (`;`-separated, as the registry keeps it) with `dir` added at its end,
 /// or `None` when one of its entries is `dir` already. Entries are compared as Windows compares
 /// folders: without case, quotes or a trailing `\`, and with `%VARIABLES%` expanded by `var`.

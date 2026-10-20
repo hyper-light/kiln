@@ -12,8 +12,8 @@
 //!
 //! | OS      | `--boot auto`                                   | binary                                  |
 //! |---------|-------------------------------------------------|-----------------------------------------|
-//! | Linux   | systemd unit, else crontab `@reboot`, else XDG autostart | `~/.local/bin` (`/usr/local/bin` as root) |
-//! | macOS   | launchd: a LaunchAgent (a LaunchDaemon as root) | `~/.local/bin` (`/usr/local/bin` as root) |
+//! | Linux   | systemd unit, else crontab `@reboot`, else XDG autostart | `~/.local/bin` (`/usr/local/bin` as root), put on PATH |
+//! | macOS   | launchd: a LaunchAgent (a LaunchDaemon as root) | `~/.local/bin` (`/usr/local/bin` as root), put on PATH |
 //! | Windows | a Scheduled Task at boot, as the user (administrator rights, asked for once), else one at sign-in (none), else the Startup folder | `%LOCALAPPDATA%\Programs\kiln`, put on the user's PATH |
 
 use std::path::{Path, PathBuf};
@@ -158,13 +158,20 @@ fn place_binary(dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Windows: the binary's folder on the user's PATH, so `kiln` works in every new terminal (on
-/// Linux and macOS it goes where PATH usually looks already).
+/// The binary's folder on the user's PATH, so `kiln` works in every new terminal: on Windows in
+/// the user's own PATH; elsewhere, when this terminal's PATH hasn't it (`~/.local/bin` on a Mac),
+/// through a line in the startup file of the user's shell.
 fn put_on_path(bin: &Path) {
-    let Some(dir) = bin.parent().filter(|_| cfg!(windows)) else { return };
+    let Some(dir) = bin.parent() else { return };
     match crate::os::add_to_user_path(dir) {
-        Ok(true) => say(format!("path        {} added to your PATH (new terminals find `kiln`)", dir.display())),
-        Ok(false) => say(format!("path        {} is on your PATH", dir.display())),
+        Ok(Some(added)) => {
+            let place = added.file.map(|f| format!(" in {}", f.display())).unwrap_or_default();
+            say(format!("path        {} added to your PATH{place} (new terminals find `kiln`)", dir.display()));
+            if let Some(now) = added.now {
+                say(format!("            for this terminal too, run: {now}"));
+            }
+        }
+        Ok(None) => say(format!("path        {} is on your PATH", dir.display())),
         Err(e) => say(format!("path        {} not added to your PATH ({e}): run kiln as {}", dir.display(), bin.display())),
     }
 }
