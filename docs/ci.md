@@ -189,7 +189,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
-| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check for CD (R04's kiln half), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, R04's CD half, AC04, microVM containment (W13) left |
+| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, microVM containment (W13) left |
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
@@ -4058,7 +4058,7 @@ code from outside a repository's trust safely: microVMs or containers, limited e
 - **W18-AC04 Deploy policy.** An image without matching provenance is refused by an environment
   with `require-provenance`, and one with it deploys. *E2E.*
 
-**Progress.** R01, R02, R03, R05–R08, AC01, AC02 and AC03 (in containers) done; R04's kiln
+**Progress.** R01–R08, AC01, AC02, AC03 (in containers) and AC04 done; R04's kiln
 half:
 - **Attesting.** `kiln/attest@v1` takes GitHub's subjects (`subject-path` patterns,
   `subject-name` with `subject-digest`, `subject-checksums`) and kiln's (`subject-image`, whose
@@ -4161,11 +4161,16 @@ Done since:
   branches }`, globs) answers whether kiln's own provenance about a digest, its signature checked
   again, meets the requirement: `{ verified, attestation }`, or `{ verified: false, why }`. CD's
   `require-provenance` asks it before it deploys an image (W15-R03).
+- *Done.* R04's CD half and AC04: an environment's `require_provenance: { builder, workflows,
+  branches }` (deploy-api.md §9.1) holds a release until kiln has provenance of each artifact it
+  deploys (for half an hour, its build perhaps still attesting it), refuses one whose provenance
+  doesn't meet it, and lets one that does go, the attestation its evidence. On the deploy-api test
+  server: a release of a file `build.yml` hadn't built yet waited, and landed once the build on
+  `main` attested it; one built from `feature` was refused.
 
 Left:
 - attaching to images in other registries;
 - the SBOM differences in review;
-- R04's CD half (deploy-api's) and AC04;
 - microVM and `k8s` containment (W13), and the host's network namespace (opt-in).
 
 ### W19 Insights, audit and notifications

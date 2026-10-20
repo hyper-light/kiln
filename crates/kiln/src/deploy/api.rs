@@ -14,6 +14,7 @@
 //! | `POST`, `GET`, `DELETE /apps/{app}/environments/{env}` | register, show, deregister (`?keep=true`) |
 //! | `POST /apps/{app}/environments/{env}/pause`, `…/resume` | the provider's automation |
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
+//! | `GET /link`; `GET /apps/{app}/environments/{env}/statement?audience` | for linked servers (§11): where this one is and the issuer it signs with; what runs of an app there and what's on its way, as a JWT signed for `audience` |
 //! | `GET /apps/{app}/environments/{env}/resources`, `/manifests`, `/diff` (`?version` on Argo CD), `/logs?kind&name` | what runs, as the provider sees it |
 //! | `GET /apps/{app}/environments/{env}/actions?kind&name&group&namespace`; `POST …/actions` (`{kind, name, action, params}`) | what can be done to an object it runs (restart, scale, suspend, delete a pod …), and doing it |
 //! | `POST`, `GET`, `DELETE /environments/{env}/move` | moving it to another provider (`{to, handover, force}`): compared in shadow, then handed over with nothing made again; cancelled before the handover |
@@ -39,7 +40,7 @@ use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
 use super::model::{App, Environment, Release, State, Template};
-use super::{Deploy, actions, argocd, kilncd, moves, reads, store};
+use super::{Deploy, actions, argocd, kilncd, link, moves, reads, store};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 use crate::secrets::{self, Scope};
@@ -264,6 +265,16 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             ok(&boxed(|| secret_uses(&d, &who, app, env, limit)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": boxed(|| flow::candidates(&d, app, env)).await? })),
+        // For linked servers (§11): where this one is and what it signs with, and what runs of an
+        // app in one of its environments, signed for the server asking (`audience`, its issuer).
+        (&Method::GET, ["link"]) => ok(&link::about(&d.hub)),
+        (&Method::GET, ["apps", app, "environments", env, "statement"]) => {
+            let audience = q.get("audience").map(|a| a.trim()).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
+            match boxed(|| link::statement(&d, app, env, audience)).await.map_err(internal)? {
+                Some(statement) => ok(&json!({ "statement": statement })),
+                None => Err((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}"))),
+            }
+        }
 
         (&Method::GET, ["releases"]) => {
             let state = match q.get("state") {

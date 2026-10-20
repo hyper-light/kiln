@@ -11,7 +11,8 @@
 //!   ApplicationSet there); [`provider`]: what they answer; [`moves`]: an environment moved from one
 //!   to the other.
 //! - [`check`]: what a release is checked for before it is recorded; [`gates`]: what it waits for
-//!   before its commit.
+//!   before its commit ([`external`]: the checks that ask a URL or run a workflow; [`link`]: linked
+//!   kiln servers, whose signed statements prove an `after`).
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
 //! - [`scaffold`]: an app's source repository, made from its template's starter; [`init`]: its
 //!   chart on kiln's base chart (`kiln app init`).
@@ -24,11 +25,13 @@ pub mod appset;
 pub mod argocd;
 pub mod check;
 pub mod cli;
+pub mod external;
 pub mod flow;
 pub mod gates;
 pub mod host;
 pub mod init;
 pub mod kilncd;
+pub mod link;
 pub mod metrics;
 pub mod model;
 pub mod moves;
