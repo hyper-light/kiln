@@ -1498,11 +1498,12 @@ mod tests {
 
     /// WebKit's way in, WebDriver over HTTP (Safari's, WebKitGTK's), tried with whichever
     /// WebDriver `KILN_WEBDRIVER` names (and `KILN_WEBDRIVER_CAPS` its capabilities: chromedriver
-    /// does here): its pictures (PNG) as it changes, a click reaching it, where it went, said.
+    /// does here), else on a Mac with its own Safari as kiln drives it: its pictures (PNG) as it
+    /// changes, a click reaching it, where it went, said.
     #[test]
-    #[ignore = "needs KILN_WEBDRIVER (a WebDriver), and downloads and starts the real browser (about 200 MB)"]
+    #[ignore = "needs KILN_WEBDRIVER (a WebDriver) or a Mac with Safari's remote automation on, and downloads and starts the real browser (about 200 MB)"]
     fn webdriver_streams_a_page() -> anyhow::Result<()> {
-        if std::env::var_os("KILN_WEBDRIVER").is_none() {
+        if std::env::var_os("KILN_WEBDRIVER").is_none() && !(cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/safaridriver").is_file()) {
             return Ok(());
         }
         let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
@@ -1514,27 +1515,37 @@ mod tests {
             assert_eq!(opened.pointer("/opened/engine"), Some(&json!("webkit")), "{opened}");
             let s = streams().get("test-webdriver").ok_or_else(|| anyhow::anyhow!("not open"))?;
             s.control(&json!({"pause": false, "keyframe": true})).await?;
+            // Its pictures for four seconds from its first (a browser's window takes a while to come
+            // up). A picture after a pause starts from a key frame, so a slower engine's are mostly
+            // key frames: they're counted all the same.
             let (mut keys, mut frames, mut said) = (0, 0, Vec::new());
-            let end = std::time::Instant::now() + Duration::from_secs(5);
+            let start = std::time::Instant::now();
+            let mut end = start + Duration::from_secs(15);
             while std::time::Instant::now() < end {
                 match crate::rt::timeout(Duration::from_millis(200), rx.recv()).await {
-                    Ok(Ok(Out::Frame { data, .. })) => match (data.first(), data.get(1)) {
-                        (Some(b'v'), Some(b'k')) => keys += 1,
-                        (Some(b'v'), _) => frames += 1,
-                        _ => {}
-                    },
+                    Ok(Ok(Out::Frame { data, .. })) if data.first() == Some(&b'v') => {
+                        if keys + frames == 0 {
+                            end = std::time::Instant::now() + Duration::from_secs(4);
+                        }
+                        if data.get(1) == Some(&b'k') { keys += 1 } else { frames += 1 }
+                    }
                     Ok(Ok(Out::Event { json, .. })) => said.push(json),
                     _ => {}
                 }
             }
             let window = s.page.eval("[innerWidth, innerHeight]").await?;
             s.input(vec![Input::Pointer { k: "down".into(), x: 120.0, y: 90.0, button: 0, buttons: 1, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }, Input::Pointer { k: "up".into(), x: 120.0, y: 90.0, button: 0, buttons: 0, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }]).await?;
-            crate::rt::sleep(Duration::from_millis(300)).await;
-            let title = s.page.eval("document.title").await?;
+            let clicked = std::time::Instant::now();
+            let mut title = s.page.eval("document.title").await?;
+            while title != json!("clicked 120,90") && clicked.elapsed() < Duration::from_secs(3) {
+                crate::rt::sleep(Duration::from_millis(100)).await;
+                title = s.page.eval("document.title").await?;
+            }
+            eprintln!("pictures in 4 s: {keys} key frames, {frames} more; the click landed in {:?}", clicked.elapsed());
             streams().close("test-webdriver").await;
             crate::rt::sleep(Duration::from_millis(500)).await;
             super::super::driven::stop_all().await;
-            assert!(keys >= 1 && frames >= 5, "key frames {keys}, frames {frames}");
+            assert!(keys >= 1 && keys + frames >= 5, "key frames {keys}, frames {frames}");
             assert_eq!(window, json!([400, 300]), "its window, as asked");
             assert_eq!(title, json!("clicked 120,90"));
             assert!(said.iter().any(|e| e.contains("\"navigated\"")) && said.iter().any(|e| e.contains("\"loaded\"") && e.contains("driven")), "{said:?}");

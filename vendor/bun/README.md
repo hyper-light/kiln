@@ -50,23 +50,20 @@ Which Bun build each platform carries, and why:
 
 ## Updating Bun
 
-1. In `bun.json`, set `version`, and each platform's `sha256` from the new release's
-   `SHASUMS256.txt` (https://github.com/oven-sh/bun/releases/download/bun-v<version>/SHASUMS256.txt).
-2. Refresh `musl/` from the matching image, for both architectures, and update their hashes and
-   the Alpine versions (in `bun.json` and `NOTICE`):
+`scripts/vendor.py bun <version>` (docs/vendoring.md) takes a release from its sources, which
+`vendor/MANIFEST.toml` names:
 
-   ```sh
-   for arch in amd64 arm64; do
-     a=$([ $arch = amd64 ] && echo x86_64 || echo aarch64)
-     c=$(docker create --platform linux/$arch oven/bun:<version>-alpine)
-     docker cp -L $c:/lib/ld-musl-$a.so.1 musl/$a/
-     docker cp -L $c:/usr/lib/libstdc++.so.6 musl/$a/
-     docker cp -L $c:/usr/lib/libgcc_s.so.1 musl/$a/
-     docker cp $c:/lib/apk/db/installed /tmp/apk-$a   # the musl, libstdc++ and libgcc versions
-     docker rm $c
-   done
-   sha256sum musl/*/*
-   ```
+- `bun.json`'s `version`, and each platform's `sha256` from the release's `SHASUMS256.txt`
+  (https://github.com/oven-sh/bun/releases/download/bun-v<version>/SHASUMS256.txt);
+- `musl/<arch>/`, the loader, `libstdc++` and `libgcc_s`, from `oven/bun:<version>-alpine` for
+  both architectures, read from the registry with no Docker needed (the image's index digest is
+  pinned in the manifest), and their hashes and the Alpine versions in `bun.json`;
+- `licenses/`: Bun's from the release's tag, musl's and GCC's at the versions the image's packages
+  hold, and the GPL from SPDX's license list;
+- the versions `NOTICE` names, rewritten; it says which lines still need a hand.
 
-3. Update `NOTICE`, and `licenses/bun-LICENSE.md` from the new tag, then run `npm run build` in
-   `ui/` and start a server: its log says which Bun it runs.
+It then runs the gate: kiln's own, then `npm run build` in `ui/`, which packs this machine's Bun,
+checked against `bun.json`. Start a server after: its log says which Bun it runs.
+`scripts/vendor.py check bun` proves what's here is that release, byte for byte; every re-vendor
+runs it first. kiln's CI doesn't (its image comes from Docker Hub, whose pulls are rate-limited):
+there, every release build's pack checks Bun's hashes.

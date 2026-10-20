@@ -1,0 +1,19 @@
+Subject: core/build.rs never runs git
+Why: Vendored, it would embed kiln's commit; as with SOURCE_DATE_EPOCH, the build stays reproducible.
+
+diff --git a/core/build.rs b/core/build.rs
+index d304999c457ed5f35b2103193da46880fc0e0bf2..ff37dacfde69e16fb12b6ef96d3341a1589562ea 100644
+--- a/core/build.rs
++++ b/core/build.rs
+@@ -23,7 +23,10 @@ fn main() {
+     // We use `git rev-parse --git-dir` instead of hardcoding ".git" to support worktrees,
+     // where the git directory lives elsewhere (e.g., ../.git/worktrees/my-worktree).
+     // Silently ignored if git unavailable (e.g., building from tarball).
+-    let (git_hash, git_commit_epoch) = if source_date_epoch.is_some() {
++    // kiln: vendored, this copy is not Turso's git repository, so git is never asked (it would
++    // answer with kiln's commit): the build is reproducible as with SOURCE_DATE_EPOCH.
++    let _ = source_date_epoch;
++    let (git_hash, git_commit_epoch): (Option<String>, Option<i64>) = if true {
+         (None, None)
+     } else {
+         // Resolve git dir dynamically to support worktrees.

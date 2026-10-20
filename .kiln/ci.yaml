@@ -63,6 +63,23 @@ jobs:
       - run: ci/ui/run-all.sh target/debug/kiln
     artifacts: [ci/ui/shots/*/*]
 
+  vendor:
+    name: vendored projects (upstream plus kiln's recorded changes)
+    runs-on: [k8s]
+    toolchain: python
+    resources: { cpu: "1", memory: 2Gi }
+    timeout-minutes: 15
+    steps:
+      - name: git
+        run: command -v git >/dev/null || { apt-get update && apt-get install -y --no-install-recommends git ca-certificates; }
+      - name: the vendor tool's tests
+        run: python3 scripts/test_vendor.py
+      # Each git project fetched at its commit (one shallow fetch apiece). Bun's release is checked
+      # against its sources by every re-vendor, and its hashes by every release build's pack, not
+      # here: its image comes from Docker Hub, whose pulls are rate-limited (docs/vendoring.md).
+      - name: every vendored git project is its upstream plus its recorded changes
+        run: python3 scripts/vendor.py check --kind git
+
   release-binary:
     name: release build (bare metal)
     needs: [rust, ui]
