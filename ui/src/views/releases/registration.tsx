@@ -8,9 +8,9 @@ import * as React from "react";
 import { Link, useParams } from "@/lib/router";
 
 import { appHref } from "@/api/cd";
-import { boardHref, deployApi, describe, releaseAppHref, releaseHref, type RunningObject, type SecretMeta } from "@/api/deploy";
+import { boardHref, deployApi, describe, releaseAppHref, releaseHref, type ObjectAction, type RunningObject, type SecretMeta } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog } from "@/components/ui/dialog";
+import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
@@ -57,9 +57,88 @@ function Objects({ app, env }: { app: string; env: string }) {
           <SyncPair sync={o.sync} />
           <HealthPair health={o.health} />
           {says(o) && <span className="rel-msg">{says(o)}</span>}
+          <ObjectActions app={app} env={env} o={o} />
         </li>
       ))}
     </ul>
+  );
+}
+
+/** An action's name, as people say it. */
+const ACTION_WORDS: Record<string, string> = { "create-job": "Run it now", delete: "Delete it", restart: "Restart", pause: "Pause its rollout", resume: "Resume", suspend: "Suspend", scale: "Scale" };
+const actionWords = (name: string) => ACTION_WORDS[name] ?? name.replace(/-/g, " ").replace(/^./, (c) => c.toUpperCase());
+
+/** What its provider can do to an object now, in a dialog: a restart, a pause, a scale, a pod deleted. */
+function ObjectActions({ app, env, o }: { app: string; env: string; o: RunningObject }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <>
+      <Button size="sm" variant="ghost" onClick={() => setOpen(true)} aria-label={`What can be done to ${o.kind} ${o.name}`}>
+        Actions
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent eyebrow="Actions" title={`${o.kind} ${o.name}`} description="What its provider can do to it as it runs. A release changes what runs; a sync may undo what these change.">
+          {open && (
+            <Loadable label="what it can do">
+              <ActionList app={app} env={env} o={o} onDone={() => setOpen(false)} />
+            </Loadable>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function ActionList({ app, env, o, onDone }: { app: string; env: string; o: RunningObject; onDone: () => void }) {
+  const target = { group: o.group || undefined, kind: o.kind, namespace: o.namespace || undefined, name: o.name };
+  const list = useSuspenseResource(`deploy/actions/${app}/${env}/${objectKey(o)}`, (s) => deployApi.actions(app, env, target, s)).data;
+  const [params, setParams] = React.useState<Record<string, string>>({});
+  const [busy, setBusy] = React.useState(false);
+  const [deleting, setDeleting] = React.useState<ObjectAction | null>(null);
+  const run = async (a: ObjectAction) => {
+    const given = Object.fromEntries((a.params ?? []).map((p) => [p.name, params[`${a.name}.${p.name}`] ?? p.default ?? ""]));
+    setBusy(true);
+    try {
+      const r = await deployApi.runAction(app, env, target, a.name, given);
+      toast({ title: actionWords(a.name), description: r.done, tone: "succeeded" });
+      invalidate(`deploy/reads/${app}/${env}`);
+      onDone();
+    } catch (err) {
+      toast({ title: `Not done: ${actionWords(a.name).toLowerCase()}`, description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!list.length) return <p className="rel-quiet">Its provider offers nothing to do to a {o.kind}.</p>;
+  return (
+    <div className="rel-dialog">
+      {list.map((a) => (
+        <div key={a.name} className="rel-register">
+          {(a.params ?? []).map((p) => (
+            <TextField
+              key={p.name}
+              label={p.name}
+              value={params[`${a.name}.${p.name}`] ?? p.default ?? ""}
+              spellCheck={false}
+              onChange={(e) => setParams((x) => ({ ...x, [`${a.name}.${p.name}`]: e.target.value }))}
+            />
+          ))}
+          <Button size="sm" variant={a.name === "delete" ? "ghost-danger" : "secondary"} disabled={a.disabled || busy} onClick={() => (a.name === "delete" ? setDeleting(a) : void run(a))}>
+            {actionWords(a.name)}
+          </Button>
+          {a.disabled && <span className="rel-quiet">not now</span>}
+        </div>
+      ))}
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(v) => !v && setDeleting(null)}
+        title={`Delete ${o.name}?`}
+        description="Its workload makes it again."
+        confirmLabel="Delete it"
+        danger
+        onConfirm={() => (deleting ? run(deleting) : undefined)}
+      />
+    </div>
   );
 }
 

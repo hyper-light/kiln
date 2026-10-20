@@ -764,7 +764,7 @@ impl StateMachine for Machine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::apps::{Destination, Origin, Source};
 
@@ -777,6 +777,7 @@ mod tests {
             sync: Default::default(),
             ignore: Vec::new(),
             tracking: Default::default(),
+            tracking_name: None,
             origin: Origin::Api,
             environment: None,
             labels: Default::default(),

@@ -308,6 +308,19 @@
   font-size: 12.5px;
   overflow-wrap: anywhere;
 }
+/* What a gate's result rests on: a run, an answer, a signed statement. */
+.rel-evidence {
+  color: var(--color-secondary);
+  font-size: 12px;
+}
+.rel-evidence summary {
+  cursor: pointer;
+  color: var(--color-muted);
+}
+.rel-evidence .rel-log {
+  max-height: 40vh;
+  margin-top: 6px;
+}
 .rel-answers li {
   color: var(--color-secondary);
   font-size: 12.5px;
@@ -507,6 +520,24 @@
     grid-template-columns: 1fr 1fr;
   }
 }
+/* A check of the environment's own: its name, how it's asked, and whether it only reports. */
+.rel-ext-check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+}
+.rel-ext-check > * {
+  min-width: 0;
+  flex: 1 1 9rem;
+}
+.rel-ext-check > .rel-check,
+.rel-ext-check > button {
+  flex: none;
+}
+.rel-ext-check .field-label {
+  font-size: 10px;
+}
 .rel-settings-row {
   display: flex;
   flex-wrap: wrap;
@@ -546,4 +577,27 @@
   color: var(--color-foreground);
   font-size: 13px;
   font-weight: 600;
+}
+/* An environment's move between providers: how it stands, app by app. */
+.rel-move {
+  display: grid;
+  gap: 8px;
+}
+.rel-move .rel-history li {
+  flex-wrap: wrap;
+}
+.rel-move details {
+  flex-basis: 100%;
+}
+/* A choice beside a field, as tall as a touch target. */
+.rel-check {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+/* An object's actions sit at the end of its row. */
+.rel-objects li > button:last-child {
+  margin-left: auto;
 }

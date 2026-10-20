@@ -38,6 +38,19 @@ pub struct Environment {
     /// What agents may do here (docs/cd-targets.md D6). Nothing, by default: a person releases.
     #[serde(default)]
     pub agents: AgentPolicy,
+    /// How kiln drives Argo CD here (§8.3), when it's the provider.
+    #[serde(default)]
+    pub argocd: ArgoSettings,
+}
+
+/// How kiln drives an Argo CD environment's Applications (docs/deploy-api.md §8.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArgoSettings {
+    /// kiln writes each Application itself, for an Argo CD that doesn't allow ApplicationSets.
+    /// Otherwise one ApplicationSet over the release repository makes them.
+    #[serde(default)]
+    pub applications: bool,
 }
 
 /// What agents may do in an environment.
@@ -66,7 +79,8 @@ fn null_is_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'d
 #[serde(deny_unknown_fields)]
 pub struct Gates {
     /// Environments a new version runs in first: the same version, with the same artifacts,
-    /// succeeded there and still runs there (txst's required environments).
+    /// succeeded there and still runs there (txst's required environments). `staging@eu` is
+    /// `staging` on the linked kiln server `eu` (§11), which signs what it says runs there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
     /// How long it must have run in each of them (`30m`, `2h`, `1d`).
@@ -77,9 +91,14 @@ pub struct Gates {
     /// When releases may go (`allow`) or may not (`deny`), as Argo CD's sync windows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<Window>,
-    /// Checks built in: `no-snapshots`, `owners-set`.
+    /// Checks each release passes: built in (`no-snapshots`, `owners-set`, by name) or external
+    /// (a URL that answers, a kiln workflow).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<String>,
+    pub checks: Vec<Check>,
+    /// Each artifact a new version deploys has kiln's verified provenance, meeting this (docs/ci.md
+    /// W18-R04).
+    #[serde(default, alias = "require-provenance", skip_serializing_if = "Option::is_none")]
+    pub require_provenance: Option<Provenance>,
     /// Held, and why (an incident, a holiday): no release goes until it's lifted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze: Option<String>,
@@ -139,6 +158,96 @@ pub struct Window {
     /// The schedule's time zone (`Europe/Berlin`); UTC when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+}
+
+/// A check a release passes (§9.1): one built in, by its name (`no-snapshots`), or one described.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Check {
+    Named(String),
+    Spec(CheckSpec),
+}
+
+impl<'de> Deserialize<'de> for Check {
+    /// A name, or a description read as one (so a field misspelled is named, not "no variant").
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::String(name) => Ok(Check::Named(name)),
+            spec => serde_json::from_value(spec).map(Check::Spec).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl Check {
+    pub fn name(&self) -> &str {
+        match self {
+            Check::Named(n) => n,
+            Check::Spec(s) => &s.name,
+        }
+    }
+
+    /// Recorded with the release, never holding or refusing it.
+    pub fn report_only(&self) -> bool {
+        matches!(self, Check::Spec(s) if s.report_only)
+    }
+}
+
+/// A check as described: a built-in one by its name, or an external one (a URL, or a workflow).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckSpec {
+    /// A built-in check's name, or this one's own (`smoke`).
+    pub name: String,
+    /// A URL kiln asks about each release (POST, the release as JSON): it answers `pass`, `fail`
+    /// or `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpCheck>,
+    /// A workflow of one of kiln's repositories, run for each release (`workflow_dispatch`): it
+    /// passes when the run succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowCheck>,
+    /// Its result is recorded with the release, and never holds or refuses it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_only: bool,
+}
+
+/// A URL that answers whether a release may go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpCheck {
+    pub url: String,
+    /// How long it may take to answer (`10s`, the default; at most `2m`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+/// A workflow run for each release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCheck {
+    /// One of kiln's repositories (`owner/name`).
+    pub repository: String,
+    /// The workflow: its path (`.kiln/smoke.yaml`) or file name.
+    pub workflow: String,
+    /// The branch or tag it runs at: the repository's default branch when none.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+}
+
+/// The provenance an environment asks of what it deploys (docs/ci.md W18-R04): kiln's own,
+/// signed, about each artifact's digest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    /// Who built it: kiln's own CI (`<public_url>/ci@v1`) when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<String>,
+    /// The workflows it may come from (paths, globs); any when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<String>,
+    /// The branches it may be built from (globs); any when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<String>,
 }
 
 /// A gate's result on a release, with its evidence.
@@ -347,7 +456,7 @@ pub struct Template {
     pub namespace: Option<String>,
     /// Checks every release of its apps passes, wherever it goes (§9.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<String>,
+    pub checks: Vec<Check>,
     /// Properties its apps may have, each with the values allowed (none listed: any).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, Vec<String>>,
@@ -357,6 +466,10 @@ pub struct Template {
     /// The source repository kiln makes for each of its apps (§3.1), unless the app names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<RepoTemplate>,
+    /// The cluster-scoped kinds its apps may make (`ClusterRole`, as `rbac.authorization.k8s.io/ClusterRole`;
+    /// a core kind by its name alone): on Argo CD its apps' AppProject allows them, and a Namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_kinds: Vec<String>,
 }
 
 /// The source repository a template makes for each app: one of kiln's own, its first commit the
@@ -650,8 +763,9 @@ pub struct Release {
     pub irreversible: Option<String>,
 }
 
-/// `release.json`: what an environment runs, as kiln commits it (docs/deploy-api.md §6). Argo CD's
-/// git files generator reads its keys as parameters, so they stay flat and few.
+/// `release.json`: what an environment runs, as kiln commits it (docs/deploy-api.md §6): every
+/// provider reads it, Argo CD's ApplicationSets through their git files generator, so it says all
+/// a provider needs (the package at its version, what it sets, where it runs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseFile {
     pub schema: u32,
@@ -676,6 +790,17 @@ pub struct ReleaseFile {
     /// value): those set as it was committed (§3.5).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub secrets: String,
+    /// Where it runs on Kubernetes: the app's namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// What it sets (Helm's `--set`): the package's `set`, filled for this release. Every provider
+    /// sets these, so what runs is what this file says.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+    /// Whether it renders with Helm: a Helm package, or a path in git that holds a chart or is
+    /// given values to set. Unset in files from before kiln wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helm: Option<bool>,
 }
 
 /// `release.json`'s schema, and the start of every release repository path kiln owns.

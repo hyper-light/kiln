@@ -15,7 +15,7 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::argocd;
+use super::{appset, argocd};
 use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
@@ -143,6 +143,32 @@ fn provider_name(env: &Environment) -> &'static str {
     if argo_of(env).is_some() { "Argo CD" } else { "KilnCD" }
 }
 
+/// Refused while an environment moves between providers (§8.4): what runs there is changing hands.
+async fn not_moving(d: &Deploy, env: &str) -> Result<(), Fail> {
+    match super::moves::under_way(d, env).await.map_err(internal)? {
+        Some(m) => Err(conflict(format!("{env} is moving to {}: releases there wait until the move is done or cancelled", m.to))),
+        None => Ok(()),
+    }
+}
+
+/// Follows an Argo CD's Applications by its stream from now on, unless kiln already does: each
+/// change wakes the release of its registration in flight.
+fn watch_argo(d: &Deploy, integration: &str) {
+    let changed: argocd::Changed = Arc::new(|app: &Value| {
+        let label = |k: &str| app.pointer(&format!("/metadata/labels/{}", k.replace('/', "~1"))).and_then(Value::as_str).map(str::to_owned);
+        let (Some(a), Some(e), Some(d)) = (label("kiln.dev/app"), label("kiln.dev/environment"), super::get()) else { return };
+        crate::rt::spawn(async move {
+            if let Ok(Some(r)) = store::in_flight(&d.hub.store, &a, &e).await
+                && r.state == State::Delivering
+                && store::schedule(&d.hub.store, r.id, crate::util::now_unix()).await.is_ok()
+            {
+                d.wake.notify();
+            }
+        });
+    });
+    d.argo.ensure(&d.hub, integration, changed);
+}
+
 /// A commit, as messages show it.
 fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
@@ -209,7 +235,35 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
+    gates::check(d, &e.gates).await.map_err(|why| bad(format!("gates: {why}")))?;
+    let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?;
+    // Its provider changes by a move, which hands what runs over (§8.4).
+    if let Some(b) = &before
+        && b.provider != e.provider
+        && !store::registrations(&d.hub.store, None, Some(&e.name)).await.map_err(internal)?.is_empty()
+    {
+        return Err(conflict(format!(
+            "{} has apps registered on {}: move it (POST /api/deploy/environments/{}/move, `kiln deploy env move`), which hands what runs to {} with nothing made again",
+            e.name, b.provider, e.name, e.provider
+        )));
+    }
     ensure_release_repo(d, &e.release_repo).await.map_err(bad)?;
+    // On Argo CD: its ApplicationSet, and what it needs, in place before the environment says so
+    // (or none, where kiln writes the Applications). Only what they read asks Argo CD: a freeze or a
+    // gate changes while it's away.
+    let argo_reads = before.as_ref().is_none_or(|b| b.provider != e.provider || b.release_repo != e.release_repo || b.targets != e.targets || b.sync != e.sync || b.argocd != e.argocd);
+    if argo_reads && let Some(name) = argo_of(&e) {
+        let argo = argocd::Argo::of(&d.hub, name).await.map_err(|why| (StatusCode::BAD_GATEWAY, why))?;
+        match appset::integration_of(&e) {
+            Some(_) => appset::ensure(d, &argo, &e).await.map_err(|why| (StatusCode::BAD_GATEWAY, why.to_string()))?,
+            // kiln takes to writing the Applications: their ApplicationSet goes, and they stay
+            // (kiln's ApplicationSets never delete theirs).
+            None if before.as_ref().is_some_and(|b| appset::integration_of(b) == Some(name)) => {
+                argo.delete_application_set(&argocd::set_name(&e.name)).await.map_err(|why| (StatusCode::BAD_GATEWAY, why))?;
+            }
+            None => {}
+        }
+    }
     store::put_environment(&d.hub.store, &e).await.map_err(internal)?;
     // Its gates may have changed: what waits on them looks again now.
     let held = store::releases(&d.hub.store, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, version: None, limit: 1000 }).await.map_err(internal)?;
@@ -268,6 +322,17 @@ pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(
     if !regs.is_empty() {
         let apps: Vec<&str> = regs.iter().map(|r| r.app.as_str()).collect();
         return Err(conflict(format!("{name} has apps registered: {}. Deregister them first", apps.join(", "))));
+    }
+    let env = environment(d, name).await?;
+    // Its ApplicationSet goes with it (it makes nothing: nothing is registered).
+    if let Some(integration) = appset::integration_of(&env) {
+        let gone = match argocd::Argo::of(&d.hub, integration).await {
+            Ok(argo) => argo.delete_application_set(&argocd::set_name(name)).await,
+            Err(e) => Err(e),
+        };
+        if let Err(why) = gone {
+            tracing::warn!(environment = %name, error = %why, "deploy: an environment's ApplicationSet couldn't be deleted with it");
+        }
     }
     if !store::delete_environment(&d.hub.store, name).await.map_err(internal)? {
         return Err(missing(format!("no environment {name}")));
@@ -579,11 +644,7 @@ pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool
         }
         super::scaffold::check(d, r).map_err(bad)?;
     }
-    for c in &t.checks {
-        if !matches!(c.as_str(), "no-snapshots" | "owners-set") {
-            return Err(bad(format!("kiln has no check `{c}` (no-snapshots, owners-set)")));
-        }
-    }
+    gates::check_checks(d, &t.checks).await.map_err(|why| bad(format!("checks: {why}")))?;
     if let Some(p) = &t.package {
         for (k, v) in p.set() {
             repo::check(v).map_err(|e| bad(format!("package.set {k}: {e}")))?;
@@ -611,6 +672,24 @@ pub async fn delete_template(d: &Deploy, actor: &str, name: &str) -> Result<(), 
 /// The trailer kiln's registering commits carry, so no scan takes them for someone's edit.
 const REGISTRATION_TRAILER: &str = "Kiln-Registration";
 
+/// Gives an environment's release repository its first commit, when it has none yet: a README
+/// saying what it is. An empty repository has no `HEAD` for Argo CD to read, and Argo CD tries one
+/// as it's registered (§8.3).
+pub(super) async fn first_commit(d: &Deploy, env: &Environment) -> Result<(), String> {
+    let (hosted, rr) = (d.hosted.clone(), env.release_repo.clone());
+    let head = crate::rt::blocking(move || hosted.head(&rr.repo, &rr.branch)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    if head.is_some() {
+        return Ok(());
+    }
+    let readme = format!(
+        "# {}\n\nkiln's release repository (docs/deploy-api.md §6): what each environment runs, one release a commit.\n\n- `<project>/<app>/app.yaml`: an app's package\n- `<project>/<app>/<env>/release.json`: what runs there, kiln writes it\n- `<project>/<app>/<env>/values.yaml`: its values there, a config release changes them\n",
+        env.release_repo.repo
+    );
+    let path = repo::join(&env.release_repo.root, "README.md");
+    let message = format!("start the release repository\n\n{REGISTRATION_TRAILER}: -\n{}: kiln\n", repo::REQUESTED_BY_TRAILER);
+    commit_files(d, env, vec![Change { path, content: Some(readme.into_bytes()) }], message, "kiln").await.map(|_| ())
+}
+
 /// Commits `changes` on the environment's release repository, made on its head, again on a newer
 /// head while someone else's push races it.
 async fn commit_files(d: &Deploy, env: &Environment, changes: Vec<Change>, message: String, who: &str) -> Result<String, String> {
@@ -631,6 +710,7 @@ async fn commit_files(d: &Deploy, env: &Environment, changes: Vec<Change>, messa
 }
 
 pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -> Result<Registration, Fail> {
+    not_moving(d, env_name).await?;
     let (a, env) = (app(d, app_name).await?, environment(d, env_name).await?);
     if a.archived {
         return Err(conflict(format!("{app_name} is archived")));
@@ -673,12 +753,23 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     commit_files(d, &env, changes, message, actor).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let reg = Registration { app: app_name.to_owned(), environment: env_name.to_owned(), enabled: false, paused: false, running: None, created_at: crate::util::now_unix(), degraded: None };
     store::put_registration(&d.hub.store, &reg).await.map_err(internal)?;
+    // On Argo CD, its project allows it from now (the first release does, if Argo CD is away now).
+    if let Some(integration) = appset::integration_of(&env) {
+        let ready = match argocd::Argo::of(&d.hub, integration).await {
+            Ok(argo) => appset::ensure(d, &argo, &env).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(why) = ready {
+            tracing::warn!(app = %app_name, environment = %env_name, error = %why, "deploy: Argo CD isn't ready for a registration yet; its first release makes it so");
+        }
+    }
     audit(d, actor, "deploy.register", format!("{app_name} in {env_name}")).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "registration": reg }));
     Ok(reg)
 }
 
 pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, keep: bool) -> Result<(), Fail> {
+    not_moving(d, env_name).await?;
     let actor = who.name.as_str();
     let (a, env) = (app(d, app_name).await?, environment(d, env_name).await?);
     agents_may(who, &env, "deregister apps")?;
@@ -686,7 +777,11 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
     if let Some(r) = store::in_flight(&d.hub.store, app_name, env_name).await.map_err(internal)? {
         return Err(conflict(format!("release {} is in flight for {app_name} in {env_name}: wait for it, or cancel it", r.id)));
     }
-    if reg.running.is_some() || reg.enabled {
+    let runs = reg.running.is_some() || reg.enabled;
+    // Through an ApplicationSet, its files go first: deleted before, its Application would be made
+    // again from them.
+    let through_set = appset::integration_of(&env).is_some();
+    if runs && !through_set {
         match argo_of(&env) {
             Some(name) => {
                 let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -702,6 +797,13 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
     let changes = vec![Change { path: repo::release_file(rr, &a, env_name), content: None }, Change { path: repo::values_file(rr, &a, env_name), content: None }];
     let message = format!("deregister {app_name} from {env_name}\n\n{REGISTRATION_TRAILER}: {app_name}/{env_name}\n{}: {actor}\n", repo::REQUESTED_BY_TRAILER);
     commit_files(d, &env, changes, message, actor).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    if runs
+        && through_set
+        && let Some(name) = argo_of(&env)
+    {
+        let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+        appset::remove(d, &argo, &env, &argocd::application_name(&a, env_name), keep).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    }
     store::delete_registration(&d.hub.store, app_name, env_name).await.map_err(internal)?;
     audit(d, actor, "deploy.deregister", format!("{app_name} from {env_name}{}", if keep { " (objects kept)" } else { "" })).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "removed": { "app": app_name, "environment": env_name } }));
@@ -715,6 +817,7 @@ async fn registration(d: &Deploy, app_name: &str, env_name: &str) -> Result<Regi
 /// Pauses (or resumes) the provider's automation for a registration, git left as it is: hand edits
 /// survive until the next release, which resumes it.
 pub async fn pause(d: &Deploy, actor: &str, app_name: &str, env_name: &str, paused: bool) -> Result<Registration, Fail> {
+    not_moving(d, env_name).await?;
     let a = app(d, app_name).await?;
     let env = environment(d, env_name).await?;
     let mut reg = registration(d, app_name, env_name).await?;
@@ -939,6 +1042,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     if a.archived {
         return Err(conflict(format!("{} is archived: no new releases", a.name)));
     }
+    not_moving(d, &env.name).await?;
     let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some(), ask.secrets.is_some()].iter().filter(|b| **b).count();
     if asked != 1 {
         return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, promote_from, or secrets"));
@@ -1278,11 +1382,20 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             let committed_at = r.committed_at.unwrap_or(r.created_at);
             let settle = env.as_ref().map_or(30, |e| i64::try_from(e.watch.settle_secs).unwrap_or(30));
             let delivered = r.provider.get("delivered_at").and_then(Value::as_i64);
+            // When the provider last couldn't be asked, and since when it hasn't answered (an
+            // outage still on): the release's timeout runs from when it answers again, and an
+            // outage longer than `watch.unreachable_secs` holds it.
+            let unanswered_at = r.provider.get("unanswered_at").and_then(Value::as_i64);
+            let unanswered_since = r.provider.get("unanswered_since").and_then(Value::as_i64);
+            let clock = unanswered_at.map_or(committed_at, |at| at.max(committed_at));
             // When the provider first held the release: kept from one look to the next.
             let looked = follow(d, &r, &commit).await.map(|(landed, mut view)| {
                 let held = !matches!(landed, Landed::Refused(_));
                 if let Some(at) = delivered.or(held.then_some(now)) {
                     note(&mut view, "delivered_at", json!(at));
+                }
+                if let Some(at) = unanswered_at {
+                    note(&mut view, "unanswered_at", json!(at));
                 }
                 (landed, view)
             });
@@ -1338,42 +1451,45 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
                 // Still progressing as its provider sees it (Kubernetes hasn't called the rollout
                 // stuck): a slow rollout isn't a failed one. It waits, up to three times its timeout.
-                Ok((Landed::No, view)) if now - committed_at > timeout && now - committed_at <= timeout * 3 && view.get("health").and_then(Value::as_str) == Some("Progressing") => {
+                Ok((Landed::No, view)) if now - clock > timeout && now - clock <= timeout * 3 && view.get("health").and_then(Value::as_str) == Some("Progressing") => {
                     r.provider = view;
                     r.message = Some(format!("still progressing past its {timeout}s; it waits up to {}s while it does", timeout * 3));
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + 5).await?;
                 }
-                Ok((Landed::No, view)) if now - committed_at > timeout => {
+                Ok((Landed::No, view)) if now - clock > timeout => {
                     let progressing = view.get("health").and_then(Value::as_str) == Some("Progressing");
                     r.provider = view;
                     let why = if progressing { format!("it didn't land within {}s, still progressing (three times watch.timeout_secs)", timeout * 3) } else { format!("it didn't land within {timeout}s (watch.timeout_secs)") };
                     failed(d, r, why).await?;
                 }
                 Ok((Landed::No, view)) => {
+                    // What it waits on, where the provider says; a stream wakes it as that changes,
+                    // so it looks less often by itself.
+                    let watched = view.get("watched").and_then(Value::as_bool) == Some(true);
+                    r.message = view.get("waiting").and_then(Value::as_str).map(|w| format!("waiting for {w}"));
                     r.provider = view;
-                    r.message = None;
                     store::update_release(st, &r, State::Delivering).await?;
-                    store::schedule(st, id, now + 3).await?;
+                    store::schedule(st, id, now + if watched { 15 } else { 3 }).await?;
                 }
                 // The provider never held it: nothing changed there, and git goes back too.
                 Err(e) if now - committed_at > timeout && delivered.is_none() => {
                     refused(d, r, format!("it never reached the provider within {timeout}s: {e}")).await?;
                 }
                 // It held it, and can't be asked since: what it did is unknown, and nothing is
-                // done blind. It's judged when the provider answers; past `unreachable_secs`, held.
-                Err(e) if now - committed_at > unreachable => {
-                    hold(d, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
-                }
-                Err(e) if now - committed_at > timeout => {
-                    r.message = Some(format!("the provider can't be asked ({e}): it is judged when it answers"));
-                    store::update_release(st, &r, State::Delivering).await?;
-                    store::schedule(st, id, now + 30).await?;
-                }
+                // done blind. It's judged when the provider answers; held when it hasn't for
+                // `unreachable_secs`.
                 Err(e) => {
-                    r.message = Some(e);
-                    store::update_release(st, &r, State::Delivering).await?;
-                    store::schedule(st, id, now + 5).await?;
+                    let first = unanswered_since.unwrap_or(now);
+                    if now - first > unreachable {
+                        hold(d, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
+                    } else {
+                        note(&mut r.provider, "unanswered_since", json!(first));
+                        note(&mut r.provider, "unanswered_at", json!(now));
+                        r.message = Some(format!("the provider can't be asked ({e}): it is judged when it answers"));
+                        store::update_release(st, &r, State::Delivering).await?;
+                        store::schedule(st, id, now + if now - first > timeout { 30 } else { 5 }).await?;
+                    }
                 }
             }
         }
@@ -1437,6 +1553,15 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     let pinned = crate::secrets::of(&d.hub).current(&crate::secrets::Scope::of(&a.name, &env.name)).await.map_err(|e| format!("the app's secrets: {e:#}"))?;
     file.secrets = crate::secrets::versions_text(pinned.iter().map(|(n, v)| (n.as_str(), *v)));
     let changed = secrets_changed(prior.as_ref().map_or("", |p| p.secrets.as_str()), &file.secrets);
+    // What it runs, filled in for every provider to read the same (§6): a git path is looked at
+    // for a chart where KilnCD can look.
+    let chart = match (&a.package, crate::cd::get(), file.version.as_deref()) {
+        (Package::Git { .. }, Some(cd), Some(v)) => kilncd::git_chart(&cd, &a.package, v).await,
+        _ => false,
+    };
+    if let Err(why) = repo::resolve(&mut file, &a, chart) {
+        return Ok(Committed::Refused(why));
+    }
     // Checked before it changes anything: its secrets, its images, and on KilnCD its render and
     // its cluster's dry run (§8.1).
     let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
@@ -1466,7 +1591,7 @@ fn secrets_changed(before: &str, after: &str) -> String {
 }
 
 /// What a release's commit holds for its registration.
-async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<ReleaseFile, String> {
+pub(super) async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<ReleaseFile, String> {
     let (hosted, rr, path, commit) = (d.hosted.clone(), env.release_repo.clone(), repo::release_file(&env.release_repo, a, &env.name), commit.to_owned());
     let bytes = crate::rt::blocking(move || hosted.read(&rr.repo, &commit, &path)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
     let bytes = bytes.ok_or("the commit holds no release.json for the registration")?;
@@ -1494,8 +1619,16 @@ pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, versi
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
     let chart = kilncd::git_chart(&cd, &a.package, version).await;
+    // Filled again for that version, as a release of it would be.
+    file.package = a.package.clone();
+    repo::resolve(&mut file, a, chart).map_err(bad)?;
     let then = kilncd::definition(a, env, &reg, &file, &commit, &url, chart).map_err(bad)?;
     futures::try_join!(cd.render_definition(now), cd.render_definition(then)).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))
+}
+
+/// A registration's values at a commit (`None`: it has none).
+pub(super) async fn values_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<Option<String>, String> {
+    file_at(d, env, commit, repo::values_file(&env.release_repo, a, &env.name)).await
 }
 
 /// A file of a release's commit, for its registration (`None`: the commit has none).
@@ -1519,17 +1652,23 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
     }
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
+        watch_argo(d, name);
+        if let (Package::Helm { repo, .. }, Some(_)) = (&file.package, &file.version)
+            && let Some(oci) = repo.strip_prefix("oci://")
+        {
+            argo.ensure_oci_repo(oci.trim_end_matches('/')).await?;
+        }
+        // Through the environment's ApplicationSet: it's read again now, and makes or updates the
+        // release's Application; following the release does the rest, a deletion included.
+        if appset::integration_of(&env).is_some() {
+            return appset::ensure(d, &argo, &env).await;
+        }
         let app_name = argocd::application_name(&a, &env.name);
         if !file.enabled {
             return Ok(argo.delete_application(&app_name, r.keep).await?);
         }
         if file.version.is_none() {
             return Ok(());
-        }
-        if let super::model::Package::Helm { repo, .. } = &a.package
-            && let Some(oci) = repo.strip_prefix("oci://")
-        {
-            argo.ensure_oci_repo(oci.trim_end_matches('/')).await?;
         }
         let values = file_at(d, &env, &commit, repo::values_file(&env.release_repo, &a, &env.name)).await?;
         let spec = argocd::application(&argo.namespace, &a, &env, &reg, &file, values.as_deref(), &commit).map_err(Undelivered::Refused)?;
@@ -1562,8 +1701,17 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     let file = release_file_at(d, &a, &env, commit).await?;
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
+        watch_argo(d, name);
+        if appset::integration_of(&env).is_some() {
+            let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+            return appset::follow(d, &argo, r, &a, &env, &reg, &file, commit).await;
+        }
         let app_name = argocd::application_name(&a, &env.name);
-        let current = argo.application(&app_name, None).await?;
+        // What its stream last said, or Argo CD asked.
+        let current = match d.argo.application(name, &app_name) {
+            Some(app) => Some(app),
+            None => argo.application(&app_name, None).await?,
+        };
         if !file.enabled {
             // Still there and not on its way out: the delete didn't happen, and is asked for again.
             if current.as_ref().is_some_and(|c| c.pointer("/metadata/deletionTimestamp").is_none()) {
@@ -1591,6 +1739,12 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     }
     let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let id = kilncd::app_id(&a, &env.name);
+    // A cluster that doesn't answer can't say what the release did there, nor what runs (KilnCD's
+    // last look may be all it has): it's judged when the cluster answers, and held past
+    // `watch.unreachable_secs` (§8.1).
+    if cd.apps.read().contains_key(&id) {
+        kilncd::answers(&cd, &id).await?;
+    }
     let present = cd.apps.read().get(&id).map(|e| e.def.sources.iter().any(|s| s.as_ref.as_deref() == Some("release") && s.revision == commit));
     if !file.enabled {
         // KilnCD lets go of an app as it deletes it: one still there wasn't deleted, and is again.
@@ -1610,7 +1764,18 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         }
     }
     let since_ms = u64::try_from(r.committed_at.unwrap_or(r.created_at)).unwrap_or(0).saturating_mul(1000);
-    Ok(kilncd::landed(&cd, &id, commit, since_ms))
+    let (landed, view) = kilncd::landed(&cd, &id, commit, since_ms);
+    // Its sync failed because the cluster didn't answer then: synced again now that it does,
+    // rather than judged on what the outage did.
+    if let Landed::Failed(why) = &landed
+        && kilncd::unanswered(why)
+    {
+        if let Err(e) = kilncd::sync_again(&d.hub, &cd, &format!("deploy for {}", r.requested_by), &id).await {
+            tracing::info!(release = r.id, error = %e, "deploy: KilnCD didn't sync the release again yet");
+        }
+        return Ok((Landed::No, json!({ "app": id, "waiting": "KilnCD to sync it again, its cluster answering again" })));
+    }
+    Ok((landed, view))
 }
 
 /// Ends a release: its state, its registration's, and the release it replaced.
@@ -1818,6 +1983,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
     let env = store::environment(st, &failed.environment).await?.ok_or_else(|| anyhow::anyhow!("no environment {}", failed.environment))?;
     let running = store::registration(st, &failed.app, &failed.environment).await?.and_then(|reg| reg.running);
     let file = release_file_at(d, &a, &env, sha).await.ok();
+    let keep = keeps_objects(d, file.as_ref()).await;
     let now = crate::util::now_unix();
     let back = Release {
         id: 0,
@@ -1834,7 +2000,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
         message: Some(format!("putting back what ran before release {}", failed.id)),
         rollback_of: running,
         rolled_back_by: None,
-        keep: true,
+        keep,
         provider: Value::Null,
         gates: Vec::new(),
         approvals: Vec::new(),
@@ -1869,10 +2035,34 @@ async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
     undo(d, r, why).await
 }
 
+/// Whether what a release left in the cluster stays when git goes back to `file` (its revert, or
+/// its undo). It does while something runs there (handing over `file` puts that back), and when
+/// `file` is a disable that kept what ran (`writer`: the release that wrote it). Where nothing ran
+/// before (an app's first release, or after a disable that removed what ran), what the release made
+/// goes with it. Unknown is kept: nothing is deleted blind.
+fn keeps(file: Option<&ReleaseFile>, writer: Option<&Release>) -> bool {
+    match file {
+        None => true,
+        Some(f) if f.enabled && f.version.is_some() => true,
+        // Registered, never released.
+        Some(f) if f.release == 0 => false,
+        Some(_) => writer.is_none_or(|w| w.keep),
+    }
+}
+
+/// [`keeps`], the release that wrote `file` looked up.
+async fn keeps_objects(d: &Deploy, file: Option<&ReleaseFile>) -> bool {
+    let writer = match file.map(|f| f.release).filter(|id| *id > 0) {
+        Some(id) => store::release(&d.hub.store, id).await.ok().flatten(),
+        None => None,
+    };
+    keeps(file, writer.as_ref())
+}
+
 /// Puts git and the provider back after a release that won't land (failed, refused, or cancelled
-/// while delivering): its commit is reverted, and the provider handed what git says then. Nothing is
-/// deleted on the way: a registration git says is disabled keeps its objects. What was done, as
-/// the release's message says it.
+/// while delivering): its commit is reverted, and the provider handed what git says then. Where
+/// nothing ran before it, what it made goes; a disable that kept what ran keeps it ([`keeps`]).
+/// What was done, as the release's message says it.
 async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
     let (reverted, head) = match revert(d, r, why).await {
         Ok(back) => back,
@@ -1883,15 +2073,15 @@ async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
         None => "nothing of its commit was left to revert".to_owned(),
     };
     let Some(head) = head else { return said };
-    let back = Release { commit: Some(head.clone()), keep: true, ..r.clone() };
-    if let Err(e) = deliver(d, &back).await {
-        return format!("{said}, but handing the provider what git says failed: {e}");
-    }
     let (a, env) = (store::app(&d.hub.store, &r.app).await.ok().flatten(), store::environment(&d.hub.store, &r.environment).await.ok().flatten());
     let file = match (&a, &env) {
         (Some(a), Some(env)) => release_file_at(d, a, env, &head).await.ok(),
         _ => None,
     };
+    let back = Release { commit: Some(head.clone()), keep: keeps_objects(d, file.as_ref()).await, ..r.clone() };
+    if let Err(e) = deliver(d, &back).await {
+        return format!("{said}, but handing the provider what git says failed: {e}");
+    }
     match file {
         Some(f) if f.enabled && f.version.is_some() => format!("{said}; release {} runs on", f.release),
         Some(_) => format!("{said}; nothing runs"),
@@ -1941,14 +2131,26 @@ async fn revert(d: &Deploy, r: &Release, why: &str) -> Result<(Option<String>, O
     Ok((Some(sha.clone()), Some(sha)))
 }
 
+/// Where an environment's look at its release repository's branch for commits kiln didn't make
+/// got to.
+fn seen_key(env: &str, repo: &str, branch: &str) -> String {
+    format!("deploy/seen/{env}/{repo}/{branch}")
+}
+
 /// Commits on release repositories that kiln didn't make become releases (origin `git`), so the
 /// records never disagree with git (docs/deploy-api.md §6).
 async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
     let st = &d.hub.store;
     for env in store::environments(st).await? {
         let rr = env.release_repo.clone();
-        let key = format!("deploy/seen/{}/{}", rr.repo, rr.branch);
-        let seen = st.kv_get(key.clone()).await?;
+        // Where each environment has looked to, its own: environments share a release repository
+        // (kiln/releases by default), and each looks at every commit for its registrations. One
+        // from before kept a repository's mark: it starts from there.
+        let key = seen_key(&env.name, &rr.repo, &rr.branch);
+        let seen = match st.kv_get(key.clone()).await? {
+            Some(s) => Some(s),
+            None => st.kv_get(format!("deploy/seen/{}/{}", rr.repo, rr.branch)).await?,
+        };
         let (hosted, rr2, since) = (d.hosted.clone(), rr.clone(), seen.clone());
         let (head, commits) = crate::rt::blocking(move || -> anyhow::Result<(Option<String>, Vec<super::host::LoggedCommit>)> {
             let head = hosted.head(&rr2.repo, &rr2.branch)?;
@@ -2028,6 +2230,85 @@ mod tests {
     use super::*;
     use crate::authz::gate::Kind as CallerKind;
 
+    #[test]
+    fn a_commit_kiln_didn_t_make_is_a_release_in_every_environment_sharing_the_repository() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let st = &hub.store;
+            // Two environments on one release repository: kiln's default.
+            let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+            store::put_app(st, &web).await?;
+            for name in ["staging", "production"] {
+                store::put_environment(st, &Environment { name: name.into(), ..env(false) }).await?;
+                store::put_registration(st, &Registration { app: "web".into(), environment: name.into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None }).await?;
+            }
+            let rr = super::super::model::RepoRef::default();
+            let hand = |path: String, text: &str, message: &str| -> anyhow::Result<()> {
+                let head = d.hosted.head(&rr.repo, &rr.branch)?;
+                d.hosted
+                    .commit(&rr.repo, &rr.branch, head.as_deref(), &[Change { path, content: Some(text.as_bytes().to_vec()) }], message, &author("hand"))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(())
+            };
+            // The first look notes where the branch is.
+            hand("README.md".into(), "releases\n", "start")?;
+            scan_git(&d).await?;
+            // A hand edit of each environment's values, one commit each.
+            hand(repo::values_file(&rr, &web, "staging"), "replicaCount: 2\n", "two replicas in staging")?;
+            hand(repo::values_file(&rr, &web, "production"), "replicaCount: 3\n", "three in production")?;
+            scan_git(&d).await?;
+            let releases = store::releases(st, store::ReleaseQuery { app: Some("web".into()), environment: None, state: None, version: None, limit: 10 }).await?;
+            let mut made: Vec<(String, Origin, Kind)> = releases.iter().map(|r| (r.environment.clone(), r.origin, r.kind)).collect();
+            made.sort_by(|a, b| a.0.cmp(&b.0));
+            anyhow::ensure!(made == [("production".into(), Origin::Git, Kind::Config), ("staging".into(), Origin::Git, Kind::Config)], "each environment sees its own: {made:?}");
+            // Looked at again, nothing new.
+            scan_git(&d).await?;
+            anyhow::ensure!(store::releases(st, store::ReleaseQuery { app: Some("web".into()), environment: None, state: None, version: None, limit: 10 }).await?.len() == 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_release_repository_starts_with_a_commit_argo_cd_can_read() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let mut e = env(false);
+            e.release_repo.root = "deploy".into();
+            let head = |d: &Deploy| d.hosted.head(&e.release_repo.repo, &e.release_repo.branch);
+            anyhow::ensure!(head(&d)?.is_none(), "an empty repository has no HEAD for Argo CD to read");
+            first_commit(&d, &e).await.map_err(anyhow::Error::msg)?;
+            let first = head(&d)?.ok_or_else(|| anyhow::anyhow!("no first commit"))?;
+            let readme = d.hosted.read(&e.release_repo.repo, &first, "deploy/README.md")?.unwrap_or_default();
+            anyhow::ensure!(String::from_utf8_lossy(&readme).contains("release.json"), "a README under its root");
+            // Not a commit kiln takes for someone's: it carries a registration's trailer.
+            let logged = d.hosted.commits_since(&e.release_repo.repo, &e.release_repo.branch, None)?;
+            anyhow::ensure!(logged.iter().all(|c| c.trailer(REGISTRATION_TRAILER).is_some()), "{logged:?}");
+            // Once is enough.
+            first_commit(&d, &e).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(head(&d)?.as_deref() == Some(first.as_str()), "a repository with commits gets none");
+            Ok(())
+        })
+    }
+
     fn env(agents_deploy: bool) -> Environment {
         Environment {
             name: "production".into(),
@@ -2039,6 +2320,7 @@ mod tests {
             watch: Default::default(),
             concurrency: Default::default(),
             agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
+            argocd: Default::default(),
         }
     }
 
@@ -2154,6 +2436,25 @@ mod tests {
         assert!(matches!(aftermath(&asked), Aftermath::Hold(why) if why.contains("asked not to be reverted")));
         let migrates = Release { irreversible: Some("Job web-migrate".into()), ..failed_release(Kind::Deploy, Origin::Api) };
         assert!(matches!(aftermath(&migrates), Aftermath::Hold(why) if why.contains("Job web-migrate")), "a migration that ran isn't undone by putting the code back");
+    }
+
+    /// §8.1: putting back what ran before keeps what's in the cluster unless nothing ran: an app's
+    /// first release, or one after a disable that removed what ran, takes what it made with it.
+    #[test]
+    fn what_a_release_made_goes_with_its_revert_where_nothing_ran_before() -> anyhow::Result<()> {
+        let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+        let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+        let registered = repo::registered_json(&web, "production");
+        assert!(!keeps(Some(&registered), None), "the first release: nothing ran before");
+        let running = ReleaseFile { release: 7, enabled: true, version: Some("1.4.0".into()), ..registered.clone() };
+        assert!(keeps(Some(&running), None), "what ran is put back by handing it over");
+        let disabled = ReleaseFile { release: 9, ..registered.clone() };
+        let disable = |keep: bool| Release { id: 9, kind: Kind::Disable, keep, ..failed_release(Kind::Disable, Origin::Api) };
+        assert!(keeps(Some(&disabled), Some(&disable(true))), "a disable that kept what ran keeps it");
+        assert!(!keeps(Some(&disabled), Some(&disable(false))), "after a disable that removed what ran, nothing ran");
+        assert!(keeps(Some(&disabled), None), "a writer that can't be found: nothing deleted blind");
+        assert!(keeps(None, None), "a file that can't be read: nothing deleted blind");
+        Ok(())
     }
 
     #[test]

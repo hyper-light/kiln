@@ -68,14 +68,11 @@ pub async fn fetched(cd: &Arc<Cd>, repo: &str, commit: &str) -> anyhow::Result<(
 pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, commit: &str, release_url: &str, chart: bool) -> Result<AppDef, String> {
     let version = file.version.clone().ok_or("the release names no version")?;
     let values = format!("$release/{}", repo::values_file(&env.release_repo, app, &env.name));
-    let set = repo::filled_set(&app.package, file)?;
-    let raw_set = app.package.set();
-    // What comes from the release (a version, a tag, a digest) stays a string, whatever it looks
-    // like: Helm reads `--set image.tag=1.10` as the number 1.1.
-    let parameters: Vec<HelmParam> = set
+    // What runs is what release.json says: its package, what it sets, where it runs (§6).
+    let parameters: Vec<HelmParam> = repo::set_of(file)?
         .into_iter()
         .map(|(name, value)| {
-            let force_string = raw_set.get(&name).is_some_and(|t| t.contains("${{"));
+            let force_string = repo::sets_string(file, &name);
             HelmParam { name, value, force_string }
         })
         .collect();
@@ -86,8 +83,9 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
         ignore_missing_value_files: true,
         ..Helm::default()
     };
-    let kubernetes = Destination { cluster: env.targets.kubernetes.first().cloned().unwrap_or_else(|| apps::IN_CLUSTER.to_owned()), namespace: app.namespace().to_owned() };
-    let (package, destination) = match &app.package {
+    let namespace = file.namespace.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| app.namespace().to_owned());
+    let kubernetes = Destination { cluster: env.targets.kubernetes.first().cloned().unwrap_or_else(|| apps::IN_CLUSTER.to_owned()), namespace };
+    let (package, destination) = match &file.package {
         Package::Platform { provider, spec, repo: files, path } => {
             let place = env.targets.platforms.get(provider).ok_or_else(|| format!("{} has no {provider} target: give it targets.platforms.{provider}: {{ account: <integration>, … }}", env.name))?;
             let (target, extra) = kiln_cd::providers::target_of(provider, place).map_err(|e| format!("{}: {e}", env.name))?;
@@ -120,10 +118,10 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
             revision: version,
             chart: None,
             as_ref: None,
-            engine: if parameters.is_empty() && !chart { Engine::Auto } else { Engine::Helm(helm(vec![values])) },
+            engine: if parameters.is_empty() && !chart && file.helm != Some(true) { Engine::Auto } else { Engine::Helm(helm(vec![values])) },
         }, kubernetes),
     };
-    let platform = matches!(app.package, Package::Platform { .. });
+    let platform = matches!(file.package, Package::Platform { .. });
     // Its secrets, at the versions the release pinned, as one Secret (§3.5). A platform takes them
     // its own way, later.
     let secrets = match (platform, file.secrets.as_str()) {
@@ -145,6 +143,7 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
         sync: SyncPolicy { auto: !reg.paused, prune: env.sync.prune, self_heal: env.sync.self_heal, allow_empty: false, options, retry: None },
         ignore: Vec::new(),
         tracking: Tracking::Kiln,
+        tracking_name: None,
         origin: Origin::Api,
         environment: None,
         labels: BTreeMap::from([("kiln.dev/registration".to_owned(), format!("{}/{}", app.name, env.name)), ("kiln.dev/release".to_owned(), file.release.to_string())]),
@@ -181,6 +180,32 @@ pub async fn deliver(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, def: &AppDef) ->
     // Registered just now, KilnCD may not hold it yet: a refresh that misses is no failure.
     let _ = op(hub, cd, actor, "cd.apps.refresh", json!({ "app": id, "hard": true })).await;
     Ok(())
+}
+
+/// How long a look at whether an app's cluster answers may take.
+const PROBE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the cluster an app runs in answers now (asked its version), and why not. A cluster that
+/// doesn't answer can't say what a release did there: nothing is judged blind (§8.1).
+pub async fn answers(cd: &Cd, id: &str) -> Result<(), String> {
+    let Some(name) = cd.apps.read().get(id).map(|e| e.def.destination.cluster.clone()) else { return Ok(()) };
+    let Some(cluster) = cd.clusters.read().get(&name).cloned() else { return Err(format!("cluster {name} isn't connected")) };
+    match crate::rt::timeout(PROBE, cluster.request(http::Method::GET, "/version", None, None)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(_) => Err(format!("cluster {name} {}: nothing within {} s", crate::cd::kube::NO_ANSWER, PROBE.as_secs())),
+    }
+}
+
+/// Whether a sync failed because its cluster didn't answer: what it did there is unknown.
+pub fn unanswered(message: &str) -> bool {
+    message.contains(crate::cd::kube::NO_ANSWER)
+}
+
+/// Has KilnCD sync an app again, as its automation would: its last sync failed while its cluster
+/// didn't answer, and automation doesn't try a revision again once its sync has failed.
+pub async fn sync_again(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str) -> Result<(), String> {
+    op(hub, cd, actor, "cd.apps.sync", json!({ "app": id })).await.map(|_| ())
 }
 
 /// Removes a registration's app: its objects too, unless `keep`.
@@ -241,6 +266,8 @@ struct Seen {
 /// message), why its sources don't read or render, where the app stands, and why it's Degraded.
 fn verdict(ran: Option<(bool, String)>, refused: Option<String>, seen: Seen, degraded: Option<String>) -> Landed {
     match (ran, refused) {
+        // Synced again since (its cluster answers again): that sync says.
+        (Some((false, _)), _) if seen.syncing => Landed::No,
         (Some((false, message)), _) => Landed::Failed(if message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { message }),
         (Some(_), _) if seen.settled => Landed::Yes,
         // Synced from this commit, and Degraded: what the release runs doesn't.
@@ -269,6 +296,7 @@ mod tests {
             watch: Default::default(),
             concurrency: Default::default(),
             agents: Default::default(),
+            argocd: Default::default(),
         }
     }
 
@@ -304,6 +332,9 @@ mod tests {
             at: String::new(),
             rollback_of: None,
             secrets: String::new(),
+            namespace: None,
+            set: BTreeMap::new(),
+            helm: None,
         }
     }
 
@@ -345,6 +376,11 @@ mod tests {
         assert_eq!(verdict(None, None, seen(true, true, false), None), Landed::Yes, "nothing to sync: it runs already");
         assert!(matches!(verdict(None, None, seen(true, false, false), degraded()), Landed::Degraded(_)));
         assert_eq!(verdict(None, None, seen(false, false, false), degraded()), Landed::No, "what's Degraded isn't this release's yet");
+        // A sync that failed while its cluster didn't answer is synced again once it does: the
+        // sync running since decides.
+        assert_eq!(verdict(Some((false, "cluster e2e doesn't answer: nothing within 30 s".into())), None, seen(true, false, true), None), Landed::No);
+        assert!(unanswered("the namespace failed to apply: cluster e2e doesn't answer: nothing within 30 s"));
+        assert!(!unanswered("the Deployment failed to apply: admission webhook denied it"), "an answer, even a no, isn't");
     }
 
     #[test]

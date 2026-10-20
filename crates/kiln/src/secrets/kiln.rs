@@ -337,10 +337,10 @@ mod tests {
                 let m = s.put(&web, "DB_PASSWORD", value(&format!("pw-{n}")), &ada()).await?;
                 anyhow::ensure!(m.version == n && m.set_by == "ada", "{m:?}");
             }
-            s.put(&web, "API_KEY", value("k1"), &ada()).await?;
+            s.put(&web, "API_KEY", value("api-key-one-7f3c"), &ada()).await?;
             let list = s.list(&web, &ada()).await?;
             let names: Vec<(&str, u32, usize)> = list.iter().map(|m| (m.name.as_str(), m.version, m.size)).collect();
-            anyhow::ensure!(names == [("API_KEY", 1, 2), ("DB_PASSWORD", 12, 5)], "{names:?}");
+            anyhow::ensure!(names == [("API_KEY", 1, 16), ("DB_PASSWORD", 12, 5)], "{names:?}");
             anyhow::ensure!(s.list(&prod, &ada()).await?.is_empty(), "a scope holds only its own");
 
             // The last ten keep their values; older ones only their record.
@@ -357,7 +357,8 @@ mod tests {
                     Ok(r)
                 })
                 .await?;
-            anyhow::ensure!(rows.len() == 11 && rows.iter().all(|c| !c.windows(4).any(|w| w == b"pw-1") && !c.windows(2).any(|w| w == b"k1")), "values are sealed");
+            // Each value is long enough that no ciphertext holds it by chance.
+            anyhow::ensure!(rows.len() == 11 && rows.iter().all(|c| !c.windows(5).any(|w| w == b"pw-12") && !c.windows(16).any(|w| w == b"api-key-one-7f3c")), "values are sealed");
             hub.store
                 .call(|c| {
                     c.execute(
@@ -377,7 +378,7 @@ mod tests {
             let now = s.current(&web).await?;
             anyhow::ensure!(now == [("API_KEY".to_owned(), 1), ("DB_PASSWORD".to_owned(), 12)], "{now:?}");
             let b = s.resolve(&web, &now, &why).await?;
-            anyhow::ensure!(texts(&b) == [("API_KEY".into(), 1, "k1".into()), ("DB_PASSWORD".into(), 12, "pw-12".into())], "{:?}", b.versions());
+            anyhow::ensure!(texts(&b) == [("API_KEY".into(), 1, "api-key-one-7f3c".into()), ("DB_PASSWORD".into(), 12, "pw-12".into())], "{:?}", b.versions());
             let reads = s.reads(&web, 10, &ada()).await?;
             anyhow::ensure!(reads.len() == 1 && reads.first().is_some_and(|r| r.by == "kilncd" && r.versions == "API_KEY@1,DB_PASSWORD@12"), "{reads:?}");
 

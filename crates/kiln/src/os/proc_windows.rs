@@ -315,6 +315,13 @@ pub struct Detached {
     pub foreign: bool,
 }
 
+impl Detached {
+    /// Nothing to keep on Windows (no in-place upgrade).
+    pub fn keep_across_exec(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Duplex {
     /// Windows has no SIGTERM for a job: kill it at once.
     pub fn terminate(&self, _grace: Duration) {

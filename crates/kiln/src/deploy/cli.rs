@@ -210,6 +210,25 @@ enum DeployCmd {
         #[arg(long, visible_alias = "to")]
         env: String,
     },
+    /// What can be done to an object an app runs (`Deployment/web`), or, with an action, doing it:
+    /// restart, pause, resume, scale (`--set replicas=3`), suspend, create-job, delete (a pod) and
+    /// whatever else its provider offers.
+    Action {
+        app: String,
+        #[arg(long, visible_alias = "to")]
+        env: String,
+        /// `Kind/name`: `Deployment/web`, `Pod/web-7d9c-abcde`, `CronJob/report`.
+        object: String,
+        action: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Its API group, when its kind isn't one kiln knows.
+        #[arg(long)]
+        group: Option<String>,
+        /// What the action takes: `replicas=3`.
+        #[arg(long = "set")]
+        set: Vec<String>,
+    },
     /// The environments apps are released to.
     Env {
         #[command(subcommand)]
@@ -488,12 +507,40 @@ enum EnvCmd {
         /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
         #[arg(long)]
         agents: bool,
-        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after, soak,
-        /// approvals, windows, checks, freeze.
+        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
+        /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
+        /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
+        /// require_provenance, freeze.
         #[arg(long)]
         gates: Option<PathBuf>,
+        /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet
+        /// (for an Argo CD that doesn't allow them).
+        #[arg(long)]
+        applications: bool,
     },
     Rm { env: String },
+    /// Move an environment to another provider (docs/deploy-api.md §8.4): the new one compares in
+    /// shadow and never writes; `--handover` hands what runs over once it agrees (`--force`: even
+    /// if not), with nothing made again. Without `--to`, how its move stands.
+    Move {
+        env: String,
+        /// `kilncd`, or `argocd/<integration>`.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        handover: bool,
+        #[arg(long, requires = "handover")]
+        force: bool,
+        /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet.
+        #[arg(long)]
+        applications: bool,
+        /// Cancel a move that hasn't begun handing over.
+        #[arg(long, conflicts_with_all = ["to", "handover"])]
+        cancel: bool,
+        /// Return once it's asked for.
+        #[arg(long)]
+        no_wait: bool,
+    },
 }
 
 struct Api {
@@ -902,6 +949,35 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             });
             return Ok(());
         }
+        Some(DeployCmd::Action { app, env, object, action, namespace, group, set }) => {
+            let (kind, name) = object.split_once('/').ok_or_else(|| anyhow::anyhow!("{object}: an object is Kind/name, as Deployment/web"))?;
+            let path = format!("/apps/{}/environments/{}/actions", enc(&app), enc(&env));
+            match action {
+                Some(action) => {
+                    let params: BTreeMap<String, String> = set.iter().map(|p| p.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| anyhow::anyhow!("{p}: name=value"))).collect::<Result<_>>()?;
+                    let v = api.call(Method::Post, &path, Some(json!({ "kind": kind, "name": name, "namespace": namespace, "group": group, "action": action, "params": params }))).await?;
+                    api.print(&v, |v| println!("{}", s(v, "done")));
+                }
+                None => {
+                    let mut q = format!("?kind={}&name={}", enc(kind), enc(name));
+                    if let Some(n) = &namespace {
+                        q.push_str(&format!("&namespace={}", enc(n)));
+                    }
+                    if let Some(g) = &group {
+                        q.push_str(&format!("&group={}", enc(g)));
+                    }
+                    let v = api.call(Method::Get, &format!("{path}{q}"), None).await?;
+                    api.print(&v, |v| {
+                        for a in v.get("actions").and_then(Value::as_array).into_iter().flatten() {
+                            let params: Vec<&str> = a.get("params").and_then(Value::as_array).into_iter().flatten().filter_map(|p| p.get("name").and_then(Value::as_str)).collect();
+                            let off = if a.get("disabled").and_then(Value::as_bool) == Some(true) { "  (not now)" } else { "" };
+                            println!("{}{}{off}", s(a, "name"), if params.is_empty() { String::new() } else { format!(" --set {}=…", params.join("=… --set ")) });
+                        }
+                    });
+                }
+            }
+            return Ok(());
+        }
         Some(DeployCmd::Approve { release, note }) => {
             let v = api.call(Method::Post, &format!("/releases/{release}/approve"), Some(json!({ "note": note }))).await?;
             api.print(&v, |v| println!("{}", line(v)));
@@ -1159,7 +1235,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates } => {
+        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates, applications } => {
             let gates: Value = match gates {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1177,6 +1253,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "concurrency": if queue { "queue" } else { "reject" },
                 "agents": { "deploy": agents },
                 "gates": gates,
+                "argocd": { "applications": applications },
             });
             let v = api.call(Method::Post, "/environments", Some(body)).await?;
             api.print(&v, |v| println!("environment {} ready", s(v, "name")));
@@ -1187,8 +1264,57 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 println!("environment {env} removed");
             }
         }
+        EnvCmd::Move { env, to, handover, force, applications, cancel, no_wait } => {
+            let path = format!("/environments/{}/move", enc(&env));
+            let mut v = match (cancel, to) {
+                (true, _) => api.call(Method::Delete, &path, None).await?,
+                (false, Some(to)) => api.call(Method::Post, &path, Some(json!({ "to": to, "handover": handover, "force": force, "argocd": { "applications": applications } }))).await?,
+                (false, None) => api.call(Method::Get, &path, None).await?,
+            };
+            let mut said = String::new();
+            while !no_wait && matches!(s(&v, "phase"), "comparing" | "handing_over") {
+                let now = format!("{}: {}", s(&v, "phase").replace('_', " "), s(&v, "message"));
+                if now != said && !api.json {
+                    eprintln!("{env} → {}: {}", s(&v, "to"), s(&v, "phase").replace('_', " "));
+                    said = now;
+                }
+                crate::rt::sleep(Duration::from_secs(3)).await;
+                v = api.call(Method::Get, &path, None).await?;
+            }
+            api.print(&v, print_move);
+        }
     }
     Ok(())
+}
+
+/// How a move stands, a registration a line.
+fn print_move(v: &Value) {
+    println!("{} → {}: {}", s(v, "environment"), s(v, "to"), s(v, "phase").replace('_', " "));
+    for r in v.get("registrations").and_then(Value::as_array).into_iter().flatten() {
+        let agrees = match r.get("agrees").and_then(Value::as_bool) {
+            Some(true) => "agrees".to_owned(),
+            Some(false) => format!("differs on {}", r.get("differences").and_then(Value::as_array).map_or(0, Vec::len)),
+            None => "not compared".to_owned(),
+        };
+        let remade = match r.get("remade").and_then(Value::as_array) {
+            Some(m) if m.is_empty() => format!(", nothing made again ({} objects)", r.get("uids").and_then(Value::as_object).map_or(0, serde_json::Map::len)),
+            Some(m) => format!(", made again: {}", m.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+            None => String::new(),
+        };
+        println!("  {:<24} {agrees}{remade}", s(r, "app"));
+        for d in r.get("differences").and_then(Value::as_array).into_iter().flatten() {
+            let k = |f: &str| d.pointer(&format!("/key/{f}")).and_then(Value::as_str).unwrap_or("").to_owned();
+            println!("    {} {}/{}", k("kind"), k("namespace"), k("name"));
+            for h in d.get("hunks").and_then(Value::as_array).into_iter().flatten() {
+                for l in h.get("lines").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                    println!("      {l}");
+                }
+            }
+        }
+    }
+    if !s(v, "message").is_empty() {
+        println!("{}", s(v, "message"));
+    }
 }
 
 /// `kiln app init`: an app's chart on kiln's base chart, written into the repository at `dir`.

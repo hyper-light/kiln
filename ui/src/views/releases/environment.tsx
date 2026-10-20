@@ -2,13 +2,15 @@
  * An environment deployed to by API (docs/deploy-api.md §4): its provider and release repository,
  * where it deploys, the gates each release passes there and who may release; what runs there; and
  * a freeze, put on and lifted here with why (an incident, a holiday): nothing goes until it's lifted.
- * Its gates, concurrency and what agents may do are changed here too.
+ * Its gates, concurrency and what agents may do are changed here too, and it moves to another
+ * provider here (§8.4): the new one compares in shadow, then takes over with nothing made again.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
-import { Plus, Snowflake, Sun, Trash2 } from "lucide-react";
+import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
-import { boardHref, deployApi, describe, providerName, releaseAppHref, releaseHref, type Environment, type Gates } from "@/api/deploy";
+import { api } from "@/api/client";
+import { boardHref, checkName, deployApi, describe, providerName, releaseAppHref, releaseHref, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
@@ -21,6 +23,20 @@ import { boardRes, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
+/** A check, as a person reads it. */
+function checkWords(c: Check): string {
+  if (typeof c === "string") return c;
+  const what = c.http ? `asks ${c.http.url}` : c.workflow ? `runs ${c.workflow.workflow} of ${c.workflow.repository}${c.workflow.ref ? `@${c.workflow.ref}` : ""}` : "";
+  return `${c.name}${what ? `: ${what}` : ""}${c.report_only ? " (report only)" : ""}`;
+}
+
+/** The provenance asked of what an environment deploys, as a person reads it. */
+function provenanceWords(p: ProvenanceRequirement): string {
+  const from = p.workflows?.length ? `, built by ${p.workflows.join(", ")}` : "";
+  const on = p.branches?.length ? ` on ${p.branches.join(", ")}` : "";
+  return `kiln's signed provenance of each artifact${from}${on}${p.builder ? ` (builder ${p.builder})` : ""}`;
+}
+
 /** Each gate, in a line. */
 function gateLines(g: Gates): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [];
@@ -32,7 +48,8 @@ function gateLines(g: Gates): { label: string; value: string }[] {
   for (const w of g.windows ?? []) {
     out.push({ label: w.allow ? "Allowed" : "Denied", value: `${w.allow ?? w.deny} for ${w.duration}${w.timezone ? ` (${w.timezone})` : ""}` });
   }
-  if (g.checks?.length) out.push({ label: "Checks", value: g.checks.join(", ") });
+  if (g.checks?.length) out.push({ label: "Checks", value: g.checks.map(checkWords).join("; ") });
+  if (g.require_provenance) out.push({ label: "Provenance", value: provenanceWords(g.require_provenance) });
   return out;
 }
 
@@ -50,6 +67,32 @@ const CHECKS: { name: string; words: string }[] = [
   { name: "owners-set", words: "The app has an owner team" },
 ];
 
+/** An external check, as edited: a URL kiln asks, or a workflow it runs. */
+type CheckRow = { name: string; kind: "http" | "workflow"; url: string; timeout: string; repository: string; workflow: string; ref: string; reportOnly: boolean };
+
+const isExternal = (c: Check): c is CheckSpec => typeof c !== "string" && (!!c.http || !!c.workflow);
+
+function checkRow(c: CheckSpec): CheckRow {
+  return {
+    name: c.name,
+    kind: c.workflow ? "workflow" : "http",
+    url: c.http?.url ?? "",
+    timeout: c.http?.timeout ?? "",
+    repository: c.workflow?.repository ?? "",
+    workflow: c.workflow?.workflow ?? "",
+    ref: c.workflow?.ref ?? "",
+    reportOnly: !!c.report_only,
+  };
+}
+
+function checkSpec(r: CheckRow): CheckSpec {
+  const how =
+    r.kind === "http"
+      ? { http: { url: r.url.trim(), timeout: r.timeout.trim() || undefined } }
+      : { workflow: { repository: r.repository.trim(), workflow: r.workflow.trim(), ref: r.ref.trim() || undefined } };
+  return { name: r.name.trim(), ...how, report_only: r.reportOnly || undefined };
+}
+
 /** What every release here passes, how a second one waits, and what agents may do; saved whole. */
 function Settings({ e }: { e: Environment }) {
   const g = e.gates;
@@ -59,7 +102,14 @@ function Settings({ e }: { e: Environment }) {
   const [approvals, setApprovals] = React.useState(String(g.approvals?.count ?? 0));
   const [reviewers, setReviewers] = React.useState((g.approvals?.reviewers ?? []).join(", "));
   const [selfApprove, setSelfApprove] = React.useState(!!g.approvals?.self_approve);
-  const [checks, setChecks] = React.useState<string[]>(g.checks ?? []);
+  // Built-in checks by name (one given as a description, report only, stays as it is), and the
+  // environment's own: a URL asked, or a workflow run.
+  const builtInSpecs = (g.checks ?? []).filter((c): c is CheckSpec => typeof c !== "string" && !isExternal(c));
+  const [checks, setChecks] = React.useState<string[]>((g.checks ?? []).filter((c) => !isExternal(c)).map(checkName));
+  const [external, setExternal] = React.useState<CheckRow[]>((g.checks ?? []).filter(isExternal).map(checkRow));
+  const [provenance, setProvenance] = React.useState(!!g.require_provenance);
+  const [provWorkflows, setProvWorkflows] = React.useState((g.require_provenance?.workflows ?? []).join(", "));
+  const [provBranches, setProvBranches] = React.useState((g.require_provenance?.branches ?? []).join(", "));
   const [windows, setWindows] = React.useState<WindowRow[]>(
     (g.windows ?? []).map((w) => ({ kind: w.allow ? "allow" : "deny", cron: w.allow ?? w.deny ?? "", duration: w.duration, timezone: w.timezone ?? "" })),
   );
@@ -72,10 +122,16 @@ function Settings({ e }: { e: Environment }) {
       ? "Approvals: a whole number, 0 for none."
       : windows.some((w) => !w.cron.trim() || !w.duration.trim())
         ? "Each window needs its schedule and how long it lasts."
-        : null;
+        : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
+          ? "Each check needs its name, and its URL, or its repository and workflow."
+          : null;
   const setWindow = (i: number, patch: Partial<WindowRow>) => setWindows((ws) => ws.map((w, j) => (j === i ? { ...w, ...patch } : w)));
+  const setCheck = (i: number, patch: Partial<CheckRow>) => setExternal((xs) => xs.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   const save = async () => {
+    const builtIn: Check[] = checks.map((n) => builtInSpecs.find((s) => s.name === n) ?? n);
     const gates: Gates = {
+      // What this form doesn't show is kept as it is.
+      ...g,
       after: names(after),
       soak: soak.trim() || undefined,
       promote: promote === "auto" && names(after).length ? "auto" : undefined,
@@ -84,7 +140,8 @@ function Settings({ e }: { e: Environment }) {
         const when = { duration: w.duration.trim(), timezone: w.timezone.trim() || undefined };
         return w.kind === "allow" ? { allow: w.cron.trim(), ...when } : { deny: w.cron.trim(), ...when };
       }),
-      checks,
+      checks: [...builtIn, ...external.map(checkSpec)],
+      require_provenance: provenance ? { builder: g.require_provenance?.builder, workflows: names(provWorkflows), branches: names(provBranches) } : undefined,
       freeze: g.freeze,
     };
     setBusy(true);
@@ -116,6 +173,54 @@ function Settings({ e }: { e: Environment }) {
             {c.words}
           </label>
         ))}
+        <label className="cd-new-check">
+          <input type="checkbox" className="check" checked={provenance} onChange={(ev) => setProvenance(ev.target.checked)} /> Only what kiln's CI built and signed (provenance)
+        </label>
+      </div>
+      {provenance && (
+        <div className="cd-new-grid">
+          <TextField label="Built by" placeholder=".kiln/build.yaml" value={provWorkflows} spellCheck={false} onChange={(ev) => setProvWorkflows(ev.target.value)} hint="The workflows it may come from; any when empty." />
+          <TextField label="From branches" placeholder="main" value={provBranches} spellCheck={false} onChange={(ev) => setProvBranches(ev.target.value)} hint="The branches it may be built from; any when empty." />
+        </div>
+      )}
+      <div className="rel-windows">
+        <span className="field-label">Checks of its own</span>
+        {external.map((r, i) => (
+          <div key={i} className="rel-ext-check">
+            <TextField label="Name" placeholder="smoke" value={r.name} spellCheck={false} onChange={(ev) => setCheck(i, { name: ev.target.value })} />
+            <SelectField
+              label="Kind"
+              value={r.kind}
+              onChange={(v) => setCheck(i, { kind: v === "workflow" ? "workflow" : "http" })}
+              options={[
+                { value: "http", label: "A URL answers" },
+                { value: "workflow", label: "A workflow runs" },
+              ]}
+            />
+            {r.kind === "http" ? (
+              <>
+                <TextField label="URL" placeholder="https://checks.example.com/smoke" value={r.url} spellCheck={false} onChange={(ev) => setCheck(i, { url: ev.target.value })} />
+                <TextField label="Timeout" placeholder="10s" value={r.timeout} spellCheck={false} onChange={(ev) => setCheck(i, { timeout: ev.target.value })} />
+              </>
+            ) : (
+              <>
+                <TextField label="Repository" placeholder="acme/web" value={r.repository} spellCheck={false} onChange={(ev) => setCheck(i, { repository: ev.target.value })} />
+                <TextField label="Workflow" placeholder=".kiln/smoke.yaml" value={r.workflow} spellCheck={false} onChange={(ev) => setCheck(i, { workflow: ev.target.value })} />
+                <TextField label="At" placeholder="main" value={r.ref} spellCheck={false} onChange={(ev) => setCheck(i, { ref: ev.target.value })} />
+              </>
+            )}
+            <label className="rel-check">
+              <input type="checkbox" className="check" checked={r.reportOnly} onChange={(ev) => setCheck(i, { reportOnly: ev.target.checked })} />
+              <span>Report only</span>
+            </label>
+            <Button size="xs" variant="ghost-danger" aria-label="Remove the check" onClick={() => setExternal((xs) => xs.filter((_, j) => j !== i))}>
+              <Trash2 />
+            </Button>
+          </div>
+        ))}
+        <Button size="xs" variant="ghost" onClick={() => setExternal((xs) => [...xs, { name: "", kind: "http", url: "", timeout: "", repository: "", workflow: "", ref: "", reportOnly: false }])}>
+          <Plus /> A check
+        </Button>
       </div>
       <div className="rel-windows">
         <span className="field-label">Windows</span>
@@ -225,6 +330,149 @@ function Freeze({ e }: { e: Environment }) {
   );
 }
 
+const PHASE_WORDS: Record<Move["phase"], string> = {
+  comparing: "comparing in shadow",
+  compared: "compared",
+  handing_over: "handing over",
+  moved: "moved",
+  failed: "stopped",
+  cancelled: "cancelled",
+};
+
+/** How a move stands: each app, whether the new provider agrees with what runs, and, handed over, whether anything was made again. */
+function MoveReport({ m }: { m: Move }) {
+  return (
+    <div className="rel-move">
+      <p className="cd-meta">
+        To {providerName(m.to)}: {PHASE_WORDS[m.phase]}
+        {m.message ? ` · ${m.message}` : ""}
+      </p>
+      {m.registrations.length > 0 && (
+        <ol className="rel-history">
+          {m.registrations.map((r) => (
+            <li key={r.app}>
+              <Link to={releaseAppHref(r.app)}>{r.app}</Link>
+              <span className="rel-what">
+                {r.agrees === undefined ? "not compared yet" : r.agrees ? "agrees with what runs" : `would change ${r.differences?.length ?? 0} object${r.differences?.length === 1 ? "" : "s"}`}
+              </span>
+              <span className="rel-who">
+                {r.remade === undefined ? "" : r.remade.length ? `made again: ${r.remade.join(", ")}` : `nothing made again (${Object.keys(r.uids ?? {}).length} objects)`}
+              </span>
+              {!!r.differences?.length && (
+                <details className="rel-manifest">
+                  <summary>Where it disagrees</summary>
+                  {r.differences.map((d) => (
+                    <pre key={`${d.key.kind}/${d.key.namespace}/${d.key.name}`} className="rel-log">
+                      {`${d.key.kind} ${d.key.namespace}/${d.key.name}\n`}
+                      {d.hunks.flatMap((h) => h.lines).join("\n")}
+                    </pre>
+                  ))}
+                </details>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+/** Its provider, and moving it to another (§8.4): compared in shadow first, then handed over. */
+function Provider({ e }: { e: Environment }) {
+  const move = useSuspenseResource(`deploy/move/${e.name}`, (s) => deployApi.move(e.name, s), { on: DEPLOY_EVENTS, pollMs: 10_000 }).data;
+  const integrations = useSuspenseResource("deploy/integrations", (s) => api.integrations(s)).data.integrations.filter((i) => i.kind === "argocd");
+  const options = [{ value: "kilncd", label: "KilnCD (kiln's own)" }, ...integrations.map((i) => ({ value: `argocd/${i.name}`, label: `Argo CD ${i.name}` }))].filter((o) => o.value !== e.provider);
+  const [to, setTo] = React.useState(options[0]?.value ?? "");
+  const [applications, setApplications] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const open = !!move && (["comparing", "compared", "handing_over"].includes(move.phase) || (move.phase === "failed" && move.handing_over));
+  const agree = !!move && move.registrations.every((r) => r.agrees);
+  const argo = e.provider.startsWith("argocd/");
+  const ask = async (handover: boolean, force = false) => {
+    setBusy(true);
+    try {
+      const target = open && move ? move.to : to;
+      const m = await deployApi.startMove(e.name, { to: target, handover, force, argocd: { applications: open && move ? move.argocd.applications : applications } });
+      toast({
+        title: handover ? `Handing ${e.name} over to ${providerName(m.to)}` : `Comparing ${e.name} on ${providerName(m.to)}`,
+        description: "It goes on by itself; this page follows it.",
+        tone: "info",
+      });
+      invalidate(`deploy/move/${e.name}`);
+    } catch (err) {
+      toast({ title: "Not moved", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const cancel = async () => {
+    setBusy(true);
+    try {
+      await deployApi.cancelMove(e.name);
+      toast({ title: "Move cancelled", description: `${e.name} stays on ${providerName(e.provider)}.`, tone: "info" });
+      invalidate(`deploy/move/${e.name}`);
+    } catch (err) {
+      toast({ title: "Not cancelled", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Panel
+      eyebrow="Provider"
+      title={providerName(e.provider)}
+      description={
+        argo
+          ? e.argocd?.applications
+            ? "kiln writes each app's Application itself."
+            : "One ApplicationSet makes each app's Application from its release.json."
+          : "kiln's own engine runs each app from the release repository."
+      }
+    >
+      {move && <MoveReport m={move} />}
+      {!open ? (
+        options.length > 0 && (
+          <div className="rel-register">
+            <SelectField label="Move it to" value={to} onChange={setTo} options={options} />
+            {to.startsWith("argocd/") && (
+              <label className="rel-check">
+                <input type="checkbox" className="check" checked={applications} onChange={(ev) => setApplications(ev.target.checked)} />
+                <span>kiln writes each Application (no ApplicationSet)</span>
+              </label>
+            )}
+            <Button size="sm" variant="secondary" disabled={busy || !to} onClick={() => void ask(false)}>
+              <ArrowRightLeft /> Compare there
+            </Button>
+          </div>
+        )
+      ) : (
+        <div className="rel-register">
+          {move?.phase === "compared" && (
+            <Button size="sm" disabled={busy || !agree} onClick={() => void ask(true)}>
+              Hand over to {providerName(move.to)}
+            </Button>
+          )}
+          {move?.phase === "compared" && !agree && (
+            <Button size="sm" variant="ghost-danger" disabled={busy} onClick={() => void ask(true, true)}>
+              Hand over anyway
+            </Button>
+          )}
+          {move?.phase === "failed" && move.handing_over && (
+            <Button size="sm" disabled={busy} onClick={() => void ask(true)}>
+              Finish the handover
+            </Button>
+          )}
+          {move?.phase === "compared" && (
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>
+              Cancel the move
+            </Button>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 /** What runs here, app by app, and what's on its way. */
 function Here({ env }: { env: string }) {
   const board = useRes(boardRes).data;
@@ -276,6 +524,9 @@ function EnvView({ name }: { name: string }) {
           {gates.length > 0 && <Facts items={gates} />}
         </Panel>
         <Freeze e={e} />
+        <Loadable label="its provider">
+          <Provider e={e} />
+        </Loadable>
       </div>
       <Loadable label="what runs here">
         <Here env={e.name} />

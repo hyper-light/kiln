@@ -86,8 +86,28 @@ impl Base {
     }
 }
 
-/// This runner's folder of agents' groups, worked out once.
+/// Whether this process holds agents' processes together: only the processes that start agents for
+/// kiln (the runner, the server) do, from [`hold_agents`] on. Anything else linking kiln (an
+/// integration test, a tool) that starts a harness leaves its processes where they are, so it never
+/// makes groups in a live runner's cgroup it happens to run in (a test in a kiln terminal).
+static HOLDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process starts agents for kiln (the runner, the server): their processes are held together
+/// from now on.
+pub fn hold_agents() {
+    HOLDS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn holds() -> bool {
+    HOLDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This runner's folder of agents' groups, worked out once (none in a process that doesn't start
+/// agents for kiln).
 fn base() -> Option<&'static Base> {
+    if !holds() {
+        return None;
+    }
     static B: OnceLock<Option<Base>> = OnceLock::new();
     B.get_or_init(|| Base::under_own(AGENTS)).as_ref()
 }
@@ -207,7 +227,14 @@ fn remove_tree(dir: &Path, depth: usize) {
             }
         }
     }
-    let _ = fs::remove_dir(dir);
+    // A group whose last processes were just killed counts them until they're reaped: busy for
+    // a moment, then removable.
+    for _ in 0..40 {
+        match fs::remove_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => std::thread::sleep(Duration::from_millis(25)),
+            _ => return,
+        }
+    }
 }
 
 /// A group in a folder of its own (`kiln-agents-test-<pid>` beside the runner's), so tests never

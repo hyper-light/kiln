@@ -3,7 +3,7 @@
  * over `/api/deploy`. A release is a commit to an environment's release repository that its CD
  * provider (KilnCD or Argo CD) makes run; it waits on the environment's gates first.
  */
-import { request } from "./client";
+import { ApiError, request } from "./client";
 import type { CdDiff, CdResourceKey } from "./types";
 
 export type ReleaseState = "waiting" | "waiting_approval" | "committing" | "delivering" | "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded";
@@ -77,12 +77,36 @@ export interface Registration {
   degraded?: string | null;
 }
 
+/** A check a release passes (§9.1): one built in, by its name, or one described: a URL kiln asks, or a workflow it runs. */
+export type Check = string | CheckSpec;
+
+export interface CheckSpec {
+  name: string;
+  /** A URL asked about each release: it answers pass, fail or pending. */
+  http?: { url: string; timeout?: string };
+  /** A workflow of one of kiln's repositories, run for each release: it passes when the run succeeds. */
+  workflow?: { repository: string; workflow: string; ref?: string };
+  /** Recorded with the release, never holding or refusing it. */
+  report_only?: boolean;
+}
+
+export const checkName = (c: Check) => (typeof c === "string" ? c : c.name);
+
+/** What an environment asks of what it deploys (docs/ci.md W18-R04): kiln's signed provenance, built by its CI. */
+export interface ProvenanceRequirement {
+  builder?: string;
+  workflows?: string[];
+  branches?: string[];
+}
+
 export interface Gates {
+  /** `staging@eu`: `staging` on the linked kiln server `eu` (§11). */
   after?: string[];
   soak?: string;
   approvals?: { count: number; reviewers?: string[]; self_approve?: boolean };
   windows?: { allow?: string; deny?: string; duration: string; timezone?: string }[];
-  checks?: string[];
+  checks?: Check[];
+  require_provenance?: ProvenanceRequirement;
   freeze?: string;
   /** `auto`: a version that lands in one of `after` is released here by itself (§9.2). */
   promote?: "auto" | "manual";
@@ -97,6 +121,56 @@ export interface Environment {
   gates: Gates;
   concurrency: "reject" | "queue";
   agents: { deploy: boolean; approve: boolean };
+  /** On Argo CD: kiln writes each Application itself, rather than through the environment's ApplicationSet. */
+  argocd?: { applications: boolean };
+}
+
+export type MovePhase = "comparing" | "compared" | "handing_over" | "moved" | "failed" | "cancelled";
+
+/** One app's part in an environment's move between providers (docs/deploy-api.md §8.4). */
+export interface MovedRegistration {
+  app: string;
+  /** The new provider would change nothing of what runs but its own tracking marks. */
+  agrees?: boolean;
+  /** Where it disagrees: each object it would change. */
+  differences?: CdDiff[];
+  /** Each object's uid as the handover began. */
+  uids?: Record<string, string>;
+  /** Objects made again by the handover (their uid changed): none, if it went as it should. */
+  remade?: string[];
+  message?: string;
+}
+
+/** An environment's move between providers: compared in shadow, then handed over with nothing made again. */
+export interface Move {
+  environment: string;
+  from: string;
+  to: string;
+  argocd: { applications: boolean };
+  phase: MovePhase;
+  by: string;
+  started_at: number;
+  ended_at?: number;
+  handover: boolean;
+  force: boolean;
+  handing_over: boolean;
+  registrations: MovedRegistration[];
+  message?: string;
+}
+
+/** What can be done to an object a registration runs: its provider's action, whether it can be now, what it takes. */
+export interface ObjectAction {
+  name: string;
+  disabled: boolean;
+  params?: { name: string; default?: string }[] | null;
+}
+
+/** An object an action is on. */
+export interface ActionTarget {
+  group?: string;
+  kind: string;
+  namespace?: string;
+  name: string;
 }
 
 export type Package =
@@ -133,7 +207,7 @@ export interface Template {
   description?: string;
   package?: Package;
   namespace?: string;
-  checks?: string[];
+  checks?: Check[];
   properties?: Record<string, string[]>;
   environments?: string[];
   repository?: RepoTemplate;
@@ -308,8 +382,25 @@ export const deployApi = {
   environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
   putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
   /** A new environment: what isn't given is the server's default (no gates, one release at a time, no agents). */
-  createEnvironment: (e: { name: string; provider: string; release_repo: { repo: string; branch: string; root: string }; targets: { kubernetes: string[] } }) =>
+  createEnvironment: (e: { name: string; provider: string; release_repo: { repo: string; branch: string; root: string }; targets: { kubernetes: string[] }; argocd?: { applications: boolean } }) =>
     request<Environment>("POST", "/api/deploy/environments", e),
+  /** How an environment's move between providers stands; `null` when it hasn't moved. */
+  move: (env: string, signal?: AbortSignal) =>
+    request<Move>("GET", `/api/deploy/environments/${enc(env)}/move`, undefined, { signal }).catch((err: unknown) => {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }),
+  startMove: (env: string, ask: { to: string; handover: boolean; force: boolean; argocd?: { applications: boolean } }) => request<Move>("POST", `/api/deploy/environments/${enc(env)}/move`, ask),
+  cancelMove: (env: string) => request<Move>("DELETE", `/api/deploy/environments/${enc(env)}/move`),
+  actions: (app: string, env: string, t: ActionTarget, signal?: AbortSignal) => {
+    const qs = Object.entries(t)
+      .filter(([, v]) => v !== undefined && v !== "")
+      .map(([k, v]) => `${enc(k)}=${enc(String(v))}`)
+      .join("&");
+    return request<{ actions: ObjectAction[] }>("GET", `${reg(app, env)}/actions?${qs}`, undefined, { signal }).then((r) => r.actions);
+  },
+  runAction: (app: string, env: string, t: ActionTarget, action: string, params: Record<string, string> = {}) =>
+    request<{ done: string }>("POST", `${reg(app, env)}/actions`, { ...t, action, params }),
   register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
   resources: (app: string, env: string, signal?: AbortSignal) => request<{ resources: RunningObject[] }>("GET", `${reg(app, env)}/resources`, undefined, { signal }).then((r) => r.resources),
   manifests: (app: string, env: string, version?: string, signal?: AbortSignal) =>
