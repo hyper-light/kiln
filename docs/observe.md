@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
-| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17). Next: a streaming JSON reader and records handed over encoded (a JSON line's allocations); the Event Log on a Windows machine | in progress |
+| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second). Next: records handed over encoded; the Event Log on a Windows machine | in progress |
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Next: a date read without a second expression, fewer allocations a record | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
@@ -2351,10 +2351,28 @@ machine other sessions share (rates over runs given as a range):
 
 A busy node writes some thousands of lines a second; one core reads hundreds of thousands. A text
 line's nine allocations are its record's strings (its text, service, host, source, the file's path
-and the tags, each a `String` of `kiln_obs`'s `Record`); a JSON line's thirty-six are mostly
+and the tags, each a `String` of `kiln_obs`'s `Record`); a JSON line's thirty-six were mostly
 serde_json's tree of it: its fields moved into the record rather than copied took 46 to 37, the
-record's attributes sized once 37 to 36. Next: a streaming JSON reader (no tree), and records handed
-to the batcher encoded, as rows (no strings a record at all).
+record's attributes sized once 37 to 36.
+
+Then the tree went (`kiln_obs::json`, 2026-10-20): a JSON line's object read in place, its fields
+borrowed from the line until each is an attribute, checked as serde_json checks it (a differential
+test over 20,000 random objects, a fifth of them broken, takes and refuses alike), the lists of
+fields kept from line to line, its message written into the line's own room, and a line that names
+no message read for its level from the fields already read (serde_json parsed it again). The same
+records come out (40,000 random log lines read both ways in a test; the attributes in the line's
+order now, a number as written). The same machine (fedora, a Ryzen of 32 threads others share),
+before and after, three reads each taken in turn, medians:
+
+| | lines a second | allocations a line | bytes a line | page faults a read |
+| --- | --- | --- | --- | --- |
+| JSON lines, before | 559 k | 36 | 2,417 | 72 k |
+| JSON lines, after | 780 k (+40%) | 18 | 1,063 | 83 k |
+| CRI, JSON in it, before | 535 k | 39 | 2,718 | 67 k |
+| CRI, JSON in it, after | 800 k (+50%) | 21 | 1,364 | 39 k |
+
+Next: records handed to the batcher encoded, as rows (no strings a record at all): the batcher's
+log queue then holds rows beside records, its acks counted across both.
 
 Through kiln's nginx pipeline a line costs some ten plain ones (the same run: 1.8 M lines a second
 plain, 160 k parsed, on a loaded machine): perf puts 18% in the regular expressions' backtracker
