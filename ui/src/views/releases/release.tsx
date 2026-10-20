@@ -42,6 +42,27 @@ function Head({ r }: { r: Release | null; id: number }) {
   );
 }
 
+/** What a gate's result rests on: the workflow run a check ran, who signed a linked server's statement, and all of it as kept. */
+function Evidence({ e }: { e: Record<string, unknown> }) {
+  const run = typeof e.run === "string" ? e.run : undefined;
+  const signer = typeof e.statement === "string" && typeof e.issuer === "string" ? e.issuer : undefined;
+  return (
+    <details className="rel-evidence">
+      <summary>
+        {run && (
+          <>
+            <Link to={`/runs/${encodeURIComponent(run)}`}>run {typeof e.number === "number" ? `#${e.number}` : run}</Link>
+            {" · "}
+          </>
+        )}
+        {signer && `signed by ${signer} · `}
+        evidence
+      </summary>
+      <pre className="rel-log">{JSON.stringify(e, null, 2)}</pre>
+    </details>
+  );
+}
+
 function Gates({ r }: { r: Release }) {
   if (!r.gates?.length) return null;
   return (
@@ -53,6 +74,7 @@ function Gates({ r }: { r: Release }) {
             <div className="min-w-0">
               <span className="rel-gate-name">{g.gate}</span>
               <span className="rel-gate-detail">{g.detail}</span>
+              {g.evidence && Object.keys(g.evidence).length > 0 && <Evidence e={g.evidence} />}
             </div>
           </li>
         ))}

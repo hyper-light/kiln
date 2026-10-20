@@ -235,6 +235,7 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
+    gates::check(d, &e.gates).await.map_err(|why| bad(format!("gates: {why}")))?;
     let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?;
     // Its provider changes by a move, which hands what runs over (§8.4).
     if let Some(b) = &before
@@ -643,11 +644,7 @@ pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool
         }
         super::scaffold::check(d, r).map_err(bad)?;
     }
-    for c in &t.checks {
-        if !matches!(c.as_str(), "no-snapshots" | "owners-set") {
-            return Err(bad(format!("kiln has no check `{c}` (no-snapshots, owners-set)")));
-        }
-    }
+    gates::check_checks(d, &t.checks).await.map_err(|why| bad(format!("checks: {why}")))?;
     if let Some(p) = &t.package {
         for (k, v) in p.set() {
             repo::check(v).map_err(|e| bad(format!("package.set {k}: {e}")))?;
@@ -1385,11 +1382,20 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             let committed_at = r.committed_at.unwrap_or(r.created_at);
             let settle = env.as_ref().map_or(30, |e| i64::try_from(e.watch.settle_secs).unwrap_or(30));
             let delivered = r.provider.get("delivered_at").and_then(Value::as_i64);
+            // When the provider last couldn't be asked, and since when it hasn't answered (an
+            // outage still on): the release's timeout runs from when it answers again, and an
+            // outage longer than `watch.unreachable_secs` holds it.
+            let unanswered_at = r.provider.get("unanswered_at").and_then(Value::as_i64);
+            let unanswered_since = r.provider.get("unanswered_since").and_then(Value::as_i64);
+            let clock = unanswered_at.map_or(committed_at, |at| at.max(committed_at));
             // When the provider first held the release: kept from one look to the next.
             let looked = follow(d, &r, &commit).await.map(|(landed, mut view)| {
                 let held = !matches!(landed, Landed::Refused(_));
                 if let Some(at) = delivered.or(held.then_some(now)) {
                     note(&mut view, "delivered_at", json!(at));
+                }
+                if let Some(at) = unanswered_at {
+                    note(&mut view, "unanswered_at", json!(at));
                 }
                 (landed, view)
             });
@@ -1445,13 +1451,13 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
                 // Still progressing as its provider sees it (Kubernetes hasn't called the rollout
                 // stuck): a slow rollout isn't a failed one. It waits, up to three times its timeout.
-                Ok((Landed::No, view)) if now - committed_at > timeout && now - committed_at <= timeout * 3 && view.get("health").and_then(Value::as_str) == Some("Progressing") => {
+                Ok((Landed::No, view)) if now - clock > timeout && now - clock <= timeout * 3 && view.get("health").and_then(Value::as_str) == Some("Progressing") => {
                     r.provider = view;
                     r.message = Some(format!("still progressing past its {timeout}s; it waits up to {}s while it does", timeout * 3));
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + 5).await?;
                 }
-                Ok((Landed::No, view)) if now - committed_at > timeout => {
+                Ok((Landed::No, view)) if now - clock > timeout => {
                     let progressing = view.get("health").and_then(Value::as_str) == Some("Progressing");
                     r.provider = view;
                     let why = if progressing { format!("it didn't land within {}s, still progressing (three times watch.timeout_secs)", timeout * 3) } else { format!("it didn't land within {timeout}s (watch.timeout_secs)") };
@@ -1471,19 +1477,19 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     refused(d, r, format!("it never reached the provider within {timeout}s: {e}")).await?;
                 }
                 // It held it, and can't be asked since: what it did is unknown, and nothing is
-                // done blind. It's judged when the provider answers; past `unreachable_secs`, held.
-                Err(e) if now - committed_at > unreachable => {
-                    hold(d, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
-                }
-                Err(e) if now - committed_at > timeout => {
-                    r.message = Some(format!("the provider can't be asked ({e}): it is judged when it answers"));
-                    store::update_release(st, &r, State::Delivering).await?;
-                    store::schedule(st, id, now + 30).await?;
-                }
+                // done blind. It's judged when the provider answers; held when it hasn't for
+                // `unreachable_secs`.
                 Err(e) => {
-                    r.message = Some(e);
-                    store::update_release(st, &r, State::Delivering).await?;
-                    store::schedule(st, id, now + 5).await?;
+                    let first = unanswered_since.unwrap_or(now);
+                    if now - first > unreachable {
+                        hold(d, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
+                    } else {
+                        note(&mut r.provider, "unanswered_since", json!(first));
+                        note(&mut r.provider, "unanswered_at", json!(now));
+                        r.message = Some(format!("the provider can't be asked ({e}): it is judged when it answers"));
+                        store::update_release(st, &r, State::Delivering).await?;
+                        store::schedule(st, id, now + if now - first > timeout { 30 } else { 5 }).await?;
+                    }
                 }
             }
         }
@@ -1733,6 +1739,12 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     }
     let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let id = kilncd::app_id(&a, &env.name);
+    // A cluster that doesn't answer can't say what the release did there, nor what runs (KilnCD's
+    // last look may be all it has): it's judged when the cluster answers, and held past
+    // `watch.unreachable_secs` (§8.1).
+    if cd.apps.read().contains_key(&id) {
+        kilncd::answers(&cd, &id).await?;
+    }
     let present = cd.apps.read().get(&id).map(|e| e.def.sources.iter().any(|s| s.as_ref.as_deref() == Some("release") && s.revision == commit));
     if !file.enabled {
         // KilnCD lets go of an app as it deletes it: one still there wasn't deleted, and is again.
@@ -1752,7 +1764,18 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         }
     }
     let since_ms = u64::try_from(r.committed_at.unwrap_or(r.created_at)).unwrap_or(0).saturating_mul(1000);
-    Ok(kilncd::landed(&cd, &id, commit, since_ms))
+    let (landed, view) = kilncd::landed(&cd, &id, commit, since_ms);
+    // Its sync failed because the cluster didn't answer then: synced again now that it does,
+    // rather than judged on what the outage did.
+    if let Landed::Failed(why) = &landed
+        && kilncd::unanswered(why)
+    {
+        if let Err(e) = kilncd::sync_again(&d.hub, &cd, &format!("deploy for {}", r.requested_by), &id).await {
+            tracing::info!(release = r.id, error = %e, "deploy: KilnCD didn't sync the release again yet");
+        }
+        return Ok((Landed::No, json!({ "app": id, "waiting": "KilnCD to sync it again, its cluster answering again" })));
+    }
+    Ok((landed, view))
 }
 
 /// Ends a release: its state, its registration's, and the release it replaced.
@@ -1960,6 +1983,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
     let env = store::environment(st, &failed.environment).await?.ok_or_else(|| anyhow::anyhow!("no environment {}", failed.environment))?;
     let running = store::registration(st, &failed.app, &failed.environment).await?.and_then(|reg| reg.running);
     let file = release_file_at(d, &a, &env, sha).await.ok();
+    let keep = keeps_objects(d, file.as_ref()).await;
     let now = crate::util::now_unix();
     let back = Release {
         id: 0,
@@ -1976,7 +2000,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
         message: Some(format!("putting back what ran before release {}", failed.id)),
         rollback_of: running,
         rolled_back_by: None,
-        keep: true,
+        keep,
         provider: Value::Null,
         gates: Vec::new(),
         approvals: Vec::new(),
@@ -2011,10 +2035,34 @@ async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
     undo(d, r, why).await
 }
 
+/// Whether what a release left in the cluster stays when git goes back to `file` (its revert, or
+/// its undo). It does while something runs there (handing over `file` puts that back), and when
+/// `file` is a disable that kept what ran (`writer`: the release that wrote it). Where nothing ran
+/// before (an app's first release, or after a disable that removed what ran), what the release made
+/// goes with it. Unknown is kept: nothing is deleted blind.
+fn keeps(file: Option<&ReleaseFile>, writer: Option<&Release>) -> bool {
+    match file {
+        None => true,
+        Some(f) if f.enabled && f.version.is_some() => true,
+        // Registered, never released.
+        Some(f) if f.release == 0 => false,
+        Some(_) => writer.is_none_or(|w| w.keep),
+    }
+}
+
+/// [`keeps`], the release that wrote `file` looked up.
+async fn keeps_objects(d: &Deploy, file: Option<&ReleaseFile>) -> bool {
+    let writer = match file.map(|f| f.release).filter(|id| *id > 0) {
+        Some(id) => store::release(&d.hub.store, id).await.ok().flatten(),
+        None => None,
+    };
+    keeps(file, writer.as_ref())
+}
+
 /// Puts git and the provider back after a release that won't land (failed, refused, or cancelled
-/// while delivering): its commit is reverted, and the provider handed what git says then. Nothing is
-/// deleted on the way: a registration git says is disabled keeps its objects. What was done, as
-/// the release's message says it.
+/// while delivering): its commit is reverted, and the provider handed what git says then. Where
+/// nothing ran before it, what it made goes; a disable that kept what ran keeps it ([`keeps`]).
+/// What was done, as the release's message says it.
 async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
     let (reverted, head) = match revert(d, r, why).await {
         Ok(back) => back,
@@ -2025,15 +2073,15 @@ async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
         None => "nothing of its commit was left to revert".to_owned(),
     };
     let Some(head) = head else { return said };
-    let back = Release { commit: Some(head.clone()), keep: true, ..r.clone() };
-    if let Err(e) = deliver(d, &back).await {
-        return format!("{said}, but handing the provider what git says failed: {e}");
-    }
     let (a, env) = (store::app(&d.hub.store, &r.app).await.ok().flatten(), store::environment(&d.hub.store, &r.environment).await.ok().flatten());
     let file = match (&a, &env) {
         (Some(a), Some(env)) => release_file_at(d, a, env, &head).await.ok(),
         _ => None,
     };
+    let back = Release { commit: Some(head.clone()), keep: keeps_objects(d, file.as_ref()).await, ..r.clone() };
+    if let Err(e) = deliver(d, &back).await {
+        return format!("{said}, but handing the provider what git says failed: {e}");
+    }
     match file {
         Some(f) if f.enabled && f.version.is_some() => format!("{said}; release {} runs on", f.release),
         Some(_) => format!("{said}; nothing runs"),
@@ -2388,6 +2436,25 @@ mod tests {
         assert!(matches!(aftermath(&asked), Aftermath::Hold(why) if why.contains("asked not to be reverted")));
         let migrates = Release { irreversible: Some("Job web-migrate".into()), ..failed_release(Kind::Deploy, Origin::Api) };
         assert!(matches!(aftermath(&migrates), Aftermath::Hold(why) if why.contains("Job web-migrate")), "a migration that ran isn't undone by putting the code back");
+    }
+
+    /// §8.1: putting back what ran before keeps what's in the cluster unless nothing ran: an app's
+    /// first release, or one after a disable that removed what ran, takes what it made with it.
+    #[test]
+    fn what_a_release_made_goes_with_its_revert_where_nothing_ran_before() -> anyhow::Result<()> {
+        let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+        let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+        let registered = repo::registered_json(&web, "production");
+        assert!(!keeps(Some(&registered), None), "the first release: nothing ran before");
+        let running = ReleaseFile { release: 7, enabled: true, version: Some("1.4.0".into()), ..registered.clone() };
+        assert!(keeps(Some(&running), None), "what ran is put back by handing it over");
+        let disabled = ReleaseFile { release: 9, ..registered.clone() };
+        let disable = |keep: bool| Release { id: 9, kind: Kind::Disable, keep, ..failed_release(Kind::Disable, Origin::Api) };
+        assert!(keeps(Some(&disabled), Some(&disable(true))), "a disable that kept what ran keeps it");
+        assert!(!keeps(Some(&disabled), Some(&disable(false))), "after a disable that removed what ran, nothing ran");
+        assert!(keeps(Some(&disabled), None), "a writer that can't be found: nothing deleted blind");
+        assert!(keeps(None, None), "a file that can't be read: nothing deleted blind");
+        Ok(())
     }
 
     #[test]

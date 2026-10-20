@@ -2,7 +2,7 @@
 //! bucket histograms, and labelled families keyed by a small string set. Host statistics are read
 //! straight from `/proc` on demand (only when scraped or sampled), so idle cost is ~zero.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -139,6 +139,15 @@ impl GaugeVec {
     /// Every series, as just measured: label values (in `keys` order) and value.
     pub fn replace(&self, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
         *self.series.write() = series.into_iter().collect();
+    }
+
+    /// The series of one publisher, as just measured: those whose first label is one of `owned`
+    /// (what it published before, and now) replaced, another publisher's kept (several sync
+    /// servers in one process, as tests have them).
+    pub fn replace_owned(&self, owned: &BTreeSet<String>, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
+        let mut g = self.series.write();
+        g.retain(|k, _| k.first().is_none_or(|first| !owned.contains(first)));
+        g.extend(series);
     }
 
     fn render(&self, out: &mut String, name: &str) {

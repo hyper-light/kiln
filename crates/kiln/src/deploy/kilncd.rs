@@ -182,6 +182,32 @@ pub async fn deliver(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, def: &AppDef) ->
     Ok(())
 }
 
+/// How long a look at whether an app's cluster answers may take.
+const PROBE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the cluster an app runs in answers now (asked its version), and why not. A cluster that
+/// doesn't answer can't say what a release did there: nothing is judged blind (§8.1).
+pub async fn answers(cd: &Cd, id: &str) -> Result<(), String> {
+    let Some(name) = cd.apps.read().get(id).map(|e| e.def.destination.cluster.clone()) else { return Ok(()) };
+    let Some(cluster) = cd.clusters.read().get(&name).cloned() else { return Err(format!("cluster {name} isn't connected")) };
+    match crate::rt::timeout(PROBE, cluster.request(http::Method::GET, "/version", None, None)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(_) => Err(format!("cluster {name} {}: nothing within {} s", crate::cd::kube::NO_ANSWER, PROBE.as_secs())),
+    }
+}
+
+/// Whether a sync failed because its cluster didn't answer: what it did there is unknown.
+pub fn unanswered(message: &str) -> bool {
+    message.contains(crate::cd::kube::NO_ANSWER)
+}
+
+/// Has KilnCD sync an app again, as its automation would: its last sync failed while its cluster
+/// didn't answer, and automation doesn't try a revision again once its sync has failed.
+pub async fn sync_again(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str) -> Result<(), String> {
+    op(hub, cd, actor, "cd.apps.sync", json!({ "app": id })).await.map(|_| ())
+}
+
 /// Removes a registration's app: its objects too, unless `keep`.
 pub async fn remove(hub: &Arc<Hub>, cd: &Arc<Cd>, actor: &str, id: &str, keep: bool) -> Result<(), String> {
     if !cd.apps.read().contains_key(id) {
@@ -240,6 +266,8 @@ struct Seen {
 /// message), why its sources don't read or render, where the app stands, and why it's Degraded.
 fn verdict(ran: Option<(bool, String)>, refused: Option<String>, seen: Seen, degraded: Option<String>) -> Landed {
     match (ran, refused) {
+        // Synced again since (its cluster answers again): that sync says.
+        (Some((false, _)), _) if seen.syncing => Landed::No,
         (Some((false, message)), _) => Landed::Failed(if message.is_empty() { "KilnCD's sync of the release failed".to_owned() } else { message }),
         (Some(_), _) if seen.settled => Landed::Yes,
         // Synced from this commit, and Degraded: what the release runs doesn't.
@@ -348,6 +376,11 @@ mod tests {
         assert_eq!(verdict(None, None, seen(true, true, false), None), Landed::Yes, "nothing to sync: it runs already");
         assert!(matches!(verdict(None, None, seen(true, false, false), degraded()), Landed::Degraded(_)));
         assert_eq!(verdict(None, None, seen(false, false, false), degraded()), Landed::No, "what's Degraded isn't this release's yet");
+        // A sync that failed while its cluster didn't answer is synced again once it does: the
+        // sync running since decides.
+        assert_eq!(verdict(Some((false, "cluster e2e doesn't answer: nothing within 30 s".into())), None, seen(true, false, true), None), Landed::No);
+        assert!(unanswered("the namespace failed to apply: cluster e2e doesn't answer: nothing within 30 s"));
+        assert!(!unanswered("the Deployment failed to apply: admission webhook denied it"), "an answer, even a no, isn't");
     }
 
     #[test]

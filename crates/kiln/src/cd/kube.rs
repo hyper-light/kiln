@@ -28,6 +28,10 @@ use crate::http::tls::{ClientTls, TlsStream};
 
 /// Longest a request waits for its answer.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// What a request that never got an answer says (no connection, none in time, or the connection
+/// dropped), as against one the API server answered, whatever it said: what was done there is
+/// unknown (`crate::deploy::kilncd::unanswered`).
+pub const NO_ANSWER: &str = "doesn't answer";
 /// Most bytes a (non-watch) response may hold.
 const BODY_LIMIT: usize = 256 << 20;
 /// Kept-alive connections a cluster's pool holds.
@@ -205,7 +209,7 @@ impl Cluster {
                 let mut sender = match pooled {
                     Some(s) if !s.is_closed() => s,
                     Some(_) => continue,
-                    None => self.connect().await?,
+                    None => self.connect().await.map_err(|e| anyhow::anyhow!("cluster {} {NO_ANSWER}: {e:#}", self.name))?,
                 };
                 attempts += 1;
                 if sender.ready().await.is_err() {
@@ -215,13 +219,13 @@ impl Cluster {
                 let resp = match sender.send_request(req).await {
                     Ok(r) => r,
                     Err(e) if e.is_canceled() || e.is_closed() => continue,
-                    Err(e) => return Err(anyhow::anyhow!("cluster {}: {e}", self.name)),
+                    Err(e) => return Err(anyhow::anyhow!("cluster {} {NO_ANSWER}: {e}", self.name)),
                 };
                 let status = resp.status().as_u16();
                 let bytes = http_body_util::Limited::new(resp.into_body(), BODY_LIMIT)
                     .collect()
                     .await
-                    .map_err(|e| anyhow::anyhow!("cluster {}: reading the answer: {e}", self.name))?
+                    .map_err(|e| anyhow::anyhow!("cluster {} {NO_ANSWER}: its answer broke off: {e}", self.name))?
                     .to_bytes();
                 let mut pool = self.pool.lock();
                 if pool.len() < POOL {
@@ -229,11 +233,11 @@ impl Cluster {
                 }
                 return Ok((status, bytes));
             }
-            bail!("cluster {}: no connection would take the request", self.name)
+            bail!("cluster {} {NO_ANSWER}: no connection would take the request", self.name)
         };
         match crate::rt::timeout(TIMEOUT, fut).await {
             Ok(r) => r,
-            Err(_) => bail!("cluster {}: no answer within {} s", self.name, TIMEOUT.as_secs()),
+            Err(_) => bail!("cluster {} {NO_ANSWER}: nothing within {} s", self.name, TIMEOUT.as_secs()),
         }
     }
 

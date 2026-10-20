@@ -12,7 +12,7 @@
 import * as React from "react";
 import { Rocket } from "lucide-react";
 
-import { boardHref, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package } from "@/api/deploy";
+import { boardHref, checkName, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -214,7 +214,7 @@ function Builder() {
                 Runs in <code>{filled(t.namespace)}</code>
               </li>
             )}
-            {!!t.checks?.length && <li>Every release passes {t.checks.join(", ")}</li>}
+            {!!t.checks?.length && <li>Every release passes {t.checks.map(checkName).join(", ")}</li>}
             {!!t.environments?.length && <li>May go to {t.environments.join(", ")}</li>}
             {makes && (
               <li>

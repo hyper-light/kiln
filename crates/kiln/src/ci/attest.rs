@@ -323,13 +323,33 @@ pub struct Requirement {
     pub branches: Vec<String>,
 }
 
+/// What kiln's provenance says of a digest, against a requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provenanced {
+    /// An attestation meets it, its signature verified: its id.
+    Verified(i64),
+    /// kiln has none about it (yet: the build that attests it may still run).
+    None(String),
+    /// Those kiln has don't meet it, and why.
+    Unmet(String),
+}
+
 /// Whether kiln's own provenance about `digest`, its signature verified, meets `req`: the
 /// attestation's id when one does, else why none did.
 pub async fn verify_provenance(hub: &Hub, digest: &str, req: &Requirement) -> anyhow::Result<Result<i64, String>> {
+    Ok(match provenance_of(hub, digest, req).await? {
+        Provenanced::Verified(id) => Ok(id),
+        Provenanced::None(why) | Provenanced::Unmet(why) => Err(why),
+    })
+}
+
+/// [`verify_provenance`], telling none from none that meets `req` (CD waits for the one, refuses
+/// the other: docs/deploy-api.md §9.1).
+pub async fn provenance_of(hub: &Hub, digest: &str, req: &Requirement) -> anyhow::Result<Provenanced> {
     let sql = format!("SELECT {COLUMNS} FROM ci_attestations a JOIN ci_attestation_subjects s ON s.attestation_id = a.id WHERE s.digest = ?1 AND a.origin = 'kiln' AND a.predicate_type = ?2 ORDER BY a.id DESC LIMIT 50");
     let found = rows(hub, sql, digest.to_ascii_lowercase(), a::PROVENANCE.to_owned()).await?;
     if found.is_empty() {
-        return Ok(Err(format!("kiln has no provenance of {digest}")));
+        return Ok(Provenanced::None(format!("kiln has no provenance of {digest}")));
     }
     let builder = req.builder.clone().unwrap_or_else(|| format!("{}/ci@v1", hub.cfg.server.public_url.trim_end_matches('/')));
     let mut why = Vec::new();
@@ -355,10 +375,10 @@ pub async fn verify_provenance(hub: &Hub, digest: &str, req: &Requirement) -> an
         } else if !req.branches.is_empty() && !req.branches.iter().any(|g| crate::pipeline::glob_match(g, branch)) {
             why.push(format!("#{id}: from {git_ref}, not {}", req.branches.join(", ")));
         } else {
-            return Ok(Ok(id));
+            return Ok(Provenanced::Verified(id));
         }
     }
-    Ok(Err(why.join("; ")))
+    Ok(Provenanced::Unmet(why.join("; ")))
 }
 
 /// `POST /api/ci/attestations/verify` `{ digest, builder?, workflows?, branches? }`: whether an
@@ -414,6 +434,16 @@ pub async fn facade_create(hub: &Hub, claims: &token::Job, body: &Value) -> Resu
     }
     let ids = keep(hub, claims.run.clone(), claims.leg.clone(), 0, String::new(), "job", &subjects, vec![(kind, bundle)]).await.map_err(internal)?;
     Ok(srv::json(StatusCode::CREATED, &json!({ "id": ids.first() })))
+}
+
+/// kiln's provenance of `subjects` from the build `f` says, signed and kept as a leg's attest
+/// step's is: for tests of what asks for it (CD's `require_provenance`).
+#[cfg(test)]
+pub(crate) async fn keep_provenance(hub: &Hub, subjects: &[Subject], f: &a::Facts) -> anyhow::Result<i64> {
+    let workload = kiln_ci::oidc::Workload { repository: &f.repository, actor: "kiln", source: "job", ..kiln_ci::oidc::Workload::default() };
+    let bundle = super::signing::bundle(hub, &a::statement(subjects, a::PROVENANCE, a::provenance(f)), &workload).await?;
+    let ids = keep(hub, "run".into(), "leg".into(), 0, String::new(), "kiln", subjects, vec![(a::PROVENANCE.into(), bundle)]).await?;
+    ids.first().copied().ok_or_else(|| anyhow::anyhow!("nothing was kept"))
 }
 
 #[cfg(test)]
