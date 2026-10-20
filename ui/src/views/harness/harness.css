@@ -3203,7 +3203,8 @@ textarea.hx-input {
   color: #8a8e98;
 }
 .hx-step-body {
-  padding: 2px 2px 14px 26px;
+  /* Expanded content shares the header's outer inset; nested cards pad their own contents. */
+  padding: 2px 2px 14px;
 }
 .hx-note {
   padding: 12px 0;
