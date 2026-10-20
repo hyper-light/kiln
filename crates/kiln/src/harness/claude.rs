@@ -1953,7 +1953,7 @@ impl Claude {
                     core.state.mode = m.to_owned();
                 }
                 let activity = str_of(v, "status").map(str::to_owned);
-                if activity.as_deref() == Some("requesting") {
+                if activity.as_deref() == Some("requesting") && parent.is_none() {
                     self.begin(core);
                 }
                 core.state.activity = activity;
@@ -2153,7 +2153,11 @@ impl Claude {
             .or_else(|| ev.get("message").and_then(|m| str_of(m, "id")))
             .unwrap_or("")
             .to_owned();
-        self.begin(core);
+        // A subagent's own output (its parent call's id on it) is the subagent's: one in the
+        // background goes on after its parent's turn has ended, and doesn't start that turn again.
+        if parent.is_none() {
+            self.begin(core);
+        }
         match str_of(ev, "type").unwrap_or("") {
             "message_start" => {
                 self.streams.entry(msg_id).or_default();
@@ -2203,7 +2207,10 @@ impl Claude {
     }
 
     fn assistant(&mut self, core: &mut Core, v: &Value, parent: Option<String>) {
-        self.begin(core);
+        // A subagent's messages are its own (`stream_event`).
+        if parent.is_none() {
+            self.begin(core);
+        }
         if parent.is_none()
             && let Some(run) = v.get("local_command_run")
             && str_of(run, "command") == Some("goal")
@@ -4075,6 +4082,40 @@ mod tests {
         assert_eq!(sub.and_then(|e| e.parent), Some("toolu_5".to_owned()));
         c.command(&mut core, Command::StopTask { task: "a575".into() });
         assert!(core.take_writes().iter().any(|w| w.contains("\"stop_task\"") && w.contains("a575")));
+    }
+
+    /// An agent that started a subagent in the background and ended its turn is done with it:
+    /// the subagent's own output, coming in after, is the subagent's, and doesn't make its parent
+    /// work again (nor hold a message sent to it meanwhile). The parent works again when it does:
+    /// Claude Code starts its next turn itself once the subagent is done.
+    #[test]
+    fn a_background_subagent_leaves_its_parent_s_turn_ended() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        for l in [
+            r#"{"type":"assistant","message":{"id":"msg_4","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_5","name":"Agent","input":{"description":"Sleep then say OK","prompt":"sleep 20, then OK","subagent_type":"general-purpose","run_in_background":true}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a575","tool_use_id":"toolu_5","description":"Sleep then say OK","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"sleep 20, then OK"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_5","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully."}]}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"msg_5","model":"claude-opus-5-5","content":[{"type":"text","text":"DONE"}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"DONE","stop_reason":"end_turn","session_id":"s"}"#,
+        ] {
+            c.line(&mut core, l);
+        }
+        assert!(!c.busy(&core) && core.state.turn_started.is_none(), "its turn ended");
+        // The subagent at work, after its parent's turn.
+        for l in [
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_6","type":"message","role":"assistant","content":[]}},"parent_tool_use_id":"toolu_5"}"#,
+            r#"{"type":"system","subtype":"status","status":"requesting","parent_tool_use_id":"toolu_5"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_6","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_7","name":"Bash","input":{"command":"sleep 20"}}]},"parent_tool_use_id":"toolu_5"}"#,
+        ] {
+            c.line(&mut core, l);
+        }
+        assert!(!c.busy(&core) && core.state.turn_started.is_none(), "the subagent's work isn't its parent's turn");
+        assert_eq!(core.get("msg_6:0").and_then(|e| e.parent.clone()), Some("toolu_5".to_owned()), "the subagent's call shows, under it");
+        // A message to the parent goes to it now, rather than waiting for the subagent.
+        let _ = core.take_writes();
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "and another thing".into(), mode: Default::default(), attachments: Vec::new(), overrides: None });
+        assert!(core.take_writes().iter().any(|w| w.contains("and another thing")), "sent at once");
     }
 
     #[test]
