@@ -164,6 +164,8 @@ const fleet: AgentInfo[] = !FLEET
 export const fleetInfos = () => fleet;
 
 let emitFleet: (info: AgentInfo) => void = () => {};
+/** What Mission control's box sent (`GET /api/mock/broadcasts`). */
+const broadcasts: unknown[] = [];
 /**
  * A command to one of the fleet: answering a request takes it away (with none left it works on).
  * False: not one of the fleet.
@@ -201,6 +203,23 @@ export async function handlePush(req: http.IncomingMessage, res: http.ServerResp
     ctx.emit({ type: "harness", info: changed });
     return (ctx.json(res, 200, changed), true);
   }
+  // Messages to many agents (Mission control's box): each kept, for trying it, and said sent.
+  if (p === "/api/harness/files" && m === "POST") {
+    let size = 0;
+    for await (const chunk of req) size += (chunk as Buffer).length;
+    return (ctx.json(res, 200, { file_id: `up-${randomBytes(6).toString("hex")}`, size }), true);
+  }
+  if (p === "/api/harness/broadcast" && m === "POST") {
+    const b = await ctx.body<{ to?: { ids?: string[] }; text?: string; mode?: string; attachments?: unknown[]; command?: unknown; approvals?: string }>(req);
+    broadcasts.push({ at: Date.now(), ...b });
+    const ids = b.to?.ids ?? [];
+    const results = ids.map((id) => {
+      const a = fleet.find((x) => x.id === id);
+      return { id, name: a?.name ?? id, machine: (a?.target ?? "local").replace(/^agent:/, ""), kind: a?.kind ?? "claude", result: "sent" };
+    });
+    return (ctx.json(res, 200, { id: `bc-${broadcasts.length}`, sent: results.length, skipped: 0, failed: 0, results }), true);
+  }
+  if (p === "/api/mock/broadcasts" && m === "GET") return (ctx.json(res, 200, { broadcasts }), true);
   if (!p.startsWith("/api/push")) return false;
   let mm: RegExpMatchArray | null;
   if (p === "/api/push" && m === "GET") {

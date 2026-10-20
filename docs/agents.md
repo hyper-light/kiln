@@ -174,7 +174,9 @@ that continues a copy of the conversation (Claude Code's `--fork-session`, Codex
     prompt route sends its words, a control sends its command, a panel (`/model`) or a command the
     harness can't run from kiln is skipped, saying why; a name not in its catalog goes as typed
     (its harness may know it, as a skill). `mode` for a prompt: `queue` (after the current turn,
-    the default), `steer` (into it) or `now` (stopping it).
+    the default), `steer` (into it) or `now` (stopping it). `attachments`: files with the prompt
+    (or alone, without `text`), as an agent's own message takes them (each uploaded first with
+    `POST /api/harness/files`, then named by `file_id`): each agent gets its own copy.
   - `command`: a command as the console sends one (`{"type": "interrupt"}`,
     `{"type": "set_mode", "mode": "plan"}`, `{"type": "restart"}`, ...). A `send` gets its own
     message id per agent.

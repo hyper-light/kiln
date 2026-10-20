@@ -1,22 +1,29 @@
 /**
  * Message many agents at once, in the page, drawn like an agent's own composer: to the agents
- * checked in the list or, with none checked, every one it shows. A prompt (queued after the current
- * turn, steered into it, or sent now), a slash command read in their own catalogs, or a command:
- * interrupt, restart, a mode, model or effort, an answer to everything waiting on you. Commands are
- * asked once, in a line under the field; the same line then says how it went, and opens to each
- * agent's outcome.
+ * picked (checked in the list, or found by typing @ and part of a name, machine or harness) or,
+ * with none picked, every one the list shows. A prompt, with files and what you say into the mic,
+ * queued after the current turn, steered into it, or sent now; a slash command read in their own
+ * catalogs; or a command: interrupt, restart, a mode, model or effort, an answer to everything
+ * waiting on you. Commands are asked once, in a line under the field; the same line then says how
+ * it went, and opens to each agent's outcome.
  */
 import * as React from "react";
 import "./console.css";
-import { ArrowUp, ChevronRight, CornerDownLeft } from "lucide-react";
+import { ArrowUp, ChevronRight, CornerDownLeft, Paperclip, SlidersHorizontal, X } from "lucide-react";
 import { harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
+import { Tip } from "@/components/ui/tooltip";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { CommandList, matchCommands, parseSlash } from "./palette";
+import { MODES, SendModes } from "./composer";
+import { useAttachments } from "./controls";
+import { agentLabel } from "./derive";
+import { machineName } from "./parts";
+import { MicButton } from "./voice";
 
 const machineLabel = (m: string) => (m === "local" ? "server" : m);
 /** Enter sends with a keyboard and pointer; on a touch screen it is a new line (as in the composer). */
@@ -33,20 +40,59 @@ interface Ask {
 /** Who the message goes to, in words: "2 selected", "5 shown", "all 7". */
 export type Reach = "selected" | "shown" | "all";
 
-type BarProps = { agents: AgentInfo[]; reach: Reach; onEnded?: () => void };
+type BarProps = {
+  /** Who it goes to: those picked, or (none picked) every one the list shows. */
+  agents: AgentInfo[];
+  reach: Reach;
+  onEnded?: () => void;
+  /** Every agent, to find by typing @ (picking one adds it to those picked). */
+  all?: AgentInfo[];
+  /** Pick (or put back) agents: the list's own selection. */
+  onPick?: (ids: string[], on: boolean) => void;
+};
+
+/** Chips for those picked, at most; past these, how many more. */
+const CHIPS = 4;
+
+/** "@words" being typed at the end: the words. */
+const atOf = (text: string) => text.match(/(?:^|\s)@([^\s@]*)$/)?.[1];
+
+/** Agents a few typed letters may mean: by name, then machine, harness or what it's on. */
+function findAgents(all: AgentInfo[], q: string, not: ReadonlySet<string>): AgentInfo[] {
+  const w = q.toLowerCase();
+  const score = (a: AgentInfo) => {
+    const name = agentLabel(a).toLowerCase();
+    if (!w) return 3;
+    if (name.startsWith(w)) return 0;
+    if (name.split(/[\s\-_/:]+/).some((p) => p.startsWith(w))) return 1;
+    if (name.includes(w)) return 2;
+    if ([machineName(a.target), a.kind_name, a.goal ?? "", a.cwd].some((x) => x.toLowerCase().includes(w))) return 4;
+    return -1;
+  };
+  return all
+    .filter((a) => !not.has(a.id) && a.status !== "exited")
+    .map((a) => [a, score(a)] as const)
+    .filter(([, sc]) => sc >= 0)
+    .sort((x, y) => x[1] - y[1] || y[0].last_activity - x[0].last_activity)
+    .slice(0, 6)
+    .map(([a]) => a);
+}
+
+/** What an agent is doing, in a word, beside its name in the finder. */
+const doingOf = (a: AgentInfo) => (a.approvals.length > 0 ? "needs you" : a.status === "running" ? "working" : a.status === "idle" ? "idle" : a.status);
 
 /** What the agents of a roster ("id:status,…") understand; nothing for no agents, or when it can't be said. */
 const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
   roster ? harnessApi.broadcastPreview({ ids: roster.split(",").map((r) => r.slice(0, r.lastIndexOf(":"))) }).catch(() => null) : Promise.resolve(null);
 
-export function MessageBar({ agents, reach, onEnded }: BarProps) {
+export function MessageBar(props: BarProps) {
   // What they understand (commands, modes, models, efforts, and how many have each): again as
   // the agents picked change, come or go. Meanwhile the bar keeps what it knew; before the first
   // answer it shows as it does without one.
-  const roster = React.useDeferredValue(agents.map((a) => `${a.id}:${a.status}`).join(","));
+  const roster = React.useDeferredValue(props.agents.map((a) => `${a.id}:${a.status}`).join(","));
   return (
-    <Loadable label="Loading what the agents understand" fallback={<Bar agents={agents} reach={reach} onEnded={onEnded} preview={null} />}>
-      <Previewed roster={roster} agents={agents} reach={reach} onEnded={onEnded} />
+    <Loadable label="Loading what the agents understand" fallback={<Bar {...props} preview={null} />}>
+      <Previewed roster={roster} {...props} />
     </Loadable>
   );
 }
@@ -56,10 +102,16 @@ function Previewed({ roster, ...bar }: BarProps & { roster: string }) {
   return <Bar {...bar} preview={data} />;
 }
 
-function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: BroadcastPreview | null }) {
+function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & { preview: BroadcastPreview | null }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
-  const [picked, setPicked] = React.useState("");
+  const [found, setFound] = React.useState(0);
+  const field = React.useRef<HTMLTextAreaElement | null>(null);
+  const [note, setNote] = React.useState<string | null>(null);
+  const attachments = useAttachments("any");
+  const { files, pending } = attachments;
+  const picker = React.useRef<HTMLInputElement>(null);
+  const [choice, setChoice] = React.useState("");
   const [ask, setAsk] = React.useState<Ask | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
@@ -75,7 +127,7 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
   if (askedOf !== key) {
     setAskedOf(key);
     setAsk(null);
-    setPicked("");
+    setChoice("");
   }
 
   const n = agents.length;
@@ -88,6 +140,7 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
     try {
       setReport(await harnessApi.broadcastTo({ to: { ids }, ...body }));
       setReportOpen(false);
+      if (body.attachments) attachments.clear();
       return true;
     } catch (e) {
       toast.error("Couldn't send", errorMessage(e));
@@ -95,7 +148,7 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
     } finally {
       setBusy(false);
       setAsk(null);
-      setPicked("");
+      setChoice("");
     }
   };
   const command = (c: Command) => send({ command: c });
@@ -103,7 +156,17 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
   // The slash palette: what the agents understand, marked where only some do.
   const slash = parseSlash(text);
   const items = focused && slash?.typingName ? matchCommands(preview?.commands ?? [], slash.name) : [];
-  const note = (c: SlashCommand) => {
+  // The finder: agents to add, for "@" and what's typed after it.
+  const at = focused && onPick ? atOf(text) : undefined;
+  const pickedIds = React.useMemo(() => new Set(reach === "selected" ? ids : []), [reach, ids]);
+  const finds = at === undefined ? [] : findAgents(all, at, pickedIds);
+  const add = (a: AgentInfo) => {
+    onPick?.([a.id], true);
+    setText((t) => t.replace(/(^|\s)@[^\s@]*$/, "$1"));
+    setFound(0);
+    field.current?.focus();
+  };
+  const noteOf = (c: SlashCommand) => {
     const k = (c as SlashCommand & { count?: number }).count;
     return k !== undefined && k < n ? `${k} of ${n}` : undefined;
   };
@@ -113,8 +176,8 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
   };
   const sendText = () => {
     const body = text.trim();
-    if (!body || n === 0 || busy) return;
-    const go = () => send({ text: body, mode }).then((ok) => ok && setText(""));
+    if ((!body && files.length === 0) || pending > 0 || n === 0 || busy) return;
+    const go = () => send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined }).then((ok) => ok && setText(""));
     if (mode === "now" && working > 0)
       setAsk({
         ask: `Stop the turn of ${count(working, "working agent")} and send this now?`,
@@ -130,7 +193,7 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
   const efforts = preview?.efforts ?? [];
   /** A command picked from the select: asked in the line under the field, run from there. */
   const choose = (v: string) => {
-    setPicked(v);
+    setChoice(v);
     if (!v) {
       setAsk(null);
       return;
@@ -189,7 +252,7 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
         run: async () => {
           await Promise.allSettled(ids.map((id) => harnessApi.stop(id)));
           setAsk(null);
-          setPicked("");
+          setChoice("");
           onEnded?.();
         },
       });
@@ -203,17 +266,66 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
         ? `Steer ${who}${roomy ? ": each reads this at its next step" : "…"}`
         : mode === "now"
           ? `Stop ${who} and say…`
-          : `Message ${who}${roomy ? ": a prompt, or / for a command" : "…"}`;
+          : `Message ${who}${roomy ? `: a prompt, / for a command${onPick ? ", @ to pick agents" : ""}` : "…"}`;
   const outcome = report
     ? [report.sent ? `Sent to ${report.sent}` : "", report.skipped ? `${report.skipped} skipped` : "", report.failed ? `${report.failed} failed` : ""].filter(Boolean).join(" · ") ||
       "No agent to send to"
     : "";
 
+  // Grows with the text up to the stylesheet's most lines, then scrolls inside (as the composer).
+  const lengthWas = React.useRef(0);
+  const grow = React.useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      field.current = el;
+      if (!el) return;
+      if (text.length < lengthWas.current || !text) el.style.height = "auto";
+      lengthWas.current = text.length;
+      const h = `${el.scrollHeight}px`;
+      if (el.style.height !== h) el.style.height = h;
+    },
+    [text],
+  );
+  const picked = reach === "selected" ? agents : [];
+  const sendLabel = working > 0 ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
+
   return (
     <section className="ms-msg cp" aria-label="Message agents">
-      <div className="ms-msg-field">
+      <div
+        className="ms-msg-field"
+        onDragOver={(e) => {
+          if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          if (e.dataTransfer.files.length === 0) return;
+          e.preventDefault();
+          void attachments.add(e.dataTransfer.files);
+        }}
+      >
         <div className={cn("hx-compose-box", working > 0 && "hx-compose-live")}>
+          {/* Who it goes to: those picked (each put back with its ×), or everyone the list shows. */}
+          <div className="ms-to">
+            <span className="ms-to-label">To</span>
+            {picked.length > 0 ? (
+              <>
+                {picked.slice(0, CHIPS).map((a) => (
+                  <span key={a.id} className="ms-to-chip">
+                    <span className="hx-trunc">{agentLabel(a)}</span>
+                    {onPick && (
+                      <button type="button" aria-label={`Not to ${agentLabel(a)}`} onClick={() => onPick([a.id], false)}>
+                        <X size={11} />
+                      </button>
+                    )}
+                  </span>
+                ))}
+                {picked.length > CHIPS && <span className="ms-to-more">+{picked.length - CHIPS} more</span>}
+              </>
+            ) : (
+              <span className="ms-to-all">{reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
+            )}
+          </div>
+          {attachments.chips}
           <textarea
+            ref={grow}
             className="hx-compose-input"
             rows={1}
             value={text}
@@ -224,12 +336,25 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
             autoCapitalize="sentences"
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
+            onPaste={(e) => {
+              if (e.clipboardData.files.length === 0) return;
+              e.preventDefault();
+              void attachments.add(e.clipboardData.files);
+            }}
             onChange={(e) => {
               setText(e.target.value);
               setIndex(0);
+              setFound(0);
             }}
             onKeyDown={(e) => {
-              if (items.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+              if (finds.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                e.preventDefault();
+                setFound((i) => (i + (e.key === "ArrowDown" ? 1 : finds.length - 1)) % finds.length);
+              } else if (finds.length > 0 && (e.key === "Tab" || e.key === "Enter")) {
+                e.preventDefault();
+                const a = finds[Math.min(found, finds.length - 1)];
+                if (a) add(a);
+              } else if (items.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                 e.preventDefault();
                 setIndex((i) => (i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length);
               } else if (items.length > 0 && (e.key === "Tab" || e.key === "Enter")) {
@@ -243,67 +368,130 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
             }}
           />
           <div className="cp-bar">
-            <select className="ms-msg-select ms-msg-mode" aria-label="How to send to agents that are working" value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
-              <option value="queue">Queue</option>
-              <option value="steer">Steer</option>
-              <option value="now">Now</option>
-            </select>
-            <select className="ms-msg-select" aria-label="Command" value={picked} disabled={n === 0 || busy} onChange={(e) => choose(e.target.value)}>
-              <option value="">Command…</option>
-              <option value="interrupt" disabled={working === 0}>
-                Interrupt{working > 0 ? ` (${working} working)` : ""}
-              </option>
-              <option value="restart">Restart</option>
-              {modes.length > 0 && (
-                <optgroup label="Permissions">
-                  {modes.map((m) => (
-                    <option key={m.id} value={`mode:${m.id}`}>
-                      {m.label}
-                      {some(m.count)}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              {models.length > 0 && (
-                <optgroup label="Model">
-                  {models.map((m) => (
-                    <option key={m.id} value={`model:${m.id}`}>
-                      {m.label}
-                      {some(m.count)}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              {efforts.length > 0 && (
-                <optgroup label="Effort">
-                  {efforts.map((m) => (
-                    <option key={m.id} value={`effort:${m.id}`}>
-                      {m.label}
-                      {some(m.count)}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              <optgroup label="Waiting on you">
-                <option value="allow" disabled={waiting === 0}>
-                  Allow {waiting > 0 ? `${waiting} ` : ""}waiting
+            <input
+              ref={picker}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                if (e.target.files) void attachments.add(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <Tip content="Attach files or images">
+              <button type="button" className="cp-icon" aria-label="Attach files" disabled={n === 0} onClick={() => picker.current?.click()}>
+                <Paperclip size={15} />
+                {files.length > 0 && <span className="cp-badge">{files.length}</span>}
+              </button>
+            </Tip>
+            <MicButton field={field} setText={(t) => setText(t)} onNote={setNote} disabled={n === 0} />
+            {working > 0 && <SendModes modes={MODES} mode={mode} onMode={setMode} />}
+            {/* On a phone, an icon with the select over it: a tap opens the phone's own list. */}
+            <label className="ms-cmd">
+              <SlidersHorizontal size={15} className="ms-cmd-icon" aria-hidden="true" />
+              <select className="ms-msg-select" aria-label="Command" value={choice} disabled={n === 0 || busy} onChange={(e) => choose(e.target.value)}>
+                <option value="">Command…</option>
+                <option value="interrupt" disabled={working === 0}>
+                  Interrupt{working > 0 ? ` (${working} working)` : ""}
                 </option>
-                <option value="deny" disabled={waiting === 0}>
-                  Deny {waiting > 0 ? `${waiting} ` : ""}waiting
-                </option>
-              </optgroup>
-              {reach === "selected" && <option value="end">End {count(n, "agent")}</option>}
-            </select>
+                <option value="restart">Restart</option>
+                {modes.length > 0 && (
+                  <optgroup label="Permissions">
+                    {modes.map((m) => (
+                      <option key={m.id} value={`mode:${m.id}`}>
+                        {m.label}
+                        {some(m.count)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {models.length > 0 && (
+                  <optgroup label="Model">
+                    {models.map((m) => (
+                      <option key={m.id} value={`model:${m.id}`}>
+                        {m.label}
+                        {some(m.count)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {efforts.length > 0 && (
+                  <optgroup label="Effort">
+                    {efforts.map((m) => (
+                      <option key={m.id} value={`effort:${m.id}`}>
+                        {m.label}
+                        {some(m.count)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                <optgroup label="Waiting on you">
+                  <option value="allow" disabled={waiting === 0}>
+                    Allow {waiting > 0 ? `${waiting} ` : ""}waiting
+                  </option>
+                  <option value="deny" disabled={waiting === 0}>
+                    Deny {waiting > 0 ? `${waiting} ` : ""}waiting
+                  </option>
+                </optgroup>
+                {reach === "selected" && <option value="end">End {count(n, "agent")}</option>}
+              </select>
+            </label>
             <span className="cp-gap" />
-            <button type="button" className="cp-send" data-mode={working > 0 ? mode : "send"} disabled={busy || !text.trim() || n === 0} onClick={sendText}>
+            <button
+              type="button"
+              className="cp-send"
+              data-mode={working > 0 ? mode : "send"}
+              disabled={busy || (!text.trim() && files.length === 0) || pending > 0 || n === 0}
+              onClick={sendText}
+              aria-label={`${sendLabel} to ${n}`}
+            >
               {working > 0 && mode === "queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
-              <span>Send to {n}</span>
+              <span>
+                {sendLabel} to {n}
+              </span>
             </button>
           </div>
         </div>
-        {items.length > 0 && (
+        {finds.length > 0 && (
           <div className="ms-msg-pal">
-            <CommandList items={items} index={Math.min(index, items.length - 1)} onPick={pick} onHover={setIndex} note={note} />
+            <ul className="pl-list" role="listbox" aria-label="Agents to add">
+              {finds.map((a, i) => (
+                <li key={a.id}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={i === Math.min(found, finds.length - 1)}
+                    className="pl-item"
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      add(a);
+                    }}
+                    onPointerEnter={() => setFound(i)}
+                  >
+                    <span className="pl-name">
+                      {agentLabel(a)}
+                      <span className="pl-note">{doingOf(a)}</span>
+                    </span>
+                    <span className="pl-desc">
+                      {machineName(a.target)} · {a.kind_name}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {finds.length === 0 && items.length > 0 && (
+          <div className="ms-msg-pal">
+            <CommandList items={items} index={Math.min(index, items.length - 1)} onPick={pick} onHover={setIndex} note={noteOf} />
+          </div>
+        )}
+        {note && (
+          <div className="pl-note ms-msg-note" role="status">
+            <span>{note}</span>
+            <button type="button" className="hx-icon" aria-label="Dismiss" onClick={() => setNote(null)}>
+              <X size={12} />
+            </button>
           </div>
         )}
       </div>
@@ -319,7 +507,7 @@ function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: Broadcas
             disabled={busy}
             onClick={() => {
               setAsk(null);
-              setPicked("");
+              setChoice("");
             }}
           >
             Cancel

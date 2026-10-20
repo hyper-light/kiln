@@ -974,3 +974,94 @@ html[data-motion="paused"] .ms-pick {
 .ms-select + .ms-msg-open {
   margin-left: 0;
 }
+
+/* ---------------------------------------------------------------- the message box's To line: those picked
+   (each with its ×; @ in the field finds more), or everyone the list shows */
+.ms-to {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 8px 12px 0;
+  font-size: 12px;
+}
+.ms-to-label {
+  margin-right: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6d7078;
+}
+.ms-to-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  height: 24px;
+  padding: 0 4px 0 9px;
+  border: 1px solid #303239;
+  border-radius: 999px;
+  background: #121318;
+  color: #dfe1e6;
+}
+.ms-to-chip > button {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: #8b8e97;
+}
+.ms-to-chip > button:hover {
+  background: rgb(255 255 255 / 8%);
+  color: #eceef2;
+}
+.ms-to-all,
+.ms-to-more {
+  color: #a1a4ad;
+}
+.ms-msg-note {
+  margin-top: 6px;
+}
+@media (pointer: coarse) {
+  .ms-to-chip {
+    height: 30px;
+  }
+  .ms-to-chip > button {
+    width: 24px;
+    height: 24px;
+  }
+}
+/* The command select: as it is where there's room; on a phone an icon, the select over it unseen. */
+.ms-cmd {
+  display: contents;
+}
+.ms-cmd-icon {
+  display: none;
+}
+@container (max-width: 520px) {
+  .ms-cmd {
+    position: relative;
+    display: inline-grid;
+    flex: none;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border: 1px solid #303239;
+    border-radius: 999px;
+    color: #a1a4ad;
+  }
+  .ms-cmd-icon {
+    display: block;
+  }
+  .ms-cmd .ms-msg-select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    opacity: 0;
+  }
+}

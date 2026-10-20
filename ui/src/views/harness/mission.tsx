@@ -500,7 +500,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   // The message goes to what's checked; with nothing checked, to every agent the list shows.
   const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
   const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
-  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} />;
+  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} all={list} onPick={setMany} />;
   const folds = phone && checked.length === 0;
 
   return (
