@@ -298,10 +298,12 @@ function ServerSection({ d }: { d: OverviewData }) {
 /** The overview while it loads: its frame (titles, labels, panels) with the loader in each part. */
 function OverviewHold() {
   const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
+  // A person of some repositories gets theirs, not the server's name (W10).
+  const server = !me?.can || me.can["runs.read"] === "server";
   return (
     <>
       <Intro
-        title={me?.hostname ?? <span className="invisible">kiln</span>}
+        title={(server && me?.hostname) || <span className="invisible">kiln</span>}
         lead={<span className="invisible">kiln v{me?.version ?? "0.0.0"} · up 0d 0h · generation 0. Every run, job and agent below updates live.</span>}
       />
       <Kpis d={null} />
