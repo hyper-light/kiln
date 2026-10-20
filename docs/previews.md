@@ -224,7 +224,8 @@ in the Tools tab's Live pages; `engine` in `show_live`):
 
 Neither has a capture a page can be streamed from. So their page's picture is taken as it changes
 (Firefox's in about 5 ms: up to 30 a second while it changes or was just used, a few a second while
-it's still, none while nobody looks), and one that hasn't changed goes nowhere: still costs
+it's still, none while nobody looks; WebKit's up to about 6 a second, Safari taking one in about
+16 ms), and one that hasn't changed goes nowhere: still costs
 nothing on the wire. Each picture is encoded by kiln's capture extension as a tab's frames are
 (H.264, a sharp key frame when still), so viewers, recordings and the agent's `use_live` work the
 same. What viewers do goes to them as WebDriver actions (the pointer, touch, keys, text, the wheel).
