@@ -29,7 +29,7 @@ use rusqlite::params;
 
 use super::cas;
 use crate::ci::integrations::aws::{self, Aws, Body, Call, Credentials};
-use crate::config::ci::S3Store;
+use crate::config::ci::{S3Credentials, S3Store};
 use crate::http::client::{Client, Method, Response, Roots};
 use crate::hub::Hub;
 
@@ -60,7 +60,7 @@ pub struct Bucket {
 /// The bucket `[ci.store.s3]` names, with its credentials now; `None` without one.
 pub async fn bucket(hub: &Hub) -> Result<Option<Bucket>> {
     let Some(s) = &hub.cfg.ci.store.s3 else { return Ok(None) };
-    let creds = credentials(hub, s).await?;
+    let creds = credentials(hub, &s.credentials, "[ci.store.s3]").await?;
     Ok(Some(Bucket { aws: Aws { creds, region: s.region.clone() }, http: http(s)?, base: s.endpoint.trim_end_matches('/').to_owned(), name: s.bucket.clone(), prefix: s.prefix.clone() }))
 }
 
@@ -80,30 +80,35 @@ fn http(s: &S3Store) -> Result<Arc<Client>> {
     Ok(c)
 }
 
-/// The bucket's credentials, as `[ci.store.s3] credentials` says.
-async fn credentials(hub: &Hub, s: &S3Store) -> Result<Credentials> {
-    let c = &s.credentials;
+/// S3 credentials as `c` says (`what` names the setting, for errors): an `aws` integration's,
+/// minted for kiln itself as the server's own workload (W10-R11); a key pair; or the server's
+/// environment.
+pub async fn credentials(hub: &Hub, c: &S3Credentials, what: &str) -> Result<Credentials> {
     if let Some(name) = &c.integration {
-        let i = crate::ci::integrations::get(hub, name).await?.with_context(|| format!("[ci.store.s3]: no integration `{name}`"))?;
+        let i = crate::ci::integrations::get(hub, name).await?.with_context(|| format!("{what}: no integration `{name}`"))?;
         if i.kind != "aws" {
-            bail!("[ci.store.s3]: `{name}` is a {} integration; the store signs in through an aws one", i.kind);
+            bail!("{what}: `{name}` is a {} integration; S3 is signed in to through an aws one", i.kind);
         }
-        // kiln itself, as the server's own workload (W10-R11).
         let w = kiln_ci::oidc::Workload { repository: "kiln", environment: None, git_ref: None, sha: None, actor: "kiln", source: "service", app: None, deployment: None, trigger: Some("store") };
         return aws::credentials(hub, &i, &w).await;
     }
     if let Some(id) = &c.access_key_id {
         let secret = match (&c.secret_access_key_file, &c.secret_access_key_env) {
-            (Some(p), _) => std::fs::read_to_string(p).with_context(|| format!("[ci.store.s3]: reading {}", p.display()))?.trim().to_owned(),
-            (None, Some(v)) => std::env::var(v).with_context(|| format!("[ci.store.s3]: {v} isn't set"))?,
-            (None, None) => bail!("[ci.store.s3]: access_key_id needs secret_access_key_file or secret_access_key_env"),
+            (Some(p), _) => std::fs::read_to_string(p).with_context(|| format!("{what}: reading {}", p.display()))?.trim().to_owned(),
+            (None, Some(v)) => std::env::var(v).with_context(|| format!("{what}: {v} isn't set"))?,
+            (None, None) => bail!("{what}: access_key_id needs secret_access_key_file or secret_access_key_env"),
         };
         return Ok(Credentials { access_key_id: id.clone(), secret_access_key: secret, session_token: None, expires_at: None });
     }
+    from_env().with_context(|| format!("{what}: no credentials: an integration, access_key_id, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the server's environment"))
+}
+
+/// Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
+pub fn from_env() -> Result<Credentials> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     match (var("AWS_ACCESS_KEY_ID"), var("AWS_SECRET_ACCESS_KEY")) {
         (Some(id), Some(secret)) => Ok(Credentials { access_key_id: id, secret_access_key: secret, session_token: var("AWS_SESSION_TOKEN"), expires_at: None }),
-        _ => bail!("[ci.store.s3]: no credentials: an integration, access_key_id, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the server's environment"),
+        _ => bail!("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY aren't set"),
     }
 }
 
@@ -383,7 +388,7 @@ pub async fn forget(hub: &Hub, used: &HashSet<String>, cutoff: i64) -> Result<us
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, SystemTime};
 
     use http::StatusCode;
@@ -393,13 +398,14 @@ mod tests {
     use crate::http::server::{self as srv, Request};
 
     /// A fake S3: objects by path, and each request's signature checked as S3 checks it (the
-    /// signed headers as they came, the body against its hash), with the one key pair it knows.
+    /// signed headers as they came, the body against its hash), with the one key pair it knows
+    /// (`AKIDTEST`, `s3cr3t`, in `us-east-1`).
     #[derive(Default)]
-    struct Fake {
-        objects: Mutex<HashMap<String, Vec<u8>>>,
-        puts: Mutex<usize>,
-        gets: Mutex<usize>,
-        refused: Mutex<Vec<String>>,
+    pub(crate) struct Fake {
+        pub(crate) objects: Mutex<HashMap<String, Vec<u8>>>,
+        pub(crate) puts: Mutex<usize>,
+        pub(crate) gets: Mutex<usize>,
+        pub(crate) refused: Mutex<Vec<String>>,
     }
 
     impl srv::Handler for Fake {
@@ -446,7 +452,7 @@ mod tests {
         }
     }
 
-    fn fake_s3() -> Result<(String, Arc<Fake>)> {
+    pub(crate) fn fake_s3() -> Result<(String, Arc<Fake>)> {
         let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
         let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
         let fake = Arc::new(Fake::default());

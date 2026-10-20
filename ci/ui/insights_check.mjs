@@ -201,6 +201,11 @@ for (const [name, type, phone] of [
         check(name, `${tag}: and taken out`, await until(async () => /Saved/.test(await rulesText()) && !/plan9/.test(await rulesText())), (await rulesText()).slice(-300));
         const issuer = (await page.locator("#ci\\.oidc, [id='ci.oidc']").first().innerText().catch(() => "")).replace(/\s+/g, " ");
         check(name, `${tag}: the issuer and its keys`, /\/oidc/.test(issuer) && /signing now/.test(issuer), issuer.slice(0, 200));
+        // How it's reached (W10-R12): not from the internet at 127.0.0.1; its own address; published.
+        check(name, `${tag}: how the issuer is reached`, /From the internet No: its URL is this network's/.test(issuer) && /Its own address 127\.0\.0\.1:\d+/.test(issuer) && /Published \//.test(issuer), issuer.slice(0, 500));
+        const oidcGroup = page.locator("[id='ci.oidc']").first();
+        await oidcGroup.getByRole("button", { name: "Publish", exact: true }).click();
+        check(name, `${tag}: published by hand`, await until(async () => /Published to \//.test(await oidcGroup.innerText())), (await oidcGroup.innerText().catch(() => "")).replace(/\s+/g, " ").slice(-300));
         check(name, `${tag}: the CI settings fit`, (await overflow(page)) <= 0, String(await overflow(page)));
         await page.screenshot({ path: `${shots}/insights-${name}-${tag}-ci-settings.png`, fullPage: true });
       }

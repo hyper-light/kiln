@@ -285,6 +285,51 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
 
+    // kiln's OIDC issuer on addresses of its own (docs/ci.md W10-R12): its two documents and
+    // nothing else, so they can face the internet without the rest of kiln.
+    let issuer_tls = match (&cfg.ci.oidc.listen_cert, &cfg.ci.oidc.listen_key) {
+        (Some(c), Some(k)) => {
+            let cert = std::fs::read_to_string(c).with_context(|| format!("[ci.oidc] listen_cert {}", c.display()))?;
+            let key = std::fs::read_to_string(k).with_context(|| format!("[ci.oidc] listen_key {}", k.display()))?;
+            Some(crate::http::tls::ServerTls::from_pem(&cert, &key).context("[ci.oidc] listen_cert and listen_key")?)
+        }
+        (None, None) => registry_tls.clone(),
+        _ => anyhow::bail!("[ci.oidc] listen_cert and listen_key go together"),
+    };
+    for listen in cfg.ci.oidc.listen.clone() {
+        let h = hub.clone();
+        let sd = shutdown.clone();
+        let tls = issuer_tls.clone();
+        sup::spawn(reg, &format!("issuer {listen}"), shutdown.clone(), move || {
+            let (hub, sd, tls, listen) = (h.clone(), sd.clone(), tls.clone(), listen.clone());
+            async move {
+                let addr: SocketAddr = listen.parse().with_context(|| format!("[ci.oidc] listen {listen}"))?;
+                let std_listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+                let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
+                tracing::info!(%addr, https = tls.is_some(), "the OIDC issuer listening");
+                let only = Arc::new(crate::ci::oidc::Only::new(hub));
+                loop {
+                    let accepted = futures::select_biased! {
+                        () = sd.cancelled().fuse() => return Ok(()),
+                        r = listener.accept().fuse() => r,
+                    };
+                    match accepted {
+                        Ok(stream) => {
+                            let (only, remote, tls) = (only.clone(), stream.peer_addr().ok(), tls.clone());
+                            crate::rt::spawn_spread(async move {
+                                crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "the issuer's accept failed");
+                            crate::rt::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // In-process bare-metal agent, connected over loopback QUIC like any other agent.
     if cfg.local_agent.enabled {
         let name = crate::pki::sanitize_name(&cfg.local_agent_name());

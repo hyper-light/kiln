@@ -171,12 +171,21 @@ enum OidcCmd {
     Status,
     /// The published key set (JWKS), for providers that take keys pasted in (Google Cloud, …).
     Jwks,
-    /// Write the discovery document and keys to a directory for a static host (W10-R12): serve it
-    /// at the issuer URL (`[ci.oidc] issuer`). Run it again within 7 days of each new key (`kiln
-    /// oidc status`), or set `[ci.oidc] publish_dir` and the server keeps it written.
+    /// Publish the discovery document and keys where providers fetch them (W10-R12), served at
+    /// the issuer URL (`[ci.oidc] issuer`): a directory for a static host; `s3://<bucket>[/<prefix>]`,
+    /// signed with this machine's AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; or
+    /// `gs://<bucket>[/<prefix>]`, with GOOGLE_OAUTH_ACCESS_TOKEN or gcloud's token. Run it again
+    /// within 7 days of each new key (`kiln oidc status`), or set `[ci.oidc] publish_to` and the
+    /// server keeps them published.
     Publish {
         #[arg(long)]
-        to: std::path::PathBuf,
+        to: String,
+        /// For s3://: the store's endpoint, AWS S3's in the region by default.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// For s3://: the region, else AWS_REGION, else us-east-1.
+        #[arg(long)]
+        region: Option<String>,
     },
     /// Make a new signing key: it signs in 7 days, or at once with `--now`.
     Rotate {
@@ -215,11 +224,36 @@ pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
             let v = api.call(Method::Get, "/oidc/jwks-export", None).await?;
             println!("{}", serde_json::to_string_pretty(v.get("jwks").unwrap_or(&Value::Null))?);
         }
-        OidcCmd::Publish { to } => {
+        OidcCmd::Publish { to, endpoint, region } => {
             let v = api.call(Method::Get, "/oidc/jwks-export", None).await?;
             let (Some(discovery), Some(jwks)) = (v.get("discovery"), v.get("jwks")) else { bail!("the server sent no documents") };
-            super::oidc::write_published(&to, discovery, jwks)?;
-            println!("wrote the discovery document and keys to {}; serve it at {}", to.display(), v.get("issuer").and_then(Value::as_str).unwrap_or_default());
+            let issuer = v.get("issuer").and_then(Value::as_str).unwrap_or_default();
+            match super::oidc::Target::parse(&to)? {
+                super::oidc::Target::Dir(dir) => {
+                    super::oidc::write_published(&dir, discovery, jwks)?;
+                    println!("wrote the discovery document and keys to {}; serve it at {issuer}", dir.display());
+                }
+                super::oidc::Target::S3 { bucket, prefix } => {
+                    let region = region.or_else(|| std::env::var("AWS_REGION").ok()).or_else(|| std::env::var("AWS_DEFAULT_REGION").ok()).unwrap_or_else(|| "us-east-1".into());
+                    let base = endpoint.unwrap_or_else(|| super::integrations::aws::endpoint("s3", &region));
+                    let creds = super::services::remote::from_env()?;
+                    super::oidc::put_s3(&super::integrations::aws::Aws { creds, region }, base.trim_end_matches('/'), &bucket, &prefix, &super::oidc::published_files(discovery, jwks)?).await?;
+                    println!("put the discovery document and keys in s3://{bucket}/{prefix}; the issuer must be where they're served (it's {issuer})");
+                }
+                super::oidc::Target::Gcs { bucket, prefix } => {
+                    let token = match std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN").ok().filter(|t| !t.is_empty()) {
+                        Some(t) => t,
+                        None => {
+                            let out = crate::rt::blocking(|| std::process::Command::new("gcloud").args(["auth", "print-access-token"]).output()).await?;
+                            let out = out.map_err(|e| anyhow::anyhow!("no GOOGLE_OAUTH_ACCESS_TOKEN, and gcloud didn't run: {e}"))?;
+                            anyhow::ensure!(out.status.success(), "no GOOGLE_OAUTH_ACCESS_TOKEN, and gcloud gave no token: {}", String::from_utf8_lossy(&out.stderr).trim());
+                            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+                        }
+                    };
+                    super::oidc::put_gcs(&token, &bucket, &prefix, &super::oidc::published_files(discovery, jwks)?).await?;
+                    println!("put the discovery document and keys in gs://{bucket}/{prefix}; the issuer must be where they're served (it's {issuer})");
+                }
+            }
         }
         OidcCmd::Rotate { now } => {
             let v = api.call(Method::Post, "/oidc/rotate", Some(json!({ "now": now }))).await?;

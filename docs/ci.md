@@ -181,7 +181,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault, Vault, Infisical, Doppler, 1Password), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); Vault, Infisical, Doppler and 1Password as stores (R08); AC02 (every read and read-only tool walked, none with a value); AC06 and AC08 left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; R12's buckets and issuer-only front door, the cloud ACs left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools and images; microVM and k8s executors and pool kinds, UI-made image definitions left |
@@ -3104,9 +3104,30 @@ elsewhere (G-24, G-33).
   - Checked in Chromium and WebKit, desktop and phone (`ci/ui/people_check.mjs`): a person
     added, linked, granted and removed; a role made and removed; a token made, shown once and
     revoked; a viewer with Tokens and no People.
+- *Done.* R12, the issuer reached from the internet, three ways (`crates/kiln/src/ci/oidc.rs`):
+  - An address of its own (`[ci.oidc] listen`, with `listen_cert` and `listen_key` for the
+    issuer's public name, else the server's TLS, else plain HTTP behind a TLS proxy or tunnel)
+    that serves the two documents and nothing else: any other path is 404 whatever the token,
+    any method but GET is refused, and each client gets a burst of 30 requests, then one a
+    second (429 past it).
+  - Published where the hourly upkeep and each rotation keep them (`[ci.oidc] publish_to`):
+    a directory for a static host, `s3://<bucket>[/<prefix>]` (any S3-compatible store,
+    `publish_endpoint` and `publish_region`, signed in as `[ci.store.s3]` is: a key pair or the
+    server's environment, since an `aws` integration can't publish the first keys AWS checks
+    its token against) or `gs://<bucket>[/<prefix>]` (through a `gcp` integration: Google Cloud
+    takes the keys pasted into its pool). Only what changed is sent again. `kiln oidc publish
+    --to <dir | s3://… | gs://…>` does the same by hand, with the machine's own AWS keys or
+    Google token.
+  - `kiln oidc jwks` and Settings → OIDC's download, for providers that take keys pasted in.
+
+  Settings → OIDC says how it's reached: whether the issuer URL is public (HTTPS, a name or
+  address the internet reaches), its own addresses, where it's published, when, and what went
+  wrong; and for each federating integration, what it needs (its keys fetched over the internet,
+  or pasted in) and whether it trusted kiln when last verified. Unit-tested against a fake S3
+  that checks every signature and a fake Cloud Storage (the documents published to the bucket
+  verify kiln's tokens, as a provider checks them), and end to end
+  (`w10_r12_the_issuers_own_address`).
 - *Left.*
-  - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
-    issuer paths, and the Settings → OIDC page (W21).
   - AC01, AC02, AC04's cloud cases (AWS, Google Cloud, Azure: test tenants, user-assisted).
 
 ### W11 Integrations and the credential broker

@@ -54,7 +54,10 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
         .await?;
     let evicted = cache_v1::evict(hub, None).await?;
     crate::ci::token::prune(hub).await?;
-    crate::ci::oidc::publish(hub).await?;
+    // A store that can't be reached doesn't stop the rest; Settings → OIDC says what went wrong.
+    if let Err(e) = crate::ci::oidc::publish(hub).await {
+        tracing::warn!(error = %format!("{e:#}"), "OIDC: publishing the issuer's documents failed");
+    }
     let collected = cas::collect(hub).await?;
     let sent = remote::backfill(hub).await?;
     let (trimmed, trimmed_bytes) = remote::trim(hub).await?;

@@ -4,6 +4,7 @@
 //   makes a token, sees it once, revokes it. dev (a viewer) has Tokens and no People.
 // - W13-R09, W21-R08: the Runners page's pools. A pool added, heading for its minimum, warned of
 //   as no runner can start it (W20-R03), edited in place, removed.
+// - W10-R12: Settings → OIDC says how the issuer is reached, and fits a phone.
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
@@ -144,6 +145,14 @@ for (const [name, type, phone] of [
         await page.getByRole("button", { name: "Remove", exact: true }).click();
         await page.getByRole("button", { name: `Remove ${pool}` }).click();
         check(name, `${tag}: and removed`, await until(async () => (await poolRow.count()) === 0));
+        // Settings → CI → OIDC (W10-R12): how the issuer is reached, laid out on this screen.
+        await page.goto(`${cfg.base}/settings#ci.oidc`);
+        const oidc = page.locator("[id='ci.oidc']").first();
+        await oidc.waitFor({ timeout: 30000 });
+        await until(async () => /From the internet/.test(await text(oidc)), 30000);
+        check(name, `${tag}: how the issuer is reached`, /From the internet No: its URL is this network's/.test(await text(oidc)) && /AWS and Azure fetch/.test(await text(oidc)), (await text(oidc)).slice(0, 300));
+        check(name, `${tag}: the OIDC settings fit`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await oidc.screenshot({ path: `${shots}/oidc-${name}-${tag}.png` });
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();
 

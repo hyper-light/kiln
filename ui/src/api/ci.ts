@@ -193,6 +193,8 @@ export interface CiOidc {
   serving: boolean;
   keys: { kid: string; created_at: number; sign_from: number; signing: boolean; published: boolean }[];
   subject_claims: string[];
+  /** How providers reach it (R12): whether its URL looks public, its own addresses, and where it's published. */
+  reach?: { public: boolean; listen: string[]; publish: { to: string; at: number | null; checked_at: number | null; error: string | null } | null };
 }
 
 /** A secret as listed (W09): never its value. `from` for a brokered one, made at leg start. */
@@ -599,7 +601,7 @@ export const ci = {
   oidc: (signal?: AbortSignal) => request<CiOidc>("GET", "/api/ci/oidc", undefined, { signal }),
   /** A new signing key: signing in 7 days (published first, so relying parties fetch it), or `now`. */
   oidcRotate: (now: boolean) => request<{ sign_from: number; published: string | null }>("POST", "/api/ci/oidc/rotate", { now }),
-  /** Writes the issuer's documents to `[ci.oidc] publish_dir` now. */
+  /** Publishes the issuer's documents to `[ci.oidc] publish_to` now. */
   oidcPublish: () => request<{ published: string }>("POST", "/api/ci/oidc/publish", {}),
   /** Every routing rule in the order they apply, each with where it comes from. */
   routingRules: (signal?: AbortSignal) => request<{ rules: { index: number; source: string; rule: CiRoutingRule }[]; github_labels: boolean }>("GET", "/api/ci/routing/rules", undefined, { signal }),

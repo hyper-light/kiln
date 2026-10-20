@@ -618,4 +618,24 @@ pub struct Oidc {
     /// Keep the discovery document and keys written here, for a static host that serves the
     /// directory at `issuer` (W10-R12): providers that fetch from the internet read them there.
     pub publish_dir: Option<std::path::PathBuf>,
+    /// Where the hourly upkeep and each rotation publish the two documents (W10-R12): a directory
+    /// for a static host, `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]`. `issuer` is
+    /// then where that is served (`https://<bucket>.s3.<region>.amazonaws.com/<prefix>`, say).
+    pub publish_to: Option<String>,
+    /// For `s3://`: the store's endpoint, AWS S3's in `publish_region` by default (MinIO's, R2's).
+    pub publish_endpoint: Option<String>,
+    /// For `s3://`: the region requests are signed for (`us-east-1` by default).
+    pub publish_region: Option<String>,
+    /// How kiln signs in to publish, as `[ci.store.s3]` takes it: an integration (`aws` for
+    /// `s3://`, `gcp` for `gs://`), a key pair, or the server's environment. An `aws` integration
+    /// can't publish the first keys, since AWS checks kiln's token against them: start with a
+    /// key pair. Google Cloud takes the keys pasted into its pool, so a `gcp` one can.
+    pub publish_credentials: S3Credentials,
+    /// Addresses of the issuer's own (W10-R12), each serving its two documents and nothing else,
+    /// rate-limited, so they can face the internet without the rest of kiln: `["0.0.0.0:8444"]`.
+    /// Over TLS with `listen_cert` and `listen_key` (a certificate for the issuer's public name),
+    /// else the server's own when `server.https`, else plain HTTP (a TLS proxy or tunnel in front).
+    pub listen: Vec<String>,
+    pub listen_cert: Option<std::path::PathBuf>,
+    pub listen_key: Option<std::path::PathBuf>,
 }

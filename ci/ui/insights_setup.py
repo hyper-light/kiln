@@ -28,7 +28,7 @@ def free():
     return p
 
 
-port, quic = free(), free()
+port, quic, issuer_port = free(), free(), free()
 data = os.path.join(work, "data")
 runs_dir = os.path.join(work, "work")
 cfg = os.path.join(work, "kiln.toml")
@@ -68,6 +68,10 @@ enabled = false
 [ci]
 enabled = true
 kiln_workflows = true
+
+[ci.oidc]
+listen = ["127.0.0.1:{issuer_port}"]
+publish_to = "{os.path.join(work, 'oidc-published')}"
 """)
 # Its own binary name, so nothing that looks for kiln's processes takes it for another's.
 binary = os.path.join(work, "kiln-insights-ui")
