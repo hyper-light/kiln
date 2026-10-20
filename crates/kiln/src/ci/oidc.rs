@@ -153,7 +153,9 @@ async fn rotate(hub: &Hub) -> anyhow::Result<(Vec<Stored>, rules::Rotation)> {
     if let Some(at) = plan.create {
         make_key(hub, at).await?;
         keys = stored(hub).await?;
-        plan = rules::rotation(&keys.iter().map(|k| k.times.clone()).collect::<Vec<_>>(), now);
+        // At the time it was made, not `now`: a key made as the second turned would sign but go
+        // unpublished, and the first key set served or published would be empty.
+        plan = rules::rotation(&keys.iter().map(|k| k.times.clone()).collect::<Vec<_>>(), crate::util::now_unix());
     }
     if !plan.retire.is_empty() {
         let gone = plan.retire.clone();
