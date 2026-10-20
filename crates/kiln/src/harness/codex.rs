@@ -64,6 +64,7 @@ enum Pending {
     /// running one end first), unless kiln wrote it (feedback).
     Steer(String, Option<QueueItem>),
     Interrupt,
+    PermissionInterrupt(String),
     Models,
     Suggest(String),
     Skills,
@@ -227,6 +228,16 @@ pub struct Codex {
     /// Approval policy and sandbox chosen directly (over the mode's).
     approval: Option<String>,
     sandbox: Option<String>,
+    /// A person's permission change is interrupting the current turn. Codex cannot change a
+    /// running turn's policy; its continuation starts with the newly chosen policy.
+    #[serde(default)]
+    permissions_changing: bool,
+    /// Policies sent for the current turn; old handed-over adapters may not know them.
+    #[serde(default)]
+    turn_permissions: Option<(String, String)>,
+    /// Notifications can finish a turn before its turn/start RPC reply arrives.
+    #[serde(default)]
+    completed_turn: Option<String>,
     /// Effort levels per model, from model/list.
     efforts: HashMap<String, Vec<(String, String)>>,
     /// The turn each prompt started (rewinds and branches name a prompt).
@@ -312,6 +323,9 @@ impl Codex {
             summary: None,
             approval: None,
             sandbox: None,
+            permissions_changing: false,
+            turn_permissions: None,
+            completed_turn: None,
             efforts: HashMap::new(),
             turns: HashMap::new(),
             skills: HashMap::new(),
@@ -367,6 +381,66 @@ impl Codex {
             _ => p,
         };
         (approval, sandbox, turn)
+    }
+
+    /// Keep the preset label honest when the two permission controls are chosen separately.
+    fn permission_controls(&mut self, core: &mut Core) {
+        // Older live adapters are adopted without start(); publish the capability there too.
+        if !core.meta.features.iter().any(|f| f == "permissions_live") {
+            core.meta.features.push("permissions_live".into());
+            core.touch_meta();
+        }
+        let (approval, sandbox, _) = self.policies(core);
+        // Older adapters could keep just one override. Preserve its other, implicit value
+        // before changing the label to Custom (which has no preset of its own).
+        if self.approval.is_some() || self.sandbox.is_some() {
+            self.approval = Some(approval.clone());
+            self.sandbox = Some(sandbox.clone());
+        }
+        let mode = modes(true).into_iter().find(|m| {
+            let (a, s, _) = policy(&m.id);
+            a == approval && s == sandbox
+        }).map_or_else(|| "custom".to_owned(), |m| m.id);
+        if core.state.mode != mode {
+            core.state.mode = mode;
+            core.touch_state();
+        }
+        if core.state.mode == "custom" && !core.meta.modes.iter().any(|m| m.id == "custom") {
+            core.meta.modes.push(ModeOption { id: "custom".into(), label: "Custom".into(), description: "The approval and sandbox settings selected separately".into(), dangerous: false });
+            core.touch_meta();
+        } else if core.state.mode != "custom" && core.meta.modes.iter().any(|m| m.id == "custom") {
+            // Custom describes the controls in force; it isn't a saved preset to switch back to.
+            core.meta.modes.retain(|m| m.id != "custom");
+            core.touch_meta();
+        }
+        core.set_control("approval_policy", json!(approval));
+        core.set_control("sandbox", json!(sandbox));
+        self.compose_status(core);
+    }
+
+    fn permissions_changed(&mut self, core: &mut Core) {
+        self.permission_controls(core);
+        if self.turn.is_none() && !self.pending.values().any(|p| matches!(p, Pending::Turn(_))) {
+            return;
+        }
+        let (approval, sandbox, _) = self.policies(core);
+        if !self.permissions_changing && self.turn_permissions.as_ref() == Some(&(approval, sandbox)) {
+            return;
+        }
+        if !self.permissions_changing {
+            self.notice(core, Level::Info, "Applying the new permissions: interrupting this turn, then continuing its work.");
+            self.permissions_changing = true;
+        }
+        self.interrupt_for_permissions(core);
+    }
+
+    fn interrupt_for_permissions(&mut self, core: &mut Core) {
+        if self.permissions_changing
+            && let (Some(thread), Some(turn)) = (self.thread.clone(), self.turn.clone())
+            && !self.pending.values().any(|p| matches!(p, Pending::PermissionInterrupt(t) if *t == turn))
+        {
+            self.request(core, Pending::PermissionInterrupt(turn.clone()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        }
     }
 
     fn refresh_controls(&mut self, core: &mut Core) {
@@ -463,17 +537,29 @@ impl Codex {
             }
             "approval_policy" | "sandbox" => {
                 let v = text();
+                let valid = if id == "sandbox" { matches!(v.as_str(), "read-only" | "workspace-write" | "danger-full-access") }
+                    else { matches!(v.as_str(), "untrusted" | "on-request" | "never") };
+                if !valid {
+                    self.notice(core, Level::Warn, format!("{v}: not a {id} setting this session offers"));
+                    return;
+                }
                 let dangerous = matches!(v.as_str(), "never" | "danger-full-access");
                 if dangerous && !self.allow_bypass {
                     self.notice(core, Level::Warn, "That needs the session to be started with bypass allowed.");
                     return;
                 }
+                let before = self.policies(core);
+                // Both values stay explicit when a combination has no named preset.
+                self.approval = Some(before.0.clone());
+                self.sandbox = Some(before.1.clone());
                 if id == "sandbox" {
                     self.sandbox = Some(v.clone());
                 } else {
                     self.approval = Some(v.clone());
                 }
-                core.set_control(id, json!(v));
+                if self.policies(core) != before {
+                    self.permissions_changed(core);
+                }
             }
             "compact" => self.request(core, Pending::Plain("compact".into()), "thread/compact/start", json!({"threadId": thread})),
             "review" => {
@@ -550,7 +636,10 @@ impl Codex {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
+        let own_approval = core.state.approvals.iter().any(|a| {
+            a.input.get("threadId").and_then(Value::as_str).is_none_or(|id| self.thread.as_deref().is_none_or(|own| own == id))
+        });
+        self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || own_approval || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
@@ -586,13 +675,30 @@ impl Codex {
         if core.meta.efforts.is_empty() {
             core.meta.efforts = default_efforts().iter().map(|e| ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect();
         }
-        if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode) {
+        // Explicit controls survive a process restart. Older versions could persist a custom
+        // combination under a preset label; do not silently drop its restrictions.
+        if core.state.control_values.contains_key("approval_policy") || core.state.control_values.contains_key("sandbox") {
+            let (a, s, _) = policy(&core.state.mode);
+            let a = core.state.control_values.get("approval_policy").and_then(Value::as_str).unwrap_or(a);
+            let s = core.state.control_values.get("sandbox").and_then(Value::as_str).unwrap_or(s);
+            if matches!(a, "untrusted" | "on-request" | "never")
+                && matches!(s, "read-only" | "workspace-write" | "danger-full-access")
+                && (self.allow_bypass || (a != "never" && s != "danger-full-access"))
+            {
+                self.approval = Some(a.to_owned());
+                self.sandbox = Some(s.to_owned());
+            }
+        }
+        if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode)
+            && !(core.state.mode == "custom" && self.approval.is_some() && self.sandbox.is_some())
+        {
             core.state.mode = self.mode.clone();
             core.touch_state();
         }
         // Full access is always a choice; choosing it allows it.
         core.meta.modes = modes(true);
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
+        self.permission_controls(core);
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -615,6 +721,8 @@ impl Codex {
         self.thread_status = None;
         self.pending.clear();
         self.asks.clear();
+        self.permissions_changing = false;
+        self.turn_permissions = None;
         core.state.approvals.clear();
         core.state.exit = Some(ExitInfo { code, error });
         core.state.activity = None;
@@ -668,11 +776,18 @@ impl Codex {
                 self.send(core, item, SendMode::Steer);
             }
             Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
-            Command::Interrupt => self.interrupt(core),
+            Command::Interrupt => {
+                // A person's stop wins over the automatic continuation of a setting change.
+                self.permissions_changing = false;
+                self.interrupt(core);
+            }
             Command::SetMode { mode } => {
-                // Takes effect from the next turn (Codex sets policy per turn): the mode's approval
-                // policy and sandbox, over any chosen one by one before.
                 if modes(true).iter().any(|m| m.id == mode) {
+                    if mode == "full-access" {
+                        // Persist even for an adopted adapter whose earlier version only
+                        // changed the in-memory flag.
+                        core.effects.push(Effect::AllowBypass);
+                    }
                     if mode == "full-access" && !self.allow_bypass {
                         // Chosen, so allowed: its approval and sandbox settings come with it.
                         self.allow_bypass = true;
@@ -685,6 +800,7 @@ impl Codex {
                     core.set_control("sandbox", json!(s));
                     core.state.mode = mode;
                     core.touch_state();
+                    self.permissions_changed(core);
                 } else {
                     self.notice(core, Level::Warn, format!("{mode}: not a mode this session offers"));
                 }
@@ -888,6 +1004,8 @@ impl Codex {
     /// Every few seconds: a thread open to send again; servers still starting; the plan's rate
     /// limits now and then.
     pub fn tick(&mut self, core: &mut Core) {
+        // A hot upgrade adopts the adapter without start(); reconcile legacy override labels.
+        self.permission_controls(core);
         self.reload_when_idle(core);
         if std::mem::take(&mut self.reopen)
             && let Some((method, params)) = self.opening.clone()
@@ -1088,6 +1206,9 @@ impl Codex {
         if m.text.is_empty() && m.attachments.is_empty() {
             return;
         }
+        if mode == SendMode::Now {
+            self.permissions_changing = false;
+        }
         if core.state.goal.is_empty() {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
@@ -1139,7 +1260,8 @@ impl Codex {
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
         self.thread_status = None;
-        let (approval, _, sandbox) = self.policies(core);
+        let (approval, sandbox_mode, sandbox) = self.policies(core);
+        self.turn_permissions = Some((approval.clone(), sandbox_mode));
         let items = self.items(&m);
         let mut params = json!({
             "threadId": thread,
@@ -1400,7 +1522,14 @@ impl Codex {
                     self.waiting.insert(0, m);
                     self.next(core);
                 }
-                Pending::Turn(id) | Pending::Steer(id, _) => {
+                Pending::Turn(id) => {
+                    self.permissions_changing = false;
+                    self.turn_permissions = None;
+                    core.state.delivery.insert(id, Delivery::Cancelled);
+                    self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
+                    core.touch_state();
+                }
+                Pending::Steer(id, _) => {
                     core.state.delivery.insert(id, Delivery::Cancelled);
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
@@ -1435,7 +1564,11 @@ impl Codex {
                         self.go_on(core, p);
                     }
                 }
-                Pending::Models | Pending::Interrupt | Pending::Hooks | Pending::Account => {}
+                Pending::PermissionInterrupt(turn) if self.permissions_changing && self.turn.as_deref() == Some(&turn) => {
+                    self.permissions_changing = false;
+                    self.notice(core, Level::Warn, format!("Codex could not interrupt to apply the permissions: {msg}. They apply when the next turn starts."));
+                }
+                Pending::Models | Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::Hooks | Pending::Account => {}
                 Pending::Skills => {
                     core.state.inventory.skills = Known::Ready;
                     core.touch_state();
@@ -1617,10 +1750,15 @@ impl Codex {
             }
             Pending::Turn(id) => {
                 if let Some(t) = result.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
+                    if self.completed_turn.as_deref() == Some(t) {
+                        self.next(core);
+                        return;
+                    }
                     self.turn = Some(t.to_owned());
                 }
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
+                self.interrupt_for_permissions(core);
                 self.steer_waiting(core);
             }
             Pending::Steer(id, _) => {
@@ -1892,7 +2030,7 @@ impl Codex {
                     .unwrap_or_default();
                 core.reply(client, json!({"suggestions": files, "cwd": cwd}));
             }
-            Pending::Interrupt => {}
+            Pending::Interrupt | Pending::PermissionInterrupt(_) => {}
         }
         self.settle(core);
     }
@@ -2035,7 +2173,10 @@ impl Codex {
             default_to_no: false,
             questions,
             plan: None,
-            agent: None,
+            agent: p.get("threadId").and_then(Value::as_str)
+                .filter(|id| self.thread.as_deref().is_some_and(|own| own != *id))
+                .map(|id| core.state.tasks.iter().find(|t| t.id == id)
+                    .map_or_else(|| id.to_owned(), |t| t.description.clone())),
             at: Core::now(),
         };
         if let Some(tid) = item_id.as_deref() {
@@ -2251,11 +2392,15 @@ impl Codex {
         match method {
             "thread/status/changed" => self.thread_status(core, p.get("status").unwrap_or(&Value::Null)),
             "turn/started" => {
+                if p.pointer("/turn/id").and_then(Value::as_str).is_some_and(|id| self.completed_turn.as_deref() == Some(id)) {
+                    return;
+                }
                 self.thread_status = Some(Status::Running);
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
                 }
                 self.steer_waiting(core);
+                self.interrupt_for_permissions(core);
                 if core.state.turn_started.is_none() {
                     core.state.turn_started = Some(Core::now());
                 }
@@ -2265,12 +2410,17 @@ impl Codex {
             }
             "turn/completed" => {
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
+                if turn.get("id").and_then(Value::as_str).is_some_and(|id| self.completed_turn.as_deref() == Some(id)) {
+                    return;
+                }
                 if let (Some(current), Some(completed)) = (self.turn.as_deref(), turn.get("id").and_then(Value::as_str))
                     && current != completed
                 {
                     return;
                 }
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("completed");
+                self.completed_turn = turn.get("id").and_then(Value::as_str).map(str::to_owned);
+                let permissions_changed = std::mem::take(&mut self.permissions_changing);
                 match status {
                     "interrupted" => self.notice(core, Level::Info, "Interrupted"),
                     "failed" => {
@@ -2306,7 +2456,19 @@ impl Codex {
                 for id in open {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
+                // Interrupting a turn cancels its pending requests. Never answer them as an
+                // approval; native children's requests still belong to their own turns.
+                let ended = turn.get("id").and_then(Value::as_str);
+                let resolved: Vec<String> = core.state.approvals.iter()
+                    .filter(|a| a.input.get("threadId").and_then(Value::as_str).is_none_or(|id| self.thread.as_deref() == Some(id)))
+                    .filter(|a| a.input.get("turnId").and_then(Value::as_str).is_none_or(|id| ended == Some(id)))
+                    .map(|a| a.id.clone()).collect();
+                for id in resolved {
+                    self.asks.remove(&id);
+                    core.take_approval(&id);
+                }
                 self.turn = None;
+                self.turn_permissions = None;
                 if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
                     self.thread_status = Some(Status::Idle);
                 }
@@ -2321,6 +2483,9 @@ impl Codex {
                 core.state.doing = None;
                 core.state.usage.turns += 1;
                 core.touch_state();
+                if permissions_changed && status == "interrupted" {
+                    super::pause::continue_later(core, "Your permissions were updated. Continue the work interrupted by that change, checking the state of any commands already started before retrying them. Existing subagents keep their own permissions.");
+                }
                 self.settle(core);
                 self.next(core);
             }
@@ -2455,6 +2620,7 @@ impl Codex {
                 self.asks.remove(&id);
                 if core.take_approval(&id).is_some() {
                     self.settle(core);
+                    self.next(core);
                 }
             }
             "error" => {
@@ -4018,15 +4184,16 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_change_applies_from_the_next_turn() -> anyhow::Result<()> {
+    fn an_idle_mode_change_sets_the_next_turns_policies_and_persists_bypass() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();
         assert!(core.meta.modes.iter().any(|m| m.id == "read-only"));
+        assert!(core.meta.features.iter().any(|f| f == "permissions_live"));
         // An approval policy chosen on its own, then a mode: the mode's policies win.
         c.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("untrusted")) });
         c.command(&mut core, Command::SetMode { mode: "read-only".into() });
         assert_eq!(core.state.mode, "read-only");
         assert_eq!(core.state.control_values.get("approval_policy"), Some(&json!("on-request")));
-        let _ = written(&mut core);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
         c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
@@ -4036,10 +4203,211 @@ mod tests {
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         assert_eq!(core.state.mode, "full-access");
         assert_eq!(core.state.control_values.get("sandbox"), Some(&json!("danger-full-access")));
+        assert!(core.effects.contains(&Effect::AllowBypass));
         // Not a mode at all: refused.
         c.command(&mut core, Command::SetMode { mode: "nope".into() });
         assert_eq!(core.state.mode, "full-access");
         Ok(())
+    }
+
+    #[test]
+    fn a_running_permission_change_cancels_only_its_requests_and_continues_before_the_queue() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "finish the change".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then run tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        core.state.tasks.push(Task { id: "child".into(), description: "Review".into(), class: Some("agent".into()), ..Task::default() });
+        for (id, thread) in [("own-ask", "th1"), ("child-ask", "child")] {
+            feed(&mut c, &mut core, &[json!({"id": id, "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": thread, "turnId": "t1", "itemId": id, "command": "gh pr list", "cwd": "/work"}})]);
+        }
+        assert_eq!(core.state.approvals.iter().find(|a| a.id == "child-ask").and_then(|a| a.agent.as_deref()), Some("Review"));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        let w = written(&mut core);
+        assert_eq!(w.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt"))).count(), 1);
+        assert!(!w.iter().any(|v| v.get("result").is_some() || v.get("method") == Some(&json!("turn/start"))));
+        // A duplicate choice does not interrupt twice or add another continuation.
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(written(&mut core).is_empty());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("never")));
+        assert_eq!(next.pointer("/params/sandboxPolicy"), Some(&json!({"type": "dangerFullAccess"})));
+        assert!(next.pointer("/params/input/0/text").and_then(Value::as_str).is_some_and(|s| s.contains("Continue the work")));
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2"]);
+        assert_eq!(core.state.approvals.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["child-ask"]);
+        assert!(c.asks.contains_key("child-ask") && !c.asks.contains_key("own-ask"));
+        assert!(core.events().any(|e| matches!(&e.body, Body::User { origin: Some(o), text, .. } if o == "kiln" && text.contains("permissions"))));
+        // An ordinary request in full access is still a request, never an automatic approval.
+        feed(&mut c, &mut core, &[json!({"id": "new-ask", "method": "item/commandExecution/requestApproval", "params": {"threadId": "th1", "turnId": "t2", "command": "gh pr list"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "new-ask"));
+        assert!(!written(&mut core).iter().any(|v| v.get("result").is_some()));
+        Ok(())
+    }
+
+    #[test]
+    fn changing_permissions_while_the_turn_starts_waits_for_its_id() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/turnId") == Some(&json!("t1"))));
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}})]);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+    }
+
+    #[test]
+    fn a_late_start_reply_cannot_resurrect_the_turn_interrupted_for_permissions() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}})]);
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/approvalPolicy") == Some(&json!("never"))));
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        assert_eq!(c.turn_permissions, Some(("never".into(), "danger-full-access".into())));
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
+        assert!(c.turn.is_none());
+    }
+
+    #[test]
+    fn a_permission_change_does_not_continue_finished_or_explicitly_stopped_work() {
+        for (status, stop) in [("completed", false), ("interrupted", true)] {
+            let (mut c, mut core, _) = opened();
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            let start = written(&mut core);
+            respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+            c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+            let interrupt = written(&mut core);
+            if stop {
+                c.command(&mut core, Command::Interrupt);
+                written(&mut core);
+            }
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": status}}})]);
+            // The turn may finish naturally before its interrupt is acknowledged.
+            respond(&mut c, &mut core, &interrupt, "turn/interrupt", json!({}));
+            assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+            assert!(!c.permissions_changing && core.state.queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_old_permission_interrupt_cannot_block_or_cancel_the_next_turns_change() {
+        for failed in [false, true] {
+            let (mut c, mut core, _) = opened();
+            c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+            let start = written(&mut core);
+            respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+            c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+            let interrupt = written(&mut core);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+            let next = written(&mut core);
+            respond(&mut c, &mut core, &next, "turn/start", json!({"turn": {"id": "t2", "status": "inProgress"}}));
+            c.command(&mut core, Command::SetMode { mode: "read-only".into() });
+            let w = written(&mut core);
+            assert!(w.iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/turnId") == Some(&json!("t2"))));
+            if failed {
+                let id = interrupt.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+                feed(&mut c, &mut core, &[json!({"id": id, "error": {"message": "turn already ended"}})]);
+            } else {
+                respond(&mut c, &mut core, &interrupt, "turn/interrupt", json!({}));
+            }
+            assert!(c.permissions_changing);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t2", "status": "interrupted"}}})]);
+            assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/sandboxPolicy/type") == Some(&json!("readOnly"))));
+        }
+    }
+
+    #[test]
+    fn an_explicit_replacement_does_not_requeue_the_work_interrupted_for_permissions() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "old work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        written(&mut core);
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "do this instead".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/clientUserMessageId") == Some(&json!("m2"))));
+        assert!(core.state.queue.is_empty() && c.waiting.is_empty());
+    }
+
+    #[test]
+    fn separate_permission_controls_are_validated_labeled_and_restored() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        c.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("on-request")) });
+        assert_eq!(core.state.mode, "custom");
+        assert_eq!(c.policies(&core).0, "on-request");
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        let mut restarted = Codex::new(None, None, Some(core.state.mode.clone()), true);
+        restarted.start(&mut core);
+        assert_eq!(restarted.policies(&core), c.policies(&core));
+        assert_eq!(core.state.mode, "custom");
+        assert!(core.meta.modes.iter().any(|m| m.id == "custom"));
+        c.command(&mut core, Command::Control { id: "sandbox".into(), value: Some(json!("no-such-policy")) });
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        c.command(&mut core, Command::Control { id: "sandbox".into(), value: Some(json!("workspace-write")) });
+        assert_eq!(core.state.mode, "auto");
+        assert!(!core.meta.modes.iter().any(|m| m.id == "custom"));
+        // Explicit session boundaries still exclude bypass controls.
+        let mut limited = Codex::new(None, None, None, false);
+        limited.thread = Some("limited".into());
+        limited.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("never")) });
+        assert_eq!(limited.policies(&core).0, "on-request");
+    }
+
+    #[test]
+    fn an_adopted_adapter_repairs_legacy_labels_and_reapplies_an_unknown_turns_mode() {
+        let (mut c, mut core, _) = opened();
+        core.state.mode = "full-access".into();
+        c.allow_bypass = true;
+        c.approval = Some("on-request".into());
+        c.sandbox = None;
+        c.turn = Some("legacy".into());
+        c.turn_permissions = None;
+        core.meta.features.retain(|f| f != "permissions_live");
+        c.tick(&mut core);
+        assert!(core.meta.features.iter().any(|f| f == "permissions_live"));
+        assert_eq!(core.state.mode, "custom");
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(core.effects.contains(&Effect::AllowBypass));
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        // An old header already saying full access can be explicitly selected again too.
+        c.permissions_changing = false;
+        c.pending.retain(|_, p| !matches!(p, Pending::PermissionInterrupt(_)));
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+    }
+
+    #[test]
+    fn a_cold_restart_keeps_a_legacy_single_control_override() {
+        let mut core = Core::new();
+        core.state.mode = "full-access".into();
+        core.set_control("approval_policy", json!("on-request"));
+        let mut c = Codex::new(None, None, Some("full-access".into()), true);
+        c.start(&mut core);
+        assert_eq!(core.state.mode, "custom");
+        assert_eq!(c.policies(&core).0, "on-request");
+        assert_eq!(c.policies(&core).1, "danger-full-access");
+        let initialize = written(&mut core);
+        respond(&mut c, &mut core, &initialize, "initialize", json!({}));
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("thread/start"))
+            && v.pointer("/params/approvalPolicy") == Some(&json!("on-request"))
+            && v.pointer("/params/sandbox") == Some(&json!("danger-full-access"))));
     }
 
     #[test]

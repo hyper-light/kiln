@@ -352,6 +352,15 @@ their own modes by their words (`yolo` is bypass, `autoEdit` accept edits, `plan
 kiln can't place is refused for a child; a parent in one counts as ask. The limits hold when a
 child starts: a person may change its mode later, as for any agent.
 
+Codex applies approval and sandbox settings per turn. Changing them during a turn interrupts
+that turn and continues its work with the new settings before queued messages. A stop or a new
+"Send now" message takes precedence over that continuation. Pending requests from the interrupted
+turn are cancelled, never approved automatically; existing native subagents keep their own
+permissions. Choosing approval and sandbox settings separately shows `Custom` unless they match
+a preset. An explicit Full access choice is retained across restarts.
+Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
+preset to a turn inherited from an older runner. Older runners still show "From the next turn."
+
 ### Waiting
 
 `agents.wait` holds no thread and no lock: it listens to the server's changes to the agents it
@@ -741,6 +750,8 @@ turn (`harness/pause.rs`):
 - **Your call.** `resume` ends it now (after a plan upgrade, say). Turn off "Resume by itself at the
   reset" (`auto_resume`) to keep it paused until you do. Picking another harness's model
   (`set_model` with `kind`) ends it too: the conversation goes on there, the cut-off turn first.
+  The pause panel folds down to its limit and reset time. **Switch account** opens the same login
+  dialog as `/login`, on the agent's machine; after signing in, **Resume now** retries the work.
 - **Stop point.** `pause_at` (the head's usage badge → Pause at, or the agent's Settings → Usage
   limits: 80, 90 or 95 % used) pauses the agent once a limit is that full, before the limit cuts a
   turn off. Between turns, or in the middle of one (an agent working on its own can go for hours
@@ -939,7 +950,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
 | questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — |
 | plans to approve | unit | — | — | — |
-| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (from the next turn) | ✓ (the agent's modes) | ? |
+| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
 | effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
 | one message's own model and effort | unit | ✓ | — | — |
