@@ -468,11 +468,11 @@ impl Core {
     /// The turn under way ended (`how`, `why`: see [`TurnEnd`]). What it did is read from the
     /// timeline since it `started` (unknown: since the last thing said to it).
     pub fn end_turn(&mut self, started: Option<i64>, how: &str, why: Option<&str>) {
-        let since = started.unwrap_or_else(|| self.events.iter().rev().find(|e| matches!(e.body, Body::User { .. })).map_or(0, |e| e.at));
+        let since = started.unwrap_or_else(|| self.events.iter().rev().find(|e| e.parent.is_none() && matches!(e.body, Body::User { .. })).map_or(0, |e| e.at));
         let (tools, after_error, asks) = {
             let mut tools = 0u32;
             let mut last: Option<&Body> = None;
-            for e in self.events.iter().filter(|e| e.at >= since) {
+            for e in self.events.iter().filter(|e| e.parent.is_none() && e.at >= since) {
                 match &e.body {
                     Body::Tool(_) => {
                         tools = tools.saturating_add(1);
@@ -753,6 +753,33 @@ mod tests {
         core.end_turn(None, "done", None);
         let t = core.state.last_turn.clone().unwrap_or_default();
         assert_eq!((t.after_error, t.asks), (false, true));
+    }
+
+    #[test]
+    fn child_work_cannot_change_the_parent_turns_keep_going_decision() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.upsert("parent-prompt", None, Body::User { text: "go".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("parent-tool", None, tool(ToolStatus::Error));
+        core.upsert("child-prompt", Some("spawn".into()), Body::User { text: "audit".into(), images: 0, client_id: None, origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("child-tool", Some("spawn".into()), tool(ToolStatus::Done));
+        core.upsert("child-answer", Some("spawn".into()), said("Should I try again?"));
+        // Distinct times also exercise the fallback to the parent's prompt when no start
+        // timestamp survives a reconnect.
+        for (id, at) in [("parent-prompt", 10), ("parent-tool", 20), ("child-prompt", 30), ("child-tool", 40), ("child-answer", 50)] {
+            core.get_mut(id).ok_or_else(|| anyhow::anyhow!("missing event {id}"))?.at = at;
+        }
+        for started in [None, Some(10)] {
+            core.end_turn(started, "done", None);
+            let turn = core.state.last_turn.as_ref().ok_or_else(|| anyhow::anyhow!("missing turn end"))?;
+            assert_eq!((turn.tools, turn.after_error, turn.asks), (1, true, false), "child work changed the parent turn");
+        }
+
+        core.upsert("parent-answer", None, said("Should I retry the failed command?"));
+        core.upsert("child-error", Some("spawn".into()), tool(ToolStatus::Error));
+        core.end_turn(Some(10), "done", None);
+        let turn = core.state.last_turn.as_ref().ok_or_else(|| anyhow::anyhow!("missing turn end"))?;
+        assert_eq!((turn.tools, turn.after_error, turn.asks), (1, false, true), "the child's error hid the parent's question");
+        Ok(())
     }
 
     #[test]

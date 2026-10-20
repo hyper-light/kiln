@@ -837,6 +837,15 @@ sends to the background, monitors and workflows. Besides `id`, `description`, `s
   wake, "agent" or the subagent task that started the monitor.
 - `stoppable`: `stop_task` can stop it.
 
+Codex's native subagents keep their own threads and execution settings. kiln tracks each one by
+its native thread ID and keeps its work under the original spawning call, including later
+messages and follow-up work. Read-only `thread/read` and `thread/turns/list` requests fill in its
+status, latest 100 turns, elapsed time and result; live child notifications update that same
+view. Tracking never starts, resumes or attaches another executor to the child. Its messages,
+commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
+finishing does not mean the child has finished, and unavailable child history does not end the
+parent.
+
 `state.left_behind` counts the tasks left running while no turn is under way (the agent idle or
 exited): shells, monitors, workflows, background calls and subagents sent to the background.
 
@@ -937,7 +946,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |
 | calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — |
-| subagents: tasks, nested messages, stop | ✓ | ? (subagent activity is shown; not run) | — | — |
+| subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |
