@@ -40,6 +40,7 @@ pub mod moving;
 pub mod opened;
 pub mod ops;
 pub mod pause;
+pub mod port;
 pub mod registry;
 pub mod relocate;
 pub mod screen;

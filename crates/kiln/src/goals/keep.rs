@@ -26,12 +26,12 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use kiln_seams::HarnessPort;
 use parking_lot::Mutex;
 
 use crate::harness::core::KEEP_ID;
 use crate::harness::model::{Command, SendMode, Status};
 use crate::harness::session::Info;
-use crate::hub::Hub;
 
 /// Turns in a row kiln starts, since a person last said something.
 pub const MAX_KEPT: u32 = 5;
@@ -193,7 +193,10 @@ pub(super) fn message(why: &Why) -> String {
 /// One agent with no goal stack driving it, at `now`: kept going if it stopped part-way. Agents
 /// it started that are at work (`children`) are work it has going, as its background tasks are:
 /// it isn't prodded while they work, and is told when each settles (`harness::told`).
-pub async fn tick(hub: &Hub, info: &Info, now: i64, children: bool) {
+pub async fn tick<P>(port: &P, info: &Info, now: i64, children: bool)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
     let held;
     let info = if children {
         held = Info { tasks_running: info.tasks_running + 1, ..info.clone() };
@@ -215,7 +218,7 @@ pub async fn tick(hub: &Hub, info: &Info, now: i64, children: bool) {
     if let Next::Keep { why, .. } = next {
         let c = Command::Send { id: format!("{KEEP_ID}{now}"), text: message(&why), mode: SendMode::Queue, attachments: Vec::new(), overrides: None };
         tracing::info!(agent = %info.id, why = ?why, "keep going");
-        let _ = hub.harness.command(hub, &info.id, c).await;
+        let _ = port.send(&info.id, c).await;
     }
 }
 

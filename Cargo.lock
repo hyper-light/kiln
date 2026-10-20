@@ -2174,6 +2174,7 @@ dependencies = [
  "k8s-openapi",
  "kiln-cd",
  "kiln-ci",
+ "kiln-seams",
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",
