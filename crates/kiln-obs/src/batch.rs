@@ -10,8 +10,12 @@
 //! item  := DEF u8 | fp u64-le | kind u8 | key varint-length bytes
 //!        | RUN u8 | fp u64-le | samples varint | chunk varint-length bytes
 //!        | LOGS u8 | rows varint | raw length varint | LZ4 of the rows varint-length bytes
+//!        | SPANS u8 | rows varint | raw length varint | LZ4 of the rows varint-length bytes
 //! key   := metric | tags varint | (tag-key, tag-value)*          (each varint-length bytes)
 //! ```
+//!
+//! Spans are rows as log records are (`crate::logs::record`), for the span store
+//! (`crate::otlp::traces`).
 //!
 //! A run names a series defined in its batch (earlier) or in an earlier batch. A definition takes
 //! effect with the first of its series' samples a replica keeps, never alone: no replica holds a
@@ -30,6 +34,7 @@ pub const VERSION: u8 = 1;
 const DEF: u8 = 0;
 const RUN: u8 = 1;
 const LOGS: u8 = 2;
+const SPANS: u8 = 3;
 
 /// The most bytes a batch's log rows decompress to: three times the largest request the
 /// OpenTelemetry Collector's HTTP receiver takes by default (`confighttp` `max_request_body_size`,
@@ -268,6 +273,21 @@ impl Builder {
         self.items += 1;
     }
 
+    /// Span rows, as one item: rows written whole (`crate::otlp::traces`'s segment, its times
+    /// chained from 0), LZ4-compressed.
+    pub fn spans(&mut self, raw: &[u8], rows: u32) {
+        if rows == 0 {
+            return;
+        }
+        let mut packed = Vec::with_capacity(raw.len() / 4);
+        crate::lz4::compress(raw, &mut packed);
+        self.body.push(SPANS);
+        varint::put(&mut self.body, u64::from(rows));
+        varint::put(&mut self.body, raw.len() as u64);
+        put_bytes(&mut self.body, &packed);
+        self.items += 1;
+    }
+
     pub fn items(&self) -> u64 {
         self.items
     }
@@ -319,6 +339,8 @@ pub enum Item<'a> {
     Run { fp: u64, samples: ChunkRef<'a> },
     /// Log rows: how many, their size decompressed, and their LZ4 bytes.
     Logs { rows: u32, raw_len: usize, packed: &'a [u8] },
+    /// Span rows, as log rows are.
+    Spans { rows: u32, raw_len: usize, packed: &'a [u8] },
 }
 
 /// A batch's items, read in place.
@@ -346,12 +368,12 @@ impl<'a> Reader<'a> {
         }
         let (&tag, rest) = self.at.split_first().ok_or(BatchError::Malformed("item tag"))?;
         self.at = rest;
-        if tag == LOGS {
+        if tag == LOGS || tag == SPANS {
             let rows = varint::get(&mut self.at).and_then(|r| u32::try_from(r).ok()).ok_or(BatchError::Malformed("log rows"))?;
             let raw_len = varint::get(&mut self.at).and_then(|r| usize::try_from(r).ok()).filter(|&r| r <= MAX_LOG_ROWS_BYTES).ok_or(BatchError::Malformed("log rows' size"))?;
             let packed = get_bytes(&mut self.at).ok_or(BatchError::Malformed("log rows"))?;
             self.left -= 1;
-            return Ok(Some(Item::Logs { rows, raw_len, packed }));
+            return Ok(Some(if tag == LOGS { Item::Logs { rows, raw_len, packed } } else { Item::Spans { rows, raw_len, packed } }));
         }
         let fp = get_u64(&mut self.at).ok_or(BatchError::Malformed("fingerprint"))?;
         let item = match tag {
@@ -439,14 +461,14 @@ mod tests {
         let mut r = Reader::new(&batch).unwrap();
         match r.next_item().unwrap().unwrap() {
             Item::Def { fp, kind, key } => assert_eq!((fp, kind, key), (a.fp, Kind::Gauge, &*a.key)),
-            Item::Run { .. } | Item::Logs { .. } => panic!("a definition first"),
+            Item::Run { .. } | Item::Logs { .. } | Item::Spans { .. } => panic!("a definition first"),
         }
         match r.next_item().unwrap().unwrap() {
             Item::Run { fp, samples } => {
                 assert_eq!(fp, a.fp);
                 assert_eq!(samples.iter().map(Result::unwrap).collect::<Vec<_>>(), vec![(10, 1.0), (20, 2.5), (30, 3.0)]);
             }
-            Item::Def { .. } | Item::Logs { .. } => panic!("a run"),
+            Item::Def { .. } | Item::Logs { .. } | Item::Spans { .. } => panic!("a run"),
         }
         assert!(matches!(r.next_item().unwrap().unwrap(), Item::Run { fp: 77, .. }));
         assert!(r.next_item().unwrap().is_none());
@@ -487,7 +509,7 @@ mod tests {
                                 }
                             }
                         }
-                        Item::Logs { raw_len, packed, .. } => {
+                        Item::Logs { raw_len, packed, .. } | Item::Spans { raw_len, packed, .. } => {
                             let mut out = Vec::new();
                             let _ = crate::lz4::decompress(packed, &mut out, raw_len);
                         }

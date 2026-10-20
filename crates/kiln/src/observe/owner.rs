@@ -100,9 +100,10 @@ pub struct Settings {
     /// The node's observe folder: the group's log and the store.
     pub dir: PathBuf,
     pub role: Role,
-    /// How long samples and log records are kept (the server moves the cutoffs).
+    /// How long samples, log records and spans are kept (the server moves the cutoffs).
     pub metrics_retention: Duration,
     pub logs_retention: Duration,
+    pub spans_retention: Duration,
     /// The bound on series the server states (0: none).
     pub max_series: u64,
 }
@@ -127,9 +128,11 @@ pub struct View {
     pub durable: u64,
     pub series: u64,
     pub blocks: u64,
-    /// Bytes observe's folder holds on this machine (`dir_bytes`), and of them its logs files.
+    /// Bytes observe's folder holds on this machine (`dir_bytes`), and of them its logs files and
+    /// its spans files.
     pub disk_bytes: u64,
     pub log_bytes: u64,
+    pub span_bytes: u64,
     /// Bytes the store holds in memory, by part (`kiln_obs::store::Heap`): its symbols, its
     /// index (series, blocks' and logs files' summaries), its head's samples.
     pub heap_symbols: u64,
@@ -178,6 +181,8 @@ enum Input {
     Logs(Vec<Record>),
     /// Log records whose sender waits to know they are written (a file's reader).
     LogsAcked(Vec<Record>, super::ingest::Ack),
+    /// Spans, as rows a request's decoding wrote: segments, each with its rows.
+    Spans(Vec<(Vec<u8>, u32)>),
     Staged { generation: u64, msg: Box<Message>, ok: bool },
     Fetched { generation: u64, done: u64, of: u64 },
     /// Cut the store and compact the log now, keeping nothing (an operator's, or a test's).
@@ -296,6 +301,7 @@ pub struct Observe {
     key: Option<String>,
     feed: Arc<Feed>,
     touched: Arc<Touched>,
+    spans_touched: Arc<Touched>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -318,10 +324,12 @@ impl Observe {
         };
         let admission = Arc::new(Admission::default());
         let feed = Feed::new();
-        // The server counts metrics from logs: its replica tells which windows records came in.
-        let touched = Arc::new(Touched::new());
-        let told = matches!(settings.role, Role::Server { .. }).then(|| touched.clone());
-        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched };
+        // The server counts metrics from logs and from spans: its replica tells which windows
+        // records and spans came in.
+        let (touched, spans_touched) = (Arc::new(Touched::new()), Arc::new(Touched::new()));
+        let server = matches!(settings.role, Role::Server { .. });
+        let told = server.then(|| (touched.clone(), spans_touched.clone()));
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
             let mut owner = Owner::new(settings, store, view, out_tx, tx, admission, feed, told);
             owner.run(&rx);
@@ -522,6 +530,31 @@ impl Observe {
         Ok(())
     }
 
+    /// Spans an exporter sent, as rows its request's decoding wrote (`kiln_obs::otlp::traces`): as
+    /// [`Observe::offer_logs`], their bytes against the same bound. Refused, their buffers are kept
+    /// for the next request's rows.
+    #[must_use]
+    pub fn offer_spans(&self, segments: Vec<(Vec<u8>, u32)>) -> bool {
+        let n: u64 = segments.iter().map(|(r, _)| r.len() as u64).sum();
+        let a = &self.admission;
+        if n == 0 {
+            return true;
+        }
+        if a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire) || !reserve(&a.log_bytes, &a.left_log_bytes, n, WAITING_LOG_BYTES as u64 / 4 * 3) {
+            for (rows, _) in segments {
+                a.spares.give_bytes(rows);
+            }
+            return false;
+        }
+        if let Err(std::sync::mpsc::SendError(Input::Spans(segments))) = self.tx.send(Input::Spans(segments)) {
+            a.left_log_bytes.fetch_add(n, Ordering::AcqRel);
+            for (rows, _) in segments {
+                a.spares.give_bytes(rows);
+            }
+        }
+        true
+    }
+
     /// Cuts the store and compacts the group's log now, keeping nothing: a member behind takes an
     /// image after this.
     pub fn compact(&self) {
@@ -557,6 +590,11 @@ impl Observe {
     /// from logs count them).
     pub fn touched(&self) -> &Arc<Touched> {
         &self.touched
+    }
+
+    /// As [`Observe::touched`], of spans (metrics from spans: trace metrics).
+    pub fn spans_touched(&self) -> &Arc<Touched> {
+        &self.spans_touched
     }
 
     pub fn view(&self) -> View {
@@ -635,7 +673,7 @@ struct Fetching {
 struct Owner {
     dir: PathBuf,
     role: Role,
-    retention: (Duration, Duration),
+    retention: (Duration, Duration, Duration),
     max_series: u64,
     rep: Option<Rep>,
     store: Arc<Mutex<Option<Shared>>>,
@@ -651,8 +689,8 @@ struct Owner {
     input: Sender<Input>,
     admission: Arc<Admission>,
     feed: Arc<Feed>,
-    /// Told the times of records the replica applies (the server's).
-    touched: Option<Arc<Touched>>,
+    /// Told the times of records and of spans the replica applies (the server's).
+    touched: Option<(Arc<Touched>, Arc<Touched>)>,
     start: Instant,
     batcher: Batcher,
     /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
@@ -709,13 +747,13 @@ fn now_ns(start: Instant) -> u64 {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<Arc<Touched>>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
             dir: settings.dir,
             role: settings.role,
-            retention: (settings.metrics_retention, settings.logs_retention),
+            retention: (settings.metrics_retention, settings.logs_retention, settings.spans_retention),
             max_series: settings.max_series,
             rep: None,
             store,
@@ -835,15 +873,17 @@ impl Owner {
                 // opened: entries applied before a restart are applied again.
                 if let Ok(last) = hyper_raft::Storage::last_index(rep.r.core().store()) {
                     self.feed.seen(last);
-                    if let Some(t) = &self.touched {
+                    if let Some((t, s)) = &self.touched {
                         t.seen(last);
+                        s.seen(last);
                     }
                 }
                 {
                     let shared = rep.r.machine().shared();
                     let mut s = shared.write().unwrap_or_else(PoisonError::into_inner);
                     s.set_feed(Some(self.feed.clone()));
-                    s.set_touched(self.touched.clone());
+                    s.set_touched(self.touched.as_ref().map(|t| t.0.clone()));
+                    s.set_spans_touched(self.touched.as_ref().map(|t| t.1.clone()));
                 }
                 *lock(&self.store) = Some(rep.r.machine().shared());
                 self.opened_at = Some(Instant::now());
@@ -904,6 +944,10 @@ impl Owner {
             let (points, log_bytes) = self.batcher.left();
             self.admission.left_points.store(points, Ordering::Release);
             self.admission.left_log_bytes.store(log_bytes, Ordering::Release);
+            // Spans' rows written into a write: their buffers for the next requests' rows.
+            for rows in self.batcher.spent() {
+                self.admission.spares.give_bytes(rows);
+            }
             self.admission.congested.store(self.batcher.congested(Instant::now()), Ordering::Release);
         }
     }
@@ -975,6 +1019,7 @@ impl Owner {
             }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::LogsAcked(records, ack) => self.batcher.logs_acked(records, ack, Instant::now()),
+            Input::Spans(segments) => self.batcher.spans(segments, Instant::now()),
             Input::Staged { generation, msg, ok } => {
                 if self.fetching.as_ref().is_some_and(|f| f.generation == generation) {
                     self.fetching = None;
@@ -1183,6 +1228,11 @@ impl Owner {
             if rep.r.propose(Vec::new(), kiln_obs::command::retain(back(self.retention.0), back(self.retention.1), now)).is_ok() {
                 self.retained = Some(Instant::now());
             }
+            // Spans' own, once the group holds any: a group that never took a span never sends an
+            // entry a build that knows none would stop at.
+            if rep.r.machine().read().holds_spans() {
+                let _ = rep.r.propose(Vec::new(), kiln_obs::command::retain_spans(back(self.retention.2), now));
+            }
         }
     }
 
@@ -1200,8 +1250,9 @@ impl Owner {
                         let _ = std::fs::remove_dir_all(self.dir.join("store"));
                         let _ = std::fs::remove_file(self.dir.join("obs.log"));
                         self.feed.reset();
-                        if let Some(t) = &self.touched {
+                        if let Some((t, s)) = &self.touched {
                             t.reset();
+                            s.reset();
                         }
                     }
                     if let Err(e) = save_json(&self.dir.join("member.json"), &me) {
@@ -1524,6 +1575,7 @@ impl Owner {
             v.series = store.series_count() as u64;
             v.blocks = store.block_count() as u64;
             v.log_bytes = store.log_bytes();
+            v.span_bytes = store.span_bytes();
             let heap = store.heap();
             (v.heap_symbols, v.heap_index, v.heap_samples) = (heap.symbols as u64, heap.index as u64, heap.samples as u64);
             v.cutoff_ms = store.cutoff();
@@ -1607,7 +1659,7 @@ impl Fetch {
         let checked = crate::rt::blocking(move || -> bool {
             let ok = match kind {
                 FileKind::Block => kiln_obs::block::Block::open(&part).is_ok_and(|b| b.bytes == bytes && b.crc == crc && b.verify().is_ok()),
-                FileKind::Logs => kiln_obs::logs::file::LogFile::open(&part).is_ok_and(|l| l.bytes == bytes && l.crc == crc && l.verify().is_ok()),
+                FileKind::Logs | FileKind::Spans => kiln_obs::logs::file::LogFile::open(&part).is_ok_and(|l| l.bytes == bytes && l.crc == crc && l.verify().is_ok()),
             };
             ok && std::fs::rename(&part, &to).is_ok()
         })

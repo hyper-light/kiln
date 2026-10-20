@@ -405,6 +405,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/observe/v1/logs/aggregate", "observe.read", At::Server),
     r("POST", "/api/observe/v1/logs/facets", "observe.read", At::Server),
     r("POST", "/api/observe/v1/logs/patterns", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/spans/search", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/spans/aggregate", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/spans/facets", "observe.read", At::Server),
     r("POST", "/api/observe/v1/events/search", "observe.read", At::Server),
     r("POST", "/api/observe/v1/monitors/validate", "observe.read", At::Server),
     any("/api/observe/v1/integrations/**", "observe.manage", At::Server),
@@ -422,6 +425,7 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/pipeline_order", "observe.manage", At::Server),
     // Metrics from logs write series, as monitors and dashboards are written; trying one reads.
     r("POST", "/api/observe/v1/log_metric_test", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/span_metric_test", "observe.read", At::Server),
     r("POST", "/api/observe/v1/compact", "observe.manage", At::Server),
     r("POST", "/api/observe/v1/verify", "observe.manage", At::Server),
     any("/api/observe/v1/**", "observe.write", At::Server),

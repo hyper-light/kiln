@@ -33,6 +33,8 @@ pub struct LogStore {
     head_bytes: usize,
     sealed: Vec<LogBlock>,
     pub files: Vec<HeldFile>,
+    /// A store of spans: its blocks' filters hold their trace ids ([`LogBlock::seal_in`]).
+    spans: bool,
 }
 
 /// A search's answer.
@@ -47,6 +49,17 @@ pub struct Found {
 }
 
 impl LogStore {
+    /// A store of spans (`crate::otlp::traces`): records as logs are, its blocks' filters holding
+    /// their trace ids, so a trace's spans are found without reading the blocks that hold none.
+    pub fn spans() -> Self {
+        Self { spans: true, ..Self::default() }
+    }
+
+    /// Whether it holds spans.
+    pub fn is_spans(&self) -> bool {
+        self.spans
+    }
+
     /// Takes a batch's rows (their encoding, decompressed).
     pub fn append(&mut self, raw: Vec<u8>, rows: u32) -> Result<(), LogStoreError> {
         if rows == 0 {
@@ -72,7 +85,7 @@ impl LogStore {
                 refs.push(r);
             }
         }
-        let block = LogBlock::seal(&refs);
+        let block = LogBlock::seal_in(&refs, self.spans);
         drop(refs);
         self.sealed.push(block);
         self.head.clear();
@@ -105,7 +118,7 @@ impl LogStore {
                     refs.push(r);
                 }
             }
-            Some(LogBlock::seal(&refs))
+            Some(LogBlock::seal_in(&refs, self.spans))
         };
         let blocks: Vec<&LogBlock> = self.sealed.iter().chain(head.as_ref()).collect();
         if blocks.is_empty() {
@@ -120,6 +133,14 @@ impl LogStore {
         self.head_bytes = 0;
         self.sealed.clear();
         self.files.push(file);
+    }
+
+    /// Rows of the blocks (and the head) whose time reaches into `[from, to]` (ns), from their
+    /// summaries alone: what a scan of the range reads, at the most.
+    pub fn rows_between(&self, from: i64, to: i64) -> u64 {
+        let head: u64 = self.head.iter().map(|h| u64::from(h.1)).sum();
+        let blocks = self.sealed.iter().chain(self.files.iter().flat_map(|f| f.log.blocks.iter()));
+        head + blocks.filter(|b| b.max_ts >= from && b.min_ts <= to).map(|b| u64::from(b.rows)).sum::<u64>()
     }
 
     /// Rows held in memory (head and sealed blocks not yet written).
@@ -213,7 +234,7 @@ impl LogStore {
                 Src::File(f, i) => f.log.blocks.get(*i),
                 Src::Sealed(b) => Some(*b),
             };
-            if summary.is_some_and(|b| search.block(b) == Maybe::No) {
+            if summary.is_some_and(|b| search.block_in(b, self.spans) == Maybe::No) {
                 found.blocks_pruned += 1;
                 continue;
             }
@@ -246,6 +267,8 @@ pub enum Facet {
     Source,
     /// The severity's level (`error`, `warn`, ...).
     Status,
+    /// A span's name, its message (Datadog's `resource_name`).
+    Name,
     Attr(String),
 }
 
@@ -261,12 +284,21 @@ impl Facet {
         }
     }
 
+    /// As [`Facet::parse`], of spans: `resource_name` (or `resource`) their name too.
+    pub fn parse_span(s: &str) -> Self {
+        match s.trim() {
+            "resource_name" | "resource" => Self::Name,
+            other => Self::parse(other),
+        }
+    }
+
     pub fn name(&self) -> String {
         match self {
             Self::Service => "service".into(),
             Self::Host => "host".into(),
             Self::Source => "source".into(),
             Self::Status => "status".into(),
+            Self::Name => "resource_name".into(),
             Self::Attr(k) => format!("@{k}"),
         }
     }
@@ -278,6 +310,7 @@ impl Facet {
             Self::Host => Some(r.host),
             Self::Source => Some(r.source),
             Self::Status => Some(super::record::level(r.severity)),
+            Self::Name => Some(r.message),
             Self::Attr(k) => r.attr(k),
         }
     }
@@ -506,6 +539,16 @@ impl LogStore {
         .map(|_| ())
     }
 
+    /// Every record in `[from, to]` (ns) that `search` matches, to `f`, one at a time, none kept:
+    /// the blocks it rules out never read.
+    pub fn each_matching(&self, search: &Search, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>)) -> Result<(), LogStoreError> {
+        self.each_match(search, from, to, |r| {
+            f(r);
+            Ok::<(), LogStoreError>(())
+        })
+        .map(|_| ())
+    }
+
     /// Every record in `[from, to]` (ns) that `search` matches, to `f`, across the head, sealed
     /// blocks and files (blocks a search rules out are never read); the rows read and the blocks
     /// ruled out.
@@ -529,7 +572,7 @@ impl LogStore {
             }
         }
         let (mut text, mut raw) = (Vec::new(), Vec::new());
-        let consider = |b: &LogBlock| b.max_ts >= from && b.min_ts <= to && search.block(b) != Maybe::No;
+        let consider = |b: &LogBlock| b.max_ts >= from && b.min_ts <= to && search.block_in(b, self.spans) != Maybe::No;
         for b in &self.sealed {
             if !consider(b) {
                 blocks_pruned += 1;
@@ -777,6 +820,53 @@ mod tests {
         assert!(matches!(s.aggregate(&parse("*").unwrap(), 0, i64::MAX, &nine, &Measure::Count), Err(AggregateError::TooManyFacets)));
         // More groups than kept: refused, not cut short.
         assert!(matches!(s.aggregate(&parse("*").unwrap(), 0, i64::MAX, &[Facet::Attr("n".into())], &Measure::Count), Err(AggregateError::TooManyGroups)));
+    }
+
+    /// Blocks of spans that share what every block of a service holds (its name, its kind, its
+    /// resource) and each its traces: a trace found reads its own block and about one in a hundred
+    /// besides, whichever trace, as the filters are sized for (unsalted, the places of a query fell
+    /// on the bits the shared tokens set in every filter alike, and some traces read most blocks).
+    #[test]
+    fn a_trace_reads_its_own_block_and_about_one_in_a_hundred_besides_whichever_trace() {
+        let mut s = LogStore::spans();
+        let id = |t: u64| (u128::from(t) * 0x9e37_79b9_7f4a_7c15).to_le_bytes();
+        for b in 0..400u64 {
+            let mut raw = Vec::new();
+            let mut prev = 0;
+            for i in 0..510u64 {
+                let trace = b * 1_000 + i / 3;
+                let r = Record {
+                    ts: (b * 510 + i) as i64 * 1_000_000,
+                    severity: 9,
+                    service: "checkout".into(),
+                    host: "web-1".into(),
+                    source: "opentelemetry.instrumentation.flask".into(),
+                    message: "GET /checkout/{id}".into(),
+                    attrs: vec![("span.kind".into(), "server".into()), ("url.path".into(), format!("/checkout/{}", trace % 1_000)), ("pad".into(), "p".repeat(420))],
+                    trace_id: Some(id(trace)),
+                    span_id: Some((b * 1_000 + i + 1).to_le_bytes()),
+                };
+                put_row(&mut raw, &r, prev);
+                prev = r.ts;
+            }
+            // Each request's spans a block of its own (past the block's text).
+            assert!(raw.len() >= BLOCK_TEXT);
+            s.append(raw, 510).unwrap();
+        }
+        assert_eq!(s.sealed.len(), 400);
+        let mut reads: Vec<u64> = (0..300u64)
+            .map(|q| {
+                let t = (q * 7_919 % 400) * 1_000 + 77;
+                let found = s.search(&Search::trace(id(t)), i64::MIN, i64::MAX, 100).unwrap();
+                assert_eq!(found.records.len(), 3);
+                found.blocks_total - found.blocks_pruned
+            })
+            .collect();
+        reads.sort_unstable();
+        // Its own block, and of 399 others each 1% (Binomial(399, 0.01): mean 4, P(> 19) < 1e-7).
+        let (median, most) = (reads[150], reads[299]);
+        assert!(median <= 8, "median {median}");
+        assert!(most <= 20, "the worst trace read {most} of 400 blocks");
     }
 
     #[test]

@@ -35,6 +35,11 @@ pub enum LogBlockError {
     Malformed(&'static str),
 }
 
+/// What a block of spans' token filter leaves out: the values of a span's own numbers and ids and
+/// its events' and links' JSON, a token or more each a span, which would double the filter for
+/// searches no one makes by a word of them (a search of them is never ruled out by it).
+pub const UNTOKENIZED: [&str; 4] = ["duration", "parent_id", "events", "links"];
+
 /// A sealed block: its summary and its compressed text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogBlock {
@@ -62,6 +67,13 @@ fn insert_sorted(v: &mut Vec<String>, s: &str) {
 impl LogBlock {
     /// Seals records (in any order: sorted by time here, stably).
     pub fn seal(records: &[RecordRef<'_>]) -> Self {
+        Self::seal_in(records, false)
+    }
+
+    /// As [`LogBlock::seal`], of spans when `spans`: the filter holds each one's trace id (its
+    /// bytes' hashes, `super::bloom::id_hashes`) and not [`UNTOKENIZED`]'s values, every place
+    /// salted by the block ([`LogBlock::salt`]).
+    pub fn seal_in(records: &[RecordRef<'_>], spans: bool) -> Self {
         let mut order: Vec<usize> = (0..records.len()).collect();
         order.sort_by_key(|&i| records.get(i).map_or(0, |r| r.ts));
         let mut raw = Vec::with_capacity(BLOCK_TEXT + BLOCK_TEXT / 8);
@@ -86,14 +98,23 @@ impl LogBlock {
             });
             for (k, v) in r.attrs() {
                 insert_sorted(&mut keys, k);
+                if spans && UNTOKENIZED.contains(&k) {
+                    continue;
+                }
                 tokens(v, &mut buf, |t| {
                     seen.insert(token_hashes(t));
                 });
             }
+            if spans && let Some(t) = r.trace_id {
+                seen.insert(super::bloom::id_hashes(&t));
+            }
         }
         let mut bloom = Bloom::with_rate(seen.len(), BLOOM_RATE);
+        // A block of spans' filter salted by the block (`super::bloom::salted`); a block of logs'
+        // as logs' have always been.
+        let salt = spans.then(|| super::bloom::block_salt(if records.is_empty() { 0 } else { min_ts }, records.len() as u32));
         for h in seen {
-            bloom.insert(h);
+            bloom.insert(salt.map_or(h, |s| super::bloom::salted(h, s)));
         }
         let mut text = Vec::with_capacity(raw.len() / 4);
         lz4::compress(&raw, &mut text);
@@ -151,6 +172,11 @@ impl LogBlock {
     /// The rows, oldest first, from what [`LogBlock::decompress`] wrote.
     pub fn rows<'a>(&self, raw: &'a [u8]) -> Rows<'a> {
         Rows::new(raw, self.rows as usize)
+    }
+
+    /// Its filter's salt, a block of spans' (what `seal_in` salted it with).
+    pub fn salt(&self) -> u64 {
+        super::bloom::block_salt(self.min_ts, self.rows)
     }
 
     /// Bytes of its summary held in memory.

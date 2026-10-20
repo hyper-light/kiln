@@ -1311,6 +1311,120 @@ const scenarios = {
     }
   },
 
+  /** Traces sent over OTLP's JSON: found in the trace explorer, a trace's waterfall drawn with its
+   * error where it happened, its services in APM from the trace metrics, and the map's call. */
+  async "a trace is found, its waterfall drawn, its services and their call shown"() {
+    const front = `e2e-front-${run}`;
+    const cart = `e2e-cart-${run}`;
+    const hex = (n, len) => n.toString(16).padStart(len, "0");
+    const t0 = BigInt(Date.now() - 30_000) * 1_000_000n;
+    const kv = (k, v) => ({ key: k, value: { stringValue: v } });
+    // Ten orders, each a frontend's request calling the cart, whose database call fails once.
+    const traces = Array.from({ length: 10 }, (_, i) =>
+      hex(
+        Number(
+          run
+            .slice(-6)
+            .split("")
+            .reduce((a, c) => a * 36 + parseInt(c, 36), 0),
+        ) *
+          100 +
+          i +
+          1,
+        32,
+      ),
+    );
+    const spanId = (i, j) => hex(i * 10 + j + 1, 16);
+    const span = (i, j, name, kind, parent, start, dur, extra = {}) => ({
+      traceId: traces[i],
+      spanId: spanId(i, j),
+      ...(parent === null ? {} : { parentSpanId: spanId(i, parent) }),
+      name,
+      kind,
+      startTimeUnixNano: String(t0 + BigInt(i) * 100_000_000n + start),
+      endTimeUnixNano: String(t0 + BigInt(i) * 100_000_000n + start + dur),
+      ...extra,
+    });
+    const resource = (service) => ({ attributes: [kv("service.name", service), kv("deployment.environment.name", "e2e")] });
+    const fronts = [];
+    const carts = [];
+    for (let i = 0; i < 10; i++) {
+      const fail = i === 3;
+      fronts.push(span(i, 0, "GET /checkout/{order}", 2, null, 0n, 40_000_000n, fail ? { status: { code: 2 } } : {}));
+      fronts.push(span(i, 1, "GET", 3, 0, 2_000_000n, 35_000_000n, { attributes: [kv("server.address", "cart.internal")] }));
+      carts.push(span(i, 2, "GET /cart/{order}", 2, 1, 3_000_000n, 30_000_000n, fail ? { status: { code: 2 } } : {}));
+      carts.push(
+        span(i, 3, "SELECT carts", 3, 2, 5_000_000n, 20_000_000n, {
+          attributes: [kv("db.system", "postgresql")],
+          ...(fail
+            ? {
+                status: { code: 2 },
+                events: [
+                  { timeUnixNano: String(t0 + 3n * 100_000_000n + 24_000_000n), name: "exception", attributes: [kv("exception.type", "ValueError"), kv("exception.message", "cart 3 is locked")] },
+                ],
+              }
+            : {}),
+        }),
+      );
+    }
+    const body = {
+      resourceSpans: [
+        { resource: resource(front), scopeSpans: [{ scope: { name: "e2e" }, spans: fronts }] },
+        { resource: resource(cart), scopeSpans: [{ scope: { name: "e2e" }, spans: carts }] },
+      ],
+    };
+    expect((await api("POST", "/v1/traces", body)).status === 200, "the spans sent");
+    await until(
+      "the spans stored",
+      async () => (await api("POST", "/api/observe/v1/spans/search", { query: `service:${front}`, from: Date.now() - 3_600_000, to: Date.now() + 60_000 })).body?.spans?.length === 20,
+    );
+
+    // The explorer: the frontend's spans; the failing order's opened.
+    await page.goto(`${BASE}/observe/traces?q=${encodeURIComponent(`service:${cart} status:error resource_name:"SELECT carts"`)}&range=1h`);
+    const rows = page.getByRole("region", { name: "Spans" }).getByRole("link");
+    await until("the database's failing span", async () => (await rows.count()) === 1);
+    await rows.first().click();
+    await page.waitForURL(new RegExp(`/observe/traces/${traces[3]}\\?span=${spanId(3, 3)}`));
+    const waterfall = page.getByRole("region", { name: "Waterfall" });
+    await until("the waterfall's four spans", async () => (await waterfall.getByRole("listitem").count()) === 4);
+    // Its spans in the order a waterfall draws them, the picked one opened below.
+    const names = (await waterfall.getByRole("listitem").allTextContents()).map((t) => t.replace(/\s+/g, " "));
+    expect(names[0].includes("GET /checkout/{order}") && names[3].includes("SELECT carts"), `in order: ${names.join(" | ")}`);
+    await page.getByText("cart 3 is locked").waitFor();
+    await page.getByText("ValueError:", { exact: false }).first().waitFor();
+    // Another span picked: the address says it.
+    await waterfall.getByRole("button", { name: /GET \/cart\/\{order\}/ }).click();
+    await page.waitForURL(new RegExp(`span=${spanId(3, 2)}`));
+
+    // APM: the services from the trace metrics, once their window is counted.
+    await until(
+      "the services counted",
+      async () => {
+        const s = await api("GET", `/api/observe/v1/apm/services?from=${Date.now() - 3_600_000}&to=${Date.now() + 60_000}`);
+        const row = s.body?.services?.find((r) => r.service === cart);
+        return row?.hits === 10 && row?.errors === 1;
+      },
+      90_000,
+    );
+    await page.goto(`${BASE}/observe/apm?range=1h`);
+    await page.getByRole("link", { name: cart, exact: true }).click();
+    await page.waitForURL(new RegExp(`/observe/apm/services/${cart}`));
+    await page.getByRole("heading", { name: cart, exact: true }).waitFor();
+    await page.getByRole("link", { name: "GET /cart/{order}", exact: true }).waitFor();
+    await page.getByText("postgresql", { exact: true }).waitFor();
+
+    // The map: the frontend's call to the cart, answered by the cart's spans.
+    await page.goto(`${BASE}/observe/apm/map?range=1h`);
+    const map = page.getByRole("img", { name: /services/ });
+    await map.waitFor();
+    for (const s of [front, cart, "postgresql"]) await map.getByText(s.length > 22 ? `${s.slice(0, 21)}…` : s, { exact: true }).waitFor();
+    const m = (await api("GET", `/api/observe/v1/apm/map?from=${Date.now() - 3_600_000}&to=${Date.now() + 60_000}`)).body;
+    expect(
+      m.edges.some((e) => e.from === front && e.to === cart && e.calls === 10 && !e.inferred),
+      `the call answered: ${JSON.stringify(m.edges)}`,
+    );
+  },
+
   /** A time-slice SLO made from the form: the minutes whose latency met its condition, of all. */
   async "a time-slice SLO counts the minutes that meet its condition"() {
     const metric = "e2e.slo.latency";

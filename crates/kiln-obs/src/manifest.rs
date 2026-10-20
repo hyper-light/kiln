@@ -7,17 +7,21 @@
 //! the new, never a mix.
 //!
 //! ```text
-//! kiln-obs manifest 2
+//! kiln-obs manifest 2                                (3 once it holds spans)
 //! durable <index> <term>
 //! next <seq>
 //! cutoff <metrics' ms> <logs' ms>
+//! spans_cutoff <spans' ms>                           (3)
 //! max_series <n>
 //! conf <voters> <learners> <outgoing voters> <next learners> <auto leave 0|1>   (ids, commas; "-")
 //! session <sender, hex> <seq> <at ms> <index>
 //! block <seq> <file name>
 //! logs <seq> <file name>
+//! spans <seq> <file name>                            (3)
 //! crc <crc32c of the lines above, hex>
 //! ```
+//!
+//! A store that never held spans writes version 2, so a build that knows no spans opens it still.
 //!
 //! Everything but the files is the replicated state at `durable` that the files do not hold: what
 //! retention cut off, the bound on series, each sender's last write, and the group's configuration.
@@ -33,6 +37,8 @@ use crate::crc32c;
 pub const NAME: &str = "MANIFEST";
 const TMP: &str = "MANIFEST.tmp";
 const FIRST_LINE: &str = "kiln-obs manifest 2";
+/// The first line of a manifest that holds spans.
+const FIRST_LINE_SPANS: &str = "kiln-obs manifest 3";
 
 /// A point of the group's log: an entry's index and its term.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,9 +77,11 @@ pub struct Session {
 pub struct Manifest {
     pub durable: Point,
     pub next_seq: u64,
-    /// No sample older is kept (ms), and no log record older than `logs_cutoff`.
+    /// No sample older is kept (ms), no log record older than `logs_cutoff`, and no span older
+    /// than `spans_cutoff`.
     pub cutoff: i64,
     pub logs_cutoff: i64,
+    pub spans_cutoff: i64,
     /// 0: no bound.
     pub max_series: u64,
     pub conf: Membership,
@@ -81,11 +89,13 @@ pub struct Manifest {
     pub blocks: Vec<BlockEntry>,
     /// Logs files.
     pub logs: Vec<BlockEntry>,
+    /// Spans files (logs files of the span store).
+    pub spans: Vec<BlockEntry>,
 }
 
 impl Default for Manifest {
     fn default() -> Self {
-        Self { durable: Point::default(), next_seq: 0, cutoff: i64::MIN, logs_cutoff: i64::MIN, max_series: 0, conf: Membership::default(), sessions: BTreeMap::new(), blocks: Vec::new(), logs: Vec::new() }
+        Self { durable: Point::default(), next_seq: 0, cutoff: i64::MIN, logs_cutoff: i64::MIN, spans_cutoff: i64::MIN, max_series: 0, conf: Membership::default(), sessions: BTreeMap::new(), blocks: Vec::new(), logs: Vec::new(), spans: Vec::new() }
     }
 }
 
@@ -105,6 +115,11 @@ pub fn block_file(seq: u64) -> String {
 /// A logs file's name for its sequence number.
 pub fn logs_file(seq: u64) -> String {
     format!("{seq:016}.logs")
+}
+
+/// A spans file's name for its sequence number.
+pub fn spans_file(seq: u64) -> String {
+    format!("{seq:016}.spans")
 }
 
 /// Whether `file` may name a file of a store: a plain name in its directory, never a path.
@@ -127,15 +142,24 @@ fn parse_ids(s: &str) -> Option<Vec<u64>> {
 }
 
 impl Manifest {
+    /// Whether it holds spans, or a cutoff of theirs.
+    fn has_spans(&self) -> bool {
+        self.spans_cutoff != i64::MIN || !self.spans.is_empty()
+    }
+
     fn encode(&self) -> String {
         use std::fmt::Write as _;
         let mut body = String::new();
         let c = &self.conf;
         // Writing to a String cannot fail.
-        let _ = writeln!(body, "{FIRST_LINE}");
+        let spans = self.has_spans();
+        let _ = writeln!(body, "{}", if spans { FIRST_LINE_SPANS } else { FIRST_LINE });
         let _ = writeln!(body, "durable {} {}", self.durable.index, self.durable.term);
         let _ = writeln!(body, "next {}", self.next_seq);
         let _ = writeln!(body, "cutoff {} {}", self.cutoff, self.logs_cutoff);
+        if spans {
+            let _ = writeln!(body, "spans_cutoff {}", self.spans_cutoff);
+        }
         let _ = writeln!(body, "max_series {}", self.max_series);
         let _ = writeln!(body, "conf {} {} {} {} {}", ids(&c.voters), ids(&c.learners), ids(&c.voters_outgoing), ids(&c.learners_next), u8::from(c.auto_leave));
         for (sender, s) in &self.sessions {
@@ -146,6 +170,9 @@ impl Manifest {
         }
         for b in &self.logs {
             let _ = writeln!(body, "logs {} {}", b.seq, b.file);
+        }
+        for b in &self.spans {
+            let _ = writeln!(body, "spans {} {}", b.seq, b.file);
         }
         let crc = crc32c::checksum(body.as_bytes());
         let _ = writeln!(body, "crc {crc:08x}");
@@ -161,9 +188,11 @@ impl Manifest {
             return Err(damaged("checksum"));
         }
         let mut lines = body.lines();
-        if lines.next() != Some(FIRST_LINE) {
-            return Err(damaged("not a kiln-obs manifest of this version"));
-        }
+        let spans = match lines.next() {
+            Some(FIRST_LINE) => false,
+            Some(FIRST_LINE_SPANS) => true,
+            _ => return Err(damaged("not a kiln-obs manifest of this version")),
+        };
         let mut m = Self::default();
         for line in lines {
             let f: Vec<&str> = line.split(' ').collect();
@@ -174,6 +203,7 @@ impl Manifest {
                     m.cutoff = c.parse().map_err(|_| damaged("cutoff"))?;
                     m.logs_cutoff = l.parse().map_err(|_| damaged("cutoff"))?;
                 }
+                ["spans_cutoff", c] if spans => m.spans_cutoff = c.parse().map_err(|_| damaged("spans_cutoff"))?,
                 ["max_series", n] => m.max_series = n.parse().map_err(|_| damaged("max_series"))?,
                 ["conf", v, l, vo, ln, al] => {
                     let p = |s: &str| parse_ids(s).ok_or_else(|| damaged("conf"));
@@ -184,15 +214,15 @@ impl Manifest {
                     let s = Session { seq: seq.parse().map_err(|_| damaged("session"))?, at: at.parse().map_err(|_| damaged("session"))?, index: index.parse().map_err(|_| damaged("session"))? };
                     m.sessions.insert(sender, s);
                 }
-                [kind @ ("block" | "logs"), seq, file] => {
-                    if !plain_name(file) {
+                [kind @ ("block" | "logs" | "spans"), seq, file] => {
+                    if !plain_name(file) || (*kind == "spans" && !spans) {
                         return Err(damaged("block file"));
                     }
                     let e = BlockEntry { seq: seq.parse().map_err(|_| damaged("block"))?, file: (*file).to_owned() };
-                    if *kind == "block" {
-                        m.blocks.push(e);
-                    } else {
-                        m.logs.push(e);
+                    match *kind {
+                        "block" => m.blocks.push(e),
+                        "logs" => m.logs.push(e),
+                        _ => m.spans.push(e),
                     }
                 }
                 _ => return Err(damaged("a line")),
@@ -260,9 +290,23 @@ mod tests {
             sessions: [(0xdead_beef, Session { seq: 5, at: 1_700_000_000_123, index: 40 }), (7, Session { seq: 1, at: -1, index: 2 })].into(),
             blocks: vec![BlockEntry { seq: 5, file: block_file(5) }, BlockEntry { seq: 6, file: block_file(6) }],
             logs: vec![BlockEntry { seq: 6, file: logs_file(6) }],
+            spans_cutoff: i64::MIN,
+            spans: Vec::new(),
         };
         m.save(dir.path()).unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), Some(m.clone()));
+        // No spans: the version a build that knows none reads.
+        assert!(fs::read_to_string(dir.path().join(NAME)).unwrap().starts_with("kiln-obs manifest 2\n"));
+        let with = Manifest { spans_cutoff: 1_700_000_600_000, spans: vec![BlockEntry { seq: 7, file: spans_file(7) }], ..m.clone() };
+        with.save(dir.path()).unwrap();
+        assert_eq!(Manifest::load(dir.path()).unwrap(), Some(with.clone()));
+        assert!(fs::read_to_string(dir.path().join(NAME)).unwrap().starts_with("kiln-obs manifest 3\n"));
+        // A version 2 manifest that names spans is damage, its checksum right or not.
+        let text = with.encode();
+        let body = text[..text.rfind("crc ").unwrap()].replace("manifest 3", "manifest 2");
+        fs::write(dir.path().join(NAME), format!("{body}crc {:08x}\n", crc32c::checksum(body.as_bytes()))).unwrap();
+        assert!(matches!(Manifest::load(dir.path()), Err(ManifestError::Damaged(_, "a line"))));
+        m.save(dir.path()).unwrap();
         let empty = Manifest::default();
         empty.save(dir.path()).unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), Some(empty));

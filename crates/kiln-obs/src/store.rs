@@ -125,6 +125,9 @@ pub struct Counts {
     /// [`LOGS_AHEAD_MS`]: dropped (a sender's clock, or its data, is wrong).
     pub ahead: u64,
     pub logs_ahead: u64,
+    /// Spans, and spans more than [`LOGS_AHEAD_MS`] ahead (dropped).
+    pub spans: u64,
+    pub spans_ahead: u64,
 }
 
 /// How far past its write's time a sample may be: ten minutes, as far as Datadog's intake takes a
@@ -145,6 +148,8 @@ impl std::ops::AddAssign for Counts {
         self.logs += o.logs;
         self.ahead += o.ahead;
         self.logs_ahead += o.logs_ahead;
+        self.spans += o.spans;
+        self.spans_ahead += o.spans_ahead;
     }
 }
 
@@ -178,6 +183,7 @@ pub enum Answer {
     Empty,
     Write { sender: u64, seq: u64, outcome: Written },
     Retain { cutoff: i64, logs_cutoff: i64, series_dropped: u64 },
+    RetainSpans { spans_cutoff: i64 },
     Limits { max_series: u64 },
     /// An entry that holds no command whole: applied as nothing, alike on every replica.
     Malformed(CommandError),
@@ -214,12 +220,15 @@ pub struct Store {
     metric_samples: Vec<u64>,
     blocks: Vec<OpenBlock>,
     logs: LogStore,
+    /// Spans: records of a store of their own (`crate::otlp::traces`), kept for their own time.
+    spans: LogStore,
     dir: Option<PathBuf>,
     /// What is durable: the files, and the replicated state at `durable`.
     manifest: Manifest,
     /// The replicated state as of the last entry applied.
     cutoff: i64,
     logs_cutoff: i64,
+    spans_cutoff: i64,
     max_series: u64,
     sessions: BTreeMap<u64, Session>,
     conf: Membership,
@@ -235,8 +244,10 @@ pub struct Store {
     /// new to them.
     feed: Option<Arc<Feed>>,
     publishing: bool,
-    /// Who is told the records' times applied (metrics from logs count those windows again).
+    /// Who is told the records' times applied (metrics from logs count those windows again), and
+    /// the spans' (metrics from spans).
     touched: Option<Arc<Touched>>,
+    spans_touched: Option<Arc<Touched>>,
     /// Whether [`Store::read_rolled`] reads rollups (always, but to measure or check against them).
     read_rollups: bool,
     /// Held by whoever changes the manifest (a cut, a merge taken in, files expired, an install)
@@ -308,11 +319,12 @@ struct Expired {
     manifest: Manifest,
     blocks: Vec<String>,
     logs: Vec<String>,
+    spans: Vec<String>,
 }
 
 impl Expired {
     fn files(&self) -> Vec<PathBuf> {
-        self.logs.iter().chain(&self.blocks).map(|f| self.dir.join(f)).collect()
+        self.logs.iter().chain(&self.spans).chain(&self.blocks).map(|f| self.dir.join(f)).collect()
     }
 }
 
@@ -325,6 +337,7 @@ pub struct CutWritten {
     manifest: Manifest,
     block: Option<OpenBlock>,
     logs: Option<HeldFile>,
+    spans: Option<HeldFile>,
     /// The series whose samples the block holds.
     series: Vec<u32>,
     done: Maintained,
@@ -537,10 +550,12 @@ impl Store {
             metric_samples: Vec::new(),
             blocks: Vec::new(),
             logs: LogStore::default(),
+            spans: LogStore::spans(),
             dir: None,
             manifest: Manifest::default(),
             cutoff: i64::MIN,
             logs_cutoff: i64::MIN,
+            spans_cutoff: i64::MIN,
             max_series: 0,
             sessions: BTreeMap::new(),
             conf: Membership::default(),
@@ -552,6 +567,7 @@ impl Store {
             feed: None,
             publishing: false,
             touched: None,
+            spans_touched: None,
             read_rollups: true,
             manifest_lock: Arc::new(Mutex::new(())),
         }
@@ -566,6 +582,11 @@ impl Store {
     /// [`crate::logs::metrics`]).
     pub fn set_touched(&mut self, touched: Option<Arc<Touched>>) {
         self.touched = touched;
+    }
+
+    /// As [`Store::set_touched`], of spans (metrics from spans).
+    pub fn set_spans_touched(&mut self, touched: Option<Arc<Touched>>) {
+        self.spans_touched = touched;
     }
 
     /// Opens the store in `dir` (made if missing): the state its manifest states, its files as it
@@ -584,8 +605,13 @@ impl Store {
             let log = LogFile::open(&dir.join(&e.file))?;
             store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log });
         }
+        for e in &manifest.spans {
+            let log = LogFile::open(&dir.join(&e.file))?;
+            store.spans.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log });
+        }
         store.cutoff = manifest.cutoff;
         store.logs_cutoff = manifest.logs_cutoff;
+        store.spans_cutoff = manifest.spans_cutoff;
         store.max_series = manifest.max_series;
         store.sessions = manifest.sessions.clone();
         store.conf = manifest.conf.clone();
@@ -601,8 +627,8 @@ impl Store {
         for entry in std::fs::read_dir(dir).map_err(io_err(dir))? {
             let entry = entry.map_err(io_err(dir))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            let listed = self.manifest.blocks.iter().chain(&self.manifest.logs).any(|b| b.file == name);
-            if ((name.ends_with(".block") || name.ends_with(".logs")) && !listed) || name == "MANIFEST.tmp" {
+            let listed = self.manifest.blocks.iter().chain(&self.manifest.logs).chain(&self.manifest.spans).any(|b| b.file == name);
+            if ((name.ends_with(".block") || name.ends_with(".logs") || name.ends_with(".spans")) && !listed) || name == "MANIFEST.tmp" {
                 std::fs::remove_file(entry.path()).map_err(io_err(&entry.path()))?;
             }
         }
@@ -699,6 +725,11 @@ impl Store {
         self.logs_cutoff
     }
 
+    /// No span older is kept or read (ms), as of the last entry applied.
+    pub fn spans_cutoff(&self) -> i64 {
+        self.spans_cutoff
+    }
+
     pub fn max_series(&self) -> u64 {
         self.max_series
     }
@@ -763,6 +794,12 @@ impl Store {
             Command::Limits { max_series } => {
                 self.max_series = max_series;
                 Answer::Limits { max_series }
+            }
+            Command::RetainSpans { spans, .. } => {
+                // Never back. Sessions age by the metrics' and the logs' cutoffs alone, as they did
+                // before spans were kept.
+                self.spans_cutoff = self.spans_cutoff.max(spans);
+                Answer::RetainSpans { spans_cutoff: self.spans_cutoff }
             }
         })
     }
@@ -870,6 +907,23 @@ impl Store {
                         self.logs.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
                     }
                     done.counts.logs += u64::from(rows);
+                }
+                Item::Spans { rows, raw_len, packed } => {
+                    let mut raw = Vec::with_capacity(raw_len);
+                    crate::lz4::decompress(packed, &mut raw, raw_len).map_err(|_| ApplyError::LogRows)?;
+                    if raw.len() != raw_len {
+                        return Err(ApplyError::LogRows);
+                    }
+                    let mut windows = self.spans_touched.as_ref().map(|_| BatchWindows::default());
+                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon, windows.as_mut()).map_err(|_| ApplyError::LogRows)?;
+                    done.counts.spans_ahead += ahead;
+                    if rows > 0 {
+                        if let (Some(t), Some(w)) = (&self.spans_touched, &windows) {
+                            t.note(w, self.applied);
+                        }
+                        self.spans.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
+                    }
+                    done.counts.spans += u64::from(rows);
                 }
                 Item::Run { fp, samples } => {
                     let known = self.index.by_fp(fp);
@@ -985,10 +1039,11 @@ impl Store {
         manifest.durable = at;
         manifest.cutoff = self.cutoff;
         manifest.logs_cutoff = self.logs_cutoff;
+        manifest.spans_cutoff = self.spans_cutoff;
         manifest.max_series = self.max_series;
         manifest.sessions.clone_from(&self.sessions);
         manifest.conf.clone_from(&self.conf);
-        let mut w = CutWritten { applied: self.applied, epoch: self.epoch, manifest, block: None, logs: None, series: Vec::new(), done: Maintained::default() };
+        let mut w = CutWritten { applied: self.applied, epoch: self.epoch, manifest, block: None, logs: None, spans: None, series: Vec::new(), done: Maintained::default() };
         let mut written: Vec<PathBuf> = Vec::new();
         let made = (|| -> Result<(), StoreError> {
             // Logs first: a file of their own, listed with the blocks in the same manifest.
@@ -1001,6 +1056,17 @@ impl Store {
                     w.manifest.next_seq = seq + 1;
                     w.manifest.logs.push(BlockEntry { seq, file: file.clone() });
                     w.logs = Some(HeldFile { seq, file, log });
+                }
+            }
+            if self.spans.unwritten_rows() > 0 {
+                let seq = w.manifest.next_seq;
+                let file = manifest::spans_file(seq);
+                written.push(dir.join(&file));
+                if let Some(log) = self.spans.write_unwritten(&dir.join(&file))? {
+                    w.done.bytes_written += log.bytes;
+                    w.manifest.next_seq = seq + 1;
+                    w.manifest.spans.push(BlockEntry { seq, file: file.clone() });
+                    w.spans = Some(HeldFile { seq, file, log });
                 }
             }
             let mut borrowed: Vec<(u32, &[Chunk])> = Vec::new();
@@ -1068,6 +1134,9 @@ impl Store {
         }
         if let Some(l) = w.logs {
             self.logs.written(l);
+        }
+        if let Some(s) = w.spans {
+            self.spans.written(s);
         }
         Ok(w.done)
     }
@@ -1204,24 +1273,27 @@ impl Store {
         let dir = self.dir.clone()?;
         let cutoff = self.manifest.cutoff;
         let logs = self.logs.expired(self.manifest.logs_cutoff.saturating_mul(1_000_000));
+        let spans = self.spans.expired(self.manifest.spans_cutoff.saturating_mul(1_000_000));
         let blocks: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
-        if logs.is_empty() && blocks.is_empty() {
+        if logs.is_empty() && spans.is_empty() && blocks.is_empty() {
             return None;
         }
         let mut manifest = self.manifest.clone();
         manifest.logs.retain(|e| !logs.contains(&e.file));
+        manifest.spans.retain(|e| !spans.contains(&e.file));
         manifest.blocks.retain(|e| !blocks.contains(&e.file));
-        Some(Expired { dir, manifest, blocks, logs })
+        Some(Expired { dir, manifest, blocks, logs, spans })
     }
 
     /// Expired files taken out, their manifest durable already.
     fn take_expired(&mut self, e: &Expired) -> Maintained {
         self.logs.drop_files(&e.logs);
+        self.spans.drop_files(&e.spans);
         self.blocks.retain(|b| !e.blocks.contains(&b.file));
         let mut manifest = e.manifest.clone();
         manifest.next_seq = manifest.next_seq.max(self.manifest.next_seq);
         self.manifest = manifest;
-        Maintained { blocks_removed: (e.logs.len() + e.blocks.len()) as u64, ..Maintained::default() }
+        Maintained { blocks_removed: (e.logs.len() + e.spans.len() + e.blocks.len()) as u64, ..Maintained::default() }
     }
 
     /// Deletes what the durable cutoff left behind: files wholly older are removed, and a block
@@ -1235,20 +1307,23 @@ impl Store {
     }
     /// The image of what is durable: its replicated state and its files, in write order.
     pub fn image(&self) -> Image {
-        let mut files: Vec<ImageFile> = Vec::with_capacity(self.blocks.len() + self.logs.files.len());
+        let mut files: Vec<ImageFile> = Vec::with_capacity(self.blocks.len() + self.logs.files.len() + self.spans.files.len());
         for b in &self.blocks {
             files.push(ImageFile { kind: FileKind::Block, seq: b.seq, name: b.file.clone(), bytes: b.block.bytes, crc: b.block.crc });
         }
         for l in &self.logs.files {
             files.push(ImageFile { kind: FileKind::Logs, seq: l.seq, name: l.file.clone(), bytes: l.log.bytes, crc: l.log.crc });
         }
+        for l in &self.spans.files {
+            files.push(ImageFile { kind: FileKind::Spans, seq: l.seq, name: l.file.clone(), bytes: l.log.bytes, crc: l.log.crc });
+        }
         files.sort_by_key(|f| f.seq);
-        Image { cutoff: self.manifest.cutoff, logs_cutoff: self.manifest.logs_cutoff, max_series: self.manifest.max_series, sessions: self.manifest.sessions.clone(), files }
+        Image { cutoff: self.manifest.cutoff, logs_cutoff: self.manifest.logs_cutoff, spans_cutoff: self.manifest.spans_cutoff, max_series: self.manifest.max_series, sessions: self.manifest.sessions.clone(), files }
     }
 
     /// Bytes of the files the durable state is in.
     pub fn image_bytes(&self) -> u64 {
-        self.disk_bytes() + self.log_bytes()
+        self.disk_bytes() + self.log_bytes() + self.span_bytes()
     }
 
     /// Links the files of what is durable into a snapshot of their own, `snaps/<index>`, named by
@@ -1262,7 +1337,7 @@ impl Store {
             std::fs::remove_dir_all(&snap).map_err(io_err(&snap))?;
         }
         std::fs::create_dir_all(&snap).map_err(io_err(&snap))?;
-        for e in self.manifest.blocks.iter().chain(&self.manifest.logs) {
+        for e in self.manifest.blocks.iter().chain(&self.manifest.logs).chain(&self.manifest.spans) {
             let (from, to) = (dir.join(&e.file), snap.join(&e.file));
             if std::fs::hard_link(&from, &to).is_err() {
                 std::fs::copy(&from, &to).map_err(io_err(&to))?;
@@ -1294,13 +1369,25 @@ impl Store {
             let p = staging.join(&f.name);
             let (bytes, crc) = match f.kind {
                 FileKind::Block => Block::open(&p).map(|b| (b.bytes, b.crc)).map_err(|_| StoreError::Staged(f.name.clone()))?,
-                FileKind::Logs => LogFile::open(&p).map(|l| (l.bytes, l.crc)).map_err(|_| StoreError::Staged(f.name.clone()))?,
+                FileKind::Logs | FileKind::Spans => LogFile::open(&p).map(|l| (l.bytes, l.crc)).map_err(|_| StoreError::Staged(f.name.clone()))?,
             };
             if bytes != f.bytes || crc != f.crc {
                 return Err(StoreError::Staged(f.name.clone()));
             }
         }
-        let mut manifest = Manifest { durable: at, next_seq: self.manifest.next_seq, cutoff: image.cutoff, logs_cutoff: image.logs_cutoff, max_series: image.max_series, conf, sessions: image.sessions.clone(), blocks: Vec::new(), logs: Vec::new() };
+        let mut manifest = Manifest {
+            durable: at,
+            next_seq: self.manifest.next_seq,
+            cutoff: image.cutoff,
+            logs_cutoff: image.logs_cutoff,
+            spans_cutoff: image.spans_cutoff,
+            max_series: image.max_series,
+            conf,
+            sessions: image.sessions.clone(),
+            blocks: Vec::new(),
+            logs: Vec::new(),
+            spans: Vec::new(),
+        };
         let mut files: Vec<&ImageFile> = image.files.iter().collect();
         files.sort_by_key(|f| f.seq);
         for f in files {
@@ -1309,28 +1396,31 @@ impl Store {
             let name = match f.kind {
                 FileKind::Block => manifest::block_file(seq),
                 FileKind::Logs => manifest::logs_file(seq),
+                FileKind::Spans => manifest::spans_file(seq),
             };
             let to = dir.join(&name);
             std::fs::rename(staging.join(&f.name), &to).map_err(io_err(&to))?;
             match f.kind {
                 FileKind::Block => manifest.blocks.push(BlockEntry { seq, file: name }),
                 FileKind::Logs => manifest.logs.push(BlockEntry { seq, file: name }),
+                FileKind::Spans => manifest.spans.push(BlockEntry { seq, file: name }),
             }
         }
         manifest::sync_dir(&dir).map_err(io_err(&dir))?;
         manifest.save(&dir)?;
-        for e in self.manifest.blocks.iter().chain(&self.manifest.logs) {
+        for e in self.manifest.blocks.iter().chain(&self.manifest.logs).chain(&self.manifest.spans) {
             remove_if_there(&dir.join(&e.file))?;
         }
-        let (epoch, feed, touched, lock) = (self.epoch + 1, self.feed.take(), self.touched.take(), self.manifest_lock.clone());
+        let (epoch, feed, touched, spans_touched, lock) = (self.epoch + 1, self.feed.take(), self.touched.take(), self.spans_touched.take(), self.manifest_lock.clone());
         *self = Self::open(&dir, self.hash)?;
         self.epoch = epoch;
         self.feed = feed;
         self.manifest_lock = lock;
-        if let Some(t) = &touched {
+        for t in touched.iter().chain(&spans_touched) {
             t.everything();
         }
         self.touched = touched;
+        self.spans_touched = spans_touched;
         Ok(())
     }
 
@@ -1548,6 +1638,58 @@ impl Store {
         self.logs.disk_bytes()
     }
 
+    /// The newest `limit` spans in `[from, to]` (ns, none older than the spans' cutoff) that
+    /// `search` matches (a search of spans: `crate::logs::search::parse_spans`).
+    pub fn search_spans(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
+        Ok(self.spans.search(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, limit)?)
+    }
+
+    /// Spans in `[from, to]` that `search` matches, grouped by `by` and measured (trace analytics).
+    pub fn aggregate_spans(&self, search: &Search, from: i64, to: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Aggregated, crate::logs::store::AggregateError> {
+        self.spans.aggregate(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, by, measure)
+    }
+
+    /// As [`aggregate_spans`](Self::aggregate_spans), in buckets of `step` ns aligned to it.
+    pub fn aggregate_spans_buckets(&self, search: &Search, from: i64, to: i64, step: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
+        let buckets = crate::logs::store::Buckets::over(from, to, step)?;
+        self.spans.aggregate_buckets(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, buckets, by, measure)
+    }
+
+    /// Each facet's most common values over the spans a search matches, in one pass.
+    pub fn span_facets(&self, search: &Search, from: i64, to: i64, facets: &[crate::logs::store::Facet], top: usize) -> Result<crate::logs::store::FacetCounts, crate::logs::store::AggregateError> {
+        self.spans.facet_counts(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, facets, top)
+    }
+
+    /// Every metric from spans' points for the window that begins at `window` (ns): none when the
+    /// spans' cutoff reaches into it.
+    pub fn count_span_metrics(&self, metrics: &[crate::logs::metrics::LogMetric], window: i64) -> Result<Option<crate::logs::metrics::Counted>, StoreError> {
+        if window < self.spans_cutoff.saturating_mul(1_000_000) {
+            return Ok(None);
+        }
+        Ok(Some(crate::logs::metrics::count(&self.spans, metrics, window)?))
+    }
+
+    /// Every span in `[from, to]` (ns) that `search` matches, to `f`, one at a time, none kept (a
+    /// trace's spans, a service map's).
+    pub fn each_span(&self, search: &Search, from: i64, to: i64, f: impl FnMut(&crate::logs::record::RecordRef<'_>)) -> Result<(), StoreError> {
+        Ok(self.spans.each_matching(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, f)?)
+    }
+
+    /// Spans a scan of `[from, to]` (ns) reads at the most, from the blocks' summaries.
+    pub fn span_rows_between(&self, from: i64, to: i64) -> u64 {
+        self.spans.rows_between(from.max(self.spans_cutoff.saturating_mul(1_000_000)), to)
+    }
+
+    /// Bytes of spans on disk.
+    pub fn span_bytes(&self) -> u64 {
+        self.spans.disk_bytes()
+    }
+
+    /// Whether the store holds spans, or their cutoff: the group has taken spans.
+    pub fn holds_spans(&self) -> bool {
+        self.spans_cutoff != i64::MIN || !self.spans.files.is_empty() || self.spans.unwritten_rows() > 0
+    }
+
     /// Every metric's name, sorted.
     pub fn metric_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.index.metrics().iter().map(|&m| self.symbols.get(m)).collect();
@@ -1654,7 +1796,7 @@ impl Store {
     pub fn heap(&self) -> Heap {
         Heap {
             symbols: self.symbols.heap_bytes(),
-            index: self.index.heap_bytes() + self.blocks.iter().map(|b| b.block.heap_bytes()).sum::<usize>() + self.logs.heap_bytes(),
+            index: self.index.heap_bytes() + self.blocks.iter().map(|b| b.block.heap_bytes()).sum::<usize>() + self.logs.heap_bytes() + self.spans.heap_bytes(),
             samples: self.head.iter().map(HeadSeries::heap_bytes).sum::<usize>() + self.head.capacity() * std::mem::size_of::<HeadSeries>() + self.last.capacity() * 8,
         }
     }
@@ -1678,6 +1820,11 @@ impl Store {
             z ^ (z >> 31)
         };
         let mut d = mix(self.cutoff as u64).wrapping_add(mix(self.logs_cutoff as u64 ^ 0x1)).wrapping_add(mix(self.max_series ^ 0x2));
+        // The spans' cutoff only once there is one: a store that never held spans digests as a
+        // build that knows none does.
+        if self.spans_cutoff != i64::MIN {
+            d = d.wrapping_add(mix(self.spans_cutoff as u64 ^ 0x3));
+        }
         for (sender, s) in &self.sessions {
             d = d.wrapping_add(mix(mix(*sender) ^ s.seq));
         }
@@ -1705,6 +1852,12 @@ impl Store {
                 row.clear();
                 crate::logs::record::put_row_ref(&mut row, r, 0);
                 d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)));
+            })?;
+            // Spans as records are, apart from them (a span is not the log it would be).
+            self.spans.each_record(self.spans_cutoff.saturating_mul(1_000_000), i64::MAX, |r| {
+                row.clear();
+                crate::logs::record::put_row_ref(&mut row, r, 0);
+                d = d.wrapping_add(mix(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)) ^ 0x5));
             })?;
         }
         Ok(d)

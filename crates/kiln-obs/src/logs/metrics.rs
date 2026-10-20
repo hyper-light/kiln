@@ -44,6 +44,9 @@ pub enum Compute {
     /// `.count`, `.sum`, `.min` and `.max`, and with `percentiles` their buckets (`.dist`,
     /// `crate::dist`), so a query reads any percentile of them.
     Distribution { path: String, percentiles: bool },
+    /// A span's duration (its `duration`, ns) in seconds, as Datadog's trace metrics have it: a
+    /// distribution as [`Compute::Distribution`] is.
+    Duration { percentiles: bool },
 }
 
 /// A metric from logs, compiled.
@@ -64,7 +67,7 @@ impl LogMetric {
     pub fn names(&self) -> Vec<(String, Kind)> {
         match &self.compute {
             Compute::Count => vec![(self.name.clone(), Kind::Count)],
-            Compute::Distribution { percentiles, .. } => {
+            Compute::Distribution { percentiles, .. } | Compute::Duration { percentiles } => {
                 let mut out: Vec<(String, Kind)> = [(".count", Kind::Count), (".sum", Kind::Count), (".min", Kind::Gauge), (".max", Kind::Gauge)].into_iter().map(|(s, k)| (format!("{}{s}", self.name), k)).collect();
                 if *percentiles {
                     out.push((format!("{}{}", self.name, dist::SUFFIX), Kind::Count));
@@ -94,7 +97,7 @@ impl LogMetric {
         for (name, kind) in self.names() {
             SeriesKey::new(&name, tags.iter().copied(), kind).map_err(|e| format!("{name}: {e}"))?;
         }
-        if let Compute::Distribution { percentiles: true, .. } = &self.compute {
+        if let Compute::Distribution { percentiles: true, .. } | Compute::Duration { percentiles: true } = &self.compute {
             let with: Vec<(&str, &str)> = tags.iter().copied().chain([(dist::BUCKET_TAG, "5:p0")]).collect();
             SeriesKey::new(&format!("{}{}", self.name, dist::SUFFIX), with, Kind::Count).map_err(|e| e.to_string())?;
         }
@@ -242,6 +245,10 @@ pub fn count(logs: &LogStore, metrics: &[LogMetric], window: i64) -> Result<Coun
                     Some(v) => (Some(v), *percentiles),
                     None => continue,
                 },
+                Compute::Duration { percentiles } => match number(r.attr("duration")) {
+                    Some(ns) => (Some(ns / 1e9), *percentiles),
+                    None => continue,
+                },
             };
             let n = m.by.len().min(MAX_BY);
             let mut values: [&str; MAX_BY] = [""; MAX_BY];
@@ -283,7 +290,7 @@ fn points(m: &LogMetric, tags: &[(&str, &str)], acc: &Acc, ms: i64, out: &mut Ve
     #[allow(clippy::cast_precision_loss)]
     match &m.compute {
         Compute::Count => put(&m.name, tags, Kind::Count, acc.n as f64),
-        Compute::Distribution { percentiles, .. } => {
+        Compute::Distribution { percentiles, .. } | Compute::Duration { percentiles } => {
             put(&format!("{}.count", m.name), tags, Kind::Count, acc.n as f64);
             put(&format!("{}.sum", m.name), tags, Kind::Count, acc.sum);
             put(&format!("{}.min", m.name), tags, Kind::Gauge, acc.min);

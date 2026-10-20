@@ -834,7 +834,113 @@ export interface DashboardSummary {
   modified: number;
 }
 
+/** A span as a search gives one (docs/observe.md §8.7): its message is its name (Datadog's resource). */
+export interface Span {
+  ts_ns: number;
+  status: string;
+  severity: number;
+  service: string;
+  host: string;
+  source: string;
+  message: string;
+  attributes: Record<string, string>;
+  trace_id: string | null;
+  span_id: string | null;
+}
+
+export interface SpanSearch {
+  spans: Span[];
+  blocks: { total: number; pruned: number };
+  rows_scanned: number;
+  took_ms: number;
+}
+
+/** A trace's span, placed as its waterfall draws it. */
+export interface PlacedSpan {
+  ts_ns: number;
+  offset_ns: number;
+  duration_ns: number;
+  depth: number;
+  parent: number | null;
+  status: string;
+  service: string;
+  host: string;
+  source: string;
+  resource_name: string;
+  attributes: Record<string, string>;
+  trace_id: string | null;
+  span_id: string | null;
+}
+
+export interface Trace {
+  trace_id: string;
+  start_ns: number;
+  end_ns: number;
+  duration_ns: number;
+  root: { service: string; resource_name: string } | null;
+  spans_count: number;
+  truncated: boolean;
+  errors: number;
+  roots: number;
+  services: { service: string; spans: number }[];
+  spans: PlacedSpan[];
+  took_ms: number;
+}
+
+/** What a group's requests (or calls) came to over a range, from the trace metrics. */
+export interface Red {
+  hits: number;
+  errors: number;
+  error_rate: number | null;
+  avg_s: number | null;
+  p50_s: number | null;
+  p95_s: number | null;
+  p99_s: number | null;
+  max_s: number | null;
+}
+
+export type ServiceRow = Red & { service: string };
+
+export interface Services {
+  from: number;
+  to: number;
+  env: string | null;
+  envs: string[];
+  services: ServiceRow[];
+}
+
+export interface ServiceDetail {
+  service: string;
+  from: number;
+  to: number;
+  env: string | null;
+  summary: ServiceRow | null;
+  kinds: (Red & { "span.kind": string })[];
+  resources: (Red & { resource_name: string })[];
+  calls: (Red & { "peer.service": string })[];
+}
+
+export interface ServiceMap {
+  from: number;
+  to: number;
+  nodes: { service: string; hits: number; errors: number; inferred: boolean }[];
+  edges: { from: string; to: string; calls: number; errors: number; avg_s: number | null; inferred: boolean }[];
+  spans_read: number;
+  sampled_one_in: number;
+  took_ms: number;
+}
+
+const rangeQuery = (from: number, to: number, env?: string) => `from=${Math.floor(from)}&to=${Math.ceil(to)}${env && env !== "*" ? `&env=${enc(env)}` : ""}`;
+
 export const observeApi = {
+  spans: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<SpanSearch>("POST", `${BASE}/spans/search`, body, { signal }),
+  spanHistogram: (body: { query: string; from: number; to: number; step: number; by?: string[] }, signal?: AbortSignal) => request<LogHistogram>("POST", `${BASE}/spans/aggregate`, body, { signal }),
+  spanFacets: (body: { query: string; from: number; to: number; facets: string[]; top?: number }, signal?: AbortSignal) => request<LogFacets>("POST", `${BASE}/spans/facets`, body, { signal }),
+  trace: (id: string, signal?: AbortSignal) => request<Trace>("GET", `${BASE}/traces/${enc(id)}`, undefined, { signal }),
+  services: (from: number, to: number, env: string | undefined, signal?: AbortSignal) => request<Services>("GET", `${BASE}/apm/services?${rangeQuery(from, to, env)}`, undefined, { signal }),
+  service: (name: string, from: number, to: number, env: string | undefined, signal?: AbortSignal) =>
+    request<ServiceDetail>("GET", `${BASE}/apm/services/${enc(name)}?${rangeQuery(from, to, env)}`, undefined, { signal }),
+  serviceMap: (from: number, to: number, env: string | undefined, signal?: AbortSignal) => request<ServiceMap>("GET", `${BASE}/apm/map?${rangeQuery(from, to, env)}`, undefined, { signal }),
   query: (body: { query: string; from: number; to: number; step?: number; points?: number }, signal?: AbortSignal) => request<QueryAnswer>("POST", `${BASE}/query`, body, { signal }),
   heatmap: (body: { query: string; from: number; to: number; points?: number; heatmap: number }, signal?: AbortSignal) => request<HeatmapAnswer>("POST", `${BASE}/query`, body, { signal }),
   metrics: (match: string | undefined, signal?: AbortSignal) =>

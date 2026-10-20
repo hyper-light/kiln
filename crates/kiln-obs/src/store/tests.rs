@@ -412,8 +412,15 @@ struct View {
     max_series: u64,
     sessions: BTreeMap<u64, Session>,
     logs: Vec<Record>,
+    spans_cutoff: i64,
+    spans: Vec<Record>,
+    /// One trace's spans, found by its id (a block of spans ruled out by its filter).
+    trace: Vec<Record>,
     queries: Vec<Vec<(Vec<(String, String)>, Vec<u64>)>>,
 }
+
+/// The trace the stream's spans come back to most.
+const TRACE: [u8; 16] = [7; 16];
 
 const QUERIES: [&str; 4] = ["avg:m0{*} by {host}", "sum:m1{*}", "p90:m2{*} by {host}", "sum:flip{*}.as_count()"];
 
@@ -440,6 +447,9 @@ fn view(s: &Store) -> View {
         max_series: s.max_series(),
         sessions: s.sessions().clone(),
         logs: s.search_logs(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
+        spans_cutoff: s.spans_cutoff(),
+        spans: s.search_spans(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
+        trace: s.search_spans(&crate::logs::search::Search::trace(TRACE), i64::MIN, i64::MAX, usize::MAX).unwrap().records,
         queries,
     }
 }
@@ -465,6 +475,7 @@ fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
         }
         match rng.below(25) {
             0 => out.push(crate::command::retain(now - 60_000 + rng.below(10_000) as i64, now - 40_000 + rng.below(10_000) as i64, now)),
+            3 => out.push(crate::command::retain_spans(now - 50_000 + rng.below(10_000) as i64, now)),
             1 => {
                 let i = rng.below(3) as usize;
                 if let Some(e) = &sent[i] {
@@ -515,6 +526,29 @@ fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
                         })
                         .collect();
                     b.logs(&recs);
+                }
+                if rng.below(3) == 0 {
+                    // Spans, several to a time, of a few traces, one of them most.
+                    let mut raw = Vec::new();
+                    let mut prev = 0;
+                    let n = 1 + rng.below(20) as u32;
+                    for i in 0..n {
+                        let trace = if rng.below(4) == 0 { TRACE } else { [rng.below(50) as u8 + 8; 16] };
+                        let r = Record {
+                            ts: (now + i64::from(i / 4)) * 1_000_000,
+                            severity: [9, 17][rng.below(2) as usize],
+                            service: ["checkout", "cart"][rng.below(2) as usize].into(),
+                            host: format!("h{}", rng.below(4)),
+                            source: "otel".into(),
+                            message: ["GET /cart", "SELECT carts"][rng.below(2) as usize].into(),
+                            attrs: vec![("span.kind".into(), "server".into()), ("duration".into(), rng.below(1_000_000).to_string())],
+                            trace_id: Some(trace),
+                            span_id: Some((rng.next_u64() | 1).to_le_bytes()),
+                        };
+                        crate::logs::record::put_row(&mut raw, &r, prev);
+                        prev = r.ts;
+                    }
+                    b.spans(&raw, n);
                 }
                 seqs[sender] += 1;
                 let e = b.finish_write(0x5e4d_0000 + sender as u64, seqs[sender], now);
@@ -592,6 +626,8 @@ fn replicas_that_cut_compact_retain_and_restart_differently_answer_alike() {
         }
         let v = view(&c);
         assert!(restarts > 5 && v.cutoff > 0 && !v.logs.is_empty(), "seed {seed}: the stream exercised too little ({restarts} restarts)");
+        assert!(v.spans_cutoff > 0 && !v.spans.is_empty() && !v.trace.is_empty() && v.trace.len() < v.spans.len(), "seed {seed}: the spans exercised too little");
+        assert!(v.trace.iter().all(|r| r.trace_id == Some(TRACE)));
         refused_in_all += over;
         assert!(v.series.iter().any(|(name, _)| name.starts_with("flip") && name.ends_with("Count")), "seed {seed}: the flipped series is the count");
     }
@@ -631,7 +667,7 @@ fn an_image_installed_elsewhere_answers_as_its_source() {
         std::fs::copy(snap.join(&f.name), &to).unwrap();
         match f.kind {
             FileKind::Block => Block::open(&to).unwrap().verify().unwrap(),
-            FileKind::Logs => LogFile::open(&to).unwrap().verify().unwrap(),
+            FileKind::Logs | FileKind::Spans => LogFile::open(&to).unwrap().verify().unwrap(),
         }
     }
     // A file missing or not the image's is refused, and the target is as it was.
@@ -752,7 +788,7 @@ fn a_digest_tells_apart_stores_that_differ_in_any_sample_or_record() {
 }
 
 /// The full digest as it was before records were visited one at a time (gathered by a search,
-/// newest first): what a replica of an older version says.
+/// newest first): what a replica of an older version says; and the spans', which none held.
 fn digest_before(st: &Store) -> u64 {
     let mix = |x: u64| {
         let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -784,6 +820,14 @@ fn digest_before(st: &Store) -> u64 {
         crate::logs::record::put_row(&mut row, &r, 0);
         d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)));
     }
+    if st.spans_cutoff != i64::MIN {
+        d = d.wrapping_add(mix(st.spans_cutoff as u64 ^ 0x3));
+    }
+    for r in st.search_spans(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records {
+        let mut row = Vec::new();
+        crate::logs::record::put_row(&mut row, &r, 0);
+        d = d.wrapping_add(mix(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)) ^ 0x5));
+    }
     d
 }
 
@@ -812,8 +856,14 @@ fn a_full_digest_visits_each_record_and_sums_as_before() {
             })
             .collect();
         bld.logs(&records);
-        a.apply(&bld.finish()).unwrap();
+        let batch = bld.finish();
+        a.apply(&batch).unwrap();
         assert_eq!(a.digest(true).unwrap(), digest_before(&a), "seed {seed}");
+        // A store that never held spans: the older version's sum exactly, for both its digests.
+        let mut b = Store::new(Keyed::with_keys(2, 2));
+        b.apply(&batch).unwrap();
+        assert!(b.spans_cutoff() == i64::MIN && b.span_bytes() == 0);
+        assert_eq!(b.digest(true).unwrap(), digest_before(&b), "seed {seed}: no spans");
     }
 }
 
@@ -1112,4 +1162,90 @@ fn metrics_are_summarized_by_series_tags_and_samples() {
     assert_eq!(matched, 1);
     assert_eq!(all.first().map(|m| (m.series, m.samples)), Some((4, 31)));
     assert!(s.metric_summary("batch.done", 0).is_none());
+}
+
+#[test]
+fn spans_are_a_store_of_their_own_and_a_trace_is_found_by_its_blocks_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let sec = 1_000_000_000i64;
+    // 20 batches of 1,000 spans, traces of 10 spans each, and 100 log records each.
+    let span = |i: i64| Record {
+        ts: i * sec / 100,
+        severity: if i % 50 == 0 { 17 } else { 9 },
+        service: ["checkout", "cart"][(i % 2) as usize].into(),
+        host: "h".into(),
+        source: "otel".into(),
+        message: "GET /cart".into(),
+        attrs: vec![("span.kind".into(), "server".into()), ("duration".into(), (i * 1000).to_string())],
+        trace_id: Some((i / 10).to_le_bytes().repeat(2).try_into().unwrap()),
+        span_id: Some((i + 1).to_le_bytes()),
+    };
+    let log = |i: i64| Record { ts: i * sec, severity: 9, service: "checkout".into(), host: "h".into(), source: "app".into(), message: format!("line {i}"), ..Record::default() };
+    let mut b = Builder::new();
+    for batch in 0..20 {
+        let mut raw = Vec::new();
+        let mut prev = 0;
+        for i in batch * 1000..(batch + 1) * 1000 {
+            let r = span(i);
+            crate::logs::record::put_row(&mut raw, &r, prev);
+            prev = r.ts;
+        }
+        b.spans(&raw, 1000);
+        b.logs(&(batch * 100..(batch + 1) * 100).map(log).collect::<Vec<_>>());
+        let applied = s.apply(&b.finish()).unwrap();
+        assert_eq!((applied.counts.spans, applied.counts.logs), (1000, 100));
+        if batch % 6 == 5 {
+            s.cut(Point { index: batch as u64 + 1, term: 1 }).unwrap();
+        }
+    }
+    s.cut(Point { index: 20, term: 1 }).unwrap();
+    // Apart: a search of logs finds no span, one of spans no log.
+    let all = crate::logs::search::parse("*").unwrap();
+    assert_eq!(s.search_logs(&all, 0, i64::MAX, usize::MAX).unwrap().records.len(), 2_000);
+    assert_eq!(s.search_spans(&all, 0, i64::MAX, usize::MAX).unwrap().records.len(), 20_000);
+    assert!(s.span_bytes() > 0 && s.log_bytes() > 0);
+    // A trace by its id: its ten spans, and every block without it ruled out by its filter.
+    let id: [u8; 16] = 1234i64.to_le_bytes().repeat(2).try_into().unwrap();
+    let found = s.search_spans(&crate::logs::search::Search::trace(id), 0, i64::MAX, 100).unwrap();
+    assert_eq!(found.records.iter().map(|r| r.span_id.map(i64::from_le_bytes).unwrap() - 1).rev().collect::<Vec<_>>(), (12_340..12_350).collect::<Vec<_>>());
+    assert!(found.blocks_pruned + 2 >= found.blocks_total && found.blocks_total > 4, "{} of {} pruned", found.blocks_pruned, found.blocks_total);
+    // Searched as the trace explorer reads it.
+    // Errors are every 50th span, of checkout (even); 12 ms or more from the 12,000th on.
+    let q = crate::logs::search::parse_spans("service:checkout resource_name:\"GET /cart\" status:error @duration:>=12ms").unwrap();
+    let errors = s.search_spans(&q, 0, i64::MAX, usize::MAX).unwrap().records;
+    assert_eq!(errors.len(), (12_000..20_000).filter(|i| i % 50 == 0).count());
+    assert!(errors.iter().all(|r| r.service == "checkout" && r.severity == 17 && r.attrs[1].1.parse::<i64>().unwrap() >= 12_000_000));
+    assert!(s.search_spans(&crate::logs::search::parse_spans("resource:\"GET /carts\"").unwrap(), 0, i64::MAX, 1).unwrap().records.is_empty());
+    // Analytics by the span's name.
+    let by = s.aggregate_spans(&all, 0, i64::MAX, &[crate::logs::store::Facet::Name], &crate::logs::store::Measure::Count).unwrap();
+    assert_eq!(by.groups, vec![(vec!["GET /cart".to_owned()], 20_000.0)]);
+    // A restart: the same answers.
+    let digest = s.digest(true).unwrap();
+    drop(s);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(3, 4)).unwrap();
+    assert_eq!(s.digest(true).unwrap(), digest);
+    assert_eq!(s.search_spans(&crate::logs::search::Search::trace(id), 0, i64::MAX, 100).unwrap().records.len(), 10);
+    // Spans' retention, apart from the logs': spans older than 100 s go, the logs stay.
+    match s.apply_entry(21, &crate::command::retain_spans(100_000, 0)).unwrap() {
+        Answer::RetainSpans { spans_cutoff } => assert_eq!(spans_cutoff, 100_000),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.search_spans(&all, 0, 99 * sec, 1).unwrap().records.is_empty());
+    assert_eq!(s.search_logs(&all, 0, 99 * sec, usize::MAX).unwrap().records.len(), 100);
+    s.cut(Point { index: 21, term: 1 }).unwrap();
+    let (spans_before, logs_before) = (s.span_bytes(), s.log_bytes());
+    s.retain_files().unwrap();
+    assert!(s.span_bytes() < spans_before, "the spans' first file is wholly before the cutoff");
+    assert_eq!(s.log_bytes(), logs_before);
+    // Never back.
+    s.apply_entry(22, &crate::command::retain_spans(50_000, 0)).unwrap();
+    assert_eq!(s.spans_cutoff(), 100_000);
+    // The manifest says spans now; a reopen holds the cutoff.
+    assert!(std::fs::read_to_string(dir.path().join(crate::manifest::NAME)).unwrap().starts_with("kiln-obs manifest 3"));
+    s.cut(Point { index: 22, term: 1 }).unwrap();
+    drop(s);
+    let s = Store::open(dir.path(), Keyed::with_keys(5, 6)).unwrap();
+    assert_eq!(s.spans_cutoff(), 100_000);
+    assert_eq!(s.search_spans(&all, 0, i64::MAX, usize::MAX).unwrap().records.len(), 10_000);
 }

@@ -147,15 +147,25 @@ fn pipelines() -> Result<&'static std::sync::Arc<super::pipeline::kept::Pipeline
     PIPELINES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log pipelines are kept by the server"))
 }
 
-/// The server's metrics from logs, once it started.
+/// The server's metrics from logs, and from spans, once it started.
 static LOG_METRICS: OnceLock<std::sync::Arc<super::logmetrics::LogMetrics>> = OnceLock::new();
+static SPAN_METRICS: OnceLock<std::sync::Arc<super::logmetrics::LogMetrics>> = OnceLock::new();
 
 pub fn set_log_metrics(m: std::sync::Arc<super::logmetrics::LogMetrics>) {
     let _ = LOG_METRICS.set(m);
 }
 
+pub fn set_span_metrics(m: std::sync::Arc<super::logmetrics::LogMetrics>) {
+    let _ = SPAN_METRICS.set(m);
+}
+
 fn log_metrics() -> Result<&'static std::sync::Arc<super::logmetrics::LogMetrics>, Fail> {
     LOG_METRICS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "metrics from logs are counted by the server"))
+}
+
+/// Metrics from logs (`log_metrics`) or from spans (`span_metrics`), by the path's word.
+fn metrics_of(kind: &str) -> Result<&'static std::sync::Arc<super::logmetrics::LogMetrics>, Fail> {
+    if kind == "span_metrics" { SPAN_METRICS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "metrics from spans are counted by the server")) } else { log_metrics() }
 }
 
 /// A metric from logs as the API shows it: its definition, and what its latest window with records
@@ -179,12 +189,12 @@ struct LogMetricTest {
     to: Option<i64>,
 }
 
-async fn log_metric_test(t: LogMetricTest) -> Result<Response, Fail> {
+async fn log_metric_test(t: LogMetricTest, spans: bool) -> Result<Response, Fail> {
     use kiln_obs::logs::metrics::{WINDOW, window_of};
     // Its series named `preview` (`preview.count`, … a distribution's): what it is called is not
     // what it counts.
     let def = super::logmetrics::LogMetricDef { name: "preview".into(), ..t.metric.def(None) };
-    let m = def.compile(0).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let m = def.compile_for(0, spans).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     let to = t.to.unwrap_or_else(super::clock_ms);
     let from = t.from.unwrap_or(to - 15 * 60_000);
     if to < from || to - from > 3_600_000 {
@@ -198,7 +208,9 @@ async fn log_metric_test(t: LogMetricTest) -> Result<Response, Fail> {
         let mut w = window_of(from.saturating_mul(1_000_000));
         while w <= to.saturating_mul(1_000_000) {
             // A hold of the store a window: writes go on between.
-            let counted = store.read().unwrap_or_else(PoisonError::into_inner).count_log_metrics(&metrics, w).map_err(|e| e.to_string())?;
+            let s = store.read().unwrap_or_else(PoisonError::into_inner);
+            let counted = if spans { s.count_span_metrics(&metrics, w) } else { s.count_log_metrics(&metrics, w) }.map_err(|e| e.to_string())?;
+            drop(s);
             if let Some(c) = counted {
                 rows += c.rows_scanned;
                 records += c.tallies.first().map_or(0, |t| t.records);
@@ -227,6 +239,52 @@ async fn log_metric_test(t: LogMetricTest) -> Result<Response, Fail> {
 fn log_metric_fail((code, e): (u16, String)) -> Fail {
     fail(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), e)
 }
+
+/// Metrics from logs or from spans (`kind`, the path's word), listed: of spans, kiln's trace
+/// metrics too, as they are counted (not definitions to change).
+fn metrics_list(kind: &str) -> Result<Response, Fail> {
+    let ms = metrics_of(kind)?;
+    let list: Vec<Value> = ms.list().iter().map(|k| log_metric_json(ms, k)).collect();
+    let builtin: Vec<Value> = ms.builtin().iter().map(|m| json!({ "name": m.name, "series": m.names().into_iter().map(|(n, _)| n).collect::<Vec<_>>(), "group_by": m.by.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), "status": ms.status(&m.name) })).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ kind: list, "builtin": builtin, "counting": ms.counting() })))
+}
+
+async fn metrics_create(kind: &str, req: Request) -> Result<Response, Fail> {
+    let def = read_json::<super::logmetrics::DefIn>(req.into_body(), QUERY_BODY).await?.def(None);
+    let ms = metrics_of(kind)?;
+    let kept = reading(move |s| {
+        // A metric's series have one writer: names written already are refused.
+        let written = |n: &str| {
+            let mut ids = Vec::new();
+            s.select(&kiln_obs::index::Selector::metric(n), &mut ids);
+            !ids.is_empty()
+        };
+        ms.create(def, written).map_err(log_metric_fail)
+    })
+    .await?;
+    Ok(srv::json(StatusCode::CREATED, &log_metric_json(metrics_of(kind)?, &kept)))
+}
+
+fn metrics_get(kind: &str, name: &str) -> Result<Response, Fail> {
+    let ms = metrics_of(kind)?;
+    let k = ms.get(name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric"))?;
+    Ok(srv::json(StatusCode::OK, &log_metric_json(ms, &k)))
+}
+
+async fn metrics_put(kind: &str, name: &str, req: Request) -> Result<Response, Fail> {
+    let def = read_json::<super::logmetrics::DefIn>(req.into_body(), QUERY_BODY).await?.def(Some(name));
+    let ms = metrics_of(kind)?;
+    let k = ms.put(name, def).map_err(log_metric_fail)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric"))?;
+    Ok(srv::json(StatusCode::OK, &log_metric_json(ms, &k)))
+}
+
+fn metrics_delete(kind: &str, name: &str) -> Result<Response, Fail> {
+    match metrics_of(kind)?.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
+        true => Ok(srv::status(StatusCode::NO_CONTENT)),
+        false => Err(fail(StatusCode::NOT_FOUND, "no such metric")),
+    }
+}
+
 
 /// The pipelines now, applied: here from the next record, every runner told.
 fn apply_pipelines(p: &super::pipeline::kept::Pipelines) {
@@ -395,7 +453,7 @@ pub async fn otlp_grpc(signal: super::otlp::Signal, req: Request, authorised: bo
 
 /// A request's body, at the most: a query's text is 8,000 bytes (`kiln_obs::query::lex`), an
 /// ingest's points a few MB.
-const QUERY_BODY: usize = 64 << 10;
+pub(super) const QUERY_BODY: usize = 64 << 10;
 const INGEST_BODY: usize = 16 << 20;
 /// Names and values a listing gives, at the most.
 const LIST: usize = 10_000;
@@ -404,7 +462,7 @@ const LOGS_MAX: usize = 1_000;
 /// Log records a search's patterns are found from, at the most (its newest).
 const PATTERN_RECORDS: usize = 10_000;
 
-fn fail(code: StatusCode, why: impl std::fmt::Display) -> Fail {
+pub(super) fn fail(code: StatusCode, why: impl std::fmt::Display) -> Fail {
     (code, why.to_string())
 }
 
@@ -412,16 +470,16 @@ fn observe() -> Result<&'static Observe, Fail> {
     get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"))
 }
 
-fn shared() -> Result<kiln_obs::machine::Shared, Fail> {
+pub(super) fn shared() -> Result<kiln_obs::machine::Shared, Fail> {
     observe()?.store().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe's store is not open yet"))
 }
 
-async fn read_json<T: serde::de::DeserializeOwned>(body: Incoming, limit: usize) -> Result<T, Fail> {
+pub(super) async fn read_json<T: serde::de::DeserializeOwned>(body: Incoming, limit: usize) -> Result<T, Fail> {
     srv::body_json(body, limit).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))
 }
 
 /// Runs `f` on the store under its read lock, on the blocking pool.
-async fn reading<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
+pub(super) async fn reading<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
     let store = shared()?;
     crate::rt::blocking(move || {
         let s = store.read().unwrap_or_else(PoisonError::into_inner);
@@ -550,6 +608,14 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["logs", "facets"]) => facets(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["logs", "patterns"]) => patterns(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::GET, ["logs", "tail"]) => tail(q, req),
+        // APM (`super::apm`): spans as logs are, traces, services, the map.
+        (&Method::POST, ["spans", "search"]) => super::apm::search(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["spans", "aggregate"]) => super::apm::aggregate(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["spans", "facets"]) => super::apm::facets(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::GET, ["traces", id]) => super::apm::trace(id, q).await,
+        (&Method::GET, ["apm", "services"]) => super::apm::services(q).await,
+        (&Method::GET, ["apm", "services", name]) => super::apm::service(name, q).await,
+        (&Method::GET, ["apm", "map"]) => super::apm::map(q).await,
         (&Method::POST, ["events"]) => post_event(read_json(req.into_body(), QUERY_BODY).await?),
         (&Method::POST, ["events", "search"]) => {
             let mut b: SearchBody = read_json(req.into_body(), QUERY_BODY).await?;
@@ -1012,43 +1078,18 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             apply_pipelines(store);
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
-        (&Method::GET, ["log_metrics"]) => {
-            let ms = log_metrics()?;
-            let list: Vec<Value> = ms.list().iter().map(|k| log_metric_json(ms, k)).collect();
-            Ok(srv::json(StatusCode::OK, &json!({ "log_metrics": list, "counting": ms.counting() })))
-        }
-        (&Method::POST, ["log_metrics"]) => {
-            let def = read_json::<super::logmetrics::DefIn>(req.into_body(), QUERY_BODY).await?.def(None);
-            let ms = log_metrics()?;
-            let kept = reading(move |s| {
-                // A metric's series have one writer: names written already are refused.
-                let written = |n: &str| {
-                    let mut ids = Vec::new();
-                    s.select(&kiln_obs::index::Selector::metric(n), &mut ids);
-                    !ids.is_empty()
-                };
-                ms.create(def, written).map_err(log_metric_fail)
-            })
-            .await?;
-            Ok(srv::json(StatusCode::CREATED, &log_metric_json(log_metrics()?, &kept)))
-        }
-        (&Method::GET, ["log_metrics", name]) => {
-            let ms = log_metrics()?;
-            let k = ms.get(name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric from logs"))?;
-            Ok(srv::json(StatusCode::OK, &log_metric_json(ms, &k)))
-        }
-        (&Method::PUT, ["log_metrics", name]) => {
-            let name = (*name).to_owned();
-            let def = read_json::<super::logmetrics::DefIn>(req.into_body(), QUERY_BODY).await?.def(Some(&name));
-            let ms = log_metrics()?;
-            let k = ms.put(&name, def).map_err(log_metric_fail)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such metric from logs"))?;
-            Ok(srv::json(StatusCode::OK, &log_metric_json(ms, &k)))
-        }
-        (&Method::DELETE, ["log_metrics", name]) => match log_metrics()?.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
-            true => Ok(srv::status(StatusCode::NO_CONTENT)),
-            false => Err(fail(StatusCode::NOT_FOUND, "no such metric from logs")),
-        },
-        (&Method::POST, ["log_metric_test"]) => log_metric_test(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::GET, ["log_metrics"]) => metrics_list("log_metrics"),
+        (&Method::GET, ["span_metrics"]) => metrics_list("span_metrics"),
+        (&Method::POST, ["log_metrics"]) => metrics_create("log_metrics", req).await,
+        (&Method::POST, ["span_metrics"]) => metrics_create("span_metrics", req).await,
+        (&Method::GET, ["log_metrics", name]) => metrics_get("log_metrics", name),
+        (&Method::GET, ["span_metrics", name]) => metrics_get("span_metrics", name),
+        (&Method::PUT, ["log_metrics", name]) => metrics_put("log_metrics", name, req).await,
+        (&Method::PUT, ["span_metrics", name]) => metrics_put("span_metrics", name, req).await,
+        (&Method::DELETE, ["log_metrics", name]) => metrics_delete("log_metrics", name),
+        (&Method::DELETE, ["span_metrics", name]) => metrics_delete("span_metrics", name),
+        (&Method::POST, ["log_metric_test"]) => log_metric_test(read_json(req.into_body(), QUERY_BODY).await?, false).await,
+        (&Method::POST, ["span_metric_test"]) => log_metric_test(read_json(req.into_body(), QUERY_BODY).await?, true).await,
         (&Method::POST, ["pipeline_test"]) => {
             // What a pipeline (or every one, in order) makes of records given: nothing kept.
             let t: PipelineTest = read_json(req.into_body(), QUERY_BODY).await?;
@@ -1555,7 +1596,7 @@ fn post_event(e: EventIn) -> Result<Response, Fail> {
 /// serde_json keeps an object's keys in the order they were put in (`preserve_order`, which the
 /// QUIC stack's qlog turns on): the fields in that order, the attributes in the order their keys
 /// first come, a key given twice its last value.
-struct RecordOut<'a>(&'a Record);
+pub(super) struct RecordOut<'a>(pub(super) &'a Record);
 
 impl serde::Serialize for RecordOut<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -1579,7 +1620,7 @@ impl serde::Serialize for RecordOut<'_> {
 /// Attributes as an object: each key where it first comes, with the last value it is given. A record
 /// has a few: a key's earlier and later pairs are found by passes over them, nothing allocated;
 /// past [`ATTRS_SCANNED`] they are sorted by key once instead.
-struct AttrsOut<'a>(&'a [(String, String)]);
+pub(super) struct AttrsOut<'a>(pub(super) &'a [(String, String)]);
 
 const ATTRS_SCANNED: usize = 32;
 
@@ -1614,7 +1655,7 @@ impl serde::Serialize for AttrsOut<'_> {
 }
 
 /// Bytes as lowercase hex, written from the stack.
-struct HexOut<const N: usize>([u8; N]);
+pub(super) struct HexOut<const N: usize>(pub(super) [u8; N]);
 
 impl<const N: usize> serde::Serialize for HexOut<N> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {

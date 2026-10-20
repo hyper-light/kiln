@@ -233,6 +233,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
             return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
         }
+        (&Method::POST, ["v1", "traces"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Traces, req, ok).await);
+        }
         // Prometheus's remote write (`crate::observe::remote`): the same token, as a bearer token
         // or basic auth's password.
         (&Method::POST, ["api", "v1", "write"]) => {

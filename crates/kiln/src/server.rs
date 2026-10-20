@@ -153,6 +153,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             role: crate::observe::Role::Server { key: hub.admin_token.clone() },
             metrics_retention: days(cfg.observe.metrics_retention_days),
             logs_retention: days(cfg.observe.logs_retention_days),
+            spans_retention: days(cfg.observe.spans_retention_days),
             max_series: cfg.observe.max_series,
         });
         crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
@@ -169,6 +170,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::api::set_log_metrics(log_metrics.clone());
         // Its loop holds nothing that panics (the crate's lints): run, not supervised.
         crate::rt::spawn(log_metrics.run(shutdown.clone()));
+        // Metrics from spans, kiln's trace metrics among them (`kiln_obs::apm`): alike.
+        let span_metrics = crate::observe::logmetrics::LogMetrics::open_spans(&cfg.data("observe"));
+        crate::observe::api::set_span_metrics(span_metrics.clone());
+        crate::rt::spawn(span_metrics.run(shutdown.clone()));
         child!("observe", h => crate::observe::hub::send_loop(h));
         match crate::http::client::Client::public() {
             Ok(http) => {

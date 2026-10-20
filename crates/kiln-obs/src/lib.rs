@@ -7,6 +7,7 @@
 //! messages (`crates/kiln/src/observe`).
 
 pub mod anomaly;
+pub mod apm;
 pub mod batch;
 pub mod bits;
 pub mod block;

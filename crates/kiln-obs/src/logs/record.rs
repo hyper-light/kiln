@@ -169,18 +169,22 @@ fn cut(s: &str, max: usize) -> &str {
     s.get(..c).unwrap_or("")
 }
 
-/// Appends `r`'s row to `out`; `prev_ts` is the row before's time (0 for the first).
+/// Appends `r`'s row to `out`; `prev_ts` is the row before's time (0 for the first). Its
+/// attributes' values are cut at a tag's length ([`crate::batch::MAX_NAME_BYTES`]), as a log's are.
 pub fn put_row(out: &mut Vec<u8>, r: &Record, prev_ts: i64) {
-    put_fields(out, r.ts, r.severity, [&r.service, &r.host, &r.source], &r.message, r.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())), r.attrs.len(), r.trace_id, r.span_id, prev_ts);
+    put_fields(out, r.ts, r.severity, [&r.service, &r.host, &r.source], &r.message, r.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())), r.attrs.len(), r.trace_id, r.span_id, prev_ts, crate::batch::MAX_NAME_BYTES);
 }
 
-/// Appends a row read in place, without copying it out first.
+/// Appends a row read in place, without copying it out first: as it is (a row's values were cut,
+/// if at all, as it was first written; a span's are longer than a log's).
 pub fn put_row_ref(out: &mut Vec<u8>, r: &RecordRef<'_>, prev_ts: i64) {
-    put_fields(out, r.ts, r.severity, [r.service, r.host, r.source], r.message, r.attrs(), r.attr_count, r.trace_id, r.span_id, prev_ts);
+    put_fields(out, r.ts, r.severity, [r.service, r.host, r.source], r.message, r.attrs(), r.attr_count, r.trace_id, r.span_id, prev_ts, usize::MAX);
 }
 
+/// Appends a row from its fields, for a writer that makes no [`Record`] of it (a span decoded,
+/// `crate::otlp::traces`): attributes' values longer than `value_max` are cut.
 #[allow(clippy::too_many_arguments)]
-fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3], message: &str, attrs: impl Iterator<Item = (&'a str, &'a str)>, attr_count: usize, trace_id: Option<[u8; 16]>, span_id: Option<[u8; 8]>, prev_ts: i64) {
+pub fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3], message: &str, attrs: impl Iterator<Item = (&'a str, &'a str)>, attr_count: usize, trace_id: Option<[u8; 16]>, span_id: Option<[u8; 8]>, prev_ts: i64, value_max: usize) {
     varint::put(out, varint::zig(ts.wrapping_sub(prev_ts)));
     out.push(severity);
     for s in names {
@@ -191,7 +195,7 @@ fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3], me
     varint::put(out, n as u64);
     for (k, v) in attrs.take(n) {
         put_str(out, cut(k, crate::batch::MAX_NAME_BYTES));
-        put_str(out, cut(v, crate::batch::MAX_NAME_BYTES));
+        put_str(out, cut(v, value_max));
     }
     out.push(u8::from(trace_id.is_some()) | (u8::from(span_id.is_some()) << 1));
     if let Some(t) = trace_id {

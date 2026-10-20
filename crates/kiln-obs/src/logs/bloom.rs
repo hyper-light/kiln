@@ -46,6 +46,38 @@ pub fn token_hashes(token: &str) -> (u64, u64) {
     (mix(a), mix(b) | 1)
 }
 
+/// A trace id's two hashes in a block of spans' filter: from its bytes, not its hex as a token's
+/// (`token_hashes` over hex correlates for ids of one family: Datadog's 64-bit ids padded with
+/// zeros, X-Ray's that begin with their second, a generator's sequence; measured, one such id
+/// passed 616 of 2,000 filters sized for 1%). Each 64-bit half mixed into the other's
+/// (SplitMix64's finaliser on both: every input bit moves every output bit), so any 128 bits that
+/// differ hash apart.
+#[inline]
+pub fn id_hashes(id: &[u8; 16]) -> (u64, u64) {
+    let (lo, hi) = id.split_at(8);
+    let lo = u64::from_le_bytes(<[u8; 8]>::try_from(lo).unwrap_or([0; 8]));
+    let hi = u64::from_le_bytes(<[u8; 8]>::try_from(hi).unwrap_or([0; 8]));
+    (mix(lo ^ mix(hi ^ 0x243f_6a88_85a3_08d3)), mix(hi ^ mix(lo ^ 0x1319_8a2e_0370_7344)) | 1)
+}
+
+/// A block of spans' salt: from what its summary holds (its first time and its rows), so a reader
+/// salts as its writer did.
+#[inline]
+pub fn block_salt(min_ts: i64, rows: u32) -> u64 {
+    mix((min_ts as u64) ^ (u64::from(rows) << 40) ^ 0xa409_3822_299f_31d0)
+}
+
+/// A token's (or an id's) hashes in one block of spans' filter: salted by the block, mixed again.
+/// Filters of one size put a token at the same places in every one, and the tokens every block
+/// holds (a service's name, `server`, `get`) set those places in every one: a query whose places
+/// fall on them passed most filters (measured: a trace id read 654 of 2,000 blocks whose filters
+/// were each 1% for a token of their own). Salted, a query's places differ block to block, its
+/// false positives independent, each the 1% the filter is sized for.
+#[inline]
+pub fn salted(h: (u64, u64), salt: u64) -> (u64, u64) {
+    (mix(h.0 ^ salt), mix(h.1 ^ salt.rotate_left(29)) | 1)
+}
+
 #[inline]
 fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -120,6 +152,51 @@ mod tests {
         let mut buf = String::new();
         tokens("GET /api/v1/runs?id=42 -> 503 Service Unavailable (Ünïcode)", &mut buf, |t| got.push(t.to_owned()));
         assert_eq!(got, vec!["get", "api", "v1", "runs", "id", "42", "503", "service", "unavailable", "ünïcode"]);
+    }
+
+    /// Trace ids of families real tracers make (Datadog's 64-bit ids padded with zeros, X-Ray's
+    /// that begin with their second, a sequence): each one's filter passes as few filters of other
+    /// ids as a random token's would, the worst of a thousand among them too.
+    #[test]
+    fn trace_ids_of_one_family_pass_others_filters_at_the_rate_sized_for() {
+        let families: [fn(u64) -> [u8; 16]; 3] = [
+            |i| {
+                let mut id = [0u8; 16];
+                id[8..].copy_from_slice(&(i.wrapping_mul(0x9e37_79b9_7f4a_7c15)).to_be_bytes());
+                id
+            },
+            |i| {
+                let mut id = [0u8; 16];
+                id[..4].copy_from_slice(&(1_760_000_000u32 + (i / 100) as u32).to_be_bytes());
+                id[4..12].copy_from_slice(&(i % 100).wrapping_mul(0x2545_f491_4f6c_dd1d).to_be_bytes());
+                id
+            },
+            |i| (u128::from(i + 1) * 0x9e37_79b9_7f4a_7c15).to_le_bytes(),
+        ];
+        for (fi, family) in families.iter().enumerate() {
+            // 400 filters of 170 ids each (a block's traces), then 1,000 other ids against all.
+            let filters: Vec<Bloom> = (0..400u64)
+                .map(|f| {
+                    let mut b = Bloom::with_rate(170, 0.01);
+                    for j in 0..170 {
+                        b.insert(id_hashes(&family(f * 1_000 + j)));
+                    }
+                    b
+                })
+                .collect();
+            let mut worst = 0;
+            let mut total = 0;
+            for q in 0..1_000u64 {
+                let h = id_hashes(&family(1_000_000 + q * 7));
+                let yes = filters.iter().filter(|b| b.may_contain(h)).count();
+                worst = worst.max(yes);
+                total += yes;
+            }
+            let rate = total as f64 / (1_000.0 * 400.0);
+            assert!(rate < 0.0125, "family {fi}: {rate}");
+            // 4 expected of 400; a binomial's tail past 16 is under one in a billion.
+            assert!(worst <= 16, "family {fi}: the worst id passed {worst} of 400");
+        }
     }
 
     #[test]

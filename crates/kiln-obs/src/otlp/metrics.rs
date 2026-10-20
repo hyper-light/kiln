@@ -823,6 +823,16 @@ fn format_f64(v: f64) -> String {
     format!("{v}")
 }
 
+/// [`format_f64`], written in place.
+fn push_f64(out: &mut String, v: f64) {
+    use std::fmt::Write as _;
+    if v.is_infinite() {
+        out.push_str(if v > 0.0 { "+Inf" } else { "-Inf" });
+    } else {
+        let _ = write!(out, "{v}");
+    }
+}
+
 /// A `KeyValue`: its key and its value as text.
 pub(crate) fn key_value(msg: &[u8]) -> Result<Option<(String, String)>, OtlpError> {
     let (mut key, mut value) = (None, None);
@@ -898,6 +908,15 @@ fn any_value_text(msg: &[u8]) -> Result<String, OtlpError> {
 /// message's.
 pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, OtlpError> {
     let mut out = String::new();
+    any_value_push(msg, max, &mut out)?;
+    Ok(out)
+}
+
+/// An `AnyValue` as [`any_value_text_within`] has it, appended to `out` (at most `max` bytes of
+/// it): a scalar's text written in place, nothing allocated but an array's or a map's frames.
+pub(crate) fn any_value_push(msg: &[u8], max: usize, out: &mut String) -> Result<(), OtlpError> {
+    use std::fmt::Write as _;
+    let start = out.len();
     // Each frame: an array or a map being written, its fields left, whether one was written.
     enum Frame<'a> {
         Array(Fields<'a>, bool),
@@ -916,7 +935,7 @@ pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, Ot
                         if stack.is_empty() {
                             out.push_str(s);
                         } else {
-                            push_json_str(&mut out, s);
+                            push_json_str(out, s);
                         }
                         wrote = true;
                     }
@@ -925,11 +944,11 @@ pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, Ot
                         wrote = true;
                     }
                     (3, w) => {
-                        out.push_str(&w.i64().unwrap_or(0).to_string());
+                        let _ = write!(out, "{}", w.i64().unwrap_or(0));
                         wrote = true;
                     }
                     (4, w) => {
-                        out.push_str(&format_f64(w.f64().unwrap_or(f64::NAN)));
+                        push_f64(out, w.f64().unwrap_or(f64::NAN));
                         wrote = true;
                     }
                     (5, w) | (6, w) if stack.len() >= MAX_DEPTH => {
@@ -949,7 +968,7 @@ pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, Ot
                     }
                     (7, w) => {
                         for b in w.bytes().unwrap_or(&[]) {
-                            out.push_str(&format!("{b:02x}"));
+                            let _ = write!(out, "{b:02x}");
                         }
                         wrote = true;
                     }
@@ -959,7 +978,7 @@ pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, Ot
                     break;
                 }
             }
-            if out.len() > max {
+            if out.len() - start > max {
                 break;
             }
         }
@@ -996,7 +1015,7 @@ pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, Ot
                             out.push(',');
                         }
                         *any = true;
-                        push_json_str(&mut out, k);
+                        push_json_str(out, k);
                         out.push(':');
                         pending = Some(v.unwrap_or(&[]));
                     }
@@ -1008,16 +1027,27 @@ pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, Ot
             },
         }
     }
-    Ok(truncate_to(out, max))
+    if out.len() - start > max {
+        let mut cut = start + max;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    Ok(())
 }
 
-fn push_json_str(out: &mut String, s: &str) {
+/// `s` as a JSON string, appended.
+pub(crate) fn push_json_str(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
     out.push('"');
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }

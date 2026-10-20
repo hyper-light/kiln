@@ -10,11 +10,14 @@
 //! never are.
 //!
 //! ```text
-//! image := MAGIC 8 | metrics' cutoff i64-le | logs' cutoff i64-le | max series varint
+//! image := MAGIC 8 | metrics' cutoff i64-le | logs' cutoff i64-le | (spans' cutoff i64-le) | max series varint
 //!        | sessions varint | (sender u64-le | seq varint | at zigzag | index varint)*
 //!        | files varint | (kind u8 | seq varint | bytes varint | crc u32-le | name varint-length)*
 //!        | crc32c of everything before u32-le
 //! ```
+//!
+//! An image of a store that holds spans is `KOIMAGE2`, with their cutoff, and names spans files
+//! (kind 2); one of a store that never did is `KOIMAGE1`, as a build that knows no spans reads it.
 
 use std::collections::BTreeMap;
 
@@ -23,6 +26,8 @@ use crate::manifest::{Session, plain_name};
 use crate::varint;
 
 pub const MAGIC: [u8; 8] = *b"KOIMAGE1";
+/// An image of a store that holds spans.
+pub const MAGIC_SPANS: [u8; 8] = *b"KOIMAGE2";
 
 /// Files an image names at the most: a store keeps O(log n) blocks of n samples (Bentley–Saxe) and
 /// a logs file a cut, so this many is damage, not a store.
@@ -32,6 +37,7 @@ pub const MAX_FILES: usize = 1 << 16;
 pub enum FileKind {
     Block,
     Logs,
+    Spans,
 }
 
 /// A file an image names.
@@ -47,10 +53,12 @@ pub struct ImageFile {
     pub crc: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     pub cutoff: i64,
     pub logs_cutoff: i64,
+    /// `i64::MIN`: no span cut off.
+    pub spans_cutoff: i64,
     pub max_series: u64,
     pub sessions: BTreeMap<u64, Session>,
     /// In write order.
@@ -67,12 +75,27 @@ pub enum ImageError {
     Damaged(&'static str),
 }
 
+impl Default for Image {
+    fn default() -> Self {
+        Self { cutoff: 0, logs_cutoff: 0, spans_cutoff: i64::MIN, max_series: 0, sessions: BTreeMap::new(), files: Vec::new() }
+    }
+}
+
 impl Image {
+    /// Whether it holds spans, or a cutoff of theirs.
+    fn has_spans(&self) -> bool {
+        self.spans_cutoff != i64::MIN || self.files.iter().any(|f| f.kind == FileKind::Spans)
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
         let start = out.len();
-        out.extend_from_slice(&MAGIC);
+        let spans = self.has_spans();
+        out.extend_from_slice(if spans { &MAGIC_SPANS } else { &MAGIC });
         out.extend_from_slice(&self.cutoff.to_le_bytes());
         out.extend_from_slice(&self.logs_cutoff.to_le_bytes());
+        if spans {
+            out.extend_from_slice(&self.spans_cutoff.to_le_bytes());
+        }
         varint::put(out, self.max_series);
         varint::put(out, self.sessions.len() as u64);
         for (sender, s) in &self.sessions {
@@ -86,6 +109,7 @@ impl Image {
             out.push(match f.kind {
                 FileKind::Block => 0,
                 FileKind::Logs => 1,
+                FileKind::Spans => 2,
             });
             varint::put(out, f.seq);
             varint::put(out, f.bytes);
@@ -99,7 +123,10 @@ impl Image {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ImageError> {
         let (body, crc) = bytes.split_last_chunk::<4>().ok_or(ImageError::Magic)?;
-        let mut at = body.strip_prefix(&MAGIC[..]).ok_or(ImageError::Magic)?;
+        let (mut at, spans) = match body.strip_prefix(&MAGIC[..]) {
+            Some(at) => (at, false),
+            None => (body.strip_prefix(&MAGIC_SPANS[..]).ok_or(ImageError::Magic)?, true),
+        };
         if crc32c::checksum(body) != u32::from_le_bytes(*crc) {
             return Err(ImageError::Checksum);
         }
@@ -107,7 +134,13 @@ impl Image {
         let (cutoff, rest) = at.split_first_chunk::<8>().ok_or(d("cutoff"))?;
         let (logs_cutoff, rest) = rest.split_first_chunk::<8>().ok_or(d("cutoff"))?;
         at = rest;
-        let mut image = Self { cutoff: i64::from_le_bytes(*cutoff), logs_cutoff: i64::from_le_bytes(*logs_cutoff), max_series: varint::get(&mut at).ok_or(d("max series"))?, ..Self::default() };
+        let mut spans_cutoff = i64::MIN;
+        if spans {
+            let (c, rest) = at.split_first_chunk::<8>().ok_or(d("cutoff"))?;
+            spans_cutoff = i64::from_le_bytes(*c);
+            at = rest;
+        }
+        let mut image = Self { cutoff: i64::from_le_bytes(*cutoff), logs_cutoff: i64::from_le_bytes(*logs_cutoff), spans_cutoff, max_series: varint::get(&mut at).ok_or(d("max series"))?, ..Self::default() };
         let sessions = varint::get(&mut at).ok_or(d("sessions"))?;
         // Each session takes 11 bytes at least: a count past that is damage.
         if sessions > (at.len() / 11) as u64 {
@@ -132,6 +165,7 @@ impl Image {
             let kind = match kind {
                 0 => FileKind::Block,
                 1 => FileKind::Logs,
+                2 if spans => FileKind::Spans,
                 _ => return Err(d("a file's kind")),
             };
             let seq = varint::get(&mut at).ok_or(d("a file"))?;
@@ -168,6 +202,7 @@ mod tests {
         let image = Image {
             cutoff: 1_700_000_000_000,
             logs_cutoff: 1_700_000_000_007,
+            spans_cutoff: i64::MIN,
             max_series: 100_000,
             sessions: [(u64::MAX, Session { seq: 9, at: -4, index: 77 }), (3, Session { seq: 1, at: 1_700_000_000_001, index: 5 })].into(),
             files: vec![
@@ -179,6 +214,23 @@ mod tests {
         image.encode(&mut bytes);
         assert_eq!(Image::decode(&bytes), Ok(image.clone()));
         assert_eq!(image.file_bytes(), 123_465);
+        // No spans: the format a build that knows none reads.
+        assert!(bytes.starts_with(&MAGIC));
+        let mut with = image.clone();
+        with.spans_cutoff = 1_700_000_000_009;
+        with.files.push(ImageFile { kind: FileKind::Spans, seq: 6, name: "0000000000000006.spans".into(), bytes: 70, crc: 2 });
+        let mut spans = Vec::new();
+        with.encode(&mut spans);
+        assert!(spans.starts_with(&MAGIC_SPANS));
+        assert_eq!(Image::decode(&spans), Ok(with.clone()));
+        // A first-format image that names a spans file is damage.
+        let mut forged = spans.clone();
+        forged.drain(24..32);
+        forged[..8].copy_from_slice(&MAGIC);
+        let n = forged.len() - 4;
+        let crc = crate::crc32c::checksum(&forged[..n]);
+        forged[n..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(Image::decode(&forged), Err(ImageError::Damaged("a file's kind")));
         let mut empty = Vec::new();
         Image::default().encode(&mut empty);
         assert_eq!(Image::decode(&empty), Ok(Image::default()));

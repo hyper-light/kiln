@@ -407,6 +407,9 @@ pub struct Observe {
     pub metrics_retention_days: u32,
     /// How long log records are kept: Datadog's default index retention, 15 days.
     pub logs_retention_days: u32,
+    /// How long spans are kept: Datadog's for indexed spans, 15 days ("Trace Retention",
+    /// docs.datadoghq.com).
+    pub spans_retention_days: u32,
     /// The most series the group holds (0: no bound); past it, new series are refused and counted.
     pub max_series: u64,
     /// How often the server looks at its own host, container and process (`crate::observe::host`;
@@ -420,7 +423,7 @@ pub struct Observe {
 
 impl Default for Observe {
     fn default() -> Self {
-        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0, host_seconds: 15, query_helpers: None }
+        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, spans_retention_days: 15, max_series: 0, host_seconds: 15, query_helpers: None }
     }
 }
 

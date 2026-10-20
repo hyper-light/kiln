@@ -74,6 +74,10 @@ name = "promwrite"
 harness = false
 
 [[bench]]
+name = "traces"
+harness = false
+
+[[bench]]
 name = "zstd"
 harness = false
 

@@ -1,8 +1,10 @@
-//! OTLP over HTTP (`docs/observe.md` §8): `POST /v1/metrics` and `POST /v1/logs`, as the
+//! OTLP over HTTP (`docs/observe.md` §8): `POST /v1/metrics`, `/v1/logs` and `/v1/traces`, as the
 //! OpenTelemetry protocol specifies them (opentelemetry-proto v1.5.0, "OTLP/HTTP"): a request's body
 //! in protobuf (`application/x-protobuf`) or JSON (`application/json`), gzip-compressed or not,
-//! answered in the request's own encoding. And OTLP over gRPC: the metrics and logs services'
-//! `Export` ([`grpc`]), its message read by the same decoder.
+//! answered in the request's own encoding. And OTLP over gRPC: the metrics, logs and trace
+//! services' `Export` ([`grpc`]), its message read by the same decoder. Spans not kept (no valid
+//! trace or span id) are said in the answer's partial success, as the specification has a receiver
+//! say what it rejected.
 //!
 //! JSON is put into protobuf's wire format here and read by the same decoder as protobuf
 //! (`kiln_obs::otlp`), so one mapping serves both. The JSON is OTLP's "JSON Protobuf Encoding":
@@ -32,6 +34,7 @@ const MAX_DEPTH: usize = 8;
 pub enum Signal {
     Metrics,
     Logs,
+    Traces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +50,9 @@ enum Ty {
     Double,
     /// uint32, uint64, int64 and enums: a varint.
     Varint,
+    /// An enum: an integer, as OTLP's JSON writes one, or the name of one of its values (each
+    /// value's name at its number), as some writers do.
+    Enum(&'static [&'static str]),
     Sint,
     Bool,
 }
@@ -55,8 +61,15 @@ enum Ty {
 enum Schema {
     MetricsRequest,
     LogsRequest,
+    TracesRequest,
     ResourceMetrics,
     ResourceLogs,
+    ResourceSpans,
+    ScopeSpans,
+    Span,
+    SpanEvent,
+    SpanLink,
+    SpanStatus,
     Resource,
     Scope,
     ScopeMetrics,
@@ -104,6 +117,37 @@ fn fields(s: Schema) -> &'static [F] {
     match s {
         S::MetricsRequest => const { &[r("resourceMetrics", "resource_metrics", 1, Msg(S::ResourceMetrics))] },
         S::LogsRequest => const { &[r("resourceLogs", "resource_logs", 1, Msg(S::ResourceLogs))] },
+        S::TracesRequest => const { &[r("resourceSpans", "resource_spans", 1, Msg(S::ResourceSpans))] },
+        S::ResourceSpans => const { &[f("resource", "resource", 1, Msg(S::Resource)), r("scopeSpans", "scope_spans", 2, Msg(S::ScopeSpans)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::ScopeSpans => const { &[f("scope", "scope", 1, Msg(S::Scope)), r("spans", "spans", 2, Msg(S::Span)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::Span => const { &[
+            f("traceId", "trace_id", 1, Hex),
+            f("spanId", "span_id", 2, Hex),
+            f("traceState", "trace_state", 3, Str),
+            f("parentSpanId", "parent_span_id", 4, Hex),
+            f("flags", "flags", 16, Fixed32),
+            f("name", "name", 5, Str),
+            f("kind", "kind", 6, Enum(&["SPAN_KIND_UNSPECIFIED", "SPAN_KIND_INTERNAL", "SPAN_KIND_SERVER", "SPAN_KIND_CLIENT", "SPAN_KIND_PRODUCER", "SPAN_KIND_CONSUMER"])),
+            f("startTimeUnixNano", "start_time_unix_nano", 7, Fixed64),
+            f("endTimeUnixNano", "end_time_unix_nano", 8, Fixed64),
+            r("attributes", "attributes", 9, Msg(S::KeyValue)),
+            f("droppedAttributesCount", "dropped_attributes_count", 10, Varint),
+            r("events", "events", 11, Msg(S::SpanEvent)),
+            f("droppedEventsCount", "dropped_events_count", 12, Varint),
+            r("links", "links", 13, Msg(S::SpanLink)),
+            f("droppedLinksCount", "dropped_links_count", 14, Varint),
+            f("status", "status", 15, Msg(S::SpanStatus)),
+        ] },
+        S::SpanEvent => const { &[f("timeUnixNano", "time_unix_nano", 1, Fixed64), f("name", "name", 2, Str), r("attributes", "attributes", 3, Msg(S::KeyValue)), f("droppedAttributesCount", "dropped_attributes_count", 4, Varint)] },
+        S::SpanLink => const { &[
+            f("traceId", "trace_id", 1, Hex),
+            f("spanId", "span_id", 2, Hex),
+            f("traceState", "trace_state", 3, Str),
+            r("attributes", "attributes", 4, Msg(S::KeyValue)),
+            f("droppedAttributesCount", "dropped_attributes_count", 5, Varint),
+            f("flags", "flags", 6, Fixed32),
+        ] },
+        S::SpanStatus => const { &[f("message", "message", 2, Str), f("code", "code", 3, Enum(&["STATUS_CODE_UNSET", "STATUS_CODE_OK", "STATUS_CODE_ERROR"]))] },
         S::ResourceMetrics => const { &[f("resource", "resource", 1, Msg(S::Resource)), r("scopeMetrics", "scope_metrics", 2, Msg(S::ScopeMetrics)), f("schemaUrl", "schema_url", 3, Str)] },
         S::ResourceLogs => const { &[f("resource", "resource", 1, Msg(S::Resource)), r("scopeLogs", "scope_logs", 2, Msg(S::ScopeLogs)), f("schemaUrl", "schema_url", 3, Str)] },
         S::Resource => const { &[r("attributes", "attributes", 1, Msg(S::KeyValue)), f("droppedAttributesCount", "dropped_attributes_count", 2, Varint)] },
@@ -270,6 +314,10 @@ fn scalar(w: &mut Writer, field: &F, v: &Value) -> Result<(), JsonError> {
         }
         Ty::Double => w.double(field.num, f64_of(v).ok_or_else(|| bad("not a number"))?),
         Ty::Varint => w.varint(field.num, u64_of(v).ok_or_else(|| bad("not an integer"))?),
+        Ty::Enum(names) => {
+            let n = u64_of(v).or_else(|| v.as_str().and_then(|s| names.iter().position(|n| *n == s)).map(|i| i as u64));
+            w.varint(field.num, n.ok_or_else(|| bad("not one of the enum's values"))?);
+        }
         Ty::Sint => {
             let n = match v {
                 Value::Number(n) => n.as_i64(),
@@ -302,6 +350,7 @@ pub fn json_to_pb(body: &[u8], signal: Signal) -> Result<Vec<u8>, JsonError> {
     let schema = match signal {
         Signal::Metrics => Schema::MetricsRequest,
         Signal::Logs => Schema::LogsRequest,
+        Signal::Traces => Schema::TracesRequest,
     };
     let mut stack: Vec<Frame<'_>> = vec![Frame { schema, entries: root.iter(), num: 0, depth: 0, out: Writer::default(), array: None }];
     loop {
@@ -356,9 +405,9 @@ pub fn json_to_pb(body: &[u8], signal: Signal) -> Result<Vec<u8>, JsonError> {
 /// What a request came to.
 #[derive(Debug)]
 pub enum Answer {
-    /// Taken: what the response says (the export service's response, empty, in the request's
-    /// encoding).
-    Ok { json: bool, points: u64 },
+    /// Taken: what the response says (the export service's response, in the request's encoding:
+    /// empty, or what was rejected as its partial success).
+    Ok { json: bool, points: u64, rejected: u64 },
     /// Malformed: 400, and why.
     Bad(String),
     /// Too big: 413.
@@ -427,7 +476,7 @@ fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body:
                     if !o.offer_samples(d) {
                         return Answer::Busy;
                     }
-                    Answer::Ok { json, points }
+                    Answer::Ok { json, points, rejected: 0 }
                 }
                 Err(e) => {
                     let why = e.to_string();
@@ -442,12 +491,63 @@ fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body:
                 if !o.offer_logs(d.records) {
                     return Answer::Busy;
                 }
-                Answer::Ok { json, points: n }
+                Answer::Ok { json, points: n, rejected: 0 }
             }
             Err(e) => Answer::Bad(e.to_string()),
         },
+        Signal::Traces => {
+            let mut spans = kiln_obs::otlp::traces::Spans::default();
+            let decoded = with_trace_decoder(|d| {
+                // Rows into buffers the node's writes handed back (`Observe::bytes`): the batcher
+                // frees on its thread what decoders grow on theirs, so they come back here.
+                while d.spares() < 2 {
+                    let b = o.bytes();
+                    if b.capacity() == 0 {
+                        break;
+                    }
+                    d.give_rows(b);
+                }
+                d.decode(pb, now_ns, &mut spans)
+            });
+            match decoded {
+                Ok(()) => {
+                    let (n, rejected) = (spans.spans, spans.invalid);
+                    if !o.offer_spans(spans.segments) {
+                        return Answer::Busy;
+                    }
+                    Answer::Ok { json, points: n, rejected }
+                }
+                Err(e) => Answer::Bad(e.to_string()),
+            }
+        }
     }
 }
+
+/// Runs `f` with this thread's trace decoder (its room kept from one request to the next), or a
+/// new one were it in use.
+fn with_trace_decoder<T>(f: impl FnOnce(&mut kiln_obs::otlp::traces::Decoder) -> T) -> T {
+    thread_local! {
+        static DECODER: std::cell::RefCell<kiln_obs::otlp::traces::Decoder> = std::cell::RefCell::new(kiln_obs::otlp::traces::Decoder::new());
+    }
+    DECODER.with(|d| match d.try_borrow_mut() {
+        Ok(mut d) => f(&mut d),
+        Err(_) => f(&mut kiln_obs::otlp::traces::Decoder::new()),
+    })
+}
+
+/// The export service's response to a request some of whose items were rejected: its
+/// `partial_success` (field 1) with `rejected_<items>` (1) and `error_message` (2), in protobuf.
+fn partial_success_pb(rejected: u64, why: &str) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.message(1, |p| {
+        p.varint(1, rejected);
+        p.str(2, why);
+    });
+    w.buf
+}
+
+/// What a request's rejected spans are said as.
+const REJECTED_SPANS: &str = "spans without a valid trace id (16 bytes, not all zero) or span id (8 bytes) are not kept";
 
 /// An OTLP request answered: read whole (at most [`MAX_BODY`]), taken on the blocking pool, and
 /// answered as the specification asks (OTLP/HTTP "Response"): 200 with the export service's
@@ -465,8 +565,12 @@ pub async fn answer(o: &Observe, signal: Signal, req: crate::http::server::Reque
     let (o, now_ns) = (o.clone(), super::clock_ms().saturating_mul(1_000_000));
     let taken = crate::rt::blocking(move || take(&o, signal, &content_type, gzip, &body, now_ns)).await;
     match taken {
-        Ok(Answer::Ok { json: true, .. }) => srv::response(StatusCode::OK, "application/json", srv::full("{}")),
-        Ok(Answer::Ok { json: false, .. }) => srv::response(StatusCode::OK, "application/x-protobuf", srv::empty()),
+        Ok(Answer::Ok { json: true, rejected: 0, .. }) => srv::response(StatusCode::OK, "application/json", srv::full("{}")),
+        Ok(Answer::Ok { json: false, rejected: 0, .. }) => srv::response(StatusCode::OK, "application/x-protobuf", srv::empty()),
+        // Only spans are rejected (`ExportTracePartialSuccess`: `rejectedSpans`, an int64, is a
+        // string in OTLP's JSON).
+        Ok(Answer::Ok { json: true, rejected, .. }) => srv::json(StatusCode::OK, &serde_json::json!({ "partialSuccess": { "rejectedSpans": rejected.to_string(), "errorMessage": REJECTED_SPANS } })),
+        Ok(Answer::Ok { json: false, rejected, .. }) => srv::response(StatusCode::OK, "application/x-protobuf", srv::full(partial_success_pb(rejected, REJECTED_SPANS))),
         Ok(Answer::Bad(why)) => srv::text(StatusCode::BAD_REQUEST, &why),
         Ok(Answer::TooLarge) => srv::text(StatusCode::PAYLOAD_TOO_LARGE, "an OTLP request is taken up to 20 MiB"),
         Ok(Answer::Busy) => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "behind on writes: try again"), header::RETRY_AFTER, "1"),
@@ -478,12 +582,14 @@ pub async fn answer(o: &Observe, signal: Signal, req: crate::http::server::Reque
 /// "OTLP/gRPC"), over HTTP/2 (with TLS, or without: prior knowledge).
 pub const GRPC_METRICS: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
 pub const GRPC_LOGS: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+pub const GRPC_TRACES: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
 /// The signal a gRPC path exports, if it is one.
 pub fn grpc_signal(path: &str) -> Option<Signal> {
     match path {
         GRPC_METRICS => Some(Signal::Metrics),
         GRPC_LOGS => Some(Signal::Logs),
+        GRPC_TRACES => Some(Signal::Traces),
         _ => None,
     }
 }
@@ -516,6 +622,12 @@ fn grpc_message(m: &str) -> String {
 /// A gRPC answer: 200, `application/grpc`, the export's response (an empty message) when it
 /// worked, and its status in trailers.
 pub fn grpc_answer(code: u32, message: &str) -> crate::http::server::Response {
+    grpc_answer_with(code, message, &[])
+}
+
+/// As [`grpc_answer`], the export's response `response` (a message, its partial success) when it
+/// worked.
+pub fn grpc_answer_with(code: u32, message: &str, response: &[u8]) -> crate::http::server::Response {
     use http_body_util::BodyExt as _;
     let mut trailers = http::HeaderMap::new();
     trailers.insert("grpc-status", http::HeaderValue::from(code));
@@ -526,9 +638,12 @@ pub fn grpc_answer(code: u32, message: &str) -> crate::http::server::Response {
     }
     let mut frames: Vec<Result<http_body::Frame<bytes::Bytes>, std::io::Error>> = Vec::with_capacity(2);
     if code == grpc_code::OK {
-        // The response message: uncompressed, empty (an ExportServiceResponse with no partial
-        // success to say).
-        frames.push(Ok(http_body::Frame::data(bytes::Bytes::from_static(&[0, 0, 0, 0, 0]))));
+        // The response message, uncompressed: its flag, its length (big-endian), itself.
+        let mut m = Vec::with_capacity(5 + response.len());
+        m.push(0);
+        m.extend_from_slice(&u32::try_from(response.len()).unwrap_or(0).to_be_bytes());
+        m.extend_from_slice(response);
+        frames.push(Ok(http_body::Frame::data(bytes::Bytes::from(m))));
     }
     frames.push(Ok(http_body::Frame::trailers(trailers)));
     let body = http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed();
@@ -568,7 +683,8 @@ pub async fn grpc(o: &Observe, signal: Signal, req: crate::http::server::Request
     let msg = msg.to_vec();
     let (o, now_ns) = (o.clone(), super::clock_ms().saturating_mul(1_000_000));
     match crate::rt::blocking(move || take(&o, signal, "application/x-protobuf", gzip, &msg, now_ns)).await {
-        Ok(Answer::Ok { .. }) => grpc_answer(grpc_code::OK, ""),
+        Ok(Answer::Ok { rejected: 0, .. }) => grpc_answer(grpc_code::OK, ""),
+        Ok(Answer::Ok { rejected, .. }) => grpc_answer_with(grpc_code::OK, "", &partial_success_pb(rejected, REJECTED_SPANS)),
         Ok(Answer::Bad(why)) => grpc_answer(grpc_code::INVALID_ARGUMENT, &why),
         Ok(Answer::TooLarge) => grpc_answer(grpc_code::RESOURCE_EXHAUSTED, "an OTLP request is taken up to 20 MiB"),
         Ok(Answer::Busy) => grpc_answer(grpc_code::UNAVAILABLE, "behind on writes: try again"),
@@ -590,13 +706,14 @@ impl crate::http::server::Handler for Local {
         match (req.method().clone(), req.uri().path()) {
             (Method::POST, "/v1/metrics") => answer(&self.o, Signal::Metrics, req).await,
             (Method::POST, "/v1/logs") => answer(&self.o, Signal::Logs, req).await,
+            (Method::POST, "/v1/traces") => answer(&self.o, Signal::Traces, req).await,
             (Method::POST, "/api/v1/write") => super::remote::answer(&self.o, req).await,
             (Method::POST, path) if grpc_signal(path).is_some() => match grpc_signal(path) {
                 Some(signal) => grpc(&self.o, signal, req).await,
-                None => grpc_answer(grpc_code::UNIMPLEMENTED, "an OTLP service: metrics or logs"),
+                None => grpc_answer(grpc_code::UNIMPLEMENTED, "an OTLP service: metrics, logs or traces"),
             },
             (Method::GET, "/healthz") => srv::text(StatusCode::OK, "ok"),
-            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics or /v1/logs; OTLP/gRPC: the metrics and logs services' Export; Prometheus's remote write: POST /api/v1/write"),
+            _ => srv::text(StatusCode::NOT_FOUND, "OTLP/HTTP: POST /v1/metrics, /v1/logs or /v1/traces; OTLP/gRPC: the metrics, logs and trace services' Export; Prometheus's remote write: POST /api/v1/write"),
         }
     }
 }
@@ -657,6 +774,55 @@ mod tests {
     /// (opentelemetry-proto v1.5.0 `examples/metrics.json` and `examples/logs.json`).
     const METRICS_JSON: &str = include_str!("fixtures/otlp-metrics.json");
     const LOGS_JSON: &str = include_str!("fixtures/otlp-logs.json");
+    /// opentelemetry-proto v1.5.0 `examples/trace.json`.
+    const TRACES_JSON: &str = include_str!("fixtures/otlp-traces.json");
+
+    fn spans_of(pb: &[u8]) -> anyhow::Result<Vec<kiln_obs::logs::record::Record>> {
+        let mut s = kiln_obs::otlp::traces::Spans::default();
+        kiln_obs::otlp::traces::Decoder::new().decode(pb, 0, &mut s)?;
+        let mut out = Vec::new();
+        for (raw, n) in &s.segments {
+            let mut rows = kiln_obs::logs::record::Rows::new(raw, *n as usize);
+            while let Some(r) = rows.next_row()? {
+                out.push(r.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn the_specification_s_trace_example_reads_as_its_protobuf_would() -> anyhow::Result<()> {
+        let pb = json_to_pb(TRACES_JSON.as_bytes(), Signal::Traces)?;
+        let spans = spans_of(&pb)?;
+        let s = spans.first().ok_or_else(|| anyhow::anyhow!("a span"))?;
+        anyhow::ensure!((s.ts, s.service.as_str(), s.source.as_str(), s.message.as_str()) == (1_544_712_660_000_000_000, "my.service", "my.library", "I'm a server span"), "{s:?}");
+        anyhow::ensure!(s.trace_id.map(hex::encode).as_deref() == Some("5b8efff798038103d269b633813fc60c"));
+        anyhow::ensure!(s.span_id.map(hex::encode).as_deref() == Some("eee19b7ec3c1b174"));
+        let a = |k: &str| s.attrs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        anyhow::ensure!(a("span.kind") == Some("server") && a("duration") == Some("1000000000") && a("parent_id") == Some("eee19b7ec3c1b173") && a("my.span.attr") == Some("some value"), "{:?}", s.attrs);
+        Ok(())
+    }
+
+    #[test]
+    fn spans_in_json_take_enum_names_and_numbers_alike() -> anyhow::Result<()> {
+        let body = |kind: &str, code: &str| {
+            format!(
+                r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174",
+                "name":"q","kind":{kind},"startTimeUnixNano":"1","endTimeUnixNano":"3","status":{{"code":{code},"message":"bad"}},
+                "events":[{{"timeUnixNano":"2","name":"exception","attributes":[{{"key":"exception.type","value":{{"stringValue":"E"}}}}]}}],
+                "links":[{{"traceId":"5b8efff798038103d269b633813fc60d","spanId":"eee19b7ec3c1b175"}}]}}]}}]}}]}}"#
+            )
+        };
+        for (kind, code) in [("3", "2"), (r#""SPAN_KIND_CLIENT""#, r#""STATUS_CODE_ERROR""#)] {
+            let spans = spans_of(&json_to_pb(body(kind, code).as_bytes(), Signal::Traces)?)?;
+            let s = spans.first().ok_or_else(|| anyhow::anyhow!("a span"))?;
+            let a = |k: &str| s.attrs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+            anyhow::ensure!(s.severity == 17 && a("span.kind") == Some("client") && a("error.type") == Some("E") && a("error.message") == Some("bad") && a("duration") == Some("2"), "{kind}: {:?}", s.attrs);
+            anyhow::ensure!(a("links").is_some_and(|l| l.contains("eee19b7ec3c1b175")));
+        }
+        anyhow::ensure!(json_to_pb(body(r#""SPAN_KIND_NOPE""#, "0").as_bytes(), Signal::Traces).is_err());
+        Ok(())
+    }
 
     #[test]
     fn the_specification_s_metrics_example_reads_as_its_protobuf_would() -> anyhow::Result<()> {

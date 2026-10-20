@@ -29,6 +29,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
 | O-16 | Synthetic tests (§10.4): Datadog's API tests, HTTP (its time cut into DNS, connection, TLS, first byte, download and redirects), TCP, DNS and TLS (a certificate's days left), from the server and runners as locations; Datadog's assertions and series; a location failing or recovering an event once; alerting by a monitor each test owns (at least N locations failing for a while); tried once from the server, run now everywhere; their page; checked live (a server and a runner, an endpoint switched to 500 and back, a TLS endpoint with a CA of its own) and in browsers (§13) | done |
 | O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
+| O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Next: Datadog's tracers' and Agent's trace intake, CI runs as traces, span monitors | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -92,6 +93,11 @@ flat map of `@`-addressable fields), `trace_id`, `span_id`.
 
 **Events.** `ts`, `title`, `text`, `source` (kiln, kiln-ci, kiln-cd, github, aws, ...), `tags`,
 `priority`, `alert_type` (info, success, warning, error), `aggregation_key`.
+
+**Spans.** Records of a store of their own (§8.7): `ts` the span's start, `message` its name,
+`service`, `host`, `source` (its instrumentation scope), severity (error or ok), `trace_id`,
+`span_id`, and attributes: the span's and its resource's, and kiln's own (`span.kind`,
+`duration` in ns, `parent_id`, the error, `peer.service`, its events and links).
 
 ## 4. The store (one replica)
 
@@ -223,6 +229,12 @@ maximum of `ts`, the dictionaries, and a Bloom filter over the message's tokens 
 `LOG_BLOOM_FPR` (Bloom 1970; `k = (m/n) ln 2` hashes with Kirsch and Mitzenmacher's double hashing,
 2006), so a search reads only blocks that may match and the time range they cover.
 
+Spans (§8.7) are records of a store of their own beside it, the same engine: their own head,
+blocks and files (`.spans`), their own cutoff, never in a log search, nor a log monitor's, nor the
+live tail. Spans come ten to a hundred times as many as logs, so a store of their own keeps a log
+search from reading their blocks, and lets them be kept for their own time (Datadog keeps indexed
+spans 15 days: `spans_retention_days`). A block of spans' filter holds its trace ids (§8.7).
+
 Events are records too, of source `kiln.event`: one store, one search. But they are not logs: a
 monitor's own alerts are events at error's severity, and a monitor of `status:error` that counted
 them would count its own alerting. A log monitor, and the logs explorer, read logs only
@@ -321,7 +333,12 @@ compacted, retained or restarted (§13):
   groups by their tags; log search breaks time ties by the record's contents.
 
 An entry of a command or batch format this build does not know stops the replica (a newer build
-applies it; skipping it would leave another state), and the owner says why.
+applies it; skipping it would leave another state), and the owner says why. Spans came after:
+their rows ride a write as an item of their own (`SPANS`), their retention is a command of its own
+(`RETAIN_SPANS`, proposed only once the group holds spans), and a manifest or an image that holds
+spans says so in its format (`kiln-obs manifest 3`, `KOIMAGE2`); a group that never took a span
+writes nothing a build that knows none would stop at, so runners of either build replicate it until
+the first span comes.
 
 **Persist, image, install.** `persist` cuts the store at the last entry applied and records the
 point with the replicated state there (the manifest: cutoffs, bound, sessions, configuration).
@@ -504,7 +521,10 @@ Log search follows Datadog's log syntax: `service:web status:error @http.status_
 log analytics `count() by {service}` over a search. A `-` that starts a term is NOT wherever it
 stands (`(a OR b) -env:dev`); one inside a term is the term's (`web-1`). A quoted value holds any
 characters (`@note:"say \"hi\""`), so a facet's every value can be searched for. Events take the
-same search syntax.
+same search syntax. `trace_id:<32 hex digits>` and `span_id:<16>` are a record's ids (logs' and
+spans' alike). Spans are searched as Datadog's trace explorer searches them (`parse_spans`): the
+same, and `resource_name:` (or `resource:`) the span's name, and `@duration` (ns, as stored) with a
+unit (`@duration:>250ms`, `@duration:[1s TO 5s]`: ns, us, µs, ms, s, m, h).
 
 ## 7. API
 
@@ -552,6 +572,11 @@ its schema (§13). Built:
 | `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
 | `GET/POST pipelines`, `GET/PUT/DELETE pipelines/{id}`, `PUT pipeline_order`, `POST pipeline_test` | log pipelines (§8.2), in the order they apply, kiln's own first (read-only but for whether they are on: one is turned off, not removed); a pipeline made or changed is checked (it compiles) and applied from the next record on every machine; `pipeline_test` runs a pipeline given (or every one, in order) on records given and keeps nothing |
 | `GET/POST log_metrics`, `GET/PUT/DELETE log_metrics/{name}`, `POST log_metric_test` | metrics from logs (§8.3): Datadog's definitions, in kiln's shape or their API's envelope; each with what its latest window with records held, and how counting goes (the settle learned, windows counted again, windows too late); a name whose series another writes is refused (409); what a metric computes stays (400); `log_metric_test` counts a definition over the last fifteen minutes (an hour at the most) and writes nothing |
+| `POST spans/search`, `POST spans/aggregate`, `POST spans/facets` | spans as logs (§8.7), their searches the trace explorer's (`resource_name:`, `@duration:>250ms`, `trace_id:`): newest first, analytics by facets (`resource_name` among them), each facet's most common values |
+| `GET traces/{id}?from=&to=` | a trace (§8.7): its spans as a waterfall draws them (each its offset from the trace's start, duration, depth and parent's place), its services, errors and roots; without `from` and `to` the spans' whole retention, the blocks without it unread |
+| `GET apm/services?from=&to=&env=`, `GET apm/services/{name}` | the services' requests, errors and latency (p50, p95, p99, most) over the range, from the trace metrics; a service's by resource and kind, and the calls it makes by what it calls |
+| `GET apm/map?from=&to=&env=` | the service map: nodes (each its requests and errors, whether only named) and edges (calls, errors, mean latency, whether inferred), and the share of traces read |
+| `GET/POST span_metrics`, `GET/PUT/DELETE span_metrics/{name}`, `POST span_metric_test` | metrics from spans, as `log_metrics` are; the list says kiln's trace metrics too (`builtin`) |
 | `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
@@ -965,6 +990,92 @@ safe, bounded at 64 MiB, read back to the byte against the reference CLI at ever
 fuzzed), deflate or gzip. Anything else under Datadog's paths (its metadata, its other products'
 intakes) is answered 202 and passed over, so an Agent neither retries nor complains; a node behind
 answers 503 and the Agent keeps its payload and sends it again.
+
+### 8.7 Traces
+
+Spans come over OTLP: `POST /v1/traces` (protobuf or OTLP's JSON, gzip or not) and OTLP/gRPC's
+`opentelemetry.proto.collector.trace.v1.TraceService/Export`, on the server (the ingest token) and
+on every runner's receiver (`127.0.0.1:4318` and `:4317`), as metrics and logs come. A span the
+specification calls invalid (no trace id of 16 bytes, or span id of 8, not all zero) is not kept
+and is said in the answer's partial success (`rejectedSpans`, OTLP's `ExportTracePartialSuccess`),
+over HTTP and gRPC alike.
+
+**A span is a record of a store of its own** (`kiln_obs::otlp::traces`, the span store: §4.6's
+engine, its own files and retention). The decoder writes each span straight into its row (the log
+rows' encoding), no record made of it on the way, its buffers kept from one request to the next:
+
+- its time the span's start; `duration` (ns, Datadog's `@duration`) its end less its start;
+- its message the span's name, which OpenTelemetry has be "the most general string that
+  identifies a (statistically) interesting class of Spans" (`GET /users/{id}`): Datadog's
+  resource, searched as `resource_name:`;
+- `service` and `host` the resource's `service.name` and `host.name`, `source` the
+  instrumentation scope's name; severity 17 for status ERROR (`status:error`), 9 else
+  (`status:ok`);
+- its attributes the span's over its resource's, and kiln's own first, so that no attribute of the
+  span's stands for them: `span.kind`, `duration`, `parent_id` (hex) and `otel.status_code`; then,
+  where the span does not say them itself, Datadog's unified service tags `env` and `version` (from
+  `deployment.environment[.name]` and `service.version`), the error (its first exception event's
+  `exception.type`, `.message` and `.stacktrace` as `error.type`, `error.message` and
+  `error.stack`, as Datadog maps them; else an error's status message), `peer.service` on a
+  client's or a producer's span (as given, else the first of `db.system.name`, `db.system`,
+  `messaging.system`, `rpc.service`, `server.address`, `net.peer.name` it has: Datadog's inferred
+  services' peer tags), Datadog's `http.status_code` (from `http.response.status_code`), and its
+  events and links as JSON (an event's time as its offset from the span's start);
+- limits Datadog's trace agent's (`pkg/trace/traceutil/truncate.go`): a value at 25,000 bytes, a
+  name at 5,000; attributes 128 in all (OpenTelemetry's count limit), the span's past what kiln's
+  own leave dropped in key order; a row at most 256 KiB, its longest values cut to the one length
+  that brings it within (water-filling), so a write always holds it.
+
+Rows go in segments of 256 KiB (a log block's text, LZ4's ratio plateau, §12.6), each a write's
+item of its own (`SPANS`, as `LOGS` is), packed whole beside points and records and refused at the
+same bound as records (§8): a segment's buffer comes back to the receivers for the next request's
+rows once it is in a write.
+
+**Found by their trace.** A block of spans' token filter holds each one's trace id (its 16 bytes
+hashed, `kiln_obs::logs::bloom::id_hashes`, not its hex as a token: ids of one family, as tracers
+make them, Datadog's zero-padded 64-bit ids or X-Ray's time-prefixed ones, must hash apart), every
+place in it salted by the block (`salted`, from its summary's first time and rows: filters of one
+size otherwise set the same bits for the tokens every block holds, a service's name, `server`, so a
+query whose places fell on those passed most filters; measured, §12.23) and
+leaves out what a word search never wants and each span has one of (`duration`, `parent_id`,
+`events`, `links`: a search of them is never ruled out by it), so `trace_id:<hex>` reads only the
+blocks that hold the trace, whatever the range: a trace's page finds its spans in the whole
+retention without a time. Logs' filters hold no trace ids (their blocks were sealed without them);
+`trace_id:` searches logs by the range alone, and a trace's page asks its logs over its own minute.
+
+**A trace** (`kiln_obs::apm::assemble`) is its spans as a waterfall draws them: each root (a span
+whose parent the trace does not hold), then its descendants depth first, siblings by their start; a
+span sent twice (an exporter's retry) once; a cycle of parents (malformed) broken where it is met.
+The earliest 10,000 are given (a browser parses some 10 MB of them in a tenth of a second), and
+the answer says when there were more.
+
+**Trace metrics** are Datadog's, counted on the server as metrics from logs are (§8.3: each
+window of ten seconds whole once its spans have come, again when more come for it; one writer, so a
+span sent to any node counts once): of the spans its trace agent computes stats of, a service's
+entry spans (its servers', its consumers', and a trace's root that calls out to nothing) and its
+exits (its clients' and producers'), never a span within a service (a function's span would make
+series of every function):
+
+| metric | of | by |
+| --- | --- | --- |
+| `trace.hits`, `trace.errors` | entry spans (errors: those of status ERROR) | `service`, `resource_name`, `span.kind`, `env`, `version`, `http.status_code` |
+| `trace.duration` | their durations, in seconds: a distribution (§4.4), any percentile | the same |
+| `trace.outbound.hits`, `.errors`, `.duration` | exits | `service`, `resource_name`, `span.kind`, `env`, `peer.service` |
+
+Each definition keeps 2,000 groups a window at the most (OpenTelemetry's cardinality limit), past
+it `otel.metric.overflow:true`, as metrics from logs do. So monitors, SLOs and dashboards read APM
+as any metric (`sum:trace.errors{service:checkout}.as_count() / sum:trace.hits{service:checkout}.as_count()`),
+and Datadog's "generate metrics from spans" is `span_metrics` (§7), its filters span searches and a
+distribution of `@duration` in seconds.
+
+**Services** (`kiln_obs::apm::red`) are read from the trace metrics: over any range, each group's
+counts summed and its durations' buckets merged before a percentile is read, so a p95 over a day is
+the day's, not an average of windows'. **The service map** (`kiln_obs::apm::MapBuilder`) is read
+from the spans: a span whose parent is another service's is a call of that service to its own (the
+caller's client span's duration the call's), a client's or a producer's span no other service's span
+answered is a call to its `peer.service`, named only. Past 200,000 spans in the range (the blocks'
+summaries say how many before any is read), one trace in `k` is read, chosen by its id (W3C's random
+low 64 bits, mixed again), so a trace is read whole or not at all, and the counts are scaled by `k`.
 
 ## 9. Monitors
 
@@ -1439,6 +1550,25 @@ time range and the search in the address (a page is a link).
   top, as the records list shows them; the line above says how many a second match and, when they
   come faster than 50 a second, that a sample of them is shown. Pause holds what comes (counted)
   until Resume; opening a record pauses.
+- **APM** (§8.7): the services that send traces, each its requests (and a second), its errors'
+  share and its p50, p95 and p99 over the range, from the trace metrics, narrowed to an environment
+  when there are several; a service's page its figures, its requests and errors and its latency's
+  percentiles over the range, its resources and the calls it makes (each its count, errors, mean and
+  p95), a resource a click from its spans.
+- **Traces**: the trace explorer, as the logs explorer (a search in the trace explorer's syntax, a
+  histogram by status, facets, the newest 200 spans: time, service, name, kind, duration), each span a
+  click from its trace. A trace's page: its root, duration, spans, errors and services (each its
+  color); its waterfall, each span a row under its parent, its bar where it began and as long as it
+  took on the trace's time, its service's color, an error ringed red (the first 400 rows, the rest on
+  asking); the span picked (in the address) opened below: its error and stack, its attributes, its
+  events at their offsets, its links to their traces; and the logs that carry the trace's id. A log
+  record's trace id is a link to its trace.
+- **Service map**: who calls whom over the range, each service a box (its requests, its errors'
+  share; red when any failed), each call an arrow (as thick as the square root of its share of the
+  most, red when any failed, dashed to a peer only named), callers to the left of what they call:
+  each service as far right as its longest chain of callers puts it (a cycle's calls back left out),
+  each column in the order of its services' callers (the barycenter heuristic's sweep). A box a
+  click from its service's page.
 - **Logs explorer and event stream**: a search, a histogram of its records by status (stacked, a
   bucket of a round size, about 60 to the range), each facet's most common values (a click narrows
   the search to one, again widens it), the newest 100 records (and 100 more on asking), each opened
@@ -2297,6 +2427,29 @@ to 38 allocations a frame): a bitstream's bits read a word at a time where eight
 made once), its literals and its scratch from frame to frame. A few KB of an Agent's payload is a
 few microseconds.
 
+### 12.23 Traces
+
+`cargo bench -p kiln-obs --bench traces` (fedora, 2026-10-19): OTLP trace requests as an SDK's batch
+span processor exports them (512 spans, its `max_export_batch_size`; and 4,096), of a web service:
+its servers' spans, its HTTP clients' and its database calls' (a resource of ten attributes, each
+span five to eight of its own, one in twenty an exception event), decoded into span rows with the
+decoder's room kept from request to request:
+
+| request | spans | bytes | rows, B a span | LZ4, B a span | decode, ns a span | allocations a span | page faults |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| a web service's | 512 | 168,534 | 685 | 41 | 628 | 0.0020 (one a request) | 0 |
+| the same | 4,096 | 1,346,671 | 685 | 41 | 614 | 0.013 | 0 |
+
+A span's row repeats its resource's attributes (685 bytes against OTLP's 329), which LZ4 takes back
+(41 bytes a span in a write: 17 to one), so a span costs the group less than its request did. Some
+1.6 million spans a second a core.
+
+A trace by its id, in a span store of 1,024,000 spans (341,334 traces) in 2,000 blocks: 1.6 ms, its
+own block and a median of 20 others read (p99 31, the most 37): the 1% each filter is sized for,
+whichever trace. Before the filters were salted by their block (§8.7), the median was 7 and the most
+654: filters of one size set the same bits for the tokens every block holds (the service, `server`,
+the names), so a query whose places fell on them passed most of them.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -2562,6 +2715,22 @@ gauge's last value, 30 distribution values their count exactly and their median 
 sketches' bounds, an event of its host with its tags, a service check a record (`status:error`); a
 file it tails, its five lines records of its service and source, `filename` among their
 attributes. A key that is not one: 403, as Datadog answers. 2026-10-19: passes (71 s).
+
+**Traces** (`crates/kiln/tests/observe_traces.rs`; Docker): a kiln server and a runner, and two
+services instrumented with OpenTelemetry's own Python SDK (1.45.1; Flask's and requests'
+instrumentation 0.66b1, grpcio 1.84.0): a frontend exporting OTLP/HTTP to the server, its spans and
+its logs, and a cart service it calls exporting OTLP/gRPC to the runner's receiver, the cart's
+database call failing one order in ten. Forty orders: each a trace of four spans across the two
+services (the frontend's server span and its call, the cart's server span and its query), the
+cart's by way of the runner and the group; a failing order's trace found by its id, its spans at
+depths 0 to 3, each its parent's child, its offsets in order, its database span's error the
+exception's (`ValueError`, its message) and its peer `postgresql`, its unified service tags; the
+frontend's log of the order found by the trace's id; the trace explorer's syntax finding the four
+database failures of 20 ms or more; from the trace metrics, each service's 40 requests and 4
+errors, the cart's median past its 20 ms, its one resource's 40, its 40 calls to its database
+with their 4 failures; the map's frontend → cart (answered by the cart's spans) and
+cart → postgresql (named) at 40 calls each. Spans with no ids refused, said as the partial
+success (protobuf and JSON). 2026-10-19: passes (71 s, on fedora).
 
 **Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
 KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and

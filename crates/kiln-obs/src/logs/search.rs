@@ -8,7 +8,12 @@
 //! ```
 //! Juxtaposition is AND; `OR`, `AND`, `NOT` and a leading `-` as in Datadog; a bare word matches a
 //! token of the message, a quoted phrase a substring of it (case-insensitively); `service`, `host`,
-//! `source` and `status` (or `level`) are the record's own fields, `@key` an attribute.
+//! `source` and `status` (or `level`) are the record's own fields, `trace_id` and `span_id` its ids
+//! (hex, as OpenTelemetry writes them), `@key` an attribute.
+//!
+//! Spans are searched as Datadog's trace explorer has them ([`parse_spans`]): the same, and
+//! `resource_name` (or `resource`) the span's name, its message; `@duration` (ns, as stored) takes a
+//! unit too (`@duration:>250ms`, `@duration:[1s TO 5s]`).
 
 use super::block::LogBlock;
 use super::bloom::{token_hashes, tokens};
@@ -64,6 +69,11 @@ pub enum Leaf {
     Field(Field, Text),
     Status(u8, u8),
     Attr(String, AttrMatch),
+    /// A record's trace id, or its span id.
+    TraceId([u8; 16]),
+    SpanId([u8; 8]),
+    /// A span's name (its message), whole.
+    Name(Text),
     /// A token, lowercased.
     Word(String),
     /// A phrase, lowercased.
@@ -113,8 +123,44 @@ fn number(s: &str) -> Option<f64> {
     s.trim().parse::<f64>().ok().filter(|x| x.is_finite())
 }
 
-/// One term's leaf: `key:value`, `@key:value`, a quoted phrase, or a word.
-fn term(text: &str, quoted: bool, at: usize) -> Result<Leaf, SearchError> {
+/// A duration with its unit (`250ms`, `1.5s`, `2m`; none: ns), in ns.
+fn duration_ns(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let at = s.find(|c: char| c.is_ascii_alphabetic() || c == 'µ').unwrap_or(s.len());
+    let (n, unit) = s.split_at(at);
+    let scale = match unit {
+        "" | "ns" => 1.0,
+        "us" | "µs" => 1e3,
+        "ms" => 1e6,
+        "s" => 1e9,
+        "m" | "min" => 60e9,
+        "h" => 3_600e9,
+        _ => return None,
+    };
+    number(n).map(|x| x * scale)
+}
+
+/// What a value of `key` is as a number: a span's duration with its unit, else the number it says.
+fn number_of(key: &str, v: &str, spans: bool) -> Option<f64> {
+    if spans && key == "duration" { duration_ns(v) } else { number(v) }
+}
+
+/// An id in hex, `N` bytes of it.
+fn hex_id<const N: usize>(v: &str) -> Option<[u8; N]> {
+    let v = v.trim();
+    if v.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(v.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// One term's leaf: `key:value`, `@key:value`, a quoted phrase, or a word; `spans`, as the trace
+/// explorer reads it.
+fn term(text: &str, quoted: bool, at: usize, spans: bool) -> Result<Leaf, SearchError> {
     if quoted {
         return Ok(Leaf::Phrase(text.to_lowercase()));
     }
@@ -140,19 +186,23 @@ fn term(text: &str, quoted: bool, at: usize) -> Result<Leaf, SearchError> {
                 let r = severities(value).ok_or_else(|| syntax(at, format!("no status {value:?}")))?;
                 return Ok(Leaf::Status(*r.start(), *r.end()));
             }
+            "trace_id" => return hex_id::<16>(value).map(Leaf::TraceId).ok_or_else(|| syntax(at, "a trace id: 32 hex digits")),
+            "span_id" => return hex_id::<8>(value).map(Leaf::SpanId).ok_or_else(|| syntax(at, "a span id: 16 hex digits")),
+            "resource_name" | "resource" if spans => return Ok(Leaf::Name(Text::of(value))),
             _ => {}
         }
     }
+    let n = |v: &str, what: &'static str| number_of(key, v, spans).ok_or_else(|| syntax(at, what));
     let m = if value == "*" {
         AttrMatch::Exists
     } else if let Some(v) = value.strip_prefix(">=") {
-        AttrMatch::Cmp(Cmp::Ge, number(v).ok_or_else(|| syntax(at, "a number after >="))?)
+        AttrMatch::Cmp(Cmp::Ge, n(v, "a number after >=")?)
     } else if let Some(v) = value.strip_prefix("<=") {
-        AttrMatch::Cmp(Cmp::Le, number(v).ok_or_else(|| syntax(at, "a number after <="))?)
+        AttrMatch::Cmp(Cmp::Le, n(v, "a number after <=")?)
     } else if let Some(v) = value.strip_prefix('>') {
-        AttrMatch::Cmp(Cmp::Gt, number(v).ok_or_else(|| syntax(at, "a number after >"))?)
+        AttrMatch::Cmp(Cmp::Gt, n(v, "a number after >")?)
     } else if let Some(v) = value.strip_prefix('<') {
-        AttrMatch::Cmp(Cmp::Lt, number(v).ok_or_else(|| syntax(at, "a number after <"))?)
+        AttrMatch::Cmp(Cmp::Lt, n(v, "a number after <")?)
     } else {
         AttrMatch::Text(Text::of(value))
     };
@@ -162,7 +212,7 @@ fn term(text: &str, quoted: bool, at: usize) -> Result<Leaf, SearchError> {
 /// The longest search: the request-line bound every HTTP implementation accepts (RFC 9110 §4.1).
 pub const MAX_SEARCH_BYTES: usize = 8000;
 
-fn lex(q: &str) -> Result<Vec<(usize, Tok)>, SearchError> {
+fn lex(q: &str, spans: bool) -> Result<Vec<(usize, Tok)>, SearchError> {
     if q.len() > MAX_SEARCH_BYTES {
         return Err(SearchError::TooLong(q.len(), MAX_SEARCH_BYTES));
     }
@@ -208,7 +258,7 @@ fn lex(q: &str) -> Result<Vec<(usize, Tok)>, SearchError> {
                 if !closed {
                     return Err(syntax(i, "an unterminated quote"));
                 }
-                out.push((i, Tok::Term(term(&s, true, i)?)));
+                out.push((i, Tok::Term(term(&s, true, i, spans)?)));
             }
             _ => {
                 // A term runs to whitespace or a bracket; `key:"quoted value"` and `[a TO b]`
@@ -254,8 +304,8 @@ fn lex(q: &str) -> Result<Vec<(usize, Tok)>, SearchError> {
                         if !to.eq_ignore_ascii_case("to") || parts.len() != 3 {
                             return Err(syntax(j, "a range is [a TO b]"));
                         }
-                        let (lo, hi) = (number(lo).ok_or_else(|| syntax(j, "a range's numbers"))?, number(hi).ok_or_else(|| syntax(j, "a range's numbers"))?);
                         let key = text.trim_end_matches(':').trim_start_matches('@').to_owned();
+                        let (lo, hi) = (number_of(&key, lo, spans).ok_or_else(|| syntax(j, "a range's numbers"))?, number_of(&key, hi, spans).ok_or_else(|| syntax(j, "a range's numbers"))?);
                         out.push((start, Tok::Term(Leaf::Attr(key, AttrMatch::Range(lo, hi)))));
                         text.clear();
                         break;
@@ -270,7 +320,7 @@ fn lex(q: &str) -> Result<Vec<(usize, Tok)>, SearchError> {
                     "AND" => out.push((start, Tok::And)),
                     "OR" => out.push((start, Tok::Or)),
                     "NOT" => out.push((start, Tok::Not)),
-                    _ => out.push((start, Tok::Term(term(&text, false, start)?))),
+                    _ => out.push((start, Tok::Term(term(&text, false, start, spans)?))),
                 }
             }
         }
@@ -301,7 +351,16 @@ fn prec(op: Op) -> u8 {
 
 /// Parses a search; an empty one matches everything.
 pub fn parse(q: &str) -> Result<Search, SearchError> {
-    let toks = lex(q)?;
+    parse_as(q, false)
+}
+
+/// Parses a search of spans, as Datadog's trace explorer reads one.
+pub fn parse_spans(q: &str) -> Result<Search, SearchError> {
+    parse_as(q, true)
+}
+
+fn parse_as(q: &str, spans: bool) -> Result<Search, SearchError> {
+    let toks = lex(q, spans)?;
     let mut nodes: Vec<Node> = Vec::new();
     let mut vals: Vec<usize> = Vec::new();
     let mut ops: Vec<Op> = Vec::new();
@@ -419,14 +478,25 @@ impl Search {
         Self { nodes: vec![Node::Leaf(Leaf::All)], root: 0 }
     }
 
+    /// The search for one trace's spans, or records.
+    pub fn trace(id: [u8; 16]) -> Self {
+        Self { nodes: vec![Node::Leaf(Leaf::TraceId(id))], root: 0 }
+    }
+
     /// Whether a block may hold a match, from its summary alone.
     pub fn block(&self, b: &LogBlock) -> Maybe {
+        self.block_in(b, false)
+    }
+
+    /// As [`Search::block`], of a block of spans when `spans` (its filter holds trace ids, and not
+    /// [`super::block::UNTOKENIZED`]'s values).
+    pub fn block_in(&self, b: &LogBlock, spans: bool) -> Maybe {
         let mut v: Vec<Maybe> = Vec::with_capacity(self.nodes.len());
         let mut buf = String::new();
         for n in &self.nodes {
             let get = |i: usize| v.get(i).copied().unwrap_or(Maybe::Unknown);
             let m = match n {
-                Node::Leaf(l) => leaf_block(l, b, &mut buf),
+                Node::Leaf(l) => leaf_block(l, b, &mut buf, spans),
                 Node::Not(x) => match get(*x) {
                     Maybe::Yes => Maybe::No,
                     Maybe::No => Maybe::Yes,
@@ -488,11 +558,14 @@ fn dict(list: &[String], t: &Text) -> Maybe {
     }
 }
 
-fn leaf_block(l: &Leaf, b: &LogBlock, buf: &mut String) -> Maybe {
+fn leaf_block(l: &Leaf, b: &LogBlock, buf: &mut String, spans: bool) -> Maybe {
+    // A block of spans' filter is salted by the block (`super::bloom::salted`).
+    let salt = spans.then(|| b.salt());
+    let has = |h: (u64, u64)| b.bloom.may_contain(salt.map_or(h, |s| super::bloom::salted(h, s)));
     let all_tokens_in = |text: &str, buf: &mut String| {
         let mut ok = true;
         tokens(text, buf, |t| {
-            if !b.bloom.may_contain(token_hashes(t)) {
+            if !has(token_hashes(t)) {
                 ok = false;
             }
         });
@@ -518,10 +591,27 @@ fn leaf_block(l: &Leaf, b: &LogBlock, buf: &mut String) -> Maybe {
                 return Maybe::No;
             }
             match m {
-                AttrMatch::Text(Text::Exact(v)) if !all_tokens_in(v, buf) => Maybe::No,
+                AttrMatch::Text(Text::Exact(v)) if !(spans && super::block::UNTOKENIZED.contains(&k.as_str())) && !all_tokens_in(v, buf) => Maybe::No,
                 _ => Maybe::Unknown,
             }
         }
+        // A block of spans' filter holds its trace ids; one of logs', none.
+        Leaf::TraceId(t) => {
+            if spans && !has(super::bloom::id_hashes(t)) {
+                Maybe::No
+            } else {
+                Maybe::Unknown
+            }
+        }
+        Leaf::SpanId(_) => Maybe::Unknown,
+        Leaf::Name(Text::Exact(n)) => {
+            if all_tokens_in(n, buf) {
+                Maybe::Unknown
+            } else {
+                Maybe::No
+            }
+        }
+        Leaf::Name(Text::Glob(_)) => Maybe::Unknown,
         Leaf::Word(w) | Leaf::Phrase(w) => {
             if all_tokens_in(w, buf) {
                 Maybe::Unknown
@@ -541,6 +631,8 @@ pub trait Fields {
     fn source(&self) -> &str;
     fn severity(&self) -> u8;
     fn attr(&self, key: &str) -> Option<&str>;
+    fn trace_id(&self) -> Option<[u8; 16]>;
+    fn span_id(&self) -> Option<[u8; 8]>;
 }
 
 impl Fields for RecordRef<'_> {
@@ -562,6 +654,12 @@ impl Fields for RecordRef<'_> {
     fn attr(&self, key: &str) -> Option<&str> {
         RecordRef::attr(self, key)
     }
+    fn trace_id(&self) -> Option<[u8; 16]> {
+        self.trace_id
+    }
+    fn span_id(&self) -> Option<[u8; 8]> {
+        self.span_id
+    }
 }
 
 impl Fields for crate::logs::record::Record {
@@ -582,6 +680,12 @@ impl Fields for crate::logs::record::Record {
     }
     fn attr(&self, key: &str) -> Option<&str> {
         self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+    fn trace_id(&self) -> Option<[u8; 16]> {
+        self.trace_id
+    }
+    fn span_id(&self) -> Option<[u8; 8]> {
+        self.span_id
     }
 }
 
@@ -608,6 +712,9 @@ fn leaf_row<F: Fields>(l: &Leaf, r: &F, lower: &mut String, lowered: &mut bool, 
         Leaf::Field(Field::Host, t) => t.matches(r.host()),
         Leaf::Field(Field::Source, t) => t.matches(r.source()),
         Leaf::Status(lo, hi) => (*lo..=*hi).contains(&r.severity()),
+        Leaf::TraceId(t) => r.trace_id() == Some(*t),
+        Leaf::SpanId(s) => r.span_id() == Some(*s),
+        Leaf::Name(t) => t.matches(r.message()),
         Leaf::Attr(k, m) => match r.attr(k) {
             None => false,
             Some(v) => match m {

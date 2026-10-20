@@ -19,6 +19,11 @@
 //! of each second at the most.
 //!
 //! Definitions are `<observe>/log_metrics.json`.
+//!
+//! Metrics from spans are counted alike, over the span store ([`LogMetrics::open_spans`],
+//! `<observe>/span_metrics.json`): Datadog's "generate metrics from spans", their filters read as
+//! the trace explorer reads a search (`kiln_obs::logs::search::parse_spans`), a distribution of
+//! `@duration` in seconds; and kiln's trace metrics among them always (`kiln_obs::apm`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -135,8 +140,9 @@ impl DefIn {
 }
 
 /// Whether `name` is a metric's name: Datadog's custom metrics' (a letter first, then ASCII
-/// letters, digits, `_` and `.`; 200 at the most), and none kiln writes.
-fn check_name(name: &str) -> Result<(), String> {
+/// letters, digits, `_` and `.`; 200 at the most), and none kiln writes (of spans, its trace
+/// metrics' `trace.*` neither).
+fn check_name(name: &str, spans: bool) -> Result<(), String> {
     let ok = name.len() <= 200 && name.starts_with(|c: char| c.is_ascii_alphabetic()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
     if !ok {
         return Err("a metric's name: a letter, then letters, digits, _ and . (200 at the most)".into());
@@ -144,15 +150,24 @@ fn check_name(name: &str) -> Result<(), String> {
     if let Some(p) = RESERVED.iter().find(|p| name.starts_with(*p)) {
         return Err(format!("{p}*: names kiln writes itself"));
     }
+    if spans && name.starts_with(kiln_obs::apm::PREFIX) {
+        return Err(format!("{}*: kiln's trace metrics' names", kiln_obs::apm::PREFIX));
+    }
     Ok(())
 }
 
 impl LogMetricDef {
     /// Compiled, its windows counted from `since_ms` on.
     pub fn compile(&self, since_ms: i64) -> Result<LogMetric, String> {
-        check_name(&self.name)?;
+        self.compile_for(since_ms, false)
+    }
+
+    /// As [`LogMetricDef::compile`], of spans when `spans`.
+    pub fn compile_for(&self, since_ms: i64, spans: bool) -> Result<LogMetric, String> {
+        check_name(&self.name, spans)?;
         let q = self.filter.query.trim();
-        let search = kiln_obs::logs::search::parse(if q.is_empty() { "*" } else { q }).map_err(|e| format!("the filter: {e}"))?;
+        let q = if q.is_empty() { "*" } else { q };
+        let search = if spans { kiln_obs::logs::search::parse_spans(q) } else { kiln_obs::logs::search::parse(q) }.map_err(|e| format!("the filter: {e}"))?;
         let compute = match self.compute.aggregation_type {
             Aggregation::Count => {
                 if self.compute.path.as_deref().is_some_and(|p| !p.trim().is_empty() && p.trim() != "*") {
@@ -162,7 +177,12 @@ impl LogMetricDef {
             }
             Aggregation::Distribution => {
                 let path = self.compute.path.as_deref().map(str::trim).filter(|p| p.starts_with('@') && p.len() > 1).ok_or("a distribution's path: the attribute whose values it takes (@duration)")?;
-                Compute::Distribution { path: path.to_owned(), percentiles: self.compute.include_percentiles }
+                if spans && path == "@duration" {
+                    // A span's duration in seconds, as kiln's trace metrics have it.
+                    Compute::Duration { percentiles: self.compute.include_percentiles }
+                } else {
+                    Compute::Distribution { path: path.to_owned(), percentiles: self.compute.include_percentiles }
+                }
             }
         };
         let mut by = Vec::with_capacity(self.group_by.len());
@@ -170,7 +190,7 @@ impl LogMetricDef {
             if g.path.trim().is_empty() || g.path.trim() == "@" {
                 return Err("a group's path: an attribute (@http.status_code) or service, host, source or status".into());
             }
-            by.push((Facet::parse(&g.path), g.tag()));
+            by.push((if spans { Facet::parse_span(&g.path) } else { Facet::parse(&g.path) }, g.tag()));
         }
         // A window that begins as it changed is the first it counts (none of its records counted
         // by the definition before).
@@ -355,9 +375,11 @@ impl State {
     }
 }
 
-/// The server's metrics from logs.
+/// The server's metrics from logs (or from spans).
 pub struct LogMetrics {
     path: PathBuf,
+    /// Of spans, over the span store, kiln's trace metrics among them.
+    spans: bool,
     saved: Mutex<Saved>,
     compiled: Mutex<Arc<Vec<LogMetric>>>,
     state: Mutex<State>,
@@ -365,18 +387,36 @@ pub struct LogMetrics {
 
 impl LogMetrics {
     pub fn open(dir: &Path) -> Arc<Self> {
-        let path = dir.join("log_metrics.json");
+        Self::open_at(dir.join("log_metrics.json"), false)
+    }
+
+    /// The server's metrics from spans: its trace metrics, and those defined.
+    pub fn open_spans(dir: &Path) -> Arc<Self> {
+        Self::open_at(dir.join("span_metrics.json"), true)
+    }
+
+    fn open_at(path: PathBuf, spans: bool) -> Arc<Self> {
         let saved: Saved = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let me = Arc::new(Self { path, saved: Mutex::new(saved), compiled: Mutex::new(Arc::new(Vec::new())), state: Mutex::new(State::default()) });
+        let me = Arc::new(Self { path, spans, saved: Mutex::new(saved), compiled: Mutex::new(Arc::new(Vec::new())), state: Mutex::new(State::default()) });
         me.recompile();
         me
     }
 
+    /// Whether these are metrics from spans.
+    pub fn of_spans(&self) -> bool {
+        self.spans
+    }
+
+    /// kiln's own metrics counted with those defined: of spans, its trace metrics.
+    pub fn builtin(&self) -> Vec<LogMetric> {
+        if self.spans { kiln_obs::apm::trace_metrics() } else { Vec::new() }
+    }
+
     fn recompile(&self) {
         let saved = lock(&self.saved);
-        let mut out = Vec::with_capacity(saved.metrics.len());
+        let mut out = self.builtin();
         for k in &saved.metrics {
-            match k.def.compile(k.modified) {
+            match k.def.compile_for(k.modified, self.spans) {
                 Ok(m) => out.push(m),
                 Err(e) => tracing::warn!(metric = %k.def.name, error = %e, "a metric from logs does not compile here; it is not counted"),
             }
@@ -402,7 +442,7 @@ impl LogMetrics {
     /// write): refused, as one whose series another metric from logs writes is.
     pub fn create(&self, def: LogMetricDef, written: impl Fn(&str) -> bool) -> Result<Kept, (u16, String)> {
         let now = super::clock_ms();
-        let m = def.compile(now).map_err(|e| (400, e))?;
+        let m = def.compile_for(now, self.spans).map_err(|e| (400, e))?;
         let names: Vec<String> = m.names().into_iter().map(|(n, _)| n).collect();
         let held = names.iter().find(|n| written(n)).cloned();
         let mut saved = lock(&self.saved);
@@ -410,7 +450,7 @@ impl LogMetrics {
             return Err((400, format!("{METRICS} metrics from logs at the most")));
         }
         for k in &saved.metrics {
-            let theirs = k.def.compile(k.modified).map(|o| o.names().into_iter().map(|(n, _)| n).collect::<Vec<_>>()).unwrap_or_else(|_| vec![k.def.name.clone()]);
+            let theirs = k.def.compile_for(k.modified, self.spans).map(|o| o.names().into_iter().map(|(n, _)| n).collect::<Vec<_>>()).unwrap_or_else(|_| vec![k.def.name.clone()]);
             if k.def.name == def.name || theirs.iter().any(|n| names.contains(n)) {
                 return Err((409, format!("{}: written by the metric from logs {} already", def.name, k.def.name)));
             }
@@ -436,7 +476,7 @@ impl LogMetrics {
         if def.name != name {
             return Err((400, "a metric's name stays: a new metric takes another".into()));
         }
-        def.compile(now).map_err(|e| (400, e))?;
+        def.compile_for(now, self.spans).map_err(|e| (400, e))?;
         let mut saved = lock(&self.saved);
         let Some(k) = saved.metrics.iter_mut().find(|k| k.def.name == name) else { return Ok(None) };
         if k.def.compute.aggregation_type != def.compute.aggregation_type || k.def.compute.path.as_deref().map(str::trim) != def.compute.path.as_deref().map(str::trim) {
@@ -494,7 +534,7 @@ impl LogMetrics {
             let Some(w) = st.due(now) else { return };
             drop(st);
             let counting = Instant::now();
-            let counted = s.count_log_metrics(&metrics, w);
+            let counted = if self.spans { s.count_span_metrics(&metrics, w) } else { s.count_log_metrics(&metrics, w) };
             drop(s);
             let took = u64::try_from(counting.elapsed().as_millis()).unwrap_or(u64::MAX);
             let mut st = lock(&self.state);
@@ -554,7 +594,7 @@ impl LogMetrics {
             let Some(store) = o.store() else { continue };
             let me = self.clone();
             let _ = crate::rt::blocking(move || {
-                let touched = o.touched().clone();
+                let touched = if me.spans { o.spans_touched() } else { o.touched() }.clone();
                 me.tick(&store, &touched, &|series| o.offer(series));
             })
             .await;

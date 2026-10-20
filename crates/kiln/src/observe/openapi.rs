@@ -240,6 +240,109 @@ fn schemas() -> Map<String, Value> {
             &["facets", "matched", "rows_scanned", "took_ms"],
         ),
     );
+    fn span_fields(extra: &[(&'static str, Value)]) -> Vec<(&'static str, Value)> {
+        let mut f: Vec<(&'static str, Value)> = vec![
+            ("ts_ns", describe(integer(), "the span's start, nanoseconds since the epoch")),
+            ("status", describe(one_of(&["info", "error"]), "error for OpenTelemetry's status ERROR")),
+            ("service", string()),
+            ("host", string()),
+            ("source", describe(string(), "its instrumentation scope")),
+            ("attributes", describe(map_of(string()), "the span's and its resource's; kiln's own: span.kind, duration (ns), parent_id, otel.status_code, env, version, error.*, peer.service, http.status_code, events, links")),
+            ("trace_id", string()),
+            ("span_id", string()),
+        ];
+        f.extend(extra.iter().cloned());
+        f
+    }
+    put("Span", object(&span_fields(&[("severity", integer()), ("message", describe(string(), "its name: Datadog's resource"))]), &["ts_ns", "status", "service", "message", "attributes", "trace_id", "span_id"]));
+    put(
+        "SpansAnswer",
+        object(
+            &[("spans", describe(array(schema("Span")), "newest first")), ("blocks", object(&[("total", integer()), ("pruned", integer())], &["total", "pruned"])), ("rows_scanned", integer()), ("took_ms", number())],
+            &["spans", "blocks", "rows_scanned", "took_ms"],
+        ),
+    );
+    put(
+        "PlacedSpan",
+        object(
+            &span_fields(&[
+                ("resource_name", describe(string(), "its name")),
+                ("offset_ns", describe(integer(), "its start from the trace's")),
+                ("duration_ns", integer()),
+                ("depth", describe(integer(), "how many of its ancestors the trace holds")),
+                ("parent", describe(nullable(integer()), "its parent's place in spans, if the trace holds it")),
+            ]),
+            &["ts_ns", "offset_ns", "duration_ns", "depth", "status", "service", "resource_name", "attributes", "span_id"],
+        ),
+    );
+    put(
+        "Trace",
+        object(
+            &[
+                ("trace_id", string()),
+                ("start_ns", integer()),
+                ("end_ns", integer()),
+                ("duration_ns", integer()),
+                ("root", nullable(object(&[("service", string()), ("resource_name", string())], &["service", "resource_name"]))),
+                ("spans_count", describe(integer(), "spans the trace holds; past 10,000 the earliest are given")),
+                ("truncated", boolean()),
+                ("errors", integer()),
+                ("roots", describe(integer(), "spans whose parent the trace does not hold: one, held whole")),
+                ("services", array(object(&[("service", string()), ("spans", integer())], &["service", "spans"]))),
+                ("spans", describe(array(schema("PlacedSpan")), "each root, then its descendants depth first, siblings by their start")),
+                ("took_ms", number()),
+            ],
+            &["trace_id", "start_ns", "end_ns", "duration_ns", "spans_count", "truncated", "errors", "roots", "services", "spans"],
+        ),
+    );
+    let red = |key: &str| {
+        object(
+            &[
+                (key, string()),
+                ("hits", number()),
+                ("errors", number()),
+                ("error_rate", nullable(number())),
+                ("avg_s", nullable(number())),
+                ("p50_s", nullable(number())),
+                ("p95_s", nullable(number())),
+                ("p99_s", nullable(number())),
+                ("max_s", nullable(number())),
+            ],
+            &[key, "hits", "errors"],
+        )
+    };
+    put("ServicesAnswer", object(&[("from", ms()), ("to", ms()), ("env", nullable(string())), ("envs", array(string())), ("services", array(red("service")))], &["from", "to", "services"]));
+    put(
+        "ServiceAnswer",
+        object(
+            &[
+                ("service", string()),
+                ("from", ms()),
+                ("to", ms()),
+                ("env", nullable(string())),
+                ("summary", nullable(red("service"))),
+                ("kinds", array(red("span.kind"))),
+                ("resources", array(red("resource_name"))),
+                ("calls", describe(array(red("peer.service")), "the calls it makes, by what it calls")),
+            ],
+            &["service", "from", "to", "kinds", "resources", "calls"],
+        ),
+    );
+    put(
+        "ServiceMap",
+        object(
+            &[
+                ("from", ms()),
+                ("to", ms()),
+                ("nodes", array(object(&[("service", string()), ("hits", number()), ("errors", number()), ("inferred", describe(boolean(), "only named, as a peer a service calls"))], &["service", "hits", "errors", "inferred"]))),
+                ("edges", array(object(&[("from", string()), ("to", string()), ("calls", number()), ("errors", number()), ("avg_s", nullable(number())), ("inferred", boolean())], &["from", "to", "calls", "errors", "inferred"]))),
+                ("spans_read", integer()),
+                ("sampled_one_in", describe(integer(), "one trace in so many read (by its id), the counts scaled up")),
+                ("took_ms", number()),
+            ],
+            &["from", "to", "nodes", "edges", "spans_read", "sampled_one_in"],
+        ),
+    );
     put(
         "PatternsAnswer",
         object(
@@ -1128,6 +1231,25 @@ fn ops() -> Vec<Op<'static>> {
         op("post", "/logs/aggregate", "Log analytics: a measure by facets, in buckets of time with `step`", "observe.read", Some(body("AggregateRequest")), vec![ok("AggregateAnswer")]),
         op("post", "/logs/facets", "Each facet's most common values over a search", "observe.read", Some(body("FacetsRequest")), vec![ok("FacetsAnswer")]),
         op("post", "/logs/patterns", "A search's records grouped into patterns (Drain)", "observe.read", Some(body("SearchRequest")), vec![ok("PatternsAnswer")]),
+        op("post", "/spans/search", "Searches spans, newest first (Datadog's trace explorer's syntax: resource_name:, @duration:>250ms)", "observe.read", Some(body("SearchRequest")), vec![ok("SpansAnswer")]),
+        op("post", "/spans/aggregate", "Trace analytics: a measure by facets (resource_name among them), in buckets of time with `step`", "observe.read", Some(body("AggregateRequest")), vec![ok("AggregateAnswer")]),
+        op("post", "/spans/facets", "Each facet's most common values over a span search", "observe.read", Some(body("FacetsRequest")), vec![ok("FacetsAnswer")]),
+        Op {
+            params: vec![path_param("id", "the trace's id, 32 hex digits"), param("from", "query", false, integer(), "ms since the epoch (with to: where to look)"), param("to", "query", false, integer(), "ms since the epoch")],
+            ..op("get", "/traces/{id}", "A trace: its spans as a waterfall draws them, its services and errors", "observe.read", None, vec![ok("Trace"), ("404", answer("no spans of it", Some("Error")))])
+        },
+        Op {
+            params: vec![param("from", "query", false, integer(), "ms since the epoch (an hour before to)"), param("to", "query", false, integer(), "ms since the epoch (now)"), param("env", "query", false, string(), "one environment")],
+            ..op("get", "/apm/services", "The services: each one's requests, errors and latency over the range, from the trace metrics", "observe.read", None, vec![ok("ServicesAnswer")])
+        },
+        Op {
+            params: vec![path_param("name", "the service"), param("from", "query", false, integer(), "ms since the epoch"), param("to", "query", false, integer(), "ms since the epoch"), param("env", "query", false, string(), "one environment")],
+            ..op("get", "/apm/services/{name}", "A service: its requests by resource and kind, and the calls it makes by what it calls", "observe.read", None, vec![ok("ServiceAnswer"), ("404", answer("no requests nor calls of it", Some("Error")))])
+        },
+        Op {
+            params: vec![param("from", "query", false, integer(), "ms since the epoch (15 minutes before to)"), param("to", "query", false, integer(), "ms since the epoch"), param("env", "query", false, string(), "one environment")],
+            ..op("get", "/apm/map", "The service map over the range: who calls whom, from the spans", "observe.read", None, vec![ok("ServiceMap")])
+        },
         Op {
             params: vec![param("query", "query", false, string(), "a log search"), param("rate", "query", false, integer(), "records a second at the most, a uniform sample past it")],
             ..op(
@@ -1221,6 +1343,42 @@ fn ops() -> Vec<Op<'static>> {
             Some(body("LogMetricTest")),
             vec![("200", answer_of("its series", object(&[("series", array(object(&[("metric", string()), ("tags", map_of(string())), ("points", array(any()))], &["metric", "tags", "points"]))), ("records", integer()), ("rows_scanned", integer())], &["series", "records"])))],
         ),
+        op(
+            "get",
+            "/span_metrics",
+            "Lists the metrics from spans, and kiln's trace metrics (trace.hits, trace.errors, trace.duration, trace.outbound.*) as they are counted",
+            "observe.read",
+            None,
+            vec![(
+                "200",
+                answer_of(
+                    "the metrics from spans",
+                    object(
+                        &[("span_metrics", array(schema("LogMetric"))), ("builtin", array(object(&[("name", string()), ("series", array(string())), ("group_by", array(string()))], &["name", "series", "group_by"]))), ("counting", schema("LogMetricCounting"))],
+                        &["span_metrics", "builtin", "counting"],
+                    ),
+                ),
+            )],
+        ),
+        op(
+            "post",
+            "/span_metrics",
+            "Makes a metric from spans (its filter a span search; a distribution of @duration in seconds), counted from the next ten seconds on",
+            "observe.write",
+            Some(body("LogMetricIn")),
+            vec![("201", answer("made", Some("LogMetric"))), ("409", answer("its series have a writer already", Some("Error")))],
+        ),
+        Op { params: vec![name()], ..op("get", "/span_metrics/{name}", "A metric from spans", "observe.read", None, vec![ok("LogMetric")]) },
+        Op { params: vec![name()], ..op("put", "/span_metrics/{name}", "Changes a metric from spans: its filter, groups and percentiles", "observe.write", Some(body("LogMetricIn")), vec![ok("LogMetric")]) },
+        Op { params: vec![name()], ..op("delete", "/span_metrics/{name}", "Removes a metric from spans (its series stay, to retention)", "observe.write", None, vec![no_content()]) },
+        op(
+            "post",
+            "/span_metric_test",
+            "What a metric from spans would count of the spans held, window by window, its series named preview: nothing written",
+            "observe.read",
+            Some(body("LogMetricTest")),
+            vec![("200", answer_of("its series", object(&[("series", array(object(&[("metric", string()), ("tags", map_of(string())), ("points", array(any()))], &["metric", "tags", "points"]))), ("records", integer()), ("rows_scanned", integer())], &["series", "records"])))],
+        ),
         op("get", "/pipelines", "Lists the log pipelines in the order they apply: kiln's own, then yours", "observe.read", None, vec![("200", answer_of("the pipelines", object(&[("pipelines", array(schema("Pipeline")))], &["pipelines"])))]),
         op("post", "/pipelines", "Makes a log pipeline, last (checked: it compiles)", "observe.manage", Some(body("PipelineIn")), vec![("201", answer("made", Some("Pipeline")))]),
         Op { params: vec![id()], ..op("get", "/pipelines/{id}", "A log pipeline", "observe.read", None, vec![ok("Pipeline")]) },
@@ -1253,6 +1411,10 @@ fn ops() -> Vec<Op<'static>> {
     v.extend([
         Op { body: Some(raw("an ExportMetricsServiceRequest, protobuf or OTLP's JSON, gzip or not")), ..op("post", "/v1/metrics", "OTLP/HTTP metrics (OTLP/gRPC's: opentelemetry.proto.collector.metrics.v1.MetricsService/Export, over HTTP/2, the token as metadata)", "ingest", None, vec![("200", answer("taken (OTLP's partial success, if any)", None))]) },
         Op { body: Some(raw("an ExportLogsServiceRequest, protobuf or OTLP's JSON, gzip or not")), ..op("post", "/v1/logs", "OTLP/HTTP logs (OTLP/gRPC's: opentelemetry.proto.collector.logs.v1.LogsService/Export)", "ingest", None, vec![("200", answer("taken", None))]) },
+        Op {
+            body: Some(raw("an ExportTraceServiceRequest, protobuf or OTLP's JSON, gzip or not")),
+            ..op("post", "/v1/traces", "OTLP/HTTP traces (OTLP/gRPC's: opentelemetry.proto.collector.trace.v1.TraceService/Export)", "ingest", None, vec![("200", answer("taken (spans without a valid trace or span id rejected, said as the partial success)", None))])
+        },
         Op {
             params: vec![param("X-Amz-Firehose-Access-Key", "header", true, string(), "observe's ingest token"), param("X-Amz-Firehose-Request-Id", "header", true, string(), "Firehose's request id, echoed")],
             body: Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("requestId", string()), ("timestamp", integer()), ("records", array(object(&[("data", describe(string(), "base64"))], &["data"])))], &["records"]) } }, "description": "CloudWatch Metric Streams' JSON, CloudWatch Logs' subscriptions; gzip or not" })),

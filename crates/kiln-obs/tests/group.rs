@@ -292,7 +292,7 @@ impl Cluster {
             }
             let ok = match f.kind {
                 FileKind::Block => Block::open(&to).is_ok_and(|b| b.bytes == f.bytes && b.crc == f.crc && b.verify().is_ok()),
-                FileKind::Logs => LogFile::open(&to).is_ok_and(|l| l.bytes == f.bytes && l.crc == f.crc && l.verify().is_ok()),
+                FileKind::Logs | FileKind::Spans => LogFile::open(&to).is_ok_and(|l| l.bytes == f.bytes && l.crc == f.crc && l.verify().is_ok()),
             };
             if !ok {
                 return false;

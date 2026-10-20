@@ -86,12 +86,12 @@ function pieces(template: string): string[] {
 }
 
 /** `facet:value` as a search term, quoted when it must be. */
-function term(facet: string, value: string) {
+export function term(facet: string, value: string) {
   return /^[\w.\-/:@]+$/.test(value) ? `${facet}:${value}` : `${facet}:"${value.replace(/["\\]/g, "\\$&")}"`;
 }
 
 /** The search with `t` added, or taken out when it is there. */
-function toggle(q: string, t: string) {
+export function toggle(q: string, t: string) {
   const words =
     q.trim() === "*"
       ? []
@@ -171,7 +171,7 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
   );
 }
 
-function SearchForm({ initial, onSearch, placeholder }: { initial: string; onSearch: (q: string) => void; placeholder: string }) {
+export function SearchForm({ initial, onSearch, placeholder }: { initial: string; onSearch: (q: string) => void; placeholder: string }) {
   const [draft, setDraft] = React.useState(initial);
   return (
     <form
@@ -211,10 +211,15 @@ function HistogramOf({ query, range }: { query: string; range: Range }) {
 
 function Facets({ query, range, facets, q, onToggle }: { query: string; range: Range; facets: readonly string[]; q: string; onToggle: (t: string) => void }) {
   const f = useRes(facetsRes(query, range, facets)).data;
+  return <FacetList f={f} q={q} onToggle={onToggle} noun={["record", "records"]} />;
+}
+
+/** Each facet's most common values, a click on one narrowing the search to it (again widening it). */
+export function FacetList({ f, q, onToggle, noun }: { f: LogFacets; q: string; onToggle: (t: string) => void; noun: [string, string] }) {
   return (
     <aside aria-label="Facets" className="space-y-6">
       <p className="font-mono text-[10px] text-[#7b7e88]">
-        {f.matched.toLocaleString()} {f.matched === 1 ? "record" : "records"} · {f.rows_scanned.toLocaleString()} read in {f.took_ms.toFixed(1)} ms
+        {f.matched.toLocaleString()} {f.matched === 1 ? noun[0] : noun[1]} · {f.rows_scanned.toLocaleString()} read in {f.took_ms.toFixed(1)} ms
       </p>
       {f.facets.map((facet) => {
         const values = facet.values.filter((v) => v.value !== "N/A" && v.value !== "");
@@ -491,8 +496,8 @@ function Detail({ r, onFilter }: { r: LogRecord; onFilter: (t: string) => void }
     ["status", r.status, "status"],
     ...Object.entries(r.attributes).map(([k, v]): [string, string, string] => [`@${k}`, v, `@${k}`]),
   ];
-  // Not a field a search reads: shown, not a filter.
-  if (r.trace_id) fields.push(["trace", r.trace_id, ""]);
+  // Its trace's page, a click away.
+  if (r.trace_id) fields.push(["trace", r.trace_id, "trace"]);
   return (
     <div className="mb-3 ml-5 overflow-x-auto px-2 pb-2">
       <p className="mb-2 font-mono text-[10px] text-[#7b7e88]">{new Date(r.ts_ns / 1e6).toISOString()}</p>
@@ -506,7 +511,11 @@ function Detail({ r, onFilter }: { r: LogRecord; onFilter: (t: string) => void }
                   {k}
                 </th>
                 <td className="py-0.5 align-top break-all text-[#c8cad0]">
-                  {facet ? (
+                  {facet === "trace" ? (
+                    <Link to={`/observe/traces/${v}`} className="font-mono text-[11px] hover:text-white hover:underline" title="Its trace">
+                      {v}
+                    </Link>
+                  ) : facet ? (
                     <button type="button" className="text-left hover:text-white hover:underline" title={`Search for ${k}:${v}`} onClick={() => onFilter(term(facet, v))}>
                       {v}
                     </button>

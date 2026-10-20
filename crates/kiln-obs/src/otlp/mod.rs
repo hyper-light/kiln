@@ -4,3 +4,4 @@
 pub mod logs;
 pub mod metrics;
 pub mod pb;
+pub mod traces;

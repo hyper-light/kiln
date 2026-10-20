@@ -747,6 +747,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             // The server moves the cutoffs and states the bound.
             metrics_retention: Duration::ZERO,
             logs_retention: Duration::ZERO,
+            spans_retention: Duration::ZERO,
             max_series: 0,
         });
         crate::observe::api::set_global(obs.clone());
