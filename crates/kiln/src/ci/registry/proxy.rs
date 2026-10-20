@@ -433,7 +433,7 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
     let mut r = if matches!(up.eco, Ecosystem::Npm | Ecosystem::Jsr | Ecosystem::Pypi | Ecosystem::Nuget | Ecosystem::Pub) && !immutable && k.size <= MAX_INDEX as u64 {
         // An index, its links written over for this origin.
         let mut buf = Vec::with_capacity(usize::try_from(k.size).unwrap_or(0));
-        let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
+        let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size).await;
         while let Ok(b) = rx.recv().await {
             buf.extend_from_slice(&b);
         }
@@ -442,7 +442,7 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
         let r = srv::response(StatusCode::OK, &k.content_type, if *req.method() == Method::HEAD { srv::empty() } else { srv::full(body) });
         srv::with_header(r, header::CONTENT_LENGTH, &len.to_string())
     } else {
-        let body = if *req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(crate::ci::services::cas::read(hub, &obj, 0, obj.size)) };
+        let body = if *req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(crate::ci::services::cas::read(hub, &obj, 0, obj.size).await) };
         let r = srv::response(StatusCode::OK, &k.content_type, body);
         srv::with_header(r, header::CONTENT_LENGTH, &k.size.to_string())
     };

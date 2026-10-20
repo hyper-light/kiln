@@ -26,7 +26,7 @@ impl Files for Hub {
         Box::pin(async move {
             let obj = crate::ci::services::cas::object(self, hex).await?.with_context(|| format!("no artifact sha256:{hex} in kiln's store (expired?)"))?;
             let size = obj.size;
-            Ok((crate::ci::services::cas::read(self, &obj, 0, size), size))
+            Ok((crate::ci::services::cas::read(self, &obj, 0, size).await, size))
         })
     }
 }

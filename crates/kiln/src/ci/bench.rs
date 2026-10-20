@@ -361,7 +361,7 @@ async fn cache(hub: &Arc<Hub>, dir: &Path, mib: u64) -> Result<Vec<Measure>> {
     let obj = crate::ci::services::cas::put_file(hub, &file).await?;
     let saved = mib as f64 / t.elapsed().as_secs_f64();
     let t = Instant::now();
-    let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
+    let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size).await;
     let mut got = 0u64;
     while let Ok(b) = rx.recv().await {
         got += b.len() as u64;

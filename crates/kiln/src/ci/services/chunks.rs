@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
-use super::cas;
+use super::{cas, remote};
 use crate::ci::token::Claims;
 use crate::ci::{Fail, token};
 use crate::http::server::{self as srv, Request, Response};
@@ -198,8 +198,11 @@ async fn missing(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respon
         })
         .await
         .map_err(internal)?;
+    // The store has a chunk in the data directory, or in its bucket (W08-R02).
+    let in_bucket = if remote::on(hub) { remote::in_bucket(hub, held.iter().cloned().collect()).await.map_err(internal)? } else { Default::default() };
     let h = Arc::clone(hub);
-    let need: Vec<String> = crate::rt::blocking(move || m.chunks.into_iter().filter(|d| !(held.contains(d) && cas::chunk_file(&h, d).is_some())).collect()).await.map_err(internal)?;
+    let need: Vec<String> =
+        crate::rt::blocking(move || m.chunks.into_iter().filter(|d| !(held.contains(d) && (in_bucket.contains(d) || cas::chunk_file(&h, d).is_some()))).collect()).await.map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &json!({ "missing": need })))
 }
 
@@ -236,7 +239,7 @@ async fn get_chunk(hub: &Arc<Hub>, claims: &Claims, id: &str, digest: &str) -> R
     if !obj.chunks.iter().any(|(d, _)| d == digest) {
         return Ok(msg(StatusCode::NOT_FOUND, "the entry has no such chunk"));
     }
-    let Some(path) = cas::chunk_file(hub, digest) else { return Ok(msg(StatusCode::NOT_FOUND, "the chunk is gone")) };
+    let Some(path) = cas::chunk_here(hub, digest).await else { return Ok(msg(StatusCode::NOT_FOUND, "the chunk is gone")) };
     let data = crate::rt::blocking(move || std::fs::read(path)).await.map_err(internal)?.map_err(|e| internal(e.into()))?;
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::full(bytes::Bytes::from(data))))
 }
@@ -282,7 +285,12 @@ async fn commit(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respons
         return Ok(msg(StatusCode::BAD_REQUEST, "the chunks' sizes don't add up to the object's"));
     }
     // The content, read back in order: every chunk there and as long as said, the whole as the
-    // digest says.
+    // digest says. One only the bucket holds is brought back first (W08-R02).
+    if remote::on(hub) {
+        for (d, _) in &c.object.chunks {
+            let _ = cas::chunk_here(hub, d).await;
+        }
+    }
     let (h, list) = (Arc::clone(hub), c.object.chunks.clone());
     let checked = crate::rt::blocking(move || -> Result<String, String> {
         let mut whole = Sha256::new();

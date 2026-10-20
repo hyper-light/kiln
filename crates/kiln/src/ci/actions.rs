@@ -466,7 +466,7 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
             kept.map_err(internal)?
         }
     };
-    let rx = super::services::cas::read(hub, &obj, 0, obj.size);
+    let rx = super::services::cas::read(hub, &obj, 0, obj.size).await;
     Ok(srv::response(StatusCode::OK, "application/gzip", srv::channel_body(rx)))
 }
 

@@ -179,7 +179,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node left |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; S3, BuildKit, speed left |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault, Vault, Infisical, Doppler, 1Password), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); the other stores left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; R12's buckets and issuer-only front door, the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
@@ -2632,8 +2632,30 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   cancelled (as v1 did), a `kiln/upload@v1` step uploads what the globs match as the run's
   artifact `artifacts`, quietly when nothing matches (`kiln_ci::store::v1_artifacts_step`,
   unit-tested). v1's own jobs keep their tarballs at `GET /api/jobs/:id/artifacts`.
+- *Done.* R02, the store's bucket (`crates/kiln/src/ci/services/remote.rs`). With
+  `[ci.store.s3]` (`endpoint`, `bucket`, `region`, `prefix`, `credentials`, `cache_gb`,
+  `ca_file`), every chunk is kept in an S3-compatible bucket too, at
+  `<prefix>chunks/<2 hex>/<2 hex>/<sha256>`, and the data directory's chunks are a cache of them:
+  - An object is recorded only once each of its chunks is in the bucket, so what the store says
+    it holds outlives the server's disk. An upload sends only the chunks the bucket lacks.
+  - A read (an artifact, a cache entry, a registry blob, a release asset, a chunk of
+    `kiln/cache@v1`'s) that needs a chunk the cache no longer holds brings it back first,
+    checked against its digest. The chunk protocol's `missing` counts a chunk the repository's
+    entries hold in the bucket as stored.
+  - The hourly upkeep trims the cache to `cache_gb` (20 by default), least recently used first,
+    of chunks the bucket holds; sends what was kept before the bucket was set up; and deletes
+    from the bucket the chunks collection finds no object uses. Collection's deletions and an
+    upload's look for its chunks take turns, so an upload never counts on a chunk being deleted.
+  - Credentials: an `aws` integration (kiln's own identity, exchanged for the role's short-lived
+    credentials: no key stored), a key id with its secret in a file or an environment variable,
+    or the server's `AWS_*` environment. Requests are signed with Signature Version 4 in kiln's
+    own HTTP client and addressed by path, so AWS S3, MinIO, Cloudflare R2 and Ceph serve;
+    `ca_file` trusts a private store's CA.
+  - Checked against a fake S3 that checks each request's signature as S3 does
+    (`w08_r02_chunks_in_a_bucket`), and against RustFS, a real S3-compatible store
+    (`w08_r02_a_real_store`, run by hand with its address and keys).
 - *Left.*
-  - R02 (S3) and R11 (BuildKit's `type=gha` and `type=registry` caches, end to end).
+  - R11 (BuildKit's `type=gha` and `type=registry` caches, end to end).
   - R12 and AC08 on a real 10 GbE LAN. The store's part is measured by `kiln ci bench`
     (W22-AC08): a 1 GiB entry restored at 7,962 MiB/s, against 500. R13's insights are done
     (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key

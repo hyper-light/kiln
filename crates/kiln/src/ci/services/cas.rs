@@ -7,7 +7,8 @@
 //!
 //! Content arrives in a file, assembled from an upload's parts, and is chunked from there. Reads
 //! stream any byte range. [`collect`] removes objects nothing refers to, and chunks no object
-//! uses.
+//! uses. With `[ci.store.s3]`, the chunks are kept in a bucket too, and these files are a cache
+//! of them (`remote`, W08-R02).
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -26,7 +27,7 @@ use crate::hub::Hub;
 /// Bytes a read sends at a time.
 const READ_PIECE: usize = 1 << 20;
 /// Chunks and objects younger than this are never collected: an upload may be about to use them.
-const GRACE: Duration = Duration::from_secs(3600);
+pub(super) const GRACE: Duration = Duration::from_secs(3600);
 
 /// A stored object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub fn staging(hub: &Hub) -> PathBuf {
     root(hub).join("staging")
 }
 
-fn chunk_path(root: &Path, digest: &str) -> PathBuf {
+pub(super) fn chunk_path(root: &Path, digest: &str) -> PathBuf {
     root.join("chunks").join(digest.get(0..2).unwrap_or("00")).join(digest.get(2..4).unwrap_or("00")).join(digest)
 }
 
@@ -56,14 +57,20 @@ fn hex(d: &[u8]) -> String {
     hex::encode(d)
 }
 
+/// Marks a chunk's file as used now: collection leaves it an hour, and trimming the cache takes
+/// the least recently used first.
+fn touch(p: &Path) {
+    if let Ok(f) = File::options().write(true).open(p) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+}
+
 /// Writes a chunk unless it is stored; returns the bytes newly written. A stored chunk is
 /// touched, so collection leaves it alone while this upload records its object.
-fn keep_chunk(root: &Path, digest: &str, data: &[u8]) -> std::io::Result<u64> {
+pub(super) fn keep_chunk(root: &Path, digest: &str, data: &[u8]) -> std::io::Result<u64> {
     let p = chunk_path(root, digest);
     if p.is_file() {
-        if let Ok(f) = File::options().write(true).open(&p) {
-            let _ = f.set_modified(SystemTime::now());
-        }
+        touch(&p);
         return Ok(0);
     }
     if let Some(dir) = p.parent() {
@@ -133,14 +140,45 @@ pub fn put_chunk(hub: &Hub, digest: &str, data: &[u8]) -> anyhow::Result<u64> {
     Ok(keep_chunk(&root(hub), digest, data)?)
 }
 
-/// Where a stored chunk is, when it is.
-pub fn chunk_file(hub: &Hub, digest: &str) -> Option<PathBuf> {
-    let ok = digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
-    ok.then(|| chunk_path(&root(hub), digest)).filter(|p| p.is_file())
+fn is_digest(d: &str) -> bool {
+    d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Records an object whose chunks are stored (the chunks' digests and sizes, its own digest).
+/// Where a stored chunk is in the data directory, when it is.
+pub fn chunk_file(hub: &Hub, digest: &str) -> Option<PathBuf> {
+    is_digest(digest).then(|| chunk_path(&root(hub), digest)).filter(|p| p.is_file())
+}
+
+/// Where a stored chunk is in the data directory, brought back from the bucket when only the
+/// bucket holds it (W08-R02).
+pub async fn chunk_here(hub: &Hub, digest: &str) -> Option<PathBuf> {
+    if let Some(p) = chunk_file(hub, digest) {
+        return Some(p);
+    }
+    if !is_digest(digest) || !super::remote::on(hub) {
+        return None;
+    }
+    let b = match super::remote::bucket(hub).await {
+        Ok(b) => b?,
+        Err(e) => {
+            tracing::warn!(chunk = %digest, error = %format!("{e:#}"), "the store's bucket can't be reached");
+            return None;
+        }
+    };
+    match super::remote::fetch(&b, &root(hub), digest).await {
+        Ok(true) => chunk_file(hub, digest),
+        Ok(false) => None,
+        Err(e) => {
+            tracing::warn!(chunk = %digest, error = %format!("{e:#}"), "fetching a chunk from the bucket failed");
+            None
+        }
+    }
+}
+
+/// Records an object whose chunks are stored (the chunks' digests and sizes, its own digest);
+/// with a bucket, once each chunk is in it.
 pub async fn record(hub: &Hub, obj: &Object) -> anyhow::Result<()> {
+    super::remote::push(hub, &obj.chunks).await?;
     let o = obj.clone();
     hub.store
         .call(move |c| {
@@ -174,13 +212,25 @@ pub async fn object(hub: &Hub, digest: &str) -> anyhow::Result<Option<Object>> {
         .await
 }
 
-/// Streams bytes `[start, end)` of an object. A chunk that can't be read ends the stream early
-/// (the reader sees fewer bytes than it was promised), with a warning.
-pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Receiver<Bytes> {
+/// Streams bytes `[start, end)` of an object. A chunk the data directory no longer holds comes
+/// back from the bucket first (W08-R02). A chunk that can't be read ends the stream early (the
+/// reader sees fewer bytes than it was promised), with a warning.
+pub async fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Receiver<Bytes> {
     let (tx, rx) = async_channel::bounded::<Bytes>(4);
     let root = root(hub);
     let chunks = obj.chunks.clone();
     let digest = obj.digest.clone();
+    // With a bucket: signed in before the stream starts (the task has no hub), and each chunk
+    // read is marked as used, for trimming.
+    let bucket = if super::remote::on(hub) {
+        super::remote::bucket(hub).await.unwrap_or_else(|e| {
+            tracing::warn!(object = %digest, error = %format!("{e:#}"), "the store's bucket can't be reached: the read has only what's here");
+            None
+        })
+    } else {
+        None
+    };
+    let remote = super::remote::on(hub);
     crate::rt::spawn(async move {
         let mut at = 0u64;
         for (d, n) in chunks {
@@ -193,13 +243,26 @@ pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Rec
                 break;
             }
             let path = chunk_path(&root, &d);
-            let file = match File::open(&path) {
+            let mut opened = File::open(&path);
+            if let (Err(e), Some(b)) = (&opened, &bucket)
+                && e.kind() == std::io::ErrorKind::NotFound
+            {
+                match super::remote::fetch(b, &root, &d).await {
+                    Ok(true) => opened = File::open(&path),
+                    Ok(false) => tracing::warn!(object = %digest, chunk = %d, "the bucket hasn't the chunk either"),
+                    Err(e) => tracing::warn!(object = %digest, chunk = %d, error = %format!("{e:#}"), "fetching a chunk from the bucket failed"),
+                }
+            }
+            let file = match opened {
                 Ok(f) => Arc::new(f),
                 Err(e) => {
                     tracing::warn!(object = %digest, chunk = %d, error = %e, "a chunk is missing; the read ends short");
                     return;
                 }
             };
+            if remote {
+                touch(&path);
+            }
             let (mut off, to) = (start.saturating_sub(lo), end.min(hi) - lo);
             while off < to {
                 let len = usize::try_from((to - off).min(READ_PIECE as u64)).unwrap_or(READ_PIECE);
@@ -245,6 +308,8 @@ pub struct Collected {
     pub objects: usize,
     pub chunks: usize,
     pub bytes: u64,
+    /// Chunks deleted from the bucket (W08-R02).
+    pub remote: usize,
 }
 
 /// Removes objects nothing refers to (no cache entry, artifact, release asset, test report,
@@ -286,42 +351,72 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
     let used = Arc::new(used);
     let u = Arc::clone(&used);
     let (chunks, bytes, removed) = crate::rt::blocking(move || sweep(&r, &u)).await?;
+    // With a bucket, what no object uses goes from there too; a chunk's row stays while the
+    // bucket holds it.
+    let bucket = super::remote::on(hub);
+    let remote = if bucket {
+        super::remote::forget(hub, &used, now - grace).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "collecting the bucket failed; the next round tries again");
+            0
+        })
+    } else {
+        0
+    };
     hub.store
         .call(move |c| {
             let tx = c.transaction()?;
+            let gone = if bucket { "DELETE FROM cas_chunks WHERE digest = ?1 AND remote_at IS NULL" } else { "DELETE FROM cas_chunks WHERE digest = ?1" };
             for d in &removed {
-                tx.execute("DELETE FROM cas_chunks WHERE digest = ?1", [d])?;
+                tx.execute(gone, [d])?;
             }
             tx.commit()?;
             Ok(())
         })
         .await?;
-    Ok(Collected { objects, chunks, bytes })
+    Ok(Collected { objects, chunks, bytes, remote })
 }
 
-/// Deletes chunk files not in `used` and older than [`GRACE`]; returns their count, bytes and
-/// digests.
-fn sweep(root: &Path, used: &HashSet<String>) -> (usize, u64, Vec<String>) {
-    let mut out = (0usize, 0u64, Vec::new());
+/// A chunk's file in the data directory: its name (a digest, or a crashed write's temporary
+/// file), size and when it was last used.
+pub(super) struct ChunkFile {
+    pub digest: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub used: SystemTime,
+}
+
+/// Every chunk file under `root`.
+pub(super) fn chunk_files(root: &Path) -> Vec<ChunkFile> {
+    let mut out = Vec::new();
     let Ok(level1) = std::fs::read_dir(root.join("chunks")) else { return out };
     for a in level1.flatten() {
         let Ok(level2) = std::fs::read_dir(a.path()) else { continue };
         for b in level2.flatten() {
             let Ok(files) = std::fs::read_dir(b.path()) else { continue };
             for f in files.flatten() {
-                let name = f.file_name().to_string_lossy().to_string();
                 let Ok(meta) = f.metadata() else { continue };
-                let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age > GRACE);
-                // Leftover temporary files of a crashed write go too.
-                if !old || (used.contains(&name) && !name.ends_with(".tmp")) {
-                    continue;
-                }
-                if std::fs::remove_file(f.path()).is_ok() {
-                    out.0 += 1;
-                    out.1 += meta.len();
-                    out.2.push(name);
-                }
+                let Ok(used) = meta.modified() else { continue };
+                out.push(ChunkFile { digest: f.file_name().to_string_lossy().to_string(), path: f.path(), size: meta.len(), used });
             }
+        }
+    }
+    out
+}
+
+/// Deletes chunk files not in `used` and older than [`GRACE`]; returns their count, bytes and
+/// digests.
+fn sweep(root: &Path, used: &HashSet<String>) -> (usize, u64, Vec<String>) {
+    let mut out = (0usize, 0u64, Vec::new());
+    for f in chunk_files(root) {
+        let old = f.used.elapsed().is_ok_and(|age| age > GRACE);
+        // Leftover temporary files of a crashed write go too.
+        if !old || (used.contains(&f.digest) && !f.digest.ends_with(".tmp")) {
+            continue;
+        }
+        if std::fs::remove_file(&f.path).is_ok() {
+            out.0 += 1;
+            out.1 += f.size;
+            out.2.push(f.digest);
         }
     }
     out

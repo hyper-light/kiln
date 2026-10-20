@@ -59,6 +59,17 @@ pub struct Ci {
     pub reservations: Vec<kiln_ci::sched::reserve::ReservationSpec>,
     pub cache: Cache,
     pub artifacts: Artifacts,
+    /// `[ci.store]`: the store under caches, artifacts, images and reports (docs/ci.md W08-R01),
+    /// and the bucket it keeps its chunks in too (W08-R02):
+    ///
+    /// ```toml
+    /// [ci.store.s3]
+    /// endpoint = "https://s3.us-east-1.amazonaws.com"
+    /// bucket = "acme-kiln-store"
+    /// region = "us-east-1"
+    /// credentials = { integration = "aws-store" }
+    /// ```
+    pub store: Store,
     pub oidc: Oidc,
     pub actions: Actions,
     /// `[[ci.notify]]`: the server's notification rules (docs/ci.md W19-R06), before each
@@ -527,6 +538,67 @@ impl Default for Artifacts {
     fn default() -> Self {
         Artifacts { retention_days: 90, max_size_gb: 10 }
     }
+}
+
+/// `[ci.store]`: the content-addressed store (docs/ci.md W08-R01, R02).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Store {
+    /// A bucket every chunk is kept in too, the data directory's copies a cache of them (W08-R02).
+    pub s3: Option<S3Store>,
+}
+
+/// `[ci.store.s3]`: any S3-compatible store (AWS S3, MinIO, Cloudflare R2, Ceph), addressed by
+/// path (`<endpoint>/<bucket>/<key>`), its requests signed with Signature Version 4. One kiln
+/// server to a bucket and prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Store {
+    /// `https://s3.us-east-1.amazonaws.com`, `https://<account>.r2.cloudflarestorage.com`,
+    /// `http://minio.internal:9000`.
+    pub endpoint: String,
+    pub bucket: String,
+    /// The region requests are signed for (R2's is `auto`; MinIO takes any).
+    #[serde(default = "S3Store::default_region")]
+    pub region: String,
+    /// Where in the bucket: chunks are at `<prefix>chunks/<2 hex>/<2 hex>/<sha256>`.
+    #[serde(default = "S3Store::default_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub credentials: S3Credentials,
+    /// Gigabytes of chunks the data directory keeps as a cache (20 by default); past it, those the
+    /// bucket holds go, least recently used first.
+    #[serde(default = "S3Store::default_cache_gb")]
+    pub cache_gb: u64,
+    /// A PEM bundle of the CAs a private store's certificate is checked against, instead of the
+    /// public ones.
+    #[serde(default)]
+    pub ca_file: Option<std::path::PathBuf>,
+}
+
+impl S3Store {
+    fn default_region() -> String {
+        "us-east-1".into()
+    }
+    fn default_prefix() -> String {
+        "kiln/cas/".into()
+    }
+    fn default_cache_gb() -> u64 {
+        20
+    }
+}
+
+/// How kiln signs in to the bucket: an `aws` integration (kiln's own identity, exchanged for the
+/// role's short-lived credentials, so no key is stored), or a key pair whose secret is read from
+/// a file or an environment variable; with neither, the server's environment
+/// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Credentials {
+    pub integration: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key_file: Option<std::path::PathBuf>,
+    pub secret_access_key_env: Option<String>,
 }
 
 /// `[ci.oidc]`: kiln as an OpenID Connect issuer for jobs (docs/ci.md W10-R06 to W10-R10).

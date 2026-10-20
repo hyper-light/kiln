@@ -344,7 +344,7 @@ async fn read(hub: &Arc<Hub>, target: Target, req: &Request) -> Result<Response,
             return Ok(srv::with_header(r, header::CONTENT_RANGE, &format!("bytes */{}", obj.size)));
         }
     };
-    let body = if req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(cas::read(hub, &obj, start, end)) };
+    let body = if req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(cas::read(hub, &obj, start, end).await) };
     let mut r = azure_headers(srv::response(status, &rd.mime, body));
     r = srv::with_header(r, header::CONTENT_LENGTH, &(end - start).to_string());
     r = srv::with_header(r, header::ACCEPT_RANGES, "bytes");
