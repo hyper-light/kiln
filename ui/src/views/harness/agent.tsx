@@ -71,10 +71,14 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const gone = useSession(store, (s) => s.conn === "gone");
   const cwd = useSession(store, (s) => s.state?.cwd || s.info?.cwd || "");
   const accepts = useSession(store, (s) => acceptsOf(s.meta));
+  const [params, setParams] = useSearchParams();
+  const taskId = params.get("task");
+  const taskInfo = useSession(store, (s) => taskId ? s.state?.tasks.find((t) => t.id === taskId || t.tool_id === taskId) : undefined);
+  // Mission Control links by the stable task id; the timeline groups its events by spawn call.
+  const task = taskId ? taskInfo?.tool_id || taskId : null;
   const wide = useMediaQuery("(min-width: 1100px)");
   const [tab, setTab] = React.useState<InspectorTab>("changes");
   const [phoneTab, setPhoneTab] = React.useState<PhoneTab>("work");
-  const [task, setTask] = React.useState<string | null>(null);
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
@@ -100,7 +104,6 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
   // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown. A
   // match found from Mission Control (`?find=`) opens it already looking.
-  const [params] = useSearchParams();
   const [findOpen, setFindOpen] = React.useState(() => Boolean(params.get("find")));
   const [findQ, setFindQ] = React.useState(() => params.get("find") ?? "");
   const [findAt, setFindAt] = React.useState<FindNow | null>(null);
@@ -139,10 +142,18 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     [store],
   );
   const openTask = React.useCallback((toolId: string) => {
-    setTask(toolId);
+    const child = store.get().state?.tasks.find((t) => t.tool_id === toolId || t.id === toolId);
+    setParams((previous) => {
+      previous.set("task", child?.id ?? toolId);
+      return previous;
+    });
     setPhoneTab("work");
-  }, []);
-  const taskName = useSession(store, (s) => (task ? s.state?.tasks.find((t) => t.tool_id === task)?.description : undefined));
+  }, [store, setParams]);
+  const mainThread = () => setParams((previous) => {
+    previous.delete("task");
+    return previous;
+  });
+  const taskName = taskInfo?.description;
 
   // The matches, in the thread shown; a new search starts at the newest, and the one shown stays
   // shown as the conversation grows. (The conversation is read here only while finding.)
@@ -242,12 +253,12 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       {findOpen && dropped > 0 && <EarlierMatches agent={id} q={findQ} before={findEvents[0]?.at} />}
       {task && (
         <div className="hx-crumbs">
-          <button type="button" className="hx-link" onClick={() => setTask(null)}>
+          <button type="button" className="hx-link" onClick={mainThread}>
             Main thread
           </button>
           <ChevronRight size={12} />
           <span className="hx-trunc">{taskName ?? "Subagent"}</span>
-          <button type="button" className="hx-icon ml-auto" aria-label="Back to the main thread" onClick={() => setTask(null)}>
+          <button type="button" className="hx-icon ml-auto" aria-label="Back to the main thread" onClick={mainThread}>
             <X size={13} />
           </button>
         </div>

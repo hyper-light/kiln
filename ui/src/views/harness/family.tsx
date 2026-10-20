@@ -7,14 +7,14 @@
  */
 import * as React from "react";
 import "./family.css";
-import { ChevronRight } from "lucide-react";
+import { ArrowUpRight, ChevronRight } from "lucide-react";
 import { Link } from "@/lib/router";
 import { attachApi, onWords, type IncidentBrief } from "@/api/attach";
-import { harnessApi, type AgentInfo } from "@/api/harness";
+import { harnessApi, type AgentInfo, type SubagentBrief } from "@/api/harness";
 import { plansApi, runHref, type PlanRunBrief } from "@/api/plans";
 import { useLocalStorage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
-import { agentLabel } from "./derive";
+import { agentLabel, taskDot } from "./derive";
 
 /** A row of the list and the rows that go under it; or a plan run, or an attachment, and its agents. */
 export interface Family<T> {
@@ -111,12 +111,30 @@ export function families<T extends { a: AgentInfo; stand: string }>(rows: T[], a
 }
 
 const WORDS: Record<string, string> = { needs: "needs you", crashed: "stopped", paused: "paused", working: "working", finished: "finished", ready: "ready", offline: "offline", ended: "ended" };
+const TASK_WORDS: Record<string, string> = { running: "working", pending: "queued", completed: "finished", failed: "failed", paused: "paused", waiting: "needs you", stopped: "stopped", killed: "stopped", cancelled: "cancelled" };
+const taskWord = (task: SubagentBrief) => TASK_WORDS[task.status] ?? task.status;
 
 /** How a family's children stand, in a few words: "1 working, 1 finished". */
-function standing<T extends { stand: string }>(kids: Family<T>[]): string {
+function standing<T extends { stand: string }>(kids: Family<T>[], tasks: SubagentBrief[] = []): string {
   const n = new Map<string, number>();
-  for (const k of kids) n.set(k.row.stand, (n.get(k.row.stand) ?? 0) + 1);
-  return [...n].map(([s, c]) => `${c} ${WORDS[s] ?? s}`).join(", ");
+  for (const word of [...kids.map((k) => WORDS[k.row.stand] ?? k.row.stand), ...tasks.map(taskWord)]) n.set(word, (n.get(word) ?? 0) + 1);
+  return [...n].map(([word, count]) => `${count} ${word}`).join(", ");
+}
+
+/** Native subagents open their existing thread; they have no independent session controls. */
+function NativeChild({ agent, task }: { agent: string; task: SubagentBrief }) {
+  return (
+    <li className="fam-task">
+      <Link to={`/agents/${encodeURIComponent(agent)}?task=${encodeURIComponent(task.id)}`} className="fam-task-link">
+        <span className="fam-task-name">{task.description || "Subagent"}</span>
+        <span className="fam-task-status">
+          <i className="dot" data-status={taskDot(task)} aria-hidden="true" />
+          {taskWord(task)}
+        </span>
+        <ArrowUpRight size={16} aria-hidden="true" />
+      </Link>
+    </li>
+  );
 }
 
 /**
@@ -169,17 +187,24 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
       }
       const id = f.row.a.id;
       const open = !folded.includes(id);
+      const tasks = f.row.a.subagents ?? [];
+      const count = f.kids.length + tasks.length;
       return (
         <React.Fragment key={id}>
           {render(f.row, f.of)}
-          {f.kids.length > 0 && (
+          {count > 0 && (
             <li className="fam">
-              <button type="button" className="fam-fold" aria-expanded={open} onClick={() => toggle(id)}>
+              <button type="button" className="fam-fold" aria-expanded={open} aria-label={`${open ? "Fold" : "Show"} ${agentLabel(f.row.a)}'s ${count} subagent${count === 1 ? "" : "s"}`} onClick={() => toggle(id)}>
                 <ChevronRight size={13} className="fam-chev" aria-hidden="true" />
-                {f.kids.length} agent{f.kids.length === 1 ? "" : "s"} it started
-                <span className="fam-stand">{standing(f.kids)}</span>
+                <span className="fam-count">{count} agent{count === 1 ? "" : "s"} it started</span>
+                <span className="fam-stand">{standing(f.kids, tasks)}</span>
               </button>
-              {open && <ul className="ms-list fam-kids">{out(f.kids)}</ul>}
+              {open && (
+                <ul className="ms-list fam-kids">
+                  {out(f.kids)}
+                  {tasks.map((task) => <NativeChild key={`task-${task.id}`} agent={id} task={task} />)}
+                </ul>
+              )}
             </li>
           )}
         </React.Fragment>
