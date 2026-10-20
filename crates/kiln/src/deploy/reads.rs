@@ -32,7 +32,9 @@ pub async fn read(d: &Deploy, app: &App, env: &Environment, what: Read) -> Resul
     match env.provider.strip_prefix("argocd/") {
         Some(integration) => {
             let argo = argocd::Argo::of(&d.hub, integration).await.map_err(unavailable)?;
-            argo_read(&argo, &argocd::application_name(app, &env.name), what).await
+            // An ApplicationSet's Applications have two sources: the package first.
+            let package = super::appset::integration_of(env).map(|_| 1);
+            argo_read(&argo, &argocd::application_name(app, &env.name), what, package).await
         }
         None => match what {
             Read::Manifests { version: Some(v) } => {
@@ -66,7 +68,7 @@ async fn kilncd_read(d: &Deploy, id: &str, what: Read) -> Result<Value, Fail> {
     crate::cd::ops::call(cx, op, input).await
 }
 
-async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value, Fail> {
+async fn argo_read(argo: &argocd::Argo, name: &str, what: Read, package: Option<usize>) -> Result<Value, Fail> {
     match what {
         Read::Resources => {
             let app = argo.application(name, None).await.map_err(unavailable)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("Argo CD has no Application {name}")))?;
@@ -91,7 +93,7 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
             Ok(json!({ "resources": resources }))
         }
         Read::Manifests { version } => {
-            let manifests = argo.manifests(name, version.as_deref()).await.map_err(unavailable)?;
+            let manifests = argo.manifests(name, version.as_deref(), package).await.map_err(unavailable)?;
             Ok(json!({ "manifests": manifests.iter().map(|o| json!({ "key": key_of_object(o), "yaml": yaml(&masked(o.clone())) })).collect::<Vec<_>>() }))
         }
         Read::Diff { version: None } => {
@@ -109,8 +111,8 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
             Ok(json!({ "diffs": changes }))
         }
         Read::Diff { version: Some(v) } => {
-            let now = argo.manifests(name, None).await.map_err(unavailable)?;
-            let then = argo.manifests(name, Some(&v)).await.map_err(unavailable)?;
+            let now = argo.manifests(name, None, package).await.map_err(unavailable)?;
+            let then = argo.manifests(name, Some(&v), package).await.map_err(unavailable)?;
             Ok(json!({ "version": v, "diffs": compare(now, then) }))
         }
         Read::Logs { group, kind, name: object, namespace, container, tail } => {
@@ -118,6 +120,33 @@ async fn argo_read(argo: &argocd::Argo, name: &str, what: Read) -> Result<Value,
             let lines = argo.logs(name, &group, &kind, &object, namespace.as_deref(), container.as_deref(), tail).await.map_err(unavailable)?;
             Ok(json!({ "lines": lines }))
         }
+    }
+}
+
+/// Where Argo CD would change an object it compared (one of its managed resources) beyond tracking
+/// marks, kiln's or its own: the change, as a diff shows it. An object that isn't there is one.
+pub(super) fn disagreement(item: &Value) -> Option<Value> {
+    let state = |k: &str| item.get(k).and_then(Value::as_str).and_then(|s| serde_json::from_str::<Value>(s).ok()).filter(|v| !v.is_null());
+    let live = state("normalizedLiveState").or_else(|| state("liveState"));
+    let predicted = state("predictedLiveState").or_else(|| state("targetState"));
+    let unmarked = |o: &Value| {
+        let mut o = strip(o);
+        if let Some(meta) = o.get_mut("metadata").and_then(Value::as_object_mut) {
+            for part in ["labels", "annotations"] {
+                if let Some(m) = meta.get_mut(part).and_then(Value::as_object_mut) {
+                    m.retain(|k, _| !k.starts_with("kiln.dev/") && !k.starts_with("argocd.argoproj.io/") && k != kiln_cd::engine::ARGO_INSTANCE);
+                }
+                if meta.get(part).and_then(Value::as_object).is_some_and(|m| m.is_empty()) {
+                    meta.remove(part);
+                }
+            }
+        }
+        o
+    };
+    match (&live, &predicted) {
+        (Some(l), Some(p)) if unmarked(l) == unmarked(p) => None,
+        (None, None) => None,
+        _ => Some(change(key_of(item), live.map(masked).as_ref(), predicted.map(masked).as_ref())),
     }
 }
 
@@ -224,6 +253,25 @@ mod tests {
         let rendered = json!({ "kind": "ConfigMap", "metadata": { "name": "a", "annotations": {} }, "data": { "x": "1" } });
         assert_eq!(strip(&live), strip(&rendered));
         assert_eq!(key_text(&key_of_object(&json!({ "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web", "namespace": "shop" } }))), "apps/Deployment/shop/web");
+    }
+
+    #[test]
+    fn a_provider_s_tracking_marks_are_no_disagreement() {
+        let deploy = |labels: Value, annotations: Value, image: &str| {
+            json!({ "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web", "namespace": "shop", "labels": labels, "annotations": annotations }, "spec": { "image": image } })
+                .to_string()
+        };
+        let item = |live: String, predicted: String| json!({ "group": "apps", "kind": "Deployment", "namespace": "shop", "name": "web", "normalizedLiveState": live, "predictedLiveState": predicted });
+        // What KilnCD runs, marked as its own, and what Argo CD would make of it: its tracking id.
+        let live = deploy(json!({ "app": "web", "kiln.dev/app": "web" }), json!({ "kiln.dev/tracking": "shop/web-staging" }), "web:1.0");
+        let ours = deploy(json!({ "app": "web", "kiln.dev/app": "web" }), json!({ "argocd.argoproj.io/tracking-id": "staging-web:apps/Deployment:shop/web", "kiln.dev/tracking": "shop/web-staging" }), "web:1.0");
+        assert!(disagreement(&item(live.clone(), ours)).is_none(), "only the marks differ");
+        let other = deploy(json!({ "app": "web" }), json!({}), "web:1.1");
+        let d = disagreement(&item(live, other));
+        assert!(d.as_ref().is_some_and(|d| d.pointer("/key/name") == Some(&json!("web"))), "{d:?}");
+        // Not there: the new provider would make it.
+        let missing = json!({ "group": "", "kind": "Service", "namespace": "shop", "name": "web", "targetState": json!({ "apiVersion": "v1", "kind": "Service", "metadata": { "name": "web" } }).to_string() });
+        assert!(disagreement(&missing).is_some());
     }
 
     #[test]

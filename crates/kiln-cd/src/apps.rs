@@ -38,6 +38,10 @@ pub struct AppDef {
     pub ignore: Vec<IgnoreRule>,
     /// How its objects are recognized.
     pub tracking: Tracking,
+    /// The name its objects carry in Argo CD's tracking when it isn't the app's own: the Argo CD
+    /// Application it takes over (an environment moving from Argo CD to KilnCD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_name: Option<String>,
     /// Where the definition came from.
     pub origin: Origin,
     /// The environment it deploys to, when it came from one.
@@ -334,7 +338,7 @@ impl AppDef {
         c.ignore = self.ignore.clone();
         c.tracking = self.tracking;
         if self.tracking != Tracking::Kiln {
-            c.tracking_name = Some(self.name.as_str().into());
+            c.tracking_name = Some(self.tracking_name.as_deref().unwrap_or(&self.name).into());
             // Adopted from Argo CD: apply as Argo CD's own field manager, so what Argo CD owned
             // stays owned (and removable) after the take-over.
             c.manager = "argocd-controller".into();
@@ -743,6 +747,7 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
         sync,
         ignore: spec.get("ignoreDifferences").map(ignore_of).unwrap_or_default(),
         tracking: Tracking::ArgoAnnotation,
+        tracking_name: None,
         origin: Origin::Argo { parent: parent.map(str::to_owned) },
         environment: None,
         labels: obj::map_at(v, &["metadata", "labels"])
@@ -1355,6 +1360,7 @@ fn app_from_spec(
             })
             .collect(),
         tracking: Tracking::Kiln,
+        tracking_name: None,
         origin: Origin::Deploy { repo: repo.to_owned() },
         environment,
         labels: spec.labels.clone(),
@@ -1394,6 +1400,18 @@ fn app_from_spec(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_app_taking_argo_cd_s_objects_over_knows_them_by_its_application_s_name() {
+        let mut d = crate::state::tests::app("podinfo-staging");
+        assert_eq!(d.config().tracking_name, None, "kiln's own tracking: the app's id");
+        d.tracking = Tracking::ArgoAnnotation;
+        assert_eq!(d.config().tracking_name.as_deref(), Some("podinfo-staging"), "imported: the Application is the app");
+        d.tracking_name = Some("staging-podinfo".into());
+        let c = d.config();
+        assert_eq!(c.tracking_name.as_deref(), Some("staging-podinfo"), "taken over: the Application it was");
+        assert_eq!(&*c.manager, "argocd-controller", "what Argo CD owned stays owned");
+    }
 
     #[test]
     fn go_durations_parse() {

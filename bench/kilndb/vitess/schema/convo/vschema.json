@@ -1,0 +1,11 @@
+{
+  "sharded": true,
+  "vindexes": {
+    "xxhash": { "type": "xxhash" }
+  },
+  "tables": {
+    "events": {
+      "column_vindexes": [{ "column": "session", "name": "xxhash" }]
+    }
+  }
+}

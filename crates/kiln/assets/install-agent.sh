@@ -1,8 +1,9 @@
 #!/bin/sh
 # Install a kiln agent on this machine (Linux or macOS), fetched from the kiln server that served
-# this script. Never asks for a password: installs into ~/.local (or /usr/local when run as root)
-# and starts on boot via `kiln install --agent --unattended` (systemd, cron or XDG autostart on
-# Linux; launchd on macOS). Windows: use install.ps1 instead.
+# this script. Never asks for a password: installs into ~/.local (or /usr/local when run as root),
+# puts that on your PATH (a line in your shell's startup file, when it isn't), and starts on boot
+# via `kiln install --agent --unattended` (systemd, cron or XDG autostart on Linux; launchd on
+# macOS). Windows: use install.ps1 instead.
 #
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --token <join-token> [--labels baremetal,bench] [--name box1] [--slots 4]
 #

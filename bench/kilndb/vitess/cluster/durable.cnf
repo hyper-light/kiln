@@ -1,0 +1,5 @@
+# Every commit on disk before it is acknowledged, as KilnDB's are; and room to cache.
+innodb_flush_log_at_trx_commit = 1
+sync_binlog = 1
+innodb_buffer_pool_size = 1G
+max_connections = 4000

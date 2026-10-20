@@ -15,6 +15,8 @@
 //! | `POST /apps/{app}/environments/{env}/pause`, `…/resume` | the provider's automation |
 //! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
 //! | `GET /apps/{app}/environments/{env}/resources`, `/manifests`, `/diff` (`?version` on Argo CD), `/logs?kind&name` | what runs, as the provider sees it |
+//! | `GET /apps/{app}/environments/{env}/actions?kind&name&group&namespace`; `POST …/actions` (`{kind, name, action, params}`) | what can be done to an object it runs (restart, scale, suspend, delete a pod …), and doing it |
+//! | `POST`, `GET`, `DELETE /environments/{env}/move` | moving it to another provider (`{to, handover, force}`): compared in shadow, then handed over with nothing made again; cancelled before the handover |
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
 //! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
@@ -37,7 +39,7 @@ use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
 use super::model::{App, Environment, Release, State, Template};
-use super::{Deploy, argocd, kilncd, reads, store};
+use super::{Deploy, actions, argocd, kilncd, moves, reads, store};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 use crate::secrets::{self, Scope};
@@ -72,6 +74,14 @@ fn created(v: &impl serde::Serialize) -> Result<Response, Fail> {
 struct Note {
     #[serde(default)]
     note: Option<String>,
+}
+
+/// An app and an environment it's registered in.
+async fn registered(d: &Deploy, app: &str, env: &str) -> Result<(App, Environment), Fail> {
+    let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    Ok((a, environment))
 }
 
 fn release_id(s: &str) -> Result<i64, Fail> {
@@ -118,6 +128,16 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             boxed(|| flow::delete_environment(&d, &actor, name)).await?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
+        // Moving an environment between providers (§8.4).
+        (&Method::GET, ["environments", name, "move"]) => match moves::get(&d, name).await.map_err(internal)? {
+            Some(m) => ok(&m),
+            None => Err((StatusCode::NOT_FOUND, format!("{name} hasn't moved between providers"))),
+        },
+        (&Method::POST, ["environments", name, "move"]) => {
+            let ask: moves::Ask = body(req.into_body()).await?;
+            Ok(srv::json(StatusCode::ACCEPTED, &boxed(|| moves::start(&d, &who, name, ask)).await?))
+        }
+        (&Method::DELETE, ["environments", name, "move"]) => ok(&boxed(|| moves::cancel(&d, &who, name)).await?),
 
         (&Method::GET, ["board"]) => ok(&boxed(|| board(&d)).await?),
         (&Method::GET, ["metrics"]) => {
@@ -206,6 +226,22 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
                 },
             };
             ok(&boxed(|| reads::read(&d, &a, &environment, read)).await?)
+        }
+        // What can be done to an object a registration runs, and doing it (§8.1).
+        (&Method::GET, ["apps", app, "environments", env, "actions"]) => {
+            let (a, environment) = registered(&d, app, env).await?;
+            let target = actions::Target {
+                group: q.get("group").cloned(),
+                kind: q.get("kind").cloned().ok_or_else(|| bad("actions on what? ?kind=Deployment&name=web"))?,
+                namespace: q.get("namespace").cloned().filter(|n| !n.is_empty()),
+                name: q.get("name").cloned().ok_or_else(|| bad("actions on what? ?kind=Deployment&name=web"))?,
+            };
+            ok(&json!({ "actions": boxed(|| actions::list(&d, &a, &environment, &target)).await? }))
+        }
+        (&Method::POST, ["apps", app, "environments", env, "actions"]) => {
+            let ask: actions::Ask = body(req.into_body()).await?;
+            let (a, environment) = registered(&d, app, env).await?;
+            ok(&boxed(|| actions::run(&d, &who, &a, &environment, &ask)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": boxed(|| versions(&d, app, env)).await? })),
         (&Method::GET, ["apps", app, "environments", env, "secrets"]) => ok(&boxed(|| secrets_list(&d, &who, app, env)).await?),
@@ -527,6 +563,7 @@ mod tests {
             watch: Default::default(),
             concurrency: Default::default(),
             agents: AgentPolicy::default(),
+            argocd: Default::default(),
         }
     }
 
@@ -545,7 +582,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
-            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), hub: Arc::clone(&hub) };
+            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), hub: Arc::clone(&hub) };
             let st = &hub.store;
             store::put_environment(st, &env("staging", KILNCD)).await?;
             store::put_environment(st, &env("argo", "argocd/prod")).await?;

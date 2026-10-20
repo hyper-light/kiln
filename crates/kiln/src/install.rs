@@ -1,6 +1,7 @@
 //! `kiln install`: put the binary in place, write config, arrange start-on-boot, start now.
 //!
-//! * **Interactive** (default) may ask for a sudo password only when `--system` is requested.
+//! * **Interactive** (default) may ask for a sudo password only when `--system` is requested; on
+//!   Windows, Windows asks for administrator rights once, to start kiln at boot.
 //! * **Unattended** (`--unattended`) never prompts: it installs per-user (no root needed), uses
 //!   `sudo -n` for system installs (failing clearly if that would need a password), generates
 //!   every secret itself and writes them `0600`.
@@ -11,9 +12,9 @@
 //!
 //! | OS      | `--boot auto`                                   | binary                                  |
 //! |---------|-------------------------------------------------|-----------------------------------------|
-//! | Linux   | systemd unit, else crontab `@reboot`, else XDG autostart | `~/.local/bin` (`/usr/local/bin` as root) |
-//! | macOS   | launchd: a LaunchAgent (a LaunchDaemon as root) | `~/.local/bin` (`/usr/local/bin` as root) |
-//! | Windows | a per-user Scheduled Task at logon (no admin rights), else the Startup folder | `%LOCALAPPDATA%\Programs\kiln` |
+//! | Linux   | systemd unit, else crontab `@reboot`, else XDG autostart | `~/.local/bin` (`/usr/local/bin` as root), put on PATH |
+//! | macOS   | launchd: a LaunchAgent (a LaunchDaemon as root) | `~/.local/bin` (`/usr/local/bin` as root), put on PATH |
+//! | Windows | a Scheduled Task at boot, as the user (administrator rights, asked for once), else one at sign-in (none), else the Startup folder | `%LOCALAPPDATA%\Programs\kiln`, put on the user's PATH |
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,8 +33,11 @@ pub enum Boot {
     Xdg,
     /// macOS: a LaunchAgent (per user) or LaunchDaemon (root).
     Launchd,
-    /// Windows: a Scheduled Task at logon (per user).
+    /// Windows: a Scheduled Task at boot, running as you whether or not anyone signs in
+    /// (administrator rights, asked for once); at your sign-in when they can't be had.
     Task,
+    /// Windows: a Scheduled Task at your sign-in, in your session (no administrator rights).
+    Logon,
     None,
 }
 
@@ -122,7 +126,7 @@ fn say(msg: impl AsRef<str>) {
 }
 
 /// Copy the running executable to `dest` atomically (no-op if it already is `dest`).
-fn place_binary(dest: &Path) -> anyhow::Result<()> {
+pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     if exe.canonicalize().ok() == dest.canonicalize().ok() {
         return Ok(());
@@ -152,6 +156,24 @@ fn place_binary(dest: &Path) -> anyhow::Result<()> {
         std::fs::rename(&tmp, dest).with_context(|| format!("replace {}", dest.display()))?;
     }
     Ok(())
+}
+
+/// The binary's folder on the user's PATH, so `kiln` works in every new terminal: on Windows in
+/// the user's own PATH; elsewhere, when this terminal's PATH hasn't it (`~/.local/bin` on a Mac),
+/// through a line in the startup file of the user's shell.
+fn put_on_path(bin: &Path) {
+    let Some(dir) = bin.parent() else { return };
+    match crate::os::add_to_user_path(dir) {
+        Ok(Some(added)) => {
+            let place = added.file.map(|f| format!(" in {}", f.display())).unwrap_or_default();
+            say(format!("path        {} added to your PATH{place} (new terminals find `kiln`)", dir.display()));
+            if let Some(now) = added.now {
+                say(format!("            for this terminal too, run: {now}"));
+            }
+        }
+        Ok(None) => say(format!("path        {} is on your PATH", dir.display())),
+        Err(e) => say(format!("path        {} not added to your PATH ({e}): run kiln as {}", dir.display(), bin.display())),
+    }
 }
 
 pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
@@ -188,6 +210,7 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     eprintln_header(if a.agent { "Installing kiln agent" } else { "Installing kiln server" });
     place_binary(&bin)?;
     say(format!("binary      {}", bin.display()));
+    put_on_path(&bin);
 
     let config_path = crate::config::default_config_path();
     let mut state_dir = crate::config::default_data_dir().join("agent");
@@ -215,14 +238,24 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
 
     let mut sup_args = vec!["supervise".to_owned(), "--".to_owned()];
     sup_args.extend(args);
-    let boot = Install { system, unit, bin: &bin, args: &sup_args, config: &config_path, state_dir: &state_dir, env: None };
+    let ask = !a.unattended && crate::join::interactive();
+    let boot = Install { system, unit, bin: &bin, args: &sup_args, config: &config_path, state_dir: &state_dir, env: None, ask };
     let started_by_boot = setup_boot(a.boot, &boot)?;
 
     if !a.no_start && !started_by_boot {
-        let mut cmd = Command::new(&bin);
-        cmd.arg("supervise").arg("--detach").args(sup_args.iter().skip(1));
-        run(&mut cmd)?;
-        say("started     kiln supervise (detached)");
+        if cfg!(windows) && crate::os::elevated() {
+            // Started from here, kiln (and everything it runs) would have this shell's
+            // administrator rights; its Scheduled Task never gives it those.
+            say("started     no: not from an elevated shell; it starts at the next sign-in or boot");
+        } else {
+            start_replacing(&boot, || {
+                let mut cmd = Command::new(&bin);
+                cmd.arg("supervise").arg("--detach").args(sup_args.iter().skip(1));
+                run(&mut cmd)?;
+                say("started     kiln supervise (detached)");
+                Ok(true)
+            })?;
+        }
     }
 
     if !a.agent {
@@ -299,7 +332,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
 /// usual boot integration for `unit`, leaving every other service alone.
 pub fn start_service(system: bool, unit: &str, bin: &Path, args: &[String], state_dir: &Path, env: &[String]) -> anyhow::Result<()> {
     let config = crate::config::default_config_path();
-    let i = Install { system, unit, bin, args, config: &config, state_dir, env: (!env.is_empty()).then_some(env) };
+    let i = Install { system, unit, bin, args, config: &config, state_dir, env: (!env.is_empty()).then_some(env), ask: false };
     if !setup_boot(Boot::Auto, &i)? {
         let mut cmd = Command::new(bin);
         cmd.arg("supervise").arg("--detach").args(args.iter().skip(1));
@@ -323,6 +356,9 @@ struct Install<'a> {
     /// The service's environment (`KEY=value`), when it must match another service's exactly
     /// (a runner set up beside an existing one); else kiln's config path and this shell's PATH.
     env: Option<&'a [String]>,
+    /// A person is here to ask (not `--unattended`, at a terminal): on Windows, for the
+    /// administrator rights a Scheduled Task at boot takes.
+    ask: bool,
 }
 
 impl Install<'_> {
@@ -331,6 +367,11 @@ impl Install<'_> {
         let mut v = vec!["supervise".to_owned(), "--detach".to_owned()];
         v.extend(self.args.iter().skip(1).cloned());
         v
+    }
+
+    /// [`Self::detach_args`] as one Windows command line.
+    fn detach_command_line(&self) -> String {
+        self.detach_args().iter().map(|a| win_quote(a)).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -426,7 +467,8 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
             Ok(false)
         }
         Boot::Launchd => launchd(i),
-        Boot::Task => scheduled_task(i),
+        Boot::Task => scheduled_task(i, TaskStart::Boot),
+        Boot::Logon => scheduled_task(i, TaskStart::SignIn),
         Boot::None | Boot::Auto => {
             say("boot        none (start manually: kiln supervise -- server)");
             Ok(false)
@@ -444,6 +486,80 @@ fn shell_quote(s: &str) -> String {
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+// ----------------------------------------------------------------- an earlier install's runner
+
+/// Start the service (`start`), stopping what an earlier install of it left running with other
+/// arguments (another name, labels or server): a supervisor only keeps out those started with its
+/// own arguments, so it would go on beside the new one, two runners on one state directory.
+/// Stopped first; after, when this process runs under one of them (from that runner's terminal
+/// or agent), as stopping it ends this process too.
+fn start_replacing(i: &Install<'_>, start: impl FnOnce() -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    let ours: Vec<String> = i.args.iter().skip_while(|a| *a != "--").skip(1).cloned().collect();
+    let (stale, inside) = stale_supervisors(&ours);
+    if stale.is_empty() {
+        return start();
+    }
+    let pids = stale.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    say(format!("stopping    kiln an earlier install started with other arguments (pid {pids})"));
+    if !inside {
+        crate::os::supervise::stop(&stale);
+        return start();
+    }
+    let started = start()?;
+    say("            this terminal runs under it, and ends with it");
+    crate::os::supervise::stop(&stale);
+    Ok(started)
+}
+
+/// This user's supervisors of the service `ours` (what follows `supervise --`) that run other
+/// arguments ([`stale_in`]), and whether this process runs under one of them.
+fn stale_supervisors(ours: &[String]) -> (Vec<u32>, bool) {
+    use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_user(UpdateKind::Always));
+    let me = sysinfo::get_current_pid().ok();
+    let user = me.and_then(|p| sys.process(p)).and_then(Process::user_id).cloned();
+    let procs: Vec<(u32, Vec<String>)> = sys
+        .processes()
+        .iter()
+        .filter(|(pid, p)| Some(**pid) != me && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
+        .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
+        .collect();
+    let stale = stale_in(&procs, ours, &crate::config::default_data_dir().join("agent"));
+    let mut up = me.and_then(|p| sys.process(p)).and_then(Process::parent);
+    let mut inside = false;
+    for _ in 0..64 {
+        let Some(p) = up else { break };
+        if stale.contains(&p.as_u32()) {
+            inside = true;
+            break;
+        }
+        up = sys.process(p).and_then(Process::parent);
+    }
+    (stale, inside)
+}
+
+/// Of `procs` (`(pid, command line)`), the supervisors of the service `ours` (what follows
+/// `supervise --`) that run other arguments: `<kiln> supervise [--exe <kiln>] -- <its subcommand> …`
+/// on the same state directory (`--state-dir`, else `default_state`). Never a runner set up beside
+/// it (`--instance`: `kiln install --agent --upgrade`), which is meant to run beside it.
+fn stale_in(procs: &[(u32, Vec<String>)], ours: &[String], default_state: &Path) -> Vec<u32> {
+    let state = |args: &[String]| {
+        let dir = crate::upgrade::arg_value(args, "--state-dir").map_or_else(|| default_state.to_path_buf(), PathBuf::from);
+        dir.canonicalize().unwrap_or(dir)
+    };
+    let our_state = state(ours);
+    procs
+        .iter()
+        .filter_map(|(pid, argv)| {
+            let sep = argv.iter().position(|w| w == "--")?;
+            let (before, after) = (argv.get(1..sep)?, argv.get(sep + 1..)?);
+            let same_service = before.iter().any(|w| w == "supervise") && after.first() == ours.first() && !after.iter().any(|w| w == "--instance") && state(after) == our_state;
+            (same_service && after != ours).then_some(*pid)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------- launchd
@@ -691,7 +807,7 @@ pub fn relaunch_runner(state_dir: &Path, instance: Option<&str>) -> anyhow::Resu
         args.extend(existing.args.iter().cloned());
         let config = crate::config::default_config_path();
         let env = (!existing.env.is_empty()).then_some(existing.env.as_slice());
-        let i = Install { system: existing.system, unit: &unit, bin: &existing.bin, args: &args, config: &config, state_dir, env };
+        let i = Install { system: existing.system, unit: &unit, bin: &existing.bin, args: &args, config: &config, state_dir, env, ask: false };
         crate::util::write_secret(&plist, launchd_body(&i, &state_dir.join("kiln.log"), Some(&launcher)).as_bytes(), 0o644)?;
         tracing::info!(plist = %plist.display(), launcher = %launcher.display(), "the runner's launchd job runs from its launcher now");
     }
@@ -838,7 +954,7 @@ fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
 // --------------------------------------------------------------------- Windows Task Scheduler
 
 /// Quote one argument for a Windows command line (the rules `CommandLineToArgvW` undoes).
-fn win_quote(s: &str) -> String {
+pub(crate) fn win_quote(s: &str) -> String {
     if !s.is_empty() && !s.contains([' ', '\t', '"']) {
         return s.to_owned();
     }
@@ -864,28 +980,45 @@ fn win_quote(s: &str) -> String {
     out
 }
 
-/// A Task Scheduler definition that runs `kiln supervise --detach -- …` at the user's logon,
-/// with no time limit (`schtasks /SC ONLOGON` would stop it after 72 hours), on battery too, at
-/// normal priority (the default 7 is below normal, and jobs would inherit it).
-fn task_xml(i: &Install<'_>) -> String {
+/// When a Windows Scheduled Task starts kiln's supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskStart {
+    /// At boot, whether or not anyone signs in, and again at the user's sign-in (nothing to do
+    /// while it runs; it starts what a fast-startup boot didn't). As the user, through Windows'
+    /// S4U logon: Windows keeps no password, and kiln gets none of the user's network
+    /// credentials (as over SSH with a key). Registering it takes administrator rights.
+    Boot,
+    /// At the user's sign-in, in their session. Takes no administrator rights.
+    SignIn,
+}
+
+/// A Task Scheduler definition that runs `kiln supervise --detach -- …` at `start`, with no time
+/// limit (`schtasks /SC ONLOGON` would stop it after 72 hours), on battery too, at normal
+/// priority (the default 7 is below normal, and jobs would inherit it), never elevated.
+fn task_xml(i: &Install<'_>, start: TaskStart) -> String {
     let user = xml_escape(&crate::os::user_principal());
-    let arguments = xml_escape(&i.detach_args().iter().map(|a| win_quote(a)).collect::<Vec<_>>().join(" "));
+    let arguments = xml_escape(&i.detach_command_line());
+    let sign_in = format!("    <LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>{user}</UserId>\n    </LogonTrigger>\n");
+    let (when, triggers, logon_type) = match start {
+        TaskStart::Boot => (
+            "at boot, whether or not anyone signs in",
+            format!("    <BootTrigger>\n      <Enabled>true</Enabled>\n    </BootTrigger>\n{sign_in}"),
+            "S4U",
+        ),
+        TaskStart::SignIn => ("at sign-in", sign_in, "InteractiveToken"),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>kiln {unit}: starts kiln's own supervisor at logon</Description>
+    <Description>kiln {unit}: starts kiln's own supervisor {when}</Description>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-      <UserId>{user}</UserId>
-    </LogonTrigger>
-  </Triggers>
+{triggers}  </Triggers>
   <Principals>
     <Principal id="Author">
       <UserId>{user}</UserId>
-      <LogonType>InteractiveToken</LogonType>
+      <LogonType>{logon_type}</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
@@ -922,7 +1055,7 @@ fn task_xml(i: &Install<'_>) -> String {
 }
 
 /// The Startup-folder fallback: a `.cmd` the shell runs at logon.
-fn startup_script(unit: &str) -> PathBuf {
+pub(crate) fn startup_script(unit: &str) -> PathBuf {
     crate::os::config_home()
         .join("Microsoft")
         .join("Windows")
@@ -932,42 +1065,173 @@ fn startup_script(unit: &str) -> PathBuf {
         .join(format!("{unit}.cmd"))
 }
 
-fn scheduled_task(i: &Install<'_>) -> anyhow::Result<bool> {
+/// Start kiln with a Scheduled Task, at boot when `start` asks for it and Windows lets this
+/// install register that (administrator rights: this process's, or those Windows asks the person
+/// here for), else at sign-in. Returns whether the task started kiln now.
+fn scheduled_task(i: &Install<'_>, start: TaskStart) -> anyhow::Result<bool> {
     std::fs::create_dir_all(i.state_dir).with_context(|| format!("create {}", i.state_dir.display()))?;
+    let user = crate::os::user_principal();
+    let elevated = crate::os::elevated();
+    let mut not_at_boot = None;
+    if start == TaskStart::Boot {
+        let created = if elevated {
+            create_task(i, TaskStart::Boot, false)
+        } else if i.ask {
+            say("boot        Windows asks for administrator rights, once, to start kiln at boot (before anyone signs in)");
+            create_task(i, TaskStart::Boot, true)
+        } else {
+            Err("that takes administrator rights".to_owned())
+        };
+        match created {
+            Ok(()) => {
+                say(format!("boot        Scheduled Task \"{}\" at boot, as {user}, whether or not anyone signs in", i.unit));
+                return task_now(i);
+            }
+            Err(why) => not_at_boot = Some(why),
+        }
+    }
+    match create_task(i, TaskStart::SignIn, false) {
+        Ok(()) => say(format!("boot        Scheduled Task \"{}\" at {user}'s sign-in", i.unit)),
+        // A task of this name registered with administrator rights, which only an administrator
+        // can replace: kept when it starts this same kiln, as another would run beside it.
+        Err(why) => match task_definition(i.unit) {
+            Some(task) if task.runs(i) => say(format!("boot        Scheduled Task \"{}\" {} (kept: set up with administrator rights)", i.unit, task.when())),
+            Some(_) => anyhow::bail!(
+                "the Scheduled Task \"{}\" starts kiln differently, and only an administrator can change it ({why}): run this again in an administrator PowerShell",
+                i.unit
+            ),
+            None => return startup_folder(i, &why),
+        },
+    }
+    if let Some(why) = not_at_boot {
+        say(if elevated {
+            format!("            not at boot: {why}")
+        } else {
+            format!("            not at boot ({why}); for that, run once in an administrator PowerShell: {}", install_command(i))
+        });
+    }
+    task_now(i)
+}
+
+/// Where `schtasks.exe` is (by its full path, as an administrator runs it).
+fn schtasks_exe() -> PathBuf {
+    std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from("schtasks.exe"), |root| PathBuf::from(root).join("System32").join("schtasks.exe"))
+}
+
+/// Register Scheduled Task `i.unit` (replacing one of that name) to start kiln at `start`: as an
+/// administrator, Windows asking the person here first, when `elevate`; else with this
+/// process's rights. Why it couldn't, otherwise.
+fn create_task(i: &Install<'_>, start: TaskStart, elevate: bool) -> Result<(), String> {
     // schtasks reads task XML as UTF-16 (with a byte-order mark).
     let xml_path = i.state_dir.join(format!("{}.task.xml", i.unit));
     let mut bytes = vec![0xFF, 0xFE];
-    bytes.extend(task_xml(i).encode_utf16().flat_map(u16::to_le_bytes));
-    std::fs::write(&xml_path, bytes).with_context(|| format!("write {}", xml_path.display()))?;
-    let created = Command::new("schtasks")
-        .args(["/Create", "/F", "/TN", i.unit, "/XML"])
-        .arg(&xml_path)
-        .stdin(Stdio::null())
-        .output();
+    bytes.extend(task_xml(i, start).encode_utf16().flat_map(u16::to_le_bytes));
+    let created = std::fs::write(&xml_path, &bytes).map_err(|e| format!("write {}: {e}", xml_path.display())).and_then(|()| {
+        if elevate {
+            create_task_elevated(i.unit, &xml_path, &bytes)
+        } else {
+            match Command::new("schtasks").args(["/Create", "/F", "/TN", i.unit, "/XML"]).arg(&xml_path).stdin(Stdio::null()).output() {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()),
+                Err(e) => Err(format!("run schtasks: {e}")),
+            }
+        }
+    });
     let _ = std::fs::remove_file(&xml_path);
-    match created {
-        Ok(o) if o.status.success() => {
-            let _ = std::fs::remove_file(startup_script(i.unit));
-            say(format!("boot        Scheduled Task \"{}\" (at logon, per user)", i.unit));
-            // Start it now: the task only launches a detached supervisor and exits.
-            Ok(quiet(Command::new("schtasks").args(["/Run", "/TN", i.unit])))
-        }
-        other => {
-            let why = match other {
-                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_owned(),
-                Err(e) => e.to_string(),
-            };
-            let path = startup_script(i.unit);
-            let body = format!(
-                "@echo off\r\nrem kiln {}: start kiln's supervisor at logon (installed by `kiln install`).\r\nstart \"\" /B {} {}\r\n",
-                i.unit,
-                win_quote(&i.bin.display().to_string()),
-                i.detach_args().iter().map(|a| win_quote(a)).collect::<Vec<_>>().join(" ")
-            );
-            crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
-            say(format!("boot        Startup folder {} (Task Scheduler refused: {why})", path.display()));
-            Ok(false)
-        }
+    created
+}
+
+/// `schtasks /Create` as an administrator, from the definition at `xml_path`, held open
+/// meanwhile so nothing can change it: what the administrator's schtasks reads is what this
+/// process wrote (`written`), whatever else runs as this user.
+fn create_task_elevated(unit: &str, xml_path: &Path, written: &[u8]) -> Result<(), String> {
+    use std::io::Read as _;
+    let mut held = crate::os::open_unchangeable(xml_path).map_err(|e| format!("open {}: {e}", xml_path.display()))?;
+    let mut now = Vec::new();
+    held.read_to_end(&mut now).map_err(|e| format!("read {}: {e}", xml_path.display()))?;
+    if now != written {
+        return Err(format!("{} changed after it was written", xml_path.display()));
+    }
+    let parameters = ["/Create", "/F", "/TN", unit, "/XML", &xml_path.display().to_string()].map(win_quote).join(" ");
+    let code = crate::os::run_elevated(&schtasks_exe(), &parameters, Duration::from_secs(120)).map_err(|e| e.to_string())?;
+    drop(held);
+    if code == 0 { Ok(()) } else { Err(format!("schtasks exited with {code}")) }
+}
+
+/// Have Scheduled Task `i.unit` start kiln now (it launches a detached supervisor and exits;
+/// nothing happens while one with the same arguments runs, and one with others is stopped), and
+/// drop the Startup-folder fallback an earlier install may have left, which would start it a
+/// second way.
+fn task_now(i: &Install<'_>) -> anyhow::Result<bool> {
+    let _ = std::fs::remove_file(startup_script(i.unit));
+    start_replacing(i, || Ok(quiet(Command::new("schtasks").args(["/Run", "/TN", i.unit]))))
+}
+
+/// What a Scheduled Task runs, as Task Scheduler has it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TaskDefinition {
+    pub(crate) command: String,
+    pub(crate) arguments: String,
+    pub(crate) at_boot: bool,
+}
+
+impl TaskDefinition {
+    /// Whether it starts the supervisor `i` describes.
+    fn runs(&self, i: &Install<'_>) -> bool {
+        self.command.eq_ignore_ascii_case(&i.bin.display().to_string()) && self.arguments == i.detach_command_line()
+    }
+
+    fn when(&self) -> &'static str {
+        if self.at_boot { "at boot" } else { "at sign-in" }
+    }
+}
+
+/// Scheduled Task `unit`, if there is one.
+pub(crate) fn task_definition(unit: &str) -> Option<TaskDefinition> {
+    let out = Command::new("schtasks").args(["/Query", "/TN", unit, "/XML"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| parse_task(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+/// A task's definition from its XML (`schtasks /Query /XML`).
+fn parse_task(xml: &str) -> Option<TaskDefinition> {
+    let field = |tag: &str| xml.split(&format!("<{tag}>")).nth(1)?.split(&format!("</{tag}>")).next().map(crate::upgrade::xml_unescape);
+    Some(TaskDefinition { command: field("Command")?, arguments: field("Arguments").unwrap_or_default(), at_boot: xml.contains("<BootTrigger") })
+}
+
+/// The last resort when Task Scheduler refuses: a `.cmd` in the user's Startup folder, which the
+/// desktop runs at sign-in.
+fn startup_folder(i: &Install<'_>, why: &str) -> anyhow::Result<bool> {
+    let path = startup_script(i.unit);
+    let body = format!(
+        "@echo off\r\nrem kiln {}: start kiln's supervisor at logon (installed by `kiln install`).\r\nstart \"\" /B {} {}\r\n",
+        i.unit,
+        win_quote(&i.bin.display().to_string()),
+        i.detach_command_line()
+    );
+    crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
+    say(format!("boot        Startup folder {} (Task Scheduler refused: {why})", path.display()));
+    Ok(false)
+}
+
+/// The `kiln install` that sets this service up again (an enrolled agent needs no token), for
+/// PowerShell: `kiln install --agent --server … --name …`.
+fn install_command(i: &Install<'_>) -> String {
+    // `supervise -- <subcommand> …`
+    let mut rest = i.args.iter().skip_while(|a| *a != "--").skip(1);
+    let mut words = vec!["kiln".to_owned(), "install".to_owned()];
+    if rest.next().is_some_and(|sub| sub == "agent") {
+        words.push("--agent".to_owned());
+    }
+    words.extend(rest.map(|a| ps_quote(a)));
+    words.join(" ")
+}
+
+/// Quote one argument for PowerShell, where a bare `a,b` would be a list.
+fn ps_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@".contains(c)) {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
     }
 }
 
@@ -997,9 +1261,7 @@ pub fn uninstall(agent: bool) -> anyhow::Result<()> {
         paths.push(launcher_path(unit));
     }
     if cfg!(windows) {
-        if quiet(Command::new("schtasks").args(["/Delete", "/F", "/TN", unit])) {
-            say(format!("removed Scheduled Task \"{unit}\""));
-        }
+        remove_task(unit);
         paths.push(startup_script(unit));
         let stopped = crate::os::supervise::stop_supervisors(if agent { "agent" } else { "server" });
         if stopped > 0 {
@@ -1016,6 +1278,30 @@ pub fn uninstall(agent: bool) -> anyhow::Result<()> {
     }
     say("data and config were kept; delete them yourself if you want a clean slate");
     Ok(())
+}
+
+/// Delete Scheduled Task `unit`. One registered with administrator rights (kiln's at boot) takes
+/// them to delete as well: Windows asks the person here for them, else they're told how.
+fn remove_task(unit: &str) {
+    if task_definition(unit).is_none() {
+        return;
+    }
+    if quiet(Command::new("schtasks").args(["/Delete", "/F", "/TN", unit])) {
+        say(format!("removed Scheduled Task \"{unit}\""));
+        return;
+    }
+    let by_hand = format!("in an administrator PowerShell run: schtasks /Delete /TN {unit} /F");
+    if !crate::join::interactive() {
+        say(format!("could not remove Scheduled Task \"{unit}\" (only an administrator can); {by_hand}"));
+        return;
+    }
+    say(format!("Windows asks for administrator rights to remove Scheduled Task \"{unit}\""));
+    let parameters = ["/Delete", "/F", "/TN", unit].map(win_quote).join(" ");
+    match crate::os::run_elevated(&schtasks_exe(), &parameters, Duration::from_secs(120)) {
+        Ok(0) => say(format!("removed Scheduled Task \"{unit}\"")),
+        Ok(code) => say(format!("could not remove Scheduled Task \"{unit}\" (schtasks exited with {code}); {by_hand}")),
+        Err(e) => say(format!("could not remove Scheduled Task \"{unit}\" ({e}); {by_hand}")),
+    }
 }
 
 #[cfg(test)]
@@ -1048,6 +1334,56 @@ mod tests {
         // (104), another machine's runner (105, 109), something else of kiln's (108), or this process.
         assert_eq!(strays_in(ps, state, &[], 0), [101, 103, 106, 107]);
         assert_eq!(strays_in(ps, state, &[103], 106), [101, 107]);
+    }
+
+    #[test]
+    fn an_earlier_installs_runner_with_other_arguments_is_found() {
+        let state = Path::new("/nonexistent/kiln/agent");
+        let ours = ["agent", "--server", "http://h:7070", "--name", "box", "--labels", "a,b"].map(str::to_owned);
+        let p = |pid: u32, cmd: &str| (pid, cmd.split(' ').map(str::to_owned).collect::<Vec<_>>());
+        let procs = [
+            p(101, "/k/kiln supervise -- agent --server http://h:7070 --name box --labels a,b"),
+            p(102, "/k/kiln supervise -- agent --server http://h:7070 --name old --labels a"),
+            p(103, "/k/kiln agent --server http://h:7070 --name old --labels a"),
+            p(104, "/k/kiln supervise -- agent --server http://h:7070 --name box --labels a,b --instance 0199a2b3"),
+            p(105, "/k/kiln supervise -- agent --name box --state-dir /elsewhere"),
+            p(106, "/k/kiln supervise -- server"),
+            p(107, "/k/launcher/kiln-agent supervise --exe /k/kiln -- agent --name old --state-dir /nonexistent/kiln/agent"),
+            p(108, "/k/kiln install --agent --server http://h:7070 --name old"),
+        ];
+        // 102 and 107: this service with other arguments. Never the service as installed (101),
+        // a runner (103), a runner set up beside it (104), another state directory (105), the
+        // server (106), nor what isn't a supervisor (108).
+        assert_eq!(stale_in(&procs, &ours, state), [102, 107]);
+    }
+
+    /// The process table for real: a stand-in for an earlier install's supervisor (a shell whose
+    /// command line reads as one, on a state directory of its own) is found and stopped.
+    #[test]
+    fn an_earlier_installs_runner_is_found_and_stopped() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().display().to_string();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "ping", "-n", "60", "127.0.0.1", ">nul", "&", "rem"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 60; :", "kiln"]);
+            c
+        };
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.args(["supervise", "--", "agent", "--name", "old", "--state-dir", &state]).stdin(Stdio::null()).stdout(Stdio::null()).spawn()?;
+        let pid = child.id();
+        // Waited for meanwhile: dead and unwaited, it would look alive to `stop` for its grace.
+        let reaper = std::thread::spawn(move || child.wait());
+        let ours = ["agent", "--name", "new", "--state-dir", &state].map(str::to_owned);
+        let (stale, inside) = stale_supervisors(&ours);
+        crate::os::supervise::stop(&[pid]);
+        reaper.join().map_err(|_| anyhow::anyhow!("the reaper panicked"))??;
+        assert_eq!((stale, inside), (vec![pid], false));
+        Ok(())
     }
 
     /// launchd for real (macOS, by hand): a one-shot job reloads another and stops a process
@@ -1106,6 +1442,7 @@ mod tests {
             config: Path::new("/Users/me/.config/kiln/kiln.toml"),
             state_dir: Path::new("/Users/me/.local/share/kiln/agent"),
             env: None,
+            ask: false,
         };
         let plist = launchd_body(&i, Path::new("/tmp/kiln.log"), None);
         assert!(plist.contains("<string>io.github.hyper-light.kiln-agent</string>"));
@@ -1131,9 +1468,121 @@ mod tests {
         let env = e.env.clone();
         let again = Install { env: Some(&env), ..i };
         assert_eq!(crate::upgrade::parse_plist(&launchd_body(&again, Path::new("/tmp/kiln.log"), Some(launcher)), "kiln-agent", false).map(|e| e.env), Some(env));
-        let xml = task_xml(&i);
-        assert!(xml.contains("<Arguments>supervise --detach -- agent --name &quot;box &lt;1&gt; &amp; co&quot;</Arguments>"));
-        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        for start in [TaskStart::Boot, TaskStart::SignIn] {
+            let xml = task_xml(&i, start);
+            assert!(xml.contains("<Arguments>supervise --detach -- agent --name &quot;box &lt;1&gt; &amp; co&quot;</Arguments>"));
+            assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+            assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"), "never elevated");
+            assert!(xml.contains("<LogonTrigger>"), "both start at sign-in");
+            // What a later install reads back to tell whether a task it can't replace is this one.
+            let read = parse_task(&xml).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+            assert!(read.runs(&i));
+            assert_eq!(read.at_boot, start == TaskStart::Boot);
+        }
+        // At boot: as the user without a session of theirs (S4U), which takes no password.
+        let boot = task_xml(&i, TaskStart::Boot);
+        assert!(boot.contains("<BootTrigger>") && boot.contains("<LogonType>S4U</LogonType>"));
+        let sign_in = task_xml(&i, TaskStart::SignIn);
+        assert!(!sign_in.contains("<BootTrigger>") && sign_in.contains("<LogonType>InteractiveToken</LogonType>"));
+        let other = Install { args: &["supervise".to_owned(), "--".to_owned(), "agent".to_owned()], ..i };
+        let read = parse_task(&boot).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+        assert!(!read.runs(&other), "another kiln's task");
         Ok(())
+    }
+
+    /// Task Scheduler for real (Windows, by hand): a task at sign-in is registered, read back and
+    /// removed; one at boot only with administrator rights (run it elevated too). Only a
+    /// throwaway task of its own, never started.
+    #[test]
+    #[ignore = "drives this machine's Task Scheduler"]
+    fn a_task_is_registered_read_back_and_removed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let unit = format!("kiln-test-{}", std::process::id());
+        let args = ["supervise", "--", "agent", "--name", "box <1> & co"].map(str::to_owned);
+        let bin = Path::new(r"C:\Windows\System32\whoami.exe");
+        let i = Install { system: false, unit: &unit, bin, args: &args, config: Path::new("kiln.toml"), state_dir: dir.path(), env: None, ask: false };
+        let result = (|| -> anyhow::Result<()> {
+            create_task(&i, TaskStart::SignIn, false).map_err(anyhow::Error::msg)?;
+            let read = task_definition(&unit).ok_or_else(|| anyhow::anyhow!("not registered"))?;
+            anyhow::ensure!(read.runs(&i) && !read.at_boot, "read back as {read:?}");
+            // What `kiln install --agent --upgrade` finds to replace.
+            let found = crate::upgrade::find_existing(&unit).ok_or_else(|| anyhow::anyhow!("an upgrade finds no {unit}"))?;
+            anyhow::ensure!(found.boot == "task" && found.bin == bin && found.args == ["agent", "--name", "box <1> & co"], "an upgrade finds {found:?}");
+            match create_task(&i, TaskStart::Boot, false) {
+                Ok(()) => {
+                    anyhow::ensure!(crate::os::elevated(), "registered at boot without administrator rights");
+                    let read = task_definition(&unit).ok_or_else(|| anyhow::anyhow!("not registered"))?;
+                    anyhow::ensure!(read.runs(&i) && read.at_boot, "read back as {read:?}");
+                }
+                Err(e) => anyhow::ensure!(!crate::os::elevated(), "refused at boot to an administrator: {e}"),
+            }
+            Ok(())
+        })();
+        remove_task(&unit);
+        anyhow::ensure!(task_definition(&unit).is_none(), "{unit} is still there");
+        result
+    }
+
+    /// An upgrade for real (Windows, by hand): the binary a task starts is replaced while it runs,
+    /// the running one moved aside, as `kiln install --agent --upgrade` does to a runner. Only a
+    /// throwaway task and binary of its own (a copy of `ping`, standing in for the runner).
+    #[test]
+    #[ignore = "drives this machine's Task Scheduler"]
+    fn an_upgrade_replaces_the_binary_a_task_starts_while_it_runs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let unit = format!("kiln-test-{}", std::process::id());
+        let bin = dir.path().join("kiln.exe");
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &bin)?;
+        let args = ["supervise", "--", "agent", "--name", "box"].map(str::to_owned);
+        let i = Install { system: false, unit: &unit, bin: &bin, args: &args, config: Path::new("kiln.toml"), state_dir: dir.path(), env: None, ask: false };
+        create_task(&i, TaskStart::SignIn, false).map_err(anyhow::Error::msg)?;
+        let mut runner = Command::new(&bin).args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).spawn()?;
+        let owned = unit.clone();
+        let upgraded = crate::rt::block_on(async move { crate::upgrade::install_alongside(&owned, &|_: String| {}).await });
+        let _ = runner.kill();
+        let _ = runner.wait();
+        remove_task(&unit);
+        upgraded?;
+        let me = std::fs::metadata(std::env::current_exe()?)?.len();
+        anyhow::ensure!(std::fs::metadata(&bin)?.len() == me, "{} is still the old binary", bin.display());
+        let aside = std::fs::read_dir(dir.path())?.flatten().any(|e| e.file_name().to_string_lossy().contains(".old-"));
+        anyhow::ensure!(aside, "the running binary wasn't moved aside");
+        Ok(())
+    }
+
+    /// The administrator prompt for real (Windows, by hand: say yes, twice): a task at boot is
+    /// registered through it, and removed through it again.
+    #[test]
+    #[ignore = "asks for administrator rights"]
+    fn a_task_at_boot_through_the_administrator_prompt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let unit = format!("kiln-test-{}", std::process::id());
+        let args = ["supervise", "--", "agent"].map(str::to_owned);
+        let bin = Path::new(r"C:\Windows\System32\whoami.exe");
+        let i = Install { system: false, unit: &unit, bin, args: &args, config: Path::new("kiln.toml"), state_dir: dir.path(), env: None, ask: true };
+        create_task(&i, TaskStart::Boot, true).map_err(anyhow::Error::msg)?;
+        let read = task_definition(&unit);
+        remove_task(&unit);
+        let read = read.ok_or_else(|| anyhow::anyhow!("not registered"))?;
+        anyhow::ensure!(read.runs(&i) && read.at_boot, "read back as {read:?}");
+        anyhow::ensure!(task_definition(&unit).is_none(), "{unit} is still there");
+        Ok(())
+    }
+
+    #[test]
+    fn the_install_to_run_as_an_administrator() {
+        let args: Vec<String> = ["supervise", "--", "agent", "--server", "http://10.0.0.2:7070", "--name", "O'Brien box", "--labels", "baremetal,windows,x86_64"]
+            .map(str::to_owned)
+            .to_vec();
+        let bin = Path::new(r"C:\Users\me\AppData\Local\Programs\kiln\kiln.exe");
+        let (config, state) = (Path::new("kiln.toml"), Path::new("state"));
+        let i = Install { system: false, unit: "kiln-agent", bin, args: &args, config, state_dir: state, env: None, ask: false };
+        // PowerShell would take a bare `a,b,c` for a list, and `'` ends a quoted string.
+        assert_eq!(
+            install_command(&i),
+            "kiln install --agent --server http://10.0.0.2:7070 --name 'O''Brien box' --labels 'baremetal,windows,x86_64'"
+        );
+        let server = ["supervise", "--", "server"].map(str::to_owned);
+        assert_eq!(install_command(&Install { unit: "kiln", args: &server, ..i }), "kiln install");
     }
 }

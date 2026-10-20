@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::flow::{self, Ask, RollbackAsk, Who};
 use super::model::{App, Environment, State, Template};
-use super::{Deploy, api, reads, store};
+use super::{Deploy, actions, api, moves, reads, store};
 use crate::ops::{Cx, Fail, Out};
 
 type Fut = Pin<Box<dyn Future<Output = Out> + Send>>;
@@ -242,6 +242,57 @@ pub fn ops() -> &'static [Op] {
                     })
                     .await
                 }),
+            op!("deploy.registrations.actions", "What can be done now to an object an app runs in an environment (`kind`, `name`: a Deployment, a CronJob, a pod): its provider's actions (restart, pause, resume, scale, suspend, create-job, delete a pod …), each with whether it's possible now and what it takes.", ro: true, destructive: false,
+                input: || schema(json!({
+                    "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV},
+                    "kind": {"type": "string", "description": "Deployment, StatefulSet, CronJob, Pod, …"}, "name": {"type": "string"}, "group": {"type": "string"}, "namespace": {"type": "string"}
+                }), &["app", "environment", "kind", "name"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["actions"])?, HashMap::new())),
+                run: |_cx: Cx, v: Value| async move {
+                    let d = service()?;
+                    let (a, e) = registered(&d, &v).await?;
+                    answer(json!({ "actions": actions::list(&d, &a, &e, &target(&v)?).await? }))
+                }),
+            op!("deploy.registrations.action", "Do something to an object an app runs in an environment, through its provider: `action` is one deploy.registrations.actions offers (`restart`, `scale` with `params: {replicas: \"3\"}`, `delete` for a pod …). Agents act only where the environment lets them deploy.", ro: false, destructive: true,
+                input: || schema(json!({
+                    "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV},
+                    "kind": {"type": "string"}, "name": {"type": "string"}, "group": {"type": "string"}, "namespace": {"type": "string"},
+                    "action": {"type": "string"}, "params": {"type": "object", "additionalProperties": {"type": "string"}}
+                }), &["app", "environment", "kind", "name", "action"]),
+                route: |v| Ok((Method::POST, registration_path(v, &["actions"])?, HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let d = service()?;
+                    let (a, e) = registered(&d, &v).await?;
+                    let params = v.get("params").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, x)| x.as_str().map(|x| (k.clone(), x.to_owned()))).collect()).unwrap_or_default();
+                    let ask = actions::Ask { target: target(&v)?, action: text(&v, "action")?, params };
+                    actions::run(&d, &Who::of(&cx.caller), &a, &e, &ask).await
+                }),
+            op!("deploy.environments.move", "Move an environment to another CD provider (`to`: `kilncd` or `argocd/<integration>`; docs/deploy-api.md §8.4). The new one gets every app in shadow and compares, never writing; with `handover` it takes over once it agrees with what runs (`force`: whatever it says), with nothing made again. It goes on in the background: follow it with deploy.environments.move_status. A person moves an environment, not an agent.", ro: false, destructive: true,
+                input: || schema(json!({
+                    "environment": {"type": "string", "description": ENV}, "to": {"type": "string"},
+                    "handover": {"type": "boolean"}, "force": {"type": "boolean"},
+                    "argocd": {"type": "object", "properties": {"applications": {"type": "boolean", "description": "kiln writes each Application, rather than through an ApplicationSet."}}}
+                }), &["environment", "to"]),
+                route: |v| Ok((Method::POST, path(&["environments", &text(v, "environment")?, "move"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let mut ask = v.clone();
+                    if let Some(m) = ask.as_object_mut() {
+                        m.remove("environment");
+                    }
+                    let ask: moves::Ask = serde_json::from_value(ask).map_err(|e| bad(format!("the move doesn't read: {e}")))?;
+                    answer(moves::start(&*service()?, &Who::of(&cx.caller), &text(&v, "environment")?, ask).await?)
+                }),
+            op!("deploy.environments.move_status", "How an environment's move between providers stands: its phase (comparing, compared, handing_over, moved, failed, cancelled), and for each app whether the new provider agrees with what runs, where it doesn't, and, handed over, whether anything was made again.", ro: true, destructive: false,
+                input: || schema(json!({"environment": {"type": "string", "description": ENV}}), &["environment"]),
+                route: |v| Ok((Method::GET, path(&["environments", &text(v, "environment")?, "move"]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move {
+                    let env = text(&v, "environment")?;
+                    answer(moves::get(&*service()?, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{env} hasn't moved between providers")))?)
+                }),
+            op!("deploy.environments.move_cancel", "Cancel an environment's move that hasn't begun handing over: the new provider lets go of its shadows, and what runs stays with the old one.", ro: false, destructive: false,
+                input: || schema(json!({"environment": {"type": "string", "description": ENV}}), &["environment"]),
+                route: |v| Ok((Method::DELETE, path(&["environments", &text(v, "environment")?, "move"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(moves::cancel(&*service()?, &Who::of(&cx.caller), &text(&v, "environment")?).await?) }),
             op!("deploy.registrations.candidates", "The releases a rollback can go to: the last ten that succeeded, the one running and any rolled back from left out.", ro: true, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
                 route: |v| Ok((Method::GET, registration_path(v, &["candidates"])?, HashMap::new())),
@@ -389,6 +440,20 @@ async fn registration_read(v: &Value, what: impl FnOnce(&Value) -> Result<reads:
     reads::read(&d, &a, &e, read).await
 }
 
+/// An app and an environment it's registered in, from an operation's input.
+async fn registered(d: &Deploy, v: &Value) -> Result<(App, Environment), Fail> {
+    let (app, env) = (text(v, "app")?, text(v, "environment")?);
+    let a = store::app(&d.hub.store, &app).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let e = store::environment(&d.hub.store, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&d.hub.store, &app, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    Ok((a, e))
+}
+
+/// The object an action is on, from an operation's input.
+fn target(v: &Value) -> Result<actions::Target, Fail> {
+    Ok(actions::Target { group: opt_text(v, "group"), kind: text(v, "kind")?, namespace: opt_text(v, "namespace"), name: text(v, "name")? })
+}
+
 /// Waits on a release: until it is done (or, `done` false, until it moves at all), or the time is
 /// up. Woken as it moves on this server; looked at every few seconds besides, since another server
 /// may move it.
@@ -462,6 +527,7 @@ mod tests {
                 "deploy.apps.put" => json!({ "app": { "name": "web" } }),
                 "deploy.templates.put" => json!({ "template": { "name": "service" } }),
                 "deploy.fleets.get" => json!({ "id": "f1" }),
+                "deploy.environments.move" => json!({ "environment": "staging", "to": "kilncd" }),
                 _ => input.clone(),
             };
             let (method, rest, _) = (op.route)(&v)?;
