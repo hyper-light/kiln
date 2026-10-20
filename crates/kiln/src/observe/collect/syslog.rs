@@ -336,7 +336,8 @@ pub(crate) fn run(c: Compiled, stop: &Stop, state: &Mutex<State>, sink: &Sink) {
     let mut batch: Batch<()> = Batch::default();
     let mut flight: InFlight<()> = InFlight::default();
     let (mut records, mut last_ms) = (0u64, None);
-    let offer = |r: Vec<Record>, a: Ack| sink(r, a);
+    // A datagram's records only (its batch writes no rows).
+    let offer = |l: crate::observe::ingest::Logs, a: Ack| sink(l.into_records(), a).map_err(crate::observe::ingest::Logs::from);
     while !stop.stopped() {
         // Offered while there is room: a refused offer is held, and nothing more taken meanwhile.
         if batch.is_empty() || flight.offer(&mut batch, &offer) {
@@ -346,7 +347,7 @@ pub(crate) fn run(c: Compiled, stop: &Stop, state: &Mutex<State>, sink: &Sink) {
                     Err(_) => break,
                 }
             }
-            if !batch.records.is_empty() {
+            if !batch.is_empty() {
                 batch.marks.push(());
                 let _ = flight.offer(&mut batch, &offer);
             }

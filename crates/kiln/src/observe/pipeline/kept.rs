@@ -176,6 +176,11 @@ pub fn activate(defs: &[PipelineDef]) {
     *active().write().unwrap_or_else(PoisonError::into_inner) = Arc::new(compiled);
 }
 
+/// The pipelines active now: what a reader asks of a line before it makes a record of it.
+pub fn snapshot() -> Arc<Vec<Pipeline>> {
+    active().read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 /// Every active pipeline applied to `records`, in order.
 pub fn process(records: &mut [Record]) {
     let pipelines = active().read().unwrap_or_else(PoisonError::into_inner).clone();

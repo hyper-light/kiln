@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Batch, Compiled, Encoding, Format, InFlight, Kind, Line, MAX_LINE, Offer, Origin, Start, State, Stop};
+use super::{Batch, Compiled, Encoding, Format, InFlight, Kind, Line, MAX_LINE, Offer, Origin, PipelineFilters, Start, State, Stop};
 
 /// How often the globs are looked at anew (Datadog's Agent's `file_scan_period`).
 const SCAN: Duration = Duration::from_secs(10);
@@ -148,6 +148,34 @@ struct Sink {
     excluded: u64,
     truncated: u64,
     now_ns: i64,
+    /// What each line is asked before a record is made of it ([`Compiled::write`]).
+    filters: PipelineFilters,
+    /// A line's room, back from one written as its row (or left out), for the next line's text;
+    /// and the room a mask writes a line into.
+    line: String,
+    mask: String,
+}
+
+/// The most room a line's text keeps for the next (a long line's goes).
+const LINE_ROOM: usize = 64 << 10;
+
+impl Sink {
+    fn new(now_ns: i64) -> Self {
+        Self { batch: Batch::default(), excluded: 0, truncated: 0, now_ns, filters: PipelineFilters::default(), line: String::new(), mask: String::new() }
+    }
+
+    /// Room for a line's text: the last line's, if it came back.
+    fn room(&mut self) -> String {
+        let mut s = std::mem::take(&mut self.line);
+        s.clear();
+        s
+    }
+
+    fn give(&mut self, text: String) {
+        if text.capacity() <= LINE_ROOM {
+            self.line = text;
+        }
+    }
 }
 
 fn mark(b: &mut Batch<Mark>, m: Mark) {
@@ -307,7 +335,11 @@ impl Tail {
                     if let Some(l) = line.strip_suffix(b"\r") {
                         line = l;
                     }
-                    let text = String::from_utf8_lossy(line).into_owned();
+                    let mut text = sink.room();
+                    match std::str::from_utf8(line) {
+                        Ok(s) => text.push_str(s),
+                        Err(_) => text.push_str(&String::from_utf8_lossy(line)),
+                    }
                     let at = self.buf_at + end as u64 + 1;
                     self.line(c, sink, text, at, false);
                     start = end + 1;
@@ -357,6 +389,8 @@ impl Tail {
                     } else {
                         p.truncated = true;
                     }
+                    // Its message is in the line it makes: its room for the next.
+                    sink.give(text);
                     if partial {
                         return;
                     }
@@ -372,6 +406,7 @@ impl Tail {
                     } else {
                         p.truncated = true;
                     }
+                    sink.give(text);
                     if partial {
                         return;
                     }
@@ -398,6 +433,7 @@ impl Tail {
                 m.truncated |= line.truncated;
                 *at = end;
                 *since = Instant::now();
+                sink.give(line.text);
             }
             _ => {
                 // A record starts here: the one before is whole (or as long as a record holds).
@@ -410,17 +446,25 @@ impl Tail {
         }
     }
 
-    /// A record through the rules into the batch, its mark there whether it is kept or not.
+    /// A record through the rules into the batch, its mark there whether it is kept or not; its
+    /// text's room back where nothing kept it.
     fn emit(&mut self, c: &Compiled, sink: &mut Sink, mut line: Line, end: u64) {
         if line.truncated {
             sink.truncated += 1;
         }
-        if !line.text.trim().is_empty() {
-            if c.keep(&mut line.text) {
-                sink.batch.push(c.record(line, &self.origin, sink.now_ns));
-            } else {
-                sink.excluded += 1;
+        let room = if line.text.trim().is_empty() {
+            Some(line.text)
+        } else if c.keep_into(&mut line.text, &mut sink.mask) {
+            if sink.mask.capacity() > LINE_ROOM {
+                sink.mask = String::new();
             }
+            c.write(line, &self.origin, sink.now_ns, &mut sink.batch, &mut sink.filters)
+        } else {
+            sink.excluded += 1;
+            Some(line.text)
+        };
+        if let Some(text) = room {
+            sink.give(text);
         }
         mark(&mut sink.batch, (self.key, self.generation, end));
         self.emitted = self.emitted.max(end);
@@ -613,7 +657,7 @@ pub(crate) fn sample(c: &Compiled, n: usize) -> Sampled {
         file.seek(SeekFrom::Start(from))?;
         let now = Instant::now();
         let mut t = Tail { key: Key(0, 0), origin: origin(c, path), path: path.clone(), file, generation: 0, read: from, size, emitted: from, buf: Vec::new(), buf_at: from, grew: now, looked: now, gone: false, part: None, multi: None, bom_done: from != 0 };
-        let mut sink = Sink { batch: Batch::default(), excluded: 0, truncated: 0, now_ns: crate::observe::clock_ms().saturating_mul(1_000_000) };
+        let mut sink = Sink::new(crate::observe::clock_ms().saturating_mul(1_000_000));
         let mut scratch = vec![0u8; READ];
         let mut budget = (size - from) as usize + READ;
         while t.read(c, &mut sink, &mut scratch, &mut budget)? > 0 {}
@@ -622,8 +666,8 @@ pub(crate) fn sample(c: &Compiled, n: usize) -> Sampled {
     })();
     match read {
         Ok(mut sink) => {
-            let skip = sink.batch.records.len().saturating_sub(n);
-            out.records = sink.batch.records.split_off(skip);
+            let mut records = sink.batch.take_records();
+            out.records = records.split_off(records.len().saturating_sub(n));
             out.excluded = sink.excluded;
         }
         Err(e) => out.error = Some(format!("{}: {e}", path.display())),
@@ -673,7 +717,7 @@ impl<'a> Files<'a> {
             places: saved.places.into_iter().map(|p| (p.key, p)).collect(),
             formers: Vec::new(),
             flight: InFlight::default(),
-            sink: Sink { batch: Batch::default(), excluded: 0, truncated: 0, now_ns: 0 },
+            sink: Sink::new(0),
             scratch: vec![0; READ],
             saved: Instant::now(),
             dirty: false,
@@ -849,6 +893,7 @@ impl<'a> Files<'a> {
             return false;
         }
         self.sink.now_ns = crate::observe::clock_ms().saturating_mul(1_000_000);
+        self.sink.filters.pipelines = crate::observe::pipeline::kept::snapshot();
         let mut busy = false;
         let mut i = 0;
         while i < self.tails.len() {
@@ -968,13 +1013,30 @@ impl<'a> Files<'a> {
 }
 
 /// Every file `c` matches read whole on this thread, each offer written at once (a bench's): the
-/// records and the bytes read.
-pub(crate) fn read_whole(c: &Compiled, saved_to: &Path) -> (u64, u64) {
+/// records, the bytes read and the bytes written. `written`: each offer through a batcher into its
+/// writes, each answered at once, as a runner's thread takes them; else dropped.
+pub(crate) fn read_whole(c: &Compiled, saved_to: &Path, written: bool) -> (u64, u64, u64) {
+    use crate::observe::ingest::{Batcher, FLUSH};
     let records = std::sync::atomic::AtomicU64::new(0);
-    let offer = |r: Vec<kiln_obs::logs::record::Record>, a: crate::observe::ingest::Ack| {
-        records.fetch_add(r.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        drop(r);
-        a.set();
+    let entries = std::sync::atomic::AtomicU64::new(0);
+    let batcher = Mutex::new(Batcher::new(1));
+    let offer = |l: crate::observe::ingest::Logs, a: crate::observe::ingest::Ack| {
+        records.fetch_add(l.len(), std::sync::atomic::Ordering::Relaxed);
+        if !written {
+            drop(l);
+            a.set();
+            return Ok(());
+        }
+        let mut b = super::lock(&batcher);
+        let due = Instant::now() + FLUSH;
+        b.logs_acked(l, a, due);
+        let ms = crate::observe::clock_ms();
+        while let Some((seq, entry)) = b.poll(due, ms) {
+            entries.fetch_add(entry.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            drop(entry);
+            b.answered(seq, &crate::observe::wire::Outcome { applied: true, ..Default::default() }, due);
+        }
+        b.spent().for_each(drop);
         Ok(())
     };
     let mut f = Files::new(c, saved_to);
@@ -987,7 +1049,7 @@ pub(crate) fn read_whole(c: &Compiled, saved_to: &Path) -> (u64, u64) {
     }
     let _ = f.flight.offer(&mut f.sink.batch, &offer);
     f.written();
-    (records.load(std::sync::atomic::Ordering::Relaxed), f.bytes)
+    (records.load(std::sync::atomic::Ordering::Relaxed), f.bytes, entries.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// A file source's thread: until told to stop, its globs looked at every [`SCAN`] and its files
@@ -1047,12 +1109,31 @@ mod tests {
         refuse: std::sync::atomic::AtomicBool,
     }
 
+    /// What was offered, as records in the order they were read: rows read back as the store
+    /// reads them.
+    fn records_of(logs: crate::observe::ingest::Logs) -> Vec<Record> {
+        let mut out = Vec::new();
+        for part in logs.parts {
+            match part {
+                crate::observe::ingest::LogPart::Records(r) => out.extend(r),
+                crate::observe::ingest::LogPart::Rows { raw, rows: n, .. } => {
+                    let mut rows = kiln_obs::logs::record::Rows::new(&raw, n as usize);
+                    while let Ok(Some(r)) = rows.next_row() {
+                        out.push(r.to_owned());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     impl Sent {
-        fn offer(&self, records: Vec<Record>, ack: Ack) -> Result<(), Vec<Record>> {
+        fn offer(&self, logs: crate::observe::ingest::Logs, ack: Ack) -> Result<(), crate::observe::ingest::Logs> {
             use std::sync::atomic::Ordering;
             if self.refuse.load(Ordering::SeqCst) {
-                return Err(records);
+                return Err(logs);
             }
+            let records = records_of(logs);
             if self.hold.load(Ordering::SeqCst) {
                 self.held.lock().unwrap_or_else(PoisonError::into_inner).push((records, ack));
             } else {
@@ -1095,7 +1176,7 @@ mod tests {
     /// Steps a source's files by hand: a scan when asked, rounds until nothing more is read.
     fn step(f: &mut Files<'_>, sent: &Arc<Sent>, scan: bool) {
         let s = sent.clone();
-        let offer = move |r: Vec<Record>, a: Ack| s.offer(r, a);
+        let offer = move |l: crate::observe::ingest::Logs, a: Ack| s.offer(l, a);
         if scan {
             f.scan(false);
         }

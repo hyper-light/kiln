@@ -203,6 +203,8 @@ pub struct Builder {
     /// Reused across runs.
     sorted: Vec<(i64, f64)>,
     enc: Encoder,
+    /// Rows' compressed form, reused across items.
+    packed: Vec<u8>,
 }
 
 impl Builder {
@@ -264,12 +266,17 @@ impl Builder {
             crate::logs::record::put_row(&mut raw, r, prev);
             prev = r.ts;
         }
-        let mut packed = Vec::with_capacity(raw.len() / 4);
-        crate::lz4::compress(&raw, &mut packed);
-        self.body.push(LOGS);
-        varint::put(&mut self.body, records.len() as u64);
+        self.packed_item(LOGS, &raw, records.len() as u64);
+    }
+
+    /// An item of rows, `raw` LZ4-compressed: its tag, how many, their size, and their bytes.
+    fn packed_item(&mut self, tag: u8, raw: &[u8], rows: u64) {
+        self.packed.clear();
+        crate::lz4::compress(raw, &mut self.packed);
+        self.body.push(tag);
+        varint::put(&mut self.body, rows);
         varint::put(&mut self.body, raw.len() as u64);
-        put_bytes(&mut self.body, &packed);
+        put_bytes(&mut self.body, &self.packed);
         self.items += 1;
     }
 
@@ -279,13 +286,17 @@ impl Builder {
         if rows == 0 {
             return;
         }
-        let mut packed = Vec::with_capacity(raw.len() / 4);
-        crate::lz4::compress(raw, &mut packed);
-        self.body.push(SPANS);
-        varint::put(&mut self.body, u64::from(rows));
-        varint::put(&mut self.body, raw.len() as u64);
-        put_bytes(&mut self.body, &packed);
-        self.items += 1;
+        self.packed_item(SPANS, raw, u64::from(rows));
+    }
+
+    /// Log rows written whole already (records a collector made rows where it read them, or a
+    /// batcher as they came; their times chained from 0), as one item: what [`Builder::logs`]
+    /// writes of records.
+    pub fn log_rows(&mut self, raw: &[u8], rows: u32) {
+        if rows == 0 {
+            return;
+        }
+        self.packed_item(LOGS, raw, u64::from(rows));
     }
 
     pub fn items(&self) -> u64 {

@@ -34,7 +34,7 @@ use kiln_obs::manifest::{Point, plain_name};
 use kiln_obs::store::{Answer, snapshot_name};
 use serde::{Deserialize, Serialize};
 
-use super::ingest::{Batcher, WAITING_LOG_BYTES, WAITING_POINTS, record_bytes};
+use super::ingest::{Batcher, WAITING_LOG_BYTES, WAITING_POINTS};
 use super::wire::{self, Joiner, Msg, Outcome, Status};
 use crate::http::client::Client;
 
@@ -178,9 +178,9 @@ enum Input {
     Series(Vec<(SeriesKey, Vec<(i64, f64)>)>),
     /// Samples as a request decoded them: keys once, samples flat.
     Samples(kiln_obs::otlp::metrics::Decoded),
-    Logs(Vec<Record>),
+    Logs(super::ingest::Logs),
     /// Log records whose sender waits to know they are written (a file's reader).
-    LogsAcked(Vec<Record>, super::ingest::Ack),
+    LogsAcked(super::ingest::Logs, super::ingest::Ack),
     /// Spans, as rows a request's decoding wrote: segments, each with its rows.
     Spans(Vec<(Vec<u8>, u32)>),
     /// A sender's wait for everything taken before it to be written (a node stopping).
@@ -528,46 +528,55 @@ impl Observe {
     /// place past them only then. Refused, they come back and the ack is never given: the reader
     /// offers them again.
     pub fn offer_logs_acked(&self, records: Vec<Record>, ack: super::ingest::Ack) -> Result<(), Vec<Record>> {
-        self.log_within_acked(records, WAITING_LOG_BYTES as u64 / 4 * 3, false, Some(ack))
+        self.offer_log_batch(records.into(), ack).map_err(super::ingest::Logs::into_records)
+    }
+
+    /// Log records as [`Observe::offer_logs_acked`] takes them, and records a collector made rows
+    /// where it read them (none a pipeline reads), all under one ack.
+    pub fn offer_log_batch(&self, logs: super::ingest::Logs, ack: super::ingest::Ack) -> Result<(), super::ingest::Logs> {
+        self.log_within_acked(logs, WAITING_LOG_BYTES as u64 / 4 * 3, false, Some(ack))
     }
 
     fn log_within(&self, records: Vec<Record>, max: u64, count: bool) -> bool {
-        self.log_within_acked(records, max, count, None).is_ok()
+        self.log_within_acked(records.into(), max, count, None).is_ok()
     }
 
-    fn log_within_acked(&self, mut records: Vec<Record>, max: u64, count: bool, ack: Option<super::ingest::Ack>) -> Result<(), Vec<Record>> {
-        if records.is_empty() && ack.is_none() {
+    fn log_within_acked(&self, mut logs: super::ingest::Logs, max: u64, count: bool, ack: Option<super::ingest::Ack>) -> Result<(), super::ingest::Logs> {
+        if logs.is_empty() && ack.is_none() {
             return Ok(());
         }
         // Each service check's status as a sample of its series, from the run as it came
         // (`kiln_obs::monitor::checks`): written once its record is taken.
-        let statuses: Vec<(SeriesKey, Vec<(i64, f64)>)> = records.iter().filter_map(kiln_obs::monitor::checks::status_sample).map(|(key, ms, v)| (key, vec![(ms, v)])).collect();
+        let statuses: Vec<(SeriesKey, Vec<(i64, f64)>)> = logs.records().filter_map(kiln_obs::monitor::checks::status_sample).map(|(key, ms, v)| (key, vec![(ms, v)])).collect();
         // The pipelines, where the records are taken. A reader's (acked) records were processed as
         // it gathered them: one refused comes back to be offered again, and is not processed twice.
+        // (Rows are of records no pipeline reads.)
         if ack.is_none() {
-            super::pipeline::kept::process(&mut records);
+            for run in logs.runs_mut() {
+                super::pipeline::kept::process(run);
+            }
         }
         // Each error's issue (`kiln_obs::errors`), after the pipelines that name its parts.
-        for r in &mut records {
+        for r in logs.records_mut() {
             kiln_obs::errors::put_log_issue(r);
         }
-        let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
+        let n = logs.bytes();
         let a = &self.admission;
-        if !records.is_empty() && ((!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max)) {
+        if !logs.is_empty() && ((!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max)) {
             if count {
-                a.refused.fetch_add(records.len() as u64, Ordering::Relaxed);
+                a.refused.fetch_add(logs.len(), Ordering::Relaxed);
             }
-            return Err(records);
+            return Err(logs);
         }
         let input = match ack {
-            Some(ack) => Input::LogsAcked(records, ack),
-            None => Input::Logs(records),
+            Some(ack) => Input::LogsAcked(logs, ack),
+            None => Input::Logs(logs),
         };
         if let Err(e) = self.tx.send(input) {
             a.left_log_bytes.fetch_add(n, Ordering::AcqRel);
             return Err(match e.0 {
-                Input::Logs(r) | Input::LogsAcked(r, _) => r,
-                _ => Vec::new(),
+                Input::Logs(l) | Input::LogsAcked(l, _) => l,
+                _ => super::ingest::Logs::default(),
             });
         }
         self.write(statuses);

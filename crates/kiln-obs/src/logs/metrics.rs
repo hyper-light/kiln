@@ -434,8 +434,8 @@ impl Touched {
         self.newest.store(0, std::sync::atomic::Ordering::Release);
     }
 
-    /// A batch of entry `index` applied, now: the windows its records fall in, and, the entry new,
-    /// how late its newest came.
+    /// A batch of entry `index` applied, now (its records whole, whichever items held them): the
+    /// windows its records fall in, and, the entry new, how late its newest came.
     pub fn note(&self, b: &BatchWindows, index: u64) {
         if b.newest == i64::MIN {
             return;

@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
-| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second). Next: records handed over encoded; the Event Log on a Windows machine | in progress |
+| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second); a text line no pipeline reads handed over as its row, in the order read beside records, a write's rows one item (9 allocations a line to 0.01, 70% more lines a second through the batcher). Next: JSON lines handed over as rows; the Event Log on a Windows machine | in progress |
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). Next: a matcher of grok's own, its groups in one pass | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
@@ -779,6 +779,14 @@ level is read from its first words as a log pipeline's status remapper reads it;
 was read. A time more than a minute ahead of the machine's clock is taken as now (one without a zone
 read as UTC on a machine west of it).
 
+A text line no pipeline reads (§8.2: each one's filter asked of the line itself, as of its record) is
+handed over as the row its record would write, written where it is read from the line as it is (its
+message, the source's names, its file's or container's attributes, its tags, an error's issue): no
+record is made of it, and a test holds the row and the record's alike over every kind of line. A
+JSON line, a line a pipeline reads, and a service check's run go as records. What a machine reads
+goes in the order it was read, rows beside records, and the batcher writes it so: a write's records
+and rows one item, compressed whole (§12.17).
+
 **Each line once.** A line's place (a file's offset, the journal's cursor) is kept only once the
 write that holds its record is applied by the group (`crate::observe::ingest::Ack`: the batcher
 gives it when the write holding the last of an offer's records is answered), and written down a
@@ -912,9 +920,10 @@ so every record noted is in what that count reads. Records that come more than t
 their window are not counted, as Datadog's ("aggregation only considers logs ingested with a
 timestamp within the past 20 minutes"); they are stored and searched as any.
 
-**When a window is counted.** Once its records have come: the latest any batch's newest record came
-over the last five minutes, a quarter more, 2 to 30 s (learned as records come, so a fleet whose
-records take longer waits longer, and in the steady state each window is counted once). A window
+**When a window is counted.** Once its records have come: how late each batch's newest record came
+(a batch a write's records, however many of its items hold them), the 99th percentile over the last
+five minutes, a quarter more, 2 to 30 s (learned as records come, so a fleet whose records take
+longer waits longer, and in the steady state each window is counted once). A window
 counted and then given more waits half as long as it has been since it ended before it is counted
 again, so however records trickle in, one is counted some fifteen times at the most; counting takes
 a quarter of each second at the most, never-counted windows first.
@@ -2577,7 +2586,7 @@ before and after, three reads each taken in turn, medians:
 | CRI, JSON in it, after | 800 k (+50%) | 21 | 1,364 | 39 k |
 
 Next: records handed to the batcher encoded, as rows (no strings a record at all): the batcher's
-log queue then holds rows beside records, its acks counted across both.
+log queue then holds rows beside records, its acks counted across both. Done (below).
 
 Through kiln's nginx pipeline a line costs some ten plain ones (the same run: 1.8 M lines a second
 plain, 160 k parsed, on a loaded machine): perf puts 18% in the regular expressions' backtracker
@@ -2621,6 +2630,57 @@ records (its trim threshold) and faults it in again, and the smaller allocations
 free more often. With trimming off (`GLIBC_TUNABLES=glibc.malloc.trim_threshold=1073741824`), the
 pages first touched fell, 6,220 to 5,439: kiln uses the system's allocator, and a long-lived server's
 trimming is left as glibc does it.
+
+Then records handed over encoded (2026-10-20). A text line no pipeline reads is written as its row
+where it is read (§8.1): the row its record would write, from the line as it is, into a segment the
+source's batch keeps (a block's text, 256 KiB, then another); the line's `String` comes back from
+the write for the next line's text (a row only reads it; a line left out or blank gives it back too,
+as does each line a `multi_line` record or a CRI or Docker line joins), and a mask writes the masked
+line into room kept from line to line (as `replace_all` with `NoExpand` writes it: a differential
+test over seven patterns, empty matches among them). A JSON line, a line a pipeline reads (each
+pipeline's filter asked of the line itself) and a service check's run stay records. The batch keeps
+what it holds in the order it was read, runs of records and segments of rows (`ingest::Logs`), and
+the batcher queues it so: records written as rows as they come, segments whole, a write taking whole
+segments by their raw bytes and joining them into one item, compressed whole, each segment's first
+time chained again from the last before it (`kiln_obs::logs::record::put_rows_after`, a test over
+runs of any times). Its compressed form is written into room the batch's builder keeps.
+
+Measured with the bench's `KOBS_WRITTEN=1` (each offer through a batcher into its writes, each
+answered at once, as a runner's thread takes them, and the bytes of the writes counted): HEAD's
+collector with that mode patched in against this one, the same bench built alike, run in turn on one
+core of fedora (others' work at a load of 8 to 24), three rounds each, 300,000 lines a file:
+
+| | allocations a line | bytes a line | lines a second | bytes written a line |
+| --- | --- | --- | --- | --- |
+| text (an nginx access log), before | 9.01 | 1,299 | 1.57–1.61 M | 22.2 |
+| text (an nginx access log), after | 0.01 | 477 | 2.68–3.09 M | 22.1 |
+| the access log, an exclude and a mask, before | 9.14 | 1,293 | 1.34–1.56 M | 13.0 |
+| the access log, an exclude and a mask, after | 0.03 | 410 | 2.12–2.45 M | 13.2 |
+| Java stack traces, `multi_line`, before | 2.22 | 258 | 6.7–7.6 M | 2.0 |
+| Java stack traces, `multi_line`, after | 0.12 | 129 | 9.5–11.1 M | 2.0 |
+| JSON lines, before | 18.01 | 1,545 | 732–754 k | 15.6 |
+| JSON lines, after | 18.00 | 1,113 | 785–890 k | 15.6 |
+| CRI, JSON in it, before | 21.01 | 1,907 | 651–704 k | 16.1 |
+| CRI, JSON in it, after | 20.00 | 1,187 | 713–799 k | 16.2 |
+| through kiln's nginx pipeline, before | 49.03 | 3,853 | 175–210 k | 51.1 |
+| through kiln's nginx pipeline, after | 49.04 | 3,187 | 176–202 k | 51.2 |
+
+The collector alone (its offers dropped, as the tables above measure it): a text line 9.00
+allocations to 0.01, 2.29 M lines a second to 4.85 M; a `multi_line` record's line 11.0 M to 16.9 M;
+the masked log 2.20 M to 3.57 M. A JSON line's eighteen allocations are its attributes' strings, a
+record's as `kiln_obs` keeps one; JSON lines written as rows from the line read in place are next.
+What is written is what was: a write's rows one item as before, compressed as well (the first
+measure of this step wrote an item a segment, each offer's, and lost that).
+
+Page faults with glibc's trimming as it is moved both ways (text 3.8 k to 5.5 k a read, JSON 1.6 k
+to 3.4 k, through the pipeline 5 k to 35–44 k; CRI 2.2 k to 0.1 k, the masked log 0.6 k to none): the
+heap's top handed back and faulted in again, as before (with trimming off, text 16.2 k both, the
+pipeline 9.8 k to 4.1 k). Rates there are within the machine's noise.
+
+Two things the runs found beside it. Metrics from logs learned how late records come from each
+write's first item alone (a write held one item before): a write's records are one batch again,
+whatever items hold them (§13, metrics from logs). And the full disk's scenario assumed the machine it
+ran on (§13, a full disk).
 
 ### 12.18 Metrics from logs
 
@@ -3184,6 +3244,16 @@ full disk failed, the replica stopped and was opened again at once, the log repl
 again: 83% CPU and a warning every 0.4 s. A replica that stops is now opened again after a second,
 twice as long each time it stops again (to a minute); a merge waits for room for its block.
 
+The scenario no longer assumes the machine it runs on (2026-10-20): the host's dynamic loader is
+found from the path its ABI names, wherever the distribution keeps it (Arch's `/usr/lib`, Fedora's
+`/usr/lib64`, Debian's `/usr/lib/x86_64-linux-gnu`); it floods until the server refuses (two minutes
+at the most) rather than for 25 s, since how soon a disk fills is the machine's speed (on fedora,
+22 M points in 38 s); and what was taken is counted once it is written (a point answered 200 is
+taken, and written a flush and a write later), as the floods count, not the instant the flood ends.
+That last was a race the test had: on a loaded machine it counted 4 to 54 thousand points short,
+every one of them stored a moment later. Were points ever lost, it names them: each series' count
+against its sender's requests taken, and the first short series read a millisecond at a time.
+
 **Clouds** (`crates/kiln/tests/observe_clouds.rs`): a kiln server pulling from services that
 stand in for AWS (STS, CloudWatch, IMDSv2), Google (OAuth, Cloud Monitoring, the metadata
 server) and Azure (Entra, Resource Manager, the VM's metadata service). Each checks what the real
@@ -3409,14 +3479,17 @@ form, minutes of a latency the last twelve of 120 over 300 ms: 108 met, 90%, bre
 its budget spent twice over (−100%). 2026-10-18: both pass in Chromium and in WebKit as a phone.
 
 **Logs collected** (`observe_collect.rs`): a server and a runner; a source of the runner's files,
-its lines JSON, each numbered, every tenth a health check a rule leaves out, a token in each a rule
-masks; 500 lines there before it, read from the beginning as it says; then the file renamed
+its lines JSON and, one in three, text (the rows the runner writes where it reads them, mixed with
+records in its batches: §8.1), each numbered, every tenth a health check a rule leaves out, a token
+in each a rule masks; 500 lines there before it, read from the beginning as it says; then the file renamed
 (logrotate's `create`) with lines written to both the old and the new, copied and truncated
 (logrotate's `copytruncate`), and 4,000 lines written at 2,000 a second while the runner is stopped
 (SIGTERM) and started, then 4,000 more while it is killed (SIGKILL) and started. Every line's records
 counted by its number: none lost, none of those left out stored, none repeated through the renaming,
 the copy and the stop; the kill repeats what was written in its last second (0 to 477 of the 4,000
-over six runs). A record as stored: masked, its level, its host, its file's path, the source's tag.
+over six runs). A record as stored: masked, its level, its host, its file's path, the source's tag;
+a text line's alike, from its row (2026-10-20: passes with the text lines, a text line counted by the
+number its message says, its group's search at a time).
 2026-10-18: passes (each run 2 min). Then a pod's CRI log (a long line in parts, then JSON on
 stderr), a Docker container's json-file log (its name, image and Compose service from its config)
 and the journal through a stand-in for `journalctl` that keeps cursors as the real one does: the
@@ -3475,8 +3548,8 @@ and p99 within the 1.09% bound of the value of rank q(n - 1); a distribution wit
 answering its average and no percentile), and each as log analytics counts the records stored, the
 runner's too; a value above what was sent fails at once (a record counted twice never comes
 right). Then 400 records late for two windows counted a minute before, and 50 records 25 minutes
-back; then the server stopped and started, 300 more records late for windows before it, and 15 s
-more. Every window holds what was sent through all of it, and the records 25 minutes back are
+back; then the server stopped and started, 300 more records late for windows before it sent with
+the first new ones (as an exporter back from a restart sends what it held), and 15 s more. Every window holds what was sent through all of it, and the records 25 minutes back are
 stored and never counted. Passes (4.5 min): each of the 125 windows counted once on time (the
 settle learned at 2 s), exactly the two late windows counted again, and after the restart every
 window of the twenty minutes counted again from the store, alike. In a browser: a metric tried on
@@ -3487,7 +3560,13 @@ window between them (102 of them counted again, each read whole), now each batch
 late batch held every window back five minutes (the settle was the most any batch took), now the
 99th percentile; the entries a server applies again as it opens looked minutes late (the settle 30
 s after a restart), now told apart as the live tail tells them; and the log intake kept a nested
-attribute as one JSON text where Datadog's reads `@http.status_code`, now flattened as theirs.
+attribute as one JSON text where Datadog's reads `@http.status_code`, now flattened as theirs. Then
+(2026-10-20) a write came to hold several items of records (a segment each, §12.17), and how late a
+batch came was taken of an entry's first item alone (the rest of it "applied before"): the restart's
+late records, their own segment, made a write look 23 s late and the settle 29 s. A write's records
+are one batch again whichever items hold them, as when one item held them all (spans' segments had
+the same flaw already); a store test holds it, and the late records go with new ones, so the
+scenario does not hang on whether the server's batcher writes them alone.
 
 **OTLP over gRPC** (`observe_live.rs`): a server and a runner (its gRPC receiver on a port of its
 own); OTLP messages made from OTLP/JSON, each sent as a gRPC call over HTTP/2 in the clear: a gauge

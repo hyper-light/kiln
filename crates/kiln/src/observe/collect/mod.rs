@@ -20,7 +20,6 @@ pub mod syslog;
 pub mod unified;
 pub mod winevent;
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +30,7 @@ use kiln_obs::logs::record::Record;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::ingest::Ack;
+use super::ingest::{Ack, LogPart, Logs};
 pub use super::scrape::{EVERY, SERVER};
 
 /// Sources kept at the most.
@@ -408,22 +407,141 @@ pub(crate) struct Origin {
     pub service: Option<String>,
 }
 
+/// What a reader asks of each line before it makes a record of it: the pipelines active (taken
+/// again each round), and their filters' scratch.
+#[derive(Default)]
+pub(crate) struct PipelineFilters {
+    pub pipelines: Arc<Vec<super::pipeline::Pipeline>>,
+    pub scratch: super::pipeline::Scratch,
+}
+
+/// A text line's fields as its record would hold them ([`Compiled::record`]), borrowed: what a
+/// pipeline's filter is asked of, and what its row is written of, with no record made.
+struct LineView<'a> {
+    message: &'a str,
+    service: &'a str,
+    host: &'a str,
+    source: &'a str,
+    severity: u8,
+    origin: &'a [(String, String)],
+    stream: Option<&'a str>,
+    truncated: bool,
+    tags: &'a [(String, String)],
+}
+
+impl<'a> LineView<'a> {
+    /// Its attributes, in its record's order.
+    fn attrs(&self) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+        let pair = |(k, v): &'a (String, String)| (k.as_str(), v.as_str());
+        self.origin.iter().map(pair).chain(self.stream.map(|s| ("log.iostream", s))).chain(self.truncated.then_some(("truncated", "true"))).chain(self.tags.iter().map(pair))
+    }
+}
+
+impl kiln_obs::logs::search::Fields for LineView<'_> {
+    fn message(&self) -> &str {
+        self.message
+    }
+    fn service(&self) -> &str {
+        self.service
+    }
+    fn host(&self) -> &str {
+        self.host
+    }
+    fn source(&self) -> &str {
+        self.source
+    }
+    fn severity(&self) -> u8 {
+        self.severity
+    }
+    fn attr(&self, key: &str) -> Option<&str> {
+        self.attrs().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+    fn trace_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+    fn span_id(&self) -> Option<[u8; 8]> {
+        None
+    }
+}
+
 impl Compiled {
     /// The rules applied to a record's text: `false` when it goes.
     pub(crate) fn keep(&self, text: &mut String) -> bool {
+        self.keep_into(text, &mut String::new())
+    }
+
+    /// As [`Compiled::keep`], a masked text written into `room` (the text's own room after, for
+    /// the next): each match left to right the placeholder, as it is, as `replace_all` with
+    /// `NoExpand` writes it.
+    pub(crate) fn keep_into(&self, text: &mut String, room: &mut String) -> bool {
         for s in &self.steps {
             match s {
                 Step::Exclude(r) if r.is_match(text) => return false,
                 Step::Include(r) if !r.is_match(text) => return false,
                 Step::Mask(r, with) => {
-                    if let Cow::Owned(masked) = r.replace_all(text, regex::NoExpand(with)) {
-                        *text = masked;
+                    let mut last = None;
+                    for m in r.find_iter(text) {
+                        if last.is_none() {
+                            room.clear();
+                        }
+                        room.push_str(text.get(last.unwrap_or(0)..m.start()).unwrap_or_default());
+                        room.push_str(with);
+                        last = Some(m.end());
+                    }
+                    if let Some(end) = last {
+                        room.push_str(text.get(end..).unwrap_or_default());
+                        std::mem::swap(text, room);
                     }
                 }
                 _ => {}
             }
         }
         true
+    }
+
+    /// A line into `b`: a text line no active pipeline reads as its row, written from the line as
+    /// it is, nothing else made of it (the row its record would write: a test holds them alike),
+    /// and its text back (only read) for the next line's; any other as its record
+    /// ([`Compiled::record`]), for the pipelines that read it, a JSON line's fields, or a service
+    /// check's status.
+    pub(crate) fn write<M>(&self, line: Line, origin: &Origin, now_ns: i64, b: &mut Batch<M>, filters: &mut PipelineFilters) -> Option<String> {
+        let json = match self.format {
+            Format::Json => true,
+            Format::Auto | Format::Cri | Format::Docker => line.text.trim_start().starts_with('{'),
+            Format::Text => false,
+        };
+        if json || self.source == kiln_obs::monitor::checks::SOURCE {
+            b.push(self.record(line, origin, now_ns));
+            return None;
+        }
+        let view = LineView {
+            // As its record keeps it (`cloud::message`), so a filter reads what a record's would.
+            message: kiln_obs::logs::record::cut(&line.text, kiln_obs::logs::record::MAX_MESSAGE_BYTES),
+            service: self.service.as_deref().or(origin.service.as_deref()).unwrap_or(&self.name),
+            host: &self.host,
+            source: &self.source,
+            severity: super::cloud::severity_of(&line.text),
+            origin: &origin.attrs,
+            stream: line.stream,
+            truncated: line.truncated,
+            tags: &self.tags,
+        };
+        let PipelineFilters { pipelines, scratch } = filters;
+        if pipelines.iter().any(|p| p.reads(&view, scratch)) {
+            b.push(self.record(line, origin, now_ns));
+            return None;
+        }
+        let ts = line.ts.unwrap_or(now_ns);
+        let ts = if ts > now_ns + AHEAD_MS * 1_000_000 { now_ns } else { ts };
+        // An error's issue, as `kiln_obs::errors::put_log_issue` gives a record one: one it came
+        // with left out, its own put last.
+        let error = view.severity >= 17;
+        let issue = error.then(|| kiln_obs::errors::log_issue(view.service, view.severity, &kiln_obs::errors::Error::of(view.attrs()))).flatten().map(kiln_obs::errors::hex);
+        let kept = |(k, _): &(&str, &str)| !error || *k != "issue.id";
+        let count = view.attrs().filter(kept).count() + usize::from(issue.is_some());
+        let attrs = view.attrs().filter(kept).chain(issue.as_deref().map(|id| ("issue.id", id)));
+        b.push_row(ts, view.severity, [view.service, view.host, view.source], view.message, attrs, count);
+        Some(line.text)
     }
 
     /// A line's record: a JSON line's message, level, time, trace and fields, or a text line's
@@ -804,14 +922,15 @@ impl Stop {
     }
 }
 
-/// Where records go: offered with an ack; refused (no room), they come back, to be offered again.
-pub(crate) type Offer<'a> = &'a (dyn Fn(Vec<Record>, Ack) -> Result<(), Vec<Record>> + Sync);
+/// Where records go (records, and records made rows where they were read): offered with an ack;
+/// refused (no room), they come back, to be offered again.
+pub(crate) type Offer<'a> = &'a (dyn Fn(Logs, Ack) -> Result<(), Logs> + Sync);
 
 /// The observe owner's offer: what a machine's sources write through.
-fn offer_to_observe(records: Vec<Record>, ack: Ack) -> Result<(), Vec<Record>> {
+fn offer_to_observe(logs: Logs, ack: Ack) -> Result<(), Logs> {
     match super::api::get() {
-        Some(o) => o.offer_logs_acked(records, ack),
-        None => Err(records),
+        Some(o) => o.offer_log_batch(logs, ack),
+        None => Err(logs),
     }
 }
 
@@ -875,12 +994,12 @@ pub fn test(name: &str, s: &Source, host: &str) -> Value {
 }
 
 /// For benches (`benches/collect.rs`): every file `source` matches, read whole on this thread as a
-/// machine reads it, its places kept in `places`, each offer written at once: the records and the
-/// bytes read.
+/// machine reads it, its places kept in `places`, each offer written at once (`written`: through a
+/// batcher into its writes): the records, the bytes read and the bytes written.
 #[doc(hidden)]
-pub fn read_whole(name: &str, source: &Source, places: &Path) -> Result<(u64, u64), String> {
+pub fn read_whole(name: &str, source: &Source, places: &Path, written: bool) -> Result<(u64, u64, u64), String> {
     let c = source.compile(name, "bench")?;
-    Ok(files::read_whole(&c, places))
+    Ok(files::read_whole(&c, places, written))
 }
 
 // --------------------------------------------------------------------------------------- store
@@ -1018,7 +1137,7 @@ impl Collector {
                                 Kind::UnifiedLog => unified::run(&c, &file, &stop2, &state2, &offer_to_observe),
                                 Kind::WindowsEvent => winevent::run(&c, &file, &stop2, &state2, &offer_to_observe),
                                 Kind::File | Kind::Kubernetes | Kind::Docker => files::run(&c, &file, &stop2, &state2, &offer_to_observe),
-                                Kind::Syslog => syslog::run(c, &stop2, &state2, &(Arc::new(offer_to_observe) as syslog::Sink)),
+                                Kind::Syslog => syslog::run(c, &stop2, &state2, &(Arc::new(|r: Vec<Record>, a: Ack| offer_to_observe(r.into(), a).map_err(Logs::into_records)) as syslog::Sink)),
                             }
                         })
                         .map_err(|e| lock(&state).error = Some(format!("its thread did not start: {e}")))
@@ -1163,31 +1282,106 @@ pub(crate) fn output_lines(cmd: &mut std::process::Command, what: &str, within: 
 /// Records gathered for one offer, and where each source they came from may move its place once
 /// they are written.
 pub(crate) struct Batch<M> {
-    pub records: Vec<Record>,
+    /// What it holds, in the order it was read: runs of records, and segments of rows (records
+    /// written as rows already, [`Compiled::write`]); then the segment being written, its rows and
+    /// its last row's time.
+    pub parts: Vec<LogPart>,
+    open: Vec<u8>,
+    open_rows: u32,
+    prev: i64,
     pub bytes: usize,
     pub marks: Vec<M>,
-    /// Records through the pipelines already: a refused offer's come back, not processed twice.
+    /// Records through the pipelines already, in order: a refused offer's come back, not processed
+    /// twice.
     pub processed: usize,
 }
 
 impl<M> Default for Batch<M> {
     fn default() -> Self {
-        Self { records: Vec::new(), bytes: 0, marks: Vec::new(), processed: 0 }
+        Self { parts: Vec::new(), open: Vec::new(), open_rows: 0, prev: 0, bytes: 0, marks: Vec::new(), processed: 0 }
     }
 }
+
+/// A segment of rows a batch writes records into: a log block's text, past which a new one begins.
+const ROW_SEGMENT: usize = kiln_obs::logs::block::BLOCK_TEXT;
+/// Room a segment begins with: some hundred lines' rows.
+const ROW_SEGMENT_START: usize = 16 << 10;
 
 impl<M> Batch<M> {
     pub(crate) fn push(&mut self, r: Record) {
         self.bytes += super::ingest::record_bytes(&r);
-        self.records.push(r);
+        // After the rows before it, in order.
+        self.seal();
+        match self.parts.last_mut() {
+            Some(LogPart::Records(run)) => run.push(r),
+            _ => self.parts.push(LogPart::Records(vec![r])),
+        }
+    }
+
+    /// A record written as its row (a line no pipeline reads), into the segment being written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_row<'a>(&mut self, ts: i64, severity: u8, names: [&str; 3], message: &str, attrs: impl Iterator<Item = (&'a str, &'a str)>, attr_count: usize) {
+        if self.open.capacity() == 0 {
+            self.open.reserve(ROW_SEGMENT_START);
+        }
+        let before = self.open.len();
+        kiln_obs::logs::record::put_fields(&mut self.open, ts, severity, names, message, attrs, attr_count, None, None, self.prev, kiln_obs::batch::MAX_NAME_BYTES);
+        self.prev = ts;
+        self.open_rows += 1;
+        self.bytes += self.open.len() - before;
+        if self.open.len() >= ROW_SEGMENT {
+            self.seal();
+        }
+    }
+
+    /// The segment being written, ended (the next row begins another, its time chained from 0).
+    fn seal(&mut self) {
+        if self.open_rows > 0 {
+            self.parts.push(LogPart::Rows { raw: std::mem::take(&mut self.open), rows: self.open_rows, last_ts: self.prev });
+            self.open_rows = 0;
+            self.prev = 0;
+        }
+    }
+
+    /// Records, whichever form.
+    pub(crate) fn len(&self) -> usize {
+        let held: usize = self
+            .parts
+            .iter()
+            .map(|p| match p {
+                LogPart::Records(r) => r.len(),
+                LogPart::Rows { rows, .. } => *rows as usize,
+            })
+            .sum();
+        held + self.open_rows as usize
+    }
+
+    /// Every record it holds, in order, rows read back as records (what a source's sample shows).
+    pub(crate) fn take_records(&mut self) -> Vec<Record> {
+        self.seal();
+        self.bytes = 0;
+        self.processed = 0;
+        let mut out = Vec::new();
+        for part in std::mem::take(&mut self.parts) {
+            match part {
+                LogPart::Records(r) => out.extend(r),
+                LogPart::Rows { raw, rows, .. } => {
+                    let mut rows = kiln_obs::logs::record::Rows::new(&raw, rows as usize);
+                    while let Ok(Some(r)) = rows.next_row() {
+                        out.push(r.to_owned());
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn full(&self) -> bool {
-        self.records.len() >= BATCH_RECORDS || self.bytes >= BATCH_BYTES
+        self.len() >= BATCH_RECORDS || self.bytes >= BATCH_BYTES
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.marks.is_empty()
+        self.parts.is_empty() && self.open_rows == 0 && self.marks.is_empty()
     }
 }
 
@@ -1208,14 +1402,22 @@ impl<M> InFlight<M> {
         if b.is_empty() {
             return true;
         }
+        b.seal();
         let ack = Ack::new();
-        let n = b.records.len() as u64;
-        // Through the pipelines once, the first time they are offered.
-        if let Some(fresh) = b.records.get_mut(b.processed..) {
-            super::pipeline::kept::process(fresh);
+        let n = b.len() as u64;
+        // Through the pipelines once, the first time they are offered (rows are of lines none
+        // reads): each run's records past those processed before.
+        let mut seen = 0usize;
+        for part in &mut b.parts {
+            if let LogPart::Records(run) = part {
+                if let Some(fresh) = run.get_mut(b.processed.saturating_sub(seen)..) {
+                    super::pipeline::kept::process(fresh);
+                }
+                seen += run.len();
+            }
         }
-        b.processed = b.records.len();
-        match offer(std::mem::take(&mut b.records), ack.clone()) {
+        b.processed = seen;
+        match offer(Logs { parts: std::mem::take(&mut b.parts) }, ack.clone()) {
             Ok(()) => {
                 self.queue.push_back((ack, std::mem::take(&mut b.marks), n));
                 b.bytes = 0;
@@ -1223,7 +1425,7 @@ impl<M> InFlight<M> {
                 true
             }
             Err(back) => {
-                b.records = back;
+                b.parts = back.parts;
                 false
             }
         }
@@ -1258,6 +1460,60 @@ impl<M> InFlight<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A text line no pipeline reads, written as its row, is the row its record writes (with the
+    /// issue the owner gives a record of an error's), to the byte: whatever it holds (a level's
+    /// word, an `issue.id` tag on an error's line, characters of every width, a line past a
+    /// record's message, a time ahead of now), its stream, its being cut short, its origin's
+    /// attributes and service; its text back, as it was, for the next line's. With kiln's nginx
+    /// pipeline on, a line it reads is its record still, and another source's a row.
+    #[test]
+    fn a_line_written_as_its_row_is_its_record_s_row() -> anyhow::Result<()> {
+        const NOW: i64 = 1_792_324_800_000_000_000;
+        let plain = file_source().compile("app", "web-1").map_err(anyhow::Error::msg)?;
+        let tagged = Source { tags: vec!["env:prod".into(), "issue.id:0123".into(), "team:shop".into()], service: None, source: Some("app".into()), ..file_source() }
+            .compile("shop", "web-1")
+            .map_err(anyhow::Error::msg)?;
+        let mut rng = kiln_obs::testkit::Rng::new(12);
+        let words = ["ERROR", "error:", "[WARN]", "info", "connection", "refused", "é", "漢字", "🙂", "\t", "  ", "{", "level=error", "panic:", "x"];
+        let (mut rows, mut records) = (0, 0);
+        for i in 0..4000 {
+            let c = if i % 2 == 0 { &plain } else { &tagged };
+            let n = if rng.below(50) == 0 { 30_000 } else { rng.below(12) as usize };
+            let text: String = (0..n).map(|_| words.get(rng.below(words.len() as u64) as usize).copied().unwrap_or("")).collect::<Vec<_>>().join(" ");
+            let ts = [None, Some(NOW - 5_000_000_000), Some(NOW + 3_600_000_000_000)].get(rng.below(3) as usize).copied().flatten();
+            let stream = [None, Some("stdout"), Some("stderr")].get(rng.below(3) as usize).copied().flatten();
+            let truncated = rng.below(5) == 0;
+            let origin = Origin { attrs: vec![("log.file.path".into(), "/var/log/app/a.log".into())], service: (rng.below(2) == 0).then(|| "pod-svc".to_owned()) };
+            let line = || Line { text: text.clone(), ts, stream, truncated };
+            let mut b: Batch<()> = Batch::default();
+            let back = c.write(line(), &origin, NOW, &mut b, &mut PipelineFilters::default());
+            b.seal();
+            if text.trim_start().starts_with('{') {
+                anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Records(r)] if r.len() == 1) && back.is_none(), "a JSON-looking line is its record: {text:?}");
+                records += 1;
+                continue;
+            }
+            anyhow::ensure!(back.as_deref() == Some(text.as_str()), "a row's text comes back as it was");
+            let mut r = c.record(line(), &origin, NOW);
+            kiln_obs::errors::put_log_issue(&mut r);
+            let mut want = Vec::new();
+            kiln_obs::logs::record::put_row(&mut want, &r, 0);
+            anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Rows { raw, rows: 1, last_ts }] if *raw == want && *last_ts == r.ts), "{text:?}");
+            rows += 1;
+        }
+        anyhow::ensure!(rows > 3000 && records > 100, "{rows} rows, {records} records");
+        let pipelines: Vec<_> = crate::observe::pipeline::builtin::all().into_iter().filter_map(|(_, d)| d.compile().ok()).collect();
+        let mut filters = PipelineFilters { pipelines: Arc::new(pipelines), ..PipelineFilters::default() };
+        let nginx = Source { source: Some("nginx".into()), ..file_source() }.compile("nginx", "web-1").map_err(anyhow::Error::msg)?;
+        let mut b: Batch<()> = Batch::default();
+        let access = r#"192.0.2.10 - - [18/Oct/2026:12:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "curl/8.5.0""#;
+        anyhow::ensure!(nginx.write(Line { text: access.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_none(), "a record keeps its text");
+        anyhow::ensure!(plain.write(Line { text: "an app's line".into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(), "a row's text comes back");
+        b.seal();
+        anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Records(r), LogPart::Rows { rows: 1, .. }] if r.len() == 1), "{:?}", b.parts);
+        Ok(())
+    }
 
     fn file_source() -> Source {
         Source {
@@ -1341,6 +1597,22 @@ mod tests {
         anyhow::ensure!(c.keep(&mut t) && t == "GET /a?token=[masked] costs $1", "{t}");
         let mut t = "DELETE /a".to_owned();
         anyhow::ensure!(!c.keep(&mut t));
+        // Masked into a room kept from line to line, as `replace_all` with `NoExpand` masks:
+        // matches at either end, next to each other, empty ones, across characters of every width.
+        let mut rng = kiln_obs::testkit::Rng::new(5);
+        let parts = ["GET ", "token=a1", "x", "", "é", "漢", "🙂", "$1", "token=", " costs ", "aa"];
+        let mut room = String::new();
+        for pattern in ["token=[A-Za-z0-9]+", "x*", "a", "é|漢", "^GET", "\\d+$", "(?:aa)+"] {
+            let s = Source { rules: vec![rule(RuleKind::MaskSequences, pattern, Some("[m]$1"))], ..file_source() };
+            let c = s.compile("app", "h").map_err(anyhow::Error::msg)?;
+            let re = regex::Regex::new(pattern)?;
+            for _ in 0..300 {
+                let text: String = (0..rng.below(8)).filter_map(|_| parts.get(rng.below(parts.len() as u64) as usize).copied()).collect();
+                let mut t = text.clone();
+                anyhow::ensure!(c.keep_into(&mut t, &mut room));
+                anyhow::ensure!(t == re.replace_all(&text, regex::NoExpand("[m]$1")), "{pattern} {text:?}: {t:?}");
+            }
+        }
         Ok(())
     }
 

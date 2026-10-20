@@ -158,7 +158,8 @@ fn get_str<'a>(at: &mut &'a [u8]) -> Option<&'a str> {
     std::str::from_utf8(b).ok()
 }
 
-fn cut(s: &str, max: usize) -> &str {
+/// `s`, at most `max` bytes of it, cut at a character's start: what a row keeps of a text.
+pub fn cut(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -218,6 +219,20 @@ pub fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3]
     if let Some(s) = span_id {
         out.extend_from_slice(&s);
     }
+}
+
+/// Appends rows written as a run of their own (their times chained from 0) after a row of time
+/// `prev_ts`, as one run: the first's time chained from it, the rest as they are. `false`, nothing
+/// appended, if the first row's time does not read.
+pub fn put_rows_after(out: &mut Vec<u8>, raw: &[u8], prev_ts: i64) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+    let mut at = raw;
+    let Some(delta) = varint::get(&mut at) else { return false };
+    varint::put(out, varint::zig(varint::zag(delta).wrapping_sub(prev_ts)));
+    out.extend_from_slice(at);
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -306,6 +321,44 @@ mod tests {
             trace_id: (i % 2 == 0).then_some([i as u8; 16]),
             span_id: (i % 4 == 0).then_some([7u8; 8]),
         }
+    }
+
+    /// Runs written alone and joined, each first time chained again, read as the one run written
+    /// whole: whatever the times (later, earlier, far apart), and a run of nothing joins as nothing.
+    #[test]
+    fn runs_joined_read_as_one_run() {
+        let mut rng = crate::testkit::Rng::new(17);
+        for _ in 0..200 {
+            let runs: Vec<Vec<Record>> = (0..1 + rng.below(5))
+                .map(|_| {
+                    (0..rng.below(4))
+                        .map(|_| Record { ts: [i64::MIN, -1, 0, 1, 1_700_000_000_000_000_000, i64::MAX][rng.below(6) as usize].wrapping_add(rng.below(1_000) as i64), ..sample(rng.below(100) as i64) })
+                        .collect()
+                })
+                .collect();
+            let (mut whole, mut joined, mut prev, mut last) = (Vec::new(), Vec::new(), 0, 0);
+            for run in &runs {
+                let mut alone = Vec::new();
+                let mut p = 0;
+                for r in run {
+                    put_row(&mut whole, r, prev);
+                    prev = r.ts;
+                    put_row(&mut alone, r, p);
+                    p = r.ts;
+                }
+                assert!(put_rows_after(&mut joined, &alone, last));
+                if !run.is_empty() {
+                    last = p;
+                }
+            }
+            assert_eq!(joined, whole);
+            let all: Vec<&Record> = runs.iter().flatten().collect();
+            let mut rows = Rows::new(&joined, all.len());
+            for r in all {
+                assert_eq!(&rows.next_row().unwrap().unwrap().to_owned(), r);
+            }
+        }
+        assert!(!put_rows_after(&mut Vec::new(), &[0x80], 5), "a time that does not read");
     }
 
     #[test]

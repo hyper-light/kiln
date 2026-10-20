@@ -8,7 +8,9 @@
 //! and the page faults.
 //!
 //! `cargo bench -p kiln --bench collect` (`KOBS_LINES`: lines a file, 300,000; `KOBS_CASE`: a part
-//! of the name of the cases to run, all unless given).
+//! of the name of the cases to run, all unless given; `KOBS_WRITTEN=1`: each offer through a
+//! batcher into its writes too, as a runner takes them, rather than dropped, and the bytes of its
+//! writes a line said).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
 
 use std::io::Write as _;
@@ -101,15 +103,16 @@ fn main() {
         n,
     ));
     cases.push(("text, kiln's nginx pipeline", Source { source: Some("nginx".into()), ..source(d, "access.log", Format::Auto, Vec::new()) }, n));
-    println!("{n} lines a file; the median of 3 reads; allocations and faults of one");
-    println!("{:<26} {:>9} {:>9} {:>12} {:>9} {:>11} {:>11} {:>8}", "case", "MB", "records", "lines/s", "MB/s", "allocs/line", "bytes/line", "faults");
+    let written = std::env::var("KOBS_WRITTEN").is_ok_and(|v| v == "1");
+    println!("{n} lines a file; the median of 3 reads; allocations and faults of one{}", if written { "; through a batcher into its writes" } else { "" });
+    println!("{:<26} {:>9} {:>9} {:>12} {:>9} {:>11} {:>11} {:>8} {:>13}", "case", "MB", "records", "lines/s", "MB/s", "allocs/line", "bytes/line", "faults", "written B/line");
     let only = std::env::var("KOBS_CASE").unwrap_or_default();
     for (i, (name, s, lines)) in cases.iter().enumerate().filter(|(_, c)| c.0.contains(only.as_str())) {
         // kiln's own pipelines on for the case that names one (they read `source:nginx` alone).
         let pipelines: Vec<_> = if name.contains("pipeline") { kiln::observe::pipeline::builtin::all().into_iter().map(|(_, p)| p).collect() } else { Vec::new() };
         kiln::observe::pipeline::kept::activate(&pipelines);
         let mut times: Vec<Duration> = Vec::new();
-        let mut out = (0, 0);
+        let mut out = (0, 0, 0);
         let mut counted = alloc::Counts::default();
         let mut faulted = 0;
         for rep in 0..3 {
@@ -119,7 +122,7 @@ fn main() {
             if rep == 0 {
                 alloc::begin();
             }
-            out = kiln::observe::collect::read_whole(name, s, &places).expect("read");
+            out = kiln::observe::collect::read_whole(name, s, &places, written).expect("read");
             if rep == 0 {
                 counted = alloc::end();
                 faulted = f0.zip(faults::read().ok()).map_or(0, |(a, b)| b.since(&a).total());
@@ -128,9 +131,9 @@ fn main() {
         }
         times.sort();
         let t = times.get(1).map_or(f64::NAN, Duration::as_secs_f64);
-        let (records, bytes) = out;
+        let (records, bytes, entries) = out;
         println!(
-            "{:<26} {:>9.1} {:>9} {:>12.0} {:>9.1} {:>11.2} {:>11.0} {:>8}",
+            "{:<26} {:>9.1} {:>9} {:>12.0} {:>9.1} {:>11.2} {:>11.0} {:>8} {:>13.1}",
             name,
             bytes as f64 / 1e6,
             records,
@@ -138,7 +141,8 @@ fn main() {
             bytes as f64 / 1e6 / t,
             counted.calls() as f64 / *lines as f64,
             counted.bytes as f64 / *lines as f64,
-            faulted
+            faulted,
+            entries as f64 / *lines as f64
         );
     }
 }

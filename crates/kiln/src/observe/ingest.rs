@@ -109,7 +109,13 @@ pub struct Batcher {
     /// Points waiting, each with its series' place, as they came: one buffer, kept.
     points: Vec<(u32, i64, f64)>,
     waiting_points: usize,
-    logs: VecDeque<Record>,
+    /// Log records waiting, as rows, oldest first: one queue, so they are cut in the order their
+    /// acks were counted in.
+    logs: VecDeque<LogSegment>,
+    /// Buffers of segments cut, for the next records'.
+    log_spare: Vec<Vec<u8>>,
+    /// The segments a write takes, joined (kept from write to write).
+    log_joined: Vec<u8>,
     /// Spans as their requests' decoding wrote them: segments of rows, each with its rows. Their
     /// bytes count with the records' against the same bound.
     spans: VecDeque<(Vec<u8>, u32)>,
@@ -153,6 +159,123 @@ pub struct Batcher {
     left_log_bytes: u64,
 }
 
+/// Log records offered together, in the order they were read: runs of records, and segments of
+/// records a collector made rows where it read them.
+#[derive(Debug, Default)]
+pub struct Logs {
+    pub parts: Vec<LogPart>,
+}
+
+#[derive(Debug)]
+pub enum LogPart {
+    Records(Vec<Record>),
+    /// Rows written whole (their times chained from 0), how many, and the last one's time.
+    Rows {
+        raw: Vec<u8>,
+        rows: u32,
+        last_ts: i64,
+    },
+}
+
+impl LogPart {
+    fn records(&self) -> &[Record] {
+        match self {
+            Self::Records(r) => r,
+            Self::Rows { .. } => &[],
+        }
+    }
+
+    fn records_mut(&mut self) -> &mut [Record] {
+        match self {
+            Self::Records(r) => r,
+            Self::Rows { .. } => &mut [],
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Records(r) => r.len() as u64,
+            Self::Rows { rows, .. } => u64::from(*rows),
+        }
+    }
+}
+
+impl From<Vec<Record>> for Logs {
+    fn from(records: Vec<Record>) -> Self {
+        Self { parts: if records.is_empty() { Vec::new() } else { vec![LogPart::Records(records)] } }
+    }
+}
+
+impl Logs {
+    /// Records, whichever form.
+    pub fn len(&self) -> u64 {
+        self.parts.iter().map(LogPart::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Their weight against [`WAITING_LOG_BYTES`]: a record's [`record_bytes`], rows their bytes.
+    pub fn bytes(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(|p| match p {
+                LogPart::Records(r) => r.iter().map(|r| record_bytes(r) as u64).sum::<u64>(),
+                LogPart::Rows { raw, .. } => raw.len() as u64,
+            })
+            .sum()
+    }
+
+    /// Its records not yet rows, in order.
+    pub fn records(&self) -> impl Iterator<Item = &Record> {
+        self.parts.iter().flat_map(LogPart::records)
+    }
+
+    pub fn records_mut(&mut self) -> impl Iterator<Item = &mut Record> {
+        self.parts.iter_mut().flat_map(LogPart::records_mut)
+    }
+
+    /// Its runs of records, each to be processed whole (the pipelines take a run at a time).
+    pub fn runs_mut(&mut self) -> impl Iterator<Item = &mut Vec<Record>> {
+        self.parts.iter_mut().filter_map(|p| match p {
+            LogPart::Records(r) => Some(r),
+            LogPart::Rows { .. } => None,
+        })
+    }
+
+    /// Its records alone, for a sink that takes no rows: what a records' offer comes back as (it
+    /// holds no rows, none dropped).
+    pub fn into_records(self) -> Vec<Record> {
+        debug_assert!(self.parts.iter().all(|p| matches!(p, LogPart::Records(_))), "rows where only records go");
+        self.parts
+            .into_iter()
+            .flat_map(|p| match p {
+                LogPart::Records(r) => r,
+                LogPart::Rows { .. } => Vec::new(),
+            })
+            .collect()
+    }
+}
+
+/// Log records waiting: a segment of rows (records written as rows as they came, or rows a
+/// collector wrote), how many, their weight against [`WAITING_LOG_BYTES`] (what admission took for
+/// them, and gives back as they are cut), and the last one's time (the next segment's first is
+/// chained from it, joined in a write).
+#[derive(Debug)]
+struct LogSegment {
+    raw: Vec<u8>,
+    rows: u32,
+    weight: usize,
+    last_ts: i64,
+}
+
+/// A segment of rows the batcher writes records into: a log block's text (a write, a megabyte,
+/// holds four), past which a new one begins.
+const SEGMENT_BYTES: usize = kiln_obs::logs::block::BLOCK_TEXT;
+/// Segments' buffers kept for the next records: a megabyte's.
+const SPARE_SEGMENTS: usize = 4;
+
 /// A record's weight against [`WAITING_LOG_BYTES`].
 pub fn record_bytes(r: &Record) -> usize {
     32 + r.service.len() + r.host.len() + r.source.len() + r.message.len() + r.attrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>()
@@ -169,6 +292,8 @@ impl Batcher {
             points: Vec::new(),
             waiting_points: 0,
             logs: VecDeque::new(),
+            log_spare: Vec::new(),
+            log_joined: Vec::new(),
             spans: VecDeque::new(),
             spent: Vec::new(),
             spans_turn: false,
@@ -286,7 +411,19 @@ impl Batcher {
         }
     }
 
-    pub fn logs(&mut self, records: Vec<Record>, now: Instant) {
+    /// Log records, and rows a collector wrote, waiting for the next write, in their order.
+    pub fn logs(&mut self, logs: impl Into<Logs>, now: Instant) {
+        for part in logs.into().parts {
+            match part {
+                LogPart::Records(records) => self.records(records, now),
+                LogPart::Rows { raw, rows, last_ts } => self.rows(raw, rows, last_ts, now),
+            }
+        }
+    }
+
+    /// Records written as rows as they come, into segments (a record past the bound dropped).
+    fn records(&mut self, records: Vec<Record>, now: Instant) {
+        let (mut seg, mut prev): (Option<LogSegment>, i64) = (None, 0);
         for r in records {
             let n = record_bytes(&r);
             if self.log_bytes + n > WAITING_LOG_BYTES {
@@ -294,10 +431,53 @@ impl Batcher {
                 self.left_log_bytes += n as u64;
                 continue;
             }
+            if seg.is_none() {
+                seg = Some(LogSegment { raw: self.log_spare.pop().unwrap_or_default(), rows: 0, weight: 0, last_ts: 0 });
+                prev = 0;
+            }
+            let Some(s) = seg.as_mut() else { continue };
+            kiln_obs::logs::record::put_row(&mut s.raw, &r, prev);
+            prev = r.ts;
+            s.last_ts = r.ts;
+            s.rows += 1;
+            s.weight += n;
             self.log_bytes += n;
-            self.logs.push_back(r);
             self.logs_in += 1;
             self.first_waiting.get_or_insert(now);
+            if s.raw.len() >= SEGMENT_BYTES {
+                self.logs.extend(seg.take());
+            }
+        }
+        self.logs.extend(seg);
+    }
+
+    /// A segment of rows a collector wrote, whole (dropped past the bound).
+    fn rows(&mut self, raw: Vec<u8>, n: u32, last_ts: i64, now: Instant) {
+        let bytes = raw.len();
+        if n == 0 {
+            self.spare_segment(raw);
+            return;
+        }
+        if self.log_bytes + bytes > WAITING_LOG_BYTES {
+            self.dropped += u64::from(n);
+            self.left_log_bytes += bytes as u64;
+            self.spare_segment(raw);
+            return;
+        }
+        self.log_bytes += bytes;
+        self.logs_in += u64::from(n);
+        self.logs.push_back(LogSegment { raw, rows: n, weight: bytes, last_ts });
+        self.first_waiting.get_or_insert(now);
+    }
+
+    /// A segment's buffer, cut or dropped: kept for the next records', a few of them; the rest to
+    /// the owner, for requests' decoding.
+    fn spare_segment(&mut self, mut raw: Vec<u8>) {
+        if self.log_spare.len() < SPARE_SEGMENTS && raw.capacity() <= 2 * SEGMENT_BYTES {
+            raw.clear();
+            self.log_spare.push(raw);
+        } else {
+            self.spent.push(raw);
         }
     }
 
@@ -330,8 +510,8 @@ impl Batcher {
     /// Records with an ack given once the write holding the last of them is answered: with every
     /// record queued before them answered too (writes go one at a time, in order); at once when
     /// nothing is waiting or out.
-    pub fn logs_acked(&mut self, records: Vec<Record>, ack: Ack, now: Instant) {
-        self.logs(records, now);
+    pub fn logs_acked(&mut self, logs: impl Into<Logs>, ack: Ack, now: Instant) {
+        self.logs(logs, now);
         if self.logs_cut >= self.logs_in && self.out.is_none() && self.acks.is_empty() {
             ack.set();
         } else {
@@ -346,7 +526,7 @@ impl Batcher {
 
     /// Points, records and spans waiting, and whether a write is out.
     pub fn backlog(&self) -> (u64, bool) {
-        ((self.waiting_points + self.logs.len()) as u64 + self.spans.iter().map(|s| u64::from(s.1)).sum::<u64>(), self.out.is_some())
+        (self.waiting_points as u64 + self.logs.iter().map(|s| u64::from(s.rows)).sum::<u64>() + self.spans.iter().map(|s| u64::from(s.1)).sum::<u64>(), self.out.is_some())
     }
 
     /// When [`Batcher::poll`] next has a write to give: the write out's resend, or the flush of
@@ -511,34 +691,46 @@ impl Batcher {
         }
     }
 
-    /// Log records, as many as fit: LZ4's worst case is a little over its input (the block format's
-    /// bound, n + n/255 + 16), so rows of the room left fit whatever they compress to. The first of
-    /// a write of nothing else goes however big (whole, or never); one that does not fit beside
-    /// what the write holds goes first in the next.
+    /// Log records' segments, whole, oldest first, as many as fit, joined into one item (compressed
+    /// whole: a segment alone compresses the less well the fewer its rows), each one's first time
+    /// chained again from the last before it: rows of the room left, raw, as they are (LZ4's worst
+    /// case is a little over its input, the block format's bound n + n/255 + 16, so they fit
+    /// whatever they compress to; and what a write holds, applied, is never more than an entry's
+    /// worth, however well it compresses). The first of a write of nothing else goes however big (a
+    /// segment is at most a block's text and a row); one that does not fit beside what the write
+    /// holds goes first in the next.
     fn take_logs(&mut self) {
         let room = ENTRY_BUDGET.saturating_sub(self.builder.byte_len()) * 255 / 256;
         let alone = self.builder.items() == 0;
-        let mut take = Vec::new();
-        let mut bytes = 0usize;
-        while let Some(r) = self.logs.front() {
-            let n = record_bytes(r);
-            if !(alone && take.is_empty()) && bytes + n > room.saturating_sub(64) {
-                if take.is_empty() {
+        let mut joined = std::mem::take(&mut self.log_joined);
+        joined.clear();
+        let (mut first, mut rows, mut last) = (true, 0u32, 0i64);
+        while let Some(s) = self.logs.front() {
+            // A first time chained again is a byte longer at the most.
+            if !(alone && first) && joined.len() + s.raw.len() + 1 + 64 > room {
+                if first {
                     self.records_first = true;
                 }
                 break;
             }
-            bytes += n;
-            if let Some(r) = self.logs.pop_front() {
-                self.log_bytes = self.log_bytes.saturating_sub(n);
-                self.left_log_bytes += n as u64;
-                take.push(r);
+            let Some(s) = self.logs.pop_front() else { break };
+            first = false;
+            if kiln_obs::logs::record::put_rows_after(&mut joined, &s.raw, last) {
+                rows += s.rows;
+                last = s.last_ts;
+            } else {
+                // Never so of rows written here; were it, they go, counted.
+                self.dropped += u64::from(s.rows);
             }
+            self.logs_cut += u64::from(s.rows);
+            self.log_bytes = self.log_bytes.saturating_sub(s.weight);
+            self.left_log_bytes += s.weight as u64;
+            self.spare_segment(s.raw);
         }
-        if !take.is_empty() {
-            self.builder.logs(&take);
-            self.logs_cut += take.len() as u64;
+        if rows > 0 {
+            self.builder.log_rows(&joined, rows);
         }
+        self.log_joined = joined;
     }
 
     /// Spans' segments, whole, as many as fit (one always fits a write of nothing else: a segment
@@ -675,9 +867,9 @@ mod tests {
         // Three batches; the second some two and a half writes' worth.
         let acks = [Ack::new(), Ack::new(), Ack::new()];
         let ends = [10u64, 60, 61];
-        b.logs_acked((0..10).map(|i| rec(i, 10)).collect(), acks[0].clone(), t0);
-        b.logs_acked((10..60).map(|i| rec(i, ENTRY_BUDGET / 20)).collect(), acks[1].clone(), t0);
-        b.logs_acked((60..61).map(|i| rec(i, 10)).collect(), acks[2].clone(), t0);
+        b.logs_acked((0..10).map(|i| rec(i, 10)).collect::<Vec<_>>(), acks[0].clone(), t0);
+        b.logs_acked((10..60).map(|i| rec(i, ENTRY_BUDGET / 20)).collect::<Vec<_>>(), acks[1].clone(), t0);
+        b.logs_acked((60..61).map(|i| rec(i, 10)).collect::<Vec<_>>(), acks[2].clone(), t0);
         let mut store = Store::new(Keyed::new());
         let (mut index, mut t) = (0, t0);
         // Each ack's index and the records stored when it was given.
@@ -700,13 +892,13 @@ mod tests {
         anyhow::ensure!(given.iter().all(|&(i, stored)| ends.get(i).is_some_and(|&end| stored >= end)), "each once its records were stored: {given:?}");
         // Nothing waiting or out: given at once.
         let now = Ack::new();
-        b.logs_acked(Vec::new(), now.clone(), t);
+        b.logs_acked(Vec::<Record>::new(), now.clone(), t);
         anyhow::ensure!(now.done());
         // A write out: an ack of nothing waits for it.
         let (held, after) = (Ack::new(), Ack::new());
         b.logs_acked(vec![rec(61, 10)], held.clone(), t);
         let (seq, entry) = b.poll(t + FLUSH, 0).ok_or_else(|| anyhow::anyhow!("a write"))?;
-        b.logs_acked(Vec::new(), after.clone(), t);
+        b.logs_acked(Vec::<Record>::new(), after.clone(), t);
         anyhow::ensure!(!held.done() && !after.done(), "given before the write was answered");
         let o = applied(&mut store, index + 1, &entry)?;
         b.answered(seq, &o, t);
@@ -868,7 +1060,7 @@ mod tests {
             many.push((key(&format!("h{h}"))?, (0..200).map(|i| (i, (i * h) as f64)).collect()));
         }
         b.series(many, t0);
-        b.logs((0..20_000).map(|i| Record { ts: i, message: format!("line {i} {}", "x".repeat(i as usize % 300)), ..Record::default() }).collect(), t0);
+        b.logs((0..20_000).map(|i| Record { ts: i, message: format!("line {i} {}", "x".repeat(i as usize % 300)), ..Record::default() }).collect::<Vec<_>>(), t0);
         let mut store = Store::new(Keyed::new());
         let mut index = 0;
         let mut now = t0;
@@ -897,7 +1089,7 @@ mod tests {
         let t0 = Instant::now();
         // Points enough for half an entry a write, for a while.
         b.series((0..4000).map(|h| -> anyhow::Result<_> { Ok((key(&format!("h{h}"))?, (0..20).map(|i| (i, i as f64)).collect())) }).collect::<anyhow::Result<Vec<_>>>()?, t0);
-        b.logs((0..4000).map(|i| Record { ts: i, message: format!("line {i} {}", "y".repeat(400)), ..Record::default() }).collect(), t0);
+        b.logs((0..4000).map(|i| Record { ts: i, message: format!("line {i} {}", "y".repeat(400)), ..Record::default() }).collect::<Vec<_>>(), t0);
         let mut raw = Vec::new();
         let mut prev = 0;
         // A segment as the decoder cuts them: under a segment's bytes, its last row past them.
@@ -939,6 +1131,47 @@ mod tests {
         let spans_until = kinds.iter().rposition(|k| k.2).unwrap_or(0);
         anyhow::ensure!(kinds.get(..spans_until).unwrap_or_default().windows(3).all(|w| w.iter().any(|k| k.2)), "spans waited behind records: {kinds:?}");
         anyhow::ensure!(segment < kiln_obs::otlp::traces::MAX_ROW_BYTES * 2);
+        Ok(())
+    }
+
+    /// Records and the rows a collector wrote, offered together, are written in the order they
+    /// were read: runs and segments alike, each row as it was written, whatever their times.
+    #[test]
+    fn records_and_rows_are_written_in_the_order_they_were_read() -> anyhow::Result<()> {
+        let rec = |i: i64| Record { ts: 1_700_000_000_000_000_000 + i, message: format!("line {i}"), ..Record::default() };
+        let rows = |of: &[i64]| {
+            let (mut raw, mut prev) = (Vec::new(), 0);
+            for &i in of {
+                let r = rec(i);
+                kiln_obs::logs::record::put_row(&mut raw, &r, prev);
+                prev = r.ts;
+            }
+            LogPart::Rows { raw, rows: of.len() as u32, last_ts: prev }
+        };
+        // Two JSON lines, two text lines, a JSON line, a text line.
+        let parts = vec![LogPart::Records(vec![rec(5), rec(1)]), rows(&[4, 2]), LogPart::Records(vec![rec(6)]), rows(&[3])];
+        let mut b = Batcher::new(9);
+        let t0 = Instant::now();
+        b.logs(Logs { parts }, t0);
+        let Some((_, entry)) = b.poll(t0 + FLUSH, 1_700_000_000_000) else { anyhow::bail!("no write") };
+        let Ok(Command::Write { batch, .. }) = command::decode(&entry) else { anyhow::bail!("not a write") };
+        let mut items = kiln_obs::batch::Reader::new(batch)?;
+        let (mut read, mut logs_items) = (Vec::new(), 0);
+        while let Some(item) = items.next_item()? {
+            if let kiln_obs::batch::Item::Logs { rows, raw_len, packed } = item {
+                logs_items += 1;
+                let mut raw = Vec::new();
+                kiln_obs::lz4::decompress(packed, &mut raw, raw_len)?;
+                let mut it = kiln_obs::logs::record::Rows::new(&raw, rows as usize);
+                while let Some(r) = it.next_row()? {
+                    read.push(r.to_owned().message);
+                }
+            }
+        }
+        anyhow::ensure!(read == ["line 5", "line 1", "line 4", "line 2", "line 6", "line 3"], "{read:?}");
+        // Joined: one item, compressed whole.
+        anyhow::ensure!(logs_items == 1, "{logs_items} items");
+        anyhow::ensure!(b.backlog() == (0, true), "{:?}", b.backlog());
         Ok(())
     }
 
@@ -987,7 +1220,7 @@ mod tests {
             sent += spans.spans;
             b.spans(spans.segments, t0);
         }
-        b.logs((0..500).map(|i| Record { ts: i, message: format!("line {i}"), ..Record::default() }).collect(), t0);
+        b.logs((0..500).map(|i| Record { ts: i, message: format!("line {i}"), ..Record::default() }).collect::<Vec<_>>(), t0);
         let mut store = Store::new(Keyed::new());
         let (mut index, mut now, mut spent) = (0, t0, 0);
         while b.backlog().0 > 0 || b.backlog().1 {

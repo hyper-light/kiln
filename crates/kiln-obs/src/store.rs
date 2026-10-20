@@ -855,7 +855,17 @@ impl Store {
         let mut done = Applied::default();
         self.pending.clear();
         self.pending_at.clear();
-        let result = self.apply_items(batch, &mut done, horizon, logs_horizon);
+        // The batch's records one batch to metrics from logs, however many items hold them (a
+        // write's segments): the windows they reach, and how late the newest of them came (an item
+        // alone would say its own, and only an entry's first is taken); spans alike.
+        let mut windows: [Option<BatchWindows>; 2] = [None, None];
+        let result = self.apply_items(batch, &mut done, horizon, logs_horizon, &mut windows);
+        let [logs, spans] = &windows;
+        for (t, w) in [(&self.touched, logs), (&self.spans_touched, spans)] {
+            if let (Some(t), Some(w)) = (t, w) {
+                t.note(w, self.applied);
+            }
+        }
         self.pending.clear();
         self.pending_at.clear();
         self.totals += done.counts;
@@ -866,7 +876,8 @@ impl Store {
         self.pending_at.find(fp, |&i| self.pending.get(i as usize).is_some_and(|p| p.fp == fp)).and_then(|&i| self.pending.get(i as usize)).copied()
     }
 
-    fn apply_items(&mut self, batch: &[u8], done: &mut Applied, horizon: i64, logs_horizon: i64) -> Result<(), ApplyError> {
+    fn apply_items(&mut self, batch: &[u8], done: &mut Applied, horizon: i64, logs_horizon: i64, windows: &mut [Option<BatchWindows>; 2]) -> Result<(), ApplyError> {
+        let [log_windows, span_windows] = windows;
         let mut r = Reader::new(batch)?;
         while let Some(item) = r.next_item()? {
             match item {
@@ -892,13 +903,10 @@ impl Store {
                     if raw.len() != raw_len {
                         return Err(ApplyError::LogRows);
                     }
-                    let mut windows = self.touched.as_ref().map(|_| BatchWindows::default());
-                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon, windows.as_mut()).map_err(|_| ApplyError::LogRows)?;
+                    let windows = if self.touched.is_some() { Some(log_windows.get_or_insert_with(BatchWindows::default)) } else { None };
+                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon, windows).map_err(|_| ApplyError::LogRows)?;
                     done.counts.logs_ahead += ahead;
                     if rows > 0 {
-                        if let (Some(t), Some(w)) = (&self.touched, &windows) {
-                            t.note(w, self.applied);
-                        }
                         if self.publishing
                             && let Some(f) = self.feed.as_ref().filter(|f| f.following())
                         {
@@ -914,13 +922,10 @@ impl Store {
                     if raw.len() != raw_len {
                         return Err(ApplyError::LogRows);
                     }
-                    let mut windows = self.spans_touched.as_ref().map(|_| BatchWindows::default());
-                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon, windows.as_mut()).map_err(|_| ApplyError::LogRows)?;
+                    let windows = if self.spans_touched.is_some() { Some(span_windows.get_or_insert_with(BatchWindows::default)) } else { None };
+                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon, windows).map_err(|_| ApplyError::LogRows)?;
                     done.counts.spans_ahead += ahead;
                     if rows > 0 {
-                        if let (Some(t), Some(w)) = (&self.spans_touched, &windows) {
-                            t.note(w, self.applied);
-                        }
                         self.spans.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
                     }
                     done.counts.spans += u64::from(rows);

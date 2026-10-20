@@ -148,6 +148,50 @@ fn a_write_sent_twice_is_applied_once() {
     assert_eq!(s.apply_entry(5, &[crate::command::RETAIN, 1]), Ok(Answer::Malformed(CommandError::Short)));
 }
 
+/// Metrics from logs learn how late records come from each write's newest record, whatever items
+/// hold its records: a late segment first and fresh records after are one batch, as fresh as its
+/// newest (an item alone would say the late segment's twenty seconds); its windows all noted. Spans
+/// alike.
+#[test]
+fn a_write_s_records_are_one_batch_to_metrics_from_logs_whatever_items_hold_them() {
+    use crate::logs::metrics::{Touched, lag_bucket};
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let (logs, spans) = (Arc::new(Touched::new()), Arc::new(Touched::new()));
+    s.set_touched(Some(logs.clone()));
+    s.set_spans_touched(Some(spans.clone()));
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+    let rec = |ago_ms: i64| Record { ts: now - ago_ms * 1_000_000, message: format!("{ago_ms} ms ago"), ..Record::default() };
+    let rows = |ago: &[i64]| {
+        let (mut raw, mut prev) = (Vec::new(), 0);
+        for &a in ago {
+            let r = rec(a);
+            crate::logs::record::put_row(&mut raw, &r, prev);
+            prev = r.ts;
+        }
+        (raw, ago.len() as u32)
+    };
+    let mut b = Builder::new();
+    b.logs(&[rec(20_000), rec(21_000)]);
+    let (raw, n) = rows(&[300, 200]);
+    b.log_rows(&raw, n);
+    let (late, n_late) = rows(&[20_000]);
+    b.spans(&late, n_late);
+    let (fresh, n_fresh) = rows(&[100]);
+    b.spans(&fresh, n_fresh);
+    let Ok(Answer::Write { outcome: Written::Applied(a), .. }) = s.apply_entry(1, &b.finish_write(5, 1, now / 1_000_000)) else { panic!("not applied") };
+    assert_eq!((a.counts.logs, a.counts.spans), (4, 2));
+    for (what, t) in [("logs", &logs), ("spans", &spans)] {
+        let got = t.take();
+        assert_eq!((got.batches, got.backlogs, got.lags.iter().sum::<u32>()), (1, 0, 1), "{what}: one batch");
+        let noted = got.lags.iter().position(|&n| n > 0).unwrap();
+        assert!(noted <= lag_bucket(1_000), "{what}: as late as its newest, not its first item's: bucket {noted}");
+        let window = |ago_ms: i64| crate::logs::metrics::window_of(now - ago_ms * 1_000_000);
+        for ago in [20_000, 100] {
+            assert!(got.windows.iter().any(|&(a, z)| (a..=z).contains(&window(ago))), "{what}: the window of {ago} ms ago: {:?}", got.windows);
+        }
+    }
+}
+
 /// A write's samples more than ten minutes past its time, and its log records more than two hours
 /// past it, are counted and dropped, judged by the write's own time (its leader's clock): every
 /// replica alike. A series whose only sample was ahead is not defined.

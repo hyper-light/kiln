@@ -300,13 +300,15 @@ fn metrics_from_logs_count_each_window_once_through_late_records_and_a_restart()
     f.stop_gently();
     f.start_server()?;
     f.start_runner("r1")?;
-    let late: Vec<Sent> = (0..300).map(|_| record(&mut rng, t0, 40_000)).collect();
-    send(&f, &late)?;
-    sent.extend(late);
+    // The late ones sent with the first new ones, as an exporter back from a restart sends what it
+    // held: one batch, as late as its newest (alone, a batch of them would say records come some
+    // thirty seconds late, and be right to).
+    let mut late: Option<Vec<Sent>> = Some((0..300).map(|_| record(&mut rng, t0, 40_000)).collect());
     let t1 = now_ms();
     while now_ms() < t1 + 15_000 {
         let now = now_ms();
-        let batch: Vec<Sent> = (0..20).map(|_| record(&mut rng, now - 200, 200)).collect();
+        let mut batch: Vec<Sent> = late.take().unwrap_or_default();
+        batch.extend((0..20).map(|_| record(&mut rng, now - 200, 200)));
         send(&f, &batch)?;
         sent.extend(batch);
         std::thread::sleep(Duration::from_millis(250));

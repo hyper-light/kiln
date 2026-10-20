@@ -3,7 +3,8 @@
 //! them, rotated (renamed; copied then truncated), the runner stopped and killed while lines come;
 //! containers' logs in Kubernetes' and Docker's layouts; and the journal, through a stand-in for
 //! `journalctl` that keeps cursors as the real one does. Every line carries its number, so each is
-//! counted where it is stored: one lost or repeated is named.
+//! counted where it is stored: one lost or repeated is named. JSON lines and text lines come mixed,
+//! as records and as the rows the runner writes where it reads them (§12.17).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 mod common;
@@ -18,11 +19,22 @@ use std::time::{Duration, Instant};
 use common::{Fleet, at, caught_up, now_ms};
 use serde_json::{Value, json};
 
-/// Line `seq` as an app writes it: JSON, a token in it to mask, and every tenth a health check
+/// Line `seq` as an app writes it: JSON, or text one in three (`seq % 3 == 1`: written as its row
+/// where it is read, no pipeline reading it); a token in it to mask, and every tenth a health check
 /// (`seq % 10 == 7`) the source's rules leave out.
 fn line(seq: u64) -> String {
     let what = if seq % 10 == 7 { "GET /healthz 200" } else { "order paid" };
-    format!("{}\n", json!({ "seq": seq, "level": if seq.is_multiple_of(50) { "error" } else { "info" }, "msg": format!("{what} token=t{seq}x"), "route": "/pay" }))
+    let error = seq.is_multiple_of(50);
+    if seq % 3 == 1 {
+        return format!("{} {what} token=t{seq}x seq={seq} of {}\n", if error { "ERROR" } else { "INFO" }, group(seq));
+    }
+    format!("{}\n", json!({ "seq": seq, "level": if error { "error" } else { "info" }, "msg": format!("{what} token=t{seq}x"), "route": "/pay" }))
+}
+
+/// A text line's group, a word its search finds: 300 text lines to a group, under a search's 1,000
+/// records even with each stored twice.
+fn group(seq: u64) -> String {
+    format!("g{}x", seq / 900)
 }
 
 fn excluded(seq: u64) -> bool {
@@ -36,14 +48,26 @@ fn append(path: &Path, seqs: std::ops::Range<u64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Each line's count of records stored (by its `@seq`), of `query`.
-fn counts(f: &Fleet, query: &str, from: i64) -> anyhow::Result<BTreeMap<u64, u64>> {
+/// Each line's count of records stored, of `query`: a JSON line's by its `@seq`, a text line's by
+/// the `seq=` its message says (each group of `seqs` searched).
+fn counts(f: &Fleet, query: &str, from: i64, seqs: std::ops::Range<u64>) -> anyhow::Result<BTreeMap<u64, u64>> {
     let a = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": query, "from": from, "to": now_ms() + 60_000, "by": ["@seq"] })))?;
     let mut out = BTreeMap::new();
     for g in at(&a, &["groups"]).as_array().into_iter().flatten() {
         let seq = at(g, &["group"]).as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()));
         if let Some(seq) = seq {
             out.insert(seq, at(g, &["value"]).as_f64().unwrap_or(0.0) as u64);
+        }
+    }
+    for g in seqs.start / 900..seqs.end.div_ceil(900) {
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("{query} {}", group(g * 900)), "from": from, "to": now_ms() + 60_000, "limit": 1000 })))?;
+        let records = at(&found, &["records"]).as_array().cloned().unwrap_or_default();
+        anyhow::ensure!(records.len() < 1000, "a group's search was cut at {} records", records.len());
+        for r in &records {
+            let seq = at(r, &["message"]).as_str().and_then(|m| m.split_once("seq=")).and_then(|(_, rest)| rest.split(' ').next()?.parse::<u64>().ok());
+            if let Some(seq) = seq {
+                *out.entry(seq).or_insert(0) += 1;
+            }
         }
     }
     Ok(out)
@@ -54,7 +78,7 @@ fn counts(f: &Fleet, query: &str, from: i64) -> anyhow::Result<BTreeMap<u64, u64
 fn settled(f: &Fleet, query: &str, from: i64, seqs: std::ops::Range<u64>, within: Duration) -> anyhow::Result<BTreeMap<u64, u64>> {
     let start = Instant::now();
     loop {
-        let c = counts(f, query, from)?;
+        let c = counts(f, query, from, seqs.clone())?;
         let missing: Vec<u64> = seqs.clone().filter(|s| !excluded(*s) && !c.contains_key(s)).collect();
         if missing.is_empty() {
             let left_out: Vec<u64> = seqs.clone().filter(|s| excluded(*s) && c.contains_key(s)).collect();
@@ -150,6 +174,12 @@ fn a_runner_s_files_are_stored_once_each_through_rotation_truncation_a_stop_and_
     let r = at(&found, &["records"]).as_array().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
     anyhow::ensure!(at(&r, &["message"]) == "order paid token=[masked]" && at(&r, &["status"]) == "error" && at(&r, &["host"]) == "r1" && at(&r, &["source"]) == "file", "{r:#}");
     anyhow::ensure!(at(&r, &["attributes", "team"]) == "pay" && at(&r, &["attributes", "route"]) == "/pay" && at(&r, &["attributes", "log.file.path"]) == log.display().to_string().as_str(), "{r:#}");
+    // A text line as stored, from the row the runner wrote: masked, the level it starts with, its
+    // file and the source's tag.
+    let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "service:shop \"seq=100 of\"", "from": t0, "to": now_ms() + 60_000, "limit": 5 })))?;
+    let r = at(&found, &["records"]).as_array().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
+    anyhow::ensure!(at(&r, &["message"]) == "ERROR order paid token=[masked] seq=100 of g0x" && at(&r, &["status"]) == "error" && at(&r, &["host"]) == "r1" && at(&r, &["source"]) == "file", "{r:#}");
+    anyhow::ensure!(at(&r, &["attributes", "team"]) == "pay" && at(&r, &["attributes", "log.file.path"]) == log.display().to_string().as_str() && at(&r, &["attributes", "route"]).is_null(), "{r:#}");
 
     // Renamed (logrotate's `create`): the old file read to its end, late lines too; the new one
     // from its start.

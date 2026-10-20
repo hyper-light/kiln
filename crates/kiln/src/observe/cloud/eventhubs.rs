@@ -455,9 +455,9 @@ async fn read(r: &Reader, hubs: &Config, stop: &crate::rt::Shutdown, server: &cr
     let mut pending: VecDeque<Batch<(i32, i64)>> = VecDeque::new();
     let mut last_tally = Instant::now();
     let (mut tally_records, mut recovered) = (0u64, false);
-    let offer = |records: Vec<Record>, ack: crate::observe::ingest::Ack| match super::super::api::get() {
-        Some(o) => o.offer_logs_acked(records, ack),
-        None => Err(records),
+    let offer = |logs: crate::observe::ingest::Logs, ack: crate::observe::ingest::Ack| match super::super::api::get() {
+        Some(o) => o.offer_log_batch(logs, ack),
+        None => Err(logs),
     };
     update(r, |s| {
         s.partitions = partitions.len();

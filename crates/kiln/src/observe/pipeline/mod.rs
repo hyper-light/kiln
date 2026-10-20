@@ -470,6 +470,12 @@ pub struct Scratch {
 }
 
 impl Pipeline {
+    /// Whether it would read what has these fields (a line's, before a record is made of it): its
+    /// filter matches them, or it has none.
+    pub fn reads<F: kiln_obs::logs::search::Fields>(&self, r: &F, s: &mut Scratch) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.fields(r, &mut s.search))
+    }
+
     /// Its processors run on `r` if its filter matches it: whether it did.
     pub fn apply(&self, r: &mut Record, now_ns: i64, s: &mut Scratch) -> bool {
         if let Some(f) = &self.filter

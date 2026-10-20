@@ -935,6 +935,26 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
     Ok(())
 }
 
+/// This machine's dynamic loader, wherever its distribution keeps it (`/usr/lib`, `/usr/lib64`,
+/// `/usr/lib/x86_64-linux-gnu`), found from the path its ABI names: its folder (its libraries
+/// beside it) and its name.
+fn host_loader() -> anyhow::Result<(String, String)> {
+    let abi = if cfg!(target_arch = "aarch64") { "/lib/ld-linux-aarch64.so.1" } else { "/lib64/ld-linux-x86-64.so.2" };
+    let real = std::fs::canonicalize(abi)?;
+    let dir = real.parent().and_then(|d| d.to_str()).ok_or_else(|| anyhow::anyhow!("{}: no folder", real.display()))?;
+    let name = real.file_name().and_then(|n| n.to_str()).ok_or_else(|| anyhow::anyhow!("{}: no name", real.display()))?;
+    Ok((dir.to_owned(), name.to_owned()))
+}
+
+/// A container's last lines, what it wrote to either stream.
+fn container_log(name: &str) -> String {
+    std::process::Command::new("docker")
+        .args(["logs", "--tail", "80", name])
+        .output()
+        .map(|o| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or_default()
+}
+
 /// Runs `docker` with `args`, its output.
 fn docker(args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("docker").args(args).output()?;
@@ -963,13 +983,14 @@ fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() ->
     )?;
     let name = format!("kiln-fulldisk-{port}");
     let bin = common::BIN;
+    let (libs, loader) = host_loader()?;
     let _ = docker(&["rm", "-f", &name]);
     docker(&[
         "run", "-d", "--name", &name, "--network", "host", "--user", "1000:1000", "--tmpfs", "/data:size=96m,mode=1777,uid=1000,gid=1000",
-        "-v", &format!("{bin}:/work/kiln:ro"), "-v", "/usr/lib:/hostlib:ro", "-v", &format!("{}:/cfg/kiln.toml:ro", cfg.display()), "-e", "HOME=/data/home",
+        "-v", &format!("{bin}:/work/kiln:ro"), "-v", &format!("{libs}:/hostlib:ro"), "-v", &format!("{}:/cfg/kiln.toml:ro", cfg.display()), "-e", "HOME=/data/home",
         // No UI server: the one kiln carries unpacks into its data folder, a third of this disk.
         "-e", "KILN_UI_DIR=/nonexistent",
-        "--entrypoint", "/hostlib/ld-linux-x86-64.so.2", &image, "--library-path", "/hostlib", "/work/kiln", "--config", "/cfg/kiln.toml", "server",
+        "--entrypoint", &format!("/hostlib/{loader}"), &image, "--library-path", "/hostlib", "/work/kiln", "--config", "/cfg/kiln.toml", "server",
     ])?;
     struct Gone(String);
     impl Drop for Gone {
@@ -988,13 +1009,20 @@ fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() ->
     docker(&["exec", &name, "dd", "if=/dev/zero", "of=/data/balloon", "bs=1M", "count=30"])?;
     let pid: u32 = docker(&["inspect", "-f", "{{.State.Pid}}", &name])?.parse()?;
     let t0_ms = common::now_ms() - 7_200_000;
-    let flood = |from_i: u64, secs: u64| -> (u64, u64, u64) {
+    // Points as fast as the server takes them, for `at_most`, or (`until_refused`) until it refuses
+    // and two seconds more: however fast this machine fills the disk.
+    // Each request taken, by sender: its index and when (ms into the test), to name any lost.
+    let begun = Instant::now();
+    let took: Arc<std::sync::Mutex<Vec<Vec<(u64, u64)>>>> = Arc::new(std::sync::Mutex::new(vec![Vec::new(), Vec::new()]));
+    let flood = |from_i: u64, at_most: Duration, until_refused: bool| -> (u64, u64, u64) {
         let stop = Arc::new(AtomicBool::new(false));
+        let refusals = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let senders: Vec<_> = (0..2u64)
             .map(|sender| {
-                let (stop, ingest) = (stop.clone(), ingest.clone());
+                let (stop, ingest, refusals, took) = (stop.clone(), ingest.clone(), refusals.clone(), took.clone());
                 std::thread::spawn(move || {
                     let (mut taken, mut refused, mut i) = (0u64, 0u64, from_i);
+                    let mut mine = Vec::new();
                     let mut conn = Conn::new(port);
                     let headers = format!("Authorization: Bearer {ingest}\r\nContent-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n");
                     while !stop.load(Ordering::Relaxed) {
@@ -1002,25 +1030,38 @@ fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() ->
                         match conn.send("/v1/metrics", &headers, &body) {
                             Ok(a) if a.code == 200 => {
                                 taken += 1000;
+                                mine.push((i, begun.elapsed().as_millis() as u64));
                                 i += 1;
                             }
                             Ok(a) if a.code == 503 => {
                                 refused += 1000;
+                                refusals.fetch_add(1, Ordering::Relaxed);
                                 std::thread::sleep(Duration::from_millis(500));
                             }
                             _ => std::thread::sleep(Duration::from_millis(500)),
                         }
                     }
+                    if let Some(all) = took.lock().ok().as_mut().and_then(|t| t.get_mut(sender as usize)) {
+                        all.extend(mine);
+                    }
                     (taken, refused, i)
                 })
             })
             .collect();
-        std::thread::sleep(Duration::from_secs(secs));
+        let start = Instant::now();
+        while start.elapsed() < at_most && !(until_refused && refusals.load(Ordering::Relaxed) > 0) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if until_refused {
+            std::thread::sleep(Duration::from_secs(2));
+        }
         stop.store(true, Ordering::Relaxed);
         senders.into_iter().filter_map(|t| t.join().ok()).fold((0, 0, 0), |a, (t, r, i)| (a.0 + t, a.1 + r, a.2.max(i)))
     };
-    let (taken, refused, last_i) = flood(0, 25);
-    anyhow::ensure!(refused > 0, "never refused: {taken} taken on a 96 MiB disk");
+    let filling = Instant::now();
+    let (taken, refused, last_i) = flood(0, Duration::from_secs(120), true);
+    let filled = filling.elapsed();
+    anyhow::ensure!(refused > 0, "never refused: {taken} taken on a 96 MiB disk in {filled:?}");
     // Refusing, it does not spin: under a tenth of a core over five seconds.
     let (c0, _) = usage(pid);
     std::thread::sleep(Duration::from_secs(5));
@@ -1028,18 +1069,95 @@ fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() ->
     anyhow::ensure!(c1 - c0 < 0.5, "{:.2} CPU s in 5 s while the disk was full", c1 - c0);
     // Room freed: it takes again.
     docker(&["exec", &name, "rm", "/data/balloon"])?;
-    let (more, _, _) = flood(last_i + 1, 15);
+    let (more, _, _) = flood(last_i + 1, Duration::from_secs(15), false);
     anyhow::ensure!(more > 0, "nothing taken once room was freed");
-    // Everything it took, stored.
-    let a = {
+    // Everything it took, stored: once written (a point answered 200 is taken, and written a flush
+    // and a write later).
+    let total = || -> anyhow::Result<f64> {
         let body = serde_json::to_vec(&json!({ "query": "sum:load.v{*}.rollup(sum)", "from": t0_ms - 60_000, "to": t0_ms + 3_600_000, "points": 100 }))?;
         let (code, b) = common::raw(port, "POST", "/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body)?;
         anyhow::ensure!(code == 200, "{code}");
-        serde_json::from_slice::<serde_json::Value>(&b)?
+        let a: serde_json::Value = serde_json::from_slice(&b)?;
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum())
     };
-    let stored: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
-    anyhow::ensure!(stored.round() as u64 == taken + more, "{} taken, {stored} stored", taken + more);
-    eprintln!("\na full disk: {taken} points taken, then refused; idle while full ({:.2} CPU s in 5 s); {more} more once 30 MiB were freed; all {} stored", c1 - c0, taken + more);
+    let waited = Instant::now();
+    let mut stored = total()?;
+    while stored.round() as u64 != taken + more && waited.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(500));
+        stored = total()?;
+    }
+    if stored.round() as u64 != taken + more {
+        // Where: each series' count (each sender's should be its requests taken), then the first
+        // short one read a millisecond (a request) at a time.
+        let ask = |q: &str, from: i64, to: i64, step: Option<i64>| -> anyhow::Result<serde_json::Value> {
+            let req = match step {
+                Some(s) => json!({ "query": q, "from": from, "to": to, "max_series": 10_000, "step": s }),
+                None => json!({ "query": q, "from": from, "to": to, "max_series": 10_000, "points": 1 }),
+            };
+            let (code, b) = common::raw(port, "POST", "/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &serde_json::to_vec(&req)?)?;
+            anyhow::ensure!(code == 200, "{code} {}", String::from_utf8_lossy(&b));
+            Ok(serde_json::from_slice(&b)?)
+        };
+        let took = took.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
+        let counts = ask("sum:load.v{*} by {host,s}.rollup(sum)", t0_ms - 60_000, t0_ms + 3_600_000, None)?;
+        let mut short = Vec::new();
+        for series in at(&counts, &["series"]).as_array().into_iter().flatten() {
+            let (host, s) = (at(series, &["tags", "host"]).as_str().unwrap_or(""), at(series, &["tags", "s"]).as_str().unwrap_or(""));
+            let sender: usize = host.strip_prefix("load-").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let n: f64 = at(series, &["values"]).as_array().into_iter().flatten().filter_map(|v| v.as_f64()).sum();
+            let want = took.get(sender).map_or(0, Vec::len) as f64;
+            if (n - want).abs() > 0.5 {
+                short.push((format!("host:{host},s:{s}"), sender, n, want));
+            }
+        }
+        let series_n = at(&counts, &["series"]).as_array().map_or(0, Vec::len);
+        // One series' total at each step: raw points (1 ms) and coarser.
+        let one = "sum:load.v{host:load-0,s:0}.rollup(sum)";
+        let mut by_step = Vec::new();
+        for step in [1_000i64, 10_000, 60_000, 600_000, 3_600_000] {
+            let a = ask(one, t0_ms - 3_600_000, t0_ms + 3_600_000, Some(step))?;
+            let n: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
+            by_step.push((step, n));
+        }
+        let mut missing = Vec::new();
+        if let Some((tags, sender, _, _)) = short.first() {
+            let mine = took.get(*sender).cloned().unwrap_or_default();
+            let last = mine.iter().map(|&(i, _)| i).max().unwrap_or(0);
+            let mut present = std::collections::HashSet::new();
+            let mut from = 0;
+            while from <= last {
+                let a = ask(&format!("sum:load.v{{{tags}}}.rollup(sum)"), t0_ms + from as i64, t0_ms + (from + 10_000) as i64, Some(1))?;
+                let start = at(&a, &["grid", "from"]).as_i64().unwrap_or(0);
+                let step = at(&a, &["grid", "step"]).as_i64().unwrap_or(1).max(1);
+                for s in at(&a, &["series"]).as_array().into_iter().flatten() {
+                    for (k, v) in at(s, &["values"]).as_array().into_iter().flatten().enumerate() {
+                        if v.as_f64().is_some() {
+                            present.insert(((start + k as i64 * step) - t0_ms) as u64);
+                        }
+                    }
+                }
+                from += 10_000;
+            }
+            missing.extend(mine.iter().filter(|(i, _)| !present.contains(i)).copied());
+        }
+        anyhow::bail!(
+            "{} taken, {stored} stored after 30 s; {series_n} series, {} short (tags, sender, stored, taken) {:?}; the first's missing (index, ms taken): {} {:?}; host:load-0,s:0 by step (ms, sum) {by_step:?} of {} taken; first refused at {:.1} s\n{}",
+            taken + more,
+            short.len(),
+            short.iter().take(12).collect::<Vec<_>>(),
+            missing.len(),
+            missing.iter().take(30).collect::<Vec<_>>(),
+            took.first().map_or(0, Vec::len),
+            filled.as_secs_f64(),
+            container_log(&name)
+        );
+    }
+    eprintln!(
+        "\na full disk: {taken} points taken in {:.1} s, then refused; idle while full ({:.2} CPU s in 5 s); {more} more once 30 MiB were freed; all {} stored",
+        filled.as_secs_f64(),
+        c1 - c0,
+        taken + more
+    );
     Ok(())
 }
 
