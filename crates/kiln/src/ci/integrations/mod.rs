@@ -201,6 +201,19 @@ pub const KINDS: &[KindInfo] = &[
         built: true,
     },
     KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON"), f("events", false, "kiln events to send as they happen: run, job, agent, queue, cd_plan, cd_apps, cd_app_deleted, or * (comma-separated); without, only notify rules use it")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
+    // Where runs' traces go (docs/ci.md W19-R02, W11-R09).
+    KindInfo {
+        kind: "otel",
+        title: "OpenTelemetry",
+        category: "observability",
+        mode: Mode::Optional,
+        fields: &[
+            f("endpoint", true, "an OTLP/HTTP receiver: https://otlp.example.com, or http://collector:4318 (one on a private network needs [ci] allow_private_targets)"),
+            f("service_name", false, "the traces' service.name (kiln-ci)"),
+        ],
+        secret: Some("a header the receiver wants, `Name: value` (an API key: `x-honeycomb-team: …`, `Authorization: Bearer …`)"),
+        built: true,
+    },
     KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true },
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false },
@@ -273,6 +286,12 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
     }
     if info.kind == "webhook" {
         crate::ci::webhooks::check_events(config)?;
+    }
+    if info.kind == "otel"
+        && let Some(e) = obj.get("endpoint").and_then(Value::as_str)
+        && !(e.trim().starts_with("http://") || e.trim().starts_with("https://"))
+    {
+        return Err(format!("`{e}` is not an OTLP/HTTP endpoint: http:// or https://"));
     }
     if info.kind == "oci"
         && let Some(r) = obj.get("registry").and_then(Value::as_str)
@@ -543,6 +562,7 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
                 Err(e) => Err(format!("{e:#}")),
             },
             "argocd" => Box::pin(crate::deploy::argocd::verify(hub, &i.name)).await,
+            "otel" => Box::pin(crate::ci::otel::verify(hub, &i)).await,
             other => Err(format!("no check for {other} yet")),
         }
     };

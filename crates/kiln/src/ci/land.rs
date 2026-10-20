@@ -85,6 +85,8 @@ struct Entry {
     /// The commit that carries each diff on the candidate.
     commits: BTreeMap<String, String>,
     enqueued_by: String,
+    /// Who landed it, which its candidate's runs are held to (W10-R02's `secrets.use`).
+    started_by: Option<Value>,
 }
 
 fn entry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
@@ -103,10 +105,11 @@ fn entry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         started: started.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
         commits: commits.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
         enqueued_by: r.get(9)?,
+        started_by: r.get::<_, Option<String>>(10)?.and_then(|t| serde_json::from_str(&t).ok()),
     })
 }
 
-const ENTRY_COLUMNS: &str = "id, diffs, strategy, state, batch, base, candidate, checks, commits, enqueued_by";
+const ENTRY_COLUMNS: &str = "id, diffs, strategy, state, batch, base, candidate, checks, commits, enqueued_by, started_by";
 
 async fn entries(hub: &Hub, repo_id: &str, trunk: &str, states: &'static [&'static str]) -> anyhow::Result<Vec<Entry>> {
     let (repo_id, trunk) = (repo_id.to_owned(), trunk.to_owned());
@@ -227,12 +230,13 @@ pub async fn enqueue(hub: &Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) ->
     let names: Vec<String> = chain.iter().map(|x| x.name.clone()).collect();
     let (entry, repo_id, trunk, by, list) = (crate::util::new_id(), repo.id.clone(), d.trunk.clone(), caller.name.clone(), serde_json::to_string(&ids).unwrap_or_default());
     let e2 = entry.clone();
+    let started_by = caller.started_by().map(|v| v.to_string());
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
             c.execute(
-                "INSERT INTO land_queue (id, repo_id, trunk, diffs, strategy, state, enqueued_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7)",
-                params![e2, repo_id, trunk, list, strategy.as_str(), by, now],
+                "INSERT INTO land_queue (id, repo_id, trunk, diffs, strategy, state, enqueued_by, created_at, updated_at, started_by) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7, ?8)",
+                params![e2, repo_id, trunk, list, strategy.as_str(), by, now, started_by],
             )?;
             Ok(())
         })
@@ -248,7 +252,7 @@ pub async fn enqueue(hub: &Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) ->
 /// `GET /api/repos/:repo/queue`: its entries, newest first (the last 100 that finished too).
 pub async fn list(hub: &Hub, repo: &str) -> Result<Value, Fail> {
     let key = repo.to_owned();
-    let rows: Vec<Value> = hub
+    let mut rows: Vec<Value> = hub
         .store
         .call(move |c| {
             let mut st = c.prepare(
@@ -270,6 +274,15 @@ pub async fn list(hub: &Hub, repo: &str) -> Result<Value, Fail> {
         })
         .await
         .map_err(fail)?;
+    // Each candidate's `bench-gate` results (W16-R09).
+    let candidates: Vec<String> = rows.iter().filter_map(|r| r.get("candidate").and_then(Value::as_str).map(str::to_owned)).collect();
+    let gates = super::review::gates_on(hub, repo, candidates).await.map_err(fail)?;
+    for r in &mut rows {
+        let g = r.get("candidate").and_then(Value::as_str).and_then(|c| gates.get(c)).cloned().unwrap_or_default();
+        if let Some(o) = r.as_object_mut() {
+            o.insert("gates".into(), json!(g));
+        }
+    }
     Ok(json!({ "entries": rows }))
 }
 
@@ -563,8 +576,9 @@ async fn commit_of(hub: &Hub, path: &str, sha: &str) -> kiln_ci::trigger::contex
 }
 
 /// The candidate's `land` and `merge_group` events: GitHub's payload, with kiln's own part
-/// (`kiln.land`).
-fn candidate_events(ctx: &kiln_ci::trigger::context::Repo, repo: &Repo, trunk: &str, base: &str, tip: &kiln_ci::trigger::context::Commit, batch: &str, names: &[String]) -> (Event, Event) {
+/// (`kiln.land`). Held to whoever landed its entries (`started_by`).
+#[allow(clippy::too_many_arguments)]
+fn candidate_events(ctx: &kiln_ci::trigger::context::Repo, repo: &Repo, trunk: &str, base: &str, tip: &kiln_ci::trigger::context::Commit, batch: &str, names: &[String], started_by: Option<Value>) -> (Event, Event) {
     let head_ref = format!("refs/kiln/land/{trunk}/{batch}");
     let kiln = kiln_ci::trigger::context::Person { name: "kiln".into(), email: String::new(), username: Some("kiln[bot]".into()) };
     let mut payload = kiln_ci::trigger::context::merge_group(ctx, trunk, base, tip, &head_ref, &kiln);
@@ -572,7 +586,7 @@ fn candidate_events(ctx: &kiln_ci::trigger::context::Repo, repo: &Repo, trunk: &
         p.insert("kiln".into(), json!({ "land": { "trunk": trunk, "batch": batch, "diffs": names } }));
     }
     let tip = tip.id.as_str();
-    let mg = Event { name: "merge_group".into(), action: "checks_requested".into(), repo: repo.name.clone(), git_ref: head_ref.clone(), sha: tip.to_owned(), base_ref: Some(trunk.to_owned()), actor: "kiln".into(), trusted: true, source: Source::Native, payload, ..Event::default() };
+    let mg = Event { name: "merge_group".into(), action: "checks_requested".into(), repo: repo.name.clone(), git_ref: head_ref.clone(), sha: tip.to_owned(), base_ref: Some(trunk.to_owned()), actor: "kiln".into(), trusted: true, source: Source::Native, payload, started_by, ..Event::default() };
     let landing = Event { name: "land".into(), action: String::new(), ..mg.clone() };
     (mg, landing)
 }
@@ -664,7 +678,17 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
             }
         }
         if !failed.is_empty() {
-            let reason = format!("{} on the candidate", failed.join(", "));
+            // A failing bench-gate says which metrics got worse (W16-R09).
+            let said: Vec<String> = super::review::gates_on(hub, &repo.name, vec![candidate.clone()])
+                .await
+                .unwrap_or_default()
+                .remove(&candidate)
+                .unwrap_or_default()
+                .iter()
+                .filter(|g| g.get("level").and_then(Value::as_str) == Some("error"))
+                .filter_map(|g| g.get("message").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+            let reason = format!("{} on the candidate{}", failed.join(", "), said.iter().map(|m| format!("; {m}")).collect::<String>());
             let _ = gitops::run_git(hub, &["-C", &path, "update-ref", "-d", &format!("refs/kiln/land/{trunk}/{batch}")], LS_REMOTE_TIMEOUT).await;
             if testing.len() > 1 {
                 // Bisect: the next batch is half as big.
@@ -733,7 +757,10 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
     }
     let ctx = super::events::facts(hub, repo).await.repo;
     let head = commit_of(hub, &path, &tip).await;
-    let events = candidate_events(&ctx, repo, trunk, &base, &head, &batch, &names);
+    // A batch is held to each of its landers: a secret only every one of them may use.
+    let landers: Vec<Value> = built.iter().filter_map(|(e, _)| e.started_by.clone()).collect();
+    let started_by = (!landers.is_empty()).then(|| json!({ "name": "the batch's landers", "all": landers }));
+    let events = candidate_events(&ctx, repo, trunk, &base, &head, &batch, &names, started_by);
     let started = start_checks(hub, repo, &events).await.unwrap_or_else(|e| {
         tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the candidate's workflows didn't start");
         Vec::new()

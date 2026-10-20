@@ -39,6 +39,8 @@ pub const CAPABILITIES: &[&str] = &[
     "artifacts.write",
     "caches.write",
     "workflows.edit",
+    // Any secret given to the runs one starts; `secrets.use:<NAME>` is one of them (see `capability`).
+    "secrets.use",
     "secrets.manage",
     "variables.manage",
     "integrations.manage",
@@ -70,11 +72,12 @@ pub const CAPABILITIES: &[&str] = &[
 pub const SIGNED_IN: &str = "signed-in";
 
 /// The built-in roles (W10-R02, access.md): `viewer` reads; `developer` also triggers, reruns,
-/// submits and reviews; `maintainer` also lands, attaches agents, debugs, approves, deploys and
-/// manages the queue, secrets and variables; `admin` and `owner` have every capability.
+/// submits and reviews, its runs given any secret; `maintainer` also lands, attaches agents,
+/// debugs, approves, deploys and manages the queue, secrets and variables; `admin` and `owner`
+/// have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
     const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
@@ -219,13 +222,35 @@ impl Grant {
     }
 
     pub fn gives(&self, capability: &str, custom: &HashMap<String, Vec<String>>) -> bool {
-        self.what == capability || role(&self.what).is_some_and(|caps| caps.contains(&capability)) || custom.get(&self.what).is_some_and(|caps| caps.iter().any(|c| c == capability))
+        held_gives(&self.what, capability)
+            || role(&self.what).is_some_and(|caps| caps.iter().any(|c| held_gives(c, capability)))
+            || custom.get(&self.what).is_some_and(|caps| caps.iter().any(|c| held_gives(c, capability)))
+    }
+}
+
+/// Whether `what` is a capability: one of [`CAPABILITIES`], or `secrets.use:<NAME>` (one secret by
+/// name, letters, digits and `_`; `*` for any).
+pub fn capability(what: &str) -> bool {
+    CAPABILITIES.contains(&what) || what.strip_prefix("secrets.use:").is_some_and(|n| n == "*" || (!n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
+}
+
+/// Whether holding capability `held` gives `wanted`: the same one, or `secrets.use` (and
+/// `secrets.use:*`) giving `secrets.use:<NAME>` for any name. Secrets' names compare as kiln
+/// keeps them, without case.
+fn held_gives(held: &str, wanted: &str) -> bool {
+    if held == wanted {
+        return true;
+    }
+    match (held.strip_prefix("secrets.use"), wanted.strip_prefix("secrets.use:")) {
+        (Some("" | ":*"), Some(_)) => true,
+        (Some(h), Some(w)) => h.strip_prefix(':').is_some_and(|h| h.eq_ignore_ascii_case(w)),
+        _ => false,
     }
 }
 
 /// Whether `what` names a capability or a role (built-in, or one of `custom`).
 pub fn known(what: &str, custom: &HashMap<String, Vec<String>>) -> bool {
-    CAPABILITIES.contains(&what) || role(what).is_some() || custom.contains_key(what)
+    capability(what) || role(what).is_some() || custom.contains_key(what)
 }
 
 /// Whether `grants` give `capability` in `target`: some grant reaching it gives it, and no deny
@@ -288,12 +313,17 @@ const fn any(pattern: &'static str, capability: &'static str, at: At) -> Rule {
 /// The API behind authentication (W10-R05), first match wins. docs/ci.md §4.1 lists the CI part.
 pub static ROUTES: &[Rule] = &[
     r("GET", "/api/openapi.json", SIGNED_IN, At::Server),
+    // A person's own notification rules (W19-R06).
+    r("GET", "/api/me/notifications", SIGNED_IN, At::Server),
+    r("PUT", "/api/me/notifications", SIGNED_IN, At::Server),
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
-    r("GET", "/api/overview", "runs.read", At::Server),
+    // A person of some repositories gets theirs (W10).
+    r("GET", "/api/overview", "runs.read", At::Anywhere),
     r("GET", "/api/system", "runners.read", At::Server),
-    r("GET", "/api/events", "runs.read", At::Server),
+    // Each event narrowed to the repositories the caller may read (W10).
+    r("GET", "/api/events", "runs.read", At::Anywhere),
     r("GET", "/api/metrics/history", "runners.read", At::Server),
     r("GET", "/api/audit", "audit.read", At::Server),
     // Repositories, runs and jobs (v1's routes; the engine's legs are jobs too).
@@ -340,7 +370,8 @@ pub static ROUTES: &[Rule] = &[
     r("PATCH", "/api/change-requests/*", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/labels/*", "diffs.review", At::Diff(2)),
-    r("GET", "/api/runs", "runs.read", At::RepoQuery),
+    // Lists narrowed row by row to the repositories the caller may read (W10).
+    r("GET", "/api/runs", "runs.read", At::Anywhere),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),
     r("POST", "/api/runs/*/retry", "runs.rerun", At::Run(2)),
@@ -359,7 +390,7 @@ pub static ROUTES: &[Rule] = &[
     r("PUT", "/api/ci/pools/:name", "pools.manage", At::Server),
     r("DELETE", "/api/ci/pools/:name", "pools.manage", At::Server),
     r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/runs", "runs.read", At::RepoQuery),
+    r("GET", "/api/ci/runs", "runs.read", At::Anywhere),
     r("GET", "/api/ci/runs/*", "runs.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/artifacts/*/download", "artifacts.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/**", "runs.read", At::Run(3)),
@@ -588,6 +619,29 @@ mod tests {
         assert_eq!(Grant::parse("!runs.cancel@repo:acme/other")?.text(), "!runs.cancel@repo:acme/other");
         assert!(Grant::parse("runs.read@galaxy:far").is_err() && Grant::parse("@server").is_err());
         assert!(role("maintainer").is_some_and(|m| role("developer").is_some_and(|d| d.iter().all(|c| m.contains(c)))));
+        Ok(())
+    }
+
+    /// `secrets.use:<NAME>` (access.md): a developer's runs may use any secret, one denied by name
+    /// excepted; a grant of one name gives that one alone (as kiln keeps names, any case); `*`
+    /// any; a viewer none. Custom roles name them too.
+    #[test]
+    fn w10_r02_secrets_use_by_name() -> Result<(), String> {
+        let wf = Scope::Workflow { repo: "acme/app".into(), path: ".kiln/ci.yaml".into() };
+        let env = Scope::Environment { repo: "acme/app".into(), environment: "production".into() };
+        let none = HashMap::new();
+        let dev = vec![Grant::parse("developer@repo:acme/app")?, Grant::parse("!secrets.use:DEPLOY_KEY@repo:acme/app")?];
+        assert!(allows(&dev, &none, "secrets.use:NPM_TOKEN", &wf));
+        assert!(!allows(&dev, &none, "secrets.use:DEPLOY_KEY", &wf) && !allows(&dev, &none, "secrets.use:DEPLOY_KEY", &env), "the deny wins, in its environments too");
+        let one = vec![Grant::parse("viewer@repo:acme/app")?, Grant::parse("secrets.use:deploy_key@repo:acme/app")?];
+        assert!(allows(&one, &none, "secrets.use:DEPLOY_KEY", &env) && !allows(&one, &none, "secrets.use:NPM_TOKEN", &env));
+        assert!(allows(&[Grant::parse("secrets.use:*@repo:acme/app")?], &none, "secrets.use:ANY", &wf));
+        assert!(!allows(&[Grant::parse("viewer@repo:acme/app")?], &none, "secrets.use:ANY", &wf), "a viewer starts no runs");
+        let custom: HashMap<String, Vec<String>> = [("deployer".to_owned(), vec!["runs.trigger".to_owned(), "secrets.use:DEPLOY_KEY".to_owned()])].into_iter().collect();
+        assert!(allows(&[Grant::parse("deployer@repo:acme/app")?], &custom, "secrets.use:DEPLOY_KEY", &wf) && !allows(&[Grant::parse("deployer@repo:acme/app")?], &custom, "secrets.use:OTHER", &wf));
+        assert!(capability("secrets.use:DEPLOY_KEY") && capability("secrets.use:*") && capability("secrets.use"));
+        assert!(!capability("secrets.use:") && !capability("secrets.use:a-b") && !capability("secrets.used"));
+        assert!(known("secrets.use:X", &none) && Grant::parse("!secrets.use:X@env:acme/app:production").is_ok_and(|g| g.deny && g.what == "secrets.use:X"));
         Ok(())
     }
 

@@ -2037,6 +2037,103 @@ jobs:
     Ok(())
 }
 
+/// W16-R09: a job's `bench-gate` result shows on the diff and in the land queue. Three trunk runs
+/// make `parse`'s baseline; a diff makes it 10 % slower, past the gate's 5 %. The diff's run fails
+/// with the gate's verdict beside it, and its candidate in the land queue fails the same way: the
+/// entry is ejected saying which metric got worse, the verdict beside it too.
+#[test]
+fn w16_r09_bench_gate_on_the_diff_and_the_land_queue() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/bench.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/bench", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/bench"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/bench"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/bench"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&lead), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("README.md"), "bench\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    // The trunk moves as the owner moves it (only the land queue writes it for others).
+    let owner = url(&s.admin);
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+    // The metric is whatever the commit's `speed.txt` says.
+    std::fs::write(
+        work.join(".kiln/bench.yaml"),
+        r#"on: [push, diff, land]
+jobs:
+  bench:
+    runs-on: local
+    bench-gate: { metric: "parse*", max-regression: 5% }
+    steps:
+      - run: printf '{"name":"parse","value":%s,"unit":"ns","better":"lower"}\n' "$(cat speed.txt)" >> "$KILN_METRICS"
+"#,
+    )?;
+    std::fs::write(work.join("speed.txt"), "1000\n")?;
+    let runs = |sha: &str| -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/bench&limit=50", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| text(r, "sha") == sha).collect())
+    };
+    let finished = |sha: &str, what: &str| -> anyhow::Result<Value> {
+        let mut last = Value::Null;
+        until(240, what, || {
+            last = runs(sha)?.into_iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).unwrap_or(Value::Null);
+            Ok(last.is_null().then(|| s.log()))
+        })?;
+        Ok(last)
+    };
+    // The baseline: three trunk runs at 1,000 ns.
+    for i in 0..3 {
+        std::fs::write(work.join("README.md"), format!("bench {i}\n"))?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", &format!("trunk {i}")]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+        let sha = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+        let run = finished(&sha, &format!("trunk run {i}"))?;
+        anyhow::ensure!(text(&run, "conclusion") == "success", "trunk run {i}: {run}\n{}", s.log());
+    }
+
+    // A diff 10 % slower: its run fails, the gate's verdict beside it.
+    let head = commit(&home, &work, "speed.txt", "1100\n", "Parse more carefully", &format!("I{}", "7".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", &url(&dev), "HEAD:refs/for/main"]), "submit")?;
+    let run = finished(&head, "the diff's run")?;
+    assert_eq!(text(&run, "conclusion"), "failure", "the gate fails the diff's run: {run}");
+    let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+    let gates: Vec<Value> = d.get("runs").and_then(Value::as_array).into_iter().flatten().flat_map(|r| r.get("gates").and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+    assert!(
+        gates.iter().any(|g| text(g, "level") == "error" && text(g, "job") == "bench" && text(g, "message").contains("parse is 10.0% worse than main") && text(g, "message").contains("more than the 5% it allows")),
+        "the diff's gates: {d}"
+    );
+
+    // Accepted and landed, its candidate fails the gate too: ejected, saying why.
+    let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+    let (st, e) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    anyhow::ensure!(st == 200, "land: {e}");
+    let mut entry = Value::Null;
+    until(300, "the entry is ejected", || {
+        let q = api(&s, &dev, "GET", "/api/repos/acme%2Fbench/queue")?;
+        entry = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D1"])))).cloned().unwrap_or(Value::Null);
+        Ok((text(&entry, "state") != "ejected").then(|| format!("{q}\n{}", s.log())))
+    })?;
+    let reason = text(&entry, "reason");
+    assert!(reason.contains("`.kiln/bench.yaml` failure on the candidate; bench-gate: parse is 10.0% worse than main"), "{entry}");
+    let said: Vec<&Value> = entry.get("gates").and_then(Value::as_array).into_iter().flatten().collect();
+    assert!(said.iter().any(|g| text(g, "level") == "error" && text(g, "message").contains("parse is 10.0% worse")), "the candidate's gates: {entry}");
+    assert_eq!(text(&api(&s, &dev, "GET", "/api/diffs/D1")?, "state"), "accepted", "back to its review state");
+    Ok(())
+}
+
 /// W15-R01's concurrency limit: with `concurrency: 1`, two jobs deploying to the environment run
 /// one after the other, though the runner could take both at once (two slots).
 #[test]

@@ -126,7 +126,7 @@ pub fn ops() -> &'static [Op] {
                     "actor": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}, "cursor": {"type": "string", "description": "The `next` of the previous page."}
                 }), &[]),
                 route: |v| Ok((Method::GET, path(&["runs"]), query(v, &["repo", "workflow", "branch", "event", "conclusion", "actor", "limit", "cursor"]))),
-                run: |cx: Cx, v: Value| async move { answer(super::runs_api::list(&cx.hub, &query(&v, &["repo", "workflow", "branch", "event", "conclusion", "actor", "limit", "cursor"])).await).await }),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::list(&cx.hub, &query(&v, &["repo", "workflow", "branch", "event", "conclusion", "actor", "limit", "cursor"]), Some(&cx.caller)).await).await }),
             op!("ci.runs.get", "A run and its legs: status, conclusion, wait reasons, matrix values, runners.", ro: true, destructive: false,
                 input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
                 route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?]), HashMap::new())),
@@ -146,7 +146,7 @@ pub fn ops() -> &'static [Op] {
                         None => super::events::facts(&cx.hub, &r).await.default_branch,
                     };
                     let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx)).await.map_err(|e| (e.status, e.message))?;
+                    super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "dispatched": true, "ref": git_ref }))
                 }),
             op!("ci.runs.ask", "As an agent, ask for a run of a workflow that takes kiln's `agent` event (`on: { agent: { agents, inputs } }`, its `agents` naming you or `*`), at a branch or tag, with its inputs. You are the run's actor.", ro: false, destructive: false,
@@ -164,7 +164,7 @@ pub fn ops() -> &'static [Op] {
                         None => super::events::facts(&cx.hub, &r).await.default_branch,
                     };
                     let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx)).await.map_err(|e| (e.status, e.message))?;
+                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "asked": true, "ref": git_ref }))
                 }),
             op!("ci.runs.compare", "What changed between two runs of a workflow, or since its last green run (`other`: a run's id or `last-green`, the default): the actions, variables, environment, images, machines and cache that differ, the files changed between the commits, and each leg's steps side by side.", ro: true, destructive: false,
@@ -380,10 +380,10 @@ pub fn ops() -> &'static [Op] {
                     let rest: Vec<&str> = match &repo { Some(r) => vec!["repos", r.as_str()], None => vec!["repos"] };
                     answer(super::insights::route(&cx.hub, &rest, &query(&v, &["days"])).await).await
                 }),
-            op!("ci.insights.workflows", "A repository's workflows' insights: the critical path, slowest jobs and steps, cache hit rates, queue time, flakiness.", ro: true, destructive: false,
-                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &["repo"]),
-                route: |v| Ok((Method::GET, path(&["insights", "workflows", &text(v, "repo")?]), query(v, &["days"]))),
-                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; answer(super::insights::route(&cx.hub, &["workflows", repo.as_str()], &query(&v, &["days"])).await).await }),
+            op!("ci.insights.workflows", "A workflow's insights (`workflow`, its path; `ci.insights.repos` with `repo` lists them): durations and success over time, the critical path, its jobs, slowest steps, executors and pools, cache hit rates, queue time, flakiness.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "workflow": {"type": "string", "description": "Its path, e.g. `.github/workflows/ci.yml`."}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &["repo", "workflow"]),
+                route: |v| Ok((Method::GET, path(&["insights", "workflows", &text(v, "repo")?]), query(v, &["workflow", "days"]))),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; answer(super::insights::route(&cx.hub, &["workflows", repo.as_str()], &query(&v, &["workflow", "days"])).await).await }),
             op!("ci.insights.runners", "Runners' insights: utilization, queue time and failures by runner.", ro: true, destructive: false,
                 input: || schema(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]),
                 route: |v| Ok((Method::GET, path(&["insights", "runners"]), query(v, &["days"]))),

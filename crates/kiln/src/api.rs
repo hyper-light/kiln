@@ -406,7 +406,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
         }
-        (&Method::GET, ["api", "overview"]) => overview(&hub).await,
+        (&Method::GET, ["api", "overview"]) => overview(&hub, &caller).await,
+        (&Method::GET, ["api", "me", "notifications"]) => crate::ci::notify::mine(&hub, &caller, None).await.map_err(|(s, m)| ApiError(s, m)),
+        (&Method::PUT, ["api", "me", "notifications"]) => {
+            let body: serde_json::Value = srv::body_json(req.into_body(), 1 << 20).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            crate::ci::notify::mine(&hub, &caller, Some(body)).await.map_err(|(s, m)| ApiError(s, m))
+        }
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
         (&Method::GET, ["api", "updates"]) => Ok(updates_overview(&hub, false).await),
@@ -438,7 +443,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let id = (*id).to_owned();
             trigger(&hub, &id, req).await
         }
-        (&Method::GET, ["api", "runs"]) => runs(&hub, &q).await,
+        (&Method::GET, ["api", "runs"]) => runs(&hub, &q, &caller).await,
         (&Method::GET, ["api", "runs", id]) => run(&hub, id, &q).await,
         (&Method::POST, ["api", "runs", id, "cancel"]) => cancel(&hub, id).await,
         (&Method::POST, ["api", "runs", id, "retry"]) => {
@@ -499,7 +504,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::DELETE, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::delete(&hub).await),
         (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
-        (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
+        (&Method::GET, ["api", "events"]) => {
+            // A person of some repositories hears theirs (W10); the server's scope hears it all.
+            let narrow = crate::authz::gate::readable(&hub, &caller, "runs.read")
+                .await
+                .map(|repos| Narrow { repos: repos.into_iter().collect(), person: crate::ci::inbox::person(&crate::ci::review::who(&caller).0), runs: HashMap::new() });
+            events_ws(hub.clone(), req, narrow)
+        }
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
@@ -1740,6 +1751,20 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "principal": caller.as_ref().map(|c| c.name.clone()),
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
+            // What it may do (W10-R02), for pages that show only what one can use: each
+            // capability held on the whole server, or only somewhere (a repository, …).
+            "can": caller.as_ref().map(|c| {
+                crate::authz::CAPABILITIES
+                    .iter()
+                    .filter_map(|cap| {
+                        if c.can(cap, &crate::authz::Scope::Server) {
+                            Some(((*cap).to_owned(), json!("server")))
+                        } else {
+                            c.has_somewhere(cap).then(|| ((*cap).to_owned(), json!("some")))
+                        }
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+            }),
             "public_url": hub.cfg.server.public_url,
             // Where pages agents show are served, when not here (docs/previews.md).
             "pages_url": hub.cfg.server.pages_url,
@@ -1754,8 +1779,16 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
 
 // ------------------------------------------------------------------ overview / system
 
-async fn overview(hub: &Hub) -> R {
-    let stats = hub.store.stats().await?;
+async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
+    // A person of some repositories sees theirs (W10): their runs, jobs and queue, none of the
+    // server's (its runners, processes and samples, its host's name).
+    if let Some(repos) = crate::authz::gate::readable(hub, caller, "runs.read").await {
+        let stats = hub.store.stats(Some(repos.clone())).await?;
+        let queue = hub.store.queue_among(repos.clone()).await?;
+        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "uptime_s": hub.started.elapsed().as_secs(), "hostname": null, "generation": hub.generation, "children": [], "sample": null });
+        return Ok(srv::json(StatusCode::OK, &json!({ "stats": stats, "queue": queue, "agents": null, "system": system, "sample": null, "narrowed": repos })));
+    }
+    let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
     let m = crate::metrics::global();
     let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
@@ -1934,10 +1967,21 @@ async fn trigger(hub: &Hub, id: &str, req: Request) -> R {
 
 // ------------------------------------------------------------------ runs & jobs
 
-async fn runs(hub: &Hub, q: &HashMap<String, String>) -> R {
+/// `GET /api/runs`: runs newest first, of the repositories the caller may read (W10).
+async fn runs(hub: &Hub, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> R {
     let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let before = q.get("before").and_then(|v| v.parse().ok());
-    Ok(srv::json(StatusCode::OK, &hub.store.runs(q.get("repo").cloned(), limit, before).await?))
+    // Another order than newest first pages by `offset` (W21-R03's sort).
+    if let Some(sort) = q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")) {
+        let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
+        return Ok(srv::json(StatusCode::OK, &hub.store.runs_sorted(among, q.get("repo").cloned(), sort, limit, offset).await?));
+    }
+    let list = match crate::authz::gate::readable(hub, caller, "runs.read").await {
+        None => hub.store.runs(q.get("repo").cloned(), limit, before).await?,
+        Some(names) => hub.store.runs_among(names, q.get("repo").cloned(), limit, before).await?,
+    };
+    Ok(srv::json(StatusCode::OK, &list))
 }
 
 async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
@@ -2978,13 +3022,51 @@ fn agent_tunnel(hub: &Arc<Hub>, req: Request) -> R {
 
 // ------------------------------------------------------------------ events ws
 
-fn events_ws(hub: Arc<Hub>, req: Request) -> R {
+/// What a caller of some repositories hears of the event stream (W10): events about those
+/// repositories (a run's, a job's run's, any that names one) and their own inbox's; the rest are
+/// the server's.
+struct Narrow {
+    repos: std::collections::HashSet<String>,
+    person: String,
+    /// The repository of each run a job event was about, as looked up.
+    runs: HashMap<String, Option<String>>,
+}
+
+impl Narrow {
+    async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+        let kind = v.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        match kind {
+            "resync" => return true,
+            "inbox" => return v.get("person").and_then(serde_json::Value::as_str) == Some(self.person.as_str()),
+            _ => {}
+        }
+        let named = v
+            .get("repo")
+            .and_then(|r| r.as_str().map(str::to_owned).or_else(|| r.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)))
+            .or_else(|| v.pointer("/run/repo_name").and_then(serde_json::Value::as_str).map(str::to_owned));
+        if let Some(r) = named {
+            return self.repos.contains(&r);
+        }
+        let Some(run) = v.pointer("/job/run_id").and_then(serde_json::Value::as_str).map(str::to_owned) else { return false };
+        if !self.runs.contains_key(&run) {
+            if self.runs.len() > 10_000 {
+                self.runs.clear();
+            }
+            let repo = hub.store.run(run.clone()).await.ok().flatten().map(|r| r.repo_name);
+            self.runs.insert(run.clone(), repo);
+        }
+        self.runs.get(&run).cloned().flatten().is_some_and(|r| self.repos.contains(&r))
+    }
+}
+
+fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>) -> R {
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
         m.ws_clients.add(1);
-        if let Err(e) = pump_events(&hub, socket).await {
+        if let Err(e) = pump_events(&hub, socket, narrow).await {
             tracing::debug!(error = %e, "events stream ended");
         }
         m.ws_clients.add(-1);
@@ -2992,7 +3074,7 @@ fn events_ws(hub: Arc<Hub>, req: Request) -> R {
     Ok(resp)
 }
 
-async fn pump_events(hub: &Hub, socket: ws::WebSocket) -> anyhow::Result<()> {
+async fn pump_events(hub: &Hub, socket: ws::WebSocket, mut narrow: Option<Narrow>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let mut rx = hub.events.subscribe();
@@ -3000,7 +3082,15 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket) -> anyhow::Result<()> {
     loop {
         futures::select_biased! {
             ev = rx.recv().fuse() => match ev {
-                Ok(text) => tx.send(ws::text(text.as_ref())).await?,
+                Ok(text) => {
+                    let keep = match narrow.as_mut() {
+                        Some(n) => n.lets(hub, text.as_ref()).await,
+                        None => true,
+                    };
+                    if keep {
+                        tx.send(ws::text(text.as_ref())).await?;
+                    }
+                }
                 Err(async_broadcast::RecvError::Overflowed(_)) => {
                     tx.send(ws::text(json!({"type": "resync"}).to_string())).await?;
                 }

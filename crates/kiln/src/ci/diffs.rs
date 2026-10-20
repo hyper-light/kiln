@@ -211,7 +211,7 @@ pub async fn propose_file(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, file:
     let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
     let message = review::with_change_id(&format!("{title}\n"), &new_change_id());
     let sha = make_commit(hub, &p, &tree, &tip, (&me, None), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &sha, pushed_by: &caller.name, author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &sha, pushed_by: &caller.name, started_by: caller.started_by(), author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     Ok(json!({ "diffs": out }))
 }
 
@@ -234,7 +234,7 @@ pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, bod
         let author = patch.author.clone().unwrap_or_else(|| me.clone());
         parent = make_commit(hub, &p, &tree, &parent, (&author, patch.date.as_deref()), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
-    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &parent, pushed_by: &caller.name, author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &parent, pushed_by: &caller.name, started_by: caller.started_by(), author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     Ok(json!({ "diffs": out }))
 }
 
@@ -265,6 +265,8 @@ pub struct Submission<'a> {
     pub sha: &'a str,
     /// The principal as the audit names them.
     pub pushed_by: &'a str,
+    /// What its versions' runs are held to ([`crate::authz::Caller::started_by`]).
+    pub started_by: Option<Value>,
     pub author: (String, &'static str),
     pub options: review::Options,
 }
@@ -361,6 +363,8 @@ pub(crate) struct Fresh {
     pub branch: Option<String>,
     /// Its labels (W14-R11), for `github.event.pull_request.labels`.
     pub labels: Vec<String>,
+    /// Who submitted it, which its runs are held to (W10-R02's `secrets.use`).
+    pub started_by: Option<Value>,
 }
 
 /// A diff's labels, by name.
@@ -397,6 +401,8 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     // The rows, in one transaction: diffs, versions, the stack.
     let (repo_id, trunk, opts) = (s.repo.id.clone(), s.trunk.to_owned(), s.options.clone());
     let (pushed_by, author, author_kind) = (s.pushed_by.to_owned(), s.author.0.clone(), s.author.1);
+    let started_by = s.started_by.clone();
+    let by_text = started_by.as_ref().map(Value::to_string);
     let rows: Vec<(Planned, Option<(String, Option<String>)>)> = planned.into_iter().map(|p| { let f = found.get(&p.change_id).map(|(id, stack, _)| (id.clone(), stack.clone())); (p, f) }).collect();
     let (outcomes, fresh, asked) = hub
         .store
@@ -456,13 +462,13 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                 };
                 if kind != "unchanged" {
                     tx.execute(
-                        "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                        params![diff_id, n, p.sha, p.parent, base, patch_id, message, opts.message, rebase_only, pushed_by, now],
+                        "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![diff_id, n, p.sha, p.parent, base, patch_id, message, opts.message, rebase_only, pushed_by, now, by_text],
                     )?;
                     let draft: String = tx.query_row("SELECT state FROM diffs WHERE id = ?1", [&diff_id], |r| r.get(0))?;
                     let labels = label_names(&tx, &diff_id)?;
-                    fresh.push(Fresh { number, n, sha: p.sha.clone(), parent: p.parent.clone(), title: p.title.clone(), summary: p.summary.clone(), message, draft: draft == "draft", rebase_only, branch: None, labels });
+                    fresh.push(Fresh { number, n, sha: p.sha.clone(), parent: p.parent.clone(), title: p.title.clone(), summary: p.summary.clone(), message, draft: draft == "draft", rebase_only, branch: None, labels, started_by: started_by.clone() });
                 }
                 // `-o reviewer=` asks for review of what the push changed.
                 for r in opts.reviewers.iter().filter(|_| kind != "unchanged") {
@@ -540,6 +546,7 @@ fn events_of(repo: &Repo, ctx: &context::Repo, trunk: &str, base_sha: &str, auth
         source: Source::Native,
         changed,
         message: Some(f.message.clone()),
+        started_by: f.started_by.clone(),
         ..Event::default()
     };
     e.payload = context::pull_request(&e, ctx, &pr);
@@ -581,7 +588,8 @@ pub(crate) async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, 
 /// What the pull request's branch changed in its workflows never runs this way.
 async fn target(hub: &Hub, repo: &Repo, trunk: &str, pr: &Event, message: &str, author: &str) -> anyhow::Result<()> {
     let Some(tip) = tip(hub, repo, trunk).await else { return Ok(()) };
-    let e = Event { name: "pull_request_target".into(), git_ref: format!("refs/heads/{trunk}"), sha: tip.clone(), trusted: true, ..pr.clone() };
+    // The trunk's own workflows: what the repository says, whoever opened the pull request.
+    let e = Event { name: "pull_request_target".into(), git_ref: format!("refs/heads/{trunk}"), sha: tip.clone(), trusted: true, started_by: None, ..pr.clone() };
     start_at(hub, repo, &e, &tip, message, author).await
 }
 
@@ -624,7 +632,7 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
     let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name == d.repo) else { return Ok(()) };
     let Some(latest) = versions(hub, &d).await?.pop() else { return Ok(()) };
     let facts = super::events::facts(hub, &repo).await;
-    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await };
+    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by: latest.started_by.clone() };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
     let (pr, _) = events_of(&repo, &facts.repo, &d.trunk, &latest.base, &author, &f, None);
     // `user:ada` is GitHub's `ada`; an agent's name is its first word.
@@ -649,7 +657,7 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
             let e = Event { name: "pull_request_review_comment".into(), action: "created".into(), actor: login.clone(), payload: context::pull_request_review_comment(&pr.payload, &c, &login), ..pr.clone() };
             start_at(hub, &repo, &e, &f.sha, &d.title, &who).await?;
         } else if let Some(t) = tip(hub, &repo, &facts.default_branch).await {
-            let e = Event { name: "issue_comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", facts.default_branch), sha: t.clone(), base_ref: None, head_ref: None, trusted: true, changed: None, payload: as_issue.clone(), ..pr.clone() };
+            let e = Event { name: "issue_comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", facts.default_branch), sha: t.clone(), base_ref: None, head_ref: None, trusted: true, changed: None, payload: as_issue.clone(), started_by: None, ..pr.clone() };
             start_at(hub, &repo, &e, &t, &d.title, &who).await?;
         }
         if let Some(t) = tip(hub, &repo, &d.trunk).await {
@@ -660,7 +668,7 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
                     k.insert("mentions".into(), json!(context::mentions(&c.body)));
                 }
             }
-            let e = Event { name: "comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", d.trunk), sha: t.clone(), trusted: true, changed: None, payload, ..pr.clone() };
+            let e = Event { name: "comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", d.trunk), sha: t.clone(), trusted: true, changed: None, payload, started_by: None, ..pr.clone() };
             start_at(hub, &repo, &e, &t, &d.title, &who).await?;
         }
         return Ok(());
@@ -682,24 +690,27 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
 /// its checks started. Its number.
 pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Diff, v: NewVersion) -> anyhow::Result<u32> {
     let (id, nv) = (d.id.clone(), v.clone());
-    let n: u32 = hub
+    let (n, by): (u32, Option<String>) = hub
         .store
         .call(move |c| {
             let tx = c.transaction()?;
             let n: u32 = tx.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM diff_versions WHERE diff_id = ?1", [&id], |r| r.get(0))?;
+            // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
+            let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [&id], |r| r.get(0)).optional()?.flatten();
             let now = crate::util::now_unix();
             tx.execute(
-                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now],
+                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by],
             )?;
             tx.execute("UPDATE diffs SET parent_diff = ?2, updated_at = ?3 WHERE id = ?1", params![id, nv.parent_diff, now])?;
             tx.commit()?;
-            Ok(n)
+            Ok((n, by))
         })
         .await?;
     gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/{}/v{n}", d.name), &v.commit], LS_REMOTE_TIMEOUT).await?;
     let (title, summary) = review::title_and_summary(&v.message);
-    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await };
+    let started_by = by.as_deref().and_then(|t| serde_json::from_str(t).ok());
+    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by };
     let (hub2, repo2, trunk, author, base) = (hub.clone(), repo.clone(), d.trunk.clone(), (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" }), v.base.clone());
     crate::rt::spawn(async move {
         if let Err(e) = checks(&hub2, &repo2, &trunk, &base, &author, &f).await {
@@ -746,7 +757,7 @@ pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by:
     let Some(v) = versions(hub, d).await?.pop() else { return Ok(()) };
     let ctx = super::events::facts(hub, repo).await.repo;
     let (title, summary) = (d.title.clone(), d.summary.clone());
-    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await };
+    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by: v.started_by.clone() };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
     let (mut e, _) = events_of(repo, &ctx, &d.trunk, &v.base, &author, &f, None);
     e.action = action.into();
@@ -812,6 +823,9 @@ pub struct Version {
     /// Where it is kept: `refs/kiln/diffs/D12/v3`.
     #[serde(rename = "ref")]
     pub git_ref: String,
+    /// Who submitted it, which its runs are held to (W10-R02's `secrets.use`); kiln's own.
+    #[serde(skip)]
+    pub started_by: Option<Value>,
 }
 
 const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for";
@@ -867,10 +881,11 @@ pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>
     let (id, name) = (d.id.clone(), d.name.clone());
     hub.store
         .call(move |c| {
-            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
             let rows = st.query_map([&id], |r| {
                 let n: u32 = r.get(0)?;
-                Ok(Version { n, commit: r.get(1)?, parent: r.get(2)?, base: r.get(3)?, rebase_only: r.get(4)?, pushed_by: r.get(5)?, note: r.get(6)?, created_at: r.get(7)?, git_ref: format!("refs/kiln/diffs/{name}/v{n}") })
+                let started_by = r.get::<_, Option<String>>(8)?.and_then(|t| serde_json::from_str(&t).ok());
+                Ok(Version { n, commit: r.get(1)?, parent: r.get(2)?, base: r.get(3)?, rebase_only: r.get(4)?, pushed_by: r.get(5)?, note: r.get(6)?, created_at: r.get(7)?, git_ref: format!("refs/kiln/diffs/{name}/v{n}"), started_by })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1102,18 +1117,32 @@ async fn get(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     let vs = versions(hub, d).await.map_err(fail)?;
     let rs = reviewers(hub, d).await.map_err(fail)?;
     let latest = vs.last().map(|v| v.commit.clone()).unwrap_or_default();
-    let repo = d.repo.clone();
+    let (repo, at) = (d.repo.clone(), latest.clone());
     let runs = hub
         .store
         .call(move |c| {
             let mut st = c.prepare("SELECT r.id, r.number, r.pipeline, r.run_name, r.event, r.status, r.conclusion FROM runs r JOIN repos p ON p.id = r.repo_id WHERE p.name = ?1 AND r.sha = ?2 ORDER BY r.created_at DESC LIMIT 100")?;
-            let rows = st.query_map(params![repo, latest], |r| {
+            let rows = st.query_map(params![repo, at], |r| {
                 Ok(json!({ "id": r.get::<_, String>(0)?, "number": r.get::<_, Option<i64>>(1)?, "workflow": r.get::<_, Option<String>>(2)?, "name": r.get::<_, Option<String>>(3)?, "event": r.get::<_, String>(4)?, "status": r.get::<_, String>(5)?, "conclusion": r.get::<_, Option<String>>(6)? }))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
         .map_err(fail)?;
+    // Each run's `bench-gate` results beside it (W16-R09).
+    let mut gates = super::review::gates_on(hub, &d.repo, vec![latest.clone()]).await.map_err(fail)?.remove(&latest).unwrap_or_default();
+    let runs: Vec<Value> = runs
+        .into_iter()
+        .map(|mut r| {
+            let id = r.get("id").cloned();
+            let (mine, rest): (Vec<Value>, Vec<Value>) = std::mem::take(&mut gates).into_iter().partition(|g| g.get("run") == id.as_ref());
+            gates = rest;
+            if let Some(o) = r.as_object_mut() {
+                o.insert("gates".into(), json!(mine));
+            }
+            r
+        })
+        .collect();
     let commits = match (d.kind.as_str(), vs.last(), home(hub, d).await) {
         ("change_request", Some(l), Ok((_, path))) => json!(super::cr::commits(hub, &path, &l.base, &l.commit).await),
         _ => Value::Null,

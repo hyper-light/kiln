@@ -632,7 +632,7 @@ enum RoutingCmd {
         labels: Vec<String>,
         #[arg(long)]
         repo: Option<String>,
-        /// Constraints of its own (`requires:`), e.g. `"memory >= 16Gi"`.
+        /// Constraints of its own (`requires:`), e.g. `"mem.total >= 16Gi"`.
         #[arg(long = "require")]
         requires: Vec<String>,
     },

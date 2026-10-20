@@ -617,7 +617,8 @@ pub async fn create(hub: &std::sync::Arc<crate::hub::Hub>, s: &Site<'_>, job: &J
         return Ok(invalid(&format!("base: no branch {base}")));
     }
     let Some(head_sha) = rev(format!("refs/heads/{branch}^{{commit}}")).await else { return Ok(invalid(&format!("head: no branch {branch}: push it first"))) };
-    let by = crate::ci::cr::By { pushed_by: format!("job:{}", job.leg), author: (format!("job:{}", job.leg), "agent") };
+    // A job's run shares its trust: nothing more to hold the change request's runs to.
+    let by = crate::ci::cr::By { pushed_by: format!("job:{}", job.leg), author: (format!("job:{}", job.leg), "agent"), started_by: None };
     let options = kiln_ci::review::Options { draft: body.get("draft").and_then(Value::as_bool).unwrap_or(false), title: body.get("title").and_then(Value::as_str).map(str::to_owned), ..kiln_ci::review::Options::default() };
     let made = match crate::ci::cr::submit(hub, &s.repo, &p, &base, &branch, &head_sha, &by, &options).await {
         Ok(o) => o,

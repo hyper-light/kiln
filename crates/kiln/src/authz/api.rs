@@ -93,7 +93,7 @@ async fn put_role(hub: &Hub, caller: &Caller, name: &str, req: Request) -> Resul
         return Err(bad("a role's name is letters, digits, `-` and `_`"));
     }
     let b: RoleBody = body(req).await?;
-    if let Some(unknown) = b.capabilities.iter().find(|c| !CAPABILITIES.contains(&c.as_str())) {
+    if let Some(unknown) = b.capabilities.iter().find(|c| !super::capability(c)) {
         return Err(bad(format!("`{unknown}` is not a capability")));
     }
     let (n, caps) = (name.to_owned(), serde_json::to_string(&b.capabilities).unwrap_or_default());

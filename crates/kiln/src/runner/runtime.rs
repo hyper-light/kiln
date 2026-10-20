@@ -675,14 +675,14 @@ fn script_file(shell: Option<&str>, body: &str) -> (&'static str, String) {
 }
 
 /// What decides whether two benchmark runs compare (W16-R07): this machine's OS and architecture,
-/// CPU model and kernel, and the executor.
+/// CPU model and kernel, and the executor. The CPU and kernel are the runner's facts' (`sysinfo`'s),
+/// so a Mac's, a Windows machine's and an Arm board's are told apart too.
 fn fingerprint(executor: &str) -> String {
     static MACHINE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let cpu = std::fs::read_to_string("/proc/cpuinfo")
-            .ok()
-            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("model name").and_then(|r| r.split_once(':')).map(|(_, m)| m.trim().to_owned())))
-            .unwrap_or_default();
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").map(|k| k.trim().to_owned()).unwrap_or_default();
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+        let cpu = sys.cpus().first().map(|c| c.brand().trim().to_owned()).unwrap_or_default();
+        let kernel = sysinfo::System::kernel_version().map(|k| k.trim().to_owned()).unwrap_or_default();
         [format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH), cpu, kernel].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
     });
     format!("{} · {}", *MACHINE, if executor.is_empty() { "host" } else { executor })
@@ -4515,5 +4515,24 @@ jobs:
         let line = release_line(7, &json!({ "app": "web", "environment": "staging", "state": "delivering", "sync": "Synced", "health": "Healthy", "phase": "Succeeded", "message": "synced and healthy; settling for 30s" }));
         assert_eq!(line, "release 7 of web to staging: delivering [sync Synced, health Healthy, operation Succeeded] (synced and healthy; settling for 30s)");
         assert_eq!(release_line(7, &json!({ "app": "web", "environment": "staging", "state": "waiting" })), "release 7 of web to staging: waiting");
+    }
+
+    /// W16-R07: a benchmark's fingerprint names the machine as its facts do, on any platform: its
+    /// OS and architecture, CPU model and kernel, then the executor.
+    #[test]
+    fn w16_r07_fingerprint_names_the_machine() {
+        let f = fingerprint("docker");
+        let parts: Vec<&str> = f.split(" · ").collect();
+        assert_eq!(parts.first().copied(), Some(format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH).as_str()), "{f}");
+        assert_eq!(parts.last().copied(), Some("docker"), "{f}");
+        assert!(fingerprint("").ends_with(" · host"), "{f}");
+        if let Some(k) = sysinfo::System::kernel_version().filter(|k| !k.trim().is_empty()) {
+            assert!(parts.contains(&k.trim()), "the kernel, {k}: {f}");
+        }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+        if let Some(cpu) = sys.cpus().first().map(|c| c.brand().trim().to_owned()).filter(|c| !c.is_empty()) {
+            assert!(parts.contains(&cpu.as_str()), "the CPU, {cpu}: {f}");
+        }
     }
 }

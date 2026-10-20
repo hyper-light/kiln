@@ -247,7 +247,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             let ask: Value = srv::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             let git_ref = ask.get("ref").and_then(Value::as_str).unwrap_or_default().to_owned();
             let inputs = ask.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-            match super::events::workflow_dispatch(hub, &r, &git_ref, which, &inputs, "github-actions[bot]").await {
+            // A job's run shares its trust: nothing more to hold it to.
+            match super::events::workflow_dispatch(hub, &r, &git_ref, which, &inputs, "github-actions[bot]", None).await {
                 Ok(()) => Ok(srv::status(StatusCode::NO_CONTENT)),
                 Err(e) => Ok(message(e.status, &e.message)),
             }
@@ -257,7 +258,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             let ask: Value = srv::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             let event_type = ask.get("event_type").and_then(Value::as_str).unwrap_or_default().to_owned();
             let payload = ask.get("client_payload").cloned().unwrap_or(Value::Null);
-            match super::events::repository_dispatch(hub, &r, &event_type, &payload, "github-actions[bot]").await {
+            match super::events::repository_dispatch(hub, &r, &event_type, &payload, "github-actions[bot]", None).await {
                 Ok(_) => Ok(srv::status(StatusCode::NO_CONTENT)),
                 Err(e) => Ok(message(e.status, &e.message)),
             }

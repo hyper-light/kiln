@@ -563,6 +563,36 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
         None => None,
     };
+    // Who pushes to each branch and tag (W10-R02's `secrets.use`), kept before git takes it: the
+    // poller makes the push's events, and their runs are given only the secrets the pusher may
+    // use. A push kiln can't keep this for is refused.
+    let started_by = match &who {
+        Pusher::Caller(c) => c.started_by(),
+        Pusher::Job(_) => None,
+    };
+    let moved: Vec<(String, String)> = updates.iter().filter(|u| u.name.starts_with("refs/heads/") || u.name.starts_with("refs/tags/")).map(|u| (u.name.clone(), u.new.clone())).collect();
+    if !moved.is_empty() {
+        let (id, by) = (repo.id.clone(), started_by.as_ref().map(serde_json::Value::to_string));
+        hub.store
+            .call(move |c| {
+                let now = crate::util::now_unix();
+                let tx = c.transaction()?;
+                for (r, sha) in moved {
+                    tx.execute("DELETE FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2", rusqlite::params![id, r])?;
+                    // Whoever may use every secret leaves nothing to hold its runs to.
+                    if let Some(b) = &by
+                        && sha != ZERO
+                    {
+                        tx.execute("INSERT OR REPLACE INTO ci_pushes (repo_id, ref, sha, started_by, ts) VALUES (?1, ?2, ?3, ?4, ?5)", rusqlite::params![id, r, sha, b, now])?;
+                    }
+                }
+                tx.execute("DELETE FROM ci_pushes WHERE ts < ?1", [now - 30 * 86_400])?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("who pushed couldn't be kept, so the push isn't taken: {e:#}")))?;
+    }
     // git takes the push; its answer (a report, and its progress) is read before it's passed on,
     // so kiln can say what the push made.
     let mut configs: Vec<&str> = cgi.configs.to_vec();
@@ -616,12 +646,12 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
                 // A change request (W14-R04): the branch is the commit pushed, then reviewed whole.
                 Some((trunk, branch)) => match crate::gitops::run_git(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), &target.new], crate::gitops::LS_REMOTE_TIMEOUT).await {
                     Ok(_) => {
-                        let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
+                        let by = super::cr::By { pushed_by: user.clone(), author: author.clone(), started_by: started_by.clone() };
                         super::cr::submit(hub, repo, &p, trunk, branch, &target.new, &by, &options).await.map(|o| vec![o])
                     }
                     Err(e) => Err(format!("the branch {branch}: {e:#}")),
                 },
-                None => super::diffs::submit(hub, super::diffs::Submission { repo, path: &p, trunk: spec, sha: &target.new, pushed_by: &user, author: author.clone(), options }).await,
+                None => super::diffs::submit(hub, super::diffs::Submission { repo, path: &p, trunk: spec, sha: &target.new, pushed_by: &user, started_by: started_by.clone(), author: author.clone(), options }).await,
             };
             match result {
                 Ok(outcomes) => {
@@ -656,7 +686,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         .filter(|(b, _)| !trunk_list.iter().any(|t| t == b))
         .collect();
     if !branches.is_empty() {
-        let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
+        let by = super::cr::By { pushed_by: user.clone(), author: author.clone(), started_by: started_by.clone() };
         said.extend(super::cr::pushed(hub, repo, &p, &branches, &by).await);
     }
     // A trunk written directly goes to the mirror too.

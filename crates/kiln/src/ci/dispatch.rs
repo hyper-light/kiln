@@ -1180,8 +1180,9 @@ impl Dispatch {
                 PlanAction::Finish(c) => {
                     self.save_removed(run).await?;
                     runs::finish_run(&self.hub, run, status_of(c), c.result(), None).await?;
-                    // W19-R06: who wants to hear of it.
+                    // W19-R06: who wants to hear of it; R02: its trace.
                     crate::rt::spawn(super::notify::run_finished(Arc::clone(&self.hub), run.to_owned()));
+                    crate::rt::spawn(super::otel::run_finished(Arc::clone(&self.hub), run.to_owned()));
                     let cmds = self.sched.handle(Input::RunFinished { run: run.to_owned() }, now_ms());
                     if let Some(r) = self.runs.remove(run) {
                         self.workflow_run(&r, "completed", Some(c.result()));
@@ -1584,7 +1585,8 @@ impl Dispatch {
             None => job_token,
         };
         let (secrets, used_ids, vars, unmade) = self.leg_secrets(l, r, &job_token).await;
-        // Brokered secrets that couldn't be made (W09-R08): the leg goes on without them, told why.
+        // Brokered secrets that couldn't be made (W09-R08) and secrets withheld from whoever
+        // started the run (W10-R02): the leg goes on without them, told why.
         for why in &unmade {
             runs::annotation(&self.hub, leg, None, "warning", Some("secrets".into()), why, None, None, None, None, None).await?;
         }
@@ -1701,7 +1703,7 @@ impl Dispatch {
         }
         let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
         // An untrusted run gets none of the server's secrets: only those given with it (W17-R06).
-        let resolved = if !r.trusted {
+        let mut resolved = if !r.trusted {
             Default::default()
         } else {
             let text = |k: &str| r.github.get(k).and_then(serde_json::Value::as_str);
@@ -1720,6 +1722,19 @@ impl Dispatch {
                 }
             }
         };
+        // W10-R02's `secrets.use`: of the rest, only what whoever started the run may use here (its
+        // environment, else its workflow), the others withheld and said so.
+        if let Some(by) = &r.event.started_by {
+            let target = match &env {
+                Some(e) => crate::authz::Scope::Environment { repo: r.repo.name.clone(), environment: e.clone() },
+                None => crate::authz::Scope::Workflow { repo: r.repo.name.clone(), path: r.path.clone() },
+            };
+            let who = by.get("name").and_then(serde_json::Value::as_str).unwrap_or("whoever started the run").to_owned();
+            for name in crate::authz::gate::withheld_secrets(&self.hub, by, resolved.keys().cloned().collect(), &target).await {
+                resolved.remove(&name);
+                unmade.push(format!("secret {name} withheld: {who} may not use it here (`secrets.use:{name}`)"));
+            }
+        }
         let mut run: std::collections::BTreeMap<String, String> = resolved.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect();
         run.extend(r.given.secrets.iter().map(|(k, v)| (k.clone(), v.clone())));
         run.insert("GITHUB_TOKEN".into(), token.to_owned());

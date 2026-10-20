@@ -249,7 +249,7 @@ impl GitHost {
                 let path = crate::ci::hosting::native_path(hub, repo).ok_or_else(|| anyhow::anyhow!("{} isn't hosted here", repo.name))?;
                 let p = path.to_string_lossy().into_owned();
                 let sha = crate::gitops::run_git(hub, &["-C", &p, "rev-parse", "--verify", &format!("refs/heads/{head}^{{commit}}")], crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned())?;
-                let by = crate::ci::cr::By { pushed_by: "kiln".into(), author: ("kiln".into(), "agent") };
+                let by = crate::ci::cr::By { pushed_by: "kiln".into(), author: ("kiln".into(), "agent"), started_by: None };
                 let options = kiln_ci::review::Options { title: Some(title.to_owned()), message: (!body.is_empty()).then(|| body.to_owned()), ..kiln_ci::review::Options::default() };
                 let o = crate::ci::cr::submit(hub, repo, &p, base, head, &sha, &by, &options).await.map_err(anyhow::Error::msg)?;
                 Ok(ChangeRef { number: u64::from(o.number), url: o.url })

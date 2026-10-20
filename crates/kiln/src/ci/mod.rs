@@ -32,6 +32,7 @@ pub mod logsearch;
 pub mod notify;
 pub mod oidc;
 pub mod ops;
+pub mod otel;
 pub mod preview;
 pub mod providers;
 pub mod registry;

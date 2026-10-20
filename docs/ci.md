@@ -180,19 +180,19 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins, musl Node left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; S3, BuildKit, speed left |
-| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); the other stores, UI left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use`, row-level lists for scoped callers, passkeys and the Settings pages left |
+| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); the other stores left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and the Settings pages left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); microVM and k8s executors and pool kinds, the Pools page, UI-made image definitions left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); the rest of the REST left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); previews, pages and board left (with CD) |
-| W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; the tests page, trends and AC05 left |
+| W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check for CD (R04's kiln half), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, R04's CD half, AC04, microVM containment (W13) left |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, issue-tracker channels and a person's own subscriptions left |
-| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; `kiln-ci-diagnose`; users' tokens over MCP; generated routes and CLI, skills, attachments, experiments left |
-| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); issue-tracker channels left |
+| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; generated routes and CLI, attachments, experiments left |
+| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI and → You; comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
@@ -2807,9 +2807,9 @@ and masking), names to the editor's completion (W21; names only).
   (`w09_ac07_environment_secrets_after_approval`): while the leg waited for its reviewer, the
   environment's secret was never used. Once approved, the leg read it and the use was
   recorded.
+- *Done.* The UI: Settings → CI's secrets and variables, by scope (W21-R11).
 - *Left.*
   - R08's other stores: Vault, Infisical, Doppler, 1Password (their integration kinds first).
-  - The UI (W21).
   - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
 
 ### W10 Identity: tokens, principals, OIDC issuer
@@ -2997,6 +2997,33 @@ elsewhere (G-24, G-33).
   - Verified end to end: a leg's token said `repo:acme/e2e:ref:refs/heads/main:kiln_trust:trusted`
     under the organization's keys, and GitHub's default again once the repository chose
     `use_default`. The facade answered both in GitHub's shape.
+- *Done.* Run lists narrowed row by row: `/api/runs` and `/api/ci/runs` (and `ci.runs.list`) list
+  the runs of the repositories the caller may read, `?repo=` narrowing that further; a person
+  of one repository lists without saying which and gets its runs alone, and asking for another
+  gets none (`w10_run_lists_narrowed_to_what_the_caller_reads`). The event stream too: such a
+  person hears events about those repositories (a run's, a job's run's, any that names one) and
+  their own inbox's, the rest being the server's, so the UI's live updates work for them. And the
+  overview (`/api/overview`, the home page): theirs is those repositories' runs, jobs and queue,
+  with none of the server's (its runners, processes, samples and host name), and the home page
+  shows it so, without the fleet and the server.
+- *Done.* `secrets.use:<NAME>`: a run's legs are given only the secrets whoever started it may
+  use, in the leg's environment (else its workflow).
+  - A grant names one secret (`secrets.use:DEPLOY_KEY@repo:acme/app`, names compared as kiln keeps
+    them), or any (`secrets.use`, `secrets.use:*`); custom roles take them too. `developer` and
+    up use any, so a deny takes one away (`!secrets.use:DEPLOY_KEY@repo:acme/app`), and an agent
+    does what its grant and its person's both allow.
+  - Who started a run: the pusher of a kiln-hosted repository's branch or tag (kept as the push
+    is taken, before git has it; a push kiln can't keep this for is refused), a diff's or change
+    request's submitter (its versions keep it; a restack keeps the version before's), whoever
+    landed a land queue entry (a batch: each of them), and the caller of a dispatch or an
+    `agent` event; a rerun is held to its run's, as GitHub's keep its actor's. Their grants are
+    read as each leg starts (a user gone or disabled: none), a token's own as the run started (an
+    agent's is rotated while it waits).
+  - What the repository starts itself (schedules, another run, `pull_request_target`, a comment's
+    `issue_comment`, a host's events) and a job's runs answer to its configuration, as do the
+    owner's.
+  - A secret withheld is left out, as an untrusted run's are, and the leg says which and why
+    (`w10_r02_secrets_use_by_name`, `w10_secrets_use_holds_a_run_to_whoever_started_it`).
 - *Done.* R11, kiln as a workload: the server's own tokens (`kiln:<server-id>:service:<name>`,
   the id kept with its data, `kiln_service` naming the service: `ci::oidc::service_token`, for
   W11's broker) and an agent's (`kiln:agent:<session>`, `kiln_on_behalf_of` the person who
@@ -3007,9 +3034,6 @@ elsewhere (G-24, G-33).
 - *Left.*
   - Passwords and passkeys per user (users sign in with links), and the Settings pages for
     people and tokens (W21).
-  - Lists narrowed row by row for repository-scoped callers: `/api/runs` and `/api/ci/runs` ask
-    them for `?repo=`, and the event stream and overview need the server scope.
-  - `secrets.use:<name>`.
   - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
     issuer paths, and the Settings → OIDC page (W21).
   - AC01, AC02, AC04's cloud cases (AWS, Google Cloud, Azure: test tenants, user-assisted).
@@ -3129,6 +3153,8 @@ auth`, W11-R03, R04). Done on this side: R03, R04.
 - *Done.* R06's channels are W19-R06's (see its notes): Slack, Discord, Teams, Telegram,
   PagerDuty, Opsgenie, signed webhooks and email (`email`, by SMTP). AC04 with local fakes is
   W19-AC05's test (`w19_ac05_notifications`).
+- *Done.* R09's OpenTelemetry half is W19-R02's (see its notes): the `otel` kind, an OTLP/HTTP
+  receiver every finished run's trace goes to.
 
 ### W12 Registries
 
@@ -4325,10 +4351,23 @@ annotations), R04 to R09; AC01 to AC04.
   - Checked end to end (`w16_r01_discovered_test_reports`): a step wrote nextest's report and
     exited 1. The run failed, and its tests were the report's `adds` (passed) and `divides`
     (failed), without the fixture report the checkout brought.
-- *Left*:
-  - the repository's tests page and metric trend charts;
-  - the gate's result on diffs and the land queue (W14);
-  - AC05, kiln's own `bench.yaml` on an exclusive runner.
+- *Done.* R03's tests page per repository and R07's trends, on Insights:
+  - A repository's Insights page has a Tests panel: its default branch's tests over the window,
+    the most failing, the slowest or the flaky first, each with its runs, failures (and their
+    share), p50 and p90, and its flaky mark with why.
+  - Its Benchmarks panel lists the metrics the default branch recorded. Each opens the metric's
+    page: one chart per kind of runner (fingerprint), the latest first, each spanning the window,
+    its values in the unit that suits them (criterion's nanoseconds as µs or ms), with a table of
+    its points (when, the commit and its run, the value). The run page's Benchmarks panel links
+    each metric to its trend.
+  - Fingerprints name the CPU model and kernel on every platform, as the runner's facts do
+    (`sysinfo`). They were read from `/proc`, so a Mac's, a Windows machine's and an Arm board's
+    were `os/arch · executor` alone, and different machines' points shared a baseline.
+- *Done.* R09's result on the diff and in the land queue: a diff's runs carry their jobs'
+  `bench-gate` verdicts (failing or warning, from each leg's latest attempt), shown beside its
+  checks; a land queue entry carries its candidate's, and an entry ejected by a failing gate says
+  which metrics got worse (`w16_r09_bench_gate_on_the_diff_and_the_land_queue`).
+- *Left*: AC05, kiln's own `bench.yaml` on an exclusive runner.
 
 ### W17 Debugging
 
@@ -4710,8 +4749,8 @@ rule-based notifications (G-30, G-31).
   Discord, email and webhook channels deliver (local fakes, then real ones). *Integration test.*
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
-**Progress.** In progress: R02 (OpenTelemetry export waits for W11-R09) and R06 (with W11-R06's
-channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
+**Progress.** In progress: R06 (issue trackers). Done: R01, R02,
+R03, R04, R05, R07, AC01, AC02, AC03, AC04, AC05 and AC06.
 
 - *R05* (`crates/kiln/src/audit.rs`, migration `20261018-2200_w19_audit2.sql`):
   - **One row per change.** Every request that changes something writes exactly one `audit2`
@@ -4972,8 +5011,34 @@ channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
     `mention` in dev's, and dev's answer in the thread put `comment.reply` in rev's (nobody
     heard of what they did themselves); rev read them all; each of the four reached an SMTP
     server, from kiln to the rule's address; every delivery was recorded as sent.
-- *Left*: R02's OpenTelemetry export (with W11-R09); issue trackers as channels (W11-R07); a
-  person's own subscriptions.
+- *Done.* R02's OpenTelemetry export (`crates/kiln/src/ci/otel.rs`, W11-R09's `otel`
+  integration kind: an OTLP/HTTP receiver's `endpoint`, a `service_name`, and a header such as
+  an API key as its secret):
+  - Each finished run is a trace, sent to every `otel` integration its repository may use as
+    OTLP's JSON (`<endpoint>/v1/traces`): the run the root span, each leg of its latest attempt a
+    span under it, each step that ran a span under its leg. Ids come from the run and attempt,
+    so a rerun is a trace of its own.
+  - Attributes follow OpenTelemetry's CI/CD and VCS conventions (`cicd.pipeline.name`,
+    `.run.id`, `.run.url.full`, `.result`; `cicd.pipeline.task.*`, `cicd.worker.name`;
+    `vcs.repository.*`, `vcs.ref.head.*`), with kiln's (`kiln.event`, `kiln.actor`,
+    `kiln.queued_seconds`, `kiln.executor`, …). A failure's span is an error.
+  - It reaches only where requests someone named may go (W22-AC07): a receiver on a private
+    network needs `[ci] allow_private_targets`. Verify sends an empty export; each export
+    records the integration's last use and error (`w19_r02_a_run_as_a_trace`).
+- *Done.* R06's per-user subscriptions: a person's own rules, beside the trunk's and the
+  server's (`GET` and `PUT /api/me/notifications`, `{ rules, email }`; Settings → You → CI
+  notifications):
+  - A rule is `.kiln/notify.yaml`'s (`on`, `where`, `throttle`) for repository events, sent to
+    their `inbox` or their `email` (the address they keep there), for every repository they may
+    read or those `repos` names (globs), and with `about_me` only what's about them: runs they
+    started, reviews asked of them, replies to and mentions of them.
+  - It takes nothing of repositories they can't read (their grants as each event comes). The
+    owner's rules are the server's (`[[ci.notify]]`), and an agent doesn't change its person's.
+  - A run is about whoever in kiln started it (W10's `started_by`, an agent's person), so the
+    trunk's `inbox` rules reach them too; without one, its actor.
+  - Checked end to end (`w19_r06_a_persons_own_rules`): dev's failing run reached dev's inbox and
+    email, the owner's didn't; a channel that isn't a person's and an agent's change were refused.
+- *Left*: issue trackers as channels (W11-R07).
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 
@@ -5101,7 +5166,7 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
   variants measured by a pipeline on routed runners and a recommendation with intervals. *E2E.*
 
 **Progress.** In progress: R01's registry with CI's first operations, R02's `kiln.ci.*` for them,
-R04, R05's `kiln-ci-diagnose`, and R06's rights.
+R04, R05's skills, and R06's rights.
 
 - *R01* (`crate::ops`, `crates/kiln/src/ci/ops.rs`): deployments' and CI's operations are one
   list, and the MCP tools and code mode's `kiln.*` are generated from it. Each CI operation is
@@ -5135,6 +5200,38 @@ R04, R05's `kiln-ci-diagnose`, and R06's rights.
   - classifying the failure;
   - keeping a failed leg, running commands in it, and rerunning the step in place;
   - fixing rather than rerunning.
+
+  And the other six (`crates/kiln/assets/skills/`), each with code-mode programs on the
+  operations above:
+  - `kiln-ci-author`: where workflows live and which dialect runs, kiln's keys, expressions, and
+    the validate → preview → propose → watch loop as one program;
+  - `kiln-ci-runners`: a leg's routing explained, where a job would go, the facts constraints
+    read (by their names), routing rules, executors and pools, images validated and proposed;
+  - `kiln-ci-review`: submitting by push and by patch, readiness, answering threads, reviewing
+    with suggestions, strategies and the land queue;
+  - `kiln-ci-migrate`: the five steps, and GitHub Actions, GitLab CI/CD, Bitbucket Pipelines,
+    Jenkins and CircleCI mapped to kiln;
+  - `kiln-ci-secrets`: scopes, how a leg gets secrets (and `secrets.use`), integrations, OIDC trust
+    for AWS, Google Cloud, Azure and Vault;
+  - `kiln-ci-performance`: the critical path, waits by reason, caches, timing shards and reuse,
+    measured before and after.
+
+  Writing them found `ci.insights.workflows` without the workflow its route needs: it takes
+  `workflow` now.
+- *AC05* (`tests/skills.rs`): the skills' programs run as written. The test takes each program
+  from its `SKILL.md` and calls `code_run` with it over MCP, against a server with a repository,
+  a failing run, a leg no runner can take, a diff and a secret:
+  - diagnose's failure bundle names the failing step and its error;
+  - author's loop checks a fixed workflow, previews its legs and proposes it as a diff;
+  - runners explains the waiting leg (the runner, and the label it lacks) and says where a job
+    would go;
+  - review reads the diff's readiness and its open threads;
+  - secrets lists names and last use, never a value;
+  - performance finds the critical path and the slowest test.
+
+  The migrate skill's mappings are prose and YAML, with no program to run. Running the programs
+  found that a finished leg's routing is history (`known: false`), so the runners skill
+  explains a waiting leg and says where a finished one ran.
 - *R06*: `/api/mcp` takes users' sessions and tokens too, and checks each operation as its HTTP
   route is checked. The admin token, the owner's session and kiln's MCP tokens act as the owner,
   as before. Calls no longer need deployments to be on.
@@ -5147,7 +5244,7 @@ R04, R05's `kiln-ci-diagnose`, and R06's rights.
   - R02's `images.build` (with W13-R11's API);
   - generating the HTTP routes, the OpenAPI document and the CLI from the registry;
   - R03's diagnostics and preview on writes;
-  - the other skills, R07 to R11, and AC01 to AC06.
+  - R07 to R11, AC01 to AC04, and AC06.
 
 ### W21 UI
 
@@ -5277,7 +5374,10 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   "Workflow insights" and a runner's details):
   - the overview: repositories (runs, success, p50 and p90, runner time, share against fair
     share) and runners (utilization, busy time, legs, failure classes, cost);
-  - a repository's workflows, with each one's median-duration trend;
+  - a repository's workflows, with each one's median-duration trend, its tests (the most
+    failing, slowest or flaky) and its benchmarks (W16);
+  - a metric: its trend on each kind of runner, a chart each (one hue, so no two series share a
+    chart), with its points as a table (W16-AC05);
   - a workflow:
     - its numbers, and the latest run's critical path;
     - duration (p50 and p90), success, and waiting charts;
@@ -5303,13 +5403,41 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   - Copy and Download until saving to the repository arrives (W14).
 - Checked in Chromium and WebKit (WebKit through Playwright's own image) at 1440×900 and 390×844:
   no horizontal scrolling, nothing fixed but the shell's, no page errors.
+- *Done.* R11, Settings → CI (`ui/src/views/settings-ci.tsx`, `settings-routing.tsx`,
+  `settings-actions.tsx`, `settings-oidc.tsx`), beside Deployments' registries and accounts (the
+  integrations' catalog, each kind's setup in the page with Verify):
+  - secrets and variables: a scope chosen first (the server, an organization, a repository, or a
+    workflow's or environment's written out), then its secrets (names, when set and last used, a
+    brokered one's source; saving one again replaces its value) and its variables;
+  - routing: every rule in the order it applies with where it comes from, the server's edited as
+    an ordered list (earlier, later, remove, add), and a tester that explains a sample leg
+    against the rules and the runners connected now;
+  - actions: the server's policy as configured, and a repository's set here (allow, deny, pinned
+    by SHA) beside its `.kiln/config.yaml`'s; mirroring the prefetched actions;
+  - OIDC: the issuer, whether it's served here, the subject's claims, the keys (signing,
+    published), rotating in 7 days or now, publishing, the key set to download, and each
+    federating integration's last Verify;
+  - notifications: what every rule sent, and why any didn't go; and Settings → You, a person's
+    own rules (W19-R06).
+- *Done.* R05's step timing bar, attempts and outputs, on the leg page:
+  - the bar: each step's share of the leg's time, with 2 px gaps, rounded ends, a reading
+    each, and the fail tone only for a step that failed;
+  - attempts: each attempt's status, failure class, runner, executor, exit code and error, and
+    its times;
+  - outputs: the leg's, by name.
+
+  With Open terminal and Keep (W17) and "Compare with last green" (W19-R03), R05 is done.
+- *Done.* R03's facet box and sort on the runs list: repository, workflow, event, branch and
+  author offered from the runs loaded (each with how many it would show), words typed matching
+  a run's message, commit, branch, workflow or author; and the sort, newest, oldest, longest or
+  shortest first, the server's (`/api/runs?sort=&offset=`), paging through every run. Each is in
+  the URL; one repository chosen is the server's to narrow by too.
 - *Left.*
-  - R03's facet box and sort on the runs list.
-  - R05's step timing bar, attempts with failure classes, outputs, terminal and Keep (W17),
-    "Compare with last green" (W19).
+  - R03's runner and executor facets (a run's legs run on several), and the list windowed to
+    1,000,000 rows (AC04).
   - R06's flow view and matrix editor, saving.
   - R01's hover, schema completion of keys, and the Dockerfile and Agentfile modes.
-  - R07 to R12, and AC01's Playwright scripts in kiln's own CI, AC02 to AC04.
+  - R07 to R10, and AC01's Playwright scripts in kiln's own CI, AC02 to AC04.
 
 ### W22 Conformance, end-to-end and performance testing
 
@@ -6180,7 +6308,7 @@ when the provider module is built; `verified <date>` is set by W11-AC03 once a r
 | Microsoft Teams, Telegram, email (SMTP), PagerDuty, Opsgenie | notifications | token or webhook | as each needs | verify |
 | Datadog | observability | oidc-chain through AWS (Datadog's federation accepts AWS identities only), or API and app keys | AWS role mapping, or keys | docs |
 | Grafana Cloud | observability | token (access policy tokens) | token | verify |
-| OpenTelemetry collectors | observability | none or token | OTLP endpoint | — |
+| OpenTelemetry collectors | observability | none or token | OTLP endpoint | verify |
 | Wiz | security | app (service-account client credentials); no OIDC found | client id + secret | verify |
 | Snyk | security | token or service account; no OIDC found | token | verify |
 | Vercel | hosting | token (Vercel's OIDC is outbound only: it issues tokens for its own deployments) | token | docs |

@@ -326,6 +326,35 @@ pub async fn checks_on(hub: &Hub, repo: &str, sha: &str) -> anyhow::Result<BTree
         .await
 }
 
+/// The `bench-gate` results on commits of a repository (W16-R09), by commit: what each leg's
+/// latest attempt was told, failing (`error`) or warning, with its run and job. Shown on the diff
+/// and in the land queue.
+pub async fn gates_on(hub: &Hub, repo: &str, shas: Vec<String>) -> anyhow::Result<HashMap<String, Vec<Value>>> {
+    if shas.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (repo, shas) = (repo.to_owned(), serde_json::to_string(&shas)?);
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.sha, r.id, j.id, COALESCE(j.job_id, j.key), a.level, a.message FROM runs r JOIN repos p ON p.id = r.repo_id JOIN jobs j ON j.run_id = r.id JOIN ci_annotations a ON a.leg_id = j.id
+                 WHERE (p.name = ?1 OR p.id = ?1) AND r.sha IN (SELECT value FROM json_each(?2)) AND a.title = 'bench-gate'
+                   AND j.run_attempt = (SELECT MAX(k.run_attempt) FROM jobs k WHERE k.run_id = j.run_id AND k.key = j.key)
+                 ORDER BY a.id",
+            )?;
+            let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+            let rows = st.query_map(params![repo, shas], |r| {
+                Ok((r.get::<_, String>(0)?, json!({ "run": r.get::<_, String>(1)?, "leg": r.get::<_, String>(2)?, "job": r.get::<_, String>(3)?, "level": r.get::<_, String>(4)?, "message": r.get::<_, String>(5)? })))
+            })?;
+            for row in rows {
+                let (sha, g) = row?;
+                out.entry(sha).or_default().push(g);
+            }
+            Ok(out)
+        })
+        .await
+}
+
 /// What keeps `d` from landing now, by its trunk's policy: each a sentence.
 pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
@@ -580,7 +609,7 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
             let msg = format!("Apply a suggestion from {suggested_by}\n\nOn {file}, lines {s}-{e}.\n");
             let c = super::diffs::make_commit(hub, &path, &tree, &latest.commit, (&applier, None), &applier, &msg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
             gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &c, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
-            let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)) };
+            let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
             super::cr::submit(hub, &repo, &path, &d.trunk, branch, &c, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version
         }
         // A diff: its commit amended.

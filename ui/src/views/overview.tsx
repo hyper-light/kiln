@@ -28,19 +28,29 @@ export default function Overview() {
 }
 
 function OverviewBody() {
-  warm(overviewRes, recentRunsRes(14), agentsRes, historyRes);
+  warm(overviewRes, recentRunsRes(14));
   const ov = useOverview();
   const d = ov.data;
+  // A person of some repositories sees theirs (W10): their runs and queue, not the server's runners and host.
+  const mine = d.narrowed;
+  if (!mine) warm(agentsRes, historyRes);
   return (
     <>
-      <Intro lead={`kiln v${d.system.version} · up ${formatUptime(d.system.uptime_s)} · generation ${d.system.generation}. Every run, job and agent below updates live.`} title={d.system.hostname} />
+      {mine ? (
+        <Intro
+          title={mine.length === 1 ? mine[0] : "Your repositories"}
+          lead={`Runs and jobs of ${mine.length <= 3 ? mine.join(", ") : `your ${mine.length} repositories`} over the last day, updated live.`}
+        />
+      ) : (
+        <Intro lead={`kiln v${d.system.version} · up ${formatUptime(d.system.uptime_s)} · generation ${d.system.generation}. Every run, job and agent below updates live.`} title={d.system.hostname} />
+      )}
       <Kpis d={d} />
       <div className="mt-8 grid gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
         <Throughput d={d} />
         <RecentRuns />
       </div>
-      <Fleet />
-      <ServerSection d={d} />
+      {!mine && <Fleet />}
+      {!mine && <ServerSection d={d} />}
     </>
   );
 }
@@ -77,12 +87,14 @@ function Kpis({ d }: { d: OverviewData | null }) {
       <Kpi label="Median job" value={stats ? formatDuration(stats.median_job_seconds) : undefined} foot="p50 · last 24h" />
       <Kpi label="Queue depth" value={d?.queue.queued} foot={d ? (d.queue.queued ? "jobs waiting for a slot" : "nothing waiting") : undefined} />
       <Kpi label="Running" value={d?.queue.running} foot={d && stats ? `${stats.jobs_by_status.running ?? d.queue.running} jobs in flight` : undefined} live={Boolean(d?.queue.running)} />
-      <Kpi
-        label="Slots busy"
-        value={d ? `${d.agents.busy}` : undefined}
-        unit={d ? `/ ${d.agents.slots}` : undefined}
-        foot={d ? `${d.agents.connected}/${d.agents.total} runners connected` : undefined}
-      />
+      {d?.agents !== null && (
+        <Kpi
+          label="Slots busy"
+          value={d?.agents ? `${d.agents.busy}` : undefined}
+          unit={d?.agents ? `/ ${d.agents.slots}` : undefined}
+          foot={d?.agents ? `${d.agents.connected}/${d.agents.total} runners connected` : undefined}
+        />
+      )}
     </section>
   );
 }
@@ -99,9 +111,11 @@ function Throughput({ d }: { d: OverviewData | null }) {
       title="Runs per hour"
       description="Succeeded and failed runs, hourly; average run time on the right axis."
       actions={
-        <Link to="/telemetry" className="icon-btn" aria-label="Open metrics">
-          <ArrowUpRight size={16} />
-        </Link>
+        !d?.narrowed && (
+          <Link to="/telemetry" className="icon-btn" aria-label="Open metrics">
+            <ArrowUpRight size={16} />
+          </Link>
+        )
       }
     >
       {d ? (

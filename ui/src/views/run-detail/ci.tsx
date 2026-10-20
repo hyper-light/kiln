@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
-import { formatBytes } from "@/lib/format";
+import { formatBytes, formatDuration } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -237,7 +237,7 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
   return (
     <div className="mt-6 flex flex-col gap-4">
       {tests.tests.length > 0 && <Tests list={tests.tests} counts={tests.counts} />}
-      {metrics.length > 0 && <Metrics list={metrics} />}
+      {metrics.length > 0 && <Metrics list={metrics} repo={detail.run.repo} />}
       {summaries.length > 0 && (
         <Panel eyebrow={`Summaries · ${summaries.length}`} title="Job summaries">
           <div className="flex flex-col gap-6">
@@ -304,8 +304,9 @@ function metricValue(v: number, unit: string): string {
 const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
 
 /** The run's benchmark metrics (W16-R07, R08): clear changes first, each with its interval
- * against the baseline (the default branch's last runs on the same kind of runner). */
-function Metrics({ list }: { list: CiMetric[] }) {
+ * against the baseline (the default branch's last runs on the same kind of runner), and a link to
+ * its trend. */
+function Metrics({ list, repo }: { list: CiMetric[]; repo: string }) {
   const sorted = [...list].sort((a, b) => (VERDICT_RANK[a.comparison?.verdict ?? ""] ?? 3) - (VERDICT_RANK[b.comparison?.verdict ?? ""] ?? 3) || a.name.localeCompare(b.name));
   const regressed = list.filter((m) => m.comparison?.verdict === "regressed").length;
   const improved = list.filter((m) => m.comparison?.verdict === "improved").length;
@@ -320,7 +321,9 @@ function Metrics({ list }: { list: CiMetric[] }) {
             <li key={i} className="flex flex-col gap-1 px-5 py-2.5">
               <span className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
                 <i className="dot" data-status={status} aria-hidden="true" />
-                <span className="min-w-0 font-mono text-[12px] [overflow-wrap:anywhere] text-[#d4dde8]">{m.name}</span>
+                <Link to={`/insights?repo=${encodeURIComponent(repo)}&metric=${encodeURIComponent(m.name)}`} className="text-link min-w-0 font-mono text-[12px] [overflow-wrap:anywhere]">
+                  {m.name}
+                </Link>
                 <span className="font-mono text-[12px] text-[#a6b2c6] tabular-nums">{metricValue(m.value, m.unit)}</span>
                 <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a]">{m.leg_key}</span>
               </span>
@@ -460,6 +463,47 @@ export function Annotations({ list, title = "Annotations" }: { list: CiAnnotatio
 
 /** A CI leg's own notes on its panel: a kept result, its annotations, and why it waits or where it
  * would run (W21-R05, W05-R20). */
+/** A leg's attempts when it took more than one, or its one ended with a failure class (each
+ * attempt's end, why it failed, and where it ran), and its outputs (W21-R05). */
+function Attempts({ legId }: { legId: string }) {
+  const d = useSuspenseResource(`ci-leg/${legId}/detail`, (s) => ci.legDetail(legId, s)).data;
+  const list = d.attempts ?? [];
+  const outputs = Object.entries(d.outputs ?? {});
+  return (
+    <>
+      {(list.length > 1 || list.some((a) => a.class)) && (
+        <ul className="row-list" aria-label="Attempts">
+          {list.map((a) => {
+            const took = a.started_at && a.finished_at ? formatDuration(a.finished_at - a.started_at) : null;
+            return (
+              <li key={a.number} className="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-5 py-2">
+                <i className="dot" data-status={a.conclusion === "success" ? "succeeded" : a.conclusion ? "failed" : a.status} aria-hidden="true" />
+                <span className="font-mono text-[11px] text-[#d4dde8]">Attempt {a.number}</span>
+                <span className="font-mono text-[11px] text-[#a6b2c6]">{a.conclusion ?? a.status}</span>
+                {a.class && <span className="font-mono text-[10px] tracking-[0.06em] text-[#c9a86a] uppercase">{a.class}</span>}
+                <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a]">
+                  {[a.runner, a.executor, took, a.exit_code !== null && a.exit_code !== 0 ? `exit ${a.exit_code}` : null].filter(Boolean).join(" · ")}
+                </span>
+                {a.error && <span className="w-full font-mono text-[10.5px] [overflow-wrap:anywhere] text-[#d1aaad]">{a.error}</span>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {outputs.length > 0 && (
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 border-t border-[#28313d] px-5 py-3 font-mono text-[11px]" aria-label="Outputs">
+          {outputs.map(([k, v]) => (
+            <React.Fragment key={k}>
+              <dt className="text-[#93a1b4]">{k}</dt>
+              <dd className="[overflow-wrap:anywhere] text-[#d4dde8]">{v}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+      )}
+    </>
+  );
+}
+
 export function CiLegExtras({
   runId,
   attempt,
@@ -497,6 +541,9 @@ export function CiLegExtras({
           </Link>
         </p>
       )}
+      <React.Suspense fallback={null}>
+        <Attempts legId={legId} />
+      </React.Suspense>
       {status === "queued" && (
         <React.Suspense fallback={<p className="px-5 py-3 font-mono text-[11px] text-[#7f8a9a]">Asking the scheduler why it waits…</p>}>
           <WhyWaiting legId={legId} />

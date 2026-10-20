@@ -143,13 +143,13 @@ struct DispatchAsk {
 
 /// `POST /api/ci/repos/:repo/workflows/<path>/dispatches { ref, inputs }` (W03-R11): GitHub's
 /// `workflow_dispatch`. 204 when the run starts.
-pub async fn dispatch(hub: &Hub, repo: &str, path: &str, body: Incoming) -> Result<Response, Fail> {
+pub async fn dispatch(hub: &Hub, repo: &str, path: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let v: serde_json::Value = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
-    dispatch_value(hub, repo, path, v).await
+    dispatch_value(hub, repo, path, v, started_by).await
 }
 
 /// [`dispatch`], its body read already.
-pub async fn dispatch_value(hub: &Hub, repo: &str, path: &str, body: serde_json::Value) -> Result<Response, Fail> {
+pub async fn dispatch_value(hub: &Hub, repo: &str, path: &str, body: serde_json::Value, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: DispatchAsk = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
     // A repository whose CI is another provider's (W23-R01): that provider starts it.
@@ -158,7 +158,7 @@ pub async fn dispatch_value(hub: &Hub, repo: &str, path: &str, body: serde_json:
         started?;
         return Ok(srv::status(StatusCode::NO_CONTENT));
     }
-    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln").await.map_err(|r| (r.status, r.message))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -171,10 +171,10 @@ struct RepoDispatchAsk {
 
 /// `POST /api/ci/repos/:repo/dispatches { event_type, client_payload }` (W03-R11): GitHub's
 /// `repository_dispatch`. 204, as GitHub answers, whether or not a workflow listens.
-pub async fn repository_dispatch(hub: &Hub, repo: &str, body: Incoming) -> Result<Response, Fail> {
+pub async fn repository_dispatch(hub: &Hub, repo: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: RepoDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
-    super::events::repository_dispatch(hub, &repo, &ask.event_type, &ask.client_payload, "kiln").await.map_err(|r| (r.status, r.message))?;
+    super::events::repository_dispatch(hub, &repo, &ask.event_type, &ask.client_payload, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -190,7 +190,7 @@ struct NamedDispatchAsk {
 /// `POST /api/ci/repos/:repo/dispatch { workflow, ref, inputs }` (§4.1's form of the same).
 /// `POST /api/ci/repos/:repo/agent` `{ workflow, ref, inputs }`: kiln's `agent` event (W03-R09),
 /// `agent` (the caller) asking for the run.
-pub async fn agent_run(hub: &Hub, repo: &str, agent: &str, body: Incoming) -> Result<Response, Fail> {
+pub async fn agent_run(hub: &Hub, repo: &str, agent: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     #[derive(serde::Deserialize)]
     struct AgentAsk {
         workflow: String,
@@ -202,13 +202,13 @@ pub async fn agent_run(hub: &Hub, repo: &str, agent: &str, body: Incoming) -> Re
     let repo = find_repo(hub, repo).await?;
     let ask: AgentAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
     let git_ref = if ask.git_ref.is_empty() { super::events::facts(hub, &repo).await.default_branch } else { ask.git_ref.clone() };
-    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, agent).await.map_err(|r| (r.status, r.message))?;
+    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, agent, started_by).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
-pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming) -> Result<Response, Fail> {
+pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: NamedDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
-    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, "kiln").await.map_err(|r| (r.status, r.message))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }

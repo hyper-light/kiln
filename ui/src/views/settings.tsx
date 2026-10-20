@@ -21,6 +21,11 @@ import { invalidate } from "@/lib/resource";
 import { UpdatesHold, UpdatesPanel, UpdatesStatus } from "@/views/settings-updates";
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
+import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
+import { CiSecretsGroups, CiSecretsHold } from "@/views/settings-ci";
+import { RoutingGroups, RoutingHold } from "@/views/settings-routing";
+import { OidcGroups, OidcHold } from "@/views/settings-oidc";
+import { ActionsGroup, ActionsHold } from "@/views/settings-actions";
 import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
 
 const methodsRes: Res<{ password: boolean; token: boolean }> = {
@@ -29,7 +34,10 @@ const methodsRes: Res<{ password: boolean; token: boolean }> = {
 };
 
 export default function Settings() {
-  warm(updatesRes, methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes);
+  warm(updatesRes, methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes, myNotificationsRes);
+  // CI's groups for those who can use them (W10-R02): the owner sees every one.
+  const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
+  const may = (c: string, server = true) => !can || can[c] === "server" || (!server && can[c] === "some");
   const [query, setQuery] = React.useState("");
   // At /settings#<section or group>, arriving or following a link here: that one opens.
   const { hash } = useLocation();
@@ -75,6 +83,38 @@ export default function Settings() {
             <PasswordGroup />
           </Loadable>
           <SessionGroup />
+        </SettingsSection>
+        {(may("secrets.manage", false) || may("variables.manage", false) || may("routing.manage") || may("settings.manage")) && (
+          <SettingsSection id="ci" index={6} title="CI" about="The secrets and variables runs read, where legs run, the actions they may use, and the identity jobs prove" words="ci secrets variables routing actions oidc">
+            {(may("secrets.manage", false) || may("variables.manage", false)) && (
+              <Loadable label="the scopes" fallback={<CiSecretsHold />}>
+                <CiSecretsGroups />
+              </Loadable>
+            )}
+            {may("routing.manage") && (
+              <Loadable label="the routing rules" fallback={<RoutingHold />}>
+                <RoutingGroups />
+              </Loadable>
+            )}
+            {may("settings.manage") && (
+              <>
+                <Loadable label="the actions policy" fallback={<ActionsHold />}>
+                  <ActionsGroup />
+                </Loadable>
+                <Loadable label="the issuer" fallback={<OidcHold />}>
+                  <OidcGroups />
+                </Loadable>
+                <Loadable label="the deliveries" fallback={<DeliveriesHold />}>
+                  <DeliveriesGroup />
+                </Loadable>
+              </>
+            )}
+          </SettingsSection>
+        )}
+        <SettingsSection id="you" index={7} title="You" about="What kiln tells you of your repositories, wherever you sign in" words="person account">
+          <Loadable label="your notifications" fallback={<MyNotificationsHold />}>
+            <MyNotificationsGroup />
+          </Loadable>
         </SettingsSection>
       </SettingsSections>
     </div>

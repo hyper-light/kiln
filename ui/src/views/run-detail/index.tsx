@@ -12,6 +12,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, EmptyState, ErrorState, Facts, Panel } from "@/components/ui/misc";
 import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { Tip } from "@/components/ui/tooltip";
 import { upsert } from "@/lib/data";
 import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, shortSha, spanSeconds } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
@@ -433,6 +434,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
 
       {/* steps */}
       <div className="border-t border-[#28313d]">
+        <StepTimingBar steps={job.steps} now={now} onOpen={(idx) => !open.has(idx) && setOpen(new Set([...open, idx]))} />
         {job.steps.length === 0 && <p className="empty-line px-5 py-6">No steps reported yet.</p>}
         {inRunOrder(job.steps).map((s, i) => (
           <StepRow
@@ -471,6 +473,42 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
         </div>
       )}
     </section>
+  );
+}
+
+/** The leg's time by step (W21-R05), in the order they ran: each step's share of it as a segment of
+ * one hue (a failed step's in the failure tone), 2px of surface between them. A segment says its step
+ * and time, and opens the step; the steps below have the same numbers. */
+function StepTimingBar({ steps, now, onOpen }: { steps: Step[]; now: number; onOpen: (idx: number) => void }) {
+  const timed = inRunOrder(steps)
+    .filter((s) => s.started_at !== null)
+    .map((s) => ({ s, secs: Math.max(0, (s.finished_at ?? now / 1000) - (s.started_at ?? 0)) }));
+  const total = timed.reduce((n, t) => n + t.secs, 0);
+  if (timed.length < 2 || total <= 0) return null;
+  return (
+    <div className="flex items-center gap-[2px] px-5 pt-4 pb-1" role="list" aria-label="Time by step">
+      {timed.map(({ s, secs }, i) => (
+        <Tip key={s.idx} content={`${s.name}: ${formatDuration(secs)}`}>
+          <button
+            type="button"
+            role="listitem"
+            aria-label={`${s.name}, ${formatDuration(secs)}`}
+            onClick={() => onOpen(s.idx)}
+            className="group flex h-6 min-w-[4px] items-center outline-none"
+            style={{ flexGrow: Math.max(secs, total / 400), flexBasis: 0 }}
+          >
+            <span
+              className={cn(
+                "block h-2 w-full transition-opacity group-hover:opacity-80 group-focus-visible:ring-2 group-focus-visible:ring-[#bab0e3]",
+                i === 0 && "rounded-l-[4px]",
+                i === timed.length - 1 && "rounded-r-[4px]",
+              )}
+              style={{ background: s.status === "failed" || s.status === "timed_out" ? "#d1aaad" : "#b8a6d5", opacity: s.status === "running" ? 0.6 : 1 }}
+            />
+          </button>
+        </Tip>
+      ))}
+    </div>
   );
 }
 

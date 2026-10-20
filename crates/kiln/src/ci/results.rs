@@ -624,13 +624,15 @@ pub async fn repo_metrics(hub: &Hub, repo: &str, q: &HashMap<String, String>) ->
                     json!({ "metrics": rows.collect::<Result<Vec<_>, _>>()? })
                 }
                 Some(n) => {
-                    let mut st = c.prepare("SELECT fingerprint, sha, run_id, value, unit, ts FROM metrics WHERE repo_id = ?1 AND branch = ?2 AND name = ?3 AND ts >= ?4 ORDER BY ts")?;
-                    let mut by: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-                    for x in st.query_map(params![repo_id, b, n, since], |x| Ok((x.get::<_, String>(0)?, json!({ "sha": x.get::<_, String>(1)?, "run": x.get::<_, String>(2)?, "value": x.get::<_, f64>(3)?, "unit": x.get::<_, String>(4)?, "ts": x.get::<_, i64>(5)? }))))? {
-                        let (fp, v) = x?;
+                    let mut st = c.prepare("SELECT fingerprint, sha, run_id, value, unit, ts, better FROM metrics WHERE repo_id = ?1 AND branch = ?2 AND name = ?3 AND ts >= ?4 ORDER BY ts")?;
+                    let (mut by, mut better): (BTreeMap<String, Vec<Value>>, Option<String>) = (BTreeMap::new(), None);
+                    for x in st.query_map(params![repo_id, b, n, since], |x| Ok((x.get::<_, String>(0)?, json!({ "sha": x.get::<_, String>(1)?, "run": x.get::<_, String>(2)?, "value": x.get::<_, f64>(3)?, "unit": x.get::<_, String>(4)?, "ts": x.get::<_, i64>(5)? }), x.get::<_, String>(6)?)))? {
+                        let (fp, v, b) = x?;
                         by.entry(fp).or_default().push(v);
+                        better = Some(b);
                     }
-                    json!({ "name": n, "series": by.into_iter().map(|(fp, points)| json!({ "fingerprint": fp, "points": points })).collect::<Vec<_>>() })
+                    // Which way is better, as the latest point says.
+                    json!({ "name": n, "better": better, "series": by.into_iter().map(|(fp, points)| json!({ "fingerprint": fp, "points": points })).collect::<Vec<_>>() })
                 }
             })
         })

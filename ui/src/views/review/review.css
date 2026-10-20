@@ -124,6 +124,35 @@
   align-items: center;
   gap: 6px;
 }
+/* Benchmark gates (W16-R09): one a line, its level as the run page marks annotations. */
+.rv-gates {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+.rv-queue-row .rv-gates {
+  margin: 4px 0 0;
+}
+.rv-gates li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+.rv-gates .rv-sub {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+.rv-gate-level {
+  color: var(--rv-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
 .rv-land,
 .rv-review {
   margin: 0 0 14px;

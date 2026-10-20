@@ -29,6 +29,8 @@ export interface Me {
   authenticated: boolean;
   version: string;
   hostname: string;
+  /** Each capability held: on the whole server, or only somewhere (a repository, …). */
+  can?: Record<string, "server" | "some">;
   /** Where the server says it is reachable from other devices. */
   public_url?: string;
   /** Its runners' front doors (`https://kiln.home`, …). */
@@ -259,15 +261,19 @@ export interface OverviewStats {
 export interface Overview {
   stats: OverviewStats;
   queue: { queued: number; running: number };
-  agents: { connected: number; total: number; slots: number; busy: number };
+  /** `null` for a person of some repositories (W10): runners are the server's. */
+  agents: { connected: number; total: number; slots: number; busy: number } | null;
   system: {
     version: string;
     uptime_s: number;
-    hostname: string;
+    /** `null` for a person of some repositories. */
+    hostname: string | null;
     generation: number;
     children: Child[];
     sample: HostSample | null;
   };
+  /** The repositories it covers, for a person of some of them (W10); absent, it is the whole server's. */
+  narrowed?: string[];
 }
 
 export interface RunDetail {

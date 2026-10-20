@@ -19,6 +19,7 @@ import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { useListener } from "@/views/harness/dom";
 import { anchorOf, FileDiff, ThreadView, type Pick } from "./diff";
+import { Gates } from "./gates";
 import { findMoves, parsePatch } from "./patch";
 import "./review.css";
 
@@ -183,16 +184,20 @@ function Head({ d }: { d: DiffDetail }) {
 
 function Checks({ d }: { d: DiffDetail }) {
   if (d.runs.length === 0) return <p className="rv-sub rv-checks">No checks have run on its latest version.</p>;
+  const gates = d.runs.flatMap((r) => r.gates ?? []);
   return (
-    <ul className="rv-checks" aria-label="Checks on its latest version">
-      {d.runs.map((r) => (
-        <li key={r.id}>
-          <StatusDot status={r.conclusion ?? r.status} title={r.conclusion ?? r.status} />
-          <Link to={`/runs/${r.id}`}>{r.workflow ?? r.name ?? `run ${r.number ?? ""}`}</Link>
-          <span className="rv-sub">{r.conclusion ?? r.status}</span>
-        </li>
-      ))}
-    </ul>
+    <>
+      <ul className="rv-checks" aria-label="Checks on its latest version">
+        {d.runs.map((r) => (
+          <li key={r.id}>
+            <StatusDot status={r.conclusion ?? r.status} title={r.conclusion ?? r.status} />
+            <Link to={`/runs/${r.id}`}>{r.workflow ?? r.name ?? `run ${r.number ?? ""}`}</Link>
+            <span className="rv-sub">{r.conclusion ?? r.status}</span>
+          </li>
+        ))}
+      </ul>
+      {gates.length > 0 && <Gates gates={gates} />}
+    </>
   );
 }
 

@@ -304,3 +304,136 @@ fn w19_ac05_notifications() -> anyhow::Result<()> {
     assert!(!rows.iter().any(|r| r.get("status").and_then(Value::as_str) == Some("failed")), "{rows:?}");
     Ok(())
 }
+
+/// W19-R02: a finished run is a trace at an OTLP/HTTP receiver (here a local one): the run, its
+/// leg and its steps as spans, each under the one it's part of, with the integration's header.
+/// Verify sends the receiver an empty export.
+#[test]
+fn w19_r02_runs_reach_an_otlp_receiver() -> anyhow::Result<()> {
+    let (web, posts) = web_fake()?;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\nallow_private_targets = [\"127.0.0.1\"]", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/ci/integrations", &s.admin, Some(&json!({ "kind": "otel", "name": "traces", "config": { "endpoint": format!("http://127.0.0.1:{web}"), "service_name": "acme-ci" }, "secret": "x-api-key: k1", "scope": "server" })))?;
+    anyhow::ensure!((200..300).contains(&st), "otel: {st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/ci/integrations/traces/verify", &s.admin, None)?;
+    anyhow::ensure!(st == 200 && body.contains("\"ok\":true"), "verify: {st} {body}");
+    assert!(seen(&posts).iter().any(|r| r.starts_with("POST /v1/traces") && r.contains("{\"resourceSpans\":[]}")), "verify's empty export: {:?}", seen(&posts));
+
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/traced", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    let owner = format!("http://x:{}@127.0.0.1:{}/git/acme/traced.git", s.admin, s.port);
+    std::fs::write(work.join("README.md"), "traced\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &owner, "HEAD:main"])?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/traced.yaml"), "on: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - name: compile\n        run: echo compiled\n      - name: test\n        run: echo tested\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "traced"])?;
+    git(&home, &work, &["push", "-q", &owner, "HEAD:main"])?;
+    let mut export = String::new();
+    until(240, "the run's trace", || {
+        export = seen(&posts).into_iter().find(|r| r.starts_with("POST /v1/traces") && r.contains("\"compile\"")).unwrap_or_default();
+        Ok(export.is_empty().then(|| format!("{:?}\n{}", seen(&posts), s.log())))
+    })?;
+    assert!(export.to_ascii_lowercase().contains("x-api-key: k1"), "the stored header: {export}");
+    let body: Value = serde_json::from_str(export.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default())?;
+    let spans: Vec<Value> = body.pointer("/resourceSpans/0/scopeSpans/0/spans").and_then(Value::as_array).cloned().unwrap_or_default();
+    let named = |n: &str| spans.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(n)).cloned().unwrap_or_default();
+    let (run, leg, compile, test) = (spans.first().cloned().unwrap_or_default(), named("build"), named("compile"), named("test"));
+    assert!(run.get("parentSpanId").is_none() && run.pointer("/status/code") == Some(&json!(1)), "the run, a success: {body}");
+    assert_eq!(leg.get("parentSpanId"), run.get("spanId"), "the leg is the run's: {body}");
+    assert!(compile.get("parentSpanId") == leg.get("spanId") && test.get("parentSpanId") == leg.get("spanId"), "the steps are the leg's: {body}");
+    assert_eq!(body.pointer("/resourceSpans/0/resource/attributes/0/value/stringValue"), Some(&json!("acme-ci")));
+    let attrs = run.get("attributes").map(Value::to_string).unwrap_or_default();
+    assert!(attrs.contains("vcs.repository.name") && attrs.contains("acme/traced") && attrs.contains("cicd.pipeline.result"), "{attrs}");
+    Ok(())
+}
+
+/// W19-R06's per-person rules: dev keeps a rule of their own (a failed run that's about them, to
+/// their inbox and their email). dev's failing run reaches both; the owner's failing run isn't
+/// about dev, so neither hears of it. A rule for a channel that isn't a person's, and an agent
+/// changing its person's rules, are refused.
+#[test]
+fn w19_r06_a_persons_own_rules() -> anyhow::Result<()> {
+    let (smtp, mails) = smtp_fake()?;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\nallow_private_targets = [\"127.0.0.1\"]", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/ci/integrations", &s.admin, Some(&json!({ "kind": "email", "name": "mail", "config": { "host": "127.0.0.1", "port": smtp.to_string(), "tls": "none", "from": "kiln <ci@kiln.test>" }, "scope": "server" })))?;
+    anyhow::ensure!((200..300).contains(&st), "email: {st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/mine", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/mine"])?;
+    // The owner's are the server's.
+    let (st, body) = http(s.port, "GET", "/api/me/notifications", &s.admin, None)?;
+    anyhow::ensure!(st == 200 && body.contains("\"person\":false"), "the owner's: {st} {body}");
+    let (st, body) = http(s.port, "PUT", "/api/me/notifications", &dev, Some(&json!({ "rules": [{ "on": ["run.failed"], "to": ["slack:#ci"] }] })))?;
+    anyhow::ensure!(st == 400 && body.contains("inbox"), "a channel isn't a person's: {st} {body}");
+    let (st, body) = http(s.port, "PUT", "/api/me/notifications", &dev, Some(&json!({ "email": "dev@kiln.test", "rules": [{ "on": ["run.failed"], "to": ["inbox", "email"], "about_me": true }] })))?;
+    anyhow::ensure!(st == 200, "dev's rule: {st} {body}");
+    let mine: Value = serde_json::from_str(&http(s.port, "GET", "/api/me/notifications", &dev, None)?.1)?;
+    assert_eq!(mine.get("email"), Some(&json!("dev@kiln.test")), "{mine}");
+    assert_eq!(mine.pointer("/rules/0/about_me"), Some(&json!(true)), "{mine}");
+    assert!(mine.get("events").and_then(Value::as_array).is_some_and(|e| e.contains(&json!("run.failed")) && !e.contains(&json!("agent.finished"))), "{mine}");
+    let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "agent", "agent": "helper", "user": "dev", "grants": ["developer@repo:acme/mine"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "agent token: {st} {body}");
+    let agent = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (st, _) = http(s.port, "PUT", "/api/me/notifications", &agent, Some(&json!({ "rules": [] })))?;
+    assert_eq!(st, 403, "an agent doesn't change its person's rules");
+
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    let url = |t: &str| format!("http://x:{t}@127.0.0.1:{}/git/acme/mine.git", s.port);
+    std::fs::write(work.join("README.md"), "mine\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"])?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/fails.yaml"), "on: push\njobs:\n  check:\n    runs-on: local\n    steps:\n      - run: exit 1\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "fails"])?;
+    // The owner's failing run first: not about dev.
+    git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"])?;
+    let finished = |branch: &str| -> anyhow::Result<bool> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/mine&limit=20", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        Ok(v.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("branch").and_then(Value::as_str) == Some(branch) && r.get("conclusion").and_then(Value::as_str) == Some("failure")))
+    };
+    until(240, "the owner's run fails", || Ok((!finished("main")?).then(|| s.log())))?;
+    // Then dev's, on a branch of theirs.
+    git(&home, &work, &["checkout", "-qb", "dev-work"])?;
+    std::fs::write(work.join("README.md"), "dev's\n")?;
+    git(&home, &work, &["commit", "-qam", "dev's change"])?;
+    git(&home, &work, &["push", "-q", &url(&dev), "HEAD:refs/heads/dev-work"])?;
+    until(240, "dev's run fails", || Ok((!finished("dev-work")?).then(|| s.log())))?;
+    until(60, "dev hears of their run", || {
+        let n = inbox(&s, &dev)?;
+        let failed: Vec<String> = n.get("notifications").and_then(Value::as_array).into_iter().flatten().filter(|x| x.get("event").and_then(Value::as_str) == Some("run.failed")).filter_map(|x| x.get("title").and_then(Value::as_str).map(str::to_owned)).collect();
+        Ok((failed.len() != 1 || !failed.iter().all(|t| t.contains("dev-work"))).then(|| format!("{n}\n{:?}", seen(&mails))))
+    })?;
+    // By email too, once: the owner's run wasn't about dev (its subject is encoded; its recipient isn't).
+    until(60, "and by email", || {
+        let m = seen(&mails);
+        Ok((!m.iter().any(|x| x.contains("dev@kiln.test"))).then(|| format!("{m:?}")))
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    let to_dev = seen(&mails).iter().filter(|x| x.contains("dev@kiln.test")).count();
+    assert_eq!(to_dev, 1, "{:?}", seen(&mails));
+    Ok(())
+}

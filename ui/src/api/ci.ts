@@ -57,6 +57,21 @@ export interface CiLeg {
   kept_until?: number | null;
 }
 
+/** One attempt of a leg (W05-R14's retries): how it ended, why (its failure class), and where it ran. */
+export interface CiAttempt {
+  number: number;
+  status: string;
+  conclusion: string | null;
+  class: string | null;
+  runner: string | null;
+  executor: string | null;
+  queued_at: number | null;
+  started_at: number | null;
+  finished_at: number | null;
+  exit_code: number | null;
+  error: string | null;
+}
+
 export interface CiRunDetail {
   run: CiRun;
   legs: CiLeg[];
@@ -126,6 +141,111 @@ export interface CiTest {
   retried: number;
   quarantined: boolean;
   flaky: { class: "flaky" | "probably_flaky"; why: string } | null;
+}
+
+/** A test over a window on a repository's default branch (W16-R03). */
+export interface CiRepoTest {
+  id: string;
+  suite: string;
+  name: string;
+  file: string | null;
+  runs: number;
+  failures: number;
+  p50_ms: number | null;
+  p90_ms: number | null;
+  flaky: { class: "flaky" | "probably_flaky"; why: string } | null;
+}
+
+export type CiTestSort = "failing" | "slowest" | "flaky";
+
+/** A routing rule (W05-R21): what it matches, and what it adds to a leg's routing. */
+export interface CiRoutingRule {
+  match: { labels?: string[]; job?: string | null; repos?: string[] };
+  require?: string[];
+  executor?: string[];
+  image?: string | null;
+  prefer?: { fact?: string; label?: string; higher?: boolean; weight?: number }[];
+  docker?: string | null;
+}
+
+/** Where a leg with these needs would go (W05-R20): what's left for runners to match, and each runner's checks. */
+export interface CiRouteExplain {
+  labels: string[];
+  constraints: string[];
+  executors: string[];
+  image: string | null;
+  rules: { source: string; rule: CiRoutingRule }[];
+  runners: { name: string; eligible: boolean; room?: boolean; checks?: { requirement: string; value?: string; pass: boolean }[] }[];
+}
+
+/** An actions policy (W07-R04): globs a run may use, globs it may not, and whether every remote action is pinned by its SHA. */
+export interface CiActionsPolicy {
+  allow: string[];
+  deny: string[];
+  require_sha_pins: boolean;
+}
+
+/** kiln's OIDC issuer (W10-R06, R12): where it is, whether this server serves it, and its keys. */
+export interface CiOidc {
+  issuer: string;
+  discovery: string;
+  jwks_uri: string;
+  serving: boolean;
+  keys: { kid: string; created_at: number; sign_from: number; signing: boolean; published: boolean }[];
+  subject_claims: string[];
+}
+
+/** A secret as listed (W09): never its value. `from` for a brokered one, made at leg start. */
+export interface CiSecretMeta {
+  name: string;
+  size: number;
+  created_at: number;
+  updated_at: number;
+  last_used_at: number | null;
+  from?: string;
+}
+
+/** A variable (W09-R09): shown, unlike a secret. */
+export interface CiVariable {
+  name: string;
+  value: string;
+  updated_at: number;
+}
+
+/** A person's own notification rule (W19-R06): repository events, to their inbox or their email. */
+export interface MyRule {
+  on: string[];
+  to: ("inbox" | "email")[];
+  where?: string | null;
+  throttle?: string | null;
+  /** By name or glob; every repository they may read when empty. */
+  repos?: string[];
+  /** Only what's about them: runs they started, reviews asked of them, replies to and mentions of them. */
+  about_me?: boolean;
+}
+
+/** A person's own rules, the address `email` sends to, and the events a rule may take; `person` false for the owner, whose rules are the server's. */
+export interface MyNotifications {
+  person: boolean;
+  rules: MyRule[];
+  email: string | null;
+  events: string[];
+}
+
+/** A metric a repository's default branch recorded over a window (W16-R07): how many points, and the latest's time. */
+export interface CiRepoMetric {
+  name: string;
+  unit: string;
+  better: "lower" | "higher";
+  points: number;
+  last: number;
+}
+
+/** A metric's values over a window, one series per runner fingerprint (W16-AC05). */
+export interface CiMetricTrend {
+  name: string;
+  better: "lower" | "higher" | null;
+  series: { fingerprint: string; points: { sha: string; run: string; value: number; unit: string; ts: number }[] }[];
 }
 
 export interface CiSummary {
@@ -429,6 +549,58 @@ export const ci = {
   artifacts: (id: string, signal?: AbortSignal) => request<{ artifacts: CiArtifact[] }>("GET", `/api/ci/runs/${enc(id)}/artifacts`, undefined, { signal }),
   /** The run's benchmark metrics (W16-R07). */
   metrics: (id: string, signal?: AbortSignal) => request<{ metrics: CiMetric[] }>("GET", `/api/ci/runs/${enc(id)}/metrics`, undefined, { signal }),
+  /** A repository's tests over `days` (W16-R03): the most failing, the slowest, or the flaky. */
+  repoTests: (repo: string, sort: CiTestSort, days: number, signal?: AbortSignal) =>
+    request<{ repo: string; branch: string; days: number; sort: CiTestSort; tests: CiRepoTest[] }>("GET", `/api/ci/repos/${enc(repo)}/tests?sort=${sort}&days=${days}&limit=50`, undefined, {
+      signal,
+    }),
+  /** The server's actions policy, and with `repo` that repository's: kiln's own setting and its `.kiln/config.yaml`'s. */
+  actionsPolicy: (repo: string | null, signal?: AbortSignal) =>
+    request<{ server: CiActionsPolicy; repository?: CiActionsPolicy | null; config_yaml?: CiActionsPolicy | null }>("GET", `/api/ci/actions/policy${repo ? `?repo=${enc(repo)}` : ""}`, undefined, {
+      signal,
+    }),
+  setActionsPolicy: (repo: string, p: CiActionsPolicy) => request<unknown>("PUT", `/api/ci/actions/policy?repo=${enc(repo)}`, p),
+  clearActionsPolicy: (repo: string) => request<unknown>("DELETE", `/api/ci/actions/policy?repo=${enc(repo)}`),
+  /** Mirrors `[ci.actions] prefetch` now: each action's pinned commit, or why not. */
+  syncActions: () => request<{ synced: { uses: string; sha?: string; error?: string }[] }>("POST", "/api/ci/actions/sync", {}),
+  /** kiln's issuer and its keys. */
+  oidc: (signal?: AbortSignal) => request<CiOidc>("GET", "/api/ci/oidc", undefined, { signal }),
+  /** A new signing key: signing in 7 days (published first, so relying parties fetch it), or `now`. */
+  oidcRotate: (now: boolean) => request<{ sign_from: number; published: string | null }>("POST", "/api/ci/oidc/rotate", { now }),
+  /** Writes the issuer's documents to `[ci.oidc] publish_dir` now. */
+  oidcPublish: () => request<{ published: string }>("POST", "/api/ci/oidc/publish", {}),
+  /** Every routing rule in the order they apply, each with where it comes from. */
+  routingRules: (signal?: AbortSignal) => request<{ rules: { index: number; source: string; rule: CiRoutingRule }[]; github_labels: boolean }>("GET", "/api/ci/routing/rules", undefined, { signal }),
+  /** Replaces a scope's stored rules (`server` or `org:<owner>`; a repository's are its `.kiln/routing.yaml`). */
+  setRoutingRules: (scope: string, rules: CiRoutingRule[]) => request<unknown>("PUT", `/api/ci/routing/rules?scope=${enc(scope)}`, { rules }),
+  /** Where a leg with these labels and constraints would go, against the runners connected now. */
+  routingExplain: (body: { labels: string[]; repo?: string; requires?: string[] }) => request<CiRouteExplain>("POST", "/api/ci/routing/explain", body),
+  /** A scope's secrets (`server`, `org:acme`, `repo:acme/app`, `workflow:acme/app:<path>`, `env:acme/app:<name>`): names, never values. */
+  secrets: (scope: string, signal?: AbortSignal) => request<{ scope: string; secrets: CiSecretMeta[] }>("GET", `/api/ci/secrets?scope=${enc(scope)}`, undefined, { signal }),
+  setSecret: (scope: string, name: string, value: string) => request<void>("PUT", `/api/ci/secrets/${enc(name)}?scope=${enc(scope)}`, { value }),
+  deleteSecret: (scope: string, name: string) => request<void>("DELETE", `/api/ci/secrets/${enc(name)}?scope=${enc(scope)}`),
+  /** A scope's variables, with their values. */
+  variables: (scope: string, signal?: AbortSignal) => request<{ scope: string; variables: CiVariable[] }>("GET", `/api/ci/variables?scope=${enc(scope)}`, undefined, { signal }),
+  setVariable: (scope: string, name: string, value: string) => request<void>("PUT", `/api/ci/variables/${enc(name)}?scope=${enc(scope)}`, { value }),
+  deleteVariable: (scope: string, name: string) => request<void>("DELETE", `/api/ci/variables/${enc(name)}?scope=${enc(scope)}`),
+  /** What notification rules sent (W19-R06), newest first: each delivery's rule, event, channel, and why one didn't go. */
+  deliveries: (limit: number, signal?: AbortSignal) =>
+    request<{ deliveries: { ts: number; rule: string; event: string; run: string | null; channel: string; status: string; error: string | null; attempts: number }[] }>(
+      "GET",
+      `/api/ci/notify/deliveries?limit=${limit}`,
+      undefined,
+      { signal },
+    ),
+  /** Your own notification rules (W19-R06). */
+  myNotifications: (signal?: AbortSignal) => request<MyNotifications>("GET", "/api/me/notifications", undefined, { signal }),
+  /** Replaces your rules, and the address email goes to when given (`null` clears it). */
+  setMyNotifications: (rules: MyRule[], email?: string | null) => request<MyNotifications>("PUT", "/api/me/notifications", email === undefined ? { rules } : { rules, email }),
+  /** The metrics a repository's default branch recorded over `days` (W16-R07). */
+  repoMetrics: (repo: string, days: number, signal?: AbortSignal) =>
+    request<{ repo: string; branch: string; days: number; data: { metrics: CiRepoMetric[] } }>("GET", `/api/ci/repos/${enc(repo)}/metrics?days=${days}`, undefined, { signal }),
+  /** A metric's values on a repository's default branch over `days`, by runner fingerprint (W16-AC05). */
+  repoMetric: (repo: string, name: string, days: number, signal?: AbortSignal) =>
+    request<{ repo: string; branch: string; days: number; data: CiMetricTrend }>("GET", `/api/ci/repos/${enc(repo)}/metrics?name=${enc(name)}&days=${days}`, undefined, { signal }),
   /** The run's tests, failures first (W16-R03). */
   tests: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ counts: Record<string, number>; tests: CiTest[] }>("GET", `/api/ci/runs/${enc(id)}/tests${at(attempt)}`, undefined, { signal }),
@@ -445,6 +617,8 @@ export const ci = {
   /** A kept leg's step run again in place, as a new section of its log (W17-R04). */
   rerunStep: (leg: string, idx: number) => request<{ leg: string; step: number; idx: number }>("POST", `/api/ci/legs/${enc(leg)}/rerun-step`, { idx }),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
+  /** A leg's attempts, oldest first, each with its failure class, and its outputs (W21-R05). */
+  legDetail: (leg: string, signal?: AbortSignal) => request<{ attempts: CiAttempt[]; outputs: Record<string, string> }>("GET", `/api/ci/legs/${enc(leg)}`, undefined, { signal }),
   validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
   workflows: (repo: string, ref: string, signal?: AbortSignal) =>
     request<{ ref: string; sha: string; workflows: CiWorkflowFile[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),

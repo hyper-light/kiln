@@ -534,6 +534,54 @@ impl Store {
         .await
     }
 
+    /// [`Self::runs`], of the repositories named only.
+    pub async fn runs_among(&self, names: Vec<String>, repo: Option<String>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
+        let names = serde_json::to_string(&names)?;
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                        r.error, r.concurrency_group
+                 FROM runs r JOIN repos p ON p.id = r.repo_id
+                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+                   AND (?3 IS NULL OR r.created_at < ?3)
+                   AND p.name IN (SELECT value FROM json_each(?4))
+                 ORDER BY r.created_at DESC, r.number DESC LIMIT ?2",
+            )?;
+            let rows = st.query_map(params![repo, limit.min(500), before, names], row_run)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Runs in another order than newest first (the runs list's sort, W21-R03): `oldest`, or
+    /// `longest` and `shortest` (a running one's time so far), from `offset` on; `among` the
+    /// repositories a person may read, when narrowed.
+    pub async fn runs_sorted(&self, among: Option<Vec<String>>, repo: Option<String>, order: &str, limit: u32, offset: u32) -> anyhow::Result<Vec<Run>> {
+        const TOOK: &str = "(COALESCE(r.finished_at, CAST(strftime('%s', 'now') AS INTEGER)) - COALESCE(r.started_at, r.created_at))";
+        let by = match order {
+            "oldest" => "r.created_at ASC, r.number ASC".to_owned(),
+            "longest" => format!("{TOOK} DESC, r.created_at DESC"),
+            "shortest" => format!("{TOOK} ASC, r.created_at DESC"),
+            _ => "r.created_at DESC, r.number DESC".to_owned(),
+        };
+        let names = among.map(|n| serde_json::to_string(&n).unwrap_or_default());
+        self.call(move |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                        r.error, r.concurrency_group
+                 FROM runs r JOIN repos p ON p.id = r.repo_id
+                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+                   AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
+                 ORDER BY {by} LIMIT ?2 OFFSET ?3"
+            ))?;
+            let rows = st.query_map(params![repo, limit.min(500), offset, names], row_run)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
     pub async fn run(&self, id: String) -> anyhow::Result<Option<Run>> {
         self.call(move |c| {
             Ok(c.query_row(
@@ -823,15 +871,20 @@ impl Store {
         .await
     }
 
-    pub async fn stats(&self) -> anyhow::Result<serde_json::Value> {
-        self.call(|c| {
+    /// The last day's runs and jobs (the overview's), every repository's or `among` these (by name:
+    /// a person of some repositories, W10).
+    pub async fn stats(&self, among: Option<Vec<String>>) -> anyhow::Result<serde_json::Value> {
+        let among = among.map(|names| serde_json::to_string(&names).unwrap_or_default());
+        self.call(move |c| {
             let since = crate::util::now_unix() - 86_400;
-            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [since], |r| r.get(0)) };
+            // `?2`: the repositories, or NULL for all of them.
+            const RUNS_IN: &str = "(?2 IS NULL OR repo_id IN (SELECT id FROM repos WHERE name IN (SELECT value FROM json_each(?2))))";
+            const JOBS_IN: &str = "(?2 IS NULL OR run_id IN (SELECT r.id FROM runs r JOIN repos p ON p.id = r.repo_id WHERE p.name IN (SELECT value FROM json_each(?2))))";
+            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(&sql.replace("{RUNS_IN}", RUNS_IN), params![since, among], |r| r.get(0)) };
             let mut by_status = serde_json::Map::new();
             {
-                let mut st =
-                    c.prepare("SELECT status, COUNT(*) FROM jobs WHERE COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running') GROUP BY status")?;
-                let rows = st.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let mut st = c.prepare(&format!("SELECT status, COUNT(*) FROM jobs WHERE (COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running')) AND {JOBS_IN} GROUP BY status"))?;
+                let rows = st.query_map(params![since, among], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
                     let (s, n) = row?;
                     by_status.insert(s, n.into());
@@ -839,13 +892,13 @@ impl Store {
             }
             let mut hourly = Vec::new();
             {
-                let mut st = c.prepare(
+                let mut st = c.prepare(&format!(
                     "SELECT (finished_at / 3600) * 3600 AS h,
                             SUM(status = 'succeeded'), SUM(status IN ('failed','timed_out')),
                             AVG(finished_at - started_at)
-                     FROM jobs WHERE finished_at >= ?1 GROUP BY h ORDER BY h",
-                )?;
-                let rows = st.query_map([since], |r| {
+                     FROM jobs WHERE finished_at >= ?1 AND {JOBS_IN} GROUP BY h ORDER BY h"
+                ))?;
+                let rows = st.query_map(params![since, among], |r| {
                     Ok(serde_json::json!({
                         "ts": r.get::<_, i64>(0)?,
                         "succeeded": r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -868,16 +921,32 @@ impl Store {
                 }
             }
             Ok(serde_json::json!({
-                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1")?,
-                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out')")?,
-                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded'")?,
+                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND {RUNS_IN}")?,
+                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out') AND {RUNS_IN}")?,
+                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded' AND {RUNS_IN}")?,
                 "median_job_seconds": c.query_row(
-                    "SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL
-                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL)",
-                    [since], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
+                    &format!("SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN}
+                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN})"),
+                    params![since, among], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
                 "jobs_by_status": by_status,
                 "hourly": hourly,
             }))
+        })
+        .await
+    }
+
+    /// How many jobs of these repositories (by name) wait and run: a person of some repositories'
+    /// queue (W10), where the server's counts are everyone's.
+    pub async fn queue_among(&self, names: Vec<String>) -> anyhow::Result<serde_json::Value> {
+        let names = serde_json::to_string(&names)?;
+        self.call(move |c| {
+            let (queued, running): (i64, i64) = c.query_row(
+                "SELECT COALESCE(SUM(j.status = 'queued'), 0), COALESCE(SUM(j.status = 'running'), 0) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
+                 WHERE j.status IN ('queued', 'running') AND p.name IN (SELECT value FROM json_each(?1))",
+                [&names],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(serde_json::json!({ "queued": queued, "running": running }))
         })
         .await
     }

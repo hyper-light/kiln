@@ -153,7 +153,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         // W23-R06: the host's pull requests (merge requests).
         (_, ["repos", repo, "pulls", tail @ ..]) => crate::githost::pulls::route(hub, method, repo, tail, body, caller).await,
         // W03-R11: dispatches (another provider's, W23-R01).
-        (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch_value(hub, repo, &path.join("/"), body).await,
+        (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch_value(hub, repo, &path.join("/"), body, caller.and_then(crate::authz::Caller::started_by)).await,
         (&Method::GET, ["runs", id, "pending"]) => super::runs_api::pending(hub, id).await,
         (&Method::GET, ["runs", id, "artifacts"]) => super::runs_api::part(hub, id, "artifacts", q).await,
         (&Method::GET, ["runs", id, "artifacts", artifact, "download"]) => super::runs_api::download(hub, id, artifact).await,
@@ -259,7 +259,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             apart(async move { super::integrations::route(&hub, &method, &rest.iter().map(String::as_str).collect::<Vec<_>>(), &q, body).await }).await
         }
         // §4.1: the engine's runs, legs and caches (W21's data).
-        (&Method::GET, ["runs"]) => super::runs_api::list(hub, q).await,
+        (&Method::GET, ["runs"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            super::runs_api::list(hub, q, caller.as_ref()).await
+        }
         (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id, q).await,
         (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id, q).await,
         // W19-R03: what changed between two runs or legs (`last-green`: since the last success).
@@ -318,10 +321,15 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::DELETE, ["repos", repo, "caches", id]) => super::runs_api::caches(hub, repo, Some(id)).await,
         // §4.1's names for the dispatches.
-        (&Method::POST, ["repos", repo, "dispatch"]) => workflows::dispatch_named(hub, repo, req.into_body()).await,
-        (&Method::POST, ["repos", repo, "repository-dispatch"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
-        // W03-R11: dispatches.
-        (&Method::POST, ["repos", repo, "dispatches"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
+        (&Method::POST, ["repos", repo, "dispatch"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().and_then(crate::authz::Caller::started_by);
+            workflows::dispatch_named(hub, repo, req.into_body(), by).await
+        }
+        (&Method::POST, ["repos", repo, "repository-dispatch"] | ["repos", repo, "dispatches"]) => {
+            // W03-R11: dispatches.
+            let by = req.extensions().get::<crate::authz::Caller>().and_then(crate::authz::Caller::started_by);
+            workflows::repository_dispatch(hub, repo, req.into_body(), by).await
+        }
         // W03-R02: inbound webhooks (`/api/ci/hooks/:id` is their call).
         (&Method::GET, ["repos", repo, "hooks"]) => super::inbound::list(hub, repo).await,
         (&Method::POST, ["repos", repo, "hooks"]) => {
@@ -336,7 +344,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W03-R09: kiln's `agent` event, the caller the agent asking.
         (&Method::POST, ["repos", repo, "agent"]) => {
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "kiln".to_owned(), |c| c.name.clone());
-            workflows::agent_run(hub, repo, &by, req.into_body()).await
+            let started_by = req.extensions().get::<crate::authz::Caller>().and_then(crate::authz::Caller::started_by);
+            workflows::agent_run(hub, repo, &by, req.into_body(), started_by).await
         }
         // W17-R06: runs of a working tree (`kiln workflow run`).
         (&Method::GET, ["repos", repo, "heads"]) => super::uploads::heads(hub, repo).await,

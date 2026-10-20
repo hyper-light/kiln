@@ -56,6 +56,17 @@ export interface DiffRun {
   event: string;
   status: string;
   conclusion: string | null;
+  /** What its jobs' `bench-gate`s said (W16-R09). */
+  gates?: BenchGate[];
+}
+
+/** A job's `bench-gate` result on a commit (W16-R09): failing (`error`) or a warning, and why. */
+export interface BenchGate {
+  run: string;
+  leg: string;
+  job: string;
+  level: string;
+  message: string;
 }
 
 export interface Reviewer {
@@ -204,6 +215,8 @@ export interface QueueEntry {
   enqueued_by: string;
   created_at: number;
   updated_at: number;
+  /** What the candidate's `bench-gate`s said (W16-R09). */
+  gates?: BenchGate[];
 }
 
 export type ReviewAction = "accept" | "request_changes" | "comment" | "resign";

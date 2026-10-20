@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use kiln_ci::trigger::context::{self, Commit, Person, PullRequest, Side};
 use kiln_ci::trigger::{Event, Source, ZERO_SHA};
+use rusqlite::OptionalExtension as _;
 
 use super::dispatch::{Msg, Start};
 use super::load;
@@ -128,6 +129,7 @@ async fn event(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
     match kiln_ci::trigger::github::event(name, p, &default_branch, &t.sha) {
         Some(mut e) => {
             e.changed = made.changed;
+            e.started_by = made.started_by;
             if e.sha.is_empty() {
                 e.sha = t.sha.clone();
             }
@@ -137,6 +139,32 @@ async fn event(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
             e
         }
         None => made,
+    }
+}
+
+/// Who pushed `sha` to `git_ref` of a kiln-hosted repository, as its push handler kept it (W10-R02's
+/// `secrets.use`): the branch's commit itself, or the tag's latest push (the poller sees an
+/// annotated tag's commit, the push its tag). `None` for what nobody kiln holds to less pushed (a
+/// host's repository, the owner). Unreadable, it may use nothing.
+async fn pushed_by(hub: &Hub, repo: &str, git_ref: &str, sha: &str) -> Option<serde_json::Value> {
+    let (r, g, s) = (repo.to_owned(), git_ref.to_owned(), sha.to_owned());
+    let found = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT started_by FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2 AND (sha = ?3 OR ref LIKE 'refs/tags/%') ORDER BY ts DESC LIMIT 1",
+                rusqlite::params![r, g, s],
+                |x| x.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+        .await;
+    match found {
+        Ok(by) => by.and_then(|t| serde_json::from_str(&t).ok()),
+        Err(e) => {
+            tracing::warn!(repo, git_ref, error = %format!("{e:#}"), "who pushed couldn't be read: the run's legs get no secrets");
+            Some(serde_json::json!({ "name": "unknown", "user": null, "rights": [], "limit": null }))
+        }
     }
 }
 
@@ -157,12 +185,14 @@ async fn synthesize(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
             };
             let commits = commits(hub, &mirror, t.before.as_deref(), &t.sha).await;
             e.payload = context::push(&e, &ctx_repo, &commits, &Person { name: author.clone(), email: String::new(), username: None }, false);
+            e.started_by = pushed_by(hub, &repo.id, &e.git_ref, &t.sha).await;
         }
         "tag" => {
             e.name = "push".into();
             e.git_ref = format!("refs/tags/{}", t.branch);
             e.created = t.before.is_none();
             e.payload = context::push(&e, &ctx_repo, &[], &Person { name: author.clone(), email: String::new(), username: None }, false);
+            e.started_by = pushed_by(hub, &repo.id, &e.git_ref, &t.sha).await;
         }
         "pull_request" => {
             // Polling sees `refs/pull/N/head` only: no title, labels or author (the payload says
@@ -340,8 +370,9 @@ pub async fn preview_event(hub: &Hub, repo: &Repo, name: &str, full_ref: &str, s
 }
 
 /// `workflow_dispatch` (W03-R11): runs workflow `which` (its path, or its file name as GitHub's
-/// API takes it) at `git_ref` with `inputs`, checked against what it declares.
-pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<(), Refused> {
+/// API takes it) at `git_ref` with `inputs`, checked against what it declares. `started_by`: who
+/// asked ([`crate::authz::Caller::started_by`]), whose `secrets.use` its legs are held to.
+pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, actor: &str, started_by: Option<serde_json::Value>) -> Result<(), Refused> {
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
@@ -357,7 +388,7 @@ pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &st
     let (typed, strings) = kiln_ci::trigger::dispatch::inputs(&declared, given).map_err(|m| refused(http::StatusCode::UNPROCESSABLE_ENTITY, m))?;
     let f = facts(hub, repo).await;
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
-    let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), ..Event::default() };
+    let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
     start(hub, repo, &e, l, &message, actor, typed).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     Ok(())
@@ -366,7 +397,7 @@ pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &st
 /// kiln's `agent` event (W03-R09, W20): agent `agent` asks for a run of workflow `which` at
 /// `git_ref`, one that takes it (`on: { agent: { agents, inputs } }`, its `agents` naming it or
 /// `*`), with `inputs` typed and checked as `workflow_dispatch`'s are. The agent is the run's actor.
-pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, agent: &str) -> Result<(), Refused> {
+pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, agent: &str, started_by: Option<serde_json::Value>) -> Result<(), Refused> {
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
@@ -381,7 +412,7 @@ pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &s
     let (typed, strings) = kiln_ci::trigger::dispatch::inputs(&declared, given).map_err(|m| refused(http::StatusCode::UNPROCESSABLE_ENTITY, m))?;
     let f = facts(hub, repo).await;
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
-    let mut e = Event { name: "agent".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: agent.to_owned(), trusted: true, source: Source::Agent, message: Some(message.clone()), ..Event::default() };
+    let mut e = Event { name: "agent".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: agent.to_owned(), trusted: true, source: Source::Agent, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
     if let Some(p) = e.payload.as_object_mut() {
         p.insert("sender".into(), serde_json::json!({ "login": agent, "type": "Bot" }));
@@ -395,8 +426,8 @@ pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &s
 }
 
 /// `repository_dispatch` (W03-R11): runs the default branch's workflows that listen for
-/// `event_type`, with `client_payload` in the event.
-pub async fn repository_dispatch(hub: &Hub, repo: &Repo, event_type: &str, client_payload: &serde_json::Value, actor: &str) -> Result<usize, Refused> {
+/// `event_type`, with `client_payload` in the event; held to `started_by` as `workflow_dispatch` is.
+pub async fn repository_dispatch(hub: &Hub, repo: &Repo, event_type: &str, client_payload: &serde_json::Value, actor: &str, started_by: Option<serde_json::Value>) -> Result<usize, Refused> {
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
@@ -410,7 +441,7 @@ pub async fn repository_dispatch(hub: &Hub, repo: &Repo, event_type: &str, clien
     let (full_ref, sha) = named_ref(hub, repo, &f.default_branch).await?;
     let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
-    let mut e = Event { name: "repository_dispatch".into(), action: event_type.to_owned(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), ..Event::default() };
+    let mut e = Event { name: "repository_dispatch".into(), action: event_type.to_owned(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::repository_dispatch(&e, &f.repo, client_payload);
     let mut started = 0;
     for l in commit.workflows.iter().filter(|l| l.runs && !l.has_errors()) {

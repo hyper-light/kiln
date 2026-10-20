@@ -138,6 +138,109 @@ impl Rule {
     }
 }
 
+/// A person's own rule (W19-R06): a repository's events, to their `inbox` or their `email`.
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
+pub struct Mine {
+    #[serde(flatten)]
+    pub rule: Rule,
+    /// The repositories it's for, by name or glob (`acme/*`); every one they may read when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    /// Only what's about them: runs they started, reviews they're asked for, replies to them,
+    /// mentions of them.
+    #[serde(default)]
+    pub about_me: bool,
+}
+
+impl Mine {
+    fn check(&self) -> Result<(), String> {
+        self.rule.check(false)?;
+        if let Some(t) = self.rule.to.iter().find(|t| !matches!(t.as_str(), "inbox" | "email")) {
+            return Err(format!("`{t}` isn't where a person's own rule goes: their `inbox`, or their `email`"));
+        }
+        if self.repos.iter().any(|r| r.trim().is_empty()) {
+            return Err("`repos` names repositories (or globs, `acme/*`)".into());
+        }
+        Ok(())
+    }
+}
+
+/// The most rules a person keeps.
+const MINE_MAX: usize = 50;
+
+/// `GET /api/me/notifications`: the caller's own rules (W19-R06) and the address `email` sends to;
+/// `PUT` `{ rules, email? }` replaces them (and that address). A person's: the owner's are the
+/// server's (`[[ci.notify]]`), and an agent doesn't change its person's.
+pub async fn mine(hub: &Hub, caller: &crate::authz::Caller, put: Option<Value>) -> Result<Response, Fail> {
+    let events: Vec<&str> = EVENTS.iter().copied().filter(|e| !AGENT_EVENTS.contains(e) && !RUNNER_EVENTS.contains(e) && !RELEASE_EVENTS.contains(e)).collect();
+    let Some(uid) = caller.user.clone() else {
+        if put.is_some() {
+            return Err((StatusCode::BAD_REQUEST, "notification rules are a person's own: the owner's are the server's ([[ci.notify]] in kiln.toml)".into()));
+        }
+        return Ok(srv::json(StatusCode::OK, &json!({ "person": false, "rules": [], "email": null, "events": events })));
+    };
+    if let Some(body) = put {
+        if caller.kind == crate::authz::gate::Kind::Agent {
+            return Err((StatusCode::FORBIDDEN, "an agent doesn't change its person's notifications".into()));
+        }
+        let rules: Vec<Mine> = serde_json::from_value(body.get("rules").cloned().unwrap_or_else(|| json!([]))).map_err(|e| (StatusCode::BAD_REQUEST, format!("rules: {e}")))?;
+        if rules.len() > MINE_MAX {
+            return Err((StatusCode::BAD_REQUEST, format!("at most {MINE_MAX} rules")));
+        }
+        for (i, r) in rules.iter().enumerate() {
+            r.check().map_err(|e| (StatusCode::BAD_REQUEST, format!("rule {}: {e}", i + 1)))?;
+        }
+        let email: Option<Option<String>> = match body.get("email") {
+            Some(Value::String(e)) if e.trim().is_empty() => Some(None),
+            Some(Value::String(e)) if super::smtp::valid_address(e.trim()) => Some(Some(e.trim().to_owned())),
+            Some(Value::String(e)) => return Err((StatusCode::BAD_REQUEST, format!("`{e}` isn't an email address"))),
+            Some(Value::Null) => Some(None),
+            _ => None,
+        };
+        let (id, text) = (uid.clone(), serde_json::to_string(&rules).unwrap_or_else(|_| "[]".into()));
+        hub.store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                if rules.is_empty() {
+                    tx.execute("DELETE FROM notify_subscriptions WHERE user_id = ?1", [&id])?;
+                } else {
+                    tx.execute("INSERT INTO notify_subscriptions (user_id, rules, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (user_id) DO UPDATE SET rules = ?2, updated_at = ?3", params![id, text, crate::util::now_unix()])?;
+                }
+                if let Some(e) = email {
+                    tx.execute("UPDATE users SET email = ?2 WHERE id = ?1", params![id, e])?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    }
+    let id = uid.clone();
+    let (rules, email): (Option<String>, Option<String>) = hub
+        .store
+        .call(move |c| {
+            let rules = c.query_row("SELECT rules FROM notify_subscriptions WHERE user_id = ?1", [&id], |r| r.get(0)).optional()?;
+            let email = c.query_row("SELECT email FROM users WHERE id = ?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
+            Ok((rules, email))
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rules: Vec<Mine> = rules.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    Ok(srv::json(StatusCode::OK, &json!({ "person": true, "rules": rules, "email": email, "events": events })))
+}
+
+/// Every person's own rules, with who they are: their id, name and address.
+async fn subscribers(hub: &Hub) -> Vec<(String, String, Option<String>, Vec<Mine>)> {
+    hub.store
+        .call(|c| {
+            let mut st = c.prepare("SELECT u.id, u.name, u.email, s.rules FROM notify_subscriptions s JOIN users u ON u.id = s.user_id WHERE u.disabled_at IS NULL")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?)))?;
+            Ok(rows.filter_map(Result::ok).map(|(id, name, email, rules)| (id, name, email, serde_json::from_str(&rules).unwrap_or_default())).collect())
+        })
+        .await
+        .unwrap_or_default()
+}
+
 /// `30s`, `10m`, `2h`, `1d`.
 fn seconds(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -539,6 +642,7 @@ async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about:
 pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
     // For outgoing webhooks' subscribers too (W19-R07), and the UI.
     hub.emit(&json!({ "type": event, "repo": { "id": repo.id, "name": repo.name }, "run": s.run_value(), "environments": s.environments }));
+    let m = Msg::of_run(event, s);
     for (name, rule) in rules_for(hub, repo).await {
         if !takes(&rule, event, s) {
             continue;
@@ -548,7 +652,37 @@ pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
             if throttled(hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
                 continue;
             }
-            deliver(hub, Some(repo), &name, event, &s.run, &Msg::of_run(event, s), spec).await;
+            deliver(hub, Some(repo), &name, event, &s.run, &m, spec).await;
+        }
+    }
+    // Each person's own rules (W19-R06), for repositories they may read.
+    for (uid, person, email, rules) in subscribers(hub).await {
+        let me = format!("user:{person}");
+        let wanted: Vec<(usize, &Mine)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.check().is_ok() && takes(&r.rule, event, s))
+            .filter(|(_, r)| r.repos.is_empty() || r.repos.iter().any(|g| crate::pipeline::glob_match(g.trim(), &repo.name)))
+            .filter(|(_, r)| !r.about_me || m.people.iter().any(|p| super::inbox::person(p) == me))
+            .collect();
+        if wanted.is_empty() || !crate::authz::gate::user_may(hub, &uid, "runs.read", &crate::authz::Scope::Repo { repo: repo.name.clone() }).await {
+            continue;
+        }
+        for (i, r) in wanted {
+            let name = format!("{me}#{}", i + 1);
+            for to in &r.rule.to {
+                let spec = match (to.as_str(), &email) {
+                    ("inbox", _) => format!("inbox:{person}"),
+                    ("email", Some(address)) => format!("email:{address}"),
+                    // No address of theirs: nowhere to send.
+                    _ => continue,
+                };
+                let key = format!("{name}\u{0}{spec}\u{0}{event}\u{0}{}\u{0}{}", s.workflow, s.branch);
+                if throttled(hub, &key, r.rule.throttle.as_deref().and_then(seconds)).await {
+                    continue;
+                }
+                deliver(hub, Some(repo), &name, event, &s.run, &m, &spec).await;
+            }
         }
     }
 }
@@ -654,9 +788,16 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
         .await?;
     let Some((repo_id, number, workflow, name, branch, sha, message, actor, conclusion, input)) = row else { return Ok(None) };
     let Some(repo) = hub.store.repos().await?.into_iter().find(|x| x.id == repo_id) else { return Ok(None) };
-    let github = input.and_then(|i| serde_json::from_str::<Value>(&i).ok()).and_then(|v| v.get("github").cloned()).unwrap_or(Value::Null);
+    let input: Value = input.and_then(|i| serde_json::from_str(&i).ok()).unwrap_or(Value::Null);
+    let github = input.get("github").cloned().unwrap_or(Value::Null);
+    // Whom a run is about: the person in kiln who started it (W10's `started_by`: an agent's, the
+    // person it acts for), when one did; else its actor.
+    let people = match input.pointer("/event/started_by/user").and_then(Value::as_str).map(str::to_owned) {
+        Some(uid) => hub.store.call(move |c| Ok(c.query_row("SELECT name FROM users WHERE id = ?1", [&uid], |x| x.get::<_, String>(0)).optional()?)).await.ok().flatten().map(|n| vec![format!("user:{n}")]).unwrap_or_default(),
+        None => Vec::new(),
+    };
     let url = format!("{}/runs/{run}", hub.cfg.server.public_url.trim_end_matches('/'));
-    Ok(Some((repo.clone(), Subject { repo: repo.name, run: run.to_owned(), number, workflow, name, branch, sha, message, actor, conclusion: conclusion.unwrap_or_default(), url, github, environments: Vec::new(), people: Vec::new() })))
+    Ok(Some((repo.clone(), Subject { repo: repo.name, run: run.to_owned(), number, workflow, name, branch, sha, message, actor, conclusion: conclusion.unwrap_or_default(), url, github, environments: Vec::new(), people })))
 }
 
 /// A run ended (W19-R06): `run.failed`, `run.cancelled`, or `run.succeeded` and, after failures

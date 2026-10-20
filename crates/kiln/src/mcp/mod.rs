@@ -295,8 +295,9 @@ agents for parts of the work on any machine (`agents_start`), wait for them (`ag
 (`agents_result`), and put an agent's work up for review (`agents_change`); what they ask a person stays a person's to answer. \
 Plans and goal stacks are under `kiln.plans` and \
 `kiln.goals`. Prefer code_run: one program can list, filter and act on a whole fleet and return only what matters. \
-code_search shows the operations and their inputs. The skills (kiln-agents, kiln-ci-diagnose, kiln-deploy, kiln-diagnose, \
-kiln-apps, kiln-argocd-migration) say how to use them.";
+code_search shows the operations and their inputs. The skills (kiln-agents, kiln-deploy, kiln-diagnose, kiln-apps, \
+kiln-argocd-migration, and CI's kiln-ci-author, kiln-ci-diagnose, kiln-ci-runners, kiln-ci-review, kiln-ci-migrate, \
+kiln-ci-secrets and kiln-ci-performance) say how to use them.";
 
 /// An MCP token for `label` (an agent session, an attachment): `kiln_mcp_<label>_<hmac>`.
 pub fn token(admin_token: &str, label: &str) -> String {

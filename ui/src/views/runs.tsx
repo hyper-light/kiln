@@ -3,18 +3,18 @@ import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ChartLine, GitBranch, Search, Activity } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Repo, Run, Status } from "@/api/types";
+import type { Run, Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { EmptyState, ErrorState, PageIntro, SearchField, SelectField } from "@/components/ui/misc";
+import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
+import { EmptyState, ErrorState, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { reposRes, useRepos, warm } from "@/lib/data";
 import { firstLine, shortSha, statusLabel } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
-import { cn } from "@/lib/utils";
 import { EventIcon, LiveDuration, RelTime } from "./shared";
 
 const PAGE = 50;
@@ -27,6 +27,23 @@ const STATUS_GROUPS: Record<StatusFilter, Status[] | null> = {
   succeeded: ["succeeded"],
   cancelled: ["cancelled", "skipped"],
 };
+
+/** The facets the list filters by (W21-R03), each a URL parameter of its own, comma-separated. */
+const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author"; label: string; of: (r: Run) => string }[] = [
+  { id: "repo", label: "Repository", of: (r) => r.repo_name },
+  { id: "workflow", label: "Workflow", of: (r) => r.pipeline },
+  { id: "event", label: "Event", of: (r) => r.event },
+  { id: "branch", label: "Branch", of: (r) => r.branch },
+  { id: "author", label: "Author", of: (r) => r.author },
+];
+
+type Sort = "newest" | "oldest" | "longest" | "shortest";
+const SORTS: { value: Sort; label: string }[] = [
+  { value: "newest", label: "Newest first" },
+  { value: "oldest", label: "Oldest first" },
+  { value: "longest", label: "Longest first" },
+  { value: "shortest", label: "Shortest first" },
+];
 
 export default function Runs() {
   return (
@@ -71,20 +88,19 @@ interface Older {
 function RunsBody() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const repo = params.get("repo") ?? "";
   const status = (params.get("status") as StatusFilter | null) ?? "all";
-  // What's typed and chosen shows at once; the URL follows it.
-  const [branch, setBranch] = React.useState(() => params.get("branch") ?? "");
-  const [repoChoice, setRepoChoice] = React.useState(repo);
-  // A repository chosen elsewhere (a link, the palette) is chosen here too.
-  const [repoSeen, setRepoSeen] = React.useState(repo);
-  if (repoSeen !== repo) {
-    setRepoSeen(repo);
-    setRepoChoice(repo);
-  }
+  const sort = (SORTS.find((x) => x.value === params.get("sort"))?.value ?? "newest") as Sort;
+  // What's chosen, from the URL: each facet's values (a repository by name or id).
+  const chosen: Chosen = Object.fromEntries(FACETS.map((f): [string, string[]] => [f.id, (params.get(f.id) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
+  // One repository is the server's to narrow by; several are narrowed here.
+  const repo = chosen.repo?.length === 1 ? (chosen.repo[0] ?? "") : "";
+  // What's typed matches runs' words at once.
+  const [query, setQuery] = React.useState("");
 
-  const key = repo || "all";
-  const firstRes = { key: `runs/list/${key}`, fetch: (s: AbortSignal) => api.runs({ repo: repo || undefined, limit: PAGE }, s), opts: { pollMs: 60_000 } };
+  // The server orders the list (W21-R03): newest first pages by time, the other orders by offset.
+  const key = `${repo || "all"}/${sort}`;
+  const ordered = sort === "newest" ? undefined : sort;
+  const firstRes = { key: `runs/list/${key}`, fetch: (s: AbortSignal) => api.runs({ repo: repo || undefined, limit: PAGE, sort: ordered }, s), opts: { pollMs: 60_000 } };
   warm(reposRes, firstRes);
   const repos = useRepos().data;
   const first = useSuspenseResource(firstRes.key, firstRes.fetch, firstRes.opts);
@@ -99,8 +115,9 @@ function RunsBody() {
         copy[i] = r;
         return copy;
       }
+      // A new run leads only the newest-first list; the others find it when they load again.
       const newest = cur[0];
-      return !newest || r.created_at >= newest.created_at ? [r, ...cur] : cur;
+      return !ordered && (!newest || r.created_at >= newest.created_at) ? [r, ...cur] : cur;
     });
   });
 
@@ -118,11 +135,11 @@ function RunsBody() {
     if (!last || older.loading || !hasMore) return;
     setOlder({ ...older, loading: true, error: null });
     // An answer for a list since replaced (another repository) is dropped.
-    api.runs({ repo: repo || undefined, limit: PAGE, before: last.created_at }).then(
+    api.runs({ repo: repo || undefined, limit: PAGE, ...(ordered ? { sort: ordered, offset: runs.length } : { before: last.created_at }) }).then(
       (more) => setOlder((o) => (o.key !== key ? o : { key, runs: [...o.runs, ...more], hasMore: more.length >= PAGE, loading: false, error: null })),
       (e: unknown) => setOlder((o) => (o.key !== key ? o : { ...o, loading: false, error: errorMessage(e) })),
     );
-  }, [runs, older, hasMore, repo, key]);
+  }, [runs, older, hasMore, repo, key, ordered]);
 
   // Infinite scroll: loads when the end nears the viewport, and keeps going while it stays near.
   const sentinel = React.useCallback(
@@ -137,27 +154,61 @@ function RunsBody() {
 
   const setParam = (k: string, v: string) => {
     const next = new URLSearchParams(params);
-    if (v && v !== "all") next.set(k, v);
+    if (v && v !== "all" && !(k === "sort" && v === "newest")) next.set(k, v);
     else next.delete(k);
+    setParams(next, { replace: true });
+  };
+  const setChosen = (c: Chosen) => {
+    const next = new URLSearchParams(params);
+    for (const f of FACETS) {
+      const v = c[f.id] ?? [];
+      if (v.length) next.set(f.id, v.join(","));
+      else next.delete(f.id);
+    }
     setParams(next, { replace: true });
   };
 
   const group = STATUS_GROUPS[status] ?? null;
-  const b = branch.trim().toLowerCase();
-  const visible = React.useMemo(() => runs.filter((r) => (!group || group.includes(r.status)) && (!b || r.branch.toLowerCase().includes(b))), [runs, group, b]);
+  const words = query.trim().toLowerCase();
+  // A repository may be chosen by its id (an older link): its name is what rows carry.
+  const named = (f: (typeof FACETS)[number], v: string) => (f.id === "repo" ? (repos.find((r) => r.id === v)?.name ?? v) : v);
+  const passes = React.useCallback(
+    (r: Run, except?: string) =>
+      FACETS.every((f) => f.id === except || !chosen[f.id]?.length || (chosen[f.id] ?? []).some((v) => named(f, v) === f.of(r))) &&
+      (!words || [r.message, r.branch, r.pipeline, r.sha, r.author, r.repo_name].some((x) => x.toLowerCase().includes(words))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [params, words, repos],
+  );
+  const visible = React.useMemo(() => runs.filter((r) => (!group || group.includes(r.status)) && passes(r)), [runs, group, passes]);
   const counts = React.useMemo(() => {
     const c: Record<StatusFilter, number> = { all: 0, active: 0, failed: 0, succeeded: 0, cancelled: 0 };
     for (const r of runs) {
-      if (b && !r.branch.toLowerCase().includes(b)) continue;
+      if (!passes(r)) continue;
       c.all++;
       for (const k of ["active", "failed", "succeeded", "cancelled"] as const) if (STATUS_GROUPS[k]!.includes(r.status)) c[k]++;
     }
     return c;
-  }, [runs, b]);
+  }, [runs, passes]);
+  // Each facet's values among the runs loaded, each with how many it would show (the other facets as they are).
+  const facets: Facet[] = React.useMemo(
+    () =>
+      FACETS.map((f) => {
+        const n = new Map<string, number>();
+        for (const r of runs) if ((!group || group.includes(r.status)) && passes(r, f.id)) n.set(f.of(r), (n.get(f.of(r)) ?? 0) + 1);
+        if (f.id === "repo") for (const r of repos) if (!n.has(r.name)) n.set(r.name, 0);
+        return {
+          id: f.id,
+          label: f.label,
+          options: [...n.entries()]
+            .filter(([v]) => v)
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .map(([v, count]) => ({ id: v, label: v, count })),
+        };
+      }),
+    [runs, repos, group, passes],
+  );
 
-  const filtered = Boolean(repo || status !== "all" || branch);
-  // A repository chosen whose runs are still on their way: the list shown is the last one.
-  const pending = repoChoice !== repo;
+  const filtered = Boolean(Object.keys(chosen).length || status !== "all" || words);
 
   return (
     <>
@@ -165,17 +216,13 @@ function RunsBody() {
         status={status}
         onStatus={(v) => setParam("status", v)}
         counts={counts}
-        repos={repos}
-        repo={repoChoice}
-        onRepo={(v) => {
-          setRepoChoice(v);
-          setParam("repo", v);
-        }}
-        branch={branch}
-        onBranch={(v) => {
-          setBranch(v);
-          setParam("branch", v);
-        }}
+        facets={facets}
+        chosen={chosen}
+        onChosen={setChosen}
+        query={query}
+        onQuery={setQuery}
+        sort={sort}
+        onSort={(v) => setParam("sort", v)}
       />
 
       {visible.length === 0 && !hasMore ? (
@@ -187,8 +234,7 @@ function RunsBody() {
               <Button
                 variant="secondary"
                 onClick={() => {
-                  setBranch("");
-                  setRepoChoice("");
+                  setQuery("");
                   setParams(new URLSearchParams(), { replace: true });
                 }}
               >
@@ -196,7 +242,7 @@ function RunsBody() {
               </Button>
             }
           >
-            Try another repository, status, or branch.
+            Try another repository, status, branch or word.
           </EmptyState>
         ) : (
           <EmptyState
@@ -212,7 +258,7 @@ function RunsBody() {
           </EmptyState>
         )
       ) : (
-        <div className={cn("table-wrap transition-opacity", pending && "opacity-60")} aria-busy={pending || undefined}>
+        <div className="table-wrap">
           <table className="data-table">
             <RunsHead />
             <tbody>
@@ -301,20 +347,24 @@ function RunsToolbar({
   status,
   onStatus,
   counts,
-  repos,
-  repo,
-  onRepo,
-  branch,
-  onBranch,
+  facets,
+  chosen,
+  onChosen,
+  query,
+  onQuery,
+  sort,
+  onSort,
 }: {
   status: StatusFilter;
   onStatus: (v: StatusFilter) => void;
   counts: Record<StatusFilter, number> | null;
-  repos: Repo[];
-  repo: string;
-  onRepo: (v: string) => void;
-  branch: string;
-  onBranch: (v: string) => void;
+  facets: Facet[];
+  chosen: Chosen;
+  onChosen: (c: Chosen) => void;
+  query: string;
+  onQuery: (q: string) => void;
+  sort: Sort;
+  onSort: (v: Sort) => void;
 }) {
   return (
     <div className="mb-5 flex flex-wrap items-end gap-3">
@@ -331,15 +381,17 @@ function RunsToolbar({
         ]}
       />
       <div className="ml-auto flex w-full flex-wrap gap-3 sm:w-auto">
-        <SelectField
-          label="Repository"
-          hideLabel
-          className="min-w-0 flex-1 sm:w-56 sm:flex-none"
-          value={repo}
-          onChange={onRepo}
-          options={[{ value: "", label: "All repositories" }, ...repos.map((r) => ({ value: r.id, label: r.name }))]}
+        <FacetBox
+          className="min-w-0 flex-1 sm:w-80 sm:flex-none"
+          label="Filter runs"
+          placeholder="Repository, workflow, branch, event, author, or words…"
+          query={query}
+          onQuery={onQuery}
+          facets={facets}
+          chosen={chosen}
+          onChosen={onChosen}
         />
-        <SearchField className="min-w-0 flex-1 sm:w-52 sm:flex-none" label="Branch" placeholder="Branch…" value={branch} onChange={onBranch} />
+        <SelectField label="Sort" hideLabel className="min-w-0 sm:w-40" value={sort} onChange={(v) => onSort(v as Sort)} options={SORTS} />
       </div>
     </div>
   );
@@ -368,7 +420,18 @@ function RunsHold() {
   const noop = () => undefined;
   return (
     <>
-      <RunsToolbar status={(params.get("status") as StatusFilter | null) ?? "all"} onStatus={noop} counts={null} repos={[]} repo="" onRepo={noop} branch={params.get("branch") ?? ""} onBranch={noop} />
+      <RunsToolbar
+        status={(params.get("status") as StatusFilter | null) ?? "all"}
+        onStatus={noop}
+        counts={null}
+        facets={[]}
+        chosen={{}}
+        onChosen={noop}
+        query=""
+        onQuery={noop}
+        sort="newest"
+        onSort={noop}
+      />
       <TableHold head={<RunsHead />} rows={12} rowHeight={41} label="Loading runs" />
     </>
   );
