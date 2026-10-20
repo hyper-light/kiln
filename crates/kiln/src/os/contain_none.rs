@@ -33,6 +33,8 @@ impl Group {
     pub fn remove(&self) {}
 }
 
+pub fn hold_agents() {}
+
 pub fn session_of(_pid: u32) -> Option<String> {
     None
 }

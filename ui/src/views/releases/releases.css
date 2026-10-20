@@ -547,3 +547,26 @@
   font-size: 13px;
   font-weight: 600;
 }
+/* An environment's move between providers: how it stands, app by app. */
+.rel-move {
+  display: grid;
+  gap: 8px;
+}
+.rel-move .rel-history li {
+  flex-wrap: wrap;
+}
+.rel-move details {
+  flex-basis: 100%;
+}
+/* A choice beside a field, as tall as a touch target. */
+.rel-check {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+/* An object's actions sit at the end of its row. */
+.rel-objects li > button:last-child {
+  margin-left: auto;
+}

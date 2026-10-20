@@ -475,6 +475,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
+    // Acting on what runs (a restart, a scale, a pod deleted) is a deployer's.
+    r("POST", "/api/deploy/apps/*/environments/*/actions", "environments.deploy", At::Server),
     // An app's secrets (§3.5) are read as the rest of it (names and versions: no value is read
     // back), and set or deleted by those who manage secrets.
     any("/api/deploy/apps/*/environments/*/secrets/*", "secrets.manage", At::Server),
@@ -722,6 +724,9 @@ mod tests {
             (Method::DELETE, "/api/deploy/apps/web/environments/staging/secrets/DB_PASSWORD", "secrets.manage"),
             (Method::POST, "/api/deploy/secret-keys/rotate", "secrets.manage"),
             (Method::POST, "/api/deploy/apps/web/environments/staging", "environments.manage"),
+            (Method::GET, "/api/deploy/apps/web/environments/staging/actions", "runs.read"),
+            (Method::POST, "/api/deploy/apps/web/environments/staging/actions", "environments.deploy"),
+            (Method::POST, "/api/deploy/environments/staging/move", "environments.manage"),
         ] {
             assert_eq!(super::rule(&m, &segs(p)).capability, cap, "{m} {p}");
         }

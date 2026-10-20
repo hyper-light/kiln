@@ -68,14 +68,11 @@ pub async fn fetched(cd: &Arc<Cd>, repo: &str, commit: &str) -> anyhow::Result<(
 pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, commit: &str, release_url: &str, chart: bool) -> Result<AppDef, String> {
     let version = file.version.clone().ok_or("the release names no version")?;
     let values = format!("$release/{}", repo::values_file(&env.release_repo, app, &env.name));
-    let set = repo::filled_set(&app.package, file)?;
-    let raw_set = app.package.set();
-    // What comes from the release (a version, a tag, a digest) stays a string, whatever it looks
-    // like: Helm reads `--set image.tag=1.10` as the number 1.1.
-    let parameters: Vec<HelmParam> = set
+    // What runs is what release.json says: its package, what it sets, where it runs (§6).
+    let parameters: Vec<HelmParam> = repo::set_of(file)?
         .into_iter()
         .map(|(name, value)| {
-            let force_string = raw_set.get(&name).is_some_and(|t| t.contains("${{"));
+            let force_string = repo::sets_string(file, &name);
             HelmParam { name, value, force_string }
         })
         .collect();
@@ -86,8 +83,9 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
         ignore_missing_value_files: true,
         ..Helm::default()
     };
-    let kubernetes = Destination { cluster: env.targets.kubernetes.first().cloned().unwrap_or_else(|| apps::IN_CLUSTER.to_owned()), namespace: app.namespace().to_owned() };
-    let (package, destination) = match &app.package {
+    let namespace = file.namespace.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| app.namespace().to_owned());
+    let kubernetes = Destination { cluster: env.targets.kubernetes.first().cloned().unwrap_or_else(|| apps::IN_CLUSTER.to_owned()), namespace };
+    let (package, destination) = match &file.package {
         Package::Platform { provider, spec, repo: files, path } => {
             let place = env.targets.platforms.get(provider).ok_or_else(|| format!("{} has no {provider} target: give it targets.platforms.{provider}: {{ account: <integration>, … }}", env.name))?;
             let (target, extra) = kiln_cd::providers::target_of(provider, place).map_err(|e| format!("{}: {e}", env.name))?;
@@ -120,10 +118,10 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
             revision: version,
             chart: None,
             as_ref: None,
-            engine: if parameters.is_empty() && !chart { Engine::Auto } else { Engine::Helm(helm(vec![values])) },
+            engine: if parameters.is_empty() && !chart && file.helm != Some(true) { Engine::Auto } else { Engine::Helm(helm(vec![values])) },
         }, kubernetes),
     };
-    let platform = matches!(app.package, Package::Platform { .. });
+    let platform = matches!(file.package, Package::Platform { .. });
     // Its secrets, at the versions the release pinned, as one Secret (§3.5). A platform takes them
     // its own way, later.
     let secrets = match (platform, file.secrets.as_str()) {
@@ -145,6 +143,7 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
         sync: SyncPolicy { auto: !reg.paused, prune: env.sync.prune, self_heal: env.sync.self_heal, allow_empty: false, options, retry: None },
         ignore: Vec::new(),
         tracking: Tracking::Kiln,
+        tracking_name: None,
         origin: Origin::Api,
         environment: None,
         labels: BTreeMap::from([("kiln.dev/registration".to_owned(), format!("{}/{}", app.name, env.name)), ("kiln.dev/release".to_owned(), file.release.to_string())]),
@@ -269,6 +268,7 @@ mod tests {
             watch: Default::default(),
             concurrency: Default::default(),
             agents: Default::default(),
+            argocd: Default::default(),
         }
     }
 
@@ -304,6 +304,9 @@ mod tests {
             at: String::new(),
             rollback_of: None,
             secrets: String::new(),
+            namespace: None,
+            set: BTreeMap::new(),
+            helm: None,
         }
     }
 

@@ -20,7 +20,8 @@ pub const RELEASE_TRAILER: &str = "Kiln-Release";
 /// The trailer that names who asked for it.
 pub const REQUESTED_BY_TRAILER: &str = "Kiln-Requested-By";
 
-fn join(root: &str, rest: &str) -> String {
+/// A path in a release repository, under its root.
+pub fn join(root: &str, rest: &str) -> String {
     let root = root.trim_matches('/');
     if root.is_empty() { rest.to_owned() } else { format!("{root}/{rest}") }
 }
@@ -75,12 +76,15 @@ pub fn release_json(app: &App, env: &str, r: &Release, prior: Option<&ReleaseFil
         at: rfc3339(r.created_at),
         rollback_of: r.rollback_of,
         secrets: String::new(),
+        namespace: None,
+        set: BTreeMap::new(),
+        helm: None,
     }
 }
 
 /// `release.json` as a registration starts: enabled, by default, once a version lands.
 pub fn registered_json(app: &App, env: &str) -> ReleaseFile {
-    ReleaseFile {
+    let mut file = ReleaseFile {
         schema: SCHEMA,
         project: app.project.clone(),
         app: app.name.clone(),
@@ -94,7 +98,45 @@ pub fn registered_json(app: &App, env: &str) -> ReleaseFile {
         at: rfc3339(crate::util::now_unix()),
         rollback_of: None,
         secrets: String::new(),
+        namespace: None,
+        set: BTreeMap::new(),
+        helm: None,
+    };
+    // Nothing to fill without a version: where it runs, and how it renders, are known already.
+    let _ = resolve(&mut file, app, false);
+    file
+}
+
+/// Fills in what a release runs, so that every provider reads the same of it (§6): the package's
+/// chart version and `set` filled from the release's version and artifacts, where it runs, and
+/// whether it renders with Helm (`chart`: its git path holds a chart, as the caller found). A file
+/// without a version fills nothing.
+pub fn resolve(file: &mut ReleaseFile, app: &App, chart: bool) -> Result<(), String> {
+    let platform = matches!(file.package, Package::Platform { .. });
+    file.namespace = (!platform).then(|| app.namespace().to_owned());
+    if file.version.is_some() {
+        if let Package::Helm { chart_version: Some(v), .. } = &file.package {
+            let filled = fill(v, file)?;
+            if let Package::Helm { chart_version, .. } = &mut file.package {
+                *chart_version = Some(filled);
+            }
+        }
+        file.set = filled_set(&file.package, file)?;
     }
+    file.helm = (!platform).then(|| matches!(file.package, Package::Helm { .. }) || !file.package.set().is_empty() || chart);
+    Ok(())
+}
+
+/// What a release sets: what its file says, or, for a file from before kiln wrote it there, the
+/// package's `set` filled for it.
+pub fn set_of(file: &ReleaseFile) -> Result<BTreeMap<String, String>, String> {
+    if file.set.is_empty() { filled_set(&file.package, file) } else { Ok(file.set.clone()) }
+}
+
+/// Whether a value it sets stays a string, whatever it looks like: one filled from the release (a
+/// version, a tag, a digest), as Helm reads `--set image.tag=1.10` as the number 1.1.
+pub fn sets_string(file: &ReleaseFile, name: &str) -> bool {
+    file.package.set().get(name).is_some_and(|t| t.contains("${{"))
 }
 
 pub fn encode(f: &ReleaseFile) -> anyhow::Result<Vec<u8>> {
@@ -338,6 +380,43 @@ mod tests {
         assert_eq!(filled_set(&app().package, &deploy)?.get("kiln.release").map(String::as_str), Some("42"));
         assert!(fill("${{ release.nope }}", &deploy).is_err());
         assert_eq!(fill("v${{release.version}}-x", &deploy)?, "v1.4.2-x");
+        Ok(())
+    }
+
+    #[test]
+    fn release_json_says_what_runs_for_every_provider_to_read() -> Result<(), String> {
+        let mut a = app();
+        a.namespace = Some("shop-web".into());
+        if let Package::Helm { chart_version, .. } = &mut a.package {
+            *chart_version = Some("${{ release.version }}-chart".into());
+        }
+        let mut f = release_json(&a, "staging", &release(Kind::Deploy, Some("1.4.2")), None, true);
+        resolve(&mut f, &a, false)?;
+        assert_eq!(f.namespace.as_deref(), Some("shop-web"));
+        assert_eq!(f.set.get("image.tag").map(String::as_str), Some("1.4.2"), "filled from the release's artifacts");
+        assert_eq!(f.helm, Some(true));
+        assert!(matches!(&f.package, Package::Helm { chart_version: Some(v), .. } if v == "1.4.2-chart"), "its chart's version filled");
+        assert!(sets_string(&f, "image.tag") && !sets_string(&f, "nope"), "a value the release filled stays a string");
+        // What the file says is what runs, even edited by hand.
+        f.set.insert("image.tag".into(), "by-hand".into());
+        assert_eq!(set_of(&f)?.get("image.tag").map(String::as_str), Some("by-hand"));
+        // A file from before kiln wrote `set`: the package's, filled.
+        f.set.clear();
+        assert_eq!(set_of(&f)?.get("image.tag").map(String::as_str), Some("1.4.2"));
+        // Registered, no version: nothing to fill, where it runs known already.
+        let r = registered_json(&a, "staging");
+        assert_eq!((r.namespace.as_deref(), r.set.is_empty(), r.helm), (Some("shop-web"), true, Some(true)));
+        // A git path is Helm when it sets something, or holds a chart.
+        let git = App { package: Package::Git { repo: "https://github.com/acme/web".into(), path: "deploy".into(), set: BTreeMap::new() }, ..app() };
+        let mut g = release_json(&git, "staging", &release(Kind::Deploy, Some("1.4.2")), None, true);
+        resolve(&mut g, &git, false)?;
+        assert_eq!(g.helm, Some(false));
+        resolve(&mut g, &git, true)?;
+        assert_eq!(g.helm, Some(true));
+        // One the release can't fill is refused before its commit.
+        let bad = App { package: Package::Helm { repo: "oci://r".into(), chart: "web".into(), chart_version: None, set: BTreeMap::from([("x".into(), "${{ release.artifacts.nope.tag }}".into())]) }, ..app() };
+        let mut b = release_json(&bad, "staging", &release(Kind::Deploy, Some("1.4.2")), None, true);
+        assert!(resolve(&mut b, &bad, false).is_err());
         Ok(())
     }
 

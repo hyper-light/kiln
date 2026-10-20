@@ -1134,9 +1134,24 @@ impl Cd {
                     _ => break 'watch,
                 };
                 let mut buf: Vec<u8> = Vec::new();
+                let mut idle = Duration::ZERO;
                 loop {
-                    let chunk = crate::rt::timeout(Duration::from_secs(330), kube::next_chunk(resp.body_mut())).await;
-                    let Ok(Ok(Some(bytes))) = chunk else { continue 'watch };
+                    // An app that tracks as Argo CD does needs objects without kiln's label: what
+                    // the cluster is watched for changed, and it's listed again at once.
+                    if self.selector(&cluster) != selector {
+                        break 'watch;
+                    }
+                    let chunk = crate::rt::timeout(Duration::from_secs(5), kube::next_chunk(resp.body_mut())).await;
+                    let bytes = match chunk {
+                        Ok(Ok(Some(bytes))) => bytes,
+                        // Quiet: the stream is watched again after a while, as before.
+                        Err(_) if idle < Duration::from_secs(330) => {
+                            idle += Duration::from_secs(5);
+                            continue;
+                        }
+                        _ => continue 'watch,
+                    };
+                    idle = Duration::ZERO;
                     buf.extend_from_slice(&bytes);
                     for line in kiln_cd::kube::take_lines(&mut buf) {
                         match kiln_cd::kube::watch_event(&line) {
