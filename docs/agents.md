@@ -243,8 +243,9 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control's child disclosure includes both kiln sessions an agent started and the native
-subagents its harness reports. Native subagents show their own status and open their work inside
+Mission Control shows kiln sessions and native subagents in a flat list, without relationship
+labels or nested disclosures. Search, status filters and sorting apply to each row independently.
+Native subagents show their own status and open their work inside
 the parent's conversation, including after they finish. The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
@@ -542,8 +543,8 @@ resolved; dismissing is a person's). A failure that keeps coming back from rerun
 tells the agent to stop rerunning. An incident waits for a person instead (`waiting`, saying why)
 while its attachment is paused, past its limit for the day, or when its agent couldn't start.
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
-its workflows' and environments' too. Mission Control puts the agents an attachment woke under it,
-and their questions come to Needs you and to notifications as any agent's do. A runner doctor's
+its workflows' and environments' too. Mission Control lists the agents an attachment woke with
+the other agents; their questions come to Needs you and to notifications as any agent's do. A runner doctor's
 open incident shows in the runner's row in Settings → Updates.
 
 | Operation | Route | |

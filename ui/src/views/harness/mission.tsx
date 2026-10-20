@@ -29,7 +29,8 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { AgentFamilies } from "./family";
+import { NativeTask } from "./family";
+import { missionRows, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { PushOffer } from "./push-offer";
@@ -37,9 +38,6 @@ import { RowChange, RowReview } from "./change-bar";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
-
-/** Where an agent stands. */
-type Stand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended";
 
 function standOf(a: AgentInfo, seen: number | undefined): Stand {
   if (a.approvals.length > 0 || a.status === "waiting") return "needs";
@@ -126,7 +124,7 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
 }
 
 /** A row re-renders only when its own agent changes (or is selected); its clock counts by itself. */
-const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void; of?: string }) {
+const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void }) {
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   const ap = a.approvals[0];
@@ -155,10 +153,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: A
         </div>
       ) : (
         <button type="button" className="ms-main" onClick={open}>
-          <span className="ms-name">
-            {label}
-            {of && <span className="ms-of">started by {of}</span>}
-          </span>
+          <span className="ms-name">{label}</span>
           {line}
         </button>
       )}
@@ -217,13 +212,14 @@ const LEAD = "Every coding agent kiln runs, on every machine.";
 function Lead({ short }: { short?: boolean }) {
   const list = useAgentList();
   const seen = useSeen();
-  const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  const managed = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  const all = React.useMemo(() => missionRows(managed), [managed]);
   const n = (s: Stand) => all.filter((r) => r.stand === s).length;
   const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
   const status = [
     n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`,
     n("crashed") && `${n("crashed")} stopped`,
-    n("paused") && `${n("paused")} paused for a usage limit`,
+    n("paused") && `${n("paused")} paused`,
     n("working") && `${n("working")} working`,
     n("finished") && `${n("finished")} finished`,
   ]
@@ -437,7 +433,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const phone = useMediaQuery(PHONE);
   const [messaging, setMessaging] = React.useState(false);
 
-  const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  const managed = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  const all = React.useMemo(() => missionRows(managed), [managed]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
   // to find a name are not. The list holds still while agents work: see useShownList.
   const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.list", DEFAULT_VIEW);
@@ -445,6 +442,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const [q, setQ] = React.useState("");
   const shown = useShownList(all, q, view, true);
   const { live, ended } = shown;
+  const managedLive = live.filter((r) => !r.native);
+  const managedEnded = ended.filter((r) => !r.native);
+  const selectable = [...managedLive, ...managedEnded];
   const filtered = isFiltered(q, view.facets);
 
   const select = React.useCallback((id: string, on: boolean) => {
@@ -456,27 +456,30 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
     });
   }, []);
   // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
-  const shownIds = [...live, ...ended].map((r) => r.a.id).join(",");
+  const shownIds = selectable.map((r) => r.a.id).join(",");
   const [wasShown, setWasShown] = React.useState(shownIds);
   if (wasShown !== shownIds) {
     setWasShown(shownIds);
     const here = new Set(shownIds.split(","));
     if (![...selected].every((id) => here.has(id))) setSelected(new Set([...selected].filter((id) => here.has(id))));
   }
-  const checked = [...live, ...ended].filter((r) => selected.has(r.a.id));
-  const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
-  const some = liveChecked > 0 && liveChecked < live.length;
+  const checked = selectable.filter((r) => selected.has(r.a.id));
+  const liveChecked = managedLive.filter((r) => selected.has(r.a.id)).length;
+  const some = liveChecked > 0 && liveChecked < managedLive.length;
   const allBox = React.useCallback(
     (el: HTMLInputElement | null) => {
       if (el) el.indeterminate = some;
     },
     [some],
   );
-  // The message goes to what's checked; with nothing checked, to every agent the list shows.
-  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
+  // Only real sessions can receive commands; native rows are views into existing threads.
+  const targets = checked.length > 0 ? checked.map((r) => r.a) : managedLive.map((r) => r.a);
   const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
   const message = <MessageBar agents={targets} reach={reach} onEnded={() => setSelected(new Set())} />;
   const folds = phone && checked.length === 0;
+  const renderRow = ({ a, stand, native }: MissionRow) => native
+    ? <NativeTask key={a.id} agent={native.agent} task={native.task} />
+    : <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />;
 
   return (
     <>
@@ -485,7 +488,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
           {!phone && message}
           <React.Suspense fallback={null}>
-            <Recover rows={all} />
+            <Recover rows={managed} />
           </React.Suspense>
           <React.Suspense fallback={null}>
             <PushOffer />
@@ -509,14 +512,14 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 ref={allBox}
                 type="checkbox"
                 className="check"
-                disabled={live.length === 0}
-                checked={live.length > 0 && liveChecked === live.length}
-                onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
-                aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+                disabled={managedLive.length === 0}
+                checked={managedLive.length > 0 && liveChecked === managedLive.length}
+                onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...managedLive.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !managedLive.some((r) => r.a.id === id))))}
+                aria-label={filtered ? `Select the ${managedLive.length} agents shown` : `Select all ${managedLive.length} agents`}
               />
               <span>
                 {checked.length > 0
-                  ? `${checked.length} of ${live.length + ended.length} selected`
+                  ? `${checked.length} of ${selectable.length} selected`
                   : filtered
                     ? `${live.length + ended.length} of ${all.length} agents`
                     : `${all.length} agent${all.length === 1 ? "" : "s"}`}
@@ -542,7 +545,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
             <ul className="ms-list">
-              <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
+              {live.map(renderRow)}
             </ul>
           ) : filtered && ended.length === 0 ? (
             <p className="ms-quiet">
@@ -569,7 +572,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
       <React.Suspense fallback={null}>
-        <Found all={all} />
+        <Found all={managed} />
       </React.Suspense>
 
       {ended.length > 0 && (
@@ -579,13 +582,13 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
               <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
               Ended · {ended.length}
             </button>
-            <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
+            {managedEnded.length > 0 && <button type="button" className="ms-link" onClick={() => void Promise.allSettled(managedEnded.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
               Clear
-            </button>
+            </button>}
           </div>
           {showEnded && (
             <ul className="ms-list">
-              <AgentFamilies rows={ended} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
+              {ended.map(renderRow)}
             </ul>
           )}
         </section>
