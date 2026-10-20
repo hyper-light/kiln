@@ -569,6 +569,265 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     Ok(())
 }
 
+/// An OTLP traces request of `traces` traces of `sender`'s service (`load-svc-<sender>`), trace `n`
+/// on from `first`, each a server's span, its call out and its database's query (both clients'):
+/// every id its own, the times now's.
+fn traces_request(sender: u64, first: u64, traces: u64, now_ns: u64) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.message(1, |rs| {
+        rs.message(1, |res| {
+            kv(res, 1, "service.name", &format!("load-svc-{sender}"));
+            kv(res, 1, "host.name", &format!("load-{sender}"));
+            kv(res, 1, "deployment.environment.name", "load");
+        });
+        rs.message(2, |ss| {
+            ss.message(1, |sc| sc.str(1, "load"));
+            for t in first..first + traces {
+                let trace = trace_id(sender, t);
+                let span = |k: u64| ((sender << 48) | (t * 3 + k + 1)).to_be_bytes();
+                let start = now_ns + (t - first) * 1_000;
+                for (k, kind, name, parent) in [(0u64, 2u64, "GET /orders/{id}", None), (1, 3, "GET", Some(0u64)), (2, 3, "SELECT orders", Some(1u64))] {
+                    ss.message(2, |sp| {
+                        sp.bytes(1, &trace);
+                        sp.bytes(2, &span(k));
+                        if let Some(p) = parent {
+                            sp.bytes(4, &span(p));
+                        }
+                        sp.str(5, name);
+                        sp.varint(6, kind);
+                        sp.fixed64(7, start + k * 100_000);
+                        sp.fixed64(8, start + 3_000_000 - k * 1_000_000);
+                        match k {
+                            0 => kv(sp, 9, "http.route", "/orders/{id}"),
+                            1 => kv(sp, 9, "server.address", "orders.internal"),
+                            _ => kv(sp, 9, "db.system.name", "postgresql"),
+                        }
+                    });
+                }
+            }
+        });
+    });
+    w.buf
+}
+
+/// Trace `t` of `sender`'s id.
+fn trace_id(sender: u64, t: u64) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let (hi, lo) = id.split_at_mut(8);
+    hi.copy_from_slice(&(sender + 1).to_be_bytes());
+    lo.copy_from_slice(&(t + 1).to_be_bytes());
+    id
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// docs/observe.md §13: traces under load, end to end. Senders flood OTLP/HTTP trace requests
+/// (protobuf, gzip, kept alive) as fast as they are answered, half to the server and half to the
+/// runner's receiver, while a reader looks traces up by their ids and asks for the services. What it
+/// proves: every span answered 200 is stored once (one answered 503 was not taken, and is sent
+/// again), each trace whole and found by its id; Datadog's trace metrics count each entry span and
+/// each call out once; every replica holds the same. What it measures: spans a second taken, how
+/// long an answer and a trace's lookup take, how long until a trace can be read, and the server's
+/// and the runner's CPU, memory and page faults.
+///
+/// `cargo test --release -p kiln --test observe_load -- --ignored --nocapture a_trace_flood`, with
+/// `KOBS_LOAD_SECS` (20), `KOBS_LOAD_SENDERS` (8), `KOBS_LOAD_TRACES` (170 a request: 510 spans, a
+/// batch span processor's 512 at the most).
+#[test]
+#[ignore = "starts real processes and loads them"]
+fn a_trace_flood_is_taken_or_refused_never_lost_counted_once_and_replicas_agree() -> anyhow::Result<()> {
+    let secs = env("KOBS_LOAD_SECS", 20);
+    let senders = env("KOBS_LOAD_SENDERS", 8);
+    let traces = env("KOBS_LOAD_TRACES", 170);
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());
+    let runner_pid = f.runners.get("r1").and_then(Option::as_ref).map_or(0, |p| p.child.id());
+    let (s_cpu0, _) = usage(server_pid);
+    let s_flt0 = MINFLT.with(std::cell::Cell::get);
+    let (r_cpu0, _) = usage(runner_pid);
+    let r_flt0 = MINFLT.with(std::cell::Cell::get);
+    let (s_threads0, r_threads0) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
+
+    let t0_ms = common::now_ms();
+    let stop = Arc::new(AtomicBool::new(false));
+    // Each sender's last trace taken: what the reader looks up.
+    let latest: Arc<std::sync::Mutex<Vec<Option<[u8; 16]>>>> = Arc::new(std::sync::Mutex::new(vec![None; senders as usize]));
+    let started = Instant::now();
+    let mut threads = Vec::new();
+    for sender in 0..senders {
+        let (stop, ingest, latest) = (stop.clone(), ingest.clone(), latest.clone());
+        let (port, auth) = if sender % 2 == 0 { (f.http, format!("Authorization: Bearer {ingest}\r\n")) } else { (r1, String::new()) };
+        threads.push(std::thread::spawn(move || -> (Sent, u64) {
+            let mut sent = Sent::default();
+            let mut conn = Conn::new(port);
+            let headers = format!("{auth}Content-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n");
+            let mut next = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let now_ns = common::now_ms() as u64 * 1_000_000;
+                let body = traces_request(sender, next, traces, now_ns);
+                let body = gzip(&body).unwrap_or(body);
+                let t = Instant::now();
+                let answer = conn.send("/v1/traces", &headers, &body);
+                sent.latencies_us.push(t.elapsed().as_micros() as u64);
+                sent.requests += 1;
+                match answer {
+                    // A partial success says spans were refused: none should be.
+                    Ok(a) if a.code == 200 && a.body.is_empty() => {
+                        sent.taken += traces * 3;
+                        next += traces;
+                        if let Ok(mut l) = latest.lock()
+                            && let Some(slot) = l.get_mut(sender as usize)
+                        {
+                            *slot = Some(trace_id(sender, next - 1));
+                        }
+                    }
+                    Ok(a) if a.code == 503 => {
+                        sent.refused += traces * 3;
+                        std::thread::sleep(Duration::from_millis(a.retry_after.map_or(100, |s| s * 1000).min(2_000)));
+                    }
+                    Ok(a) => sent.errors.push(format!("{}: {}", a.code, String::from_utf8_lossy(&a.body))),
+                    Err(e) => sent.errors.push(e.to_string()),
+                }
+                if sent.errors.len() > 20 {
+                    break;
+                }
+            }
+            (sent, next)
+        }));
+    }
+    // A trace looked up by its id meanwhile, each sender's newest in turn, and the services.
+    let reader = {
+        let (stop, port, admin, latest) = (stop.clone(), f.http, f.admin.clone(), latest.clone());
+        std::thread::spawn(move || -> (Vec<u64>, Vec<u64>, u64, Vec<String>) {
+            let (mut lookups, mut services, mut not_yet, mut errors) = (Vec::new(), Vec::new(), 0u64, Vec::new());
+            let mut turn = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let id = latest.lock().ok().and_then(|l| l.get(turn % l.len().max(1)).copied().flatten());
+                turn += 1;
+                if let Some(id) = id {
+                    match timed_get(port, &format!("/api/observe/v1/traces/{}", hex(&id)), &admin, Duration::from_secs(30)) {
+                        Ok(d) => lookups.push(d.as_micros() as u64),
+                        // Taken and not yet written: a lookup of a trace a moment too soon.
+                        Err(e) if e.contains("404") => not_yet += 1,
+                        Err(e) => errors.push(format!("trace: {e}")),
+                    }
+                }
+                if turn % 8 == 0 {
+                    let to = common::now_ms();
+                    match timed_get(port, &format!("/api/observe/v1/apm/services?from={}&to={to}", to - 900_000), &admin, Duration::from_secs(30)) {
+                        Ok(d) => services.push(d.as_micros() as u64),
+                        Err(e) => errors.push(format!("services: {e}")),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            (lookups, services, not_yet, errors)
+        })
+    };
+    std::thread::sleep(Duration::from_secs(secs));
+    stop.store(true, Ordering::Relaxed);
+    let flood = started.elapsed();
+    let mut all = Sent::default();
+    let mut sent_traces: Vec<u64> = Vec::new();
+    for t in threads {
+        let (s, n) = t.join().map_err(|_| anyhow::anyhow!("a sender panicked"))?;
+        all.taken += s.taken;
+        all.refused += s.refused;
+        all.requests += s.requests;
+        all.errors.extend(s.errors);
+        all.latencies_us.extend(s.latencies_us);
+        sent_traces.push(n);
+    }
+    let (mut lookups, mut services, not_yet, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
+    anyhow::ensure!(all.errors.is_empty(), "senders' errors (but 503s): {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), f.logs());
+    anyhow::ensure!(read_errors.is_empty(), "the reader's errors: {:?}", read_errors.iter().take(5).collect::<Vec<_>>());
+
+    // Readable: each sender's newest trace, whole, by its id.
+    let settled = Instant::now();
+    for (sender, n) in sent_traces.iter().enumerate() {
+        let Some(last) = n.checked_sub(1) else { continue };
+        let id = hex(&trace_id(sender as u64, last));
+        loop {
+            let t = f.call("GET", &format!("/api/observe/v1/traces/{id}"), None).ok();
+            if t.as_ref().is_some_and(|t| at(t, &["spans"]).as_array().is_some_and(|s| s.len() == 3)) {
+                break;
+            }
+            anyhow::ensure!(settled.elapsed() < Duration::from_secs(120), "sender {sender}'s newest trace never readable\n{}", f.logs());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let lag = settled.elapsed();
+    // Every span taken stored once: their count settles at what was taken, no more, no less.
+    let (from, to) = (t0_ms - 60_000, common::now_ms() + 60_000);
+    let count = |q: &str| -> anyhow::Result<u64> {
+        let a = f.call("POST", "/api/observe/v1/spans/aggregate", Some(&json!({ "query": q, "from": from, "to": to, "measure": "count" })))?;
+        Ok(at(&a, &["groups"]).as_array().into_iter().flatten().filter_map(|g| at(g, &["value"]).as_f64()).sum::<f64>().round() as u64)
+    };
+    let mut have = 0;
+    while settled.elapsed() < Duration::from_secs(180) {
+        have = count("service:load-svc-*")?;
+        if have >= all.taken {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    anyhow::ensure!(have == all.taken, "{} spans taken, {have} stored\n{}", all.taken, f.logs());
+    // Datadog's trace metrics: each trace's request an entry, its two calls exits, counted once as
+    // their windows settle.
+    let taken_traces = all.taken / 3;
+    let metric = |q: &str| -> anyhow::Result<f64> {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": 10_000 })))?;
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().filter(|s| at(s, &["tags", "service"]).as_str().is_some_and(|v| v.starts_with("load-svc-"))).flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum())
+    };
+    let counted_at = Instant::now();
+    let (mut hits, mut outbound) = (0.0, 0.0);
+    while counted_at.elapsed() < Duration::from_secs(120) {
+        hits = metric("sum:trace.hits{*} by {service}.as_count()")?;
+        outbound = metric("sum:trace.outbound.hits{*} by {service}.as_count()")?;
+        if hits >= taken_traces as f64 && outbound >= 2.0 * taken_traces as f64 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let counted = counted_at.elapsed();
+    anyhow::ensure!(hits == taken_traces as f64 && outbound == 2.0 * taken_traces as f64, "{taken_traces} traces taken: trace.hits {hits}, trace.outbound.hits {outbound}\n{}", f.logs());
+    let s = f.status()?;
+    let dropped = at(&s, &["dropped"]).as_u64().unwrap_or(0) + at(&s, &["machines"]).as_array().into_iter().flatten().map(|m| at(m, &["status", "dropped"]).as_u64().unwrap_or(0)).sum::<u64>();
+    anyhow::ensure!(dropped == 0, "{dropped} dropped for room after being taken\n{}", f.logs());
+    let (s_cpu1, s_rss) = usage(server_pid);
+    let s_flt = MINFLT.with(std::cell::Cell::get) - s_flt0;
+    let (r_cpu1, r_rss) = usage(runner_pid);
+    let r_flt = MINFLT.with(std::cell::Cell::get) - r_flt0;
+    let (s_threads1, r_threads1) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
+    let (index, digest) = f.verify(2)?;
+
+    all.latencies_us.sort_unstable();
+    lookups.sort_unstable();
+    services.sort_unstable();
+    let ms = |us: u64| us as f64 / 1000.0;
+    eprintln!("\ntraces under load: {senders} senders × {} spans a request (gzip), {:.1} s", traces * 3, flood.as_secs_f64());
+    eprintln!("  taken      {:>12} spans, {:>10.0} spans/s, {} requests", all.taken, all.taken as f64 / flood.as_secs_f64(), all.requests);
+    eprintln!("  refused    {:>12} spans (503, sent again when told), {:.2}% of requests", all.refused, 100.0 * (all.refused / (traces * 3).max(1)) as f64 / all.requests.max(1) as f64);
+    eprintln!("  a request  p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms", ms(pct(&all.latencies_us, 0.5)), ms(pct(&all.latencies_us, 0.99)), ms(pct(&all.latencies_us, 1.0)));
+    eprintln!("  a trace    by its id, p50 {:.2} ms, p99 {:.2} ms ({} lookups, {not_yet} a moment too soon)", ms(pct(&lookups, 0.5)), ms(pct(&lookups, 0.99)), lookups.len());
+    eprintln!("  services   p50 {:.2} ms, p99 {:.2} ms ({} reads)", ms(pct(&services, 0.5)), ms(pct(&services, 0.99)), services.len());
+    eprintln!("  readable   every sender's newest trace {:.0} ms after the flood; trace metrics counted {:.1} s after", lag.as_secs_f64() * 1000.0, counted.as_secs_f64());
+    eprintln!("  server     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.4} minor faults a span", s_cpu1 - s_cpu0, (s_cpu1 - s_cpu0) / flood.as_secs_f64(), s_rss as f64 / 1048576.0, s_flt as f64 / all.taken.max(1) as f64);
+    eprintln!("    by thread: {}", spent(&s_threads0, &s_threads1));
+    eprintln!("  runner     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.4} minor faults a span", r_cpu1 - r_cpu0, (r_cpu1 - r_cpu0) / flood.as_secs_f64(), r_rss as f64 / 1048576.0, r_flt as f64 / all.taken.max(1) as f64);
+    eprintln!("    by thread: {}", spent(&r_threads0, &r_threads1));
+    eprintln!("  where      the server's {}; the runner's {}", anon_by_mapping(server_pid), anon_by_mapping(runner_pid));
+    eprintln!("  replicas   agree at index {index}: {digest:016x}");
+    f.stop_gently();
+    Ok(())
+}
+
 /// A runner flooded while its server is away (killed: SIGKILL) keeps taking only while its queue's
 /// wait is short, then refuses (503) in a couple of seconds, its memory bounded; the server back,
 /// it drains, and everything it took is stored once, every replica alike.

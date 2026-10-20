@@ -2755,6 +2755,19 @@ stored exactly once, the replicas alike; and a runner flooded while its server i
 and later started again: it refuses in time (0.5 s at full rate, 2.4 s at 100 k points a second),
 its memory bounded, and everything it took is stored once the server is back.
 
+**Traces under load** (`observe_load.rs`, `a_trace_flood_…`): eight senders flood OTLP/HTTP trace
+requests (510 spans each, gzip, kept alive) as fast as they are answered, half to the server and
+half to a runner's receiver, each trace a server's span, its call out and a database's query, while
+a reader looks traces up by their ids and asks for the services. Every span answered 200 is stored
+once (counted by an aggregate over the range: what was taken, no more, no less), each sender's newest
+trace whole by its id; the trace metrics count each request once and each call out once
+(`trace.hits` the traces taken, `trace.outbound.hits` twice them), as their windows settle; the
+replicas agree. 2026-10-20, fedora (32 threads others share), 20 s: 6.6 M spans taken, 330 k a
+second, 1.2% of requests refused (503, sent again when told); an answer 0.45 ms p50, 1.2 ms p99; a
+trace by its id 44 ms p50, 184 ms p99 meanwhile; the newest trace readable 131 ms after the flood,
+the trace metrics counted 18 s after (their windows' settling, §8.3); the server 1.7 cores and 390
+MiB at its peak, the runner 0.75 cores and 340 MiB; 0.013 page faults a span.
+
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is
 measured an hour ahead from its writes and said so once; its own figures, an hour ahead, are dropped
