@@ -2,8 +2,9 @@
 //! - every route refuses a token that may do nothing;
 //! - every YAML kiln reads from a repository refuses a bomb, at once;
 //! - webhooks and channels never reach this machine or a private network unless allowed;
-//! - a secret a run uses appears nowhere: not in its logs, the API, the events or the database's
-//!   files.
+//! - a secret a run uses appears nowhere: not in its logs, the API (every read of the route
+//!   table, and every read-only operation the MCP tools are made of: W09-AC02), the events or
+//!   the database's files.
 //!
 //! Fork isolation is W18-AC03's, signed URLs W08-AC04's, and archives the runner's own test
 //! (`w22_ac07_tarball_stays_in_the_workspace`).
@@ -271,6 +272,110 @@ jobs:
     // The secret was used: the logs show it masked.
     assert!(logs.contains("plain: ***") && logs.contains("next step ***"), "{logs}");
     seen.push(("logs".into(), logs));
+
+    // W09-AC02: every read of the route table, its parameters the run's ids (and its `**` the
+    // tails reads have), and every read-only operation, as an MCP tool calls it.
+    let leg = legs.first().cloned().unwrap_or_default();
+    let ids = [id.as_str(), leg.as_str(), "acme%2Fleak", "acme", "LEAKY", "leak", "0", "1"];
+    let tails = [
+        "annotations",
+        "summary",
+        "graph",
+        "tests",
+        "artifacts",
+        "attempts",
+        "outputs",
+        "jobs",
+        "logs",
+        "names",
+        "workflows",
+        "secrets",
+        "variables",
+        "environments",
+        "metrics",
+        "LEAKY",
+        "kinds",
+        "policy",
+        "subject",
+        "jwks-export",
+        "nobody",
+        "viewer",
+        "0",
+    ];
+    // Each path bare, and with what reads of a scope, a repository or words take.
+    let queries = ["", "?scope=repo%3Aacme%2Fleak", "?repo=acme%2Fleak", "?q=plain"];
+    let (mut walked, mut answered, mut silent) = (0usize, 0usize, Vec::new());
+    for rule in kiln::authz::ROUTES {
+        // Streams and sockets aren't reads that end; updates ask the internet.
+        if rule.method.is_some_and(|m| m != "GET") || rule.pattern.ends_with("/ws") || rule.pattern.ends_with("/terminal") || rule.pattern == "/api/events" || rule.pattern.starts_with("/api/updates")
+        {
+            continue;
+        }
+        walked += 1;
+        let mut paths = vec![String::new()];
+        for seg in rule.pattern.split('/').filter(|s| !s.is_empty()) {
+            let options: Vec<&str> = match seg {
+                "*" => ids.to_vec(),
+                "**" => tails.to_vec(),
+                s => vec![s],
+            };
+            paths = paths.iter().flat_map(|p| options.iter().map(move |o| format!("{p}/{o}"))).take(48).collect();
+        }
+        let mut any = false;
+        for path in paths {
+            for q in queries {
+                let (status, body) = http(s.port, "GET", &format!("{path}{q}"), &s.admin, None)?;
+                if (200..300).contains(&status) {
+                    any = true;
+                    seen.push((format!("GET {path}{q}"), body));
+                }
+            }
+        }
+        if any {
+            answered += 1;
+        } else {
+            silent.push(rule.pattern);
+        }
+    }
+    // Where a value could be: each of these answered (a secret's own routes only write).
+    for pattern in ["/api/ci/secrets", "/api/ci/variables", "/api/ci/runs/*", "/api/ci/runs/*/**", "/api/ci/legs/*", "/api/ci/legs/*/logs"] {
+        assert!(!silent.contains(&pattern), "{pattern} answered nothing");
+    }
+    // (66 of 108 when written: the rest have nothing to show on this server.)
+    assert!(walked > 90 && answered >= 55, "{answered} of {walked} reads answered; none did for {silent:?}");
+    let (st, body) = http(s.port, "GET", "/api/ops", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "the operations: {st} {body}");
+    let (mut tools, mut told) = (0usize, 0usize);
+    for op in serde_json::from_str::<Value>(&body)?.get("operations").and_then(Value::as_array).into_iter().flatten().filter(|o| o.get("read_only") == Some(&json!(true))) {
+        let name = op.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut input = serde_json::Map::new();
+        for (k, spec) in op.pointer("/input/properties").and_then(Value::as_object).into_iter().flatten() {
+            let v = match (k.as_str(), spec.get("type").and_then(Value::as_str)) {
+                ("run", _) => json!(id),
+                ("leg", _) => json!(leg),
+                ("repo", _) => json!("acme/leak"),
+                ("scope", _) => json!("repo:acme/leak"),
+                ("name", _) => json!("LEAKY"),
+                ("workflow", _) => json!("leak.yml"),
+                ("job", _) => json!("leak"),
+                (_, Some("integer" | "number")) => json!(5),
+                (_, Some("boolean")) => json!(false),
+                (_, Some("array")) => json!([]),
+                (_, Some("object")) => json!({}),
+                _ => json!("leak"),
+            };
+            input.insert(k.clone(), v);
+        }
+        tools += 1;
+        let (status, body) = http(s.port, "POST", &format!("/api/ops/{name}"), &s.admin, Some(&Value::Object(input)))?;
+        if (200..300).contains(&status) {
+            told += 1;
+        }
+        seen.push((format!("the {name} tool"), body));
+    }
+    // (39 of 58 when written.)
+    assert!(tools > 40 && told >= 30, "{told} of {tools} read-only tools answered");
+    eprintln!("W09-AC02: {answered} of {walked} reads answered, {told} of {tools} read-only tools; none had the value");
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let streamed = stream.join().unwrap_or_default();
     assert!(streamed.starts_with("HTTP/1.1 101") && streamed.contains("\"type\""), "no events came: {}", streamed.chars().take(200).collect::<String>());
