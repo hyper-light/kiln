@@ -13,8 +13,8 @@ import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { Loadable, Loading } from "@/components/ui/loading";
-import { PageIntro, SelectField } from "@/components/ui/misc";
+import { Loadable } from "@/components/ui/loading";
+import { PageIntro, SelectField, Skeleton } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { useAgentsLive } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
@@ -211,6 +211,28 @@ function standsOf(list: AgentInfo[], seen: Record<string, number>, done: Readonl
   });
 }
 
+/** Before the agents are known: the list's shape, so nothing moves when they come. */
+function RowsLoading() {
+  return (
+    <div className="ms-loading" role="status" aria-label="Loading agents">
+      <Skeleton className="ms-loading-bar" />
+      <ul className="ms-list" aria-hidden="true">
+        {[62, 48, 70, 54, 40].map((w, i) => (
+          <li key={i} className="ms-row ms-loading-row" style={{ opacity: 1 - i * 0.15 }}>
+            <span className="ms-main">
+              <Skeleton className="ms-loading-name" style={{ width: `${w}%` }} />
+              <Skeleton className="ms-loading-line" style={{ width: `${w + 16}%` }} />
+            </span>
+            <span className="ms-meta">
+              <Skeleton className="ms-loading-meta" />
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /** What the page's lead says before the agents are known. */
 const LEAD = "Every coding agent kiln runs, on every machine.";
 
@@ -291,7 +313,7 @@ export default function Mission() {
           )
         }
       />
-      <Loadable label="Loading agents" fallback={<Loading label="Loading agents" block />}>
+      <Loadable label="Loading agents" fallback={<RowsLoading />}>
         <Agents onSpawn={() => setSpawn(true)} />
       </Loadable>
       <SpawnDialog

@@ -1065,3 +1065,28 @@ html[data-motion="paused"] .ms-pick {
     opacity: 0;
   }
 }
+
+/* Before the agents are known (RowsLoading): the bar and a few rows, in their own sizes. */
+.ms-loading-bar {
+  height: 40px;
+  margin-bottom: 18px;
+  border-radius: 7px;
+}
+.ms-row.ms-loading-row {
+  min-height: 86px;
+}
+.ms-loading-row .ms-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ms-loading-name {
+  height: 16px;
+}
+.ms-loading-line {
+  height: 11px;
+}
+.ms-loading-meta {
+  width: 120px;
+  height: 10px;
+}
