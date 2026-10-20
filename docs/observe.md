@@ -1824,6 +1824,16 @@ block's LZ4 text (37.8 KB on average):
 space for a fifth of the waste; from 1% to 0.1%: 4.1 points for a tenth), and RocksDB's default for the
 same trade (10 bits a key).
 
+**Across blocks.** Filters of one size put a token at the same places in each, and the tokens every
+block holds set those places in each, so a word whose places fall on them could pass every block's
+filter at once. `KOBS_LOGS=… cargo bench -p kiln-obs --bench filters` (fedora, 2026-10-19): a
+machine's journal, 370,258 lines in 398 blocks of 256 KiB, its filters of 140 sizes (the commonest
+16 blocks'); 2,000 words no block holds each passed 1.00% of the blocks on average, median 4, p99 10,
+the most 14 (Binomial(398, 1%): p99 9 to 10), and salted by their block (`bloom::salted`) the same
+(the most 12). Logs' blocks differ in their tokens, so in their filters' sizes, and that decorrelates
+them: they stay as they are. Spans' blocks are alike (one service's spans, block after block), their
+filters of one size: those are salted (§8.7, §12.23).
+
 ### 12.8 Logs: ingest and search
 
 2026-10-18, same machine: `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs --bench logs`. The

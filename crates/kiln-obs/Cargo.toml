@@ -78,6 +78,10 @@ name = "traces"
 harness = false
 
 [[bench]]
+name = "filters"
+harness = false
+
+[[bench]]
 name = "zstd"
 harness = false
 
