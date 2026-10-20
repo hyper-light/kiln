@@ -9,7 +9,9 @@
 //!   function's span would make series of every function). They are counted on the server from the
 //!   spans it holds, as metrics from logs are (`crate::logs::metrics`: each window of ten seconds
 //!   whole once its spans have come, again when more come for it), so a span sent to any node of
-//!   the group counts once, and a resent one not twice.
+//!   the group counts once, and a resent one not twice. A Datadog Agent's spans are not: it
+//!   sends on only the traces it samples, and its stats count every span (`crate::ddtrace::stats`,
+//!   the same series, each of its host).
 //! - **A trace** ([`assemble`]): its spans in the order a waterfall draws them, each after its
 //!   parent and siblings by their start, with its depth; a span twice (an exporter's retry) once.
 //! - **A service map** ([`MapBuilder`]): who calls whom, from a range's spans. A span whose parent is
@@ -42,14 +44,16 @@ fn def(name: &str, query: &str, by: &[&str], compute: Compute) -> Option<LogMetr
 pub fn trace_metrics() -> Vec<LogMetric> {
     let entry_by = ["service", "resource_name", "@span.kind", "@env", "@version", "@http.status_code"];
     let exit_by = ["service", "resource_name", "@span.kind", "@env", "@peer.service"];
+    // An Agent's spans are counted from its stats.
+    let [entry, exit] = [ENTRY, EXIT].map(|q| format!("({q}) -source:{}", crate::ddtrace::SOURCE));
     let errors_in = |q: &str| format!("({q}) status:error");
     [
-        def("trace.hits", ENTRY, &entry_by, Compute::Count),
-        def("trace.errors", &errors_in(ENTRY), &entry_by, Compute::Count),
-        def("trace.duration", ENTRY, &entry_by, Compute::Duration { percentiles: true }),
-        def("trace.outbound.hits", EXIT, &exit_by, Compute::Count),
-        def("trace.outbound.errors", &errors_in(EXIT), &exit_by, Compute::Count),
-        def("trace.outbound.duration", EXIT, &exit_by, Compute::Duration { percentiles: true }),
+        def("trace.hits", &entry, &entry_by, Compute::Count),
+        def("trace.errors", &errors_in(&entry), &entry_by, Compute::Count),
+        def("trace.duration", &entry, &entry_by, Compute::Duration { percentiles: true }),
+        def("trace.outbound.hits", &exit, &exit_by, Compute::Count),
+        def("trace.outbound.errors", &errors_in(&exit), &exit_by, Compute::Count),
+        def("trace.outbound.duration", &exit, &exit_by, Compute::Duration { percentiles: true }),
     ]
     .into_iter()
     .flatten()

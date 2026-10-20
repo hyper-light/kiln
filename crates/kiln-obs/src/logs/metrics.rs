@@ -207,7 +207,7 @@ pub struct Counted {
 }
 
 /// A tag's value as a metric keeps it: [`NONE`] for none, cut to [`TAG_CHARS`] characters.
-fn tag_value(v: Option<&str>) -> &str {
+pub(crate) fn tag_value(v: Option<&str>) -> &str {
     match v {
         None | Some("") => NONE,
         Some(v) if v.len() <= TAG_CHARS => v,

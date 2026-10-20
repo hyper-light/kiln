@@ -19,14 +19,15 @@
 //!   and `service.version`), its exception event's type, message and stack (else its status's
 //!   message) as `error.type`, `error.message` and `error.stack` (as Datadog maps OpenTelemetry's
 //!   `exception.*`), `peer.service` on a client's or a producer's span (the system or the address it
-//!   calls, where not given: [`PEER_SOURCES`]), Datadog's `http.status_code` (from the semantic
+//!   calls, where not given: [`PEER_SOURCES`], Datadog's tracers' `out.host` among them), Datadog's `http.status_code` (from the semantic
 //!   conventions' `http.response.status_code`), and its events and links as JSON;
 //! - its trace id and span id. A span without a valid one of each (16 and 8 bytes, not all zero, as
 //!   the specification has them) is not kept, and counted.
 //!
 //! Limits are Datadog's trace agent's (`pkg/trace/traceutil/truncate.go`): a value at 25,000 bytes
 //! (`MaxMetaValLen`), a name at 5,000 (`MaxResourceLen`); attributes [`MAX_TAGS`] in all,
-//! OpenTelemetry's default count limit, the span's past what kiln's own leave dropped in key order.
+//! OpenTelemetry's default count limit, the span's past what kiln's own leave dropped in key order,
+//! its resource's added while room is left ([`merge_under`]).
 //! A span's row is at most [`MAX_ROW_BYTES`]: past it, its longest values are cut to one length,
 //! the least that brings it within (the others whole), so a write always holds it.
 
@@ -65,7 +66,7 @@ const FIXED: [&str; 4] = ["span.kind", "duration", "parent_id", "otel.status_cod
 /// Where a client's or a producer's span's `peer.service` comes from when it does not say one: the
 /// first of these it has, as Datadog infers a service from its peer tags (the database's system, the
 /// messaging system, the RPC service, the address called).
-pub const PEER_SOURCES: [&str; 7] = ["peer.service", "db.system.name", "db.system", "messaging.system", "rpc.service", "server.address", "net.peer.name"];
+pub const PEER_SOURCES: [&str; 9] = ["peer.service", "db.system.name", "db.system", "messaging.system", "rpc.service", "server.address", "net.peer.name", "out.host", "network.destination.name"];
 
 /// `Span.SpanKind`'s names by number; UNSPECIFIED read as INTERNAL, as the specification allows.
 pub const KINDS: [&str; 6] = ["internal", "internal", "server", "client", "producer", "consumer"];
@@ -103,15 +104,15 @@ impl Spans {
 
 /// A value: the request's own text, or text the decoder wrote (`Text(start, end)` in it).
 #[derive(Debug, Clone, Copy)]
-enum Val<'a> {
+pub(crate) enum Val<'a> {
     Str(&'a str),
     Text(usize, usize),
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Attr<'a> {
-    key: &'a str,
-    val: Val<'a>,
+pub(crate) struct Attr<'a> {
+    pub(crate) key: &'a str,
+    pub(crate) val: Val<'a>,
 }
 
 /// Decodes requests, its room kept from one to the next.
@@ -131,18 +132,18 @@ pub struct Decoder {
 
 /// A vector emptied, as one of borrows of another lifetime, its room kept (collected in place: the
 /// same layout, nothing allocated; the map is of nothing).
-fn attrs_for<'b>(mut v: Vec<Attr<'_>>) -> Vec<Attr<'b>> {
+pub(crate) fn attrs_for<'b>(mut v: Vec<Attr<'_>>) -> Vec<Attr<'b>> {
     v.clear();
     v.into_iter().map(|_| Attr { key: "", val: Val::Str("") }).collect()
 }
 
-fn parts_for<'b>(mut v: Vec<(u32, &[u8])>) -> Vec<(u32, &'b [u8])> {
+pub(crate) fn parts_for<'b>(mut v: Vec<(u32, &[u8])>) -> Vec<(u32, &'b [u8])> {
     v.clear();
     v.into_iter().map(|_| (0, &[][..])).collect()
 }
 
 /// `s`, at most `max` bytes of it, cut where a character starts.
-fn cut(s: &str, max: usize) -> &str {
+pub(crate) fn cut(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -153,7 +154,7 @@ fn cut(s: &str, max: usize) -> &str {
     s.get(..at).unwrap_or("")
 }
 
-fn id<const N: usize>(b: Option<&[u8]>) -> Option<[u8; N]> {
+pub(crate) fn id<const N: usize>(b: Option<&[u8]>) -> Option<[u8; N]> {
     b.and_then(|b| <[u8; N]>::try_from(b).ok()).filter(|i| i.iter().any(|&x| x != 0))
 }
 
@@ -191,22 +192,106 @@ fn value_of<'a>(v: &'a [u8], text: &mut String) -> Result<Val<'a>, OtlpError> {
     Ok(Val::Str(""))
 }
 
-fn resolve<'a>(v: Val<'a>, text: &'a str) -> &'a str {
+pub(crate) fn resolve<'a>(v: Val<'a>, text: &'a str) -> &'a str {
     match v {
         Val::Str(s) => s,
         Val::Text(a, b) => text.get(a..b).unwrap_or(""),
     }
 }
 
-fn find<'a>(attrs: &[Attr<'a>], key: &str) -> Option<Val<'a>> {
+pub(crate) fn find<'a>(attrs: &[Attr<'a>], key: &str) -> Option<Val<'a>> {
     attrs.iter().find(|a| a.key == key).map(|a| a.val)
 }
 
 /// A segment being written: its rows, how many, the last one's time.
-struct Seg {
+pub(crate) struct Seg {
     rows: Vec<u8>,
     count: u32,
     prev: i64,
+}
+
+/// A span's row written into the segment being written (a new one past [`SEGMENT_BYTES`]), its
+/// attributes first brought within [`MAX_ROW_BYTES`] (`names`: its service, host and source).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_row(
+    seg: &mut Option<Seg>,
+    spare: &mut Vec<Vec<u8>>,
+    out: &mut Spans,
+    attrs: &mut [Attr<'_>],
+    text: &str,
+    ts: i64,
+    severity: u8,
+    names: [&str; 3],
+    name: &str,
+    trace: [u8; 16],
+    span: [u8; 8],
+) {
+    let seg = match seg {
+        Some(s) if s.rows.len() < SEGMENT_BYTES => s,
+        slot => {
+            if let Some(full) = slot.take() {
+                out.segments.push((full.rows, full.count));
+            }
+            slot.insert(Seg { rows: spare.pop().unwrap_or_default(), count: 0, prev: 0 })
+        }
+    };
+    let name = cut(name, MAX_NAME);
+    let [service, host, source] = names;
+    if fit(attrs, text, service.len() + host.len() + source.len() + name.len() + ROW_OVERHEAD) {
+        out.cut += 1;
+    }
+    let pairs = attrs.iter().map(|a| (a.key, resolve(a.val, text)));
+    put_fields(&mut seg.rows, ts, severity, names, name, pairs, attrs.len(), Some(trace), Some(span), seg.prev, MAX_VALUE_BYTES);
+    seg.prev = ts;
+    seg.count += 1;
+    out.spans += 1;
+}
+
+/// A span's attributes (`attrs[own..]`, its own) within `room`, past it dropped in key order; then
+/// those `under` it (its resource's; a Datadog span's chunk's and payload's) where it has none of
+/// the name and `skip` does not say no, while room is left, and past it dropped; each drop counted.
+/// Each list `under` holds [`MAX_TAGS`] at the most, so this takes `MAX_TAGS × room` comparisons
+/// at the most, whatever a request holds.
+pub(crate) fn merge_under<'a>(attrs: &mut Vec<Attr<'a>>, own: usize, room: usize, under: &[&[Attr<'a>]], skip: &dyn Fn(&str) -> bool, dropped: &mut u64) {
+    let theirs = attrs.len() - own;
+    if theirs > room {
+        if let Some(user) = attrs.get_mut(own..) {
+            user.sort_unstable_by(|a, b| a.key.cmp(b.key));
+        }
+        *dropped += (theirs - room) as u64;
+        attrs.truncate(own + room);
+    }
+    for list in under {
+        for (i, u) in list.iter().enumerate() {
+            if skip(u.key) || attrs.get(own..).unwrap_or_default().iter().any(|a| a.key == u.key) {
+                continue;
+            }
+            if attrs.len() - own >= room {
+                *dropped += (list.len() - i) as u64;
+                break;
+            }
+            attrs.push(*u);
+        }
+    }
+}
+
+/// A resource's attributes at most [`MAX_TAGS`] (what a row could hold), past it dropped in key
+/// order and counted.
+pub(crate) fn bound_under(attrs: &mut Vec<Attr<'_>>, dropped: &mut u64) {
+    if attrs.len() > MAX_TAGS {
+        attrs.sort_unstable_by(|a, b| a.key.cmp(b.key));
+        *dropped += (attrs.len() - MAX_TAGS) as u64;
+        attrs.truncate(MAX_TAGS);
+    }
+}
+
+/// The segment being written, done: into `out` if it holds a row.
+pub(crate) fn finish_segment(seg: &mut Option<Seg>, out: &mut Spans) {
+    if let Some(s) = seg.take()
+        && s.count > 0
+    {
+        out.segments.push((s.rows, s.count));
+    }
 }
 
 impl Decoder {
@@ -255,11 +340,7 @@ impl Decoder {
             }
             Ok(())
         })();
-        if let Some(s) = cx.seg.take()
-            && s.count > 0
-        {
-            out.segments.push((s.rows, s.count));
-        }
+        finish_segment(&mut cx.seg, out);
         let Cx { mut text, mut tmp, resource, attrs, parts, .. } = cx;
         text.clear();
         tmp.clear();
@@ -307,6 +388,7 @@ impl<'a> Cx<'a, '_> {
         }
         let res = Res { service: find(&self.resource, "service.name"), host: find(&self.resource, "host.name"), text: self.text.len() };
         self.resource.retain(|a| a.key != "service.name" && a.key != "host.name");
+        bound_under(&mut self.resource, &mut out.dropped_attrs);
         for f in Fields::new(msg) {
             if let (2, w) = f? {
                 let scope = w.bytes().unwrap_or(&[]);
@@ -392,20 +474,7 @@ impl<'a> Cx<'a, '_> {
                 self.attrs.push(a);
             }
         }
-        let theirs = self.attrs.len();
-        for r in &self.resource {
-            if !FIXED.contains(&r.key) && !self.attrs.get(own..theirs).unwrap_or_default().iter().any(|a| a.key == r.key) {
-                self.attrs.push(*r);
-            }
-        }
-        let room = MAX_TAGS - OWN;
-        if self.attrs.len() - own > room {
-            if let Some(user) = self.attrs.get_mut(own..) {
-                user.sort_unstable_by(|a, b| a.key.cmp(b.key));
-            }
-            out.dropped_attrs += (self.attrs.len() - own - room) as u64;
-            self.attrs.truncate(own + room);
-        }
+        merge_under(&mut self.attrs, own, MAX_TAGS - OWN, &[self.resource.as_slice()], &|k| FIXED.contains(&k), &mut out.dropped_attrs);
         // Where the span does not say them: the unified service tags, the error, the peer.
         let has = |attrs: &[Attr<'_>], k: &str| attrs.iter().any(|a| a.key == k);
         if !has(&self.attrs, "env")
@@ -440,27 +509,9 @@ impl<'a> Cx<'a, '_> {
             u64::try_from(now_ns).unwrap_or(0)
         };
         let ts = i64::try_from(ts).unwrap_or(i64::MAX);
-        let seg = match &mut self.seg {
-            Some(s) if s.rows.len() < SEGMENT_BYTES => s,
-            slot => {
-                if let Some(full) = slot.take() {
-                    out.segments.push((full.rows, full.count));
-                }
-                slot.insert(Seg { rows: self.spare.pop().unwrap_or_default(), count: 0, prev: 0 })
-            }
-        };
         let (service, host) = (res.service.map_or("", |v| resolve(v, &self.text)), res.host.map_or("", |v| resolve(v, &self.text)));
-        let name = cut(name, MAX_NAME);
-        if fit(&mut self.attrs, &self.text, service.len() + host.len() + source.len() + name.len() + ROW_OVERHEAD) {
-            out.cut += 1;
-        }
-        let text = self.text.as_str();
         let severity = if status == STATUS_ERROR { SEVERITY_ERROR } else { SEVERITY_OK };
-        let attrs = self.attrs.iter().map(|a| (a.key, resolve(a.val, text)));
-        put_fields(&mut seg.rows, ts, severity, [service, host, source], name, attrs, self.attrs.len(), Some(trace), Some(span), seg.prev, MAX_VALUE_BYTES);
-        seg.prev = ts;
-        seg.count += 1;
-        out.spans += 1;
+        write_row(&mut self.seg, self.spare, out, &mut self.attrs, &self.text, ts, severity, [service, host, source], name, trace, span);
         Ok(())
     }
 
@@ -852,6 +903,48 @@ mod tests {
         assert_eq!(row.source, "otlp");
         // The address went with the rest (in key order, past the room): no peer of it.
         assert_eq!(row.attr("peer.service"), None);
+    }
+
+    #[test]
+    fn a_resource_and_its_span_of_huge_attribute_lists_merge_in_bounded_work() {
+        // 40,000 attributes on the resource and on each of its spans: merged by comparing every
+        // one with every other, a request's 3.2 billion comparisons; bounded, some thousands.
+        let mut req = Writer::default();
+        req.message(1, |rs| {
+            rs.message(1, |res| {
+                for i in 0..40_000 {
+                    kv(res, 1, &format!("r{i:05}"), "v");
+                }
+                kv(res, 1, "service.name", "wide");
+            });
+            rs.message(2, |ss| {
+                for n in 0..2u8 {
+                    ss.message(2, |s| {
+                        s.bytes(1, &[1; 16]);
+                        s.bytes(2, &[n + 1; 8]);
+                        s.str(5, "wide");
+                        for i in 0..40_000 {
+                            kv(s, 9, &format!("s{i:05}"), "v");
+                        }
+                    });
+                }
+            });
+        });
+        let started = std::time::Instant::now();
+        let mut s = Spans::default();
+        Decoder::new().decode(&req.buf, 7, &mut s).unwrap();
+        let took = started.elapsed();
+        let r = rows(&s);
+        assert_eq!(r.len(), 2);
+        for row in &r {
+            assert_eq!((row.service, row.attr_count), ("wide", 2 + MAX_TAGS - OWN), "kiln's own (kind and duration) and the span's up to the room");
+            assert_eq!(row.attr("s00000"), Some("v"));
+            assert_eq!(row.attr("r00000"), None, "the span's own fill the room first");
+        }
+        // The resource's past MAX_TAGS once, and each span's past the room, and the resource's
+        // that no longer fit.
+        assert_eq!(s.dropped_attrs, (40_000 - MAX_TAGS as u64) + 2 * ((40_000 - (MAX_TAGS - OWN) as u64) + MAX_TAGS as u64));
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
     }
 
     #[test]

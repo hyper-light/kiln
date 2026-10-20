@@ -29,7 +29,7 @@ use crate::hash::Keyed;
 const NO_RECORDED_VALUE: u64 = 1;
 /// How deep an attribute's nested value is rendered into a tag; past it, "…". A tag is a filter
 /// and a label: a value nested deeper is not read as one.
-const MAX_DEPTH: usize = 8;
+pub(crate) const MAX_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OtlpError {
@@ -824,7 +824,7 @@ fn format_f64(v: f64) -> String {
 }
 
 /// [`format_f64`], written in place.
-fn push_f64(out: &mut String, v: f64) {
+pub(crate) fn push_f64(out: &mut String, v: f64) {
     use std::fmt::Write as _;
     if v.is_infinite() {
         out.push_str(if v > 0.0 { "+Inf" } else { "-Inf" });

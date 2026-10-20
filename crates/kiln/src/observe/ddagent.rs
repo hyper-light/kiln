@@ -9,6 +9,9 @@
 //! - `POST /intake/`: events (kiln's events, `source:kiln.event`), and host metadata, taken and
 //!   passed over;
 //! - `POST /api/v2/logs`: its logs, records, their `ddtags` attributes;
+//! - `POST /api/v0.2/traces`: its tracers' spans (its trace agent's, `apm_config.apm_dd_url`),
+//!   into the span store (`kiln_obs::ddtrace`);
+//! - `POST /api/v0.2/stats`: its counts of every span before it sampled, as kiln's trace metrics;
 //! - `GET /api/v1/validate`: whether its key is one;
 //!
 //! zstd (what it compresses with), deflate or gzip, or none. Anything else under Datadog's paths
@@ -40,7 +43,7 @@ pub fn api_key(req: &srv::Request) -> Option<String> {
 
 /// Whether `path` (its segments) is one of Datadog's, answered here.
 pub fn is_datadog(path: &[&str]) -> bool {
-    matches!(path, ["api", "v1" | "v2" | "beta", ..] | ["intake", ..])
+    matches!(path, ["api", "v1" | "v2" | "v0.2" | "beta", ..] | ["intake", ..])
 }
 
 thread_local! {
@@ -100,6 +103,8 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
         ["api", "v1", "check_run"] => What::Checks,
         ["intake", ..] => What::Intake,
         ["api", "v2", "logs"] => What::Logs,
+        ["api", "v0.2", "traces"] => What::Traces,
+        ["api", "v0.2", "stats"] => What::Stats,
         _ => What::Else,
     };
     if matches!(what, What::Else) {
@@ -136,6 +141,8 @@ enum What {
     Checks,
     Intake,
     Logs,
+    Traces,
+    Stats,
     Else,
 }
 
@@ -183,8 +190,48 @@ fn take(o: &Observe, what: What, body: &[u8]) -> srv::Response {
             Ok(logs) => offered(o.offer_logs(logs.into_iter().map(|l| l.record(now)).collect())),
             Err(e) => bad(&format!("{e}")),
         },
+        What::Traces => {
+            let mut spans = kiln_obs::otlp::traces::Spans::default();
+            let decoded = with_trace_decoder(|d| {
+                // Rows into buffers the node's writes handed back, as OTLP's traces are.
+                while d.spares() < 2 {
+                    let b = o.bytes();
+                    if b.capacity() == 0 {
+                        break;
+                    }
+                    d.give_rows(b);
+                }
+                d.decode(body, now.saturating_mul(1_000_000), &mut spans)
+            });
+            match decoded {
+                Ok(()) => offered(o.offer_spans(spans.segments)),
+                Err(e) => bad(&e.to_string()),
+            }
+        }
+        What::Stats => {
+            let mut d = o.decoding();
+            match kiln_obs::ddtrace::stats_into(body, super::otlp::keys(), &mut d) {
+                Ok(_) => offered(o.offer_samples(d)),
+                Err(e) => {
+                    o.give_decoding(d);
+                    bad(&e.to_string())
+                }
+            }
+        }
         What::Else => accepted(),
     }
+}
+
+/// Runs `f` with this thread's decoder of the Agent's traces (its room kept from one payload to
+/// the next), or a new one were it in use.
+fn with_trace_decoder<T>(f: impl FnOnce(&mut kiln_obs::ddtrace::Decoder) -> T) -> T {
+    thread_local! {
+        static DECODER: std::cell::RefCell<kiln_obs::ddtrace::Decoder> = std::cell::RefCell::new(kiln_obs::ddtrace::Decoder::new());
+    }
+    DECODER.with(|d| match d.try_borrow_mut() {
+        Ok(mut d) => f(&mut d),
+        Err(_) => f(&mut kiln_obs::ddtrace::Decoder::new()),
+    })
 }
 
 fn offered(taken: bool) -> srv::Response {
@@ -410,7 +457,13 @@ mod tests {
 
     #[test]
     fn datadog_s_paths_are_known_and_kiln_s_are_not_taken() {
-        assert!(is_datadog(&["api", "v2", "series"]) && is_datadog(&["intake", ""]) && is_datadog(&["api", "beta", "sketches"]) && is_datadog(&["api", "v1", "anything"]));
+        assert!(
+            is_datadog(&["api", "v2", "series"])
+                && is_datadog(&["intake", ""])
+                && is_datadog(&["api", "beta", "sketches"])
+                && is_datadog(&["api", "v1", "anything"])
+                && is_datadog(&["api", "v0.2", "traces"])
+        );
         assert!(!is_datadog(&["api", "observe", "v1", "status"]) && !is_datadog(&["api", "sync", "blobs", "x"]));
     }
 }

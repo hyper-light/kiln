@@ -1248,7 +1248,7 @@ fn ops() -> Vec<Op<'static>> {
         },
         Op {
             params: vec![param("from", "query", false, integer(), "ms since the epoch (15 minutes before to)"), param("to", "query", false, integer(), "ms since the epoch"), param("env", "query", false, string(), "one environment")],
-            ..op("get", "/apm/map", "The service map over the range: who calls whom, from the spans", "observe.read", None, vec![ok("ServiceMap")])
+            ..op("get", "/apm/map", "The service map over the range: who calls whom, from the spans; each service's requests and errors from its trace metrics", "observe.read", None, vec![ok("ServiceMap")])
         },
         Op {
             params: vec![param("query", "query", false, string(), "a log search"), param("rate", "query", false, integer(), "records a second at the most, a uniform sample past it")],
