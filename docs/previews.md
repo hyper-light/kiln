@@ -208,7 +208,11 @@ in the Tools tab's Live pages; `engine` in `show_live`):
 - **WebKit**: Safari on a Mac, through `safaridriver` (turned on once with `safaridriver --enable`,
   which asks for an administrator's password). Its automated window opens on that Mac's screen,
   keeps nothing, and is one at a time. On Linux, WebKitGTK's `WebKitWebDriver` when it's installed
-  (`apt install webkit2gtk-driver`).
+  (`apt install webkit2gtk-driver`). Its browser draws on a display of kiln's own, so nothing comes
+  up on the machine's screen and a machine without one runs it: Xvfb when it's installed (no port,
+  and only kiln holds its key; its pictures come in about 20 ms), else GTK's broadway backend in
+  memory (its sockets in a folder only the runner's user reaches; its pictures come a second
+  apart).
 
 Neither has a capture a page can be streamed from. So their page's picture is taken as it changes
 (Firefox's in about 5 ms: up to 30 a second while it changes or was just used, a few a second while
