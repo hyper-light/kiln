@@ -147,6 +147,22 @@ impl Tracker {
     }
 }
 
+/// Whether this process holds agents' processes together: only the processes that start agents for
+/// kiln (the runner, the server) do, from [`hold_agents`] on. Anything else linking kiln (an
+/// integration test, a tool) that starts a harness leaves its processes where they are, so it never
+/// makes groups in a live runner's cgroup it happens to run in (a test in a kiln terminal).
+static HOLDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process starts agents for kiln (the runner, the server): their processes are held together
+/// from now on.
+pub fn hold_agents() {
+    HOLDS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn holds() -> bool {
+    HOLDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The children of `pid` now.
 fn children(pid: i32) -> Vec<i32> {
     let mut buf = vec![0i32; MOST_CHILDREN];
@@ -170,6 +186,9 @@ pub struct Group {
 impl Group {
     /// Agent session `session`'s group: its processes are followed once its harness has started.
     pub fn of(session: &str) -> Option<Group> {
+        if !holds() {
+            return None;
+        }
         let t = tracker()?;
         t.sessions.lock().insert(session.to_owned());
         Some(Group { session: session.to_owned() })
@@ -177,6 +196,9 @@ impl Group {
 
     /// The group `session` has, while any of its processes is followed.
     pub fn existing(session: &str) -> Option<Group> {
+        if !holds() {
+            return None;
+        }
         let t = tracker()?;
         let followed = t.members.lock().values().any(|s| s == session);
         followed.then(|| Group { session: session.to_owned() })
@@ -246,6 +268,7 @@ mod tests {
     #[test]
     fn what_an_agent_starts_is_followed_fork_by_fork() -> anyhow::Result<()> {
         let session = format!("test{}", std::process::id());
+        hold_agents();
         let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 61 & sh -c 'sleep 62 & wait' & sleep 63"]).stdin(std::process::Stdio::null());
