@@ -830,6 +830,10 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
         landed_by.extend(e.diffs.iter().map(|d| (d.clone(), e.enqueued_by.clone())));
         hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk} at {tip}: entry {} by {}", repo.name, e.id, e.enqueued_by)).await;
         tell(hub, e, "landed", None).await;
+        // For rules on `diff.landed`: the issues a diff names hear it landed (W11-R07).
+        for (diff, commit) in &e.commits {
+            crate::rt::spawn(super::notify::diff_landed(Arc::clone(hub), diff.clone(), commit.clone()));
+        }
         queue_event(hub, &e.diffs, "dequeued", Some("MERGE"), &e.enqueued_by).await;
     }
     tracing::info!(repo = %repo.name, %trunk, %tip, diffs = all.len(), "landed");

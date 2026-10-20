@@ -200,6 +200,36 @@ pub const KINDS: &[KindInfo] = &[
         secret: Some("the password, when the server wants one"),
         built: true,
     },
+    // Issue trackers: the issues runs' and diffs' trailers name hear of them, and quarantined
+    // tests get issues (docs/ci.md W11-R07).
+    KindInfo {
+        kind: "linear",
+        title: "Linear",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("team", false, "the team new issues go in, by its key (ENG), when a rule names none (linear:ENG)"),
+            f("prefixes", false, "the issue keys that are this workspace's (ENG, OPS), comma-separated; without, every key is tried"),
+            f("api", false, "Linear's API, or a proxy in front of it (https://api.linear.app/graphql)"),
+        ],
+        secret: Some("a personal API key (lin_api_…), or an OAuth app's <client id>:<client secret>"),
+        built: true,
+    },
+    KindInfo {
+        kind: "jira",
+        title: "Jira",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("site", true, "the Jira Cloud site: https://acme.atlassian.net"),
+            f("email", false, "the account an API token is of; without, the secret is a service account's"),
+            f("project", false, "the project new issues go in, by its key (OPS), when a rule names none (jira:OPS)"),
+            f("issue_type", false, "the type of the issues it opens (Bug)"),
+            f("prefixes", false, "the issue keys that are this site's (OPS, WEB), comma-separated; without, every key is tried"),
+        ],
+        secret: Some("an API token, or a service account's <client id>:<client secret>"),
+        built: true,
+    },
     KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON"), f("events", false, "kiln events to send as they happen: run, job, agent, queue, cd_plan, cd_apps, cd_app_deleted, or * (comma-separated); without, only notify rules use it")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
     // Where runs' traces go (docs/ci.md W19-R02, W11-R09).
     KindInfo {
@@ -292,6 +322,15 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
         && !(e.trim().starts_with("http://") || e.trim().starts_with("https://"))
     {
         return Err(format!("`{e}` is not an OTLP/HTTP endpoint: http:// or https://"));
+    }
+    // A tracker's site or API: where kiln's requests go.
+    for (kind, field) in [("jira", "site"), ("linear", "api")] {
+        if info.kind == kind
+            && let Some(u) = obj.get(field).and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty())
+            && !(u.starts_with("https://") || u.starts_with("http://"))
+        {
+            return Err(format!("`{field}: {u}` isn't a URL: https://…"));
+        }
     }
     if info.kind == "oci"
         && let Some(r) = obj.get("registry").and_then(Value::as_str)

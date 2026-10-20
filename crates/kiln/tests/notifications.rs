@@ -437,3 +437,173 @@ fn w19_r06_a_persons_own_rules() -> anyhow::Result<()> {
     assert_eq!(to_dev, 1, "{:?}", seen(&mails));
     Ok(())
 }
+
+/// A fake Linear (GraphQL at `/graphql`) and Jira Cloud (REST at `/rest/api/3`), answering as
+/// each would, keeping each request as its request line, headers and body.
+fn tracker_fake() -> anyhow::Result<(u16, Seen)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let seen: Seen = Arc::default();
+    let keep = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let whole = loop {
+                let Ok(n) = stream.read(&mut chunk) else { break None };
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                    if rest.len() >= len {
+                        break Some(text);
+                    }
+                }
+            };
+            let Some(text) = whole else { continue };
+            let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+            let path = head.split_whitespace().nth(1).unwrap_or_default();
+            let answer = match path {
+                "/graphql" if body.contains("viewer") => json!({ "data": { "viewer": { "name": "kiln-ci" } } }),
+                "/graphql" if body.contains("issue(id") => {
+                    let key = serde_json::from_str::<Value>(body).ok().and_then(|v| v.pointer("/variables/id").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+                    json!({ "data": { "issue": { "id": format!("lin-{key}") } } })
+                }
+                "/graphql" if body.contains("commentCreate") => json!({ "data": { "commentCreate": { "success": true } } }),
+                "/graphql" if body.contains("attachmentLinkURL") => json!({ "data": { "attachmentLinkURL": { "success": true } } }),
+                "/graphql" if body.contains("teams(") => json!({ "data": { "teams": { "nodes": [{ "id": "team-eng" }] } } }),
+                "/graphql" if body.contains("issueCreate") => json!({ "data": { "issueCreate": { "success": true, "issue": { "identifier": "ENG-100" } } } }),
+                "/rest/api/3/myself" => json!({ "displayName": "kiln-ci" }),
+                "/rest/api/3/issue" => json!({ "key": "OPS-100" }),
+                p if p.starts_with("/rest/api/3/issue/") => json!({ "id": "1" }),
+                _ => json!({ "errors": [{ "message": format!("nothing at {path}") }] }),
+            };
+            let out = answer.to_string();
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len()).as_bytes());
+            if let Ok(mut g) = keep.lock() {
+                g.push(text);
+            }
+        }
+    });
+    Ok((port, seen))
+}
+
+/// W11-R07: Linear and Jira as channels. A failing trunk run comments on and links the issues its
+/// commit's trailers name, each tracker only its own keys; a run naming none is skipped there; a
+/// test the trunk quarantines gets an issue, or a comment on the issue its entry names; a landed
+/// diff tells the issues its message names.
+#[test]
+fn w11_r07_issue_trackers() -> anyhow::Result<()> {
+    let (port, asked) = tracker_fake()?;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\nallow_private_targets = [\"127.0.0.1\"]", ..Options::default() })?;
+    let integration = |kind: &str, name: &str, config: Value, secret: &str| -> anyhow::Result<()> {
+        let (st, body) = http(s.port, "POST", "/api/ci/integrations", &s.admin, Some(&json!({ "kind": kind, "name": name, "config": config, "secret": secret, "scope": "server" })))?;
+        anyhow::ensure!((200..300).contains(&st), "{kind}: {st} {body}");
+        let (st, body) = http(s.port, "POST", &format!("/api/ci/integrations/{name}/verify"), &s.admin, None)?;
+        anyhow::ensure!(st == 200 && body.contains("as kiln-ci"), "{kind}'s Verify says who it is: {st} {body}");
+        Ok(())
+    };
+    integration("linear", "eng", json!({ "api": format!("http://127.0.0.1:{port}/graphql"), "prefixes": "ENG", "team": "ENG" }), "lin_api_test")?;
+    integration("jira", "ops", json!({ "site": format!("http://127.0.0.1:{port}"), "email": "ci@acme.test", "prefixes": "OPS", "project": "OPS" }), "jira-token")?;
+    // What the fakes were asked at `path`, whose request has `has`.
+    let asked_at = |path: &str, has: &str| -> Vec<String> { seen(&asked).into_iter().filter(|r| r.split_whitespace().nth(1) == Some(path) && r.contains(has)).collect() };
+
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/track", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/track"])?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    git(&home, dir.path(), &["clone", "-q", &format!("http://x:{dev}@127.0.0.1:{}/git/acme/track.git", s.port), "work"])?;
+    let work = dir.path().join("work");
+    let owner = format!("http://x:{}@127.0.0.1:{}/git/acme/track.git", s.admin, s.port);
+    std::fs::write(work.join("README.md"), "track\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &owner, "HEAD:main"])?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+
+    // The rules, a workflow that fails while FAIL is there, and a commit naming three issues.
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/notify.yaml"), "- on: [run.failed]\n  to: [linear, jira]\n- on: [test.quarantined]\n  to: [linear, jira]\n- on: [diff.landed]\n  to: [linear]\n")?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 0\n")?;
+    std::fs::write(work.join(".kiln/flip.yaml"), "on: push\njobs:\n  check:\n    runs-on: local\n    steps:\n      - run: test ! -f FAIL\n")?;
+    std::fs::write(work.join("FAIL"), "1\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "Break the build\n\nFixes: ENG-7\nRefs: OPS-3, WEB-1"])?;
+    git(&home, &work, &["push", "-q", &owner, "HEAD:main"])?;
+    until(240, "the failure at Linear and Jira", || {
+        let linear = !asked_at("/graphql", "lin-ENG-7").is_empty() && asked_at("/graphql", "attachmentLinkURL").iter().any(|r| r.contains("lin-ENG-7"));
+        let jira = !asked_at("/rest/api/3/issue/OPS-3/comment", "").is_empty() && !asked_at("/rest/api/3/issue/OPS-3/remotelink", "").is_empty();
+        Ok((!(linear && jira)).then(|| format!("{:?}", seen(&asked))))
+    })?;
+    let comment = asked_at("/graphql", "commentCreate").into_iter().find(|r| r.contains("lin-ENG-7")).unwrap_or_default();
+    assert!(comment.contains("failed on main") && comment.to_ascii_lowercase().contains("authorization: lin_api_test"), "Linear's comment, with its key: {comment}");
+    let link = asked_at("/rest/api/3/issue/OPS-3/remotelink", "").concat();
+    assert!(link.contains("\"globalId\"") && link.contains("/runs/"), "the run, linked once however often: {link}");
+    use base64::Engine as _;
+    let basic = format!("authorization: basic {}", base64::engine::general_purpose::STANDARD.encode("ci@acme.test:jira-token")).to_ascii_lowercase();
+    assert!(link.to_ascii_lowercase().contains(&basic), "Jira's API token, with its account: {link}");
+    assert!(asked_at("/rest/api/3/issue/WEB-1/comment", "").is_empty() && asked_at("/graphql", "\"OPS-3\"").is_empty(), "each tracker its own keys: {:?}", seen(&asked));
+
+    // A failure naming no issue: the trackers have nothing to do, and say so.
+    let deliveries = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/notify/deliveries?limit=100", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("deliveries").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    std::fs::write(work.join("README.md"), "track, again\n")?;
+    git(&home, &work, &["commit", "-qam", "Still broken"])?;
+    git(&home, &work, &["push", "-q", &owner, "HEAD:main"])?;
+    until(240, "the second failure, skipped by both", || {
+        let d = deliveries()?;
+        let skipped = d.iter().filter(|x| x.get("status") == Some(&json!("skipped")) && x.get("error").and_then(Value::as_str).is_some_and(|e| e.contains("names no issue"))).count();
+        Ok((skipped < 2).then(|| format!("{d:?}")))
+    })?;
+    let sent: Vec<String> = deliveries()?.iter().filter(|x| x.get("status") == Some(&json!("sent"))).filter_map(|x| x.get("channel").and_then(Value::as_str).map(str::to_owned)).collect();
+    assert!(sent.contains(&"linear".to_owned()) && sent.contains(&"jira".to_owned()), "the first failure went to both: {sent:?}");
+
+    // Two tests quarantined: an issue each at Linear; at Jira, one opened and a comment on the
+    // issue the other names. The fix lands with them.
+    git(&home, &work, &["rm", "-q", "FAIL"])?;
+    std::fs::write(
+        work.join(".kiln/quarantine.yaml"),
+        "- test: \"calc::rounds\"\n  reason: races the clock\n- test: \"net::retries\"\n  reason: the sandbox has no network\n  issue: https://acme.atlassian.net/browse/OPS-5\n",
+    )?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "Quarantine two tests"])?;
+    git(&home, &work, &["push", "-q", &owner, "HEAD:main"])?;
+    until(120, "the quarantined tests' issues", || {
+        let jira_opened = !asked_at("/rest/api/3/issue", "calc::rounds").is_empty();
+        let jira_commented = !asked_at("/rest/api/3/issue/OPS-5/comment", "net::retries").is_empty();
+        let linear_opened = asked_at("/graphql", "issueCreate").len() >= 2;
+        Ok((!(jira_opened && jira_commented && linear_opened)).then(|| format!("{:?}", seen(&asked))))
+    })?;
+    assert!(asked_at("/rest/api/3/issue", "net::retries").is_empty(), "the issue it names, not a new one: {:?}", seen(&asked));
+    let opened = asked_at("/rest/api/3/issue", "calc::rounds").concat();
+    assert!(opened.contains("\"key\":\"OPS\"") && opened.contains("\"name\":\"Bug\""), "in the integration's project, a bug: {opened}");
+
+    // A diff whose message closes ENG-9 lands: Linear hears of it there.
+    git(&home, &work, &["checkout", "-qb", "notes"])?;
+    std::fs::write(work.join("notes.txt"), "a note\n")?;
+    git(&home, &work, &["add", "notes.txt"])?;
+    git(&home, &work, &["commit", "-qm", &format!("Add notes\n\nCloses: ENG-9\nChange-Id: I{}", "9".repeat(40))])?;
+    git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"])?;
+    until(60, "D1", || {
+        let (st, body) = http(s.port, "GET", "/api/diffs/D1", &s.admin, None)?;
+        Ok((st != 200).then_some(body))
+    })?;
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/land", &s.admin, Some(&json!({})))?;
+    anyhow::ensure!(st == 200, "land: {st} {body}");
+    until(180, "D1 landed, at Linear", || {
+        let comments = asked_at("/graphql", "commentCreate").into_iter().filter(|r| r.contains("lin-ENG-9") && r.contains("D1 Add notes landed on main")).count();
+        let links = asked_at("/graphql", "attachmentLinkURL").into_iter().filter(|r| r.contains("lin-ENG-9") && r.contains("/diffs/D1")).count();
+        Ok((comments == 0 || links == 0).then(|| format!("{:?}\n{}", seen(&asked), s.log())))
+    })?;
+    Ok(())
+}

@@ -29,6 +29,8 @@ export interface Me {
   authenticated: boolean;
   version: string;
   hostname: string;
+  /** Who is signed in: the owner, a person, or a token's or agent's principal. */
+  kind?: "owner" | "user" | "pat" | "agent" | "job" | "peer" | null;
   /** Each capability held: on the whole server, or only somewhere (a repository, …). */
   can?: Record<string, "server" | "some">;
   /** Where the server says it is reachable from other devices. */

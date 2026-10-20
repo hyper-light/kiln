@@ -12,12 +12,16 @@
 //!   `release`) and which go to the app's own channels too (its `contacts.channels`); for people,
 //!   about a diff or change request: `review.requested`, `comment.reply`, `mention`; and
 //!   `quota.near` (a repository's cache past 90 % of its quota) and `secret.unused` (no run read
-//!   it in 90 days).
+//!   it in 90 days); `diff.landed` (a diff on its trunk) and `test.quarantined` (a test the
+//!   trunk's `.kiln/quarantine.yaml` took in).
 //! - **Channels** are `kind:target`: an integration of that kind (one named `target`, or the
 //!   first, with `target` as its channel, chat or address): `slack:#ci`, `discord:team-hook`,
 //!   `teams:ops`, `telegram:-1001234`, `pagerduty:oncall`, `opsgenie:ops`, `webhook:audit`,
-//!   `email:ada@example.com`; and kiln's own `inbox` (the people an event is about: a run's actor,
-//!   the reviewers asked, a thread's people, whom a comment mentions) or `inbox:ada`.
+//!   `email:ada@example.com`; kiln's own `inbox` (the people an event is about: a run's actor,
+//!   the reviewers asked, a thread's people, whom a comment mentions) or `inbox:ada`; and issue
+//!   trackers, `linear` and `jira` (`linear:ENG`: the team its new issues go in), which comment
+//!   on the issues a commit's trailers name (`crate::ci::trackers`).
+//! - **Deliveries** a tracker had nothing to do with (no issue of its named) are `skipped`.
 //! - **Deliveries** retry with backoff, webhooks are signed (`X-Kiln-Signature-256`, HMAC-SHA256
 //!   of the body with the integration's secret), and each is recorded (`notify_deliveries`).
 //! - `kiln/notify@v1` sends a message from a step (`POST /_kiln/notify`, the leg's token).
@@ -61,6 +65,8 @@ pub const EVENTS: &[&str] = &[
     "mention",
     "quota.near",
     "secret.unused",
+    "diff.landed",
+    "test.quarantined",
 ];
 /// The events about an agent (`crate::push`): the server's rules take them, a repository's can't.
 pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
@@ -73,8 +79,10 @@ pub const RUNNER_EVENTS: &[&str] = &["runner.offline"];
 const OFFLINE_AFTER: Duration = Duration::from_secs(120);
 /// How long a release's event, once sent through a channel, isn't sent through it again.
 const RELEASE_ONCE: i64 = 90 * 86_400;
+/// How long a test quarantined at a commit, once told of, isn't told of again (a push seen twice).
+const QUARANTINE_ONCE: i64 = 90 * 86_400;
 /// The integration kinds that are channels.
-pub const CHANNELS: &[&str] = &["slack", "discord", "teams", "telegram", "pagerduty", "opsgenie", "webhook", "email"];
+pub const CHANNELS: &[&str] = &["slack", "discord", "teams", "telegram", "pagerduty", "opsgenie", "webhook", "email", "linear", "jira"];
 /// How long a secret goes unread before `secret.unused` is said of it, and said again.
 const UNUSED_AFTER: i64 = 90 * 86_400;
 /// A repository's cache this full is `quota.near` (in hundredths); under the second, it may be said
@@ -336,6 +344,8 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         "mention" => return (format!("@ {actor} mentioned {people} on {}", s.name), format!("{} · {} · {}", s.repo, s.message.lines().next().unwrap_or_default(), s.url)),
         "quota.near" => return (format!("⚠ {}'s cache is near its quota", s.repo), format!("{} · {}", s.message, s.url)),
         "secret.unused" => return (format!("⚠ secret {} hasn't been used in {} days", s.name, UNUSED_AFTER / 86_400), format!("{} · {} · {}", s.repo, s.message, s.url)),
+        "diff.landed" => return (format!("✓ {} landed on {}", s.name, s.branch), format!("{} · {} by {actor} · {}", s.repo, s.sha.get(..8).unwrap_or(&s.sha), s.url)),
+        "test.quarantined" => return (format!("⊘ {} is quarantined in {}", s.name, s.repo), format!("{} · {}", s.message.lines().next().unwrap_or_default(), s.url)),
         _ => {}
     }
     // A land queue's entry: its diffs, why, and where they are.
@@ -375,6 +385,8 @@ struct Msg {
     webhook: Value,
     /// Whom it's about: whose inboxes `inbox` puts it in.
     people: Vec<String>,
+    /// The issues it names (its commit's trailers): what an issue tracker comments on.
+    refs: Vec<String>,
 }
 
 impl Msg {
@@ -384,14 +396,15 @@ impl Msg {
         // A deployment's incident is the environment's; a run's, its workflow's on its branch.
         let dedup = if event.starts_with("deploy.") { format!("kiln:{}:deploy:{}", s.repo, s.environments.join(",")) } else { format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch) };
         let what = match event {
-            "land.ejected" | "review.requested" | "comment.reply" | "mention" => "the diff",
+            "land.ejected" | "review.requested" | "comment.reply" | "mention" | "diff.landed" => "the diff",
             "quota.near" => "the cache",
+            "test.quarantined" => "the tests",
             "secret.unused" => "the secrets",
             _ => "the run",
         };
         let people = if s.people.is_empty() { vec![s.actor.clone()] } else { s.people.clone() };
         let people = people.into_iter().filter(|p| !p.is_empty()).collect();
-        Msg { title, line, url: s.url.clone(), what, dedup, resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"), webhook, people }
+        Msg { title, line, url: s.url.clone(), what, dedup, resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"), webhook, people, refs: super::trackers::references(&s.message) }
     }
 
     /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`.
@@ -407,7 +420,7 @@ impl Msg {
         };
         let line = format!("{text} · {machine} · {url}");
         let webhook = json!({ "event": event, "title": title, "text": line, "agent": ev.get("agent").cloned().unwrap_or(Value::Null), "url": url });
-        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new() }
+        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new(), refs: Vec::new() }
     }
 }
 
@@ -446,7 +459,7 @@ impl Msg {
         let webhook = json!({ "event": event, "title": title, "text": line, "release": r, "url": url });
         // Its approvers while it waits for them; else whoever asked for it.
         let people = if event == "release.waiting_approval" { approvers.iter().map(|a| (*a).to_owned()).collect() } else { vec![by.clone()] };
-        Msg { title, line, url: url.to_owned(), what: "the release", dedup: format!("kiln:release:{app}:{env}"), resolve: event == "release.succeeded", webhook, people }
+        Msg { title, line, url: url.to_owned(), what: "the release", dedup: format!("kiln:release:{app}:{env}"), resolve: event == "release.succeeded", webhook, people, refs: Vec::new() }
     }
 }
 
@@ -492,11 +505,25 @@ fn usable_by(i: &Integration, repo: &Repo) -> bool {
     integrations::usable_by(i, repo)
 }
 
+/// What a channel did with a message: took it, or had nothing to do with it (why).
+enum Went {
+    Sent,
+    Skipped(String),
+}
+
 /// Sends one message through `i`.
-async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: &Msg) -> Result<(), String> {
+async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: &Msg) -> Result<Went, String> {
+    // An issue tracker's: comments on the issues it names, or nothing.
+    if super::trackers::KINDS.contains(&i.kind.as_str()) {
+        let note = super::trackers::Note { event, title: &m.title, line: &m.line, url: &m.url, refs: &m.refs };
+        return Ok(match Box::pin(super::trackers::deliver(hub, i, target, &note)).await? {
+            Some(_) => Went::Sent,
+            None => Went::Skipped(if m.refs.is_empty() { "it names no issue".to_owned() } else { format!("it names no issue of {}'s ({})", i.name, m.refs.join(", ")) }),
+        });
+    }
     let secret = integrations::token(hub, i).await.map_err(|e| format!("{e:#}"))?;
     if i.kind == "email" {
-        return send_email(hub, i, target, secret, m).await;
+        return send_email(hub, i, target, secret, m).await.map(|()| Went::Sent);
     }
     let client = crate::http::client::Client::public().map_err(|e| format!("{e:#}"))?;
     let (title, line) = (m.title.clone(), m.line.clone());
@@ -570,7 +597,7 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: 
     {
         return Err(format!("Slack: {}", v.get("error").and_then(Value::as_str).unwrap_or("refused")));
     }
-    Ok(())
+    Ok(Went::Sent)
 }
 
 /// An email (W11-R06): through the integration's SMTP server, to `target` (addresses,
@@ -604,14 +631,16 @@ async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about:
             };
             match super::inbox::put(hub, &people, event, &m.title, &m.line, &m.url, repo.map(|r| r.name.as_str())).await {
                 Ok(0) => Err("it's about nobody with an inbox".to_owned()),
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(Went::Sent),
                 Err(e) => Err(format!("{e:#}")),
             }
         }
         Err(e) => Err(e),
         Ok((i, target)) => {
+            // A tracker retries each of its changes itself: again here would repeat its comments.
+            let waits: &[u64] = if super::trackers::KINDS.contains(&i.kind.as_str()) { &[0] } else { &[0, 2, 15] };
             let mut last = Err(String::new());
-            for wait in [0u64, 2, 15] {
+            for &wait in waits {
                 if wait > 0 {
                     crate::rt::sleep(Duration::from_secs(wait)).await;
                 }
@@ -629,7 +658,8 @@ async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about:
     }
     let (rule, event, run, spec, now) = (rule.to_owned(), event.to_owned(), about.to_owned(), spec.to_owned(), crate::util::now_unix());
     let (status, error) = match result {
-        Ok(()) => ("sent", None),
+        Ok(Went::Sent) => ("sent", None),
+        Ok(Went::Skipped(why)) => ("skipped", Some(why)),
         Err(e) => ("failed", Some(e)),
     };
     let _ = hub
@@ -871,6 +901,112 @@ pub async fn land_ejected(hub: Arc<Hub>, diffs: Vec<String>, reason: String) {
     emit(&hub, &repo, "land.ejected", &s).await;
 }
 
+/// A diff landed on its trunk at `commit` (W11-R07): `diff.landed`, about it (`D12 title`, its
+/// link), its author's, with its latest version's message (whose trailers name its issues).
+pub async fn diff_landed(hub: Arc<Hub>, diff: String, commit: String) {
+    let Ok(Some(d)) = super::diffs::find(&hub, &diff).await else { return };
+    let Some(repo) = hub.store.repos().await.ok().and_then(|r| r.into_iter().find(|r| r.name == d.repo)) else { return };
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let id = d.id.clone();
+    let message = hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT message FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten()))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("{}\n\n{}", d.title, d.summary));
+    let s = Subject {
+        repo: repo.name.clone(),
+        run: format!("diff:{}", d.name),
+        workflow: d.name.clone(),
+        name: format!("{} {}", d.name, d.title),
+        branch: d.trunk.clone(),
+        sha: commit,
+        message,
+        actor: d.author.clone(),
+        conclusion: "landed".into(),
+        url: format!("{base}/diffs/{}", d.name),
+        github: json!({ "repository": repo.name, "ref": format!("refs/heads/{}", d.trunk), "ref_name": d.trunk, "actor": d.author, "event_name": "diff.landed" }),
+        people: vec![d.author_for.clone().unwrap_or_else(|| d.author.clone())],
+        ..Subject::default()
+    };
+    emit(&hub, &repo, "diff.landed", &s).await;
+}
+
+/// Tests trunk pushes took into quarantine, for the scheduler's sweep to tell of: the
+/// repository's id, the entry, the trunk and the commit.
+static QUARANTINED: parking_lot::Mutex<Vec<(String, kiln_ci::results::quarantine::Entry, String, String)>> = parking_lot::Mutex::new(Vec::new());
+
+/// A push moved trunk `branch` of `repo` from `before` to `after` (W16-R05, W11-R07): the tests
+/// its `.kiln/quarantine.yaml` took in, for `test.quarantined`. A repository's first push is
+/// what's quarantined already, said of nothing.
+pub async fn trunk_moved(hub: &Hub, repo: &Repo, branch: &str, before: &str, after: &str) {
+    const NAMES: [&str; 2] = [".kiln/quarantine.yaml", ".kiln/quarantine.yml"];
+    let changed = crate::gitops::changed_files(hub, repo, before, after).await.unwrap_or_default();
+    if !changed.iter().any(|p| NAMES.contains(&p.as_str())) {
+        return;
+    }
+    let facts = super::events::facts(hub, repo).await;
+    if branch != facts.default_branch {
+        return;
+    }
+    let at = |sha: String| {
+        let mirror = facts.mirror.clone();
+        async move {
+            for name in NAMES {
+                if let Ok(text) = crate::gitops::run_git(hub, &["-C", &mirror, "show", &format!("{sha}:{name}")], crate::gitops::LS_REMOTE_TIMEOUT).await {
+                    return kiln_ci::results::quarantine::parse(&String::from_utf8_lossy(&text)).unwrap_or_default();
+                }
+            }
+            Vec::new()
+        }
+    };
+    let (was, now) = (at(before.to_owned()).await, at(after.to_owned()).await);
+    let added: Vec<_> = now.into_iter().filter(|e| !was.iter().any(|w| w.test == e.test)).collect();
+    QUARANTINED.lock().extend(added.into_iter().map(|e| (repo.id.clone(), e, branch.to_owned(), after.to_owned())));
+}
+
+/// `test.quarantined` for each test trunk pushes took into quarantine since the last sweep: once
+/// per repository, test and commit. Called as the scheduler sweeps.
+pub fn quarantined(hub: &Arc<Hub>) {
+    let taken = std::mem::take(&mut *QUARANTINED.lock());
+    if taken.is_empty() {
+        return;
+    }
+    let hub = Arc::clone(hub);
+    crate::rt::spawn(async move {
+        let repos = hub.store.repos().await.unwrap_or_default();
+        let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+        for (repo_id, e, branch, sha) in taken {
+            let Some(repo) = repos.iter().find(|r| r.id == repo_id) else { continue };
+            if throttled(&hub, &format!("test.quarantined\u{0}{repo_id}\u{0}{}\u{0}{sha}", e.test), Some(QUARANTINE_ONCE)).await {
+                continue;
+            }
+            let mut message = e.reason.clone();
+            if let Some(until) = &e.until {
+                message.push_str(&format!(" · until {until}"));
+            }
+            // The issue it names, if any, is what a tracker comments on (`Issue:`, a trailer).
+            if let Some(issue) = &e.issue {
+                message.push_str(&format!("\n\nIssue: {issue}"));
+            }
+            let s = Subject {
+                repo: repo.name.clone(),
+                run: format!("test:{}", e.test),
+                workflow: e.test.clone(),
+                name: e.test.clone(),
+                branch,
+                sha,
+                message,
+                url: format!("{base}/insights?repo={}", repo.name),
+                github: json!({ "repository": repo.name, "event_name": "test.quarantined" }),
+                ..Subject::default()
+            };
+            emit(&hub, repo, "test.quarantined", &s).await;
+        }
+    });
+}
+
 /// Runners told of as offline, until they're back.
 static OFFLINE: parking_lot::Mutex<Option<std::collections::HashSet<String>>> = parking_lot::Mutex::new(None);
 
@@ -910,7 +1046,7 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
     let title = format!("⚠ runner {name} is offline");
     let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
-    let m = Msg { title: title.clone(), line: line.clone(), url, what: "the runner", dedup: format!("kiln:runner:{name}"), resolve: false, webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }), people: Vec::new() };
+    let m = Msg { title: title.clone(), line: line.clone(), url, what: "the runner", dedup: format!("kiln:runner:{name}"), resolve: false, webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }), people: Vec::new(), refs: Vec::new() };
     for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
         if rule.check(true).is_err() || !takes_ctx(rule, "runner.offline", "runner", &runner) {
             continue;
@@ -1087,15 +1223,24 @@ pub async fn from_leg(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             Ok((i, target)) => send(hub, &i, target.as_deref(), "message", &m).await,
             Err(e) => Err(e),
         };
-        sent.push(json!({ "to": spec, "ok": r.is_ok(), "error": r.err() }));
+        let (ok, skipped, error) = match r {
+            Ok(Went::Sent) => (true, None, None),
+            Ok(Went::Skipped(why)) => (true, Some(why), None),
+            Err(e) => (false, None, Some(e)),
+        };
+        sent.push(json!({ "to": spec, "ok": ok, "skipped": skipped, "error": error }));
     }
     Ok(srv::json(StatusCode::OK, &json!({ "sent": sent })))
 }
 
 /// Integration Verify for a channel: a test message.
 pub async fn verify(hub: &Hub, i: &Integration) -> Result<String, String> {
+    // An issue tracker says who it is, rather than comment anywhere.
+    if super::trackers::KINDS.contains(&i.kind.as_str()) {
+        return Box::pin(super::trackers::verify(hub, i)).await;
+    }
     let s = Subject { name: "kiln: a test message; this channel works".into(), url: hub.cfg.server.public_url.clone(), ..Subject::default() };
-    send(hub, i, None, "message", &Msg::of_run("message", &s)).await.map(|()| format!("sent a test message through {}", i.name))
+    send(hub, i, None, "message", &Msg::of_run("message", &s)).await.map(|_| format!("sent a test message through {}", i.name))
 }
 
 /// `GET /api/ci/notify/deliveries?run=&limit=`: what went out, newest first.

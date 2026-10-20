@@ -22,6 +22,7 @@ import { UpdatesHold, UpdatesPanel, UpdatesStatus } from "@/views/settings-updat
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
 import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
+import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswordRes, passkeysRes } from "@/views/settings-signin";
 import { CiSecretsGroups, CiSecretsHold } from "@/views/settings-ci";
 import { RoutingGroups, RoutingHold } from "@/views/settings-routing";
 import { OidcGroups, OidcHold } from "@/views/settings-oidc";
@@ -36,9 +37,11 @@ const methodsRes: Res<{ password: boolean; token: boolean }> = {
 export default function Settings() {
   // Each section for those who can use it (W10-R02): the owner sees every one, a person what their rights reach.
   const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
+  // A person (not the owner): their own password beside their passkeys.
+  const person = useAuth((s) => s.kind === "authed" && s.me?.kind === "user");
   const may = (c: string, server = true) => !can || can[c] === "server" || (!server && can[c] === "some");
   const [pushes, updates, deployments, server] = [may("agents.run"), may("runners.read"), may("integrations.manage"), may("settings.manage")];
-  warm(methodsRes, thisDeviceRes, myNotificationsRes, ...(updates ? [updatesRes] : []), ...(pushes ? [pushStateRes, pushDevicesRes] : []));
+  warm(methodsRes, thisDeviceRes, myNotificationsRes, passkeysRes, ...(person ? [myPasswordRes] : []), ...(updates ? [updatesRes] : []), ...(pushes ? [pushStateRes, pushDevicesRes] : []));
   // The sections shown, numbered in order.
   let shown = 0;
   const next = () => ++shown;
@@ -92,7 +95,7 @@ export default function Settings() {
           id="signin"
           index={next()}
           title="Sign-in"
-          about={server ? "The password other devices sign in with, and this session" : "This session"}
+          about={server ? "The password other devices sign in with, your passkeys, and this session" : "Your password and passkeys, and this session"}
           words="login account"
           status={server ? <PasswordStatus /> : undefined}
         >
@@ -101,6 +104,14 @@ export default function Settings() {
               <PasswordGroup />
             </Loadable>
           )}
+          {person && (
+            <Loadable label="your password" fallback={<MyPasswordHold />}>
+              <MyPasswordGroup />
+            </Loadable>
+          )}
+          <Loadable label="your passkeys" fallback={<PasskeysHold />}>
+            <PasskeysGroup />
+          </Loadable>
           <SessionGroup />
         </SettingsSection>
         {(may("secrets.manage", false) || may("variables.manage", false) || may("routing.manage") || may("settings.manage")) && (

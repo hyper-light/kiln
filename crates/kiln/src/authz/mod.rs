@@ -16,6 +16,8 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod passkeys;
+pub mod passwords;
 pub mod sso;
 pub mod tokens;
 
@@ -316,6 +318,13 @@ pub static ROUTES: &[Rule] = &[
     // A person's own notification rules (W19-R06).
     r("GET", "/api/me/notifications", SIGNED_IN, At::Server),
     r("PUT", "/api/me/notifications", SIGNED_IN, At::Server),
+    // W10: one's own passkeys and password.
+    r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
+    r("GET", "/api/me/password", SIGNED_IN, At::Server),
+    r("PUT", "/api/me/password", SIGNED_IN, At::Server),
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),

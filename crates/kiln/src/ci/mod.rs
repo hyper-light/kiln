@@ -54,6 +54,7 @@ pub mod schedule;
 pub mod secrets;
 pub mod services;
 pub mod token;
+pub mod trackers;
 pub mod uploads;
 pub mod webhooks;
 pub mod workflows;

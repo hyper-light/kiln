@@ -181,8 +181,8 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins, musl Node left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; S3, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); the other stores left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and the Settings pages left |
-| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; the Settings pages for people and tokens left |
+| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); microVM and k8s executors and pool kinds, the Pools page, UI-made image definitions left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); the rest of the REST left |
@@ -190,7 +190,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check for CD (R04's kiln half), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, R04's CD half, AC04, microVM containment (W13) left |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); issue-tracker channels left |
+| W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; generated routes and CLI, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI and → You; comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
@@ -3031,9 +3031,25 @@ elsewhere (G-24, G-33).
   mode's `kiln.ci.oidc.token`, `POST /api/ci/oidc/token`) for the audience it federates into,
   ten minutes by default and an hour at most; nobody but an agent session gets one. Unit-tested
   (`w10_r11_service_and_agent_subjects`, `w10_r11_agent_and_service_tokens`).
+- *Done.* Passkeys and people's own passwords (`crates/kiln/src/authz/passkeys.rs`,
+  `passwords.rs`, migration `20261019-2300_w10_passkeys.sql`; Settings → Sign-in):
+  - Whoever is signed in makes a passkey (WebAuthn) in Settings, the owner or a person, never
+    through a token or an agent. It's a discoverable credential with user verification, for the
+    domain of the address in use (the public URL's or a front door's): ES256, EdDSA or RS256,
+    without attestation.
+  - Once any is kept, the sign-in page offers it: the browser lists this domain's passkeys, and
+    the one picked signs its person in. Each challenge is used once, within 5 minutes, on its
+    origin. Refused: another domain's, another key's signature, a counter gone backwards (a
+    copied authenticator), a removed passkey, a disabled person.
+  - A person may keep a password of their own (Argon2id), changed and removed with the current
+    one, and sign in with their name and it. Guesses are throttled per person, and an unknown
+    name takes as long as a known one.
+  - The sign-in page offers the hosts SSO is set up with (W23-R08) too.
+  - Checked end to end with a software authenticator (`w10_passkeys_and_passwords`), and in
+    Chromium with a virtual authenticator: a passkey made in Settings, then signed in with, and
+    a name and password; the pages in WebKit too, desktop and phone.
 - *Left.*
-  - Passwords and passkeys per user (users sign in with links), and the Settings pages for
-    people and tokens (W21).
+  - The Settings pages for people and tokens (W21).
   - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
     issuer paths, and the Settings → OIDC page (W21).
   - AC01, AC02, AC04's cloud cases (AWS, Google Cloud, Azure: test tenants, user-assisted).
@@ -3155,6 +3171,24 @@ auth`, W11-R03, R04). Done on this side: R03, R04.
   W19-AC05's test (`w19_ac05_notifications`).
 - *Done.* R09's OpenTelemetry half is W19-R02's (see its notes): the `otel` kind, an OTLP/HTTP
   receiver every finished run's trace goes to.
+- *Done.* R07, issue trackers (`crates/kiln/src/ci/trackers.rs`): the `linear` and `jira` kinds
+  are channels for W19-R06's rules.
+  - A run or diff names its issues in its commit's trailers (`Fixes: ENG-123`, `Refs: OPS-42`,
+    or an issue's link). Each tracker comments on the issues that are its own (`prefixes`) and
+    links the run or diff there, once per issue and link (a Linear attachment, a Jira remote
+    link). An event that names none of a tracker's issues is a `skipped` delivery, with why.
+  - Two events for them: `diff.landed` (a diff on its trunk, with its latest version's message)
+    and `test.quarantined` (a test a trunk push added to `.kiln/quarantine.yaml`). A quarantined
+    test gets an issue in the integration's team or project, or the rule's (`linear:ENG`,
+    `jira:OPS`), or a comment on the issue its entry names.
+  - Linear signs in with a personal API key, or an OAuth app's client credentials (the app
+    actor's token, kept until near its expiry). Jira Cloud signs in with an API token and its
+    account's email, or a service account's client credentials (Atlassian's token, then the
+    site's cloud). Verify says who.
+  - Each change is retried on its own, so a retry doesn't comment twice.
+  - Checked against fakes of both: `w11_r07_issue_trackers` end to end (a failing trunk run,
+    one naming nothing, two quarantined tests, a landed diff), and `w11_r07_trackers_as_apps`
+    for the apps' and service accounts' tokens.
 
 ### W12 Registries
 
@@ -4749,8 +4783,8 @@ rule-based notifications (G-30, G-31).
   Discord, email and webhook channels deliver (local fakes, then real ones). *Integration test.*
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
-**Progress.** In progress: R06 (issue trackers). Done: R01, R02,
-R03, R04, R05, R07, AC01, AC02, AC03, AC04, AC05 and AC06.
+**Progress.** Done: R01 to R07, and AC01 to AC06 (AC05 against local fakes; the real channels
+with W11-AC03's tenants).
 
 - *R05* (`crates/kiln/src/audit.rs`, migration `20261018-2200_w19_audit2.sql`):
   - **One row per change.** Every request that changes something writes exactly one `audit2`
@@ -5038,7 +5072,8 @@ R03, R04, R05, R07, AC01, AC02, AC03, AC04, AC05 and AC06.
     trunk's `inbox` rules reach them too; without one, its actor.
   - Checked end to end (`w19_r06_a_persons_own_rules`): dev's failing run reached dev's inbox and
     email, the owner's didn't; a channel that isn't a person's and an agent's change were refused.
-- *Left*: issue trackers as channels (W11-R07).
+- *Done.* R06's issue trackers: Linear and Jira as channels, and the `diff.landed` and
+  `test.quarantined` events (W11-R07; see its notes).
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 
@@ -5834,7 +5869,8 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
 - *Done.* R08's SSO (`crates/kiln/src/authz/sso.rs`, `[sso.github]`, `[sso.gitlab]`,
   `[sso.bitbucket]`):
   - sign-in with OAuth 2's code flow (`/api/auth/:provider/start`, `/callback`; the providers at
-    `/api/auth/sso` for the sign-in page), states used once, the way back always kiln's own;
+    `/api/auth/sso`, each a button on the sign-in page), states used once, the way back always
+    kiln's own;
   - the host's API says who signed in (a stable id, a verified email) and what they belong to:
     GitHub's organizations and teams, GitLab's groups, Bitbucket's workspaces;
   - sign-in limited to `allowed` memberships;
@@ -5996,6 +6032,9 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET · POST | `/api/ci/repos/:repo/pulls[/:n]` · `/:n/{comments,reviews,merge}` | `host.pulls.*` (GitHub's, GitLab's and Bitbucket's; as the person when they signed in with that host) | diffs.read · diffs.review · diffs.land | W23 |
 | POST | `/api/hooks/gitlab` · `/api/hooks/bitbucket` | GitLab's and Bitbucket's webhooks | open, their secret | W23 |
 | GET | `/api/auth/sso` · `/api/auth/:provider/{start,callback}` | SSO with GitHub, GitLab and Bitbucket | open | W23 |
+| POST | `/api/auth/passkey/options` · `/api/auth/passkey` · `/api/auth/password` (`{ name, password }`) | signing in with a passkey, or a person's name and password | open | W10 |
+| GET · POST · DELETE | `/api/me/passkeys` · `/api/me/passkeys/options` · `/api/me/passkeys/:id` | one's own passkeys: listed, made, removed | signed in, as oneself | W10 |
+| GET · PUT | `/api/me/password` | a person's own password (`{ password, current }`; empty removes it) | signed in, as oneself | W10 |
 
 GitHub-compatible runtime services (W08, W10), the facade (W14) and the registry (W12) are listed
 in §2.6; they are not part of the route table's public API but are authenticated by the same
@@ -6301,8 +6340,8 @@ when the provider module is built; `verified <date>` is set by W11-AC03 once a r
 | Docker Hub | registry | token (organization or personal access tokens; its OIDC accepts GitHub Actions only, from 2026-07-31 per secondary sources) | token | docs (secondary) |
 | GitHub (API, GHCR, releases) | forge | app (installation tokens) | GitHub App | docs |
 | GitLab (API, registry, packages) | forge | token (project, group or service-account tokens); inbound federation is only a proposal (issue 601894) | token | docs |
-| Atlassian: Jira, Confluence | work tracking | app (OAuth 2.0 client credentials for service accounts; 60-minute access tokens) | client id + secret | docs |
-| Linear | work tracking | app (`client_credentials` grant: app-actor token, 30 days) | client id + secret | docs |
+| Atlassian: Jira, Confluence | work tracking | app (OAuth 2.0 client credentials for service accounts; 60-minute access tokens), or an API token | client id + secret, or email + API token; the site | docs |
+| Linear | work tracking | app (`client_credentials` grant: app-actor token, 30 days), or a personal API key | client id + secret, or an API key | docs |
 | Slack | chat | token (bot token) or webhook | bot token / webhook URL | docs (no OIDC for API access) |
 | Discord | chat | token (bot) or webhook | bot token / webhook URL | verify |
 | Microsoft Teams, Telegram, email (SMTP), PagerDuty, Opsgenie | notifications | token or webhook | as each needs | verify |

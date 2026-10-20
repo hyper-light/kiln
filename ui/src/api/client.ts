@@ -135,7 +135,7 @@ export const api = {
     setAuthed(true);
   },
   /** Which sign-in methods this server offers (public). */
-  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean }>("/api/auth/methods", signal),
+  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean; passkey?: boolean; people?: boolean }>("/api/auth/methods", signal),
   loginPassword: async (password: string) => {
     await post<void>("/api/auth/password", { password });
     setAuthed(true);

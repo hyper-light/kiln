@@ -258,6 +258,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(boxed(|| otp(&hub, &req)).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(boxed(|| auth_methods(&hub)).await),
         (&Method::POST, ["api", "auth", "password"]) => return boxed(|| login_password(&hub, req)).await,
+        // Passkeys (docs/ci.md W10): a challenge, then the signature that answers it.
+        (&Method::POST, ["api", "auth", "passkey", "options"]) => {
+            let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            return crate::authz::passkeys::sign_in_options(&hub, origin.as_deref()).map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m));
+        }
+        (&Method::POST, ["api", "auth", "passkey"]) => return boxed(|| login_passkey(&hub, req)).await,
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
         (&Method::GET, ["api", "me"]) => return Ok(boxed(|| me(&hub, req.headers())).await),
         (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
@@ -421,6 +427,22 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::PUT, ["api", "me", "notifications"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 20)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             boxed(|| crate::ci::notify::mine(&hub, &caller, Some(body))).await.map_err(|(s, m)| ApiError(s, m))
+        }
+        // W10: one's own passkeys and password.
+        (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
+        (&Method::POST, ["api", "me", "passkeys", "options"]) => {
+            let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            boxed(|| crate::authz::passkeys::register_options(&hub, &caller, origin.as_deref())).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m))
+        }
+        (&Method::POST, ["api", "me", "passkeys"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 16)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| crate::authz::passkeys::register(&hub, &caller, &body)).await.map(|v| srv::json(StatusCode::CREATED, &v)).map_err(|(s, m)| ApiError(s, m))
+        }
+        (&Method::DELETE, ["api", "me", "passkeys", id]) => boxed(|| crate::authz::passkeys::remove(&hub, &caller, id)).await.map(|()| srv::status(StatusCode::NO_CONTENT)).map_err(|(s, m)| ApiError(s, m)),
+        (&Method::GET, ["api", "me", "password"]) => boxed(|| crate::authz::passwords::get(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
+        (&Method::PUT, ["api", "me", "password"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 16)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| crate::authz::passwords::set(&hub, &caller, &body)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m))
         }
         (&Method::GET, ["api", "system"]) => Ok(boxed(|| system(&hub)).await),
         (&Method::GET, ["api", "audit"]) => boxed(|| audit(&hub, &q)).await,
@@ -1781,18 +1803,27 @@ static PASSWORD_GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());
 async fn auth_methods(hub: &Hub) -> Response {
     let path = crate::password::path(&hub.cfg);
     let password = crate::rt::blocking(move || crate::password::load(&path).is_some()).await.unwrap_or(false);
-    srv::json(StatusCode::OK, &json!({ "password": password, "token": true }))
+    // Passkeys kept here, and people's own passwords (who then sign in with their name).
+    let (passkey, people) = (crate::authz::passkeys::any(hub).await, crate::authz::passwords::any(hub).await);
+    srv::json(StatusCode::OK, &json!({ "password": password, "token": true, "passkey": passkey, "people": people }))
 }
 
 #[derive(Deserialize)]
 struct PasswordLogin {
     password: String,
+    /// A person's name: their own password (W10). Without, the owner's.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 async fn login_password(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: PasswordLogin =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if let Some(name) = l.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        let (id, _, epoch) = crate::authz::passwords::sign_in(hub, name, &l.password).await.map_err(|(c, m)| err(c, m))?;
+        return Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &cookie_for(&crate::authz::gate::session_value(hub, &id, epoch), secure)));
+    }
     let gate = PASSWORD_GATE.lock().await;
     if let Err(wait) = PASSWORD_THROTTLE.check() {
         let secs = wait.as_secs().max(1);
@@ -1823,6 +1854,23 @@ async fn login_password(hub: &Hub, req: Request) -> R {
             StatusCode::CONFLICT,
             "Password sign-in is not set up yet. Sign in with the admin token once, then choose a password in Settings.",
         )),
+    }
+}
+
+/// `POST /api/auth/passkey`: a passkey's answer to its challenge; the session of whoever it's
+/// theirs (docs/ci.md W10).
+async fn login_passkey(hub: &Hub, req: Request) -> R {
+    let secure = is_secure(hub, &req);
+    let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    match crate::authz::passkeys::sign_in(hub, &body).await {
+        Ok(crate::authz::passkeys::Who::Owner) => Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub, secure))),
+        Ok(crate::authz::passkeys::Who::User { id, epoch, .. }) => {
+            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &cookie_for(&crate::authz::gate::session_value(hub, &id, epoch), secure)))
+        }
+        Err((c, m)) => {
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            Err(err(c, m))
+        }
     }
 }
 

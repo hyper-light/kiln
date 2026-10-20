@@ -27,6 +27,13 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
         return Ok(true);
     }
     let commit = load::load(hub, repo, &t.sha).await?;
+    // A push to the trunk (its commit here now): the tests it took into quarantine (W16-R05,
+    // W11-R07).
+    if t.event == "push"
+        && let Some(before) = t.before.as_deref().filter(|b| *b != ZERO_SHA)
+    {
+        super::notify::trunk_moved(hub, repo, &t.branch, before, &t.sha).await;
+    }
     // A manual run of one pipeline runs that one only.
     let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
     // GitHub's workflows; the kiln dialect's too once `[ci] kiln_workflows` takes them off v1.
