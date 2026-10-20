@@ -2143,11 +2143,14 @@ pub(crate) mod tests {
         cfg.server.data_dir = dir.clone();
         cfg.terminal.enabled = false;
         f(&mut cfg);
-        // Its keys are throwaway: written without waiting for the disk.
+        // Its slowest parts, and apart: the store's migrations (about 20 ms), on a thread of their
+        // own, while its keys are made (the process's first key starts the crypto library, about
+        // as long). The keys are throwaway: written without waiting for the disk.
+        let store = std::thread::spawn(Store::in_memory);
         let pki = Arc::new(crate::pki::Pki::open_scratch(&dir.join("pki"))?);
         let leaf = pki.server_leaf(&[])?;
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
-        let store = Store::in_memory()?;
+        let store = store.join().map_err(|_| anyhow::anyhow!("the scratch store's thread panicked"))??;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Ok(Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
     }
