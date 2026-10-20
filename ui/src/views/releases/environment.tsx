@@ -10,7 +10,7 @@ import { Link, useParams } from "@/lib/router";
 import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { api } from "@/api/client";
-import { boardHref, deployApi, describe, providerName, releaseAppHref, releaseHref, type Environment, type Gates, type Move } from "@/api/deploy";
+import { boardHref, checkName, deployApi, describe, providerName, releaseAppHref, releaseHref, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
@@ -23,6 +23,20 @@ import { boardRes, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
+/** A check, as a person reads it. */
+function checkWords(c: Check): string {
+  if (typeof c === "string") return c;
+  const what = c.http ? `asks ${c.http.url}` : c.workflow ? `runs ${c.workflow.workflow} of ${c.workflow.repository}${c.workflow.ref ? `@${c.workflow.ref}` : ""}` : "";
+  return `${c.name}${what ? `: ${what}` : ""}${c.report_only ? " (report only)" : ""}`;
+}
+
+/** The provenance asked of what an environment deploys, as a person reads it. */
+function provenanceWords(p: ProvenanceRequirement): string {
+  const from = p.workflows?.length ? `, built by ${p.workflows.join(", ")}` : "";
+  const on = p.branches?.length ? ` on ${p.branches.join(", ")}` : "";
+  return `kiln's signed provenance of each artifact${from}${on}${p.builder ? ` (builder ${p.builder})` : ""}`;
+}
+
 /** Each gate, in a line. */
 function gateLines(g: Gates): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [];
@@ -34,7 +48,8 @@ function gateLines(g: Gates): { label: string; value: string }[] {
   for (const w of g.windows ?? []) {
     out.push({ label: w.allow ? "Allowed" : "Denied", value: `${w.allow ?? w.deny} for ${w.duration}${w.timezone ? ` (${w.timezone})` : ""}` });
   }
-  if (g.checks?.length) out.push({ label: "Checks", value: g.checks.join(", ") });
+  if (g.checks?.length) out.push({ label: "Checks", value: g.checks.map(checkWords).join("; ") });
+  if (g.require_provenance) out.push({ label: "Provenance", value: provenanceWords(g.require_provenance) });
   return out;
 }
 
@@ -52,6 +67,32 @@ const CHECKS: { name: string; words: string }[] = [
   { name: "owners-set", words: "The app has an owner team" },
 ];
 
+/** An external check, as edited: a URL kiln asks, or a workflow it runs. */
+type CheckRow = { name: string; kind: "http" | "workflow"; url: string; timeout: string; repository: string; workflow: string; ref: string; reportOnly: boolean };
+
+const isExternal = (c: Check): c is CheckSpec => typeof c !== "string" && (!!c.http || !!c.workflow);
+
+function checkRow(c: CheckSpec): CheckRow {
+  return {
+    name: c.name,
+    kind: c.workflow ? "workflow" : "http",
+    url: c.http?.url ?? "",
+    timeout: c.http?.timeout ?? "",
+    repository: c.workflow?.repository ?? "",
+    workflow: c.workflow?.workflow ?? "",
+    ref: c.workflow?.ref ?? "",
+    reportOnly: !!c.report_only,
+  };
+}
+
+function checkSpec(r: CheckRow): CheckSpec {
+  const how =
+    r.kind === "http"
+      ? { http: { url: r.url.trim(), timeout: r.timeout.trim() || undefined } }
+      : { workflow: { repository: r.repository.trim(), workflow: r.workflow.trim(), ref: r.ref.trim() || undefined } };
+  return { name: r.name.trim(), ...how, report_only: r.reportOnly || undefined };
+}
+
 /** What every release here passes, how a second one waits, and what agents may do; saved whole. */
 function Settings({ e }: { e: Environment }) {
   const g = e.gates;
@@ -61,7 +102,14 @@ function Settings({ e }: { e: Environment }) {
   const [approvals, setApprovals] = React.useState(String(g.approvals?.count ?? 0));
   const [reviewers, setReviewers] = React.useState((g.approvals?.reviewers ?? []).join(", "));
   const [selfApprove, setSelfApprove] = React.useState(!!g.approvals?.self_approve);
-  const [checks, setChecks] = React.useState<string[]>(g.checks ?? []);
+  // Built-in checks by name (one given as a description, report only, stays as it is), and the
+  // environment's own: a URL asked, or a workflow run.
+  const builtInSpecs = (g.checks ?? []).filter((c): c is CheckSpec => typeof c !== "string" && !isExternal(c));
+  const [checks, setChecks] = React.useState<string[]>((g.checks ?? []).filter((c) => !isExternal(c)).map(checkName));
+  const [external, setExternal] = React.useState<CheckRow[]>((g.checks ?? []).filter(isExternal).map(checkRow));
+  const [provenance, setProvenance] = React.useState(!!g.require_provenance);
+  const [provWorkflows, setProvWorkflows] = React.useState((g.require_provenance?.workflows ?? []).join(", "));
+  const [provBranches, setProvBranches] = React.useState((g.require_provenance?.branches ?? []).join(", "));
   const [windows, setWindows] = React.useState<WindowRow[]>(
     (g.windows ?? []).map((w) => ({ kind: w.allow ? "allow" : "deny", cron: w.allow ?? w.deny ?? "", duration: w.duration, timezone: w.timezone ?? "" })),
   );
@@ -74,10 +122,16 @@ function Settings({ e }: { e: Environment }) {
       ? "Approvals: a whole number, 0 for none."
       : windows.some((w) => !w.cron.trim() || !w.duration.trim())
         ? "Each window needs its schedule and how long it lasts."
-        : null;
+        : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
+          ? "Each check needs its name, and its URL, or its repository and workflow."
+          : null;
   const setWindow = (i: number, patch: Partial<WindowRow>) => setWindows((ws) => ws.map((w, j) => (j === i ? { ...w, ...patch } : w)));
+  const setCheck = (i: number, patch: Partial<CheckRow>) => setExternal((xs) => xs.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   const save = async () => {
+    const builtIn: Check[] = checks.map((n) => builtInSpecs.find((s) => s.name === n) ?? n);
     const gates: Gates = {
+      // What this form doesn't show is kept as it is.
+      ...g,
       after: names(after),
       soak: soak.trim() || undefined,
       promote: promote === "auto" && names(after).length ? "auto" : undefined,
@@ -86,7 +140,8 @@ function Settings({ e }: { e: Environment }) {
         const when = { duration: w.duration.trim(), timezone: w.timezone.trim() || undefined };
         return w.kind === "allow" ? { allow: w.cron.trim(), ...when } : { deny: w.cron.trim(), ...when };
       }),
-      checks,
+      checks: [...builtIn, ...external.map(checkSpec)],
+      require_provenance: provenance ? { builder: g.require_provenance?.builder, workflows: names(provWorkflows), branches: names(provBranches) } : undefined,
       freeze: g.freeze,
     };
     setBusy(true);
@@ -118,6 +173,54 @@ function Settings({ e }: { e: Environment }) {
             {c.words}
           </label>
         ))}
+        <label className="cd-new-check">
+          <input type="checkbox" className="check" checked={provenance} onChange={(ev) => setProvenance(ev.target.checked)} /> Only what kiln's CI built and signed (provenance)
+        </label>
+      </div>
+      {provenance && (
+        <div className="cd-new-grid">
+          <TextField label="Built by" placeholder=".kiln/build.yaml" value={provWorkflows} spellCheck={false} onChange={(ev) => setProvWorkflows(ev.target.value)} hint="The workflows it may come from; any when empty." />
+          <TextField label="From branches" placeholder="main" value={provBranches} spellCheck={false} onChange={(ev) => setProvBranches(ev.target.value)} hint="The branches it may be built from; any when empty." />
+        </div>
+      )}
+      <div className="rel-windows">
+        <span className="field-label">Checks of its own</span>
+        {external.map((r, i) => (
+          <div key={i} className="rel-ext-check">
+            <TextField label="Name" placeholder="smoke" value={r.name} spellCheck={false} onChange={(ev) => setCheck(i, { name: ev.target.value })} />
+            <SelectField
+              label="Kind"
+              value={r.kind}
+              onChange={(v) => setCheck(i, { kind: v === "workflow" ? "workflow" : "http" })}
+              options={[
+                { value: "http", label: "A URL answers" },
+                { value: "workflow", label: "A workflow runs" },
+              ]}
+            />
+            {r.kind === "http" ? (
+              <>
+                <TextField label="URL" placeholder="https://checks.example.com/smoke" value={r.url} spellCheck={false} onChange={(ev) => setCheck(i, { url: ev.target.value })} />
+                <TextField label="Timeout" placeholder="10s" value={r.timeout} spellCheck={false} onChange={(ev) => setCheck(i, { timeout: ev.target.value })} />
+              </>
+            ) : (
+              <>
+                <TextField label="Repository" placeholder="acme/web" value={r.repository} spellCheck={false} onChange={(ev) => setCheck(i, { repository: ev.target.value })} />
+                <TextField label="Workflow" placeholder=".kiln/smoke.yaml" value={r.workflow} spellCheck={false} onChange={(ev) => setCheck(i, { workflow: ev.target.value })} />
+                <TextField label="At" placeholder="main" value={r.ref} spellCheck={false} onChange={(ev) => setCheck(i, { ref: ev.target.value })} />
+              </>
+            )}
+            <label className="rel-check">
+              <input type="checkbox" className="check" checked={r.reportOnly} onChange={(ev) => setCheck(i, { reportOnly: ev.target.checked })} />
+              <span>Report only</span>
+            </label>
+            <Button size="xs" variant="ghost-danger" aria-label="Remove the check" onClick={() => setExternal((xs) => xs.filter((_, j) => j !== i))}>
+              <Trash2 />
+            </Button>
+          </div>
+        ))}
+        <Button size="xs" variant="ghost" onClick={() => setExternal((xs) => [...xs, { name: "", kind: "http", url: "", timeout: "", repository: "", workflow: "", ref: "", reportOnly: false }])}>
+          <Plus /> A check
+        </Button>
       </div>
       <div className="rel-windows">
         <span className="field-label">Windows</span>

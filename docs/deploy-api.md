@@ -471,13 +471,13 @@ leaves what it rolled back from running, and marks the registration degraded.
 | What happened | What kiln does |
 | --- | --- |
 | Refused, or it never reached the provider: nothing of it was applied | its commit is reverted (bookkeeping: what ran before runs on) |
-| A deploy, config, secrets, enable or disable release failed after it was applied | **a revert**: its commit reverted as a release of kind `revert`, origin `kiln`, followed like any release until what ran before runs again |
+| A deploy, config, secrets, enable or disable release failed after it was applied | **a revert**: its commit reverted as a release of kind `revert`, origin `kiln`, followed like any release until what ran before runs again. Where nothing ran before (an app's first release, or one after a disable that removed what ran), the revert removes what it made; a disable that kept what ran keeps it. The app's namespace stays, as on a disable |
 | A rollback failed | **held**: not reverted, as that would bring back what it rolled back from |
 | A revert failed | **held**: kiln doesn't revert its own way back |
 | One asked with `no_revert` failed (a migration that can't run backwards; a secret rotated after a leak, which a revert would deliver again) | **held** |
 | One that runs a Job on its way in (a Helm `pre-install`/`pre-upgrade`/`post-*` hook, Argo CD's `PreSync`/`Sync`/`PostSync`: a migration) failed, as its preflight found it | **held**: what ran before may not run on what it changed; a hook marked `kiln.dev/reversible: "true"` (kiln-base: `jobs.<name>.reversible`, an expand-then-contract change) doesn't count |
 | A commit kiln didn't make (origin `git`) failed | **held**: git is its author's |
-| The provider took it and can't be asked since | nothing is done blind: it's judged when the provider answers, and **held** past `watch.unreachable` (default 6 h) |
+| The provider took it and can't be asked since | nothing is done blind: it's judged when the provider answers, and **held** once it hasn't for `watch.unreachable` (default 6 h). On KilnCD, that's while the app's cluster doesn't answer (asked before anything is judged, a landing too, since KilnCD's last look may be all it has); a sync that failed for that is synced again once the cluster answers. The release's `watch.timeout` runs from when the provider answers again |
 
 A release **held** fails as it is, and its registration is marked `degraded` (why, on the board and
 the app's page): it needs a person, and nothing is promoted into it by itself until the next release
@@ -639,30 +639,52 @@ git says then.
 
 | Gate | Passes when |
 | --- | --- |
-| `after` | the same version, with the same artifacts, succeeded in each upstream environment and still runs there healthy (txst's deploy-validate) |
+| `after` | the same version, with the same artifacts, succeeded in each upstream environment and still runs there healthy (txst's deploy-validate); one of a linked server (`staging@eu`) says so in a statement it signs (§11) |
 | `soak` | it has run there that long |
 | `approvals` | enough reviewers approved, from the UI, a phone, chat or `kiln`; agents only where the environment allows them (cd-targets.md D6). With `via: pull-request`, the merge is the approval |
 | `windows` | no deny window covers now (Argo CD's sync windows: allow and deny, cron, duration, timezone) |
 | `checks` | each check passes: built in (`no-snapshots`, `artifact-exists`, `artifact-signed`, `vulnerabilities`, `owners-set`) or external (a URL that answers pass or fail, a kiln workflow). A check is `required` or `report-only` |
+| `provenance` | each artifact a new version deploys has kiln's provenance, its signature verified, from the workflows and branches the environment allows (`require_provenance: { builder, workflows, branches }`, ci.md W18-R04) |
 | `freeze` | no freeze holds the environment or the app (incidents, holidays) |
 
 Each gate's result is recorded on the release, with its evidence. A release kiln can't gate is
-refused, never let through.
+refused, never let through. In order: a freeze, windows, the built-in checks, provenance, `after`
+and `soak`, the external checks, approvals.
 
-How each one holds or refuses (built: all but the external and signature checks):
+How each one holds or refuses (built: all but the checks `artifact-exists`, `artifact-signed` and
+`vulnerabilities`):
 
 - **Refused at once** (`409`): a version that doesn't run upstream (`after`), or runs there with
-  other artifacts; a failed check; a window that doesn't read. Nothing waiting would change them.
+  other artifacts; a failed check; a window that doesn't read; provenance that doesn't meet the
+  requirement, an artifact not pinned by digest, or none named; a linked server's statement that
+  doesn't verify, or a linked server that says the app isn't there or doesn't take the token.
+  Nothing waiting would change them.
 - **Held** (`waiting`, the reason in its message): a freeze, a deny window (until it closes) or no
   allow window open (until one opens), a soak still running, the same version still on its way
-  upstream (an upstream release of it in flight).
+  upstream (an upstream release of it in flight), an external check not answered yet (its URL
+  pending or out of reach, its workflow still running), provenance kiln doesn't have yet (for half
+  an hour after the release is asked for: its build may still be attesting it; then it's
+  refused), a linked server that can't be asked.
+- **External checks** are asked once the release is recorded, and their answers stay with it: a
+  URL that said pass or fail isn't asked again, a workflow runs once (a gate before them that
+  holds the release doesn't make them ask again). `{ name, http: { url, timeout } }` is asked
+  `POST <url>` with `{ check, server, release: { id, app, environment, kind, version, artifacts,
+  requested_by, promoted_from, url } }` and kiln's OIDC token for that URL (`Authorization:
+  Bearer`, the URL its audience), and answers 2xx `{ "result": "pass" | "fail" | "pending",
+  "detail"?, "retry_after"? }`; it's reached as webhooks are, private networks only where
+  `[ci] allow_private_targets` allows them. `{ name, workflow: { repository, workflow, ref } }`
+  runs one of kiln's workflows by `workflow_dispatch` at that ref (the repository's default branch
+  when none), given what it declares of `app`, `environment`, `version`, `release` and `kind`, and
+  passes when the run succeeds; the run is its evidence. `report_only: true` records a check's
+  answer and never holds or refuses for it. A template's checks join its apps' environments'.
 - **Held for people** (`waiting_approval`; the event says `needs: approval` and who): too few
   approvals. `POST /releases/{id}/approve` (`runs.approve`, a note optional) counts one per
   person, a token or agent counting as the person it acts for; `…/reject` cancels the release,
   with who and why. Whoever asked doesn't approve their own release unless `self_approve`;
   reviewers, when named, are the only ones who may; agents answer only with `agents.approve`.
 - `after` and `soak` hold a new version; a rollback, a config change or an enable runs what passed
-  them before, and only freezes, windows, checks and approvals hold it.
+  them before, and only freezes, windows, checks and approvals hold it. Provenance is asked of a
+  new version and of what a rollback puts back.
 - Changing an environment wakes what waits on its gates, so lifting a freeze lets releases go at
   once; otherwise each looks again when its gate says, at least every five minutes.
 
@@ -705,6 +727,21 @@ owners, templates and registrations replicate (KilnDB), each environment belongs
 belongs to. A gate result that crosses servers (staging's run proving production's `after`) is
 signed with kiln's OIDC issuer (ci.md W10), as txst signs its deployment tokens.
 
+Built, before the records replicate (P6): a linked server is an integration of kind `kiln` (its
+URL, a token of an account there that reads releases, `runs.read`; optionally the CA its
+certificate is signed by and the issuer to expect), checked by asking it where it is
+(`GET /api/deploy/link`) and reading its issuer's keys. An environment's `after` names an
+environment of one as `staging@eu`. To gate a release, this server asks `eu` what runs of the app
+in `staging` and what's on its way there (`GET /api/deploy/apps/{app}/environments/staging/statement?audience=<this
+server's issuer>`); `eu` answers with a JWT its OIDC issuer signs (RS256, the key it publishes;
+`sub` `deploy:staging:<app>`, this server's issuer the audience, five minutes), and this server
+takes it only once the signature verifies against the keys `eu`'s issuer publishes and it is
+from that issuer, for this server, and current. The gate then holds or refuses as for an
+environment of its own, and keeps the statement with its result: anyone can check it again with
+`eu`'s keys. A server that can't be asked holds the release; one that refuses the token, doesn't
+have the app there, or answers with a statement that doesn't verify refuses it. A server serves its
+issuer's keys while it makes releases. `promote: auto` follows environments of its own server.
+
 ## 12. Clients
 
 ### 12.1 API
@@ -716,7 +753,8 @@ signed with kiln's OIDC issuer (ci.md W10), as txst signs its deployment tokens.
 | `/api/deploy/templates` | list, add, update, remove |
 | `/api/deploy/environments` | list, add, show, update, remove, `move` (§8.4) |
 | `/api/deploy/apps` | list (filters: owner, template, name), create, show, update, archive, delete |
-| `/api/deploy/apps/{app}/environments/{env}` | register, show (status, history, candidates), update, deregister, `pause`, `resume`, `enable`, `disable`, `diff`, `manifests`, `resources`, `logs`, `actions` |
+| `/api/deploy/apps/{app}/environments/{env}` | register, show (status, history, candidates), update, deregister, `pause`, `resume`, `enable`, `disable`, `diff`, `manifests`, `resources`, `logs`, `actions`, `statement` (what runs there, signed for a linked server, §11) |
+| `/api/deploy/link` | where this server is and the issuer it signs with, for linked servers (§11) |
 | `/api/deploy/releases` | create, list (filters: app, environment, state, kind, person, time), show, `approve`, `reject`, `cancel`, `rollback` |
 | `/api/deploy/events` | a stream (SSE or WebSocket) of releases and their progress, filtered |
 
@@ -839,7 +877,7 @@ kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's route
 | --- | --- |
 | The commit landed, the record didn't (a crash between them) | `release.json` carries the release number: kiln finds the commit and completes the record |
 | Someone pushed in between | the commit is redone on the new head, keeping their changes |
-| The provider can't be reached | the release stays `delivering`, retried with backoff; one the provider never took fails at its timeout and is reverted; one it took is judged when the provider answers, held past `watch.unreachable` |
+| The provider can't be reached (on KilnCD: the app's cluster doesn't answer) | the release stays `delivering`, retried with backoff; one the provider never took fails at its timeout and is reverted; one it took is judged when the provider answers (its timeout running from then), held once it hasn't for `watch.unreachable` |
 | A release's sync fails, or it doesn't land within `watch.timeout` (Degraded, pods that never start) | it fails, and a revert release puts back what ran before, followed until it runs again; a rollback, a revert, or one asked `no_revert` is held instead and its registration marked degraded (§8.1) |
 | The provider refuses the release (its chart doesn't render, its spec is invalid) | after `watch.refused` the release fails, its commit is reverted and the provider handed what ran before |
 | A version that isn't in its registry | refused before it is recorded (`422`), with the newest versions there |
@@ -916,7 +954,9 @@ deployments, and aren't carried over.
 | P2: an Argo CD environment through one ApplicationSet over its release repository (`kiln-<env>`: a git files generator on `<root>/*/*/<env>/release.json`, registrations disabled or without a version left out, each Application built from release.json's keys, its values from the release repository as a second source; Applications created and updated, deleted only by kiln), its AppProject (`kiln-<env>`: its apps' sources, namespaces and cluster-scoped kinds), the release repository registered with a reader token kiln mints for it (90 days, replaced a month early or when Argo CD can't read with it, the one replaced revoked; an empty repository first given its README); Applications followed through Argo CD's stream (asked directly only while it's down); a release landed once Argo CD compared it at a commit holding its files; release.json saying what runs (namespace, what it sets, whether Helm), read alike by both providers; kiln writing each Application kept (`argocd: { applications: true }`); a commit kiln didn't make seen by every environment sharing the repository | built. On the deploy-argo test Argo CD (v3.5.4, its own minikube profile), with a test kiln running in that cluster: `argo-set`'s ApplicationSet made podinfo's Application (owned by it, two sources) in its AppProject, with the release repository registered as `kiln` with a token kiln made for it alone, which Argo CD used as it was put; a deploy (6.11.0), a second version and a rollback each landed, compared at their release's commit and followed by the stream; kiln killed while 6.11.2 was delivering finished it after its restart, with one commit; a values.yaml edited and pushed by hand became a release of origin `git` and ran two replicas. In `argo-apps`, where kiln writes the Application, a release landed in the `default` project as before |
 | P2: actions on what runs, through either provider (Argo CD's resource actions, and a pod deleted; on KilnCD restart, pause and resume a rollout, scale, suspend and resume a CronJob or run it now, delete a pod), by API, `kiln deploy action`, `deploy.registrations.actions`/`.action` and the registration's page; moving an environment between Argo CD and KilnCD (§8.4: the new provider in shadow, differences beyond tracking marks, a handover, each object's uid read before and after), by API, `kiln deploy env move`, `deploy.environments.move*` and the environment's page | built. On the deploy-argo test Argo CD: Argo CD offered restart, pause, scale and resume (disabled while it runs) on podinfo's Deployment, a restart set its `restartedAt`, and a pod deleted through kiln was made again; `argo-set` moved to KilnCD (compared, agreeing, handed over in seconds; its ApplicationSet and Application gone, KilnCD running it Synced and Healthy) and back to Argo CD's ApplicationSet with every object's uid the same throughout (the move to KilnCD rolled no pods), then released 6.14.1 there; on KilnCD meanwhile, its actions restarted the Deployment and deleted a pod |
 | The `deploy.*` operations (P8's MCP half, early, for agents: §12.3), the environment's `agents` policy, idempotency keys, the `deploy` event | built. Over MCP on the test server: a release with a key asked for twice was one release; `deploy.releases.wait` answered as it moved and when it landed; a missing version refused; a rollback with its key landed |
-| P4: gates (`after`, `soak`, approvals with reviewers and `self_approve`, allow and deny windows, the checks `no-snapshots` and `owners-set`, freezes), `waiting_approval`, approve and reject (HTTP, `kiln`, `deploy.releases.approve`/`reject`), promotion | built. On the test servers (upstream on Argo CD, downstream on KilnCD): a version not upstream refused; one upstream held for its soak, then for approval; the requester's own approval refused; a named reviewer's approval let it go and it landed; a rejection cancelled one; a freeze and a deny window each held one and released it the moment they were lifted. `promote: auto` (§9.2) since: unit-tested, end to end once the test kiln deploys to a test cluster again. External checks, signatures and signed results between servers: not yet |
+| P4: gates (`after`, `soak`, approvals with reviewers and `self_approve`, allow and deny windows, the checks `no-snapshots` and `owners-set`, freezes), `waiting_approval`, approve and reject (HTTP, `kiln`, `deploy.releases.approve`/`reject`), promotion | built. On the test servers (upstream on Argo CD, downstream on KilnCD): a version not upstream refused; one upstream held for its soak, then for approval; the requester's own approval refused; a named reviewer's approval let it go and it landed; a rejection cancelled one; a freeze and a deny window each held one and released it the moment they were lifted. `promote: auto` (§9.2) since, end to end with KilnCD on the kilncd-e2e and deploy-argo test clusters: v5 landed in `promo-a` (release 16), and `promo-b` (`after: [promo-a]`, `soak: 1m`, `promote: auto`) got release 17 by itself, promoted from 16 in the name of who asked for it (key `promote:16:promo-b`), held for its soak and landed a minute after 16 did |
+| What follows a failure (§8.1), end to end: a failed first release's revert, a failed rollback, a provider that stops answering | built. On the kilncd-e2e test cluster: an app's first release (v3, which can't start) failed Degraded, and its revert removed the Deployment, Service and pods it made (nothing had run before it; its namespace stayed). A rollback whose new pod a ResourceQuota refused failed after its timeout and was held, not reverted: the registration marked degraded, the release it rolled back from running on; with the quota lifted, the next rollback landed and cleared the mark. With the cluster frozen (`docker pause`) under a release, it waited ("the provider can't be asked … it is judged when it answers"), and once the cluster answered, KilnCD synced it again and it landed; frozen past `watch.unreachable` (180 s there), the release was held as unknown, not reverted. On the deploy-argo test Argo CD, with its API server stopped after it took a release: the release waited, and landed when Argo CD answered again; stopped past `watch.unreachable` (150 s), the release was held. (Until then, KilnCD judged a release whose cluster stopped answering failed and reverted it, and a first release's revert left what it made running) |
+| P4: external checks (a URL that answers pass, fail or pending, asked with kiln's OIDC token for it; a kiln workflow run by `workflow_dispatch`, given what it declares of the release), asked once the release is recorded and kept with it, and `report_only`; the provenance gate (`require_provenance`, ci.md W18-R04: kiln's signed provenance of each artifact a new version or a rollback deploys, from the workflows and branches allowed; one not there yet waited for half an hour); gate results signed between linked servers (an integration of kind `kiln`; `after: staging@eu`, proven by a statement the linked server signs with its OIDC issuer for this server, checked against the keys it publishes and kept as the evidence); external checks and provenance on the environment's page, each gate's evidence on a release's | built. On the test server (KilnCD on the kilncd-e2e cluster) and a second one linked to it: a release waited while its URL said pending (asked with release 9's facts and kiln's token for that URL), landed once it said pass (its answer the evidence, not asked again), and another was refused when it said fail; a release waited for its workflow run (`acme/checks`' smoke workflow, given the release's app, version and environment), landed when run #2 succeeded, and one whose run #3 failed was refused; a release of an artifact kiln had no provenance of waited, and landed once the build workflow on `main` built and attested it (attestation #1 its evidence), and one built from `feature` was refused at once (W18-AC04). The second server, linking the first with a reader's token, refused `v5` while the first didn't run it; once it did, it took the first server's signed statement (which openssl verifies again with the key the first publishes), held the release for its two-minute soak and landed it; a link whose token the first refused was refused, and one that couldn't be reached held its release |
 | P7: platforms under releases through KilnCD: an app's `platform` package (its provider, `aws-lambda`, `aws-ecs`, `cloudflare-workers` or `vercel`, and its definition as `.kiln/deploy.yaml` holds it, `${{ release.* }}`, `${{ env.name }}` and `${{ app.name }}` filled, KilnCD's `${{ git.* }}` and `${{ artifacts.* }}` left to it; the platform's files from a repository at the release's version), an environment's `targets.platforms` (an account that is an integration of the provider's kind, its place), refused on Argo CD | built. KilnCD renders what a Lambda release defines into its Function (a test, against KilnCD's own provider); on the test server a release reached KilnCD for its target, and was cancelled and reverted; no real account yet (cd-targets.md D8) |
 | P5, first part: templates (a package with `{app}` in it, a namespace pattern, checks every release passes, properties with their allowed values, the environments allowed), apps made from a template, partial updates (`PATCH`: owners, properties, contacts, template, package), contacts (on call, channels, links), `catalog-info.yaml` for Backstage, whether a name is free, delete everywhere (deregistered first, objects kept or not); `kiln app set`, `kiln app catalog`, `kiln app templates`, the `deploy.templates.*` and `deploy.apps.*` operations | built. On the test server: an app made from a template took its package and namespace; a property and an environment the template doesn't allow were refused; contacts showed in its catalog-info.yaml; delete refused while registered, and deleted everywhere when asked |
 | Delivery metrics (§18; DORA's four keys from the releases: changes landed a day, lead time from asked to landed, change failure rate counting rollbacks, time to restore), for an app, an environment or all over N days; the versions a registration has run; releases by version (txst's last by version, deployed versions); `kiln deploy metrics|versions`, `history --version`; `deploy.metrics`, `deploy.registrations.versions`; an app's Delivery panel in the UI | built. From the test servers' releases: 17 changes, 11 landed, lead time 18 s at p50, 36% failed or rolled back, restored in 2 min 14 s at p50 |

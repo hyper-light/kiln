@@ -5,7 +5,8 @@
 //!
 //! An agent that calls them is the parent of what it starts (`Caller::agent`, from how it reached
 //! kiln), which gets no more than it has (`super::lineage`). An agent steers, interrupts and ends
-//! only the agents it started (and theirs). No operation answers what waits on a person: an
+//! only the agents it started (and theirs); it may send a queued message to any agent that works
+//! for the same person, which is told who sent it. No operation answers what waits on a person: an
 //! agent's approvals, questions and plans are for people, in kiln.
 
 use http::{Method, StatusCode};
@@ -111,7 +112,15 @@ async fn send(cx: Cx, v: Value) -> Out {
     };
     let info = known(&cx, &id)?;
     let id = info.id.clone();
-    may_steer(&cx, &id)?;
+    // Steering into a turn and stopping one are an agent's own to do; a queued message any agent
+    // that works for the same person may send, its receiver told who sent it.
+    let body = match lineage::may_message(&cx.hub, &cx.caller, &id).await? {
+        lineage::Reach::Own => body,
+        lineage::Reach::Peer if mode == SendMode::Queue => from_peer(&cx, &body),
+        lineage::Reach::Peer => {
+            return Err((StatusCode::FORBIDDEN, format!("an agent steers into a turn and sends now only to the agents it started (and theirs), and {} isn't one of them: send it a queued message instead", lineage::short(&id))));
+        }
+    };
     let message = crate::util::new_id();
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
     match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None }).await {
@@ -119,6 +128,22 @@ async fn send(cx: Cx, v: Value) -> Out {
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
         Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now: try again once it's back", info.name))),
     }
+}
+
+/// A message from another agent that works for the same person, as its receiver reads it.
+fn from_peer(cx: &Cx, text: &str) -> String {
+    let me = cx.caller.agent.as_deref().unwrap_or_default();
+    peer_text(cx.hub.harness.info(me).as_ref(), me, text)
+}
+
+/// `text` from agent `me` (`sender`, as kiln lists it): who sent it, that it isn't from the
+/// receiver's person, and how to answer.
+fn peer_text(sender: Option<&Info>, me: &str, text: &str) -> String {
+    let who = match sender {
+        Some(s) => format!("Agent “{}” ({}, {} on {})", s.name, lineage::short(me), s.kind, wait::machine(&s.target)),
+        None => format!("Agent {}", lineage::short(me)),
+    };
+    format!("{who}, which works for the same person as you, sent this message. It's from a fellow agent, not from your person. To answer, send it a message: agents_send {{\"agent\": \"{me}\", \"text\": …}}.\n\n{text}")
 }
 
 /// The agents a wait is for: `agent`, or `agents`.
@@ -377,7 +402,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.send",
-            summary: "Send an agent you started a message: `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it).",
+            summary: "Send an agent a message. To an agent you started (and theirs): `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it). To any other agent that works for the same person: `queue` only, and it's told the message is from you and how to answer you.",
             read_only: false,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "text": {"type": "string"}, "mode": {"type": "string", "enum": ["queue", "steer", "now"]}}), &["agent", "text"]),
@@ -622,10 +647,13 @@ mod end_to_end {
             // The parent lists its children; a person's list filters by parent too.
             let mine = call(cx.clone(), "agents.list", json!({"parent": p})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             anyhow::ensure!(mine.get("agents").and_then(Value::as_array).map(Vec::len) == Some(2), "{mine}");
-            // Another agent can't steer or end them; their parent can, and ends them with it.
+            // Another agent can't steer or end them (it may queue them a message: they work for
+            // the same person); their parent can, and ends them with it.
             let other = parent(&hub, "default", true).await?;
             let stranger = as_agent(&hub, &other).await?;
-            let Err((s, _)) = call(stranger, "agents.send", json!({"agent": kid, "text": "stop that"})).await else { anyhow::bail!("a stranger steered a child") };
+            let Err((s, _)) = call(stranger.clone(), "agents.send", json!({"agent": kid, "text": "stop that", "mode": "steer"})).await else { anyhow::bail!("a stranger steered a child") };
+            anyhow::ensure!(s == http::StatusCode::FORBIDDEN);
+            let Err((s, _)) = call(stranger, "agents.stop", json!({"agent": kid})).await else { anyhow::bail!("a stranger ended a child") };
             anyhow::ensure!(s == http::StatusCode::FORBIDDEN);
             let ended = call(cx.clone(), "agents.stop", json!({"agent": p, "children": true})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             anyhow::ensure!(ended.get("ended").and_then(Value::as_array).map(Vec::len) == Some(3), "the parent and its two children: {ended}");
@@ -635,6 +663,55 @@ mod end_to_end {
             anyhow::ensure!(rows > 0, "audited as agent:<id> for its person");
             Ok(())
         })
+    }
+
+    #[test]
+    fn an_agent_messages_any_agent_of_its_person_and_steers_only_its_own() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            // Two agents a person started apart: neither started the other.
+            let a = parent(&hub, "default", true).await?;
+            let b = parent(&hub, "default", true).await?;
+            let cx = as_agent(&hub, &a).await?;
+            // A queued message goes through (b's harness can't run here: what matters is that kiln
+            // didn't refuse it), told as from a.
+            let sent = call(cx.clone(), "agents.send", json!({"agent": b, "text": "which commit has the fix?"})).await;
+            anyhow::ensure!(!matches!(sent, Err((http::StatusCode::FORBIDDEN, _))), "a queued message to a fellow agent: {sent:?}");
+            // Steering into its turn, sending now, interrupting and ending it are its own's to do.
+            for (op, input) in [
+                ("agents.send", json!({"agent": b, "text": "x", "mode": "steer"})),
+                ("agents.send", json!({"agent": b, "text": "x", "mode": "now"})),
+                ("agents.interrupt", json!({"agent": b})),
+                ("agents.stop", json!({"agent": b})),
+            ] {
+                let Err((s, why)) = call(cx.clone(), op, input).await else { anyhow::bail!("{op} on a fellow agent went through") };
+                anyhow::ensure!(s == http::StatusCode::FORBIDDEN, "{op}: {s} {why}");
+            }
+            anyhow::ensure!(hub.harness.info(&b).is_some(), "b still runs");
+            // An agent that works for someone else isn't sent to.
+            let c = parent(&hub, "default", true).await?;
+            hub.store.kv_set(crate::mcp::opener_key(&c), "user:someone-else".to_owned()).await?;
+            let Err((s, why)) = call(cx.clone(), "agents.send", json!({"agent": c, "text": "hello"})).await else { anyhow::bail!("sent to another person's agent") };
+            anyhow::ensure!(s == http::StatusCode::FORBIDDEN && why.contains("works for someone else"), "{s} {why}");
+            // A person still sends to any agent, in any mode.
+            let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let sent = call(person, "agents.send", json!({"agent": b, "text": "go on", "mode": "steer"})).await;
+            anyhow::ensure!(!matches!(sent, Err((http::StatusCode::FORBIDDEN, _))), "a person steering: {sent:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_message_from_a_fellow_agent_says_who_sent_it_and_how_to_answer() {
+        let sender = crate::harness::session::Info { name: "Mantle".into(), kind: "claude".into(), target: "agent:adas-macbook-pro-2.local".into(), ..Default::default() };
+        let me = "01a1488745a977f58e4224bc796f3308";
+        let text = super::peer_text(Some(&sender), me, "Which commit adds the embedding API?");
+        assert!(text.starts_with("Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as you"), "{text}");
+        assert!(text.contains("not from your person"), "{text}");
+        assert!(text.contains(&format!("agents_send {{\"agent\": \"{me}\"")), "{text}");
+        assert!(text.ends_with("\n\nWhich commit adds the embedding API?"), "{text}");
+        // One kiln no longer lists still says who, by id.
+        assert!(super::peer_text(None, me, "hi").starts_with("Agent 01a14887,"));
     }
 
     #[test]

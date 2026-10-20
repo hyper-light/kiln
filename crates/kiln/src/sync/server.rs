@@ -3,7 +3,7 @@
 //! log ([`Owner`]); the hub hands it what runners say, the API what admins ask, and it hands back
 //! what to send ([`Out`]), which the hub sends on the sync lane.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -360,8 +360,9 @@ pub struct Owner {
     /// What happened in each repo, shared with the API; saved now and then.
     activity: Arc<Mutex<Activity>>,
     saved: Instant,
-    /// The copies' gauges, last measured.
+    /// The copies' gauges, last measured, and the repos (by name) this server published them for.
     gauged: Instant,
+    gauged_repos: BTreeSet<String>,
     /// Each copy's state as last seen, and when the server last heard how it is (and the unix
     /// milliseconds then).
     states: HashMap<(String, u64), &'static str>,
@@ -417,6 +418,7 @@ impl Owner {
             activity,
             saved: Instant::now(),
             gauged: Instant::now(),
+            gauged_repos: BTreeSet::new(),
             states: HashMap::new(),
             heard_at: HashMap::new(),
             quiet: HashMap::new(),
@@ -878,12 +880,17 @@ impl Owner {
         // Copies no longer synced: forgotten.
         self.states.retain(|k, _| seen.contains(k));
         self.heard_at.retain(|k, _| seen.contains(k));
-        m.copy_lag_steps.replace(lag);
-        m.copy_unsent_steps.replace(unsent);
-        m.copy_waiting_blobs.replace(waiting);
-        m.copy_state.replace(state);
-        m.copy_heard_age.replace(age);
-        m.conflict_files.replace(conflicts);
+        // Its own repos' series: what it published before (a repo gone takes its series with it)
+        // and now; another server's in this process kept.
+        let names: BTreeSet<String> = view.repos.iter().map(|r| r.name.clone()).collect();
+        let owned: BTreeSet<String> = self.gauged_repos.union(&names).cloned().collect();
+        m.copy_lag_steps.replace_owned(&owned, lag);
+        m.copy_unsent_steps.replace_owned(&owned, unsent);
+        m.copy_waiting_blobs.replace_owned(&owned, waiting);
+        m.copy_state.replace_owned(&owned, state);
+        m.copy_heard_age.replace_owned(&owned, age);
+        m.conflict_files.replace_owned(&owned, conflicts);
+        self.gauged_repos = names;
     }
 
     /// The repo's name, as metrics and logs label it.
