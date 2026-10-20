@@ -211,8 +211,11 @@ in the Tools tab's Live pages; `engine` in `show_live`):
   Firefox a profile (the conversation's, a person's own, or a clean one each time), each stream a
   tab of its.
 - **WebKit**: Safari on a Mac, through `safaridriver` (turned on once with `safaridriver --enable`,
-  which asks for an administrator's password). Its automated window opens on that Mac's screen,
-  keeps nothing, and is one at a time. On Linux, WebKitGTK's `WebKitWebDriver` when it's installed
+  which asks for an administrator's password, or with Safari's Settings › Developer › Allow remote
+  automation). Its automated window opens on that Mac's screen, keeps nothing, and is one at a
+  time. It has to be seen there: Safari throttles a window it doesn't show (the Mac's screen locked
+  or asleep, the window covered or on another desktop), and then its pictures take about a second
+  each instead of 16 ms, and a click waits half a minute or is lost. On Linux, WebKitGTK's `WebKitWebDriver` when it's installed
   (`apt install webkit2gtk-driver`). Its browser draws on a display of kiln's own, so nothing comes
   up on the machine's screen and a machine without one runs it: Xvfb when it's installed (no port,
   and only kiln holds its key; its pictures come in about 20 ms), else GTK's broadway backend in
@@ -221,7 +224,8 @@ in the Tools tab's Live pages; `engine` in `show_live`):
 
 Neither has a capture a page can be streamed from. So their page's picture is taken as it changes
 (Firefox's in about 5 ms: up to 30 a second while it changes or was just used, a few a second while
-it's still, none while nobody looks), and one that hasn't changed goes nowhere: still costs
+it's still, none while nobody looks; WebKit's up to about 6 a second, Safari taking one in about
+16 ms), and one that hasn't changed goes nowhere: still costs
 nothing on the wire. Each picture is encoded by kiln's capture extension as a tab's frames are
 (H.264, a sharp key frame when still), so viewers, recordings and the agent's `use_live` work the
 same. What viewers do goes to them as WebDriver actions (the pointer, touch, keys, text, the wheel).
