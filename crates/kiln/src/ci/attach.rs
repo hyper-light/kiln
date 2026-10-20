@@ -1728,7 +1728,8 @@ agents:
         ];
         let news = through_news(std::slice::from_ref(&job), &all);
         assert_eq!(news.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), ["agent-i1", "agent-i5"]);
-        assert!(news[0].1.contains("brought it to build 669cb1ae027a") && news[0].1.contains("incident i1") && news[0].1.contains("report it resolved"), "{}", news[0].1);
+        let first = news.first().map(|(_, text)| text.as_str()).unwrap_or_default();
+        assert!(first.contains("brought it to build 669cb1ae027a") && first.contains("incident i1") && first.contains("report it resolved"), "{first}");
     }
 }
 
