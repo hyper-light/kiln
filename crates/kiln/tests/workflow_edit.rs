@@ -174,3 +174,99 @@ fn w02_r12_checks_and_saves_a_workflow() -> anyhow::Result<()> {
     assert_eq!(st, 403);
     Ok(())
 }
+
+const GREET: &str = r#"name: Greet
+description: Says hello.
+inputs:
+  who:
+    description: Who to greet.
+    default: world
+outputs:
+  greeting:
+    description: What it said.
+    value: ${{ steps.say.outputs.greeting }}
+runs:
+  using: composite
+  steps:
+    - id: say
+      shell: bash
+      env:
+        WHO: ${{ inputs.who }}
+      run: echo "greeting=hello $WHO" >> "$GITHUB_OUTPUT"
+"#;
+
+/// W21-R07: an action in its editor, listed with the workflows and opened as they are, and tried
+/// as it is there, saved or not: a run of it with the inputs given, its outputs the job's.
+#[test]
+fn w21_r07_an_action_tried() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    git(&home, dir.path(), &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port), "work"])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/actions/greet"))?;
+    std::fs::write(work.join(".github/actions/greet/action.yml"), GREET)?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "an action"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    let path = ".github/actions/greet/action.yml";
+    // Listed beside the workflows, and opened as one is.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let listed = loop {
+        let (st, body) = http(s.port, "GET", "/api/ci/repos/acme%2Fapp/workflows", &dev, None)?;
+        if st == 200 && body.contains(path) {
+            break serde_json::from_str::<Value>(&body)?;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the action isn't listed: {st} {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert_eq!(listed.get("actions"), Some(&json!([path])), "{listed}");
+    let (st, body) = http(s.port, "GET", &format!("/api/ci/repos/acme%2Fapp/workflows/{path}"), &dev, None)?;
+    let opened: Value = serde_json::from_str(&body)?;
+    assert!(st == 200 && opened.get("kind") == Some(&json!("action")) && opened.get("source") == Some(&json!(GREET)), "{st} {body}");
+    // Tried as edited, not as committed: the job's output is the edited action's.
+    let edited = GREET.replace("hello", "hi");
+    let try_it = "/api/ci/repos/acme%2Fapp/actions/try";
+    let (st, v) = post(&s, &s.admin, try_it, &json!({ "path": path, "content": edited, "inputs": { "who": "ada" }, "runs_on": "local" }))?;
+    assert!(st == 201 && v.get("trusted") == Some(&json!(true)), "{st} {v}");
+    let run = v.get("run").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let detail = loop {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+        let d: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        if d.pointer("/run/finished_at").is_some_and(|f| !f.is_null()) {
+            break d;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let leg = detail.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+    let leg_detail: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let mut log = String::new();
+    for step in 0..4 {
+        let (_, l) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&format!("-- step {step}\n{l}\n"));
+    }
+    log.push_str(&format!("-- leg\n{leg_detail}\n"));
+    assert_eq!(detail.pointer("/run/conclusion"), Some(&json!("success")), "{detail}\n{log}\n{}", s.log());
+    assert_eq!(leg_detail.pointer("/outputs/greeting"), Some(&json!("hi ada")), "{leg_detail}\n{log}");
+    // Anyone else's try is a fork's.
+    let (st, v) = post(&s, &dev, try_it, &json!({ "path": path, "content": GREET, "runs_on": "local" }))?;
+    assert!(st == 201 && v.get("trusted") == Some(&json!(false)), "{st} {v}");
+    // What it can't try.
+    let (st, v) = post(&s, &dev, try_it, &json!({ "path": path, "content": GREET, "inputs": { "whom": "x" }, "runs_on": "local" }))?;
+    assert!(st == 400 && v.to_string().contains("no input `whom`"), "{st} {v}");
+    let (st, v) = post(&s, &dev, try_it, &json!({ "path": path, "content": "name: x\nruns: {}\n", "runs_on": "local" }))?;
+    assert!(st == 422 && v.to_string().contains("has errors"), "{st} {v}");
+    let (st, _) = post(&s, &dev, try_it, &json!({ "path": ".github/workflows/ci.yml", "content": GREET, "runs_on": "local" }))?;
+    assert_eq!(st, 400);
+    let (st, _) = post(&s, &dev, try_it, &json!({ "path": path, "content": GREET, "runs_on": "local; rm" }))?;
+    assert_eq!(st, 400);
+    Ok(())
+}

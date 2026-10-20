@@ -591,3 +591,99 @@ export function removeRow(src: string, id: string, kind: "include" | "exclude", 
     },
   );
 }
+
+// ---------------------------------------------------------------- actions (W21-R07)
+
+export interface ActionField {
+  name: string;
+  description: string | null;
+  required: boolean;
+  default: string | null;
+  /** A composite action's output's value. */
+  value: string | null;
+}
+
+export interface ActionShape {
+  name: string | null;
+  description: string | null;
+  /** `composite`, `node24`, `docker`, …. */
+  using: string | null;
+  inputs: ActionField[];
+  outputs: ActionField[];
+  error: string | null;
+}
+
+export function readAction(src: string): ActionShape {
+  const d = parseDocument(src);
+  if (d.errors.length) return { name: null, description: null, using: null, inputs: [], outputs: [], error: d.errors[0]?.message ?? "not YAML" };
+  const fields = (k: string): ActionField[] => {
+    const m = d.get(k, true);
+    if (!isMap(m)) return [];
+    return m.items.map((p) => {
+      const v = isMap(p.value) ? p.value : null;
+      const req = v?.get("required", true);
+      return {
+        name: String(text(p.key)),
+        description: text(v?.get("description", true)),
+        required: isScalar(req) && (req.value === true || req.value === "true"),
+        default: text(v?.get("default", true)),
+        value: text(v?.get("value", true)),
+      };
+    });
+  };
+  const runs = d.get("runs", true);
+  return {
+    name: text(d.get("name", true)),
+    description: text(d.get("description", true)),
+    using: isMap(runs) ? text(runs.get("using", true)) : null,
+    inputs: fields("inputs"),
+    outputs: fields("outputs"),
+    error: null,
+  };
+}
+
+type Io = "inputs" | "outputs";
+/** Where a new `inputs:` or `outputs:` goes among an action's keys. */
+const IO_BEFORE: Record<Io, string[]> = { inputs: ["outputs", "runs", "branding"], outputs: ["runs", "branding"] };
+
+/** A new input or output, saying what it is. */
+export function addField(src: string, kind: Io, name: string, description: string): string {
+  if (!/^[A-Za-z_][\w-]*$/.test(name)) throw new EditRefused(`\`${name}\` isn't a name an expression can take: letters, digits, \`_\` and \`-\``);
+  if (readAction(src)[kind].some((f) => f.name === name)) throw new EditRefused(`there is an ${kind === "inputs" ? "input" : "output"} \`${name}\` already`);
+  const field = { description: description || name };
+  return edit(
+    src,
+    (c) => (mapAt(c, [kind]) ? setPair(c, [kind], name, field) : setPair(c, [], kind, { [name]: field }, IO_BEFORE[kind])),
+    (js) => {
+      js[kind] = { ...obj(js[kind]), [name]: field };
+    },
+  );
+}
+
+/** An input or output removed (the last one with its key). */
+export function removeField(src: string, kind: Io, name: string): string {
+  const last = readAction(src)[kind].length === 1;
+  return edit(
+    src,
+    (c) => (last ? removePair(c, [], kind) : removePair(c, [kind], name)),
+    (js) => {
+      if (last) delete js[kind];
+      else delete obj(js[kind])[name];
+    },
+  );
+}
+
+/** An input's or output's `description`, `default` or `value` (empty: the key removed, but a
+ *  description), or whether an input is `required`. */
+export function setField(src: string, kind: Io, name: string, key: "description" | "default" | "value" | "required", value: string | boolean): string {
+  const gone = value === "" && key !== "description";
+  return edit(
+    src,
+    (c) => (gone ? removePair(c, [kind, name], key) : setPair(c, [kind, name], key, value)),
+    (js) => {
+      const f = obj(obj(js[kind])[name]);
+      if (gone) delete f[key];
+      else f[key] = value;
+    },
+  );
+}

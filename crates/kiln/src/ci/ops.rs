@@ -238,6 +238,14 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}, "path": {"type": "string"}, "ref": {"type": "string"}}), &["repo", "path"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?]), query(v, &["ref"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::workflows::get(&cx.hub, &text(&v, "repo")?, &text(&v, "path")?, &query(&v, &["ref"])).await).await }),
+            op!("ci.actions.try", "Try an action as you have it, saved or not (W21-R07): it runs once with `inputs` on what `runs_on` names (a label or a runner), its outputs the job's. Watch the run and read its log after.", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "path": {"type": "string", "description": "The action's file, e.g. `.github/actions/greet/action.yml`."},
+                    "content": {"type": "string", "description": "Its whole text."}, "ref": {"type": "string", "description": "The branch, tag or commit to try it on (the default branch when left out)."},
+                    "inputs": {"type": "object"}, "runs_on": {"type": "string", "description": "A label, or a runner's name."}
+                }), &["repo", "path", "content", "runs_on"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "actions", "try"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; super::uploads::try_action(&cx.hub, Some(&cx.caller), &repo, v).await }),
             op!("ci.workflows.labels", "What a workflow's `runs-on` may name in a repository: its runners' labels (and GitHub's for self-hosted runners), its pools' and the routing rules', each with where it comes from. A label none has waits for one.", ro: true, destructive: false,
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "labels"]), HashMap::new())),

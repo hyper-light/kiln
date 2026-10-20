@@ -126,14 +126,26 @@ pub async fn pack(hub: &Hub, repo: &str, q: &HashMap<String, String>, mut body: 
         // A thin pack over a commit the server doesn't have: the client sends it whole instead.
         return Err((StatusCode::CONFLICT, format!("the pack doesn't apply here: {}", crate::util::truncate(&why, 600))));
     }
-    let name = format!("refs/kiln/uploads/{sha}");
-    gitops::run_git(hub, &["-C", &m, "update-ref", &name, &sha], LS_REMOTE_TIMEOUT).await.map_err(|e| (StatusCode::CONFLICT, format!("the pack doesn't hold commit {sha}: {e:#}")))?;
+    keep(hub, &repo, &m, &sha).await?;
     hub.store.audit(by.to_owned(), "ci.uploads.pack".into(), format!("{} {sha} ({size} bytes)", repo.name)).await;
-    forget_old_uploads(hub, &m).await;
     Ok(srv::json(StatusCode::CREATED, &json!({ "sha": sha, "bytes": size })))
 }
 
-/// Uploaded commits older than a week go (their objects with the mirror's next `gc`).
+/// An upload's commit kept as `refs/kiln/uploads/<sha>`: in the mirror, and in a repository kiln
+/// hosts too, as its legs fetch from it (W14-R02), not from the mirror.
+async fn keep(hub: &Hub, repo: &Repo, m: &str, sha: &str) -> Result<(), Fail> {
+    let name = format!("refs/kiln/uploads/{sha}");
+    gitops::run_git(hub, &["-C", m, "update-ref", &name, sha], LS_REMOTE_TIMEOUT).await.map_err(|e| (StatusCode::CONFLICT, format!("there's no commit {sha} here: {e:#}")))?;
+    forget_old_uploads(hub, m).await;
+    if let Some(hosted) = super::hosting::native_path(hub, repo) {
+        let h = hosted.to_string_lossy().into_owned();
+        gitops::run_git(hub, &["-C", &h, "fetch", "--quiet", "--no-tags", m, &format!("{name}:{name}")], LS_REMOTE_TIMEOUT).await.map_err(|e| internal(&e))?;
+        forget_old_uploads(hub, &h).await;
+    }
+    Ok(())
+}
+
+/// Uploaded commits older than a week go (their objects with the repository's next `gc`).
 async fn forget_old_uploads(hub: &Hub, mirror: &str) {
     let Ok(out) = gitops::run_git(hub, &["-C", mirror, "for-each-ref", "--format=%(refname) %(committerdate:unix)", "refs/kiln/uploads"], LS_REMOTE_TIMEOUT).await else { return };
     let cutoff = crate::util::now_unix() - KEEP_UPLOADS;
@@ -274,6 +286,138 @@ pub async fn local_runs(hub: &Hub, repo: &str, caller: Option<&Caller>, body: In
     let what = format!("{} {} at {}: {} run(s){}", repo.name, event_name, ask.sha, runs.len(), if trusted { "" } else { ", untrusted" });
     hub.store.audit(actor, "ci.runs.local".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &json!({ "runs": runs, "skipped": skipped, "trusted": trusted })))
+}
+
+#[derive(Deserialize)]
+struct TryAsk {
+    /// The action's file (`.github/actions/<name>/action.yml`, `.kiln/actions/…`).
+    path: String,
+    /// Its text, as its editor has it (saved or not).
+    content: String,
+    /// The branch, tag or commit it's tried on; the default branch when empty.
+    #[serde(default, rename = "ref")]
+    git_ref: String,
+    #[serde(default)]
+    inputs: serde_json::Map<String, Value>,
+    /// What runs it: a label, or a runner's name.
+    runs_on: String,
+}
+
+/// Where the try workflow is, in the commit made for it.
+const TRY_PATH: &str = ".kiln/kiln-try.yaml";
+
+/// A name a workflow's expressions can take as written (`inputs.<name>`, `steps.action.outputs.<name>`).
+fn plain_name(n: &str) -> bool {
+    n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The workflow that tries an action at `dir` on `runs_on`: each of its inputs a dispatch input
+/// passed on to it (so what's given is data, never YAML or an expression), its outputs the job's.
+fn try_workflow(dir: &str, action: &kiln_ci::wf::Action, runs_on: &str) -> String {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let mut w = format!("name: {}\non:\n  workflow_dispatch:\n", q(&format!("Try ./{dir}")));
+    if !action.inputs.is_empty() {
+        w.push_str("    inputs:\n");
+        for i in &action.inputs {
+            w.push_str(&format!("      {}:\n        type: string\n        required: false\n", q(&i.name)));
+        }
+    }
+    w.push_str(&format!("jobs:\n  try:\n    runs-on: {}\n", q(runs_on)));
+    if !action.outputs.is_empty() {
+        w.push_str("    outputs:\n");
+        for o in &action.outputs {
+            w.push_str(&format!("      {}: ${{{{ steps.action.outputs.{} }}}}\n", q(&o.name), o.name));
+        }
+    }
+    w.push_str(&format!("    steps:\n      - id: action\n        uses: {}\n", q(&format!("./{dir}"))));
+    if !action.inputs.is_empty() {
+        w.push_str("        with:\n");
+        for i in &action.inputs {
+            w.push_str(&format!("          {}: ${{{{ inputs.{} }}}}\n", q(&i.name), i.name));
+        }
+    }
+    w
+}
+
+/// `POST /api/ci/repos/:repo/actions/try { path, content, ref?, inputs, runs_on }` (W21-R07's "Try
+/// it"): an action, as its editor has it, run once with `inputs` on what `runs_on` names. It's
+/// committed on `ref` with a workflow whose one job uses it and gives its outputs as the job's,
+/// kept as an upload is (a week, under `refs/kiln/uploads/`), and that workflow is started. The
+/// owner's run is trusted; anyone else's is a fork's, as `local-runs`' are. → `{ run }`.
+pub async fn try_action(hub: &Hub, caller: Option<&Caller>, repo: &str, body: Value) -> Result<Value, Fail> {
+    if !hub.ci.enabled() {
+        return Err((StatusCode::NOT_FOUND, "the CI engine is off ([ci] enabled)".into()));
+    }
+    let repo = find_repo(hub, repo).await?;
+    let ask: TryAsk = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
+    let path = ask.path.trim_start_matches("./").to_owned();
+    if kiln_ci::wf::file_kind(&path) != Some(kiln_ci::wf::FileKind::Action) || path.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+        return Err(bad(format!("`{}` isn't an action's file (.github/actions/<name>/action.yml, .kiln/actions/…)", ask.path)));
+    }
+    let runs_on = ask.runs_on.trim();
+    if runs_on.is_empty() || !runs_on.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/+".contains(c)) {
+        return Err(bad(format!("`{runs_on}` isn't a label or a runner's name")));
+    }
+    let content = ask.content.clone();
+    let (action, diags) = crate::rt::blocking(move || kiln_ci::wf::parse_action(&content)).await.map_err(|e| internal(&e))?;
+    let errors: Vec<String> = diags.iter().filter(|d| d.is_error()).map(|d| d.render(&path)).collect();
+    let Some(action) = action.filter(|_| errors.is_empty()) else {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{path} has errors, so it isn't tried:\n{}", errors.join("\n"))));
+    };
+    if let Some(n) = action.inputs.iter().map(|i| &i.name).chain(action.outputs.iter().map(|o| &o.name)).find(|n| !plain_name(n)) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("`{n}` can't be passed on by name: try it from a workflow of your own")));
+    }
+    if let Some(k) = ask.inputs.keys().find(|k| !action.inputs.iter().any(|i| &i.name == *k)) {
+        return Err(bad(format!("{path} has no input `{k}`")));
+    }
+    let dir = path.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
+    let m = mirror(hub, &repo)?;
+    let r = if ask.git_ref.is_empty() { super::events::facts(hub, &repo).await.default_branch } else { ask.git_ref.clone() };
+    let tip = load::resolve(hub, &repo, &r).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{} has no branch, tag or commit `{r}`", repo.name)))?;
+    // The commit: the action as edited, and the workflow trying it, on the ref's head.
+    let put = |base: String, file: String, text: String| {
+        let m = m.clone();
+        async move {
+            let mode = gitops::run_git(hub, &["-C", &m, "ls-tree", &base, "--", &file], LS_REMOTE_TIMEOUT)
+                .await
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned))
+                .unwrap_or_else(|| "100644".into());
+            super::diffs::tree_with(hub, &m, &base, super::diffs::Edit::Put { file: &file, mode: &mode, content: text.into_bytes() }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+        }
+    };
+    let tree = put(tip.clone(), path.clone(), ask.content.clone()).await?;
+    let tree = put(tree, TRY_PATH.to_owned(), try_workflow(&dir, &action, runs_on)).await?;
+    let (actor, trusted) = match caller {
+        None => ("admin".to_owned(), true),
+        Some(c) => (c.name.clone(), c.is_owner()),
+    };
+    let (who, _) = super::diffs::author_of(&actor, caller.map(|c| c.kind));
+    let who = who.strip_prefix("user:").unwrap_or(&who).to_owned();
+    let sha = super::diffs::make_commit(hub, &m, &tree, &tip, (&who, None), &who, &format!("Try {path}\n")).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    keep(hub, &repo, &m, &sha).await?;
+    let commit = load::load(hub, &repo, &sha).await.map_err(|e| internal(&e))?;
+    let l = commit.workflows.into_iter().find(|l| l.path == TRY_PATH).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "the workflow trying it wasn't read".to_owned()))?;
+    if l.has_errors() {
+        let said: Vec<String> = l.diagnostics.iter().filter(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{} {}", d.code, d.message)).collect();
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("it can't be tried as it is: {}", said.join("; "))));
+    }
+    let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
+    let full_ref = if r.starts_with("refs/") { r.clone() } else { format!("refs/heads/{r}") };
+    let (mut event, typed) =
+        super::events::preview_event(hub, &repo, "workflow_dispatch", &full_ref, &sha, None, &ask.inputs, declared.as_deref(), &l.path).await.map_err(|r| (r.status, r.message))?;
+    event.trusted = trusted;
+    event.actor = actor.clone();
+    event.source = kiln_ci::trigger::Source::Api;
+    let (tx, rx) = async_channel::bounded(1);
+    let given = Given { reply: Some(tx), ..Given::default() };
+    super::events::start_given(hub, &repo, &event, &l, (&format!("Try {path}"), &who), typed, given).await.map_err(|e| internal(&e))?;
+    let run = match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+        Ok(Ok(id)) => id,
+        _ => return Err((StatusCode::INTERNAL_SERVER_ERROR, "the run didn't start".into())),
+    };
+    hub.store.audit(actor, "ci.actions.try".into(), format!("{} {path} at {} on {runs_on}: run {run}{}", repo.name, &sha[..12], if trusted { "" } else { ", untrusted" })).await;
+    Ok(json!({ "run": run, "sha": sha, "trusted": trusted }))
 }
 
 #[cfg(test)]

@@ -372,6 +372,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let caller = req.extensions().get::<crate::authz::Caller>().cloned();
             boxed(|| super::uploads::local_runs(hub, repo, caller.as_ref(), req.into_body())).await
         }
+        // W21-R07: an action, as its editor has it, tried once.
+        (&Method::POST, ["repos", repo, "actions", "try"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 2 << 20)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| async { super::uploads::try_action(hub, caller.as_ref(), repo, body).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v)) }).await
+        }
         _ => Err((StatusCode::NOT_FOUND, format!("no such CI route: {method} /api/ci/{}", rest.join("/")))),
     }
 }

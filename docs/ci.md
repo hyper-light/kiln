@@ -4610,7 +4610,8 @@ W06-R13's debug reruns.
   - `--executor` picks the executor; by default legs are routed as a server routes them.
   - `--server URL` sends the commit as a thin pack over the commits the server has (whole when it
     can't take that). It is kept under `refs/kiln/uploads/` for a week, and the server's runners
-    run it.
+    run it. A repository kiln hosts keeps it too, as its legs fetch from it, not from the mirror
+    (a leg checking out an upload there was refused before).
   - Runs there are trusted only for the server's owner; anyone else's are a fork's: a read-only
     token, and only the secrets sent with them (`--secret-file`). Those stay in the server's memory,
     never on disk.
@@ -5668,10 +5669,24 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
     blank lines kept, `3.10` kept a string, what can't be edited here refused) and in Chromium
     and WebKit, desktop and phone (`ci/ui/people_check.mjs`: a job added and given a need, an
     axis's values and the preview's count, and the YAML with all of it and its comment).
+- *Done.* R07, the action builder. A repository's actions (`.github/actions/**/action.yml`,
+  `.kiln/actions/…`) are listed with its workflows and open in the same editor, with the action
+  schema's keys and hover; they save as workflows do. Its second view is its inputs and outputs:
+  each input's description, default and whether it's required, each output's description (and a
+  composite action's value), added and removed, through `ui/src/lib/workflow-doc.ts` as the flow
+  view's edits are. "Try it" runs the action as the editor has it, saved or not, with the inputs
+  given, on a runner or label chosen (`POST /api/ci/repos/:repo/actions/try`, `ci.actions.try`):
+  a commit of it on the ref with a workflow whose one job uses it, each input passed on as a
+  dispatch input (data, never YAML or an expression) and its outputs the job's, kept as an
+  upload is (W17-R06), trusted for the server's owner and a fork's for anyone else. The pane
+  shows the run as it goes, its outputs and the action's log. Checked by
+  `tests/workflow_edit.rs` (`w21_r07_an_action_tried`: listed, opened, tried as edited with an
+  input, its output, a fork's for a developer, and what it refuses), `ci/ui/workflow_doc_check.ts`
+  and in Chromium and WebKit, desktop and phone.
 - *Left.*
   - R01's Dockerfile and Agentfile modes.
-  - R07; R08's image builder and the pools' scaling history; R10 (with W15's pages, the CD
-    board's). R09 is the review pages W14-AC06 checks.
+  - R08's image builder and the pools' scaling history; R10 (with W15's pages, the CD board's).
+    R09 is the review pages W14-AC06 checks.
   - AC01's Playwright scripts in kiln's own CI, AC02 and AC03.
 
 ### W22 Conformance, end-to-end and performance testing

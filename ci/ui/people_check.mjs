@@ -11,6 +11,7 @@
 //   a branch; W02-R12: a label no runner has, warned of where it is.
 // - W21-R01: the editor's keys from the schema, on hover (desktop) and as one is typed; W21-R06:
 //   the plan preview's matrix as written, and the flow view's edits in the YAML.
+// - W21-R07: an action's inputs and outputs edited in place, and "Try it" starting its run.
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
@@ -269,6 +270,38 @@ for (const [name, type, phone] of [
           (await yamlText()).slice(0, 600),
         );
         await page.screenshot({ path: `${shots}/workflow-saved-${name}-${tag}.png`, fullPage: true });
+        // An action in the same editor (W21-R07): its inputs and outputs edited in place, the YAML
+        // with them, and tried as it is there.
+        await page.goto(`${cfg.base}/workflows?repo=acme%2Fpeople&path=.github%2Factions%2Fgreet%2Faction.yml`);
+        await page.locator(".cm-content").first().waitFor({ timeout: 30000 });
+        await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Inputs and outputs", exact: true }).click();
+        const io = page.getByRole("region", { name: "Its inputs and outputs" });
+        check(name, `${tag}: an action's inputs, each with what it is`, await until(async () => /who/.test(await text(io)) && (await io.getByLabel("Its default").inputValue()) === "world"), await text(io));
+        await io.getByLabel("A new output").fill("greeting");
+        await io.getByRole("region", { name: "Outputs" }).getByLabel("What it is").last().fill("What it said.");
+        await io.getByRole("button", { name: "Add the output", exact: true }).click();
+        const out = io.getByRole("listitem", { name: "Output greeting" });
+        await out.waitFor({ timeout: 15000 });
+        await out.getByLabel("Its value").fill("${{ steps.say.outputs.greeting }}");
+        await out.getByLabel("Its value").press("Tab");
+        await io.getByRole("listitem", { name: "Input who" }).getByLabel("Required").check();
+        await page.getByRole("group", { name: "View" }).getByRole("button", { name: "YAML", exact: true }).click();
+        const actionYaml = async () => await page.locator(".cm-content").innerText();
+        check(
+          name,
+          `${tag}: the YAML has them, its comment kept`,
+          await until(async () => {
+            const y = await actionYaml();
+            return /outputs:\s+greeting:\s+description: What it said\.\s+value: \$\{\{ steps\.say\.outputs\.greeting \}\}/.test(y) && /required: true/.test(y) && /who: {2}# whom/.test(y);
+          }),
+          (await actionYaml()).slice(0, 600),
+        );
+        const tryPane = page.locator("section.panel").filter({ has: page.getByRole("button", { name: "Try it", exact: true }) });
+        await tryPane.getByLabel("who (required)").fill(`${name} ${tag}`);
+        await tryPane.getByRole("button", { name: "Try it", exact: true }).click();
+        check(name, `${tag}: tried: its run, started`, await until(async () => /Run #\d+/.test(await text(tryPane.getByRole("region", { name: "Its run" }))), 30000), await text(tryPane));
+        check(name, `${tag}: the action's page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await page.screenshot({ path: `${shots}/action-${name}-${tag}.png`, fullPage: true });
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();
 

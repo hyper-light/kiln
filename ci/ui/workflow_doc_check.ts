@@ -169,6 +169,37 @@ expect(
 refused("a row that isn't key: value", () => W.addRow(SRC, "build", "include", "nonsense"));
 refused("an axis named as a matrix's own key", () => W.setAxis(SRC, "build", "include", ["x"]));
 
+// An action's inputs and outputs (W21-R07).
+const ACTION = `name: Greet
+description: Says hello.
+inputs:
+  who:   # whom
+    description: Who to greet.
+    default: world
+runs:
+  using: composite
+  steps:
+    - run: echo "hello"
+      shell: bash
+`;
+const shape = W.readAction(ACTION);
+say(
+  shape.using === "composite" && shape.inputs.length === 1 && shape.inputs[0]?.default === "world" && shape.inputs[0]?.required === false && shape.outputs.length === 0,
+  "an action's inputs and outputs, read",
+);
+expect("an input added", () => W.addField(ACTION, "inputs", "loud", "Shout it."), change(ACTION, ["    default: world\n", "    default: world\n  loud:\n    description: Shout it.\n"]));
+expect(
+  "the first output, before runs",
+  () => W.addField(ACTION, "outputs", "greeting", "What it said."),
+  change(ACTION, ["runs:\n", "outputs:\n  greeting:\n    description: What it said.\nruns:\n"]),
+);
+expect("an input's description, its comment kept", () => W.setField(ACTION, "inputs", "who", "description", "Whom to greet."), change(ACTION, ["Who to greet.", "Whom to greet."]));
+expect("an input made required", () => W.setField(ACTION, "inputs", "who", "required", true), change(ACTION, ["    default: world\n", "    default: world\n    required: true\n"]));
+expect("a default removed", () => W.setField(ACTION, "inputs", "who", "default", ""), change(ACTION, ["    default: world\n", ""]));
+expect("the last input removed, with its key", () => W.removeField(ACTION, "inputs", "who"), change(ACTION, ["inputs:\n  who:   # whom\n    description: Who to greet.\n    default: world\n", ""]));
+refused("an input that's there already", () => W.addField(ACTION, "inputs", "who", "again"));
+refused("a name an expression can't take", () => W.addField(ACTION, "outputs", "a b", "x"));
+
 // What isn't edited here.
 refused("a flow mapping of jobs", () => W.addJob("on: push\njobs: { a: { runs-on: x, steps: [{ run: y }] } }\n", "b", "x"));
 refused("text with errors", () => W.addJob("jobs:\n  a: [\n", "b", "x"));

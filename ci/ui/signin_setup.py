@@ -107,6 +107,9 @@ call("POST", "/api/repos", admin, {"name": "acme/people", "mode": "native"})
 src = os.path.join(work, "people-src")
 os.makedirs(os.path.join(src, ".kiln"))
 open(os.path.join(src, ".kiln", "ci.yaml"), "w").write("on: push\njobs:\n  build:\n    runs-on: local\n    strategy:\n      matrix:\n        os: [linux, mac]\n        n: [1, 2]\n        exclude:\n          - { os: mac, n: 1 }\n    steps:\n      - run: echo hi\n")
+# And an action, for the action editor (W21-R07).
+os.makedirs(os.path.join(src, ".github", "actions", "greet"))
+open(os.path.join(src, ".github", "actions", "greet", "action.yml"), "w").write("name: Greet\ndescription: Says hello.\ninputs:\n  who:  # whom\n    description: Who to greet.\n    default: world\nruns:\n  using: composite\n  steps:\n    - run: echo \"hello $WHO\"\n      shell: bash\n      env:\n        WHO: ${{ inputs.who }}\n")
 genv = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="lead", GIT_AUTHOR_EMAIL="lead@example.invalid", GIT_COMMITTER_NAME="lead", GIT_COMMITTER_EMAIL="lead@example.invalid")
 for args in (["init", "-q", "-b", "main"], ["add", "."], ["commit", "-qm", "A workflow"], ["push", "-q", f"http://x:{admin}@127.0.0.1:{port}/git/acme/people.git", "main"]):
     subprocess.run(["git", "-C", src, *args], env=genv, check=True, capture_output=True)

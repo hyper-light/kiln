@@ -236,7 +236,7 @@ struct EditAsk {
 }
 
 /// `POST /api/ci/repos/:repo/workflows/:path/edit { content, to?, branch?, title?, draft?,
-/// reviewers?, topic? }` (W02-R12, W21-R06, `ci.workflows.edit`): a workflow's new text, checked
+/// reviewers?, topic? }` (W02-R12, W21-R06, `ci.workflows.edit`): a workflow's (or an action's, W21-R07) new text, checked
 /// as [`validate`] checks it with its repository (refused with its errors), then saved as `to`
 /// says, by default the first of these the repository takes:
 ///
@@ -251,8 +251,8 @@ struct EditAsk {
 pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, body: &Value) -> Result<Value, Fail> {
     let ask: EditAsk = serde_json::from_value(body.clone()).map_err(|e| bad(format!("{e}")))?;
     let file = path.trim_start_matches("./");
-    if !matches!(wf::file_kind(file), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow)) || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
-        return Err(bad(format!("`{path}` is not where workflows are (.github/workflows/*.yml, .kiln/*.yaml)")));
+    if !matches!(wf::file_kind(file), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::Action)) || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+        return Err(bad(format!("`{path}` is not where workflows or actions are (.github/workflows/*.yml, .kiln/*.yaml, .github/actions/**/action.yml)")));
     }
     let repo = find_repo(hub, repo_key).await?;
     let checked = checked(hub, Some(&repo), file, ask.content.clone(), None).await?;
@@ -287,8 +287,12 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
         (_, None) => return Err((StatusCode::CONFLICT, format!("kiln can't write to {}: no App or credentials of its host are set up here, so it takes a patch", repo.name))),
         (_, Some(h)) => on_host(hub, caller, &repo, h, file, &ask.content, to == "change", branch, &title).await?,
     };
-    // W20-R03: its effect too, as a push to the default branch plans it.
-    let preview = super::ops::answer(super::preview::of(hub, Some(caller), json!({ "repo": repo.name, "path": file, "content": ask.content, "event": "push" })).await).await.unwrap_or(Value::Null);
+    // W20-R03: a workflow's effect too, as a push to the default branch plans it.
+    let preview = if wf::file_kind(file) == Some(wf::FileKind::Action) {
+        Value::Null
+    } else {
+        super::ops::answer(super::preview::of(hub, Some(caller), json!({ "repo": repo.name, "path": file, "content": ask.content, "event": "push" })).await).await.unwrap_or(Value::Null)
+    };
     if let Some(o) = out.as_object_mut() {
         o.insert("to".into(), json!(to));
         o.insert("diagnostics".into(), serde_json::to_value(&checked.diagnostics).unwrap_or(Value::Null));
@@ -418,11 +422,15 @@ pub async fn list(hub: &Hub, repo: &str, q: &HashMap<String, String>) -> Result<
             })
         })
         .collect();
-    Ok(srv::json(StatusCode::OK, &json!({ "ref": r, "sha": sha, "github": { "run": commit.github_run, "why": commit.github_note }, "workflows": workflows })))
+    Ok(srv::json(StatusCode::OK, &json!({ "ref": r, "sha": sha, "github": { "run": commit.github_run, "why": commit.github_note }, "workflows": workflows, "actions": commit.actions })))
 }
 
-/// `GET /api/ci/repos/:repo/workflows/:path?ref=`: one workflow's source, model and diagnostics.
+/// `GET /api/ci/repos/:repo/workflows/:path?ref=`: one workflow's source, model and diagnostics;
+/// or an action's (`kind: action`, W21-R07), its source and diagnostics.
 pub async fn get(hub: &Hub, repo: &str, path: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    if wf::file_kind(path) == Some(wf::FileKind::Action) {
+        return get_action(hub, repo, path, q).await;
+    }
     if !matches!(wf::file_kind(path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow)) {
         return Err(missing(format!("`{path}` is not where workflows are (.github/workflows/*.yml, .kiln/*.yaml)")));
     }
@@ -447,6 +455,22 @@ pub async fn get(hub: &Hub, repo: &str, path: &str, q: &HashMap<String, String>)
             "host": host,
             "saves": saves,
         }),
+    ))
+}
+
+async fn get_action(hub: &Hub, repo: &str, path: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    let (repo, r, sha) = at_ref(hub, repo, q).await?;
+    let commit = load::load(hub, &repo, &sha).await.map_err(|e| internal(&e))?;
+    if !commit.actions.iter().any(|a| a == path) {
+        return Err(missing(format!("no action `{path}` at {r} ({sha})")));
+    }
+    let source = load::blob(hub, &repo, &sha, path).await.map_err(|e| internal(&e))?;
+    let (p, text) = (path.to_owned(), source.clone());
+    let checked = crate::rt::blocking(move || wf::check(&p, &text, None)).await.map_err(|e| internal(&e))?;
+    let (host, saves) = saves(hub, &repo).await;
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({ "path": path, "kind": "action", "ref": r, "sha": sha, "source": source, "diagnostics": checked.diagnostics, "outline": Value::Null, "host": host, "saves": saves }),
     ))
 }
 

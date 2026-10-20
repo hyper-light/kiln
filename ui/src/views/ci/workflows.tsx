@@ -23,6 +23,7 @@ import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
 import { ScopeSecrets } from "@/views/settings-ci";
 import { FlowView } from "@/views/ci/flow-view";
+import { ActionView, TryPane } from "@/views/ci/action-view";
 
 const CodeEditor = React.lazy(() => import("@/components/code/editor"));
 
@@ -51,11 +52,14 @@ export default function Workflows() {
           <Loadable label="the workflow" fallback={<Hold height={420} className="mt-6" />}>
             <WorkflowFile key={`${repo}\u0000${path}\u0000${ref}`} repo={repo} path={path} gitRef={ref} />
           </Loadable>
-          <Loadable label="its secrets and variables" fallback={<Hold height={160} className="mt-8" />}>
-            <section className="mt-8 max-w-3xl" aria-label="This workflow's secrets and variables">
-              <ScopeSecrets key={`${repo}\u0000${path}`} scope={`workflow:${repo}:${path}`} of="This workflow's" />
-            </section>
-          </Loadable>
+          {/* A workflow's own secrets and variables; an action has none of its own. */}
+          {!/(^|\/)action\.ya?ml$/.test(path) && (
+            <Loadable label="its secrets and variables" fallback={<Hold height={160} className="mt-8" />}>
+              <section className="mt-8 max-w-3xl" aria-label="This workflow's secrets and variables">
+                <ScopeSecrets key={`${repo}\u0000${path}`} scope={`workflow:${repo}:${path}`} of="This workflow's" />
+              </section>
+            </Loadable>
+          )}
         </>
       ) : (
         <div className="mt-8">
@@ -103,15 +107,18 @@ function Picker({ repo, path, gitRef, onChange }: { repo: string; path: string; 
 }
 
 function WorkflowSelect({ repo, gitRef, path, onChange }: { repo: string; gitRef: string; path: string; onChange: (p: string) => void }) {
-  const list = useSuspenseResource(`ci-workflows/${repo}/${gitRef}`, (s) => ci.workflows(repo, gitRef, s)).data.workflows;
+  const at = useSuspenseResource(`ci-workflows/${repo}/${gitRef}`, (s) => ci.workflows(repo, gitRef, s)).data;
+  const [list, actions] = [at.workflows, at.actions ?? []];
   return (
     <SelectField
       label="Workflow"
       value={path}
       onChange={onChange}
       options={[
-        { value: "", label: list.length ? "Choose a workflow" : "No workflows here" },
+        { value: "", label: list.length || actions.length ? "Choose a workflow" : "No workflows here" },
         ...list.map((w) => ({ value: w.path, label: `${w.path}${w.errors ? ` · ${w.errors} error${w.errors === 1 ? "" : "s"}` : ""}` })),
+        // Its own actions too, in the same editor (W21-R07).
+        ...actions.map((a) => ({ value: a, label: `${a} · action` })),
       ]}
       className="w-80"
     />
@@ -145,9 +152,16 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string; url?: string } | null>(null);
   // The branch a commit goes to, while it's being named.
   const [branch, setBranch] = React.useState<string | null>(null);
-  // Two views of the text; the code editor opens again on what the flow view made of it.
+  // Two views of the text (a workflow's flow, an action's inputs and outputs); the code editor
+  // opens again on what the other made of it.
+  const isAction = file.kind === "action";
   const [view, setView] = React.useState<"yaml" | "flow">("yaml");
   const [opened, setOpened] = React.useState(0);
+  const fromView = (t: string) => {
+    setText(t);
+    setOpened((n) => n + 1);
+    void lint(t);
+  };
   const [counts, setCounts] = React.useState<{ errors: number; warnings: number } | null>(null);
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
@@ -207,7 +221,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     known.current.outline = r.outline ?? known.current.outline;
     const errors = r.diagnostics.filter((d) => d.severity === "error").length;
     setCounts({ errors, warnings: r.diagnostics.length - errors });
-    if (errors === 0) ask(content, event);
+    if (errors === 0 && !isAction) ask(content, event);
     const end = content.length;
     const starts = [0];
     for (let i = 0; i < content.length; i++) if (content[i] === "\n") starts.push(i + 1);
@@ -353,23 +367,17 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
           onChange={setView}
           options={[
             { value: "yaml", label: "YAML" },
-            { value: "flow", label: "Flow" },
+            { value: "flow", label: isAction ? "Inputs and outputs" : "Flow" },
           ]}
           className="mx-5 mt-1 mb-2"
         />
         <React.Suspense fallback={<Hold height={420} />}>
           {view === "yaml" ? (
             <CodeEditor key={opened} value={text} onChange={setText} lint={lint} complete={complete} hover={hover} label={`Editing ${path}`} />
+          ) : isAction ? (
+            <ActionView text={text} onChange={fromView} />
           ) : (
-            <FlowView
-              repo={repo}
-              text={text}
-              onChange={(t) => {
-                setText(t);
-                setOpened((n) => n + 1);
-                void lint(t);
-              }}
-            />
+            <FlowView repo={repo} text={text} onChange={fromView} />
           )}
         </React.Suspense>
         {/* Under the edit, so a phone's header keeps to Copy and Download. */}
@@ -436,15 +444,19 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
           </div>
         )}
       </Panel>
-      <PreviewPane
-        preview={preview}
-        error={previewError}
-        event={event}
-        onEvent={(ev) => {
-          setEvent(ev);
-          ask(text, ev);
-        }}
-      />
+      {isAction ? (
+        <TryPane repo={repo} path={path} gitRef={gitRef} text={text} blocked={(counts?.errors ?? 0) > 0} />
+      ) : (
+        <PreviewPane
+          preview={preview}
+          error={previewError}
+          event={event}
+          onEvent={(ev) => {
+            setEvent(ev);
+            ask(text, ev);
+          }}
+        />
+      )}
     </div>
   );
 }

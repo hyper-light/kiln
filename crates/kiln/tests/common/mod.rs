@@ -180,6 +180,11 @@ enabled = true
             // This server, not another test's on the same port.
             match http(port, "GET", "/api/repos", &t, None) {
                 Ok((200, _)) => {
+                    // Its QUIC port too: when another test's server holds it, this one's runner
+                    // dials that one and never connects.
+                    if std::fs::read_to_string(dir.join("server.log")).is_ok_and(|l| l.contains(&format!("bind 127.0.0.1:{quic}"))) {
+                        return Ok(Err(format!("another server holds its QUIC port {quic}")));
+                    }
                     server.admin = t;
                     return Ok(Ok(server));
                 }
