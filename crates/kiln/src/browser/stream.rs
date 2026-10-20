@@ -1441,6 +1441,61 @@ mod tests {
         })
     }
 
+    /// An iPhone's Mobile Safari in kiln's simulator of it (`super::super::simulators`), on a Mac
+    /// with Xcode, an iOS runtime and Safari's remote automation on (`safaridriver --enable`): a
+    /// page from this Mac streams from it, laid out as the phone lays it out, and a tap on it is a
+    /// touch where it was.
+    #[test]
+    #[ignore = "needs a Mac with Xcode, an iOS simulator runtime and `safaridriver --enable` (it boots a simulator)"]
+    fn an_iphone_streams_from_its_simulator() -> anyhow::Result<()> {
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        // The page, from this Mac (the simulator shares its network): whatever's asked, it.
+        let site = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = site.local_addr()?.port();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let page = "<!doctype html><meta name=viewport content='width=device-width'><title>phone</title><body style='margin:0;background:#123;height:2000px'><script>addEventListener('pointerdown',e=>document.title='tapped '+Math.round(e.clientX)+','+Math.round(e.clientY)+' '+e.pointerType)</script></body>";
+            for conn in site.incoming().flatten() {
+                let mut conn = conn;
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf);
+                let _ = write!(conn, "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}", page.len());
+            }
+        });
+        crate::rt::block_on(async move {
+            let spec: Spec = serde_json::from_value(json!({"url": format!("http://127.0.0.1:{port}/"), "width": 393, "height": 852, "scale": 3, "profile": "clean", "engine": "webkit", "device": "iPhone 15"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            let opened = streams().open(&dir, "test-iphone", &spec, tx).await?;
+            assert_eq!((opened.pointer("/opened/engine"), opened.pointer("/opened/device/name")), (Some(&json!("webkit")), Some(&json!("iPhone 15"))), "{opened}");
+            let s = streams().get("test-iphone").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let mut keys = 0;
+            let end = std::time::Instant::now() + Duration::from_secs(8);
+            while std::time::Instant::now() < end {
+                if let Ok(Ok(Out::Frame { data, .. })) = crate::rt::timeout(Duration::from_millis(200), rx.recv()).await
+                    && data.first() == Some(&b'v')
+                    && data.get(1) == Some(&b'k')
+                {
+                    keys += 1;
+                }
+            }
+            let window = s.page.eval("[innerWidth, navigator.userAgent]").await?;
+            s.input(vec![Input::Pointer { k: "down".into(), x: 100.0, y: 200.0, button: 0, buttons: 1, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }, Input::Pointer { k: "up".into(), x: 100.0, y: 200.0, button: 0, buttons: 0, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }]).await?;
+            crate::rt::sleep(Duration::from_millis(800)).await;
+            let title = s.page.eval("document.title").await?;
+            streams().close("test-iphone").await;
+            super::super::driven::stop_all().await;
+            assert!(keys >= 1, "key frames {keys}");
+            assert_eq!(window.get(0), Some(&json!(393)), "laid out at the phone's width: {window}");
+            assert!(window.get(1).and_then(Value::as_str).is_some_and(|ua| ua.contains("iPhone")), "{window}");
+            assert_eq!(title, json!("tapped 100,200 touch"), "a tap, as a touch where it was");
+            Ok(())
+        })
+    }
+
     /// WebKit's way in, WebDriver over HTTP (Safari's, WebKitGTK's), tried with whichever
     /// WebDriver `KILN_WEBDRIVER` names (and `KILN_WEBDRIVER_CAPS` its capabilities: chromedriver
     /// does here): its pictures (PNG) as it changes, a click reaching it, where it went, said.
