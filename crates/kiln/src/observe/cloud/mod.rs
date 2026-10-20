@@ -636,11 +636,21 @@ pub fn severity_of(message: &str) -> u8 {
     let m = message.trim_start();
     if m.starts_with('{')
         && let Ok(Value::Object(o)) = serde_json::from_str::<Value>(m)
-        && let Some(l) = ["level", "severity", "levelname", "log.level", "status"].iter().find_map(|k| o.get(*k).and_then(Value::as_str))
+        && let Some(l) = LEVEL_FIELDS.iter().find_map(|k| o.get(*k).and_then(Value::as_str))
         && let Some(r) = kiln_obs::logs::record::severities(l)
     {
         return *r.start();
     }
+    severity_of_words(m)
+}
+
+/// The fields a JSON message's level is read from by [`severity_of`]: the first of them that is a
+/// string.
+pub const LEVEL_FIELDS: [&str; 5] = ["level", "severity", "levelname", "log.level", "status"];
+
+/// [`severity_of`] of a message's first words alone: a level in capitals, or a `level=` one.
+pub fn severity_of_words(m: &str) -> u8 {
+    let m = m.trim_start();
     for word in m.split(|c: char| c.is_whitespace() || c == '|').filter(|w| !w.is_empty()).take(4) {
         let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '=');
         let w = w.rsplit_once('=').map_or(w, |(k, v)| if k.eq_ignore_ascii_case("level") || k.eq_ignore_ascii_case("severity") { v } else { "" });

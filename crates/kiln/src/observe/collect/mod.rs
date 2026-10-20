@@ -428,66 +428,39 @@ impl Compiled {
 
     /// A line's record: a JSON line's message, level, time, trace and fields, or a text line's
     /// text and the level it starts with.
+    ///
+    /// A JSON line is read in place (`kiln_obs::json`): no tree of it is made, its fields borrowed
+    /// from it until each is an attribute, the lists that hold them kept from line to line, its
+    /// message written into the line's own room.
     pub(crate) fn record(&self, line: Line, origin: &Origin, now_ns: i64) -> Record {
         let parse = match self.format {
             Format::Json => true,
             Format::Auto | Format::Cri | Format::Docker => line.text.trim_start().starts_with('{'),
             Format::Text => false,
         };
-        let object = if parse { serde_json::from_str::<Value>(&line.text).ok().and_then(|v| if let Value::Object(o) = v { Some(o) } else { None }) } else { None };
-        // Its attributes sized once: the line's fields, where it came from, the source's tags.
-        let fields = object.as_ref().map_or(0, serde_json::Map::len);
         let mut r = Record {
             ts: line.ts.unwrap_or(now_ns),
             service: self.service.clone().or_else(|| origin.service.clone()).unwrap_or_else(|| self.name.clone()),
             host: self.host.clone(),
             source: self.source.clone(),
-            attrs: Vec::with_capacity(fields + origin.attrs.len() + self.tags.len() + 2),
             ..Record::default()
         };
-        match object {
-            Some(mut o) => {
-                let message = ["message", "msg", "log", "MESSAGE", "text", "@m", "@mt"].iter().find_map(|k| if let Some(Value::String(_)) = o.get(*k) { o.remove(*k) } else { None });
-                r.message = match message {
-                    Some(Value::String(m)) => m,
-                    _ => line.text.clone(),
-                };
-                // The first of each that is there: taken out when it reads as one, else left as a field.
-                let first = |o: &serde_json::Map<String, Value>, keys: &[&'static str]| keys.iter().copied().find(|k| o.contains_key(*k));
-                r.severity = match first(&o, &["level", "severity", "levelname", "log.level", "status", "lvl", "loglevel", "@l"]) {
-                    Some(k) if let Some(l) = o.get(k).and_then(level) => {
-                        o.remove(k);
-                        l
-                    }
-                    _ => super::cloud::severity_of(&r.message),
-                };
-                if let Some(k) = first(&o, &["timestamp", "time", "@timestamp", "ts", "date", "_timestamp", "Timestamp", "eventTime", "@t"])
-                    && let Some(ts) = o.get(k).and_then(time_ns)
-                {
-                    o.remove(k);
-                    r.ts = ts;
-                }
-                if self.service.is_none()
-                    && let Some(Value::String(s)) = o.get("service").or_else(|| o.get("service.name"))
-                    && !s.is_empty()
-                {
-                    r.service = s.clone();
-                }
-                r.trace_id = ["trace_id", "traceId", "trace.id"].iter().find_map(|k| o.get(*k).and_then(Value::as_str).and_then(hex_id::<16>));
-                r.span_id = ["span_id", "spanId", "span.id"].iter().find_map(|k| o.get(*k).and_then(Value::as_str).and_then(hex_id::<8>));
-                for (k, v) in o {
-                    if ["trace_id", "traceId", "trace.id", "span_id", "spanId", "span.id", "service", "service.name"].contains(&k.as_str()) {
-                        continue;
-                    }
-                    flatten(k, v, 1, &mut r.attrs);
-                }
-            }
+        // Its attributes sized once: the line's fields, where it came from, the source's tags.
+        let more = origin.attrs.len() + self.tags.len() + 2;
+        let mut text = line.text;
+        let read = if parse { with_room(|room| self.json_fields(&mut text, more, room, &mut r)) } else { None };
+        match read {
+            Some(Level::Said(l)) => r.severity = l,
+            // A JSON line that names no message is its own: its level the first of its fields'
+            // that `severity_of` reads a JSON message's from, found already, else its words'.
+            Some(Level::Whole(l)) => r.severity = l.unwrap_or_else(|| super::cloud::severity_of_words(&text)),
+            Some(Level::Message) => r.severity = super::cloud::severity_of(&text),
             None => {
-                r.severity = super::cloud::severity_of(&line.text);
-                r.message = line.text;
+                r.attrs.reserve_exact(more);
+                r.severity = super::cloud::severity_of(&text);
             }
         }
-        r.message = super::cloud::message(std::mem::take(&mut r.message));
+        r.message = super::cloud::message(text);
         if r.ts > now_ns + AHEAD_MS * 1_000_000 {
             r.ts = now_ns;
         }
@@ -501,13 +474,155 @@ impl Compiled {
         r.attrs.extend(self.tags.iter().cloned());
         r
     }
+
+    /// A JSON line's fields into `r` (its time, service, ids and attributes), `text` left its
+    /// message (the line whole where it names none): how its level is read; none when it is not an
+    /// object.
+    fn json_fields(&self, text: &mut String, more: usize, room: &mut JsonRoom, r: &mut Record) -> Option<Level> {
+        let JsonRoom { levels, scratch, text: msg, key: buf, path } = room;
+        let mut pool = levels_for(std::mem::take(levels));
+        pool.resize_with(JSON_DEPTH, Vec::new);
+        let read = (|| {
+            let (top, nested) = pool.split_first_mut()?;
+            kiln_obs::json::object(text.as_str(), top, scratch).ok()?;
+            let find = |keys: &[&str], string: bool| keys.iter().find_map(|k| top.iter().position(|(key, v)| (!string || matches!(v, Val::Str(_))) && key.is(k)));
+            let value = |i: Option<usize>| i.and_then(|i| top.get(i)).map(|f| f.1);
+            // Each of these taken out of the fields when it reads as one; else left a field.
+            let mut taken = [usize::MAX; 3];
+            let message = find(&MESSAGE_KEYS, true);
+            msg.clear();
+            if let (Some(i), Some(Val::Str(m))) = (message, value(message)) {
+                msg.push_str(m.text(buf));
+                taken[0] = i;
+            }
+            let lv = find(&LEVEL_KEYS, false);
+            let level = value(lv).and_then(|v| level_of(v, buf));
+            if let (Some(i), Some(_)) = (lv, level) {
+                taken[1] = i;
+            }
+            let at = find(&TIME_KEYS, false);
+            if let (Some(i), Some(ts)) = (at, value(at).and_then(|v| time_of(v, buf))) {
+                taken[2] = i;
+                r.ts = ts;
+            }
+            if self.service.is_none() {
+                let named = find(&["service"], false).or_else(|| find(&["service.name"], false));
+                if let Some(Val::Str(s)) = value(named)
+                    && !s.raw.is_empty()
+                {
+                    r.service = s.owned();
+                }
+            }
+            r.trace_id = TRACE_KEYS.iter().find_map(|k| match value(find(&[k], false)) {
+                Some(Val::Str(s)) => hex_id::<16>(s.text(buf)),
+                _ => None,
+            });
+            r.span_id = SPAN_KEYS.iter().find_map(|k| match value(find(&[k], false)) {
+                Some(Val::Str(s)) => hex_id::<8>(s.text(buf)),
+                _ => None,
+            });
+            r.attrs.reserve_exact(top.len() + more);
+            for (i, &(k, v)) in top.iter().enumerate() {
+                if taken.contains(&i) || SKIPPED.iter().any(|s| k.is(s)) {
+                    continue;
+                }
+                path.clear();
+                path.push_str(k.text(buf));
+                flatten(path, v, 1, nested, scratch, buf, &mut r.attrs);
+            }
+            let found = taken[0] != usize::MAX;
+            let level = match level {
+                Some(l) => Level::Said(l),
+                None if found => Level::Message,
+                // The line its own message: what `severity_of` reads of a JSON message, the first
+                // of its fields that is a string, read as a level or not.
+                None => Level::Whole(
+                    super::cloud::LEVEL_FIELDS
+                        .iter()
+                        .find_map(|k| match value(find(&[k], true)) {
+                            Some(Val::Str(s)) => Some(s),
+                            _ => None,
+                        })
+                        .and_then(|s| kiln_obs::logs::record::severities(s.text(buf)).map(|r| *r.start())),
+                ),
+            };
+            Some((found, level))
+        })();
+        *levels = levels_for(pool);
+        let (found, level) = read?;
+        if found {
+            // The message into the line's own room: no longer than the line.
+            text.clear();
+            text.push_str(msg);
+        }
+        Some(level)
+    }
+}
+
+/// How a JSON line's level is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// A field said it.
+    Said(u8),
+    /// None said it; it names its message: the message's own.
+    Message,
+    /// None said it, nor names its message: the line's own, as a message (the level a field that
+    /// `severity_of` reads gives, else its words').
+    Whole(Option<u8>),
+}
+
+/// Containers a JSON line's fields are flattened from, at the most: the line's object and three
+/// within (a field nested deeper is its JSON).
+const JSON_DEPTH: usize = 4;
+/// The keys a JSON line's message, level and time are read from: the first of each that is there.
+const MESSAGE_KEYS: [&str; 7] = ["message", "msg", "log", "MESSAGE", "text", "@m", "@mt"];
+const LEVEL_KEYS: [&str; 8] = ["level", "severity", "levelname", "log.level", "status", "lvl", "loglevel", "@l"];
+const TIME_KEYS: [&str; 9] = ["timestamp", "time", "@timestamp", "ts", "date", "_timestamp", "Timestamp", "eventTime", "@t"];
+const TRACE_KEYS: [&str; 3] = ["trace_id", "traceId", "trace.id"];
+const SPAN_KEYS: [&str; 3] = ["span_id", "spanId", "span.id"];
+/// Fields read into a record's own and never attributes.
+const SKIPPED: [&str; 8] = ["trace_id", "traceId", "trace.id", "span_id", "spanId", "span.id", "service", "service.name"];
+
+use kiln_obs::json::{Str, Val};
+
+/// Room a JSON line's reading keeps from line to line: a list of fields for each depth, the
+/// reader's, a message and a key decoded, a dotted key's path.
+#[derive(Default)]
+struct JsonRoom {
+    levels: Vec<Vec<(Str<'static>, Val<'static>)>>,
+    scratch: kiln_obs::json::Scratch,
+    text: String,
+    key: String,
+    path: String,
+}
+
+/// Lists of fields emptied, as lists of borrows of another lifetime, their room kept (collected in
+/// place: the same layout, nothing allocated).
+fn levels_for<'b>(v: Vec<Vec<(Str<'_>, Val<'_>)>>) -> Vec<Vec<(Str<'b>, Val<'b>)>> {
+    v.into_iter()
+        .map(|mut l| {
+            l.clear();
+            l.into_iter().map(|_| (Str { raw: "", escaped: false }, Val::Null)).collect()
+        })
+        .collect()
+}
+
+/// Runs `f` with this thread's room for JSON lines, or a new one were it in use.
+fn with_room<T>(f: impl FnOnce(&mut JsonRoom) -> T) -> T {
+    thread_local! {
+        static ROOM: std::cell::RefCell<JsonRoom> = std::cell::RefCell::new(JsonRoom::default());
+    }
+    ROOM.with(|c| match c.try_borrow_mut() {
+        Ok(mut room) => f(&mut room),
+        Err(_) => f(&mut JsonRoom::default()),
+    })
 }
 
 /// A level as JSON logs give it: a name, or a number (bunyan's and pino's 10–60, syslog's 0–7).
-fn level(v: &Value) -> Option<u8> {
+fn level_of(v: Val<'_>, buf: &mut String) -> Option<u8> {
     match v {
-        Value::String(s) => kiln_obs::logs::record::severities(s.trim()).map(|r| *r.start()),
-        Value::Number(n) => Some(match n.as_u64()? {
+        Val::Str(s) => kiln_obs::logs::record::severities(s.text(buf).trim()).map(|r| *r.start()),
+        Val::Num(n) => Some(match n.parse::<u64>().ok()? {
             10 => 1,
             20 => 5,
             30 => 9,
@@ -536,12 +651,12 @@ pub(crate) fn syslog(p: u8) -> u8 {
 
 /// A time as JSON logs give it: RFC 3339, or a number of seconds, milliseconds, microseconds or
 /// nanoseconds since the epoch (told apart by their size).
-fn time_ns(v: &Value) -> Option<i64> {
+fn time_of(v: Val<'_>, buf: &mut String) -> Option<i64> {
     match v {
-        Value::String(s) => super::cloud::parse_time_ns(s),
-        Value::Number(n) => {
+        Val::Str(s) => super::cloud::parse_time_ns(s.text(buf)),
+        Val::Num(n) => {
             // Whole numbers exactly; fractions (seconds with their decimals) as floats.
-            if let Some(i) = n.as_i64().filter(|&i| i > 0) {
+            if let Some(i) = n.parse::<i64>().ok().filter(|&i| i > 0) {
                 return match i {
                     ..100_000_000_000 => i.checked_mul(1_000_000_000),
                     100_000_000_000..100_000_000_000_000 => i.checked_mul(1_000_000),
@@ -549,7 +664,7 @@ fn time_ns(v: &Value) -> Option<i64> {
                     _ => Some(i),
                 };
             }
-            let f = n.as_f64()?;
+            let f = n.parse::<f64>().ok()?;
             let ns = if f < 1e11 {
                 f * 1e9
             } else if f < 1e14 {
@@ -574,34 +689,52 @@ fn hex_id<const N: usize>(s: &str) -> Option<[u8; N]> {
     out.iter().any(|&b| b != 0).then_some(out)
 }
 
-/// A value cut to the longest an attribute holds, at a character.
-fn cut(mut s: String) -> String {
-    if s.len() > VALUE_MAX {
-        let mut c = VALUE_MAX;
-        while !s.is_char_boundary(c) {
-            c -= 1;
-        }
-        s.truncate(c);
+/// `s`, at most the longest value an attribute holds, cut at a character.
+fn cut_str(s: &str) -> &str {
+    if s.len() <= VALUE_MAX {
+        return s;
     }
-    s
+    let mut c = VALUE_MAX;
+    while !s.is_char_boundary(c) {
+        c -= 1;
+    }
+    s.get(..c).unwrap_or("")
 }
 
-/// A JSON line's field as attributes, taken (its key and text moved, not copied): nested
-/// objects' keys joined by dots, arrays as JSON.
-fn flatten(key: String, v: Value, depth: usize, out: &mut Vec<(String, String)>) {
+/// A JSON line's field as attributes (its key `path`): nested objects' keys joined by dots (their
+/// fields read into the first of `pool`'s lists, deeper ones into the rest), null left out, a
+/// string decoded, a number as written, an array or an object nested too deep as its JSON without
+/// its spaces.
+#[allow(clippy::too_many_arguments)]
+fn flatten<'a>(path: &mut String, v: Val<'a>, depth: usize, pool: &mut [Vec<(Str<'a>, Val<'a>)>], scratch: &mut kiln_obs::json::Scratch, buf: &mut String, out: &mut Vec<(String, String)>) {
     if out.len() >= ATTRS_MAX {
         return;
     }
     match v {
-        Value::Object(o) if depth < 4 => {
-            for (k, v) in o {
-                flatten(format!("{key}.{k}"), v, depth + 1, out);
+        Val::Object(raw) if depth < JSON_DEPTH => {
+            let Some((list, rest)) = pool.split_first_mut() else { return };
+            // Checked whole with the line already: it reads.
+            if kiln_obs::json::object_at(raw, depth + 1, list, scratch).is_err() {
+                return;
             }
+            let at = path.len();
+            for &(k, v) in list.iter() {
+                path.truncate(at);
+                path.push('.');
+                path.push_str(k.text(buf));
+                flatten(path, v, depth + 1, rest, scratch, buf, out);
+            }
+            path.truncate(at);
         }
-        Value::Null => {}
-        Value::String(s) => out.push((key, cut(s))),
-        Value::Bool(_) | Value::Number(_) => out.push((key, v.to_string())),
-        Value::Array(_) | Value::Object(_) => out.push((key, cut(v.to_string()))),
+        Val::Null => {}
+        Val::Str(s) => out.push((path.clone(), cut_str(s.text(buf)).to_owned())),
+        Val::Num(n) => out.push((path.clone(), n.to_owned())),
+        Val::Bool(b) => out.push((path.clone(), if b { "true" } else { "false" }.to_owned())),
+        Val::Array(raw) | Val::Object(raw) => {
+            let mut s = String::with_capacity(raw.len().min(VALUE_MAX));
+            kiln_obs::json::compact(raw, &mut s);
+            out.push((path.clone(), cut_str(&s).to_owned()));
+        }
     }
 }
 
@@ -1227,6 +1360,249 @@ mod tests {
         // Numbers: pino's levels, epoch milliseconds.
         let r = c.record(Line { text: r#"{"level":50,"time":1792324800500,"msg":"x"}"#.into(), ..Line::default() }, &origin, 1_800_000_000_000_000_000);
         anyhow::ensure!(r.severity == 17 && r.ts == 1_792_324_800_500_000_000, "{r:?}");
+        // No message named, nor a level its first level field reads as: the line its message, its
+        // level the first of its fields a JSON message's is read from that is a string.
+        let r = c.record(Line { text: r#"{"level":{"n":1},"severity":"error","route":"/a"}"#.into(), ..Line::default() }, &origin, 1_800_000_000_000_000_000);
+        anyhow::ensure!(r.severity == 17 && r.message.starts_with('{') && r.attrs.iter().any(|(k, v)| k == "level.n" && v == "1"), "{r:?}");
+        Ok(())
+    }
+
+    /// The record of a line as kiln read it before, `serde_json`'s tree of the line made: what the
+    /// reading in place is held to, field for field.
+    fn reference(c: &Compiled, line: Line, origin: &Origin, now_ns: i64) -> Record {
+        fn level(v: &Value) -> Option<u8> {
+            match v {
+                Value::String(s) => kiln_obs::logs::record::severities(s.trim()).map(|r| *r.start()),
+                Value::Number(n) => Some(match n.as_u64()? {
+                    10 => 1,
+                    20 => 5,
+                    30 => 9,
+                    40 => 13,
+                    50 => 17,
+                    60 => 21,
+                    p @ 0..=7 => syslog(p as u8),
+                    _ => return None,
+                }),
+                _ => None,
+            }
+        }
+        fn time_ns(v: &Value) -> Option<i64> {
+            match v {
+                Value::String(s) => crate::observe::cloud::parse_time_ns(s),
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64().filter(|&i| i > 0) {
+                        return match i {
+                            ..100_000_000_000 => i.checked_mul(1_000_000_000),
+                            100_000_000_000..100_000_000_000_000 => i.checked_mul(1_000_000),
+                            100_000_000_000_000..100_000_000_000_000_000 => i.checked_mul(1_000),
+                            _ => Some(i),
+                        };
+                    }
+                    let f = n.as_f64()?;
+                    let ns = if f < 1e11 {
+                        f * 1e9
+                    } else if f < 1e14 {
+                        f * 1e6
+                    } else if f < 1e17 {
+                        f * 1e3
+                    } else {
+                        f
+                    };
+                    (ns.is_finite() && ns > 0.0 && ns < 9.2e18).then_some(ns as i64)
+                }
+                _ => None,
+            }
+        }
+        fn cut(mut s: String) -> String {
+            if s.len() > VALUE_MAX {
+                let mut c = VALUE_MAX;
+                while !s.is_char_boundary(c) {
+                    c -= 1;
+                }
+                s.truncate(c);
+            }
+            s
+        }
+        fn flatten(key: String, v: Value, depth: usize, out: &mut Vec<(String, String)>) {
+            if out.len() >= ATTRS_MAX {
+                return;
+            }
+            match v {
+                Value::Object(o) if depth < 4 => {
+                    for (k, v) in o {
+                        flatten(format!("{key}.{k}"), v, depth + 1, out);
+                    }
+                }
+                Value::Null => {}
+                Value::String(s) => out.push((key, cut(s))),
+                Value::Bool(_) | Value::Number(_) => out.push((key, v.to_string())),
+                Value::Array(_) | Value::Object(_) => out.push((key, cut(v.to_string()))),
+            }
+        }
+        let parse = match c.format {
+            Format::Json => true,
+            Format::Auto | Format::Cri | Format::Docker => line.text.trim_start().starts_with('{'),
+            Format::Text => false,
+        };
+        let object = if parse { serde_json::from_str::<Value>(&line.text).ok().and_then(|v| if let Value::Object(o) = v { Some(o) } else { None }) } else { None };
+        let mut r = Record {
+            ts: line.ts.unwrap_or(now_ns),
+            service: c.service.clone().or_else(|| origin.service.clone()).unwrap_or_else(|| c.name.clone()),
+            host: c.host.clone(),
+            source: c.source.clone(),
+            ..Record::default()
+        };
+        match object {
+            Some(mut o) => {
+                let message = ["message", "msg", "log", "MESSAGE", "text", "@m", "@mt"].iter().find_map(|k| if let Some(Value::String(_)) = o.get(*k) { o.remove(*k) } else { None });
+                r.message = match message {
+                    Some(Value::String(m)) => m,
+                    _ => line.text.clone(),
+                };
+                let first = |o: &serde_json::Map<String, Value>, keys: &[&'static str]| keys.iter().copied().find(|k| o.contains_key(*k));
+                r.severity = match first(&o, &["level", "severity", "levelname", "log.level", "status", "lvl", "loglevel", "@l"]) {
+                    Some(k) if let Some(l) = o.get(k).and_then(level) => {
+                        o.remove(k);
+                        l
+                    }
+                    _ => crate::observe::cloud::severity_of(&r.message),
+                };
+                if let Some(k) = first(&o, &["timestamp", "time", "@timestamp", "ts", "date", "_timestamp", "Timestamp", "eventTime", "@t"])
+                    && let Some(ts) = o.get(k).and_then(time_ns)
+                {
+                    o.remove(k);
+                    r.ts = ts;
+                }
+                if c.service.is_none()
+                    && let Some(Value::String(s)) = o.get("service").or_else(|| o.get("service.name"))
+                    && !s.is_empty()
+                {
+                    r.service = s.clone();
+                }
+                r.trace_id = ["trace_id", "traceId", "trace.id"].iter().find_map(|k| o.get(*k).and_then(Value::as_str).and_then(hex_id::<16>));
+                r.span_id = ["span_id", "spanId", "span.id"].iter().find_map(|k| o.get(*k).and_then(Value::as_str).and_then(hex_id::<8>));
+                for (k, v) in o {
+                    if ["trace_id", "traceId", "trace.id", "span_id", "spanId", "span.id", "service", "service.name"].contains(&k.as_str()) {
+                        continue;
+                    }
+                    flatten(k, v, 1, &mut r.attrs);
+                }
+            }
+            None => {
+                r.severity = crate::observe::cloud::severity_of(&line.text);
+                r.message = line.text;
+            }
+        }
+        r.message = crate::observe::cloud::message(std::mem::take(&mut r.message));
+        if r.ts > now_ns + AHEAD_MS * 1_000_000 {
+            r.ts = now_ns;
+        }
+        r.attrs.extend(origin.attrs.iter().cloned());
+        r.attrs.extend(c.tags.iter().cloned());
+        r
+    }
+
+    /// One of `of`, at random.
+    fn pick<'a>(rng: &mut kiln_obs::testkit::Rng, of: &[&'a str]) -> &'a str {
+        of.get(rng.below(of.len() as u64) as usize).copied().unwrap_or_default()
+    }
+
+    /// A random JSON log line: its message, level, time, service and ids under any of their names
+    /// (of any type), other fields nested past the depth flattened, arrays, escapes, a key twice;
+    /// now and then not JSON, or JSON broken.
+    fn log_line(rng: &mut kiln_obs::testkit::Rng) -> String {
+        fn string(rng: &mut kiln_obs::testkit::Rng, out: &mut String) {
+            out.push('"');
+            for _ in 0..rng.below(6) {
+                out.push_str(pick(rng, &["a", "é", "😀", "\\n", "\\\"", "\\\\", "\\/", "\\u00e9", "\\ud83d\\ude00", " ", "ERROR", "warn"]));
+            }
+            out.push('"');
+        }
+        fn value(rng: &mut kiln_obs::testkit::Rng, depth: u32, out: &mut String) {
+            match rng.below(if depth == 0 { 5 } else { 7 }) {
+                0 | 4 => string(rng, out),
+                1 => out.push_str(pick(rng, &["0", "-0", "12", "50", "3", "-7.25", "1e3", "2.5E-4", "123456789012345678901234", "1792324800500", "1792324800.5", "1.0"])),
+                2 => out.push_str(pick(rng, &["true", "false"])),
+                3 => out.push_str("null"),
+                5 => {
+                    out.push('[');
+                    for i in 0..rng.below(3) {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        value(rng, depth - 1, out);
+                    }
+                    out.push(']');
+                }
+                _ => object(rng, depth - 1, out),
+            }
+        }
+        fn object(rng: &mut kiln_obs::testkit::Rng, depth: u32, out: &mut String) {
+            const KEYS: &str = "message msg log text level severity status lvl time timestamp ts @t service service.name trace_id traceId span_id route user dup a.b \\u006dsg";
+            let keys: Vec<&str> = KEYS.split(' ').collect();
+            out.push('{');
+            for i in 0..rng.below(7) {
+                if i > 0 {
+                    out.push_str(pick(rng, &[",", " , "]));
+                }
+                out.push('"');
+                out.push_str(pick(rng, &keys));
+                out.push_str("\":");
+                match rng.below(8) {
+                    0 => out.push_str(pick(rng, &["\"0af7651916cd43dd8448eb211c80319c\"", "\"b7ad6b7169203331\"", "\"2026-10-18T12:00:00.5Z\"", "\"info\"", "\"error\""])),
+                    _ => value(rng, depth, out),
+                }
+            }
+            out.push('}');
+        }
+        let mut s = String::new();
+        match rng.below(10) {
+            0 => s.push_str("2026-10-18 12:00:00 ERROR payment failed"),
+            1 => {
+                object(rng, 5, &mut s);
+                s.pop();
+            }
+            _ => object(rng, 5, &mut s),
+        }
+        s
+    }
+
+    #[test]
+    fn a_json_line_read_in_place_is_the_record_its_tree_made() -> anyhow::Result<()> {
+        let mut rng = kiln_obs::testkit::Rng::new(7);
+        let origin = Origin { attrs: vec![("log.file.path".into(), "/var/log/app/a.log".into())], service: None };
+        for named in [true, false] {
+            let c = Source { service: named.then(|| "app".to_owned()), ..file_source() }.compile("app", "web-1").map_err(anyhow::Error::msg)?;
+            for _ in 0..20_000 {
+                let text = log_line(&mut rng);
+                let now = 1_800_000_000_000_000_000;
+                let theirs = reference(&c, Line { text: text.clone(), ..Line::default() }, &origin, now);
+                let mine = c.record(Line { text: text.clone(), ..Line::default() }, &origin, now);
+                anyhow::ensure!(
+                    (mine.ts, mine.severity, &mine.service, &mine.host, &mine.source, &mine.message, mine.trace_id, mine.span_id)
+                        == (theirs.ts, theirs.severity, &theirs.service, &theirs.host, &theirs.source, &theirs.message, theirs.trace_id, theirs.span_id),
+                    "{text}\n{mine:?}\n{theirs:?}"
+                );
+                // A number as written (the tree's as serde_json writes the double it read: beyond a
+                // double's digits, alike to its last place or two), an array as its JSON: alike as
+                // JSON values.
+                fn same(x: &Value, y: &Value) -> bool {
+                    match (x, y) {
+                        (Value::Number(p), Value::Number(q)) => p.as_f64().zip(q.as_f64()).is_some_and(|(p, q)| (p - q).abs() <= 1e-15 * p.abs().max(q.abs())),
+                        (Value::Array(p), Value::Array(q)) => p.len() == q.len() && p.iter().zip(q).all(|(p, q)| same(p, q)),
+                        (Value::Object(p), Value::Object(q)) => p.len() == q.len() && p.iter().all(|(k, v)| q.get(k).is_some_and(|w| same(v, w))),
+                        _ => x == y,
+                    }
+                }
+                let alike = |a: &str, b: &str| a == b || matches!((serde_json::from_str::<Value>(a), serde_json::from_str::<Value>(b)), (Ok(x), Ok(y)) if same(&x, &y));
+                // In any order: the tree's was its map's (`IndexMap::remove` moved its last field into
+                // the place of one taken out), this one's the line's.
+                let (mut m, mut t) = (mine.attrs.clone(), theirs.attrs.clone());
+                m.sort();
+                t.sort();
+                anyhow::ensure!(m.len() == t.len() && m.iter().zip(&t).all(|(a, b)| a.0 == b.0 && alike(&a.1, &b.1)), "{text}\n{m:?}\n{t:?}");
+            }
+        }
         Ok(())
     }
 }
