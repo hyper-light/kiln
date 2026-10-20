@@ -796,11 +796,16 @@ textarea.hx-input {
 }
 .hx-step-title {
   flex: 0 1 auto;
-  overflow-wrap: anywhere;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
   color: var(--color-foreground);
 }
 .hx-step-sub {
+  /* The summary keeps its natural width; even a long command uses only what remains. */
+  flex: 1 1 0%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
