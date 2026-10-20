@@ -34,10 +34,14 @@ const methodsRes: Res<{ password: boolean; token: boolean }> = {
 };
 
 export default function Settings() {
-  warm(updatesRes, methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes, myNotificationsRes);
-  // CI's groups for those who can use them (W10-R02): the owner sees every one.
+  // Each section for those who can use it (W10-R02): the owner sees every one, a person what their rights reach.
   const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
   const may = (c: string, server = true) => !can || can[c] === "server" || (!server && can[c] === "some");
+  const [pushes, updates, deployments, server] = [may("agents.run"), may("runners.read"), may("integrations.manage"), may("settings.manage")];
+  warm(methodsRes, thisDeviceRes, myNotificationsRes, ...(updates ? [updatesRes] : []), ...(pushes ? [pushStateRes, pushDevicesRes] : []));
+  // The sections shown, numbered in order.
+  let shown = 0;
+  const next = () => ++shown;
   const [query, setQuery] = React.useState("");
   // At /settings#<section or group>, arriving or following a link here: that one opens.
   const { hash } = useLocation();
@@ -53,39 +57,60 @@ export default function Settings() {
       <PageIntro index={10} label="Settings" title="Settings" />
       <SettingsSearch value={query} onChange={setQuery} />
       <SettingsSections query={query} onQueryChange={setQuery}>
-        <SettingsSection id="device" index={1} title="This device" about="How kiln behaves in this browser" words="browser phone">
-          <Loadable label="notifications" fallback={<NotificationsHold />}>
-            <NotificationsGroup />
-          </Loadable>
+        <SettingsSection id="device" index={next()} title="This device" about="How kiln behaves in this browser" words="browser phone">
+          {pushes && (
+            <Loadable label="notifications" fallback={<NotificationsHold />}>
+              <NotificationsGroup />
+            </Loadable>
+          )}
           <MotionGroup />
         </SettingsSection>
-        <SettingsSection
-          id="updates"
-          index={2}
-          title="Updates"
-          about="Upgrade kiln and its runners; a runner keeps what it runs while it's upgraded"
-          words="upgrade version"
-          status={<UpdatesStatus />}
-        >
-          <Loadable label="the updates" fallback={<UpdatesHold />}>
-            <UpdatesPanel />
-          </Loadable>
-        </SettingsSection>
-        <SettingsSection id="deployments" index={3} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
-          <DeploySettings />
-        </SettingsSection>
-        <SettingsSection id="integrations" index={4} title="Integrations" about="Peered kiln clusters, and a Grafana link" words="peering">
-          <ClustersGroup />
+        {updates && (
+          <SettingsSection
+            id="updates"
+            index={next()}
+            title="Updates"
+            about="Upgrade kiln and its runners; a runner keeps what it runs while it's upgraded"
+            words="upgrade version"
+            status={<UpdatesStatus />}
+          >
+            <Loadable label="the updates" fallback={<UpdatesHold />}>
+              <UpdatesPanel />
+            </Loadable>
+          </SettingsSection>
+        )}
+        {deployments && (
+          <SettingsSection id="deployments" index={next()} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
+            <DeploySettings />
+          </SettingsSection>
+        )}
+        <SettingsSection id="integrations" index={next()} title="Integrations" about={server ? "Peered kiln clusters, and a Grafana link" : "A Grafana link"} words="peering">
+          {server && <ClustersGroup />}
           <GrafanaGroup />
         </SettingsSection>
-        <SettingsSection id="signin" index={5} title="Sign-in" about="The password other devices sign in with, and this session" words="login account" status={<PasswordStatus />}>
-          <Loadable label="sign-in" fallback={<PasswordHold />}>
-            <PasswordGroup />
-          </Loadable>
+        <SettingsSection
+          id="signin"
+          index={next()}
+          title="Sign-in"
+          about={server ? "The password other devices sign in with, and this session" : "This session"}
+          words="login account"
+          status={server ? <PasswordStatus /> : undefined}
+        >
+          {server && (
+            <Loadable label="sign-in" fallback={<PasswordHold />}>
+              <PasswordGroup />
+            </Loadable>
+          )}
           <SessionGroup />
         </SettingsSection>
         {(may("secrets.manage", false) || may("variables.manage", false) || may("routing.manage") || may("settings.manage")) && (
-          <SettingsSection id="ci" index={6} title="CI" about="The secrets and variables runs read, where legs run, the actions they may use, and the identity jobs prove" words="ci secrets variables routing actions oidc">
+          <SettingsSection
+            id="ci"
+            index={next()}
+            title="CI"
+            about="The secrets and variables runs read, where legs run, the actions they may use, and the identity jobs prove"
+            words="ci secrets variables routing actions oidc"
+          >
             {(may("secrets.manage", false) || may("variables.manage", false)) && (
               <Loadable label="the scopes" fallback={<CiSecretsHold />}>
                 <CiSecretsGroups />
@@ -111,7 +136,7 @@ export default function Settings() {
             )}
           </SettingsSection>
         )}
-        <SettingsSection id="you" index={7} title="You" about="What kiln tells you of your repositories, wherever you sign in" words="person account">
+        <SettingsSection id="you" index={next()} title="You" about="What kiln tells you of your repositories, wherever you sign in" words="person account">
           <Loadable label="your notifications" fallback={<MyNotificationsHold />}>
             <MyNotificationsGroup />
           </Loadable>
