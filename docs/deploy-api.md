@@ -309,7 +309,12 @@ production:
   { applications: true }` has kiln write each one instead, for an Argo CD that doesn't allow
   ApplicationSets. Its provider changes by a move once apps are registered there (§8.4).
 - `via: pull-request` makes every release in the environment a pull request (a merge request on
-  GitLab) on the release repository: the approval is the merge, made on the git host.
+  GitLab) on the release repository: the approval is the merge, made on the git host. Built on
+  GitHub: a release is proposed from a branch of its own (`kiln/release-<id>`) once its gates
+  pass, and waits in `committing`; merged, its merge is its commit (delivered, who merged it kept
+  as its approval); closed unmerged, it's cancelled; cancelled in kiln, its pull request is
+  closed. Who may merge is the branch's protection on GitHub, so `approvals` isn't set beside it.
+  kiln's own commits (registrations, reverts) still go to the branch.
 - `agents` says what agents may do there: release (`deploy`: every kind of release, a cancel, a
   deregistration) and answer approvals (`approve`). Neither by default; elsewhere an agent's change
   is refused (`403`) and a person makes it. Only a person changes `agents`.
@@ -409,7 +414,7 @@ for apps' source repositories.
 | Change requests (`via: pull-request`) | kiln's own diffs (review.md) | pull requests | merge requests | pull requests |
 | Report a release | kiln's UI | Deployments and deployment statuses | Environments and Deployments | commit build statuses |
 | Notice commits | in process | webhooks, then polling | webhooks, then polling | webhooks, then polling |
-| Create repositories | yes | from template repositories | from project templates | yes |
+| Create repositories | yes | in an organization, through the App; from template repositories | from project templates | yes |
 | Pull request heads for CI | — | `refs/pull/<n>/head` (as today) | `refs/merge-requests/<iid>/head` | Data Center: `refs/pull-requests/<id>/from`; Cloud: read from the API |
 
 - **kiln's own git server** is CI's native hosting (ci.md W14), one server for both: release
@@ -423,6 +428,24 @@ for apps' source repositories.
 - **GitHub stays as it is**: discovery, `ls-remote` polling, webhook hints, mirrors, pull request
   heads, the Actions-compatible CI. A GitHub App joins the token kiln reads today, for writes,
   statuses and repository creation.
+- **Release repositories on GitHub** (`release_repo: { host: github, repo: owner/name }`) go
+  through kiln's GitHub App (`[ci.github]`, or the one its manifest flow made), with an
+  installation token for each call that reaches that one repository with what the call needs:
+  - **Made** in the owner's organization when it isn't there (private, empty: the App needs
+    `administration: write` there); on a person's account, made by them and given to the App.
+  - **Read** through a mirror of kiln's, fetched with a token that reads it (`contents: read`),
+    once a minute, or at once when the App's webhook says it moved. KilnCD reads kiln's mirror;
+    Argo CD reads GitHub with a token of its own, which kiln puts in place every half hour (one
+    lasts an hour).
+  - **Written** by a push of a commit made in kiln's mirror, with a lease on the head it was made
+    on (`contents: write`): a commit someone pushed meanwhile makes it try again on theirs, never
+    lose it.
+  - **Reported**: each release is a deployment of its commit to `<environment>/<app>` (so one
+    app's don't mark another's inactive), its status following the release (`in_progress`
+    delivering, `success`, `failure`, `inactive` once cancelled), linking to the release on kiln.
+  - **Webhooks**: the App's `push` and `pull_request` events (`POST /api/hooks/github/app`, signed
+    with its secret) have a release repository looked at, and a release's pull request followed,
+    at once.
 - **GitLab and Bitbucket** get the same: discovery, webhooks, polling, mirrors, change-request heads
   and statuses for CI, and everything above for release repositories. GitLab.com and self-managed
   GitLab; Bitbucket Cloud and Data Center.
