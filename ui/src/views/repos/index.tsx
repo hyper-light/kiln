@@ -15,7 +15,7 @@ import { api } from "@/api/client";
 import type { PlaceMachine, PlacesView, PlaceTask, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
-import { TableHold } from "@/components/ui/hold";
+import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -31,6 +31,7 @@ import { DEFAULT_VIEW, type Entry, type ListView, SORTS, type SortId, browseUrl,
 import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
 import { SyncActivity } from "./sync-activity";
+import { ScopeSecrets } from "../settings-ci";
 import "./repos.css";
 
 /** Folders kept the same on several machines; read often, they move by the second. */
@@ -569,6 +570,14 @@ function Details({
         <h4 className="field-label">On machines</h4>
         <PlaceList entry={e} machines={machines} synced={e.synced} onStarted={onStarted} />
       </section>
+      {r && (
+        // Its CI secrets and variables (W09-R11).
+        <section className="repo-section" aria-label="Its secrets and variables">
+          <Loadable label="its secrets and variables" fallback={<Hold height={120} />}>
+            <ScopeSecrets scope={`repo:${r.name}`} of="Its" />
+          </Loadable>
+        </section>
+      )}
       {e.synced && (
         <section className="repo-section">
           <RepoBlock repo={e.synced} machines={machineNames} onChange={onChange} title="Kept in sync" copies={false} />

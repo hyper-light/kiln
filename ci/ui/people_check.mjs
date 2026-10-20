@@ -5,6 +5,8 @@
 // - W13-R09, W21-R08: the Runners page's pools. A pool added, heading for its minimum, warned of
 //   as no runner can start it (W20-R03), edited in place, removed.
 // - W10-R12: Settings → OIDC says how the issuer is reached, and fits a phone.
+// - W09-R11: a repository's secrets on the Repositories page, a workflow's variables in its
+//   editor, each set and removed in place.
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
@@ -44,6 +46,10 @@ const flow = async (label, f) => {
   }
 };
 const text = async (loc) => (await loc.innerText().catch(() => "")).replace(/\s+/g, " ");
+
+// A repository of kiln's own, for its page's secrets and variables (W09-R11).
+const made = await fetch(`${cfg.base}/api/repos`, { method: "POST", headers: { Authorization: `Bearer ${cfg.admin}`, "Content-Type": "application/json" }, body: JSON.stringify({ name: "acme/people", mode: "native" }) });
+if (!made.ok && made.status !== 409) throw new Error(`a repository: ${made.status} ${await made.text()}`);
 
 for (const [name, type, phone] of [
   ["chromium", chromium, devices["Pixel 7"]],
@@ -153,6 +159,36 @@ for (const [name, type, phone] of [
         check(name, `${tag}: how the issuer is reached`, /From the internet No: its URL is this network's/.test(await text(oidc)) && /AWS and Azure fetch/.test(await text(oidc)), (await text(oidc)).slice(0, 300));
         check(name, `${tag}: the OIDC settings fit`, (await overflow(page)) <= 0, String(await overflow(page)));
         await oidc.screenshot({ path: `${shots}/oidc-${name}-${tag}.png` });
+        // A repository's own secrets, on the Repositories page (W09-R11): set, never shown, removed.
+        await page.goto(`${cfg.base}/repos`);
+        // Its name opens it, as a tap does (the row's centre may be one of its buttons).
+        await page.locator("table tbody tr", { hasText: "acme/people" }).first().locator("td").first().click();
+        const repoPanel = page.getByRole("region", { name: "Its secrets and variables" });
+        await repoPanel.locator("#st-secret-name").waitFor({ timeout: 30000 });
+        const key = `REPO_${name}_${tag}`.toUpperCase();
+        await repoPanel.locator("#st-secret-name").fill(key);
+        await repoPanel.locator("#st-secret-value").fill("repo-secret-value-41");
+        await repoPanel.getByRole("button", { name: "Save the secret" }).click();
+        const listed = await until(async () => (await text(repoPanel.getByRole("list", { name: "Secrets" }))).includes(key));
+        check(name, `${tag}: a repository's secret, set on its page`, listed && !(await page.content()).includes("repo-secret-value-41"), await text(repoPanel));
+        check(name, `${tag}: the Repositories page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await page.screenshot({ path: `${shots}/repo-secrets-${name}-${tag}.png`, fullPage: true });
+        await repoPanel.getByRole("list", { name: "Secrets" }).getByRole("button", { name: "Remove", exact: true }).first().click();
+        await repoPanel.getByRole("button", { name: `Remove ${key}` }).click();
+        check(name, `${tag}: and removed`, await until(async () => !(await text(repoPanel)).includes(key)), await text(repoPanel));
+        // A workflow's own variables, in its editor.
+        await page.goto(`${cfg.base}/workflows?repo=acme%2Fpeople&path=.kiln%2Fci.yaml`);
+        const wfPanel = page.getByRole("region", { name: "This workflow's secrets and variables" });
+        await wfPanel.locator("#st-var-name").waitFor({ timeout: 30000 });
+        await wfPanel.locator("#st-var-name").fill("stage");
+        await wfPanel.locator("#st-var-value").fill("blue");
+        await wfPanel.getByRole("button", { name: "Save the variable" }).click();
+        const vars = wfPanel.getByRole("list", { name: "Variables" });
+        check(name, `${tag}: a workflow's variable, set in its editor`, await until(async () => /STAGE[\s\S]*blue/.test(await text(vars))), await text(wfPanel));
+        check(name, `${tag}: the editor's page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await page.screenshot({ path: `${shots}/workflow-secrets-${name}-${tag}.png`, fullPage: true });
+        await vars.getByRole("button", { name: "Remove", exact: true }).first().click();
+        check(name, `${tag}: and removed`, await until(async () => (await vars.count()) === 0 || !/STAGE/.test(await text(vars))), await text(wfPanel));
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();
 

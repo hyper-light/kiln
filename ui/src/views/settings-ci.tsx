@@ -16,6 +16,7 @@ import { reposRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { useAuth } from "@/lib/auth";
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** A workflow's or an environment's scope, written out. */
@@ -91,7 +92,22 @@ export function CiSecretsGroups() {
   );
 }
 
-function SecretsList({ scope }: { scope: string }) {
+/**
+ * One scope's secrets and variables on its own page (W09-R11): a repository's on the Repositories
+ * page, a workflow's in the editor. Each list for those who may manage it; the values never shown.
+ */
+export function ScopeSecrets({ scope, of }: { scope: string; of: string }) {
+  const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
+  const may = (c: string) => !can || Boolean(can[c]);
+  return (
+    <div className="st">
+      {may("secrets.manage") && <SecretsList scope={scope} title={`${of} secrets`} />}
+      {may("variables.manage") && <VariablesList scope={scope} title={`${of} variables`} />}
+    </div>
+  );
+}
+
+function SecretsList({ scope, title }: { scope: string; title?: string }) {
   const res = useSuspenseResource(`ci/secrets/${scope}`, (s) => ci.secrets(scope, s));
   const list: CiSecretMeta[] = res.data.secrets;
   const [name, setName] = React.useState("");
@@ -116,7 +132,7 @@ function SecretsList({ scope }: { scope: string }) {
   const upper = name.trim().toUpperCase();
   const ready = NAME.test(name.trim()) && value.length > 0;
   return (
-    <SettingsGroup id="ci.secrets.list" title={`Secrets in ${scope}`} words="secret value set remove">
+    <SettingsGroup id="ci.secrets.list" title={title ?? `Secrets in ${scope}`} words="secret value set remove">
       {list.length === 0 ? (
         <p className="st-note">No secrets here yet.</p>
       ) : (
@@ -203,7 +219,7 @@ function SecretsList({ scope }: { scope: string }) {
   );
 }
 
-function VariablesList({ scope }: { scope: string }) {
+function VariablesList({ scope, title }: { scope: string; title?: string }) {
   const res = useSuspenseResource(`ci/variables/${scope}`, (s) => ci.variables(scope, s));
   const list: CiVariable[] = res.data.variables;
   const [name, setName] = React.useState("");
@@ -227,7 +243,7 @@ function VariablesList({ scope }: { scope: string }) {
   const upper = name.trim().toUpperCase();
   const ready = NAME.test(name.trim());
   return (
-    <SettingsGroup id="ci.variables.list" title={`Variables in ${scope}`} words="variable vars value set edit remove">
+    <SettingsGroup id="ci.variables.list" title={title ?? `Variables in ${scope}`} words="variable vars value set edit remove">
       {list.length === 0 ? (
         <p className="st-note">No variables here yet.</p>
       ) : (

@@ -1,7 +1,8 @@
 /**
  * The workflow editor (docs/ci.md W21-R01, W21-R06): a repository's workflow in the code editor,
  * checked as you type, with the plan it would make for an event beside it (W04-R29). The YAML is
- * the source; Copy and Download take it away until saving to the repository arrives (W14).
+ * the source; Copy and Download take it away until saving to the repository arrives (W14). Below,
+ * the workflow's own secrets and variables (W09-R11).
  */
 import * as React from "react";
 import { Download } from "lucide-react";
@@ -14,6 +15,7 @@ import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@
 import { useSearchParams } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
+import { ScopeSecrets } from "@/views/settings-ci";
 
 const CodeEditor = React.lazy(() => import("@/components/code/editor"));
 
@@ -38,9 +40,16 @@ export default function Workflows() {
         <Picker repo={repo} path={path} gitRef={ref} onChange={set} />
       </Loadable>
       {repo && path ? (
-        <Loadable label="the workflow" fallback={<Hold height={420} className="mt-6" />}>
-          <WorkflowFile key={`${repo}\u0000${path}\u0000${ref}`} repo={repo} path={path} gitRef={ref} />
-        </Loadable>
+        <>
+          <Loadable label="the workflow" fallback={<Hold height={420} className="mt-6" />}>
+            <WorkflowFile key={`${repo}\u0000${path}\u0000${ref}`} repo={repo} path={path} gitRef={ref} />
+          </Loadable>
+          <Loadable label="its secrets and variables" fallback={<Hold height={160} className="mt-8" />}>
+            <section className="mt-8 max-w-3xl" aria-label="This workflow's secrets and variables">
+              <ScopeSecrets key={`${repo}\u0000${path}`} scope={`workflow:${repo}:${path}`} of="This workflow's" />
+            </section>
+          </Loadable>
+        </>
       ) : (
         <div className="mt-8">
           <EmptyState title="Choose a workflow.">Pick a repository and one of its workflows to edit it.</EmptyState>
