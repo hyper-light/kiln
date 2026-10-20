@@ -3178,20 +3178,20 @@ mod tests {
         assert!(codex_task_output(&core, &task).get("error").is_some());
         task.summary = Some("The completed result remains available.".into());
         let result = codex_task_output(&core, &task);
-        assert_eq!(result["data"].as_str(), task.summary.as_deref());
-        assert_eq!(result["live"].as_bool(), Some(false));
+        assert_eq!(result.get("data").and_then(serde_json::Value::as_str), task.summary.as_deref());
+        assert_eq!(result.get("live").and_then(serde_json::Value::as_bool), Some(false));
         // Newest output is bounded; the final answer is present once even when Task.summary
         // contains its clipped representation.
         let long = format!("{}Final result.", "x".repeat(TASK_TAIL as usize + 20));
         task.summary = Some(super::super::model::clip_middle(&long, super::super::model::OUTPUT_MAX).0);
         core.upsert("child:child:answer", Some("spawn".into()), Body::Assistant { text: long.clone(), streaming: false });
         let result = codex_task_output(&core, &task);
-        let text = result["data"].as_str().unwrap_or_default();
+        let text = result.get("data").and_then(serde_json::Value::as_str).unwrap_or_default();
         assert_eq!(text.len(), TASK_TAIL as usize);
         assert!(text.ends_with("Final result."));
         assert_eq!(text.matches("Final result.").count(), 1);
-        assert_eq!(result["offset"].as_u64(), Some(long.len() as u64));
-        assert_eq!(result["truncated"].as_bool(), Some(true));
+        assert_eq!(result.get("offset").and_then(serde_json::Value::as_u64), Some(long.len() as u64));
+        assert_eq!(result.get("truncated").and_then(serde_json::Value::as_bool), Some(true));
     }
 
     #[test]
