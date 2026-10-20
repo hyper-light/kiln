@@ -452,6 +452,8 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   /** Its engine, and the device it's held to (its window the device's: drawn whole in this frame). */
   const [engine, setEngine] = React.useState("chromium");
   const [held, setHeld] = React.useState<{ name: string; width: number; height: number } | null>(null);
+  /** Its window out of sight where it runs (Safari's, its Mac locked or asleep): Safari slows it. */
+  const [hidden, setHidden] = React.useState(false);
   const live = React.useRef({ stream, sound, macPage, held });
   live.current = { stream, sound, macPage, held };
   const moved = React.useRef<Record<string, unknown> | null>(null);
@@ -491,6 +493,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         }
         const nav = e.navigated as { url?: string } | undefined;
         if (nav?.url) setAddress(nav.url);
+        if (typeof e.hidden === "boolean") setHidden(e.hidden);
         const loaded = e.loaded as { title?: string } | undefined;
         if (loaded?.title) setTitle(loaded.title);
         const closed = e.closed as { why?: string } | undefined;
@@ -718,7 +721,10 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const shown = typing || (field !== null && (touchViewer || secret(field)));
   // Its engine and device, when they're not Chromium as this screen is.
   const what = [engine !== "chromium" ? engine : "", held?.name ?? ""].filter(Boolean).join(" · ");
-  const word = (what ? `${what} · ` : "") + (status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended");
+  const seenThere = !hidden || status === "ended" || status === "unsupported";
+  const word =
+    (what ? `${what} · ` : "") +
+    (!seenThere ? "its Mac is locked or asleep: its pictures come slowly" : status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended");
   return (
     <div className="pg lv" data-ev={ev} data-ev-live={stream.id} data-status={status} data-path={path}>
       <div className="pg-head">

@@ -135,6 +135,51 @@ fn problems(lock: &str, v: &Vendored) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// `path` resolved against `dir` without touching the disk: `..` and `.` taken out lexically.
+fn resolve(dir: &Path, path: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in dir.join(path).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Path dependencies a manifest (its text, the folder it's in) takes from outside the repository
+/// at `root`: a copy of something there would be one no vendor/MANIFEST.toml pins, and Cargo.lock
+/// doesn't say where a path package lives.
+fn paths_outside(text: &str, dir: &Path, root: &Path) -> anyhow::Result<Vec<String>> {
+    let manifest = text.parse::<toml::Table>()?;
+    let mut tables: Vec<&toml::Table> = Vec::new();
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        tables.extend(manifest.get(key).and_then(|t| t.as_table()));
+        tables.extend(manifest.get("workspace").and_then(|w| w.get(key)).and_then(|t| t.as_table()));
+    }
+    for (_, target) in manifest.get("target").and_then(|t| t.as_table()).into_iter().flatten() {
+        for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            tables.extend(target.get(key).and_then(|t| t.as_table()));
+        }
+    }
+    tables.extend(manifest.get("patch").and_then(|p| p.as_table()).into_iter().flat_map(|p| p.values()).filter_map(|t| t.as_table()));
+    let root = resolve(root, ".");
+    let mut out = Vec::new();
+    for table in tables {
+        for (name, spec) in table {
+            if let Some(path) = spec.get("path").and_then(|p| p.as_str())
+                && !resolve(dir, path).starts_with(&root)
+            {
+                out.push(format!("{name} = {{ path = \"{path}\" }} leaves the repository"));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn kiln_lock() -> anyhow::Result<String> {
     std::fs::read_to_string(root().join("Cargo.lock")).context("Cargo.lock")
 }
@@ -151,6 +196,30 @@ fn ac_m1_4_kiln_links_one_revision_of_each_vendored_project_and_product() -> any
     ensure!(lock.lines().any(|l| l.starts_with("source = \"git+https://github.com/hyper-light/hyper-raft")), "no hyper-raft crate in Cargo.lock");
     let found = problems(&lock, &v)?;
     ensure!(found.is_empty(), "kiln links more than one revision:\n{}", found.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn ac_m1_4_no_manifest_of_kiln_takes_a_path_dependency_from_outside_the_repository() -> anyhow::Result<()> {
+    let root = root();
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for entry in std::fs::read_dir(root.join("crates"))? {
+        let manifest = entry?.path().join("Cargo.toml");
+        if manifest.is_file() {
+            manifests.push(manifest);
+        }
+    }
+    ensure!(manifests.len() >= 4, "kiln's manifests weren't found: {manifests:?}");
+    let mut found = Vec::new();
+    for manifest in &manifests {
+        let dir = manifest.parent().context("a manifest's folder")?;
+        found.extend(paths_outside(&std::fs::read_to_string(manifest)?, dir, &root)?.into_iter().map(|p| format!("{}: {p}", manifest.display())));
+    }
+    ensure!(found.is_empty(), "{}", found.join("\n"));
+    // And the check sees one: a product's crate by path from a clone beside the repository.
+    let planted = "[dependencies]\namphora = { path = \"../../../amphora/crates/amphora\" }\n";
+    let found = paths_outside(planted, &root.join("crates/kiln"), &root)?;
+    ensure!(found.iter().any(|p| p.starts_with("amphora = { path = \"../../../amphora")), "{found:?}");
     Ok(())
 }
 

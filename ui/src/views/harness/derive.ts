@@ -3,7 +3,7 @@
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
 import { useState } from "react";
-import type { FileDiff, HEvent, ToolCall, ToolKind } from "@/api/harness";
+import type { FileDiff, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
 import { isShowPage } from "./page-of";
 import { isShowLive } from "./live-of";
 
@@ -211,13 +211,14 @@ export function changesetOf(events: HEvent[]): FileChange[] {
   return [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
+/** The main agent's commands; child work stays in its own thread. */
 export function runsOf(events: HEvent[]): ToolEvent[] {
-  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "shell");
+  return events.filter((e): e is ToolEvent => !e.parent && e.kind === "tool" && e.tool === "shell");
 }
 
-/** The edits it made (or proposed). */
+/** The main agent's edits (or proposals); its children's edits stay with them. */
 export function editsOf(events: HEvent[]): ToolEvent[] {
-  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "edit");
+  return events.filter((e): e is ToolEvent => !e.parent && e.kind === "tool" && e.tool === "edit");
 }
 
 /**
@@ -252,8 +253,34 @@ export function stepSummary(group: StepGroup, calls: ToolCall[]): string {
       return n === 1 ? "Ran a command" : `Ran ${n} commands`;
     case "web":
       return n === 1 ? "Looked something up" : `Looked up ${n} things`;
-    case "agent":
+    case "agent": {
+      const call = calls[0];
+      const input = call?.input as { kind?: string; tool?: string } | undefined;
+      if (call?.name === "subAgentActivity") {
+        switch (input?.kind) {
+          case "started": return "Started a subagent";
+          case "interacted": return "Subagent interaction";
+          case "interrupted": return "Interrupted a subagent";
+          case "completed": return "Subagent finished";
+          default: return "Subagent activity";
+        }
+      }
+      if (call?.name === "collabAgentToolCall") {
+        switch (input?.tool) {
+          case "spawnAgent": return "Started a subagent";
+          case "sendInput":
+          case "sendMessage": return "Sent a message to a subagent";
+          case "followupTask": return "Assigned follow-up work";
+          case "resumeAgent": return "Resumed a subagent";
+          case "interruptAgent": return "Interrupted a subagent";
+          case "wait": return "Waited for subagents";
+          case "closeAgent": return "Closed a subagent";
+          case "listAgents": return "Checked subagents";
+          default: return "Subagent activity";
+        }
+      }
       return "Started a subagent";
+    }
     case "plan":
       return calls.some((c) => c.tool === "plan") ? "Proposed a plan" : "Updated the plan";
     case "ask":
@@ -273,6 +300,37 @@ export function stepStatus(calls: ToolCall[]): ToolCall["status"] {
   const order: ToolCall["status"][] = ["error", "denied", "pending", "running", "cancelled", "done"];
   for (const s of order) if (calls.some((c) => c.status === s)) return s;
   return "done";
+}
+
+/** A collaboration call can address an existing child or report several children at once. */
+export function taskOfCall(call: Pick<ToolCall, "task" | "tool_id"> | undefined, tasks: Task[]): Task | undefined {
+  if (!call) return undefined;
+  return tasks.find((task) => task.id === call.task) ?? tasks.find((task) => task.tool_id === call.tool_id);
+}
+
+/** Pausing for an approval does not finish a child's turn or its elapsed time. */
+export function taskLive(task: Task): boolean {
+  return task.status === "running" || task.status === "pending" || task.status === "paused";
+}
+
+/** A child has its own lifecycle; a successful spawn does not mean its work succeeded. */
+export function taskDot(task: Task): string {
+  switch (task.status) {
+    case "completed": return "succeeded";
+    case "failed": return "failed";
+    case "running": return "running";
+    case "pending": return "queued";
+    case "paused": return "pending";
+    case "stopped":
+    case "killed":
+    case "cancelled": return "cancelled";
+    default: return "unknown";
+  }
+}
+
+/** Older snapshots report zero duration even when they include a task's end time. */
+export function taskDuration(task: Task): number | undefined {
+  return task.duration_ms || (task.ended !== undefined ? Math.max(0, task.ended - task.started) : undefined);
 }
 
 export function tildify(path: string): string {

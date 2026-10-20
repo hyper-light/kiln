@@ -4,9 +4,12 @@ recorded changes, and record new changes (CP-M1; docs/vendoring.md).
 
   scripts/vendor.py <project> <revision> [--from PATH] [--no-gate]
       Take <project> at <revision> (a full commit id; a release version for Bun): copy its tree,
-      re-apply kiln's recorded changes, check the projects' pins of each other, then run the
-      gate. A recorded change that no longer applies stops it, naming the change and the files,
-      and nothing is changed.
+      check the projects' pins of each other, re-apply kiln's recorded changes, then run the
+      gate. A recorded change that no longer applies stops it, naming the change and the files;
+      kiln's tree is left as it was, and git's merge waits in a folder of its own.
+  scripts/vendor.py <project> --continue [--no-gate] | --abort
+      Once the conflict is resolved there: that change as resolved, the rest re-applied, kiln's
+      tree written and the gate run. Or the stopped re-vendor dropped.
   scripts/vendor.py check [<project> ...] [--kind git|bun] [--from PROJECT=PATH]
       Prove each vendored tree is its upstream at the pinned revision plus its recorded changes,
       byte for byte, that its UPSTREAM.md lists every change, and that the pins agree.
@@ -499,6 +502,17 @@ class Scratch:
         # .gitattributes the upstream tree carries.
         (self.dir / ".git" / "info").mkdir(parents=True, exist_ok=True)
         (self.dir / ".git" / "info" / "attributes").write_text("* -text -ident -filter -working-tree-encoding\n")
+        # Kept: a conflict waits in it for the person (a re-vendor's `--continue`), so it outlives
+        # the run that made it.
+        self.kept = False
+
+    @classmethod
+    def adopt(cls, where: Path) -> "Scratch":
+        """The scratch repository a stopped re-vendor kept."""
+        s = cls.__new__(cls)
+        s.dir = where
+        s.kept = True
+        return s
 
     def close(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -1097,12 +1111,101 @@ def check(manifest: Manifest, names: list[str], sources: dict[str, str], kind: s
     return 1 if problems else 0
 
 
+def pending_dir(name: str) -> Path:
+    """Where a re-vendor of the project waits on a conflict for the person to resolve."""
+    return cache_dir() / "conflict" / name
+
+
+def tree_digest(tree: Tree) -> str:
+    h = hashlib.sha256()
+    for rel, (mode, data) in sorted(tree.items()):
+        h.update(f"{rel}\0{mode}\0{hashlib.sha256(data).hexdigest()}\n".encode("utf-8", errors="surrogateescape"))
+    return h.hexdigest()
+
+
+@dataclasses.dataclass
+class Replay:
+    """A re-vendor's carrying of the recorded changes onto a new revision, one cherry-pick each in
+    the scratch repository, kept beside it when a change conflicts (`--continue`, `--abort`)."""
+
+    project: str
+    revision: str
+    source: str | None
+    here: str  # the digest of kiln's folder when it started: it must not change meanwhile
+    prev: str  # the scratch's last commit on the new revision's branch
+    plan: list[dict]  # each recorded change in order: {"file", "header", "commit"} (its commit on the old revision)
+    at: int = 0  # the next change to carry
+    done: list[dict] = dataclasses.field(default_factory=list)  # {"file", "header", "parent", "commit"} on the new branch
+    conflicted: list[str] = dataclasses.field(default_factory=list)
+
+    STATE = "kiln-vendor-replay.json"
+
+    def save(self, s: Scratch) -> None:
+        (s.dir / ".git" / self.STATE).write_text(json.dumps(dataclasses.asdict(self), indent=1), encoding="utf-8")
+
+    @classmethod
+    def load(cls, where: Path) -> "Replay":
+        try:
+            return cls(**json.loads((where / ".git" / cls.STATE).read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError) as e:
+            raise Refused(f"{where} holds no re-vendor to continue ({e}): remove it with --abort") from None
+
+
+def carry(root: Path, project: Project, s: Scratch, r: Replay) -> tuple[Tree, list[Change]]:
+    """Each recorded change from r.at on, cherry-picked onto the new revision by three-way merge,
+    then every change refreshed against it. A change that conflicts stops it: the scratch, git's
+    merge in its working tree, is kept as the project's pending re-vendor, and kiln's tree is left
+    as it was."""
+    root_path = Path(root)
+    while r.at < len(r.plan):
+        step = r.plan[r.at]
+        title = Change(file=Path(step["file"]), header=step["header"], diff=b"").title
+        picked = s.git(["cherry-pick", "--no-commit", step["commit"]], ok=True)
+        conflicted = s.git(["diff", "--name-only", "--diff-filter=U"]).stdout.decode().split()
+        if picked.returncode != 0 or conflicted:
+            r.conflicted = conflicted
+            where = pending_dir(project.name)
+            where.parent.mkdir(parents=True, exist_ok=True)
+            s.dir.replace(where)
+            s.dir = where
+            s.kept = True
+            r.save(s)
+            files = ", ".join(conflicted) or picked.stderr.decode(errors="replace").strip()
+            raise Refused(
+                f"{project.name} at {r.revision}: recorded change {step['file']} ({title}) conflicts with upstream in {files}. "
+                f"Nothing was changed in {project.path}. git's merge waits in {where}: resolve the files it marks there "
+                f"(the change as it should be on upstream's new code), then `scripts/vendor.py {project.name} --continue`; "
+                f"or `scripts/vendor.py {project.name} --abort`"
+            )
+        commit_step(s, r, step, title)
+    changes = [
+        Change(file=root_path / PATCHES / project.name / d["file"], header=d["header"], diff=s.diff(d["parent"], d["commit"]))
+        for d in r.done
+    ]
+    return s.read(), changes
+
+
+def commit_step(s: Scratch, r: Replay, step: dict, title: str) -> None:
+    """The change under way, as it now stands in the scratch's index, committed; or dropped when
+    it changes nothing on the new revision (upstream made it, or its resolution took upstream's)."""
+    if s.git(["diff", "--cached", "--quiet"], ok=True).returncode == 0:
+        s.git(["cherry-pick", "--quit"], ok=True)
+        say(f"{r.project}: {step['file']} ({title}) makes no change on upstream at {r.revision[:12]}")
+    else:
+        s.git(["commit", "-q", "--no-verify", "-m", title])
+        head = s.git(["rev-parse", "HEAD"]).stdout.decode().strip()
+        r.done.append({"file": step["file"], "header": step["header"], "parent": r.prev, "commit": head})
+        r.prev = head
+    r.at += 1
+
+
 def revendor(manifest: Manifest, name: str, revision: str, source: str | None, gate: bool) -> int:
     root = manifest.root
     project = manifest.projects.get(name)
     if project is None:
         raise Refused(f"no project {name!r} in {MANIFEST}: add its [projects.{name}] first (docs/vendoring.md)")
-    folder = root / project.path
+    if pending_dir(name).exists():
+        raise Refused(f"a re-vendor of {name} waits on a conflict in {pending_dir(name)}: resolve it and `--continue`, or `--abort`")
     here = read_vendored(root, project)
     old = None
     if here or load_changes(root, project):
@@ -1119,21 +1222,92 @@ def revendor(manifest: Manifest, name: str, revision: str, source: str | None, g
                 f"(scripts/vendor.py record {name} <title> --why <why>):\n  " + "\n  ".join(diffs)
             )
     try:
-        new_tree, new_changes, facts, upstream = take(root, project, revision, source, old)
-        problems = pin_problems(manifest, project, revision, upstream)
+        if project.kind == "bun":
+            up_b = BunUpstream(project, root)
+            new_tree, facts = up_b.tree(revision)
+            return finish(manifest, project, revision, here, new_tree, [], facts, up_b, old.facts if old else None, gate)
+        up_g = GitUpstream(project, source)
+        base = up_g.tree(revision)
+        problems = pin_problems(manifest, project, revision, up_g)
         if problems:
             raise Refused("\n  ".join(["the projects' pins don't agree:", *problems]))
+        if old is None or old.scratch is None or not old.changes:
+            return finish(manifest, project, revision, here, base, [], None, up_g, None, gate)
+        s = old.scratch
+        s.git(["switch", "-q", "--orphan", "next"])
+        s.set_tree(base)
+        prev = s.commit(f"{project.name} at {revision}")
+        plan = [{"file": c.name, "header": c.header, "commit": commit} for c, commit in zip(old.changes, old.commits)]
+        r = Replay(project=name, revision=revision, source=source, here=tree_digest(here), prev=prev, plan=plan)
+        new_tree, new_changes = carry(root, project, s, r)
     finally:
-        if old and old.scratch:
+        if old and old.scratch and not old.scratch.kept:
             old.scratch.close()
-    # Everything is settled: write it.
+    return finish(manifest, project, revision, here, new_tree, new_changes, None, up_g, None, gate)
+
+
+def resume(manifest: Manifest, name: str, gate: bool) -> int:
+    """`--continue`: the conflicting change as the person resolved it, then the rest carried, and
+    kiln's tree written once every change applies."""
+    root = manifest.root
+    project = manifest.projects.get(name)
+    if project is None:
+        raise Refused(f"no project {name!r} in {MANIFEST}")
+    where = pending_dir(name)
+    if not where.exists():
+        raise Refused(f"no re-vendor of {name} waits on a conflict")
+    r = Replay.load(where)
+    here = read_vendored(root, project)
+    if tree_digest(here) != r.here:
+        raise Refused(f"{project.path} changed since the re-vendor stopped: `scripts/vendor.py {name} --abort`, then start it again")
+    s = Scratch.adopt(where)
+    s.git(["add", "--all", "--force", "."])
+    unmerged = s.git(["diff", "--name-only", "--diff-filter=U"]).stdout.decode().split()
+    marked = [f for f in r.conflicted if (where / f).is_file() and re.search(rb"^(<<<<<<< |>>>>>>> )", (where / f).read_bytes(), re.M)]
+    if unmerged or marked:
+        raise Refused(f"not resolved yet, in {where}: {', '.join(sorted(set(unmerged) | set(marked)))} (git's conflict markers are still there)")
+    step = r.plan[r.at]
+    commit_step(s, r, step, Change(file=Path(step["file"]), header=step["header"], diff=b"").title)
+    r.save(s)
+    new_tree, new_changes = carry(root, project, s, r)
+    rc = finish(manifest, project, r.revision, here, new_tree, new_changes, None, GitUpstream(project, r.source), None, gate)
+    shutil.rmtree(where, ignore_errors=True)
+    return rc
+
+
+def abort(name: str) -> int:
+    where = pending_dir(name)
+    if not where.exists():
+        raise Refused(f"no re-vendor of {name} waits on a conflict")
+    shutil.rmtree(where)
+    say(f"{name}: the re-vendor that waited on a conflict is gone; nothing was changed")
+    return 0
+
+
+def finish(
+    manifest: Manifest,
+    project: Project,
+    revision: str,
+    here: Tree,
+    new_tree: Tree,
+    new_changes: list[Change],
+    facts: BunFacts | None,
+    upstream: GitUpstream | BunUpstream,
+    old_facts: BunFacts | None,
+    gate: bool,
+) -> int:
+    """Everything is settled: the folder, its recorded changes and the manifest written, then
+    the gate."""
+    root = manifest.root
+    name = project.name
+    folder = root / project.path
     folder.mkdir(parents=True, exist_ok=True)
     touched = write_into(folder, here, new_tree)
     patches = root / PATCHES / name
     for c in load_changes(root, project):
         if c.name not in {n.name for n in new_changes}:
             c.file.unlink()
-            say(f"{name}: dropped {c.name} ({c.title}): upstream now has it; remove its row from {project.path}/UPSTREAM.md")
+            say(f"{name}: dropped {c.name} ({c.title}): it makes no change on upstream's new tree; remove its row from {project.path}/UPSTREAM.md")
     for c in new_changes:
         data = c.header.encode("utf-8") + c.diff
         if not c.file.exists() or c.file.read_bytes() != data:
@@ -1149,8 +1323,8 @@ def revendor(manifest: Manifest, name: str, revision: str, source: str | None, g
             notes.write_text(notes.read_text(encoding="utf-8").replace(project.revision, revision), encoding="utf-8")
     if text != manifest.text:
         (root / MANIFEST).write_text(text, encoding="utf-8")
-    if isinstance(upstream, BunUpstream) and facts and old and old.facts:
-        upstream.update_notice(old.facts, facts)
+    if isinstance(upstream, BunUpstream) and facts and old_facts:
+        upstream.update_notice(old_facts, facts)
         for p in upstream.notice_problems(facts):
             say(f"{p}: update it by hand")
     say(f"{name}: {len(new_tree)} files at {revision}, {len(new_changes)} recorded changes re-applied, {len(touched)} files written or removed")
@@ -1162,42 +1336,6 @@ def revendor(manifest: Manifest, name: str, revision: str, source: str | None, g
         return run_gate(manifest, project)
     say("gate skipped (--no-gate)")
     return 0
-
-
-def take(root: Path, project: Project, revision: str, source: str | None, old: Expected | None) -> tuple[Tree, list[Change], BunFacts | None, GitUpstream | BunUpstream]:
-    """The project's tree at revision with its recorded changes re-applied by three-way merge,
-    and the changes refreshed against it."""
-    if project.kind == "bun":
-        up = BunUpstream(project, root)
-        tree, facts = up.tree(revision)
-        return tree, [], facts, up
-    up_g = GitUpstream(project, source)
-    base = up_g.tree(revision)
-    if old is None or old.scratch is None or not old.changes:
-        return base, [], None, up_g
-    s = old.scratch
-    s.git(["switch", "-q", "--orphan", "next"])
-    s.set_tree(base)
-    prev = s.commit(f"{project.name} at {revision}")
-    refreshed: list[Change] = []
-    for change, commit in zip(old.changes, old.commits):
-        r = s.git(["cherry-pick", "--no-commit", commit], ok=True)
-        conflicted = s.git(["diff", "--name-only", "--diff-filter=U"]).stdout.decode().split()
-        if r.returncode != 0 or conflicted:
-            files = ", ".join(conflicted) or r.stderr.decode(errors="replace").strip()
-            raise Refused(
-                f"{project.name} at {revision}: recorded change {change.name} ({change.title}) conflicts with upstream in {files}. "
-                f"Nothing was changed. Take the change into upstream's new code by hand: edit {project.path} at "
-                f"{project.revision[:12]}, record the edit, then re-vendor"
-            )
-        if s.git(["diff", "--cached", "--quiet"], ok=True).returncode == 0:
-            s.git(["cherry-pick", "--quit"], ok=True)
-            continue  # upstream now makes this change itself
-        s.git(["commit", "-q", "--no-verify", "-m", change.title])
-        head = s.git(["rev-parse", "HEAD"]).stdout.decode().strip()
-        refreshed.append(Change(file=change.file, header=change.header, diff=s.diff(prev, head)))
-        prev = head
-    return s.read(), refreshed, None, up_g
 
 
 def run_gate(manifest: Manifest, project: Project) -> int:
@@ -1268,6 +1406,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("args", nargs="*")
     ap.add_argument("--from", dest="source", action="append", default=[], help="where to fetch from instead of the manifest's repository: PATH, or PROJECT=PATH for check")
     ap.add_argument("--no-gate", action="store_true", help="don't run the gate after re-vendoring")
+    ap.add_argument("--continue", dest="resume", action="store_true", help="carry on a re-vendor that stopped at a conflict, once it's resolved")
+    ap.add_argument("--abort", action="store_true", help="drop a re-vendor that stopped at a conflict")
     ap.add_argument("--kind", choices=["git", "bun"], help="check: only the projects of this kind")
     ap.add_argument("--why", default="", help="record: why kiln makes the change")
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent), help=argparse.SUPPRESS)
@@ -1283,6 +1423,10 @@ def main(argv: list[str]) -> int:
             return record(manifest, a.args[0], a.args[1], a.why)
         if a.command == "list":
             return list_projects(manifest)
+        if a.resume or a.abort:
+            if a.args or (a.resume and a.abort):
+                ap.error("<project> --continue | --abort")
+            return resume(manifest, a.command, not a.no_gate) if a.resume else abort(a.command)
         if len(a.args) != 1:
             ap.error("<project> <revision>")
         if len(a.source) > 1:

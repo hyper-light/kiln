@@ -71,7 +71,7 @@ counted.
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
 | POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
-| GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
+| GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
@@ -243,6 +243,14 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
+Mission Control shows kiln sessions and native subagents in a flat list, without relationship
+labels or nested disclosures. Search, status filters and sorting apply to each row independently.
+Native subagents show their own status and open their work inside
+the parent's conversation, including after they finish. The session list carries small
+`subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
+Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
+do not create kiln sessions or change the harness's isolation, permissions or execution.
+
 ### Told, not made to wait
 
 Nothing makes a parent wait for its children, or for its own work that runs on its own (a
@@ -351,6 +359,28 @@ The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk
 their own modes by their words (`yolo` is bypass, `autoEdit` accept edits, `plan` plan). A mode
 kiln can't place is refused for a child; a parent in one counts as ask. The limits hold when a
 child starts: a person may change its mode later, as for any agent.
+
+Codex applies approval and sandbox settings per turn. Changing them during a turn interrupts
+that turn and continues its work with the new settings before queued messages. A stop or a new
+"Send now" message takes precedence over that continuation. Pending requests from the interrupted
+turn are cancelled, never approved automatically. Choosing approval and sandbox settings
+separately shows `Custom` unless they match a preset. An explicit Full access choice is retained
+across restarts.
+Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
+preset to a turn inherited from an older runner. Older runners still show "From the next turn."
+
+A native Codex subagent keeps the settings it started with (its spawner's) for its whole life:
+Codex has no way to change them, and refuses kiln's input to a subagent. kiln notes them when it
+sees the spawn. A change stops (interrupts) subagents still working with more than the new
+settings allow. Under an approval policy of `never` (Full access), nothing started with the
+session's settings asks, so a request for approval comes from work started with earlier ones: the
+session's own turn (one inherited from an older runner) is interrupted and continued with the
+current settings, and a subagent is stopped. Such a request is held back from the person while
+that work stops, which withdraws it; it's never answered for them. Should Codex refuse to stop it
+(or it's still waiting after 30 s), it's shown after all. The parent hears which subagents kiln
+stopped and is told to start new ones for their unfinished work, since new ones take the current
+settings: in its turn, or in the turn continuing after the change (a change between turns that
+stopped some starts one), else with the next message it's sent.
 
 ### Waiting
 
@@ -519,8 +549,8 @@ tells the agent to stop rerunning. An incident waits for a person instead (`wait
 while its attachment is paused, past one of its limits for the day, or when its agent couldn't
 start.
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
-its workflows' and environments' too. Mission Control puts the agents an attachment woke under it,
-and their questions come to Needs you and to notifications as any agent's do. A runner doctor's
+its workflows' and environments' too. Mission Control lists the agents an attachment woke with
+the other agents; their questions come to Needs you and to notifications as any agent's do. A runner doctor's
 open incident shows in the runner's row in Settings → Updates.
 
 | Operation | Route | |
@@ -749,6 +779,8 @@ turn (`harness/pause.rs`):
 - **Your call.** `resume` ends it now (after a plan upgrade, say). Turn off "Resume by itself at the
   reset" (`auto_resume`) to keep it paused until you do. Picking another harness's model
   (`set_model` with `kind`) ends it too: the conversation goes on there, the cut-off turn first.
+  The pause panel folds down to its limit and reset time. **Switch account** opens the same login
+  dialog as `/login`, on the agent's machine; after signing in, **Resume now** retries the work.
 - **Stop point.** `pause_at` (the head's usage badge → Pause at, or the agent's Settings → Usage
   limits: 80, 90 or 95 % used) pauses the agent once a limit is that full, before the limit cuts a
   turn off. Between turns, or in the middle of one (an agent working on its own can go for hours
@@ -845,6 +877,22 @@ sends to the background, monitors and workflows. Besides `id`, `description`, `s
   wake, "agent" or the subagent task that started the monitor.
 - `stoppable`: `stop_task` can stop it.
 
+Codex's native subagents keep their own threads and execution settings. kiln tracks each one by
+its native thread ID and keeps its work under the original spawning call, including later
+messages and follow-up work. Read-only `thread/read` and `thread/turns/list` requests fill in its
+status, latest 100 turns, elapsed time and result; live child notifications update that same
+view. Tracking never starts, resumes or attaches another executor to the child (it may interrupt
+one working with other permissions than the session's: see permission modes above). Its messages,
+commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
+finishing does not mean the child has finished, and unavailable child history does not end the
+parent.
+
+The task output endpoint projects a native Codex child's assistant messages and tool results,
+scoped to that child and its original spawning call. Its stored final result remains readable
+after timeline eviction. Each read replaces the previous snapshot, so history imports and
+streaming replacements do not duplicate output. An unavailable completed result returns an
+error rather than a successful empty read.
+
 `state.left_behind` counts the tasks left running while no turn is under way (the agent idle or
 exited): shells, monitors, workflows, background calls and subagents sent to the background.
 
@@ -938,14 +986,14 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
 | questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — |
 | plans to approve | unit | — | — | — |
-| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (from the next turn) | ✓ (the agent's modes) | ? |
+| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
 | effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
 | one message's own model and effort | unit | ✓ | — | — |
 | attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |
 | calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — |
-| subagents: tasks, nested messages, stop | ✓ | ? (subagent activity is shown; not run) | — | — |
+| subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |

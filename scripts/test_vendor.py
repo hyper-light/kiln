@@ -131,6 +131,103 @@ class GitProjects(VendorTestCase):
         self.assertIn("Nothing was changed", err)
         self.assertEqual(snapshot(lab.kiln), before)
 
+    def conflicting_upstream(self) -> str:
+        """An upstream commit that rewrites the line the recorded change edits."""
+        lib = self.lab.up / "src/lib.rs"
+        lib.write_text(lib.read_text().replace("f2() -> u32 { 2 }", "f2() -> u32 { 22 }"))
+        return self.lab.commit_up("upstream changes f2")
+
+    def test_a_conflict_resolved_and_continued_takes_the_revision_with_the_change_reworked(self) -> None:
+        """AC-M1.1: the conflict waits in a folder of its own; resolved there, --continue takes the
+        new revision with the change as resolved, refreshed, and the manifest moved."""
+        self.vendored_with_a_change()
+        lab = self.lab
+        c2 = self.conflicting_upstream()
+        before = snapshot(lab.kiln)
+        code, err = lab.vendor("demo", c2, "--no-gate")
+        self.assertEqual(code, 1, err)
+        where = vendor.pending_dir("demo")
+        self.assertIn(str(where), err)
+        self.assertIn("--continue", err)
+        self.assertEqual(snapshot(lab.kiln), before)
+        self.assertIn("<<<<<<< ", (where / "src/lib.rs").read_text())
+        # The change reworked onto upstream's new line.
+        (where / "src/lib.rs").write_text(LIB_RS.replace("f2() -> u32 { 2 }", "f2() -> u32 { 22 + 0 } // kiln"))
+        code, err = lab.vendor("demo", "--continue", "--no-gate")
+        self.assertEqual(code, 0, err)
+        self.assertIn("pub fn f2() -> u32 { 22 + 0 } // kiln", (lab.kiln / "vendor/demo/src/lib.rs").read_text())
+        self.assertIn(f'commit = "{c2}"', (lab.kiln / "vendor/MANIFEST.toml").read_text())
+        patch = (lab.kiln / "vendor/patches/demo/0001-f2-says-kiln.patch").read_text()
+        self.assertIn("+pub fn f2() -> u32 { 22 + 0 } // kiln", patch)
+        self.assertTrue(patch.startswith("Subject: f2 says kiln\n"))
+        self.assertFalse(where.exists())
+        code, err = lab.vendor("check", "demo")
+        self.assertEqual(code, 0, err)
+
+    def test_a_second_conflict_stops_the_continue_again(self) -> None:
+        self.vendored_with_a_change()
+        lab = self.lab
+        lic = lab.kiln / "vendor/demo/LICENSE"
+        lic.write_text("MIT, kiln's\n")
+        code, err = lab.vendor("record", "demo", "LICENSE says kiln", "--why", "a second change")
+        self.assertEqual(code, 0, err)
+        write(lab.kiln, {"vendor/demo/UPSTREAM.md": "0001-f2-says-kiln.patch 0002-license-says-kiln.patch\n"})
+        (lab.up / "LICENSE").write_text("MIT, upstream's\n")
+        c2 = self.conflicting_upstream()
+        code, err = lab.vendor("demo", c2, "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("0001-f2-says-kiln.patch", err)
+        where = vendor.pending_dir("demo")
+        (where / "src/lib.rs").write_text(LIB_RS.replace("f2() -> u32 { 2 }", "f2() -> u32 { 22 + 0 } // kiln"))
+        code, err = lab.vendor("demo", "--continue", "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("0002-license-says-kiln.patch", err)
+        self.assertIn("LICENSE", err)
+        (where / "LICENSE").write_text("MIT, upstream's and kiln's\n")
+        code, err = lab.vendor("demo", "--continue", "--no-gate")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((lab.kiln / "vendor/demo/LICENSE").read_text(), "MIT, upstream's and kiln's\n")
+        code, err = lab.vendor("check", "demo")
+        self.assertEqual(code, 0, err)
+
+    def test_continue_refuses_while_the_conflict_markers_remain(self) -> None:
+        self.vendored_with_a_change()
+        lab = self.lab
+        code, err = lab.vendor("demo", self.conflicting_upstream(), "--no-gate")
+        self.assertEqual(code, 1, err)
+        code, err = lab.vendor("demo", "--continue", "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("not resolved yet", err)
+        self.assertIn("src/lib.rs", err)
+        self.assertTrue(vendor.pending_dir("demo").exists())
+
+    def test_continue_refuses_when_kilns_folder_changed_meanwhile(self) -> None:
+        self.vendored_with_a_change()
+        lab = self.lab
+        code, err = lab.vendor("demo", self.conflicting_upstream(), "--no-gate")
+        self.assertEqual(code, 1, err)
+        (lab.kiln / "vendor/demo/LICENSE").write_text("MIT, edited meanwhile\n")
+        code, err = lab.vendor("demo", "--continue", "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("changed since the re-vendor stopped", err)
+
+    def test_a_revendor_waits_while_one_is_pending_and_abort_drops_it(self) -> None:
+        self.vendored_with_a_change()
+        lab = self.lab
+        c2 = self.conflicting_upstream()
+        code, err = lab.vendor("demo", c2, "--no-gate")
+        self.assertEqual(code, 1, err)
+        code, err = lab.vendor("demo", lab.c1, "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("waits on a conflict", err)
+        before = snapshot(lab.kiln)
+        code, err = lab.vendor("demo", "--abort")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(vendor.pending_dir("demo").exists())
+        self.assertEqual(snapshot(lab.kiln), before)
+        code, err = lab.vendor("demo", lab.c1, "--no-gate")
+        self.assertEqual(code, 0, err)
+
     def test_ac_m1_1_a_new_commit_is_taken_with_the_recorded_change_re_applied(self) -> None:
         """AC-M1.1: upstream moves elsewhere in the file and adds a file: one command takes it, the
         change re-applied by three-way merge and refreshed, the manifest's commit moved."""

@@ -33,6 +33,8 @@ Each change is recorded in `vendor/patches/turso/`, applied in this order on ups
 
 `scripts/vendor.py turso <commit>` takes the four crates at that commit, re-applies the changes
 above by three-way merge, refreshes them, and runs the gate. A change that no longer applies
-stops it, naming the change and the files, with nothing changed. A new edit here is recorded with
+stops it, naming the change and the files, with nothing changed here: git's merge waits for the
+change to be reworked onto upstream's new code, then `--continue` (docs/vendoring.md, "When a
+change conflicts"). `0001`'s cut-down `Cargo.toml` meets most upstream edits to the root manifest. A new edit here is recorded with
 `scripts/vendor.py record turso <title> --why <why>` and gets its row in the table;
 `scripts/vendor.py check turso` (in kiln's CI) fails while an edit isn't recorded.

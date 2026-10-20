@@ -63,7 +63,8 @@ criteria (each a sentence: "p99.9 latency is at most 200 ms") and "Tests:" its t
 shows its title, the rest under it.
 
 The server keeps the stacks and drives them, so they go on with no console open and across
-restarts.
+restarts. A stack holds at most 500 goals, those met or under way included, so a program of a
+hundred goals and more fits, its met goals kept for the record.
 
 ## Keep going
 

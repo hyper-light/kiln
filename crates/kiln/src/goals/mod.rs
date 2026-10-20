@@ -26,8 +26,9 @@ use crate::harness::registry::Sent;
 use crate::harness::session::Info;
 use crate::hub::Hub;
 
-/// Most goals a stack holds.
-const ITEMS: usize = 100;
+/// Most goals a stack holds, those met or under way included: room for a program of a hundred
+/// goals and more, its met goals kept for the record.
+const ITEMS: usize = 500;
 /// Longest goal.
 const TEXT: usize = 2000;
 /// How long an agent that stopped short of its goal is left before the goal is sent again, at
@@ -204,7 +205,7 @@ pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
             let kept: i64 = tx.query_row("SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status != 'pending'", params![agent], |r| r.get(0))?;
-            if usize::try_from(kept).unwrap_or(0) + items.len() > ITEMS {
+            if !fits(usize::try_from(kept).unwrap_or(usize::MAX), items.len()) {
                 anyhow::bail!("a stack holds at most {ITEMS} goals");
             }
             let pending: Vec<String> = {
@@ -234,6 +235,11 @@ pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
         })
         .await
         .map_err(|e| if e.to_string().contains("at most") { Error::Bad(e.to_string()) } else { Error::Other(e) })
+}
+
+/// Whether `kept` goals done or under way, and `given` more, fit in one stack.
+fn fits(kept: usize, given: usize) -> bool {
+    kept.checked_add(given).is_some_and(|n| n <= ITEMS)
 }
 
 /// Adds goals after the ones there; `start` runs the stack.
@@ -627,6 +633,14 @@ mod tests {
 
     /// Past the first pause after the goal was sent.
     const LATER: i64 = 1_000 + REMIND_MS;
+
+    #[test]
+    fn a_stack_holds_a_program_of_more_than_a_hundred_goals_and_stays_bounded() {
+        assert!(fits(1, 120), "a goal under way and 120 more");
+        assert!(fits(100, 300), "a program's met goals stay, with room for more");
+        assert!(fits(0, ITEMS) && !fits(1, ITEMS) && !fits(ITEMS, 1), "at most {ITEMS}");
+        assert!(!fits(usize::MAX, 1), "no overflow");
+    }
 
     #[test]
     fn an_agent_paused_for_a_limit_gets_no_goal_and_no_reminder() {

@@ -47,9 +47,10 @@ A re-vendor:
 1. checks the folder is what the manifest says (an edit no change records would be lost: it stops
    and names the files);
 2. takes upstream's tree at the new revision;
-3. re-applies each recorded change by three-way merge. A change that conflicts stops it, naming the
-   change and the files, with nothing changed (as with git's merges, an upstream edit to the line
-   beside a change's counts); a change upstream now makes itself is dropped, and it says so;
+3. re-applies each recorded change by three-way merge (the pins are checked first). A change that
+   conflicts stops it, naming the change and the files, with kiln's tree as it was (as with git's
+   merges, an upstream edit to the line beside a change's counts); a change upstream now makes
+   itself is dropped, and it says so;
 4. refreshes each change against the new tree, writes the folder, and moves the manifest's
    revision (and the revision named in `UPSTREAM.md`);
 5. checks the pins: every project the new revision's own `vendor/MANIFEST.toml` takes must be one
@@ -63,6 +64,23 @@ A re-vendor:
 
 Upstream sources are cached in `~/.cache/kiln/vendor` (`KILN_VENDOR_CACHE`): git projects as bare
 repositories, image layers by digest.
+
+### When a change conflicts
+
+The re-vendor keeps git's merge in `~/.cache/kiln/vendor/conflict/<project>`, a git repository
+whose working tree is the new revision with the changes before the conflicting one applied, and the
+conflicting one merged with git's markers. Rework the change there, onto upstream's new code (for
+Turso's `Cargo.toml`: upstream's new root manifest, cut down to the crates kiln takes again), then:
+
+```sh
+scripts/vendor.py <project> --continue     # the change as resolved, the rest re-applied, then the gate
+scripts/vendor.py <project> --abort        # or drop the stopped re-vendor
+```
+
+`--continue` takes the resolution as the change's new form (its patch file keeps its name and its
+Subject and Why), carries the rest, and stops again at the next conflict, if any. kiln's tree is
+written only once every change applies; while one waits, a new re-vendor of that project is
+refused, and so is `--continue` while git's markers remain or once kiln's folder has changed.
 
 ## Adding a project
 

@@ -64,7 +64,7 @@ function useTail(agent: string, task: string, live: boolean): Tail {
             key,
             r.error
               ? { ...was, note: r.error }
-              : { text: r.data ? (was.text + r.data).slice(-200_000) : was.text, offset: r.offset ?? was.offset, note: r.gone ? "Its output file is gone: the task has ended." : null },
+              : { text: r.reset ? (r.data ?? "").slice(-200_000) : r.data ? (was.text + r.data).slice(-200_000) : was.text, offset: r.offset ?? was.offset, note: r.gone ? "Its output file is gone: the task has ended." : null },
           );
           changed();
         } catch (e) {
