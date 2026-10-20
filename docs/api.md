@@ -112,6 +112,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | POST | `/api/join-requests/:id/deny` | → `{ id, status: "denied", name }`; the machine learns it on its next poll |
 | GET | `/api/metrics/history?agent=` | `{ [agent]: HostSample[] }` last hour, 5 s resolution (`agent` optional; server is `"server"`) |
 | GET | `/api/system` | `{ version, uptime_s, generation, children: Child[], crash_log: string[], config: object }` |
+| GET | `/api/conversations/status` | every conversation store as the server sees it: `{ at, on, mirrors_wanted, restore, stores: ConvoStore[], notes }` (docs/conversations.md, "Telemetry") |
+| GET | `/api/conversations/series?key=&window=` | one store's series, a column each (`t` in unix s; rates per second): an hour at 5 s, up to a day at a minute |
 | GET | `/api/audit?limit=` | `{ts, actor, action, detail}[]` |
 | GET | `/api/push` | `{ enabled, available, why, public_key, kinds, muted, reached }`: whether this server pushes notifications to devices, and the key to subscribe with ([notifications.md](notifications.md#api)) |
 | GET, POST | `/api/push/subscriptions` | your devices; a browser's subscription with its name and what it hears (at most 20 devices each) |

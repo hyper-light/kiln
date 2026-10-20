@@ -99,6 +99,56 @@ pub enum Ask {
     Plan,
     /// Write it back as planned, a person having said yes to that plan (its manifest's hash).
     Land { manifest: String },
+    /// One step of a plan run's stack: the agent's work committed on the step before's, and
+    /// pushed after the earlier steps' that weren't yet (docs/agentic.md P4).
+    Stack(Stacked),
+    /// A new version of one step of a plan run's stack, and the steps above it made again on it.
+    Restack(Restack),
+}
+
+/// A push of one commit to one ref, as one principal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Push {
+    /// The commit (empty: the one just made).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha: String,
+    pub to_ref: String,
+    /// An `Authorization: Bearer` for a kiln server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+}
+
+/// One step of a plan run's stack, committed and pushed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Stacked {
+    /// The commit it goes on (the step before's); `None`: the folder's last commit.
+    pub on: Option<String>,
+    /// The files it takes (as the agent's changes name them).
+    pub paths: Vec<String>,
+    pub message: String,
+    /// Who commits when the machine's git doesn't say.
+    pub fallback: git::Ident,
+    /// Where the pushes go (a remote's name or a URL); none: the commit stays in the folder's
+    /// repository.
+    pub to: Option<String>,
+    /// In order: the earlier steps' commits not pushed yet, then this one's.
+    pub pushes: Vec<Push>,
+}
+
+/// A step's new version, the steps above it restacked.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Restack {
+    /// The stack's commits from the step's up, bottom first.
+    pub commits: Vec<String>,
+    /// The agent's files: as the folder has them now, they go into the first commit.
+    pub paths: Vec<String>,
+    /// The first commit's new message, when it changes.
+    pub message: Option<String>,
+    pub fallback: git::Ident,
+    pub to: Option<String>,
+    /// The ref each new commit goes to, by its place in `commits` (none: not pushed by itself).
+    pub refs: Vec<Option<String>>,
+    pub bearer: Option<String>,
 }
 
 /// A commit of the agent's work, pushed.
@@ -181,5 +231,37 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
             let said = git::push(top, &c.to, &format!("+{}:{}", made.sha, c.to_ref), c.bearer.as_deref()).await?;
             Ok(json!({"made": made, "said": said}))
         }
+        Ask::Stack(s) => {
+            let Some(made) = git::commit_on(cwd, s.on.as_deref(), &s.paths, &s.message, &s.fallback).await? else {
+                return Ok(json!({"nothing": true}));
+            };
+            let facts = git::facts(cwd).await?;
+            let pushes: Vec<Push> = s.pushes.into_iter().map(|p| Push { sha: if p.sha.is_empty() { made.sha.clone() } else { p.sha }, ..p }).collect();
+            let (pushed, said, error) = push_all(Path::new(&facts.top), s.to.as_deref(), &pushes).await;
+            Ok(json!({"made": made, "pushed": pushed, "said": said, "push_error": error}))
+        }
+        Ask::Restack(r) => {
+            let facts = git::facts(cwd).await?;
+            let top = Path::new(&facts.top);
+            let who = git::identity(top, &r.fallback).await;
+            let made = git::restack(top, &r.commits, &r.paths, r.message.as_deref(), &who).await?;
+            let pushes: Vec<Push> = made.iter().zip(&r.refs).filter_map(|(m, to)| to.clone().map(|to_ref| Push { sha: m.sha.clone(), to_ref, bearer: r.bearer.clone() })).collect();
+            let (pushed, said, error) = push_all(top, r.to.as_deref(), &pushes).await;
+            Ok(json!({"made": made, "pushed": pushed, "said": said, "push_error": error}))
+        }
     }
+}
+
+/// Pushes `pushes` to `to` in order, up to the first that fails: how many went, what was said,
+/// and why the one that didn't go didn't.
+async fn push_all(top: &Path, to: Option<&str>, pushes: &[Push]) -> (usize, String, Option<String>) {
+    let Some(to) = to else { return (0, String::new(), None) };
+    let mut said = String::new();
+    for (i, p) in pushes.iter().enumerate() {
+        match git::push(top, to, &format!("+{}:{}", p.sha, p.to_ref), p.bearer.as_deref()).await {
+            Ok(s) => said.push_str(&s),
+            Err(e) => return (i, said, Some(format!("{e:#}"))),
+        }
+    }
+    (pushes.len(), said, None)
 }

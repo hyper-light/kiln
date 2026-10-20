@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::store::{Changes, Store};
+use super::telemetry::{PeerView, Report, ShipStats, ShipView};
 use crate::proto;
 
 /// The feed's lane on the runner's link.
@@ -74,13 +75,17 @@ pub enum Msg {
     Restore { store: String },
     /// Mirror to server: its copy `store` has been sent whole, through `rev`.
     Restored { store: String, rev: u64 },
+    /// Runner to server, every few seconds while linked: what its store `store` (its own, or its
+    /// copy of the server's) is doing, for the server's telemetry. A server from before takes it
+    /// for nothing.
+    Stats { store: String, report: Box<Report> },
 }
 
 impl Msg {
     /// The store it is about.
     pub fn store(&self) -> &str {
         match self {
-            Msg::Hello { store, .. } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } | Msg::Restore { store } | Msg::Restored { store, .. } => store,
+            Msg::Hello { store, .. } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } | Msg::Restore { store } | Msg::Restored { store, .. } | Msg::Stats { store, .. } => store,
         }
     }
 }
@@ -147,6 +152,7 @@ pub enum Link {
 #[derive(Clone)]
 pub struct Shipper {
     tx: async_channel::Sender<Link>,
+    stats: std::sync::Arc<ShipStats>,
 }
 
 /// Whether the taker has a row already (by its number): it is left out of what goes to it.
@@ -183,12 +189,18 @@ impl Shipper {
                 }
             }
         });
-        crate::rt::spawn(ship(store, rx, out_tx, restore, skip));
-        (Self { tx }, out_rx)
+        let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
+        crate::rt::spawn(ship(store, rx, out_tx, restore, skip, stats.clone()));
+        (Self { tx, stats }, out_rx)
     }
 
     pub fn link(&self, l: Link) {
         let _ = self.tx.try_send(l);
+    }
+
+    /// Where the feed stands, for telemetry.
+    pub fn stats(&self) -> ShipView {
+        self.stats.view()
     }
 }
 
@@ -208,7 +220,7 @@ struct Shipping {
     heard: Instant,
 }
 
-async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>) {
+async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>) {
     let me = store.id().to_owned();
     // A copy sent back goes through where it reads now, and no further.
     let through = if restore {
@@ -236,12 +248,15 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             Some(Link::Up) => {
                 up = true;
                 st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), heard: Instant::now() };
+                stats.link(true);
+                stats.hello(false);
                 hello(&out);
             }
             Some(Link::Down) => {
                 up = false;
                 st.acked = None;
                 st.flight.clear();
+                stats.link(false);
             }
             Some(Link::Heard(Msg::From { store, rev, zip, kept })) if store == me => {
                 // Where to go on from (a first answer, or after something went astray).
@@ -251,11 +266,13 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
                 st.sent = rev;
                 st.flight.clear();
                 st.heard = Instant::now();
+                stats.from(rev);
             }
             Some(Link::Heard(Msg::Ack { store, rev })) if store == me => {
                 st.acked = Some(rev);
                 st.flight.retain(|u| *u > rev);
                 st.heard = Instant::now();
+                stats.acked(rev, st.flight.len());
             }
             Some(Link::Heard(_) | Link::Wrote) | None => {}
         }
@@ -267,6 +284,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             st.acked = None;
             st.flight.clear();
             st.heard = Instant::now();
+            stats.hello(true);
             hello(&out);
             continue;
         }
@@ -309,6 +327,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
                     break;
                 }
             };
+            let bytes: usize = msgs.iter().map(|(_, d)| d.len()).sum();
             for (m, data) in msgs {
                 if out.send((encode(&m), data)).await.is_err() {
                     return;
@@ -319,6 +338,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             }
             st.sent = batch.upto;
             st.flight.push_back(batch.upto);
+            stats.sent(batch.upto, batch.rows.len(), bytes, st.flight.len());
         }
     }
 }
@@ -356,7 +376,12 @@ pub enum Brings {
 pub struct Intake {
     tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, String, Vec<u8>)>,
     restores: std::sync::Arc<Restores>,
+    peers: std::sync::Arc<Peers>,
 }
+
+/// Where each store that feeds an intake stands, by its name among the store's peers
+/// ([`peer_name`]): for telemetry.
+type Peers = std::sync::Mutex<HashMap<String, PeerView>>;
 
 /// What each mirror sent back to restore a store, by the numbers it was written under there: the
 /// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent.
@@ -393,18 +418,25 @@ impl Intake {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, String, Vec<u8>)>(256);
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
-        let restoring = restores.clone();
+        let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
+        let (restoring, seen) = (restores.clone(), peers.clone());
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut partial: HashMap<(hyper_transport::PeerId, String), Partial> = HashMap::new();
             while let Ok((peer, machine, json, data)) = rx.recv() {
-                for m in take(&store, &mut partial, peer, &machine, brings, &json, data, &restoring, echoes.as_deref()) {
+                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen };
+                for m in take(&feed, &mut partial, peer, &machine, &json, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
                     }
                 }
             }
         })?;
-        Ok((Self { tx, restores }, out_rx))
+        Ok((Self { tx, restores, peers }, out_rx))
+    }
+
+    /// Where each store that feeds this intake stands, since kiln started.
+    pub fn peers(&self) -> Vec<PeerView> {
+        self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect()
     }
 
     /// Take store `store`'s feed as a mirror's copy of this one, sent back to restore it
@@ -425,14 +457,35 @@ pub fn peer_name(machine: &str, store: &str) -> String {
     format!("{machine}/{store}")
 }
 
+/// What an intake takes into, and keeps of what it takes.
+struct Feed<'a> {
+    store: &'a Store,
+    brings: Brings,
+    restores: &'a Restores,
+    echoes: Option<&'a Echoes>,
+    peers: &'a Peers,
+}
+
+impl Feed<'_> {
+    /// Telemetry of store `store` of `machine`.
+    fn note(&self, machine: &str, store: &str, f: impl FnOnce(&mut PeerView)) {
+        let mut all = self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v = all.entry(peer_name(machine, store)).or_insert_with(|| PeerView { machine: machine.to_owned(), store: store.to_owned(), ..PeerView::default() });
+        f(v);
+    }
+}
+
 /// One message from a runner, taken: what to answer.
-#[allow(clippy::too_many_arguments)]
-fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
+fn take(feed: &Feed<'_>, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, json: &str, data: Vec<u8>) -> Vec<Msg> {
+    let Feed { store, brings, restores, echoes, .. } = *feed;
     // Where the server's copy of a runner's store stands. When that can't be read (the store is
     // busy or failing), no answer: never "from 0", which would have the runner send everything
     // again, and every runner at once. The runner asks again after a while ([`STALL`]).
     let go_on_from = |s: String| match store.peer(&peer_name(machine, &s)) {
-        Ok(rev) => vec![Msg::From { store: s, rev, zip: true, kept: true }],
+        Ok(rev) => {
+            feed.note(machine, &s, |v| v.rev = rev);
+            vec![Msg::From { store: s, rev, zip: true, kept: true }]
+        }
         Err(e) => {
             tracing::warn!(%machine, store = %s, error = %format!("{e:#}"), "conversation feed: where the server's copy stands couldn't be read; the runner asks again");
             Vec::new()
@@ -441,6 +494,7 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
     match decode(json) {
         Some(Msg::Hello { store: s, .. }) => {
             partial.remove(&(peer, s.clone()));
+            feed.note(machine, &s, |v| v.hello_at = crate::util::now_ms());
             let answer = go_on_from(s.clone());
             if let Some(Msg::From { rev, .. }) = answer.first() {
                 tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
@@ -470,17 +524,21 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                 return Vec::new();
             }
             let Some(done) = partial.remove(&key) else { return Vec::new() };
+            let wire = done.bytes.len() as u64;
             let read = if done.zip { unzip(&done.bytes) } else { Ok(done.bytes) };
             let batch: Changes = match read.and_then(|b| serde_json::from_slice(&b).map_err(anyhow::Error::from)) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: an unreadable batch");
+                    feed.note(machine, &s, |v| v.errors += 1);
                     return go_on_from(s);
                 }
             };
             let theirs = (brings == Brings::TheirMachine).then_some(machine);
             let copy = restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&s);
+            let began = Instant::now();
             let took = if copy { store.take_copy(&peer_name(machine, &s), from, batch) } else { store.take(&peer_name(machine, &s), theirs, from, batch) };
+            let take_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
             if copy
                 && let (Ok(t), Some(echoes)) = (&took, echoes)
                 && let Some((first, last)) = t.wrote
@@ -488,21 +546,33 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                 echoes.add(machine, first, last);
             }
             match took {
-                Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev, zip: true, kept: true }],
+                Ok(t) if t.gap => {
+                    feed.note(machine, &s, |v| (v.gaps, v.rev) = (v.gaps + 1, t.rev));
+                    vec![Msg::From { store: s, rev: t.rev, zip: true, kept: true }]
+                }
                 Ok(t) => {
                     if t.fenced > 0 {
                         tracing::info!(%machine, fenced = t.fenced, "conversation feed: rows of sessions that went on elsewhere were left out");
                     }
+                    feed.note(machine, &s, |v| {
+                        v.batches += 1;
+                        v.rows += t.applied as u64;
+                        v.fenced += t.fenced as u64;
+                        v.left += t.left as u64;
+                        v.bytes += wire;
+                        (v.rev, v.last_batch, v.take_ms, v.copy) = (t.rev, crate::util::now_ms(), take_ms, copy);
+                    });
                     vec![Msg::Ack { store: s, rev: t.rev }]
                 }
                 Err(e) => {
                     // Not taken: the runner asks again after a while, and sends it again.
                     tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: a batch couldn't be taken");
+                    feed.note(machine, &s, |v| v.errors += 1);
                     Vec::new()
                 }
             }
         }
-        Some(Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. }) | None => Vec::new(),
+        Some(Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. }) | None => Vec::new(),
     }
 }
 
@@ -518,13 +588,20 @@ mod tests {
 
     /// Everything `runner` has, sent to `server` the way the feed does it (batches of `bytes`,
     /// each in parts), and the number the server has at the end.
+    /// [`take`] with telemetry of its own, thrown away.
+    #[allow(clippy::too_many_arguments)]
+    fn took(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
+        let peers = Peers::default();
+        take(&Feed { store, brings, restores, echoes, peers: &peers }, partial, peer, machine, json, data)
+    }
+
     fn feed_all(runner: &Store, server: &Store, machine: &str, bytes: usize) -> anyhow::Result<u64> {
         feed_as(runner, server, machine, Brings::TheirMachine, bytes)
     }
 
     fn feed_as(runner: &Store, server: &Store, machine: &str, brings: Brings, bytes: usize) -> anyhow::Result<u64> {
         let mut partial = HashMap::new();
-        let hello = take(server, &mut partial, 7, machine, brings, &encode(&Msg::Hello { store: runner.id().to_owned(), restore: false }), Vec::new(), &Restores::default(), None);
+        let hello = took(server, &mut partial, 7, machine, brings, &encode(&Msg::Hello { store: runner.id().to_owned(), restore: false }), Vec::new(), &Restores::default(), None);
         let Some(Msg::From { mut rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
         loop {
             let batch = runner.changes_as(rev, bytes, kept)?;
@@ -533,7 +610,7 @@ mod tests {
             }
             let mut answer = Vec::new();
             for (m, data) in parts(runner.id(), rev, &batch, zip)? {
-                answer = take(server, &mut partial, 7, machine, brings, &encode(&m), data, &Restores::default(), None);
+                answer = took(server, &mut partial, 7, machine, brings, &encode(&m), data, &Restores::default(), None);
             }
             match answer.first() {
                 Some(Msg::Ack { rev: r, .. }) => rev = *r,
@@ -619,7 +696,7 @@ mod tests {
         let mut partial = HashMap::new();
         let mut answer = Vec::new();
         for (m, data) in parts(runner.id(), 2, &batch, true)? {
-            answer = take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data, &Restores::default(), None);
+            answer = took(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data, &Restores::default(), None);
         }
         assert_eq!(answer, vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true, kept: true }]);
         assert_eq!(server.kept("a1", 10)?, None);
@@ -627,7 +704,7 @@ mod tests {
         let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?, true)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
         let Msg::Batch { store, from, upto, parts: n, .. } = m else { anyhow::bail!("not a batch") };
         let astray = Msg::Batch { store, from, upto, part: 1, parts: n + 1, zip: true };
-        assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data, &Restores::default(), None), vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true, kept: true }]);
+        assert_eq!(took(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data, &Restores::default(), None), vec![Msg::From { store: runner.id().to_owned(), rev: 0, zip: true, kept: true }]);
         Ok(())
     }
 
@@ -636,7 +713,7 @@ mod tests {
         let server = super::super::store::stopped();
         let mut partial = HashMap::new();
         let restores = Restores::default();
-        let mut answer = |m: Msg, data: &[u8]| take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data.to_vec(), &restores, None);
+        let mut answer = |m: Msg, data: &[u8]| took(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data.to_vec(), &restores, None);
         assert_eq!(answer(Msg::Hello { store: "r".into(), restore: false }, b""), Vec::new());
         assert_eq!(answer(Msg::Hello { store: "r".into(), restore: true }, b""), Vec::new());
         // A part out of place, and a batch that can't be read: the same.
@@ -701,7 +778,7 @@ mod tests {
                     restored = Some((store, rev));
                     break;
                 }
-                for m in take(&server, &mut partial, 7, "mirror-box", Brings::AsItSays, &json, data, &restores, None) {
+                for m in took(&server, &mut partial, 7, "mirror-box", Brings::AsItSays, &json, data, &restores, None) {
                     ship.link(Link::Heard(m));
                 }
             }
@@ -724,7 +801,7 @@ mod tests {
             let mut partial = HashMap::new();
             // The server's side, in this test: what the shipper sends is taken, answers go back.
             let answer = |json: String, data: Vec<u8>, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>| {
-                for m in take(&server, partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                for m in took(&server, partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
                     ship.link(Link::Heard(m));
                 }
             };
@@ -791,7 +868,7 @@ mod tests {
             let at = || server.peer(&peer_name("box", runner.id()));
             for _ in 0..50 {
                 let Ok(Ok((json, data))) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await else { break };
-                for m in take(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                for m in took(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
                     ship.link(Link::Heard(m));
                 }
                 if at()? == 3 {

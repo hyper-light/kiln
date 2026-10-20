@@ -180,4 +180,6 @@ pub const FEED_DROPS: &str = "SELECT rev, session, what, source, n, at FROM drop
 
 /// Through where a store took a peer's feed.
 pub const PEER_GET: &str = "SELECT rev FROM peers WHERE peer = ?1";
+/// Every peer whose feed a store took, through where, and when it last took from it.
+pub const PEERS_ALL: &str = "SELECT peer, rev, at FROM peers ORDER BY peer";
 pub const PEER_SET: &str = "INSERT INTO peers (peer, rev, at) VALUES (?1, ?2, ?3) ON CONFLICT (peer) DO UPDATE SET rev = excluded.rev, at = excluded.at";

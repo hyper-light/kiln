@@ -14,7 +14,7 @@ import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 
 /** Its page: kiln's own review for a change kiln hosts, else the host's. */
-export function ChangeLink({ c, children, className }: { c: AgentChange; children: React.ReactNode; className?: string }) {
+export function ChangeLink({ c, children, className }: { c: Pick<AgentChange, "provider" | "change" | "url">; children: React.ReactNode; className?: string }) {
   if (c.provider === "kiln" && c.change)
     return (
       <Link to={`/review/${c.change}`} className={className}>
@@ -31,7 +31,7 @@ export function ChangeLink({ c, children, className }: { c: AgentChange; childre
 }
 
 /** Nothing at all when what's inside can't load: a row's extra words aren't worth an error. */
-class Quiet extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
+export class Quiet extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
   state = { failed: false };
 
   static getDerivedStateFromError() {
