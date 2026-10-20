@@ -243,6 +243,13 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
+Mission Control's child disclosure includes both kiln sessions an agent started and the native
+subagents its harness reports. Native subagents show their own status and open their work inside
+the parent's conversation, including after they finish. The session list carries small
+`subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
+Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
+do not create kiln sessions or change the harness's isolation, permissions or execution.
+
 ### Told, not made to wait
 
 Nothing makes a parent wait for its children, or for its own work that runs on its own (a
