@@ -6,3 +6,7 @@ node_modules/
 *.part
 /dist
 __pycache__/
+
+# KilnDB benchmark build output (bench/kilndb has a workspace of its own)
+/bench/kilndb/target/
+/bench/kilndb/Cargo.lock
