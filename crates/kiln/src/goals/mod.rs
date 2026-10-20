@@ -11,9 +11,10 @@
 //! composer) joins its stack, so it's kept the same way. The server keeps the stacks and drives
 //! them (`run`), so they go on with no console open and across restarts.
 //!
-//! The driver takes its time from the hub's clock and reaches agents through kiln-seams'
-//! `HarnessPort` (docs/seams.md): in production, kiln's runtime and its harness registry; in tests,
-//! a simulated clock and agents (`drive`), so a 15-minute back-off is checked in microseconds.
+//! The driver ([`Driver`]) takes its time from a kiln-seams `Clock` and reaches agents through a
+//! `HarnessPort` (docs/seams.md): in production, the hub's clock (kiln's runtime) and its harness
+//! registry; in tests, a simulated clock and agents, so a 15-minute back-off is checked in
+//! microseconds.
 
 pub mod keep;
 pub mod ops;
@@ -157,8 +158,12 @@ fn clean(text: &str) -> R<String> {
 
 /// The agent's stack (empty when it has none).
 pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
+    stack_of(&hub.store, agent).await
+}
+
+async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
     let agent = agent.to_owned();
-    Ok(hub.store.call(move |c| load(c, &agent)).await?)
+    Ok(store.call(move |c| load(c, &agent)).await?)
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
@@ -394,59 +399,75 @@ async fn clear_in_agent(hub: &Hub, info: &Info, items: &[Item]) {
 /// way to how it came out, and sends it again when the agent stops short of it. Goals set in an
 /// agent directly join its stack first.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    drive(&hub, hub.as_ref()).await
+    Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: Some(&hub) }.drive().await
 }
 
-/// The driver on `port`'s agents, every [`TICK`] by the hub's clock, until the hub shuts down.
-pub async fn drive<P>(hub: &Arc<Hub>, port: &P) -> anyhow::Result<()>
+/// What the goal driver works with: the stacks' store, its clock, what stops it, and its agents.
+pub struct Driver<'a, P> {
+    pub store: &'a crate::store::Store,
+    pub clock: &'a dyn kiln_seams::Clock,
+    pub shutdown: &'a crate::rt::Shutdown,
+    pub port: &'a P,
+    /// The hub, for parents told of their children (`harness::told`) and paused sessions that go
+    /// on elsewhere (`harness::elsewhere`): none for the driver alone (its tests).
+    pub hub: Option<&'a Arc<Hub>>,
+}
+
+impl<P> Driver<'_, P>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    loop {
-        if !tick(hub).await {
-            return Ok(());
-        }
-        for info in port.agents() {
-            if let Err(e) = adopt(hub, port, &info).await {
-                tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+    /// Every [`TICK`] by its clock, until it's shut down: each running stack stepped, goals set
+    /// in agents adopted, agents no stack drives kept going.
+    pub async fn drive(&self) -> anyhow::Result<()> {
+        loop {
+            if !self.tick().await {
+                return Ok(());
+            }
+            for info in self.port.agents() {
+                if let Err(e) = adopt(self, &info).await {
+                    tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+                }
+            }
+            let running: Vec<String> = self
+                .store
+                .call(|c| {
+                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
+                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                    Ok(v)
+                })
+                .await
+                .unwrap_or_default();
+            for agent in &running {
+                if let Err(e) = step(self, agent).await {
+                    tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+                }
+            }
+            // The agents no goal stack drives: kept going when they stop part-way (`keep`).
+            let now = self.clock.unix_ms();
+            let all = self.port.agents();
+            for info in all.iter().filter(|i| !running.contains(&i.id)) {
+                keep::tick(self.port, info, now, crate::harness::told::children_working(&all, &info.id)).await;
+            }
+            keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
+            if let Some(hub) = self.hub {
+                // Parents told of their children that settled, so none has to wait for them.
+                crate::harness::told::tick(hub, &all, now, &running).await;
+                // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
+                crate::harness::elsewhere::tick(hub, &all, now);
             }
         }
-        let running: Vec<String> = hub
-            .store
-            .call(|c| {
-                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
-                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                Ok(v)
-            })
-            .await
-            .unwrap_or_default();
-        for agent in &running {
-            if let Err(e) = step(hub, port, agent).await {
-                tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
-            }
-        }
-        // The agents no goal stack drives: kept going when they stop part-way (`keep`).
-        let now = now_ms(hub);
-        let all = port.agents();
-        for info in all.iter().filter(|i| !running.contains(&i.id)) {
-            keep::tick(port, info, now, crate::harness::told::children_working(&all, &info.id)).await;
-        }
-        keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
-        // Parents told of their children that settled, so none has to wait for them.
-        crate::harness::told::tick(hub, &all, now, &running).await;
-        // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
-        crate::harness::elsewhere::tick(hub, &all, now);
     }
-}
 
-/// Waits one [`TICK`] by the hub's clock: false when the hub shuts down first.
-async fn tick(hub: &Hub) -> bool {
-    if hub.shutdown.is_cancelled() {
-        return false;
+    /// Waits one [`TICK`] by its clock: false when it's shut down first.
+    async fn tick(&self) -> bool {
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+        let cancelled = pin!(self.shutdown.cancelled());
+        let slept = self.clock.sleep(TICK);
+        matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
     }
-    let cancelled = pin!(hub.shutdown.cancelled());
-    let slept = hub.clock.sleep(TICK);
-    matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
 }
 
 /// A goal set in the agent that its stack doesn't know (`/goal` typed in its composer, or its
@@ -454,11 +475,11 @@ async fn tick(hub: &Hub) -> bool {
 /// stack as the goal under way,
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
 /// next. The stack runs.
-async fn adopt<P: HarnessPort>(hub: &Hub, port: &P, info: &Info) -> anyhow::Result<()> {
+async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
     let Some(o) = info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet")) else { return Ok(()) };
     let Ok(text) = clean(&o.text) else { return Ok(()) };
-    let (agent, how, at, now) = (info.id.clone(), how(port, &info.id), o.at, now_ms(hub));
-    hub.store
+    let (agent, how, at, now) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms());
+    d.store
         .call(move |c| {
             // One you cleared or skipped is being cleared in the agent: it doesn't come back.
             let dropped: i64 = c.query_row("SELECT dropped_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.unwrap_or(0);
@@ -564,15 +585,16 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool) -> Next 
     }
 }
 
-async fn step<P>(hub: &Hub, port: &P, agent: &str) -> anyhow::Result<()>
+async fn step<P>(d: &Driver<'_, P>, agent: &str) -> anyhow::Result<()>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    let stack = get(hub, agent).await?;
+    let (store, port) = (d.store, d.port);
+    let stack = stack_of(store, agent).await?;
     let all = port.agents();
     let children = crate::harness::told::children_working(&all, agent);
     let info = all.into_iter().find(|i| i.id == agent);
-    let now = now_ms(hub);
+    let now = d.clock.unix_ms();
     let next = decide(&stack, info.as_ref(), now, children);
     let a = agent.to_owned();
     // What its harness last said of the goal it pursues: a verdict on what's sent now must be newer.
@@ -580,10 +602,10 @@ where
     match next {
         Next::Wait => {}
         Next::Busy { id } => {
-            hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET busy_at = ?2 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
+            store.call(move |c| Ok(c.execute("UPDATE goal_items SET busy_at = ?2 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
         }
         Next::End { id, status, reason } => {
-            hub.store
+            store
                 .call(move |c| {
                     c.execute("UPDATE goal_items SET status = ?2, reason = ?3, ended_at = ?4 WHERE id = ?1", params![id, status, reason, now])?;
                     touch(c, &a, None, None, now)
@@ -591,7 +613,7 @@ where
                 .await?;
         }
         Next::Done => {
-            hub.store.call(move |c| touch(c, &a, Some("done"), None, now)).await?;
+            store.call(move |c| touch(c, &a, Some("done"), None, now)).await?;
         }
         Next::Start { id, text } => {
             let how = how(port, agent);
@@ -599,7 +621,7 @@ where
             let first = if stopped && how == "goal_control" { send(format!("Your goal: {text}\n\nWork on it until it's met.")) } else { goal_command(how, &text) };
             match port.send(agent, first).await {
                 Sent::Delivered => {
-                    hub.store
+                    store
                         .call(move |c| {
                             c.execute(
                                 "UPDATE goal_items SET status = 'active', how = ?2, prior_at = ?3, started_at = ?4, reminded_at = ?4, reminders = 0, busy_at = 0 WHERE id = ?1",
@@ -617,7 +639,7 @@ where
         Next::Remind { id, text, how, worked, stopped } => match port.send(agent, reminder_command(&how, &text, stopped)).await {
             Sent::Delivered => {
                 tracing::info!(%agent, worked, stopped, "goal sent again: the agent stopped short of it");
-                hub.store
+                store
                     .call(move |c| {
                         c.execute(
                             "UPDATE goal_items SET reminded_at = ?2, reminders = CASE WHEN ?3 THEN 1 ELSE reminders + 1 END, prior_at = ?4, busy_at = 0 WHERE id = ?1",
@@ -630,7 +652,7 @@ where
             // Not known right now, or its machine is away (or its inbox full): tried again after a
             // pause, as a reminder that brought no work.
             Sent::NoSession | Sent::Unreachable | Sent::Full => {
-                hub.store
+                store
                     .call(move |c| Ok(c.execute("UPDATE goal_items SET reminded_at = ?2, reminders = reminders + 1 WHERE id = ?1", params![id, now]).map(|_| ())?))
                     .await?;
             }
@@ -777,41 +799,43 @@ mod tests {
         use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
             let clock = SimClock::new();
-            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |c| c.conversations.off = true).await?;
+            let store = crate::store::Store::in_memory()?;
+            let shutdown = crate::rt::Shutdown::new();
             let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
             let (id, goal) = ("goals-backoff", "the parser takes every input");
             // Its harness has goals of its own (Claude Code's /goal); it's idle, its goal still set.
             let objective = Objective { text: goal.into(), status: "active".into(), reason: None, at: clock.unix_ms() };
             port.open(id, Info { id: id.into(), status: Status::Idle, objective: Some(objective), ..Info::default() });
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
-            let driver = {
-                let (hub, port) = (Arc::clone(&hub), port.clone());
-                crate::rt::spawn(async move { drive(&hub, &port).await })
-            };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
             let sent = || port.heard(id).iter().map(|d| d.at_ms).collect::<Vec<i64>>();
-            clock.sleeping_since(0, 1).await;
-            // A tick: the goal set in the agent joins its stack, as the goal under way.
-            clock.advance_and_settle(TICK).await;
-            let stack = get(&hub, id).await?;
-            anyhow::ensure!(stack.items.first().is_some_and(|i| i.status == "active" && i.how.as_deref() == Some("goal")), "the goal didn't join the stack: {stack:?}");
-            let mut last = clock.unix_ms();
-            let mut gaps = Vec::new();
-            for secs in [30, 60, 120, 240, 480, 900, 900] {
-                clock.advance_and_settle(Duration::from_secs(secs).saturating_sub(TICK)).await;
-                anyhow::ensure!(sent().len() == gaps.len(), "a reminder went a tick before {secs} s: {:?}", sent());
+            let test = async {
+                clock.sleeping_since(0, 1).await;
+                // A tick: the goal set in the agent joins its stack, as the goal under way.
                 clock.advance_and_settle(TICK).await;
-                let at = sent().last().copied().unwrap_or_default();
-                anyhow::ensure!(sent().len() == gaps.len() + 1 && at == clock.unix_ms(), "no reminder at {secs} s: {:?}", sent());
-                gaps.push(at - last);
-                last = at;
-            }
-            assert_eq!(gaps, [30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000]);
+                let joined = stack_of(&store, id).await?;
+                anyhow::ensure!(joined.items.first().is_some_and(|i| i.status == "active" && i.how.as_deref() == Some("goal")), "the goal didn't join the stack: {joined:?}");
+                let mut last = clock.unix_ms();
+                let mut gaps = Vec::new();
+                for secs in [30, 60, 120, 240, 480, 900, 900] {
+                    clock.advance_and_settle(Duration::from_secs(secs).saturating_sub(TICK)).await;
+                    anyhow::ensure!(sent().len() == gaps.len(), "a reminder went a tick before {secs} s: {:?}", sent());
+                    clock.advance_and_settle(TICK).await;
+                    let at = sent().last().copied().unwrap_or_default();
+                    anyhow::ensure!(sent().len() == gaps.len() + 1 && at == clock.unix_ms(), "no reminder at {secs} s: {:?}", sent());
+                    gaps.push(at - last);
+                    last = at;
+                }
+                // The driver stops when it's shut down.
+                shutdown.cancel();
+                Ok(gaps)
+            };
+            let (driven, gaps) = futures::join!(driver.drive(), test);
+            driven?;
+            assert_eq!(gaps?, [30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000]);
             // Each was the goal again, as its harness takes it.
             let again = format!("/goal {goal}");
             assert!(port.heard(id).iter().all(|d| matches!(&d.command, Command::Send { text, .. } if *text == again)), "{:?}", port.heard(id));
-            // The driver stops with the hub.
-            hub.shutdown.cancel();
-            crate::rt::timeout(Duration::from_secs(10), driver).await.map_err(|_| anyhow::anyhow!("the driver didn't stop"))?.map_err(|_| anyhow::anyhow!("the driver panicked"))??;
             Ok(())
         })
     }
