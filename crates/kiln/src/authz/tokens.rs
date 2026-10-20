@@ -100,3 +100,36 @@ pub async fn mint_agent(hub: &Hub, label: &str, user: &str, grants: &[&str], day
     hub.store.audit("kiln".into(), "tokens.create".into(), format!("agent {id} agent:{label} for {whose} ({})", grants.join(" "))).await;
     Ok((id, token))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn a_reader_kiln_gives_argo_cd_is_found_by_its_note_and_revoked_once_replaced() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let reads = |t: String| {
+                let hub = Arc::clone(&hub);
+                async move { crate::authz::gate::caller(&hub, Some(&t), None).await.is_some() }
+            };
+            let note = "Argo CD prod reads kiln/releases";
+            let (first, t1) = mint_reader(&hub, "kiln/releases", Some(90), note).await?;
+            anyhow::ensure!(reads(t1.clone()).await, "it reads");
+            let live = readers(&hub, note, 30 * 86_400).await?;
+            anyhow::ensure!(live.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>() == [first.as_str()], "{live:?}");
+            anyhow::ensure!(readers(&hub, note, 91 * 86_400).await?.is_empty(), "it ends within 91 days: replaced before then");
+            anyhow::ensure!(readers(&hub, "Argo CD other reads kiln/releases", 0).await?.is_empty(), "another's note");
+            // Replaced: the one before stops reading.
+            let (second, t2) = mint_reader(&hub, "kiln/releases", Some(90), note).await?;
+            anyhow::ensure!(revoke_readers(&hub, note, &second).await? == 1);
+            anyhow::ensure!(!reads(t1).await && reads(t2.clone()).await);
+            // Made in vain (Argo CD refused it): gone at once.
+            revoke_reader(&hub, &second).await?;
+            anyhow::ensure!(!reads(t2).await && readers(&hub, note, 0).await?.is_empty());
+            Ok(())
+        })
+    }
+}
