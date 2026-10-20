@@ -438,7 +438,7 @@ mod tests {
         let d = tempfile::tempdir()?;
         sh(
             d.path(),
-            "git init -q -b main && git config user.name Ada && git config user.email ada@example.com && echo a > a && echo b > b && mkdir -p src && echo s > src/s.rs && printf 'target/\\n*.log\\n' > .gitignore && git add . && git commit -qm init && git remote add origin git@github.com:acme/app.git",
+            "git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && git config tag.gpgsign false && echo a > a && echo b > b && mkdir -p src && echo s > src/s.rs && printf 'target/\\n*.log\\n' > .gitignore && git add . && git commit -qm init && git remote add origin git@github.com:acme/app.git",
         )?;
         Ok(d)
     }
