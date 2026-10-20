@@ -119,6 +119,22 @@ fn jobs() -> &'static Mutex<HashMap<String, Arc<Owned>>> {
     JOBS.get_or_init(Default::default)
 }
 
+/// Whether this process holds agents' processes together: only the processes that start agents for
+/// kiln (the runner, the server) do, from [`hold_agents`] on. Anything else linking kiln (an
+/// integration test, a tool) that starts a harness leaves its processes where they are, so it never
+/// makes groups in a live runner's cgroup it happens to run in (a test in a kiln terminal).
+static HOLDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process starts agents for kiln (the runner, the server): their processes are held together
+/// from now on.
+pub fn hold_agents() {
+    HOLDS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn holds() -> bool {
+    HOLDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A session id as part of a job's name: only what an id is made of (kiln's are hex).
 fn name_of(session: &str) -> Option<Vec<u16>> {
     let ok = !session.is_empty() && session.len() <= 128 && session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
@@ -141,6 +157,9 @@ impl std::fmt::Debug for Group {
 impl Group {
     /// Agent session `session`'s job: the one it has (it outlives the harness), else a new one.
     pub fn of(session: &str) -> Option<Group> {
+        if !holds() {
+            return None;
+        }
         if let Some(g) = Group::existing(session) {
             return Some(g);
         }
@@ -253,6 +272,7 @@ mod tests {
     #[test]
     fn what_an_agent_starts_stays_in_its_job() -> anyhow::Result<()> {
         let session = format!("test{}", std::process::id());
+        hold_agents();
         let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", "start /B ping -n 30 127.0.0.1 >NUL & ping -n 30 127.0.0.1 >NUL"]).creation_flags(0x0000_0004);
