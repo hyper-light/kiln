@@ -77,12 +77,36 @@ export interface Registration {
   degraded?: string | null;
 }
 
+/** A check a release passes (§9.1): one built in, by its name, or one described: a URL kiln asks, or a workflow it runs. */
+export type Check = string | CheckSpec;
+
+export interface CheckSpec {
+  name: string;
+  /** A URL asked about each release: it answers pass, fail or pending. */
+  http?: { url: string; timeout?: string };
+  /** A workflow of one of kiln's repositories, run for each release: it passes when the run succeeds. */
+  workflow?: { repository: string; workflow: string; ref?: string };
+  /** Recorded with the release, never holding or refusing it. */
+  report_only?: boolean;
+}
+
+export const checkName = (c: Check) => (typeof c === "string" ? c : c.name);
+
+/** What an environment asks of what it deploys (docs/ci.md W18-R04): kiln's signed provenance, built by its CI. */
+export interface ProvenanceRequirement {
+  builder?: string;
+  workflows?: string[];
+  branches?: string[];
+}
+
 export interface Gates {
+  /** `staging@eu`: `staging` on the linked kiln server `eu` (§11). */
   after?: string[];
   soak?: string;
   approvals?: { count: number; reviewers?: string[]; self_approve?: boolean };
   windows?: { allow?: string; deny?: string; duration: string; timezone?: string }[];
-  checks?: string[];
+  checks?: Check[];
+  require_provenance?: ProvenanceRequirement;
   freeze?: string;
   /** `auto`: a version that lands in one of `after` is released here by itself (§9.2). */
   promote?: "auto" | "manual";
@@ -183,7 +207,7 @@ export interface Template {
   description?: string;
   package?: Package;
   namespace?: string;
-  checks?: string[];
+  checks?: Check[];
   properties?: Record<string, string[]>;
   environments?: string[];
   repository?: RepoTemplate;

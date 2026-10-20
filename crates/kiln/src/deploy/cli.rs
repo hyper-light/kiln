@@ -507,8 +507,10 @@ enum EnvCmd {
         /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
         #[arg(long)]
         agents: bool,
-        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after, soak,
-        /// approvals, windows, checks, freeze.
+        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
+        /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
+        /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
+        /// require_provenance, freeze.
         #[arg(long)]
         gates: Option<PathBuf>,
         /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet

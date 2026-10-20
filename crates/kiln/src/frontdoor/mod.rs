@@ -532,13 +532,38 @@ pub(crate) fn test_port() -> std::io::Result<u16> {
         if claim.try_lock().is_err() {
             continue;
         }
-        let free = std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok();
+        let free = match listed(port) {
+            Some(used) => !used,
+            None => std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(),
+        };
         if free {
             CLAIMS.lock().push(claim);
             return Ok(port);
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "no free port for a test"))
+}
+
+/// Whether a socket here has `port` (TCP or UDP, any address, any state), as Linux lists them.
+/// Looked up rather than bound to find out: a socket bound to try stays open a moment longer in
+/// any process another test starts just then (until it runs its program), and the test's own bind
+/// fails meanwhile. `None` without the lists (not Linux): bound to find out.
+#[cfg(test)]
+fn listed(port: u16) -> Option<bool> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let end = format!(":{port:04X}");
+    let mut used = false;
+    for table in ["tcp", "udp", "tcp6", "udp6"] {
+        match std::fs::read_to_string(format!("/proc/net/{table}")) {
+            Ok(text) => used |= text.lines().skip(1).any(|l| l.split_whitespace().nth(1).is_some_and(|local| local.ends_with(&end))),
+            // No IPv6 here.
+            Err(_) if table.ends_with('6') => {}
+            Err(_) => return None,
+        }
+    }
+    Some(used)
 }
 
 #[cfg(test)]

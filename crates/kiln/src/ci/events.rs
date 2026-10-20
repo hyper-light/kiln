@@ -380,6 +380,28 @@ pub async fn preview_event(hub: &Hub, repo: &Repo, name: &str, full_ref: &str, s
 /// API takes it) at `git_ref` with `inputs`, checked against what it declares. `started_by`: who
 /// asked ([`crate::authz::Caller::started_by`]), whose `secrets.use` its legs are held to.
 pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, actor: &str, started_by: Option<serde_json::Value>) -> Result<(), Refused> {
+    dispatch(hub, repo, git_ref, which, given, actor, started_by, false).await.map(|_| ())
+}
+
+/// [`workflow_dispatch`] for kiln's own reasons (a release's check, docs/deploy-api.md §9.1): of
+/// what's `offered`, the workflow is given the inputs it declares, and the run's id comes back.
+pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
+    dispatch(hub, repo, git_ref, which, offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+}
+
+/// With `offered`, the inputs are what's offered, of which the workflow takes those it declares,
+/// and the run's id comes back once it's made.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch(
+    hub: &Hub,
+    repo: &Repo,
+    git_ref: &str,
+    which: &str,
+    given: &serde_json::Map<String, serde_json::Value>,
+    actor: &str,
+    started_by: Option<serde_json::Value>,
+    offered: bool,
+) -> Result<Option<String>, Refused> {
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
@@ -392,13 +414,25 @@ pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &st
     let Some(declared) = declared else {
         return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, "Workflow does not have 'workflow_dispatch' trigger"));
     };
+    let taken: serde_json::Map<String, serde_json::Value>;
+    let given = if offered {
+        taken = given.iter().filter(|(k, _)| declared.iter().any(|i| i.name.eq_ignore_ascii_case(k))).map(|(k, v)| (k.clone(), v.clone())).collect();
+        &taken
+    } else {
+        given
+    };
     let (typed, strings) = kiln_ci::trigger::dispatch::inputs(&declared, given).map_err(|m| refused(http::StatusCode::UNPROCESSABLE_ENTITY, m))?;
     let f = facts(hub, repo).await;
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
     let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
-    start(hub, repo, &e, l, &message, actor, typed).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
-    Ok(())
+    let (tx, rx) = async_channel::bounded(1);
+    let reply = super::dispatch::Given { reply: offered.then_some(tx), ..super::dispatch::Given::default() };
+    let started = start_given(hub, repo, &e, l, (&message, actor), typed, reply).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    if !offered || !started {
+        return Ok(None);
+    }
+    Ok(crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.ok().and_then(Result::ok))
 }
 
 /// kiln's `agent` event (W03-R09, W20): agent `agent` asks for a run of workflow `which` at

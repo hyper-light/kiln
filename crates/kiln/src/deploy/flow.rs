@@ -235,6 +235,7 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
+    gates::check(d, &e.gates).await.map_err(|why| bad(format!("gates: {why}")))?;
     let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?;
     // Its provider changes by a move, which hands what runs over (§8.4).
     if let Some(b) = &before
@@ -643,11 +644,7 @@ pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool
         }
         super::scaffold::check(d, r).map_err(bad)?;
     }
-    for c in &t.checks {
-        if !matches!(c.as_str(), "no-snapshots" | "owners-set") {
-            return Err(bad(format!("kiln has no check `{c}` (no-snapshots, owners-set)")));
-        }
-    }
+    gates::check_checks(d, &t.checks).await.map_err(|why| bad(format!("checks: {why}")))?;
     if let Some(p) = &t.package {
         for (k, v) in p.set() {
             repo::check(v).map_err(|e| bad(format!("package.set {k}: {e}")))?;

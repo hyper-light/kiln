@@ -227,6 +227,21 @@ pub const KINDS: &[KindInfo] = &[
         secret: Some("an account's API token (argocd account generate-token --account <name>)"),
         built: true,
     },
+    // Another kiln whose environments this one's releases run in first (docs/deploy-api.md §11):
+    // what runs there comes back signed by its OIDC issuer.
+    KindInfo {
+        kind: "kiln",
+        title: "Linked kiln server",
+        category: "cd",
+        mode: Mode::Token,
+        fields: &[
+            f("url", true, "its public URL: https://kiln.eu.example.com"),
+            f("ca", false, "the PEM of the CA its certificate is signed by, when it isn't a public one"),
+            f("issuer", false, "the OIDC issuer its statements must be signed by, when not the one it says (its URL/oidc)"),
+        ],
+        secret: Some("a token of an account there that may read its releases (runs.read)"),
+        built: true,
+    },
     KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
     // Chat, paging and webhooks: where notifications go (docs/ci.md W11-R06, W19-R06).
     KindInfo { kind: "slack", title: "Slack", category: "notify", mode: Mode::Token, fields: &[f("channel", false, "the channel a bot token posts to when a rule names none (#ci)")], secret: Some("incoming webhook URL, or a bot token (xoxb-…)"), built: true },
@@ -653,6 +668,7 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
             },
             "argocd" => Box::pin(crate::deploy::argocd::verify(hub, &i.name)).await,
             "otel" => Box::pin(crate::ci::otel::verify(hub, &i)).await,
+            "kiln" => Box::pin(crate::deploy::link::check(hub, &i.name)).await,
             other => Err(format!("no check for {other} yet")),
         }
     };

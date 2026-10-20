@@ -901,9 +901,17 @@ mod tests {
             assert_eq!(fd.status().https.state, State::Error, "{:?}", fd.status().https);
             assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
 
-            // It lets go: the next try binds, and nothing more is tried soon.
+            // It lets go: a try soon after binds, and nothing more is tried soon. (A process
+            // another test starts just then holds a copy of the listener until it runs its
+            // program, so the port can stay held a moment longer.)
             drop(held);
-            fd.reconcile();
+            for _ in 0..100 {
+                fd.reconcile();
+                if fd.status().https.state == State::On {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
             assert_eq!(fd.status().https.state, State::On, "{:?}", fd.status().https);
             assert_eq!(fd.retry_in(), None);
 

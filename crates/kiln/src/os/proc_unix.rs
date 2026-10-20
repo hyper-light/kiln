@@ -313,6 +313,8 @@ pub struct Duplex {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The writer has written everything sent to it, once stdin's sender closes.
     written: Option<oneshot::Receiver<()>>,
+    /// Closed once both readers have ended: everything they read is in `stdout` and `stderr`.
+    read: Option<async_channel::Receiver<()>>,
 }
 
 /// A harness process let go of by one image of this process for the next (an in-place upgrade):
@@ -329,12 +331,29 @@ pub struct Detached {
     pub foreign: bool,
 }
 
+impl Detached {
+    /// Keep its pipes' descriptors open across the exec that comes next (clear close-on-exec).
+    /// Only just before it: a process started while they're kept would hold them for good (a
+    /// harness whose stdin never closes).
+    pub fn keep_across_exec(&self) -> io::Result<()> {
+        use std::os::fd::BorrowedFd;
+        for raw in [self.stdin, self.stdout, self.stderr] {
+            #[allow(unsafe_code)]
+            // SAFETY: the copies `Duplex::detach` made, which nothing in this image closes; the
+            // borrow only lives for the call.
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())?;
+        }
+        Ok(())
+    }
+}
+
 impl Duplex {
     /// Let go of the process without stopping it, for this process's next image to take over
     /// ([`adopt_duplex`]): nothing more is read from its pipes (what was read is still in `stdout`
-    /// and `stderr`, to drain), everything sent to its stdin is written, and its pipes' descriptors,
-    /// copied, stay open across the exec. `None` when they can't be (the process is then left as
-    /// it is, still running).
+    /// and `stderr`, to drain), everything sent to its stdin is written, and its pipes' descriptors
+    /// are copied (kept open across the exec just before it: [`Detached::keep_across_exec`]).
+    /// `None` when they can't be (the process is then left as it is, still running).
     pub async fn detach(&mut self) -> Option<Detached> {
         let copy = |raw: i32| -> Option<OwnedFd> {
             use std::os::fd::BorrowedFd;
@@ -342,9 +361,7 @@ impl Duplex {
             // SAFETY: `raw` is one of this child's pipes, still owned (open) by its reader or
             // writer task: those only end after the copies are made.
             let fd = unsafe { BorrowedFd::borrow_raw(raw) };
-            let copy = rustix::io::fcntl_dupfd_cloexec(fd, 3).ok()?;
-            crate::os::keep_across_exec(&copy).ok()?;
-            Some(copy)
+            rustix::io::fcntl_dupfd_cloexec(fd, 3).ok()
         };
         let input = copy(self.fds[0])?;
         let out = copy(self.fds[1])?;
@@ -354,6 +371,11 @@ impl Duplex {
         self.stdin.close();
         if let Some(w) = self.written.take() {
             let _ = crate::rt::timeout(Duration::from_secs(5), w).await;
+        }
+        // A reader part-way through a read puts what it read into its channel before it ends:
+        // waited for, so nothing read after this returns is lost with the `Duplex`.
+        if let Some(r) = self.read.take() {
+            let _ = crate::rt::timeout(Duration::from_secs(5), r.recv()).await;
         }
         use std::os::fd::IntoRawFd as _;
         Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: false })
@@ -478,10 +500,13 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     let fds = [input.as_raw_fd(), out.as_raw_fd(), err.as_raw_fd()];
     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Each reader holds a sender while it runs: the channel closes once both have ended.
+    let (reading_tx, read_rx) = async_channel::bounded::<()>(1);
     let reader = |fd: OwnedFd, cap: usize| {
         let (tx, rx) = async_channel::bounded::<Vec<u8>>(cap);
-        let (stop, stopped) = (stop_rx.clone(), std::sync::Arc::clone(&stopped));
+        let (stop, stopped, reading) = (stop_rx.clone(), std::sync::Arc::clone(&stopped), reading_tx.clone());
         crate::rt::spawn(async move {
+            let _reading = reading;
             use futures::FutureExt as _;
             let mut buf = vec![0u8; CHUNK * 2];
             // Whether the `Duplex` is still there to stop the readers.
@@ -513,6 +538,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     };
     let stdout = reader(out, 256);
     let stderr = reader(err, 64);
+    drop(reading_tx);
     let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
     let (written_tx, written_rx) = oneshot::channel();
     crate::rt::spawn(async move {
@@ -524,7 +550,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         let _ = written_tx.send(());
         // Dropping the fd here closes the child's stdin (unless it was handed over: a copy holds it).
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, stop: Some(stop_tx), stopped, written: Some(written_rx) })
+    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, stop: Some(stop_tx), stopped, written: Some(written_rx), read: Some(read_rx) })
 }
 
 #[cfg(test)]
