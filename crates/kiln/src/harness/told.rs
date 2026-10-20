@@ -136,8 +136,8 @@ mod tests {
     use super::*;
     use crate::harness::model::{Status, TurnEnd};
 
-    fn asks(title: &str) -> anyhow::Result<crate::harness::model::Approval> {
-        Ok(serde_json::from_value(serde_json::json!({"id": "r1", "tool_id": null, "tool_name": "Bash", "tool": "shell", "title": title, "input": {}, "cwd": "/w", "at": 1}))?)
+    fn asks(title: &str) -> anyhow::Result<crate::harness::session::ApprovalBrief> {
+        Ok(crate::harness::session::ApprovalBrief { id: "r1".into(), tool: crate::harness::model::ToolKind::Shell, tool_name: "Bash".into(), title: title.into(), at: 1 })
     }
 
     fn child(id: &str, status: Status, ended_at: i64, summary: &str) -> Info {

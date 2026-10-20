@@ -632,28 +632,28 @@ mod tests {
     fn an_agent_paused_for_a_limit_gets_no_goal_and_no_reminder() {
         let pause = crate::harness::model::Pause { reason: "limit".into(), since: 1, auto: true, by: "harness".into(), ..Default::default() };
         let paused = Info { pause: Some(pause), ..info(Status::Idle, None) };
-        assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&paused), 2_000), Next::Wait));
-        assert!(matches!(decide(&stack(vec![item("active", None)]), Some(&paused), LATER * 10), Next::Wait));
-        assert!(matches!(decide(&stack(vec![item("active", Some("goal"))]), Some(&paused), LATER * 10), Next::Wait));
+        assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&paused), 2_000, false), Next::Wait));
+        assert!(matches!(decide(&stack(vec![item("active", None)]), Some(&paused), LATER * 10, false), Next::Wait));
+        assert!(matches!(decide(&stack(vec![item("active", Some("goal"))]), Some(&paused), LATER * 10, false), Next::Wait));
         // Once it goes on, so does the stack.
-        assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&info(Status::Idle, None)), 2_000), Next::Start { .. }));
+        assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&info(Status::Idle, None)), 2_000, false), Next::Start { .. }));
     }
 
     #[test]
     fn goals_start_when_the_agent_is_free_and_end_when_its_harness_says_met() {
         let pending = stack(vec![item("pending", None)]);
-        assert!(matches!(decide(&pending, Some(&info(Status::Idle, None)), 2_000), Next::Start { .. }));
-        assert!(matches!(decide(&pending, Some(&info(Status::Running, None)), 2_000), Next::Wait));
+        assert!(matches!(decide(&pending, Some(&info(Status::Idle, None)), 2_000, false), Next::Start { .. }));
+        assert!(matches!(decide(&pending, Some(&info(Status::Running, None)), 2_000, false), Next::Wait));
         // A stopped agent starts again for its next goal.
-        assert!(matches!(decide(&pending, Some(&info(Status::Exited, None)), 2_000), Next::Start { .. }));
+        assert!(matches!(decide(&pending, Some(&info(Status::Exited, None)), 2_000, false), Next::Start { .. }));
         let native = stack(vec![item("active", Some("goal"))]);
-        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 9)))), 2_000), Next::End { status: "met", .. }));
-        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("cleared", 9)))), 2_000), Next::End { status: "skipped", .. }));
+        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 9)))), 2_000, false), Next::End { status: "met", .. }));
+        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("cleared", 9)))), 2_000, false), Next::End { status: "skipped", .. }));
         // The verdict on the goal before it doesn't count.
-        assert!(!matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 5)))), LATER), Next::End { .. }));
-        assert!(matches!(decide(&stack(vec![item("met", Some("goal"))]), Some(&info(Status::Idle, None)), 2_000), Next::Done));
+        assert!(!matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 5)))), LATER, false), Next::End { .. }));
+        assert!(matches!(decide(&stack(vec![item("met", Some("goal"))]), Some(&info(Status::Idle, None)), 2_000, false), Next::Done));
         // Not known right now (its runner reconnecting, the server just started): waited for.
-        assert!(matches!(decide(&native, None, LATER), Next::Wait));
+        assert!(matches!(decide(&native, None, LATER, false), Next::Wait));
     }
 
     #[test]
@@ -662,23 +662,25 @@ mod tests {
         // Gave up, paused it, stopped with it still set, never took it up, or lost it when it
         // started again: once the pause since it was sent is over, it's sent again.
         for o in [Some(obj("unmet", 9)), Some(obj("paused", 9)), Some(obj("active", 9)), None] {
-            assert!(matches!(decide(&native, Some(&info(Status::Idle, o.clone())), 2_000), Next::Wait), "{o:?}");
-            assert!(matches!(decide(&native, Some(&info(Status::Idle, o.clone())), LATER), Next::Remind { stopped: false, .. }), "{o:?}");
+            assert!(matches!(decide(&native, Some(&info(Status::Idle, o.clone())), 2_000, false), Next::Wait), "{o:?}");
+            assert!(matches!(decide(&native, Some(&info(Status::Idle, o.clone())), LATER, false), Next::Remind { stopped: false, .. }), "{o:?}");
         }
         // Stopped: sent again all the same (the message starts it).
-        assert!(matches!(decide(&native, Some(&info(Status::Exited, None)), LATER), Next::Remind { stopped: true, .. }));
+        assert!(matches!(decide(&native, Some(&info(Status::Exited, None)), LATER, false), Next::Remind { stopped: true, .. }));
+        // Agents it started at work: it ended its turn to let them, and isn't reminded until they settle.
+        assert!(matches!(decide(&native, Some(&info(Status::Idle, None)), LATER, true), Next::Wait));
         // At work on it: noted once, then left to it.
-        assert!(matches!(decide(&native, Some(&info(Status::Running, None)), LATER), Next::Busy { .. }));
+        assert!(matches!(decide(&native, Some(&info(Status::Running, None)), LATER, false), Next::Busy { .. }));
         let mut working = item("active", Some("goal"));
         working.busy_at = 2_000;
-        assert!(matches!(decide(&stack(vec![working]), Some(&info(Status::Running, None)), LATER), Next::Wait));
+        assert!(matches!(decide(&stack(vec![working]), Some(&info(Status::Running, None)), LATER, false), Next::Wait));
         // Waiting on you, or with something in its queue: not reminded.
         let mut asking = info(Status::Idle, None);
         asking.approvals = vec![ApprovalBrief { id: "p1".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "cargo test".into(), at: 1 }];
-        assert!(matches!(decide(&native, Some(&asking), LATER), Next::Wait));
+        assert!(matches!(decide(&native, Some(&asking), LATER, false), Next::Wait));
         let mut queued = info(Status::Idle, None);
         queued.queued = 1;
-        assert!(matches!(decide(&native, Some(&queued), LATER), Next::Wait));
+        assert!(matches!(decide(&native, Some(&queued), LATER, false), Next::Wait));
     }
 
     #[test]
@@ -686,9 +688,9 @@ mod tests {
         let mut paused_then_resumed = stack(vec![item("active", Some("goal"))]);
         paused_then_resumed.dropped_at = 7;
         // Its harness says the goal was cleared, just after kiln cleared it to pause: sent again.
-        assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 9)))), LATER), Next::Remind { .. }));
+        assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 9)))), LATER, false), Next::Remind { .. }));
         // Cleared in the agent long after: by you, so the goal ends.
-        assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 7 + OWN_CLEAR_MS + 1)))), LATER), Next::End { status: "skipped", .. }));
+        assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 7 + OWN_CLEAR_MS + 1)))), LATER, false), Next::End { status: "skipped", .. }));
     }
 
     #[test]
@@ -696,7 +698,7 @@ mod tests {
         let mut resumed = item("active", Some("goal"));
         resumed.reminded_at = 0;
         // Any time now (unix ms): it has never been sent by these rules.
-        assert!(matches!(decide(&stack(vec![resumed]), Some(&info(Status::Idle, None)), 1_792_000_000_000), Next::Remind { .. }));
+        assert!(matches!(decide(&stack(vec![resumed]), Some(&info(Status::Idle, None)), 1_792_000_000_000, false), Next::Remind { .. }));
     }
 
     #[test]
@@ -709,15 +711,15 @@ mod tests {
         thrice.reminders = 3;
         thrice.reminded_at = 10_000;
         let s = stack(vec![thrice]);
-        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS - 1), Next::Wait));
-        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS), Next::Remind { worked: false, .. }));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS - 1, false), Next::Wait));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS, false), Next::Remind { worked: false, .. }));
         // It worked on it a good while since it was last sent: real work.
         let mut worked = item("active", Some("goal"));
         worked.reminded_at = 10_000;
         worked.busy_at = 11_000;
         let mut after = info(Status::Idle, None);
         after.last_activity = 11_000 + WORKED_MS;
-        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS), Next::Remind { worked: true, .. }));
+        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS, false), Next::Remind { worked: true, .. }));
     }
 
     #[test]
@@ -726,13 +728,13 @@ mod tests {
         said.busy_at = 1_500;
         let mut done = info(Status::Idle, None);
         done.summary = "All 212 tests pass on every platform.\n\n**GOAL MET**".into();
-        assert!(matches!(decide(&stack(vec![said.clone()]), Some(&done), 2_000), Next::End { status: "met", .. }));
+        assert!(matches!(decide(&stack(vec![said.clone()]), Some(&done), 2_000, false), Next::End { status: "met", .. }));
         // Its turn ended without saying so: reminded.
         let mut not_yet = info(Status::Idle, None);
         not_yet.summary = "Fixed the parser; the lexer is next.".into();
-        assert!(matches!(decide(&stack(vec![said]), Some(&not_yet), LATER), Next::Remind { .. }));
+        assert!(matches!(decide(&stack(vec![said]), Some(&not_yet), LATER, false), Next::Remind { .. }));
         // Words from before it was last sent don't count.
-        assert!(!matches!(decide(&stack(vec![item("active", Some("message"))]), Some(&done), LATER), Next::End { .. }));
+        assert!(!matches!(decide(&stack(vec![item("active", Some("message"))]), Some(&done), LATER, false), Next::End { .. }));
         assert!(said_met("done.\nGoal met."));
         assert!(!said_met("GOAL MET is what I'll say when it's done"));
         assert!(!said_met(""));
