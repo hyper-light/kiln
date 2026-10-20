@@ -139,9 +139,54 @@ pub fn resolve_cwd(spec: &RunSpec, mirror_root: Option<&Path>) -> anyhow::Result
     Ok(path)
 }
 
-/// bash where there is one, else sh.
-fn bash() -> String {
-    crate::os::which("bash").map_or_else(|| "sh".to_owned(), |p| p.to_string_lossy().into_owned())
+/// bash where there is one, else sh. On Windows, never WSL's `bash.exe` (System32's, or the Store
+/// app's alias): it runs the command in Linux, not in this machine's folder, and with no Linux
+/// installed it hangs or fails. Git for Windows' bash is used instead, found on PATH, beside the
+/// `git` on PATH or where it installs; without one, the run fails at once and says so.
+fn bash() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        windows_bash().ok_or_else(|| "this Windows machine has no bash kiln can run commands with: install Git for Windows (WSL's bash.exe would run them in Linux, not here)".to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(crate::os::which("bash").unwrap_or_else(|| PathBuf::from("sh")))
+    }
+}
+
+/// Whether `path` is WSL's launcher rather than a bash of this machine: `bash.exe` in System32 (or
+/// SysWOW64), or the Store app's alias under WindowsApps.
+#[cfg(any(windows, test))]
+fn wsl_launcher(path: &Path) -> bool {
+    let p = path.to_string_lossy().to_lowercase().replace('/', "\\");
+    ["\\windows\\system32\\", "\\windows\\syswow64\\", "\\windows\\sysnative\\", "\\windowsapps\\"].iter().any(|d| p.contains(d))
+}
+
+/// Where Git for Windows' bash may be, given the `git` on PATH (`<Git>\cmd\git.exe`,
+/// `<Git>\bin\git.exe`, `<Git>\mingw64\bin\git.exe`) and the folders Git installs under.
+#[cfg(any(windows, test))]
+fn git_bash_places(git: Option<&Path>, install_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut places: Vec<PathBuf> = Vec::new();
+    for up in git.into_iter().flat_map(|g| g.ancestors().skip(1).take(3)) {
+        places.push(up.join("bin").join("bash.exe"));
+        places.push(up.join("usr").join("bin").join("bash.exe"));
+    }
+    for root in install_roots {
+        places.push(root.join("Git").join("bin").join("bash.exe"));
+    }
+    places
+}
+
+#[cfg(windows)]
+fn windows_bash() -> Option<PathBuf> {
+    if let Some(p) = crate::os::which("bash").filter(|p| !wsl_launcher(p)) {
+        return Some(p);
+    }
+    let mut roots: Vec<PathBuf> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("Programs"));
+    }
+    git_bash_places(crate::os::which("git").as_deref(), &roots).into_iter().find(|p| p.is_file() && !wsl_launcher(p))
 }
 
 /// The script a run's shell is given: the command, and for a named shell, its folder and
@@ -198,7 +243,14 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         }
         // A named shell starts where it was left, unless the run says where.
         let start_in_saved = shell_state.is_some() && spec.cwd.is_none();
-        let mut cmd = std::process::Command::new(bash());
+        let shell = match bash() {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = events.send(Event::Exit { code: None, error: Some(e) }).await;
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(shell);
         cmd.arg("-c").arg(script(&spec.command, shell_state.as_deref(), start_in_saved));
         cmd.current_dir(&cwd);
         cmd.env_clear();
@@ -301,6 +353,25 @@ mod tests {
                 Err(_) => anyhow::bail!("timed out"),
             }
         }
+    }
+
+    /// On Windows a run's bash is never WSL's launcher (it would run the command in Linux, and with
+    /// no Linux installed it hangs): Git for Windows' bash is looked for beside the git on PATH
+    /// and where it installs.
+    #[test]
+    fn windows_runs_never_go_to_wsl_s_bash() {
+        for wsl in [r"C:\Windows\System32\bash.exe", r"c:\windows\system32\bash.exe", r"C:\Windows\SysWOW64\bash.exe", r"C:\Users\ada\AppData\Local\Microsoft\WindowsApps\bash.exe"] {
+            assert!(wsl_launcher(Path::new(wsl)), "{wsl}");
+        }
+        for git_bash in [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe", r"C:\msys64\usr\bin\bash.exe", "/usr/bin/bash"] {
+            assert!(!wsl_launcher(Path::new(git_bash)), "{git_bash}");
+        }
+        // Paths made of parts, so they read the same on every platform.
+        let git = PathBuf::from("Program Files").join("Git").join("cmd").join("git.exe");
+        let places = git_bash_places(Some(&git), &[PathBuf::from("Apps")]);
+        let shown: Vec<String> = places.iter().map(|p| p.to_string_lossy().replace('/', "\\")).collect();
+        assert!(shown.iter().any(|p| p == r"Program Files\Git\bin\bash.exe"), "beside git's cmd folder: {shown:?}");
+        assert!(shown.iter().any(|p| p == r"Apps\Git\bin\bash.exe"), "where it installs: {shown:?}");
     }
 
     #[test]
