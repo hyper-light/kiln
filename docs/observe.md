@@ -30,7 +30,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-16 | Synthetic tests (§10.4): Datadog's API tests, HTTP (its time cut into DNS, connection, TLS, first byte, download and redirects), TCP, DNS and TLS (a certificate's days left), from the server and runners as locations; Datadog's assertions and series; a location failing or recovering an event once; alerting by a monitor each test owns (at least N locations failing for a while); tried once from the server, run now everywhere; their page; checked live (a server and a runner, an endpoint switched to 500 and back, a TLS endpoint with a CA of its own) and in browsers (§13) | done |
 | O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
 | O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Datadog's Agent's traces (§8.7: its indexed and inline forms, 532 ns a span, §12.23) and its stats as the trace metrics (every span counted before it sampled, its DDSketches' four mappings read within their accuracy; 6 µs and 0.2 allocations a grouped stat), checked live against Agent 7.84 and ddtrace 4.16 with traces kept and dropped (§13). Datadog's tracers straight to kiln on every runner (kiln in the Agent's place on its port: `/v0.4/traces`, `/v0.5/traces`, `/info`; 490 ns a span), every span counted by the runner's concentrator before a dropped trace is let go, as the Agent counts (133 ns a span); checked live with ddtrace 4.16, no Agent (§13). The Agent's priority sampler on every runner (each tracer told its services' rates, `rate_by_service`: ten traces a second a node, each service its share by water-filling), checked live: a busy service's rate falling to its share, every trace counted, kept or not (§13). A runner's last spans and buckets written as it stops, a bucket two of its lives write added and not written over, checked live across a stop (§13). The map's figures from the trace metrics, each edge its share of the groups that count its calls (the ratio estimator), so a sampled service's calls are every call: checked live through the Agent, straight to a runner under the sampler, and with OpenTelemetry's SDK (§13). CI runs as traces, span monitors | in progress |
-| O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24); Datadog's Error Tracking monitors (new issues and regressions, impact; §9) telling integrations, an ignored issue muted, checked live and in browsers (§13). Next: an allocation pass on reading an error | in progress |
+| O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24); Datadog's Error Tracking monitors (new issues and regressions, impact; §9) telling integrations, an ignored issue muted, checked live and in browsers (§13); reading an error without allocating, 0.6 to 1.1 µs (§12.24) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -2739,23 +2739,30 @@ the names), so a query whose places fell on them passed most of them.
 
 An error's issue as it is taken (`kiln_obs::errors::span_issue`; `benches/errors.rs`): its
 message's words, its stack's frame, its id, of each language's stacks as its runtime wrote them
-(`fixtures/errors/`, their messages a variable one's), on one core of fedora, three runs within 2%
-of each other:
+(`fixtures/errors/`, their messages a variable one's), on one core of fedora, the first build and
+the allocation pass's in turn, three runs each (the medians; runs within 2% of each other but one
+of the first build's, 5% slower):
 
-| stacks | cases | bytes a stack | ns an error | allocations an error |
-| --- | --- | --- | --- | --- |
-| Python | 5 | 613 | 1,355 | 10.2 |
-| Node | 5 | 257 | 1,187 | 11.6 |
-| Go | 4 | 214 | 1,193 | 11.2 |
-| Java | 5 | 859 | 1,693 | 13.8 |
-| Ruby | 5 | 306 | 1,080 | 12.2 |
-| PHP | 8 | 277 | 1,181 | 11.0 |
-| .NET | 6 | 407 | 1,437 | 12.0 |
-| Rust | 4 | 5,597 | 2,762 | 15.2 |
+| stacks | cases | bytes a stack | ns an error, first | ns an error | allocations an error, first | allocations an error |
+| --- | --- | --- | --- | --- | --- | --- |
+| Python | 5 | 613 | 1,311 | 862 | 10.2 | 0 |
+| Node | 5 | 257 | 1,159 | 780 | 11.6 | 0 |
+| Go | 4 | 214 | 1,184 | 1,070 | 11.2 | 0.2 |
+| Java | 5 | 859 | 1,622 | 909 | 13.8 | 0.2 |
+| Ruby | 5 | 306 | 1,051 | 641 | 12.2 | 0 |
+| PHP | 8 | 277 | 1,153 | 818 | 11.0 | 0 |
+| .NET | 6 | 407 | 1,375 | 1,005 | 12.0 | 0.2 |
+| Rust | 4 | 5,597 | 2,828 | 1,011 | 15.2 | 0.5 |
 
-Only an error is read so (a span in error, a log of an error's status): of a stream of spans one in
-a hundred failing, some 13 ns a span. Rust's frames, their generics written out in full (5.6 KB a
-stack), cost the most.
+The pass: a stack is walked once and its frames kept nowhere, innermost first (Python's from its
+end, a frame of Python's a line of its own), to the first of the application's (Go's to its end,
+whose frames a panic's begin again); the id is hashed as its words, file and function are read,
+none of them made whole; a function is copied only where a compiler numbers it (a lambda's, a
+closure's) or a PHP closure names its place, the 0.2 to 0.5 allocations left. Ids are unchanged:
+every fixture's, of a span and of a log, is pinned (`issue_ids_are_frozen`), and the walked frame
+and streamed id are checked against the listed frames and the id of the parts made whole. Only an
+error is read so (a span in error, a log of an error's status): of a stream of spans one in a
+hundred failing, some 9 ns a span.
 
 What the server does with issues, at Error Tracking's bound: 10,000 issues, each erring in three
 series (two versions of an env, one of another) in one window of ten seconds in twenty over a day,

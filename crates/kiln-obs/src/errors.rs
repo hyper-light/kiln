@@ -341,15 +341,24 @@ pub fn put_log_issue(r: &mut crate::logs::record::Record) {
     }
 }
 
+/// An issue's id from its parts, each hashed as it is read (its words, its frame's file and
+/// function never made whole): the id [`stable`] gives of them whole.
 fn grouped(source: Source, service: &str, kind: &str, message: &str, frame: Option<Frame<'_>>) -> u64 {
-    let mut words_of = String::new();
-    words(message, &mut words_of);
-    let (mut file, mut function) = (String::new(), String::new());
-    if let Some(f) = frame {
-        normal_file(f.file, &mut file);
-        normal_function(f.function, &mut function);
+    let mut h = Stable::new();
+    for part in [&b"kiln.issue.v1"[..], source.tag(), service.as_bytes(), kind.trim().as_bytes()] {
+        h.part(part);
     }
-    stable(&[b"kiln.issue.v1", source.tag(), service.as_bytes(), kind.trim().as_bytes(), words_of.as_bytes(), file.as_bytes(), function.as_bytes()])
+    words_to(message, &mut h);
+    h.end();
+    if let Some(f) = frame {
+        normal_file_to(f.file, &mut h);
+    }
+    h.end();
+    if let Some(f) = frame {
+        normal_function_to(f.function, &mut h);
+    }
+    h.end();
+    h.finish()
 }
 
 fn custom(source: Source, service: &str, fingerprint: &str) -> u64 {
@@ -359,18 +368,71 @@ fn custom(source: Source, service: &str, fingerprint: &str) -> u64 {
 /// FNV-1a 64 over the parts, each ended by a unit separator, then splitmix64's finalizer (FNV's
 /// last bytes mix poorly alone). Frozen: an issue's id is kept.
 fn stable(parts: &[&[u8]]) -> u64 {
+    let mut h = Stable::new();
+    for p in parts {
+        h.part(p);
+    }
+    h.finish()
+}
+
+/// [`stable`]'s hash, a part's bytes at a time.
+struct Stable(u64);
+
+impl Stable {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for p in parts {
-        for &b in p.iter().chain(&[0x1f]) {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(PRIME);
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
         }
     }
-    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^ (h >> 31)
+
+    /// The end of a part: a unit separator.
+    fn end(&mut self) {
+        self.bytes(&[0x1f]);
+    }
+
+    fn part(&mut self, bytes: &[u8]) {
+        self.bytes(bytes);
+        self.end();
+    }
+
+    fn finish(self) -> u64 {
+        let mut h = self.0;
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^ (h >> 31)
+    }
+}
+
+/// What text is written to as it is made: a `String`, or an id's hash.
+trait Sink {
+    fn push_str(&mut self, s: &str);
+    fn push(&mut self, c: char);
+}
+
+impl Sink for String {
+    fn push_str(&mut self, s: &str) {
+        String::push_str(self, s);
+    }
+    fn push(&mut self, c: char) {
+        String::push(self, c);
+    }
+}
+
+impl Sink for Stable {
+    fn push_str(&mut self, s: &str) {
+        self.bytes(s.as_bytes());
+    }
+    fn push(&mut self, c: char) {
+        self.bytes(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
 }
 
 /// A message's words into `out` (cleared), each after a space but the first: Datadog's, its
@@ -380,6 +442,10 @@ fn stable(parts: &[&[u8]]) -> u64 {
 /// read as punctuation.
 pub fn words(message: &str, out: &mut String) {
     out.clear();
+    words_to(message, out);
+}
+
+fn words_to(message: &str, out: &mut impl Sink) {
     let text = cut(message, MESSAGE_BYTES);
     let bytes = text.as_bytes();
     let (mut i, mut n) = (0usize, 0usize);
@@ -488,13 +554,33 @@ pub enum Lang {
 }
 
 /// The frame an error is grouped by, from its stack: its innermost of the application's own, else
-/// its innermost with a file and a function; none where its stack has no frame.
+/// its innermost with a file and a function; none where its stack has no frame. The stack is
+/// walked once, innermost first (Python's from its end), and its frames kept nowhere: to the first
+/// of the application's (all of it for Go's, whose frames a panic's begin again).
 pub fn frame(stack: &str) -> Option<Frame<'_>> {
-    let (lang, frames) = frames(stack)?;
-    // Innermost first: Python's last.
-    if lang == Lang::Python { pick(lang, frames.iter().rev()) } else { pick(lang, frames.iter()) }
+    let (mut own, mut any) = (None, None);
+    walk(stack, true, |lang, step| {
+        match step {
+            Step::Restart => (own, any) = (None, None),
+            Step::Frame(f) if f.file.is_empty() => {}
+            Step::Frame(f) => {
+                any.get_or_insert(f);
+                if own.is_none() && !library(lang, &f) {
+                    own = Some(f);
+                    if lang != Lang::Go {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    })?;
+    own.or(any)
 }
 
+/// The frame of frames listed innermost first, as [`frame`] picks it: the first of the
+/// application's, else the first with a file.
+#[cfg(test)]
 fn pick<'a, 'b>(lang: Lang, innermost_first: impl Iterator<Item = &'b Frame<'a>>) -> Option<Frame<'a>>
 where
     'a: 'b,
@@ -515,6 +601,29 @@ where
 /// A stack's language and its frames as written (its error's own: an inner error's, or a cause's,
 /// left out), each with its file (empty where it has none: a builtin's) and its function.
 pub fn frames(stack: &str) -> Option<(Lang, Vec<Frame<'_>>)> {
+    let mut out = Vec::new();
+    let lang = walk(stack, false, |_, step| {
+        match step {
+            Step::Frame(f) => out.push(f),
+            Step::Restart => out.clear(),
+        }
+        std::ops::ControlFlow::Continue(())
+    })?;
+    (!out.is_empty()).then_some((lang, out))
+}
+
+/// A step of a stack's walk: a frame as written; or a restart, the frames before it not the
+/// error's (a Go panic's: what recovered it, before its `panic(`).
+#[derive(Debug, Clone, Copy)]
+enum Step<'a> {
+    Frame(Frame<'a>),
+    Restart,
+}
+
+/// A stack's language, its frames told to `visit` as written (its error's own: an inner error's,
+/// or a cause's, left out) until it breaks; with `innermost_first`, Python's from its end (a frame
+/// of Python's is a line of its own, so its last is its innermost). None where no line is a frame.
+fn walk<'a>(stack: &'a str, innermost_first: bool, mut visit: impl FnMut(Lang, Step<'a>) -> std::ops::ControlFlow<()>) -> Option<Lang> {
     let whole = cut(stack, STACK_BYTES);
     // .NET: the error's own frames follow its inner exceptions' (where it has any).
     let text = match whole.rfind("--- End of inner exception stack trace ---") {
@@ -525,10 +634,16 @@ pub fn frames(stack: &str) -> Option<(Lang, Vec<Frame<'_>>)> {
         Some(lang) => (text, lang),
         None => (whole, whole.lines().find_map(lang_of)?),
     };
-    let mut out = Vec::new();
     match lang {
-        Lang::Go => go_frames(text, &mut out),
-        Lang::Rust => rust_frames(text, &mut out),
+        Lang::Go => go_walk(text, |step| visit(Lang::Go, step)),
+        Lang::Rust => rust_walk(text, |step| visit(Lang::Rust, step)),
+        Lang::Python if innermost_first => {
+            for f in text.lines().rev().filter_map(|line| python(line.trim_start())) {
+                if visit(lang, Step::Frame(f)).is_break() {
+                    break;
+                }
+            }
+        }
         _ => {
             let mut ruby_lines = 0;
             for line in text.lines() {
@@ -555,13 +670,15 @@ pub fn frames(stack: &str) -> Option<(Lang, Vec<Frame<'_>>)> {
                     }
                     Lang::Go | Lang::Rust => None,
                 };
-                if let Some(f) = frame {
-                    out.push(f);
+                if let Some(f) = frame
+                    && visit(lang, Step::Frame(f)).is_break()
+                {
+                    break;
                 }
             }
         }
     }
-    (!out.is_empty()).then_some((lang, out))
+    Some(lang)
 }
 
 /// The language a line is a frame of, if it is one.
@@ -711,16 +828,16 @@ fn go_location(t: &str) -> Option<&str> {
 }
 
 /// Go's frames: each a function's line, then its location's (a tab before it); a panic's frames
-/// those after its `panic(`, what recovered it before.
-fn go_frames<'a>(text: &'a str, out: &mut Vec<Frame<'a>>) {
+/// those after its `panic(`, what recovered it before (a restart).
+fn go_walk<'a>(text: &'a str, mut visit: impl FnMut(Step<'a>) -> std::ops::ControlFlow<()>) {
     let mut function: Option<&str> = None;
     for line in text.lines() {
         if let Some(loc) = line.strip_prefix('\t') {
             if let (Some(f), Some(file)) = (function.take(), go_location(loc)) {
-                if f.starts_with("panic(") {
-                    out.clear();
-                } else {
-                    out.push(Frame { file, function: f.rsplit_once('(').filter(|(_, args)| args.ends_with(')')).map_or(f, |(name, _)| name) });
+                let step =
+                    if f.starts_with("panic(") { Step::Restart } else { Step::Frame(Frame { file, function: f.rsplit_once('(').filter(|(_, args)| args.ends_with(')')).map_or(f, |(name, _)| name) }) };
+                if visit(step).is_break() {
+                    return;
                 }
             }
         } else if !line.trim().is_empty() && !line.starts_with("goroutine ") {
@@ -735,14 +852,20 @@ fn rust_number(t: &str) -> Option<&str> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(function)
 }
 
-/// Rust's frames: each a numbered function's line, then (where its file is known) `at file:line:col`.
-fn rust_frames<'a>(text: &'a str, out: &mut Vec<Frame<'a>>) {
+/// Rust's frames: each a numbered function's line, then (where its file is known) `at file:line:col`:
+/// a frame told once the next begins, or the stack ends.
+fn rust_walk<'a>(text: &'a str, mut visit: impl FnMut(Step<'a>) -> std::ops::ControlFlow<()>) {
+    let mut pending: Option<Frame<'a>> = None;
     for line in text.lines() {
         let t = line.trim_start();
         if let Some(function) = rust_number(t) {
-            out.push(Frame { file: "", function });
+            if let Some(done) = pending.replace(Frame { file: "", function })
+                && visit(Step::Frame(done)).is_break()
+            {
+                return;
+            }
         } else if let Some(loc) = t.strip_prefix("at ")
-            && let Some(last) = out.last_mut()
+            && let Some(last) = pending.as_mut()
             && last.file.is_empty()
         {
             let mut file = loc;
@@ -756,6 +879,9 @@ fn rust_frames<'a>(text: &'a str, out: &mut Vec<Frame<'a>>) {
             }
             last.file = file;
         }
+    }
+    if let Some(done) = pending {
+        let _ = visit(Step::Frame(done));
     }
 }
 
@@ -813,8 +939,12 @@ fn library(lang: Lang, f: &Frame<'_>) -> bool {
 /// varies from build to build left out ([`mask`]).
 pub fn normal_file(file: &str, out: &mut String) {
     out.clear();
+    normal_file_to(file, out);
+}
+
+fn normal_file_to(file: &str, out: &mut impl Sink) {
     let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
-    mask(name, out);
+    mask_to(name, out);
 }
 
 /// A frame's function as an issue knows it: its arguments left off (`f(0x1d)`, `f(42)`), what a
@@ -823,6 +953,15 @@ pub fn normal_file(file: &str, out: &mut String) {
 /// `{closure:/app/x.php:30}`), and what else varies masked ([`mask`]).
 pub fn normal_function(function: &str, out: &mut String) {
     out.clear();
+    normal_function_to(function, out);
+}
+
+/// A compiler's numbering: a run of digits after these, left out.
+const NUMBERED: [&str; 7] = ["lambda$", "$Lambda$", "b__", "d__", ".func", "{closure#", "DisplayClass"];
+
+/// [`normal_function`]'s, a copy of the function made only where it names a PHP closure's place or
+/// a compiler numbers it.
+fn normal_function_to(function: &str, out: &mut impl Sink) {
     let mut f = function.trim();
     // Rust's legacy symbols' hash.
     if let Some((head, h)) = f.rsplit_once("::h")
@@ -831,7 +970,13 @@ pub fn normal_function(function: &str, out: &mut String) {
     {
         f = head;
     }
-    // PHP's closures name their place.
+    let closed: std::borrow::Cow<'_, str> = if f.contains("{closure:") { std::borrow::Cow::Owned(closures(f)) } else { std::borrow::Cow::Borrowed(f) };
+    let plain: std::borrow::Cow<'_, str> = if NUMBERED.iter().any(|p| closed.contains(p)) { std::borrow::Cow::Owned(unnumbered(&closed)) } else { closed };
+    mask_to(&plain, out);
+}
+
+/// PHP's closures name their place: `{closure:/app/x.php:30}` as `{closure}`.
+fn closures(f: &str) -> String {
     let mut s = String::with_capacity(f.len());
     let mut rest = f;
     while let Some(at) = rest.find("{closure:") {
@@ -856,8 +1001,11 @@ pub fn normal_function(function: &str, out: &mut String) {
         rest = after.get(end..).unwrap_or("");
     }
     s.push_str(rest);
-    // A compiler's numbering: a run of digits after these, left out.
-    const NUMBERED: [&str; 7] = ["lambda$", "$Lambda$", "b__", "d__", ".func", "{closure#", "DisplayClass"];
+    s
+}
+
+/// A compiler's numbering ([`NUMBERED`]) left out.
+fn unnumbered(s: &str) -> String {
     let mut numbered = String::with_capacity(s.len());
     let mut i = 0;
     let b = s.as_bytes();
@@ -891,13 +1039,17 @@ pub fn normal_function(function: &str, out: &mut String) {
             break;
         }
     }
-    mask(&numbered, out);
+    numbered
 }
 
 /// `s` into `out`, each run of letters and digits that is a hash, an address or a timestamp (six
 /// or more hex digits, a digit among them) and each version (digits, then `.` and digits, twice
 /// at the least: `1.2.3`) as `*`.
 pub fn mask(s: &str, out: &mut String) {
+    mask_to(s, out);
+}
+
+fn mask_to(s: &str, out: &mut impl Sink) {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -1211,6 +1363,56 @@ mod tests {
         }
         let f = frame(&s).unwrap();
         assert_eq!((f.file, f.function), ("Deep.java", "com.shop.Deep.f0"));
+    }
+
+    /// Every fixture's stacks, by language.
+    const ALL: [(&str, &str); 8] = [
+        ("python", include_str!("fixtures/errors/python.txt")),
+        ("node", include_str!("fixtures/errors/node.txt")),
+        ("go", include_str!("fixtures/errors/go.txt")),
+        ("java", include_str!("fixtures/errors/java.txt")),
+        ("ruby", include_str!("fixtures/errors/ruby.txt")),
+        ("php", include_str!("fixtures/errors/php.txt")),
+        ("dotnet", include_str!("fixtures/errors/dotnet.txt")),
+        ("rust", include_str!("fixtures/errors/rust.txt")),
+    ];
+
+    /// Issue ids are kept (in issues.json, written on every error): how they are made never
+    /// changes them. Every fixture's issue, of a span and of a log, as the first build made them.
+    #[test]
+    fn issue_ids_are_frozen() {
+        let mut digest = 0u64;
+        let mut n = 0;
+        for (_, text) in ALL {
+            for (_, stack) in cases(text) {
+                let e = Error { kind: Some("ValueError"), message: Some("bad item -42 in cart 'c-294' after 3 retries [eu-1] (timeout)"), stack: Some(stack), fingerprint: None };
+                let (span, log) = (span_issue("shop", true, &e).unwrap(), log_issue("shop", 17, &e).unwrap());
+                digest = digest.rotate_left(7) ^ span ^ log.rotate_left(29);
+                n += 1;
+            }
+        }
+        let custom = span_issue("shop", true, &Error { kind: Some("E"), message: None, stack: None, fingerprint: Some("checkout-timeouts") }).unwrap();
+        // Made as they are read, the same as made of their parts whole: each stack's frame walked
+        // is its list's, and its id the hash of its words, file and function made first.
+        for (_, text) in ALL {
+            for (name, stack) in cases(text) {
+                let listed = frames(stack).and_then(|(lang, fs)| if lang == Lang::Python { pick(lang, fs.iter().rev()) } else { pick(lang, fs.iter()) });
+                assert_eq!(frame(stack), listed, "{name}");
+                for message in ["bad item -42 in cart 'c-294'", "", "order 550e8400-e29b-41d4-a716-446655440000 failed after 3 retries (timeout 30s) [shard eu-1] \u{e9}t\u{e9}"] {
+                    let (mut w, mut file, mut function) = (String::new(), String::new(), String::new());
+                    words(message, &mut w);
+                    let f = frame(stack);
+                    if let Some(f) = f {
+                        normal_file(f.file, &mut file);
+                        normal_function(f.function, &mut function);
+                    }
+                    let whole = stable(&[b"kiln.issue.v1", Source::Log.tag(), b"shop", b"ValueError", w.as_bytes(), file.as_bytes(), function.as_bytes()]);
+                    assert_eq!(grouped(Source::Log, "shop", " ValueError ", message, f), whole, "{name}: {message}");
+                }
+            }
+        }
+        println!("{n} stacks: digest {digest:#018x}, custom {custom:#018x}");
+        assert_eq!((n, digest, custom), (42, 0xd15a_caeb_d7c0_42c1, 0x82cc_f51d_a3bf_56c0));
     }
 
     /// A monitor's search of the metric's tags alone is a chart's query of what it counts; one
