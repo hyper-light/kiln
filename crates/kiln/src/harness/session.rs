@@ -582,12 +582,19 @@ impl Session {
 
     /// A task's output after byte `since` (its last `TASK_TAIL` bytes without one), read where the
     /// harness keeps it: `{data, offset, live, truncated}` (ask from `offset` next), or `{error}`.
+    /// Native Codex children return a replaceable transcript snapshot (`reset: true`).
     /// Blocking (reads a file).
     pub fn task_output(&self, task: &str, since: Option<u64>) -> serde_json::Value {
         use serde_json::json;
-        let (t, kept, session, cwd, env) = {
+        let (t, kept, session, cwd, env, codex) = {
             let core = self.core.lock();
-            (core.state.tasks.iter().find(|x| x.id == task).cloned(), core.task_output.get(task).cloned(), core.state.harness_session.clone(), core.state.cwd.clone(), self.spec.lock().env.clone())
+            let spec = self.spec.lock();
+            let codex = core.harness.as_deref().map_or(spec.kind == "codex", |h| h == "Codex");
+            let t = core.state.tasks.iter().find(|x| x.id == task).cloned();
+            if codex && let Some(t) = t.as_ref().filter(|t| t.class.as_deref() == Some("agent")) {
+                return codex_task_output(&core, t);
+            }
+            (t, core.task_output.get(task).cloned(), core.state.harness_session.clone(), core.state.cwd.clone(), spec.env.clone(), codex)
         };
         let Some(t) = t else { return json!({"error": "no such task in this session"}) };
         // Kept by kiln (a harness that streams it).
@@ -596,7 +603,7 @@ impl Session {
             return json!({"data": String::from_utf8_lossy(&bytes), "offset": offset, "live": t.live(), "truncated": truncated});
         }
         // A file the harness writes (Claude Code: while the task lives).
-        let Some(path) = t.output.clone().or_else(|| claude_task_file(&env, &cwd, session.as_deref(), task)) else {
+        let Some(path) = t.output.clone().or_else(|| (!codex).then(|| claude_task_file(&env, &cwd, session.as_deref(), task)).flatten()) else {
             return json!({"error": "this task's output is not kept anywhere kiln can read", "live": t.live()});
         };
         let p = std::path::Path::new(&path);
@@ -916,6 +923,60 @@ const TAKEOVER_QUIT: Duration = Duration::from_secs(10);
 /// Most of a task's output returned at once, and the tail returned without an offset.
 const TASK_READ_MAX: u64 = 256 * 1024;
 const TASK_TAIL: u64 = 64 * 1024;
+
+/// Codex's child messages and tool results are kept with the parent's events, not in Claude's
+/// task files or the terminal byte buffer. Project only this child's output; neither its
+/// assignment nor a parent's, sibling's or descendant's messages belong in this view.
+/// History reads can replace earlier items, so byte offsets cannot safely append snapshots.
+pub(super) fn codex_task_output(core: &Core, task: &Task) -> serde_json::Value {
+    use super::core::TaskOutput;
+    use super::model::{Body, OUTPUT_MAX, clip_middle};
+    use serde_json::json;
+
+    let mut output = TaskOutput::default();
+    let mut summary_seen = false;
+    let mut truncated = false;
+    let mut add = |text: &str| {
+        if !text.trim().is_empty() {
+            if output.total > 0 {
+                output.append(b"\n\n");
+            }
+            output.append(text.as_bytes());
+        }
+    };
+    if let Some(parent) = task.tool_id.as_deref() {
+        let prefix = format!("child:{}:", task.id);
+        // A batch spawn may give siblings the same parent tool; the child thread is also
+        // part of every Codex event id, so that cannot mix their output.
+        for event in core.events().filter(|e| e.parent.as_deref() == Some(parent) && e.id.starts_with(&prefix)) {
+            match &event.body {
+                Body::Assistant { text, .. } => {
+                    summary_seen |= task.summary.as_deref().is_some_and(|s| s == text || s == clip_middle(text, OUTPUT_MAX).0);
+                    add(text);
+                }
+                Body::Tool(tool) => {
+                    if let Some(text) = tool.output.as_deref().filter(|s| !s.trim().is_empty()) {
+                        add(&format!("{}\n{text}", tool.title));
+                        truncated |= tool.truncated;
+                    }
+                }
+                Body::Notice { text, .. } => add(text),
+                _ => {}
+            }
+        }
+    }
+    // Completed children can outlive the bounded timeline, or report a result before their
+    // history is available. Keep that result readable without inventing a transcript.
+    if !summary_seen && let Some(summary) = task.summary.as_deref() {
+        add(summary);
+    }
+    if output.total == 0 && !task.live() {
+        return json!({"error": "No readable output has been received from this Codex subagent.", "live": false});
+    }
+    let (bytes, offset, skipped) = output.since(output.total.saturating_sub(TASK_TAIL));
+    json!({"data": String::from_utf8_lossy(&bytes), "offset": offset, "live": task.live(),
+        "truncated": truncated || skipped || output.total > TASK_TAIL, "reset": true, "pending": output.total == 0})
+}
 
 /// Where Claude Code streams a task's output while it lives: `<tmp>/<cwd as a name>/<session>/
 /// tasks/<task>.output`, `<tmp>` being `CLAUDE_CODE_TMPDIR` or the system's `claude-<uid>`.
@@ -3106,6 +3167,31 @@ mod tests {
             let _ = long.wait();
             anyhow::Ok(())
         })
+    }
+
+    #[test]
+    fn native_subagent_output_keeps_results_after_history_eviction_and_bounds_snapshots() {
+        use super::super::model::Body;
+        let mut core = Core::new();
+        let mut task = Task { id: "child".into(), tool_id: Some("spawn".into()), class: Some("agent".into()), status: "completed".into(), ..Task::default() };
+        // An empty completed child is unavailable, not a successful empty file read.
+        assert!(codex_task_output(&core, &task).get("error").is_some());
+        task.summary = Some("The completed result remains available.".into());
+        let result = codex_task_output(&core, &task);
+        assert_eq!(result["data"].as_str(), task.summary.as_deref());
+        assert_eq!(result["live"].as_bool(), Some(false));
+        // Newest output is bounded; the final answer is present once even when Task.summary
+        // contains its clipped representation.
+        let long = format!("{}Final result.", "x".repeat(TASK_TAIL as usize + 20));
+        task.summary = Some(super::super::model::clip_middle(&long, super::super::model::OUTPUT_MAX).0);
+        core.upsert("child:child:answer", Some("spawn".into()), Body::Assistant { text: long.clone(), streaming: false });
+        let result = codex_task_output(&core, &task);
+        let text = result["data"].as_str().unwrap_or_default();
+        assert_eq!(text.len(), TASK_TAIL as usize);
+        assert!(text.ends_with("Final result."));
+        assert_eq!(text.matches("Final result.").count(), 1);
+        assert_eq!(result["offset"].as_u64(), Some(long.len() as u64));
+        assert_eq!(result["truncated"].as_bool(), Some(true));
     }
 
     #[test]

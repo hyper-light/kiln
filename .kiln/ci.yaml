@@ -32,13 +32,14 @@ jobs:
         run: cargo test --locked
 
   ui:
-    name: ui typecheck + build
+    name: ui typecheck + lint + build
     runs-on: [k8s]
     toolchain: node
     resources: { cpu: "2", memory: 4Gi }
     steps:
       - run: npm ci --prefix ui --no-audit --no-fund
       - run: npm run --prefix ui typecheck
+      - run: npm run --prefix ui lint
       # The UI only: packing Bun for the binary (vendor/bun) is the release builds' part.
       - run: KILN_UI_SERVER=off npm run --prefix ui build
 

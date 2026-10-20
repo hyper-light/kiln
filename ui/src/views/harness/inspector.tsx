@@ -3,7 +3,7 @@
  * its plan, subagents and the commands it ran; and what it works with — MCP servers, skills, usage.
  */
 import * as React from "react";
-import { Bot, Square } from "lucide-react";
+import { Bot, ChevronRight, Square } from "lucide-react";
 import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
@@ -20,11 +20,32 @@ import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
 import { ChangeBar } from "./change-bar";
 import { WorkspaceBar } from "./workspace-bar";
+import { SubagentOutput } from "./task-output";
 
 const NO_EVENTS: HEvent[] = [];
 
 /** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
+
+const ToolSectionOpen = React.createContext(true);
+
+/** Large tool inventories start folded; hiding them keeps searches and unfinished forms intact. */
+function ToolSection({ title, count, children }: { title: string; count?: number; children: React.ReactNode }) {
+  const [open, setOpen] = React.useState(false);
+  const bodyId = React.useId();
+  return (
+    <section className="in-fold" data-open={open || undefined}>
+      <h3 className="in-sec-head">
+        <button type="button" className="in-sec-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(!open)}>
+          <ChevronRight size={12} className={cn("hx-chev", open && "rotate-90")} aria-hidden="true" />
+          {title}
+          {count !== undefined && <span className="in-sec-count">{count}</span>}
+        </button>
+      </h3>
+      <div id={bodyId} hidden={!open}><ToolSectionOpen.Provider value={open}>{children}</ToolSectionOpen.Provider></div>
+    </section>
+  );
+}
 
 /** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
 function fromServer(files: ServerChange[]): FileChange[] {
@@ -147,11 +168,9 @@ const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
 
 function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
   const live = taskLive(t);
-  const [out, setOut] = React.useState<string | null>(null);
-  const fetchOutput = async () => {
-    const v = await store.request((client) => ({ type: "control", id: "task_output", value: { task: t.id, client } }));
-    setOut(typeof v === "string" ? v : v && typeof v === "object" && "output" in v ? String((v as { output: unknown }).output) : "(no output)");
-  };
+  const [outputOpen, setOutputOpen] = React.useState(false);
+  const sectionOpen = React.useContext(ToolSectionOpen);
+  const outputId = React.useId();
   return (
     <li className="hx-task" style={{ paddingLeft: depth * 14 }}>
       <div className="hx-task-head">
@@ -174,11 +193,13 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
         {t.tokens ? <span>{tokens(t.tokens)} tokens</span> : null}
         <TaskElapsed task={t} />
         {live && t.last_tool && <span className="hx-trunc">{t.last_tool}</span>}
-        <button type="button" className="hx-link" onClick={() => (out === null ? void fetchOutput() : setOut(null))}>
-          {out === null ? "Output" : "Hide output"}
+        <button type="button" className="hx-link" aria-expanded={outputOpen} aria-controls={outputId} onClick={() => setOutputOpen(!outputOpen)}>
+          {outputOpen ? "Hide output" : "Output"}
         </button>
       </div>
-      {out !== null && <Output text={out} />}
+      <div id={outputId} hidden={!outputOpen}>
+        {outputOpen && <SubagentOutput agent={store.id} task={t} visible={sectionOpen} />}
+      </div>
     </li>
   );
 }
@@ -275,6 +296,7 @@ export function Inspector({
   onOpenTask,
   className,
   hideTabs,
+  actions,
   agentId,
   harness,
   send,
@@ -286,6 +308,8 @@ export function Inspector({
   send?: (c: Command) => void;
   /** The page shows its own tabs (phones). */
   hideTabs?: boolean;
+  /** Desktop side tray controls, beside its tabs. */
+  actions?: React.ReactNode;
   tab: InspectorTab;
   onTab: (t: InspectorTab) => void;
   /** The agent's live session: what's shown here is read from it. */
@@ -321,13 +345,16 @@ export function Inspector({
   ];
   return (
     <div className={cn("hx-inspector", className)}>
-      <div className="hx-tabs" role="tablist" hidden={hideTabs}>
-        {tabs.map((t) => (
-          <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
-            {t.label}
-            {t.count && <span className="hx-tab-count">{t.count}</span>}
-          </button>
-        ))}
+      <div className="hx-inspector-head" hidden={hideTabs}>
+        <div className="hx-tabs" role="tablist">
+          {tabs.map((t) => (
+            <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
+              {t.label}
+              {t.count && <span className="hx-tab-count">{t.count}</span>}
+            </button>
+          ))}
+        </div>
+        {actions}
       </div>
       <div className="hx-inspector-body">
         {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} />}
@@ -382,19 +409,16 @@ export function Inspector({
               </section>
             )}
             {tasks.length > 0 && (
-              <section>
-                <h3 className="in-sec-head">Subagents<span>{tasks.length}</span></h3>
+              <ToolSection title="Subagents" count={tasks.length}>
                 <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />
-              </section>
+              </ToolSection>
             )}
-            <section>
-              <h3 className="in-sec-head">MCP servers</h3>
+            <ToolSection title="MCP servers" count={state?.mcp?.length}>
               <McpPanel state={state} store={store} />
-            </section>
-            <section>
-              <h3 className="in-sec-head">Skills</h3>
+            </ToolSection>
+            <ToolSection title="Skills" count={state?.skills?.length}>
               <SkillsPanel state={state} store={store} />
-            </section>
+            </ToolSection>
             <section>
               <h3 className="in-sec-head">Usage and status</h3>
               <Status state={state} />

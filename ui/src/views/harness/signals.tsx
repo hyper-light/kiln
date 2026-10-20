@@ -3,6 +3,8 @@ import * as React from "react";
 import "./signals.css";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useNow } from "@/lib/hooks";
+import { thinkingWords } from "./thinking";
 
 export type OpticState = "idle" | "thinking" | "tool" | "waiting" | "done" | "ended";
 
@@ -46,17 +48,13 @@ export function formatThought(seconds: number) {
   return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-/** Use the reported effort, never elapsed time or a typography change, to describe a think. */
-export function thinkingWords(effort?: string): string {
-  switch (effort?.toLowerCase()) {
-    case "minimal":
-    case "low": return "Thinking briefly";
-    case "high": return "Thinking deeply";
-    case "xhigh":
-    case "max":
-    case "ultra": return "Thinking very deeply";
-    default: return "Thinking";
-  }
+/** A live phase's words and clock share the same start, in a thought block or between steps. */
+export function ThinkingLabel({ since, doing }: { since?: number; doing?: string }) {
+  const now = useNow();
+  const [observed] = React.useState(Date.now);
+  const seconds = Math.max(0, (now - (since ?? observed)) / 1000);
+  const what = doing && /^(compact|retr|wait|summar)/i.test(doing) ? doing : thinkingWords(seconds);
+  return <><PrismLabel live>{what}</PrismLabel><span className="sg-num">{formatThought(seconds)}</span></>;
 }
 
 /** The toggle above a thinking block: live it breathes ("Thinking"); settled it reads "Thought · 12s" with a chevron. */
@@ -66,14 +64,14 @@ export function ThinkingHead({
   open,
   onToggle,
   className,
-  effort,
+  since,
 }: {
   live: boolean;
   seconds?: number;
   open: boolean;
   onToggle: () => void;
   className?: string;
-  effort?: string;
+  since?: number;
 }) {
   return (
     <button type="button" className={cn("sg-think-head", "sg-thinking-line", className)} data-live={live ? "true" : "false"} aria-expanded={open} onClick={onToggle}>
@@ -82,7 +80,7 @@ export function ThinkingHead({
         <Optic state={live ? "thinking" : "done"} />
       </span>
       {live ? (
-        <PrismLabel live>{thinkingWords(effort)}</PrismLabel>
+        <ThinkingLabel since={since} />
       ) : (
         <>
           <PrismLabel>
