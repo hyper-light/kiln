@@ -661,6 +661,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "harness", "command"]) => boxed(|| harness_command_many(&hub, req)).await,
         (&Method::POST, ["api", "harness", "files"]) => boxed(|| harness_upload(&hub, &q, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        // A page it showed: its heights, as its machine and its viewers' own browsers measured them.
+        (&Method::GET, ["api", "harness", "sessions", id, "pages", page, "heights"]) => page_heights(&hub, id, page).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "pages", page, "heights"]) => page_seen(&hub, id, page, req).await,
         // Pages streamed from its machine (`crate::harness::streams`).
         (&Method::GET, ["api", "harness", "sessions", id, "streams"]) => {
             let me = person(&req);
@@ -3706,6 +3709,30 @@ async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
         hub.store.audit("admin".into(), "agent.app.stop".into(), id.to_owned()).await;
     }
     Ok(srv::json(StatusCode::OK, &v))
+}
+
+/// `GET /api/harness/sessions/:id/pages/:page/heights`: a page the session showed, its heights:
+/// `heights` as its machine's Chromium measured them at each width, `engines` as other engines did
+/// (its machine's Firefox; viewers' own browsers at their widths).
+async fn page_heights(hub: &Arc<Hub>, session: &str, page: &str) -> R {
+    let (h, id) = (hub.clone(), page.to_owned());
+    let v = crate::rt::blocking(move || h.harness.visuals.get(&id)).await.ok().flatten().filter(|v| v.session == session).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such page"))?;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({"heights": v.heights, "engines": v.engines})))
+}
+
+/// `POST /api/harness/sessions/:id/pages/:page/heights` with `{engine, width, height}`: the height
+/// a viewer's own browser measured the page at, at its width (`crate::harness::visuals::Visuals::seen`).
+async fn page_seen(hub: &Arc<Hub>, session: &str, page: &str, req: Request) -> R {
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let n = |k: &str| b.get(k).and_then(serde_json::Value::as_u64).and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+    let (width, height) = (n("width"), n("height"));
+    let engine = b.get("engine").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+    let (h, id, s) = (hub.clone(), page.to_owned(), session.to_owned());
+    crate::rt::blocking(move || h.harness.visuals.seen(&id, &s, &engine, width, height))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer of a stream. It's sent the

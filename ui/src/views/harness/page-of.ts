@@ -12,7 +12,8 @@ export interface ShownPage {
   path: string;
   /** Its height at each width measured, `[width, height]` in CSS pixels (in Chromium). */
   heights: [number, number][];
-  /** The same in other engines (`firefox`), when its machine had them. */
+  /** The same in other engines (`firefox`, `webkit`): its machine's Firefox at each width, and
+   *  viewers' own browsers at theirs (`crate::harness::visuals::Visuals::seen`). */
   engines?: Record<string, [number, number][]>;
   files?: number;
 }
@@ -24,10 +25,31 @@ export function ownEngine(ua: string): "chromium" | "firefox" | "webkit" {
   return "chromium";
 }
 
-/** A page's heights as measured in this browser's own engine, else in Chromium. */
-export function heightsFor(page: Pick<ShownPage, "heights" | "engines">, ua: string): [number, number][] {
-  const own = page.engines?.[ownEngine(ua)];
-  return own && own.length ? own : page.heights;
+/** A viewer's own engine's height is taken at its width from one measured this near it, */
+const NEAR = 24;
+/** or from two around it this near (its machine's are at most 144 apart; viewers' farther). */
+const AROUND = 160;
+
+/** A page's heights as measured in this browser's own engine, where they reach its width `w`, else
+ *  in Chromium (its machine measured those at every width). */
+export function heightsFor(page: Pick<ShownPage, "heights" | "engines">, ua: string, w?: number): [number, number][] {
+  const own = page.engines?.[ownEngine(ua)] ?? [];
+  if (!own.length) return page.heights;
+  if (w === undefined) return own;
+  const near = own.filter(([x]) => Math.abs(x - w) <= NEAR);
+  if (near.length) return near;
+  const around = own.some(([x]) => x <= w && w - x <= AROUND) && own.some(([x]) => x >= w && x - w <= AROUND);
+  return around ? own : page.heights;
+}
+
+/** `[width, height]` pairs, as kiln answers them (none that aren't). */
+export function heightPairs(v: unknown): [number, number][] {
+  return (Array.isArray(v) ? v : []).filter((h): h is [number, number] => Array.isArray(h) && h.length === 2 && h.every((n) => typeof n === "number" && n > 0));
+}
+
+/** Each engine's heights, as kiln answers them. */
+export function enginesOf(v: unknown): Record<string, [number, number][]> {
+  return Object.fromEntries(Object.entries(v && typeof v === "object" ? v : {}).map(([e, hs]) => [e, heightPairs(hs)]));
 }
 
 /** Whether a tool call is an agent showing a page (Claude Code's and Codex's names for kiln's tool). */
@@ -39,9 +61,8 @@ export function pageOf(c: Pick<ToolCall, "output">): ShownPage | null {
   try {
     const p = (JSON.parse(c.output) as { kiln_page?: Partial<ShownPage> }).kiln_page;
     if (!p || typeof p.id !== "string" || !/^[0-9a-f]{32}$/.test(p.id)) return null;
-    const pairs = (v: unknown) => (Array.isArray(v) ? v : []).filter((h): h is [number, number] => Array.isArray(h) && h.length === 2 && h.every((n) => typeof n === "number" && n > 0));
-    const heights = pairs(p.heights);
-    const engines = Object.fromEntries(Object.entries(p.engines && typeof p.engines === "object" ? p.engines : {}).map(([e, hs]) => [e, pairs(hs)]));
+    const heights = heightPairs(p.heights);
+    const engines = enginesOf(p.engines);
     // Where it's served (its own path under `/v/<id>`), never anywhere else.
     const path = typeof p.path === "string" && p.path.startsWith(`/v/${p.id}/`) && !p.path.includes("..") ? p.path : `/v/${p.id}/`;
     return { id: p.id, title: typeof p.title === "string" && p.title ? p.title : "A page", path, heights, engines, files: p.files };

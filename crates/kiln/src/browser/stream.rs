@@ -358,9 +358,22 @@ impl Streams {
         let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(page), device, inputs, out.clone(), dir, (width, height, scale, mobile)));
         crate::rt::spawn(watch(stream.clone(), out.clone()));
         crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
-        stream.page.navigate(&spec.url).await?;
-        self.open.lock().insert(id.to_owned(), stream);
-        Ok(json!({"opened": {"width": width, "height": height, "scale": scale, "audio": started.get("audio"), "platform": std::env::consts::OS, "engine": "chromium", "device": device}}))
+        let opened = json!({"opened": {"width": width, "height": height, "scale": scale, "audio": started.get("audio"), "platform": std::env::consts::OS, "engine": "chromium", "device": device}});
+        self.went(id, stream, &spec.url, opened, out).await
+    }
+
+    /// A stream set up, open before its page loads: what its viewers ask of it meanwhile reaches
+    /// it, and they're told it opened (its window, a device's) before its first picture. Its page
+    /// then goes to its address; one that can't closes.
+    async fn went(&self, id: &str, stream: Arc<Stream>, url: &str, opened: Value, out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
+        self.open.lock().insert(id.to_owned(), stream.clone());
+        let _ = out.send(Out::Event { stream: id.to_owned(), json: opened.to_string() }).await;
+        if let Err(e) = stream.page.navigate(url).await {
+            drop(stream);
+            self.close(id).await;
+            return Err(e);
+        }
+        Ok(opened)
     }
 
     /// A stream of another engine's page (`super::driven`): its pictures, taken as it changes,
@@ -389,12 +402,11 @@ impl Streams {
         self.listen(&enc).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
         let stream = Arc::new(Stream::new(id, spec, enc, Surface::Driven(page), device, inputs, out.clone(), dir, window));
-        crate::rt::spawn(said(stream.clone(), out));
+        crate::rt::spawn(said(stream.clone(), out.clone()));
         crate::rt::spawn(pump(Arc::downgrade(&stream)));
         crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
-        stream.page.navigate(&spec.url).await?;
-        self.open.lock().insert(id.to_owned(), stream);
-        Ok(json!({"opened": {"width": width, "height": height, "scale": scale, "mobile": mobile, "audio": false, "platform": std::env::consts::OS, "engine": engine.name(), "device": device}}))
+        let opened = json!({"opened": {"width": width, "height": height, "scale": scale, "mobile": mobile, "audio": false, "platform": std::env::consts::OS, "engine": engine.name(), "device": device}});
+        self.went(id, stream, &spec.url, opened, out).await
     }
 
     /// The offscreen document's binding attached (once a browser's first capture made it), its

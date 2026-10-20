@@ -52,8 +52,9 @@ pub struct Visual {
     /// on the agent's machine; a frame takes its size from these before the page loads.
     #[serde(default)]
     pub heights: Vec<(u32, u32)>,
-    /// The same in the machine's other engines (`firefox`): a viewer's frame takes its own
-    /// engine's.
+    /// The same in other engines (`firefox`, `webkit`): as the machine's Firefox measured it, and as
+    /// viewers' own browsers did at their widths (`Visuals::seen`). A viewer's frame takes its own
+    /// engine's where there are any near its width.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub engines: std::collections::BTreeMap<String, Vec<(u32, u32)>>,
     /// Unix ms.
@@ -458,16 +459,21 @@ fn refs_in(text: &str, kind: Text) -> Vec<Ref> {
     }
 }
 
+/// Widths an engine's heights are kept at, as its viewers measured them.
+const SEEN_WIDTHS: usize = 24;
+
 /// Published pages, kept beside the files conversations keep (one store of content).
 pub struct Visuals {
     dir: PathBuf,
     blobs: PathBuf,
     cache: Mutex<HashMap<String, Visual>>,
+    /// A page's heights changed one at a time (its machine's, its viewers').
+    heights: Mutex<()>,
 }
 
 impl Visuals {
     pub fn new(harness_dir: &Path) -> Self {
-        Self { dir: harness_dir.join("visuals"), blobs: harness_dir.join("files").join("blobs"), cache: Mutex::default() }
+        Self { dir: harness_dir.join("visuals"), blobs: harness_dir.join("files").join("blobs"), cache: Mutex::default(), heights: Mutex::default() }
     }
 
     fn file(&self, id: &str) -> Option<PathBuf> {
@@ -513,6 +519,7 @@ impl Visuals {
 
     /// The heights the agent's machine measured, for its own session's page.
     pub fn measured(&self, id: &str, session: &str, heights: Vec<(u32, u32)>, engines: std::collections::BTreeMap<String, Vec<(u32, u32)>>) -> anyhow::Result<Visual> {
+        let _one = self.heights.lock();
         let mut v = self.get(id).ok_or_else(|| anyhow::anyhow!("no such page"))?;
         anyhow::ensure!(v.session == session, "that page is another conversation's");
         let sane = |hs: Vec<(u32, u32)>| {
@@ -524,6 +531,34 @@ impl Visuals {
         v.engines = engines.into_iter().filter(|(e, _)| matches!(e.as_str(), "firefox" | "webkit")).map(|(e, hs)| (e, sane(hs))).filter(|(_, hs)| !hs.is_empty()).collect();
         self.save(&v)?;
         Ok(v)
+    }
+
+    /// A height a viewer's own browser measured of its conversation's page at its width (`engine`:
+    /// its engine, one other than the Chromium its machine measured it in at every width): kept
+    /// with the page, so the next viewer in that engine has its frame at the page's height before
+    /// the page loads. At most [`SEEN_WIDTHS`] widths an engine; past that, the new one's neighbour
+    /// goes.
+    pub fn seen(&self, id: &str, session: &str, engine: &str, width: u32, height: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(matches!(engine, "firefox" | "webkit"), "heights are kept for firefox and webkit, not {engine:?}");
+        anyhow::ensure!((200..=10_000).contains(&width) && (1..=100_000).contains(&height), "not a page's width and height");
+        let _one = self.heights.lock();
+        let mut v = self.get(id).ok_or_else(|| anyhow::anyhow!("no such page"))?;
+        anyhow::ensure!(v.session == session, "that page is another conversation's");
+        let hs = v.engines.entry(engine.to_owned()).or_default();
+        if hs.contains(&(width, height)) {
+            return Ok(());
+        }
+        hs.retain(|(w, _)| *w != width);
+        hs.push((width, height));
+        hs.sort_unstable();
+        while hs.len() > SEEN_WIDTHS {
+            let at = hs.iter().position(|(w, _)| *w == width).unwrap_or(0);
+            let left = at.checked_sub(1).and_then(|i| hs.get(i).map(|n| (i, width.abs_diff(n.0))));
+            let right = hs.get(at + 1).map(|n| (at + 1, width.abs_diff(n.0)));
+            let Some((i, _)) = [left, right].into_iter().flatten().min_by_key(|(_, d)| *d) else { break };
+            hs.remove(i);
+        }
+        self.save(&v)
     }
 
     /// Every content kept for a page (the keeper's sweep leaves these).
@@ -816,6 +851,32 @@ fn joined(from: &str, to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_viewers_own_engine_measures_its_page_at_its_width() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("kiln-visuals-seen-{}", rand::random::<u64>()));
+        let vs = Visuals::new(&dir);
+        let id = "0123456789abcdef0123456789abcdef".to_owned();
+        vs.save(&Visual { id: id.clone(), session: "s1".into(), title: "t".into(), entry: "/p.html".into(), files: Vec::new(), heights: vec![(390, 500)], engines: std::collections::BTreeMap::new(), at: 0 })?;
+        vs.seen(&id, "s1", "webkit", 390, 512)?;
+        vs.seen(&id, "s1", "webkit", 1000, 300)?;
+        // The same width again: the newer.
+        vs.seen(&id, "s1", "webkit", 390, 520)?;
+        assert_eq!(vs.get(&id).map(|v| v.engines.get("webkit").cloned()), Some(Some(vec![(390, 520), (1000, 300)])));
+        // Not Chromium's (its machine measured those), not nonsense, not another conversation's.
+        assert!(vs.seen(&id, "s1", "chromium", 390, 1).is_err());
+        assert!(vs.seen(&id, "s1", "webkit", 390, 0).is_err() && vs.seen(&id, "s1", "webkit", 20, 100).is_err());
+        assert!(vs.seen(&id, "s2", "webkit", 390, 100).is_err());
+        // At most so many widths: the new one's neighbour goes.
+        for w in 0..30u32 {
+            vs.seen(&id, "s1", "firefox", 300 + w * 10, 100 + w)?;
+        }
+        let ff = vs.get(&id).and_then(|v| v.engines.get("firefox").cloned()).unwrap_or_default();
+        assert_eq!(ff.len(), SEEN_WIDTHS);
+        assert!(ff.contains(&(590, 129)) && ff.windows(2).all(|p| p.first().map(|a| a.0) < p.get(1).map(|b| b.0)), "{ff:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[test]
     fn a_pages_references_are_its_loads_imports_and_quoted_full_paths() {
