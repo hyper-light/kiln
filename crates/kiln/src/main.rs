@@ -281,8 +281,9 @@ struct AgentArgs {
     #[arg(long, env = "KILN_STATE_DIR")]
     state_dir: Option<PathBuf>,
     /// Run as another process of this machine beside its usual runner (set up by
-    /// `kiln install --agent --upgrade`; files under <state>/instances/<id>).
-    #[arg(long, env = "KILN_INSTANCE")]
+    /// `kiln install --agent --upgrade`; files under <state>/instances/<id>). Given more than once
+    /// (a service an earlier upgrade wrote), the last is the one.
+    #[arg(long, env = "KILN_INSTANCE", overrides_with = "instance")]
     instance: Option<String>,
     /// Run one job then exit (Kubernetes pods).
     #[arg(long)]
@@ -907,5 +908,14 @@ mod tests {
         }
         assert!(super::Cli::try_parse_from(["kiln", "install", "--agent", "--server", "http://x:7070", "--token", "-Hq3_z"]).is_ok());
         assert!(super::Cli::try_parse_from(["kiln", "cd", "--token", "-Hq3_z", "apps"]).is_ok());
+    }
+
+    /// A service an earlier upgrade wrote gives `--instance` twice: the runner starts, as the last.
+    #[test]
+    fn an_instance_given_twice_is_the_last() -> anyhow::Result<()> {
+        let cli = super::Cli::try_parse_from(["kiln", "agent", "--server", "http://x:7070", "--instance", "01a14c4f", "--instance", "01a1576c"])?;
+        let super::Cmd::Agent(a) = cli.cmd else { anyhow::bail!("not the agent") };
+        assert_eq!(a.instance.as_deref(), Some("01a1576c"));
+        Ok(())
     }
 }
