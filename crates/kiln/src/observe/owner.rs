@@ -523,6 +523,13 @@ impl Observe {
         self.log_within(records, WAITING_LOG_BYTES as u64 / 4 * 3, false)
     }
 
+    /// Log records an exporter sent, decoded into rows where no pipeline reads them
+    /// (`kiln_obs::otlp::logs::Decoder`), records where one does: as [`Observe::offer_logs`], the
+    /// pipelines run on its records. Refused, they come back.
+    pub fn offer_log_parts(&self, logs: super::ingest::Logs) -> Result<(), super::ingest::Logs> {
+        self.log_within_acked(logs, WAITING_LOG_BYTES as u64 / 4 * 3, false, None)
+    }
+
     /// Log records read from a source that can be read again (a file, the journal): as
     /// [`Observe::offer_logs`], and `ack` given once they are written, so the reader moves its
     /// place past them only then. Refused, they come back and the ack is never given: the reader

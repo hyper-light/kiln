@@ -17,7 +17,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7), described in OpenAPI 3.1 and held to what its routes answer; Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
-| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events; DogStatsD on every machine (§8.4: Datadog's protocol over UDP and Unix sockets, aggregated as its Agent aggregates, checked live with Datadog's own client; 5 M messages a second a listener, §12.20); Prometheus's remote write 1.0 and 2.0 on the server and every runner, native histograms as distributions (§8.5, checked live against Prometheus 3.7, sample for sample; §12.21); Datadog's Agent at Datadog's own paths (§8.6: its metrics, sketches, service checks, events and logs, zstd read by kiln's own decoder; checked live against Agent 7.84) | done |
+| O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events; DogStatsD on every machine (§8.4: Datadog's protocol over UDP and Unix sockets, aggregated as its Agent aggregates, checked live with Datadog's own client; 5 M messages a second a listener, §12.20); Prometheus's remote write 1.0 and 2.0 on the server and every runner, native histograms as distributions (§8.5, checked live against Prometheus 3.7, sample for sample; §12.21); Datadog's Agent at Datadog's own paths (§8.6: its metrics, sketches, service checks, events and logs, zstd read by kiln's own decoder; checked live against Agent 7.84); OTLP's logs decoded straight into rows, as spans are, but those a pipeline reads (a record 3× faster, no allocation a record, §12.10) | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
@@ -632,7 +632,9 @@ time, sent again until answered; §5), from:
   `KILN_OTLP_ADDR`, or `off`) as a local collector would. Metrics map by type (gauges;
   sums by temporality and monotonicity; histograms' count, sum, min, max and buckets;
   exponential histograms as distributions (§4.4), a cumulative one turned to deltas; summaries); logs keep their time, severity, body,
-  attributes and trace context, `service` and `host` from the resource. An explicit-bucket
+  attributes and trace context, `service` and `host` from the resource, each decoded straight into
+  the row its record would write (`otlp::logs::Decoder`), as spans are, but one a pipeline reads,
+  which is made its record (§12.10). An explicit-bucket
   histogram (an SDK's default) answers percentiles as Prometheus's `histogram_quantile` reads
   one: each bucket of time's counts by bound, the rank's bucket found, the value interpolated
   within it (within a bucket's width of the truth; the `+Inf` bucket's, the highest bound).
@@ -2227,6 +2229,26 @@ buffer kept with it, and unzips into bytes handed back the same way: a request's
 point fall from 199 to 17 (the load test's), 184 to 5.4 (the SDK's) and 164 to 2.1 (500 routes), its
 allocations from 0.03 to 0.013, 0.09 to 0.062 and 0.010 to 0.007, and it is 4–7% faster (the bench's
 "kept" columns).
+
+**OTLP logs** (2026-10-20, `KOBS_SIGNAL=logs cargo bench -p kiln-obs --bench otlp`, fedora quiet:
+load 3 to 5): a request of 500 records decoded, the median of 51, allocations of one. Before, each
+record was made a `Record` (its strings, and every attribute of its resource cloned into it: a bare
+record allocated 26 times), and the batcher wrote its row after; now a decoder that keeps its room
+(`otlp::logs::Decoder`, as spans' does) writes each record's row straight from the request, the
+record made only where a pipeline reads it (asked of a borrowed view of it), and a map's or an
+array's text is written with its frames held on the stack (`any_value_push`: a `Vec` each before).
+A test holds every row to the one its record writes, its error's issue on it, over 600 random
+requests (every value's kind, attributes past the bound, ids of every length, errors that are
+issues), and the two take or refuse 3,000 corrupted ones alike.
+
+| request | records and their rows: ns a record | allocations | bytes | rows: ns a record | allocations | bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| an SDK's: 9 resource attributes, 4 a record | 1,350–1,380 | 34.08 | 1,370 | 432–442 | 0.002 | 0.32 |
+| an SDK's: 12 a record, a map as its body | 2,330–2,340 | 55.08 | 2,358 | 1,121–1,128 | 0.002 | 0.32 |
+| bare: 9 resource attributes, none a record | 650–660 | 26.08 | 1,291 | 177–183 | 0.002 | 0.32 |
+
+What is left is the rows' own room (a segment's buffer, handed back by the node's writes) and,
+where a pipeline reads a record, the record.
 
 ### 12.11 Under load, end to end
 

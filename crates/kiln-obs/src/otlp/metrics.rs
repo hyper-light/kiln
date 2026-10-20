@@ -929,7 +929,38 @@ pub(crate) fn any_value_push(msg: &[u8], max: usize, out: &mut String) -> Result
         Array(Fields<'a>, bool),
         Map(Fields<'a>, bool),
     }
-    let mut stack: Vec<Frame<'_>> = Vec::new();
+    // The frames open, at most `MAX_DEPTH` (a value nested deeper is written `…`): held here,
+    // nothing allocated for a map or an array.
+    struct Frames<'a> {
+        at: [Option<Frame<'a>>; MAX_DEPTH],
+        len: usize,
+    }
+    impl<'a> Frames<'a> {
+        fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+        fn len(&self) -> usize {
+            self.len
+        }
+        fn push(&mut self, f: Frame<'a>) {
+            if let Some(slot) = self.at.get_mut(self.len) {
+                *slot = Some(f);
+                self.len += 1;
+            }
+        }
+        fn last_mut(&mut self) -> Option<&mut Frame<'a>> {
+            self.len.checked_sub(1).and_then(|i| self.at.get_mut(i)).and_then(Option::as_mut)
+        }
+        fn pop(&mut self) {
+            if let Some(i) = self.len.checked_sub(1) {
+                if let Some(slot) = self.at.get_mut(i) {
+                    *slot = None;
+                }
+                self.len = i;
+            }
+        }
+    }
+    let mut stack = Frames { at: [const { None }; MAX_DEPTH], len: 0 };
     let mut pending: Option<&[u8]> = Some(msg);
     loop {
         if let Some(v) = pending.take() {

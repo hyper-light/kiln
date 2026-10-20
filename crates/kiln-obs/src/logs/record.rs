@@ -234,6 +234,44 @@ pub fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3]
     }
 }
 
+/// Log records on their way to a write, in the order they came: a run of records (those a pipeline
+/// reads, or that a collector made records of), or rows written whole (their times chained from 0),
+/// how many, and the last one's time.
+#[derive(Debug)]
+pub enum LogPart {
+    Records(Vec<Record>),
+    Rows { raw: Vec<u8>, rows: u32, last_ts: i64 },
+}
+
+impl LogPart {
+    /// Its records, none of rows.
+    pub fn records(&self) -> &[Record] {
+        match self {
+            Self::Records(r) => r,
+            Self::Rows { .. } => &[],
+        }
+    }
+
+    pub fn records_mut(&mut self) -> &mut [Record] {
+        match self {
+            Self::Records(r) => r,
+            Self::Rows { .. } => &mut [],
+        }
+    }
+
+    /// Records, whichever form.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Records(r) => r.len() as u64,
+            Self::Rows { rows, .. } => u64::from(*rows),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Appends rows written as a run of their own (their times chained from 0) after a row of time
 /// `prev_ts`, as one run: the first's time chained from it, the rest as they are. `false`, nothing
 /// appended, if the first row's time does not read.

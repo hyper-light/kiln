@@ -1,8 +1,11 @@
 //! OTLP metrics decoded (`docs/observe.md` §12.10): an exporter's request into series, as a
 //! receiver takes it, for the shapes exporters send. Time, allocations and page faults a point;
-//! gzip's inflating and the series keys' making apart, to see what the rest costs.
+//! gzip's inflating and the series keys' making apart, to see what the rest costs. Then OTLP logs:
+//! a request into its records and their rows (what the batcher writes of them), and straight into
+//! rows (`otlp::logs::Decoder`, warm, its buffers handed back), a record's time, allocations and
+//! bytes.
 //!
-//! `cargo bench -p kiln-obs --bench otlp`
+//! `cargo bench -p kiln-obs --bench otlp` (`KOBS_SIGNAL=metrics` or `logs`: one of them)
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss)]
 
 use std::io::{Read as _, Write as _};
@@ -135,6 +138,153 @@ fn sdk(routes: usize) -> Vec<u8> {
     w.buf
 }
 
+/// The keys of the attributes an SDK's log records carry (logback's through OpenTelemetry's
+/// appender, and an app's own).
+const LOG_ATTRS: [&str; 12] = ["thread.name", "thread.id", "code.namespace", "code.function", "code.lineno", "http.route", "order.id", "user.id", "payment.method", "region", "attempt", "cart.items"];
+
+/// An SDK's log export: the resource an SDK sends, one scope, `n` records each with its times, a
+/// severity (an error one in fifty), a body (a string, or with `map` a map of four), `attrs`
+/// attributes and its trace's ids.
+fn sdk_logs(n: usize, attrs: usize, map: bool) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.message(1, |rl| {
+        rl.message(1, |r| {
+            for (k, v) in [
+                ("service.name", "checkout"),
+                ("service.version", "4.2.0"),
+                ("service.instance.id", "6f1c2a8e-2b1d-4c3e-9a7f-0e5d8c4b3a21"),
+                ("host.name", "web-17"),
+                ("deployment.environment.name", "prod"),
+                ("telemetry.sdk.name", "opentelemetry"),
+                ("telemetry.sdk.language", "java"),
+                ("telemetry.sdk.version", "1.43.0"),
+                ("k8s.pod.name", "checkout-7d9f8b6c5-x2x7k"),
+            ] {
+                kv(r, 1, k, v);
+            }
+        });
+        rl.message(2, |sl| {
+            sl.message(1, |scope| scope.str(1, "com.shop.checkout.PaymentService"));
+            for i in 0..n {
+                sl.message(2, |rec| {
+                    rec.fixed64(1, NS + i as u64 * 1_000_000);
+                    rec.fixed64(11, NS + i as u64 * 1_000_000 + 50_000);
+                    let error = i % 50 == 0;
+                    rec.varint(2, if error { 17 } else { 9 });
+                    rec.str(3, if error { "ERROR" } else { "INFO" });
+                    rec.message(5, |b| {
+                        if map {
+                            b.message(6, |kvl| {
+                                for (k, v) in [("event", "payment"), ("order", "o-1842"), ("amount", "12.50"), ("currency", "EUR")] {
+                                    kvl.message(1, |e| {
+                                        e.str(1, k);
+                                        e.message(2, |a| a.str(1, v));
+                                    });
+                                }
+                            });
+                        } else {
+                            b.str(1, &format!("order {i} paid in {} ms by a card ending 4242", i % 900));
+                        }
+                    });
+                    for a in 0..attrs {
+                        kv(rec, 6, LOG_ATTRS[a % LOG_ATTRS.len()], &format!("v{}", (i + a) % 97));
+                    }
+                    rec.bytes(9, &[(i % 251) as u8 + 1; 16]);
+                    rec.bytes(10, &[(i % 241) as u8 + 1; 8]);
+                });
+            }
+        });
+    });
+    w.buf
+}
+
+/// OTLP logs: each request decoded into records, then each record's row written as the batcher
+/// writes it; the median of 51, allocations of one.
+fn logs() {
+    println!(
+        "{:<36} {:>7} {:>7} {:>13} {:>10} {:>10} {:>12} {:>11} {:>10} {:>10}",
+        "request", "bytes", "records", "decode ns/rec", "allocs/rec", "bytes/rec", "+ row ns/rec", "rows ns/rec", "allocs/rec", "bytes/rec"
+    );
+    for (name, body) in [
+        ("an SDK's, 500 records, 4 attributes", sdk_logs(500, 4, false)),
+        ("an SDK's, 500, 12 attributes, a map", sdk_logs(500, 12, true)),
+        ("bare, 500 records, no attributes", sdk_logs(500, 0, false)),
+    ] {
+        let d = kiln_obs::otlp::logs::decode(&body, NS as i64).unwrap();
+        let records = d.records.len() as u64;
+        for _ in 0..20 {
+            std::hint::black_box(kiln_obs::otlp::logs::decode(&body, NS as i64).unwrap());
+        }
+        let ns = median(
+            (0..51)
+                .map(|_| {
+                    let t = Instant::now();
+                    std::hint::black_box(kiln_obs::otlp::logs::decode(&body, NS as i64).unwrap());
+                    t.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        );
+        alloc::begin();
+        let out = kiln_obs::otlp::logs::decode(&body, NS as i64).unwrap();
+        let c = alloc::end();
+        let mut raw = Vec::with_capacity(1 << 20);
+        let row_ns = median(
+            (0..51)
+                .map(|_| {
+                    raw.clear();
+                    let t = Instant::now();
+                    let mut prev = 0;
+                    for r in &out.records {
+                        kiln_obs::logs::record::put_row(&mut raw, r, prev);
+                        prev = r.ts;
+                    }
+                    std::hint::black_box(&raw);
+                    t.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        );
+        // Straight into rows, as a receiver decodes: warm, its buffers handed back each time.
+        let mut d = kiln_obs::otlp::logs::Decoder::new();
+        let once = |d: &mut kiln_obs::otlp::logs::Decoder| {
+            let mut out = kiln_obs::otlp::logs::Decoded::default();
+            d.decode(&body, NS as i64, &mut |_| false, &mut out).unwrap();
+            for part in out.parts {
+                if let kiln_obs::logs::record::LogPart::Rows { raw, .. } = part {
+                    d.give_rows(raw);
+                }
+            }
+        };
+        for _ in 0..20 {
+            once(&mut d);
+        }
+        let rows_ns = median(
+            (0..51)
+                .map(|_| {
+                    let t = Instant::now();
+                    once(&mut d);
+                    t.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        );
+        alloc::begin();
+        once(&mut d);
+        let r = alloc::end();
+        println!(
+            "{:<36} {:>7} {:>7} {:>13.1} {:>10.2} {:>10.1} {:>12.1} {:>11.1} {:>10.3} {:>10.2}",
+            name,
+            body.len(),
+            records,
+            ns as f64 / records as f64,
+            c.calls() as f64 / records as f64,
+            c.bytes as f64 / records as f64,
+            row_ns as f64 / records as f64,
+            rows_ns as f64 / records as f64,
+            r.calls() as f64 / records as f64,
+            r.bytes as f64 / records as f64
+        );
+    }
+}
+
 fn gzip(b: &[u8]) -> Vec<u8> {
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     e.write_all(b).unwrap();
@@ -147,6 +297,13 @@ fn median(mut ns: Vec<u64>) -> u64 {
 }
 
 fn main() {
+    let signal = std::env::var("KOBS_SIGNAL").unwrap_or_default();
+    if signal != "metrics" {
+        logs();
+    }
+    if signal == "logs" {
+        return;
+    }
     println!(
         "{:<20} {:>7} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>11} {:>10} {:>10}",
         "request", "bytes", "points", "cold ns/pt", "allocs/pt", "warm ns/pt", "allocs/pt", "bytes/pt", "faults", "inflate", "keys ns/pt", "kept ns/pt", "allocs/pt", "bytes/pt"

@@ -485,16 +485,46 @@ fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body:
                 }
             }
         }
-        Signal::Logs => match kiln_obs::otlp::logs::decode(pb, now_ns) {
-            Ok(d) => {
-                let n = d.records.len() as u64;
-                if !o.offer_logs(d.records) {
-                    return Answer::Busy;
+        Signal::Logs => {
+            let mut out = kiln_obs::otlp::logs::Decoded::default();
+            let decoded = with_log_decoder(|d, filters| {
+                // Rows into buffers the node's writes handed back, as spans' are.
+                while d.spares() < 2 {
+                    let b = o.bytes();
+                    if b.capacity() == 0 {
+                        break;
+                    }
+                    d.give_rows(b);
                 }
-                Answer::Ok { json, points: n, rejected: 0 }
+                // A record a pipeline reads is made a record, for it to be processed where taken.
+                filters.pipelines = super::pipeline::kept::snapshot();
+                let super::collect::PipelineFilters { pipelines, scratch } = filters;
+                d.decode(pb, now_ns, &mut |v| pipelines.iter().any(|p| p.reads(v, scratch)), &mut out)
+            });
+            let give = |parts: Vec<super::ingest::LogPart>| {
+                for part in parts {
+                    if let super::ingest::LogPart::Rows { raw, .. } = part {
+                        o.give_bytes(raw);
+                    }
+                }
+            };
+            match decoded {
+                Ok(()) => {
+                    let n = out.records;
+                    match o.offer_log_parts(super::ingest::Logs { parts: out.parts }) {
+                        Ok(()) => Answer::Ok { json, points: n, rejected: 0 },
+                        Err(back) => {
+                            give(back.parts);
+                            Answer::Busy
+                        }
+                    }
+                }
+                Err(e) => {
+                    give(out.parts);
+                    Answer::Bad(e.to_string())
+                }
             }
-            Err(e) => Answer::Bad(e.to_string()),
-        },
+        }
         Signal::Traces => {
             let mut spans = kiln_obs::otlp::traces::Spans::default();
             let decoded = with_trace_decoder(|d| {
@@ -521,6 +551,21 @@ fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body:
             }
         }
     }
+}
+
+/// Runs `f` with this thread's log decoder and pipelines' room (kept from one request to the next),
+/// or new ones were they in use.
+fn with_log_decoder<T>(f: impl FnOnce(&mut kiln_obs::otlp::logs::Decoder, &mut super::collect::PipelineFilters) -> T) -> T {
+    thread_local! {
+        static DECODER: std::cell::RefCell<(kiln_obs::otlp::logs::Decoder, super::collect::PipelineFilters)> = std::cell::RefCell::new(Default::default());
+    }
+    DECODER.with(|d| match d.try_borrow_mut() {
+        Ok(mut d) => {
+            let (decoder, filters) = &mut *d;
+            f(decoder, filters)
+        }
+        Err(_) => f(&mut kiln_obs::otlp::logs::Decoder::new(), &mut super::collect::PipelineFilters::default()),
+    })
 }
 
 /// Runs `f` with this thread's trace decoder (its room kept from one request to the next), or a

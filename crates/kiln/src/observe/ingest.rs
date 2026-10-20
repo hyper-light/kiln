@@ -166,39 +166,7 @@ pub struct Logs {
     pub parts: Vec<LogPart>,
 }
 
-#[derive(Debug)]
-pub enum LogPart {
-    Records(Vec<Record>),
-    /// Rows written whole (their times chained from 0), how many, and the last one's time.
-    Rows {
-        raw: Vec<u8>,
-        rows: u32,
-        last_ts: i64,
-    },
-}
-
-impl LogPart {
-    fn records(&self) -> &[Record] {
-        match self {
-            Self::Records(r) => r,
-            Self::Rows { .. } => &[],
-        }
-    }
-
-    fn records_mut(&mut self) -> &mut [Record] {
-        match self {
-            Self::Records(r) => r,
-            Self::Rows { .. } => &mut [],
-        }
-    }
-
-    fn len(&self) -> u64 {
-        match self {
-            Self::Records(r) => r.len() as u64,
-            Self::Rows { rows, .. } => u64::from(*rows),
-        }
-    }
-}
+pub use kiln_obs::logs::record::LogPart;
 
 impl From<Vec<Record>> for Logs {
     fn from(records: Vec<Record>) -> Self {
