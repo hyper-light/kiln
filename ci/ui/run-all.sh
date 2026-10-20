@@ -2,8 +2,9 @@
 # W21-AC01 in CI (docs/ci.md): every UI check against servers of this build, the browsers in
 # Playwright's image (Chromium and WebKit, at 1440×900 and 390×844), each on the fixture it needs:
 # - signin_setup.py's server: sign-in (alone on one), then People and the editor's saving, the
-#   editor's completions, the runs list's window, the editor's ranges (W21-AC02), and
-#   graph_setup.py's runs for the graph bench (W21-AC03);
+#   editor's completions, the runs list's window, the editor's ranges (W21-AC02),
+#   graph_setup.py's runs for the graph bench (W21-AC03), and environments_setup.py's for the
+#   environments board and pages (W21-R10);
 # - insights_setup.py's: Insights, and the pages no other check drives (pages_check.mjs);
 # - review_setup.py's: the review pages (W14-AC06);
 # - none: the flow view's edits (workflow_doc_check.ts) and the editor's patches (patch_check.ts).
@@ -100,6 +101,13 @@ else
   ran=$((ran + 1))
   failed=$((failed + 1))
   echo "FAIL graph_bench's runs (graph_setup.py): $(tail -3 "$run/graph.err")"
+fi
+if SIGNIN="$(cat "$run/people.json")" timeout 600 python3 -I "$here/environments_setup.py" > "$run/envs.json" 2> "$run/envs.err"; then
+  browser environments_check ENVS "$run/envs.json"
+else
+  ran=$((ran + 1))
+  failed=$((failed + 1))
+  echo "FAIL environments_check's repositories (environments_setup.py): $(tail -3 "$run/envs.err")"
 fi
 stop "$run/people.json" "$run/people"
 

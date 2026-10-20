@@ -452,6 +452,8 @@ pub static ROUTES: &[Rule] = &[
     // An agent kiln started, its own workload token (W10-R11); the handler refuses anyone else.
     r("POST", "/api/ci/oidc/token", "agents.run", At::Server),
     any("/api/ci/oidc/**", "settings.manage", At::Server),
+    // Every repository's environments the caller may read (W15-R09): it narrows by itself.
+    r("GET", "/api/ci/environments/board", "runs.read", At::Anywhere),
     r("GET", "/api/ci/environments", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/environments/**", "runs.read", At::RepoQuery),
     any("/api/ci/environments", "environments.manage", At::RepoQuery),

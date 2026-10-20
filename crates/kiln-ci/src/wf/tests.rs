@@ -83,6 +83,19 @@ fn w02_s05_untrusted_input_in_run() {
     assert_eq!(step.first().map(|(k, v)| (k.as_str(), v.src.as_str())), Some(("PULL_REQUEST_TITLE", "${{ github.event.pull_request.title }}")));
 }
 
+/// W21-R01's quick fixes: an unknown key close to a known one comes with its rename.
+#[test]
+fn w21_r01_an_unknown_keys_fix() {
+    let src = "on: push\njobs:\n  a:\n    runs_on: x\n    steps: [{run: echo}]\n";
+    let (_, d) = gha(src);
+    let e = d.iter().find(|x| x.code == "KCI1010");
+    assert_eq!(e.and_then(|x| x.fix.as_ref()).map(|f| f.title.as_str()), Some("Rename it `runs-on`"), "{d:?}");
+    let fixed = e.map(|x| apply_fix(src, x)).unwrap_or_default();
+    assert_eq!(fixed, src.replace("runs_on", "runs-on"));
+    let (_, again) = gha(&fixed);
+    assert!(errors(&again).is_empty(), "{:?}", errors(&again));
+}
+
 #[test]
 fn w02_s05_fix_quotes_for_the_shell() {
     // A block scalar, single and no quotes, an existing env, the same value twice.

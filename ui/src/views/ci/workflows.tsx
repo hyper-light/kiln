@@ -9,7 +9,7 @@
 import * as React from "react";
 import { Download } from "lucide-react";
 import { api } from "@/api/client";
-import { ci, type CiMatrix, type CiOutline, type CiPreview, type CiSave } from "@/api/ci";
+import { ci, type CiCatalogEntry, type CiMatrix, type CiOutline, type CiPreview, type CiSave } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Segmented } from "@/components/ui/tabs";
@@ -17,7 +17,7 @@ import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link, useSearchParams } from "@/lib/router";
 import { unifiedPatch } from "@/lib/patch";
-import { describe, keysAt, yamlSpot, type Schema } from "@/lib/yaml-spot";
+import { describe, keysAt, siblingValue, yamlSpot, type Schema } from "@/lib/yaml-spot";
 import { placed } from "@/lib/diagnostics";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -171,6 +171,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     outline: CiOutline | null;
     names?: { secrets: string[]; variables: string[] };
     catalog?: { label: string; detail: string }[];
+    actions?: CiCatalogEntry[];
     labels?: { label: string; detail: string }[];
     schema?: Schema;
     schemaAsked?: boolean;
@@ -258,12 +259,13 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
       };
       return { from: ns.from + space.length + 1, options: (names[space] ?? []).map((label) => ({ label, detail: space })) };
     }
+    // The catalog (W07-R12): what `uses:` offers, and the inputs `with:` offers.
+    const actions = async () => (known.current.actions ??= (await ci.catalog("").catch(() => ({ actions: [] }))).actions);
     const uses = ctx.matchBefore(/\buses:\s*[\w./@-]*$/);
     if (uses) {
       if (!known.current.catalog) {
-        const list = await ci.catalog("").catch(() => ({ actions: [] }));
         // A mirrored action's latest versions; kiln's own, as they're used.
-        known.current.catalog = list.actions.flatMap((a) =>
+        known.current.catalog = (await actions()).flatMap((a) =>
           a.versions?.length
             ? a.versions.slice(0, 3).map((v) => ({ label: `${a.uses}@${v.ref}`, detail: a.action?.description?.split("\n")[0] ?? v.sha.slice(0, 12) }))
             : [{ label: a.uses, detail: (a.description ?? a.action?.description ?? "").split("\n")[0] ?? "" }],
@@ -287,8 +289,28 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     const typing = ctx.matchBefore(/^\s*(?:-\s+)*[\w.-]*$/);
     const word = /[\w.-]*$/.exec(typing?.text ?? "")?.[0] ?? "";
     if (typing && (word || ctx.explicit)) {
+      const doc = ctx.state.doc.toString();
+      // A step's `with:`: the inputs of the action it uses, from the catalog.
+      if (yamlSpot(doc, ctx.pos)?.path.at(-1) === "with") {
+        const bare = (u: string) => u.split("@")[0]?.toLowerCase() ?? "";
+        const used = bare(siblingValue(doc, ctx.pos, "uses") ?? "");
+        const entry = used ? (await actions()).find((a) => bare(a.uses) === used) : undefined;
+        // A mirrored action's from its action.yml; a built-in's as its own action.yml would say them.
+        const inputs = entry?.action?.inputs ?? Object.entries(entry?.inputs ?? {}).map(([name, i]) => ({ name, description: i.description, required: i.required, default: i.default }));
+        if (inputs.length) {
+          return {
+            from: ctx.pos - word.length,
+            options: inputs.map((i) => ({
+              label: i.name,
+              detail: i.required ? "required" : i.default !== null ? `default ${i.default}` : "input",
+              info: i.description ?? undefined,
+              apply: `${i.name}: `,
+            })),
+          };
+        }
+      }
       const s = schema() ?? (known.current.schema = await ci.schema(kind).catch(() => undefined));
-      const spot = s ? yamlSpot(ctx.state.doc.toString(), ctx.pos) : null;
+      const spot = s ? yamlSpot(doc, ctx.pos) : null;
       if (s && spot) return { from: ctx.pos - word.length, options: keysAt(s, spot.path).map((k) => ({ label: k.key, info: k.description, apply: `${k.key}: ` })) };
     }
     return null;

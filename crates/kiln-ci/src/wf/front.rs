@@ -3,7 +3,7 @@
 //! problems become diagnostics; whatever can be read is still read, so the editor sees as much as
 //! possible.
 
-use super::diag::{Diag, Range, suggest};
+use super::diag::{Diag, Edit, Range, suggest};
 use super::ir::{
     Axis, Concurrency, Container, Defaults, Environment, Input, Job, JobKiln, JobSecrets, Matrix, MatrixSpec, Need, Output, Permissions, RunsOn, Schedule,
     SecretDecl, Step, StepKiln, Strategy, Tpl, Trigger, Workflow, YVal,
@@ -74,8 +74,15 @@ impl Fe<'_> {
                 Some(_) => out.push((name, v, k.range)),
                 None => {
                     let candidates = table.iter().filter(|c| self.kiln() || !c.kiln).map(|c| c.name);
-                    let hint = suggest(&name, candidates).map(|s| format!(" (did you mean `{s}`?)")).unwrap_or_default();
-                    self.err("KCI1010", format!("unknown key `{name}`{hint}"), k.range, &at);
+                    match suggest(&name, candidates) {
+                        // The key it likely means, the editor's quick fix (W21-R01).
+                        Some(s) => self.diags.push(
+                            Diag::error("KCI1010", format!("unknown key `{name}` (did you mean `{s}`?)"), k.range)
+                                .at(&at)
+                                .with_fix(format!("Rename it `{s}`"), vec![Edit { range: k.range, text: s.to_owned() }]),
+                        ),
+                        None => self.err("KCI1010", format!("unknown key `{name}`"), k.range, &at),
+                    }
                 }
             }
         }

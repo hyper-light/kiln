@@ -114,6 +114,52 @@ export function yamlSpot(text: string, pos: number): YamlSpot | null {
   return { path, key };
 }
 
+/**
+ * What is written for `key` beside the mapping the position is in (a step's `uses:`, for a
+ * position in its `with:`), by indentation as `yamlSpot`, quotes taken off; null when nothing is.
+ */
+export function siblingValue(text: string, pos: number, key: string): string | null {
+  const lines = text.split("\n");
+  let start = 0;
+  let li = 0;
+  for (; li < lines.length - 1; li++) {
+    const len = (lines[li] ?? "").length;
+    if (pos <= start + len) break;
+    start += len + 1;
+  }
+  const here = parse(lines[li] ?? "");
+  const col = here.text ? here.start : pos - start;
+  // The key whose mapping the position is in: the nearest line above that starts left of it.
+  let owner = -1;
+  for (let i = li - 1; i >= 0; i--) {
+    const p = parse(lines[i] ?? "");
+    if (!p.text || p.contentCol >= col) continue;
+    if (p.key === null || p.value !== "") return null;
+    owner = i;
+    break;
+  }
+  if (owner < 0) return null;
+  const c = parse(lines[owner] ?? "").contentCol;
+  const read = (p: Line) => (p.key === key ? p.value.replace(/^(["'])(.*)\1$/, "$2") || null : undefined);
+  // Its siblings: up to the line its mapping starts on (an item's dash), then down to its end.
+  for (let i = owner; i >= 0; i--) {
+    const p = parse(lines[i] ?? "");
+    if (!p.text || p.contentCol > c) continue;
+    if (p.contentCol < c) break;
+    const v = read(p);
+    if (v !== undefined) return v;
+    if (p.dashes > 0) break;
+  }
+  for (let i = owner + 1; i < lines.length; i++) {
+    const p = parse(lines[i] ?? "");
+    if (!p.text || p.contentCol > c) continue;
+    if (p.contentCol < c || p.dashes > 0) break;
+    const v = read(p);
+    if (v !== undefined) return v;
+  }
+  return null;
+}
+
 /** The part of a JSON Schema that says what a document may hold. */
 export interface Schema {
   type?: string | string[];

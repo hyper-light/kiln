@@ -114,6 +114,72 @@ export interface CiPlanJob {
   typical: number | null;
 }
 
+/** What an environment deploys to (W15-R02). */
+export type CiEnvKind = "kubernetes" | "host" | "container" | "microvm" | "platform";
+
+/** Where an environment deploys: a kubernetes one's clusters and namespace, the runners a host,
+ * container or microVM one deploys on (a routing constraint), a platform one's integration. */
+export interface CiEnvTargets {
+  clusters?: string[];
+  namespace?: string;
+  runners?: string;
+  integration?: string;
+}
+
+/** An environment's protection rules, as `.kiln/environments.yaml` writes them. */
+export interface CiProtection {
+  reviewers?: string[];
+  "prevent-self-review"?: boolean;
+  "wait-timer"?: number;
+  branches?: string[] | null;
+  tags?: string[] | null;
+  windows?: { allow?: string; deny?: string; duration: string; timezone?: string }[];
+  after?: string;
+  soak?: string;
+  gates?: { workflow?: string; check?: string }[];
+}
+
+export interface CiDeployment {
+  id: number;
+  environment?: string;
+  sha: string;
+  ref: string;
+  creator: string;
+  run: string | null;
+  leg?: string | null;
+  created_at: number;
+  state: string | null;
+  url: string | null;
+}
+
+/** A leg waiting to deploy (W15-R08, R09): its run and why it waits (its wait reason). */
+export interface CiEnvWait {
+  leg: string;
+  run: string;
+  number: number;
+  key: string;
+  name: string | null;
+  wait: { reason: string; environment?: string; reviewers?: string[]; until?: number | null; window?: string | null; promotion?: string | null; gate?: string | null; limit?: number } | null;
+  queued_at: number | null;
+}
+
+/** A repository's environment (W15). */
+export interface CiEnvironment {
+  name: string;
+  /** `file` (trunk's `.kiln/environments.yaml`), `kiln` (made here), `run` (named by a job). */
+  source: "file" | "kiln" | "run" | string;
+  kind: CiEnvKind | null;
+  targets: CiEnvTargets;
+  protection: CiProtection;
+  url: string | null;
+  agents_can_approve: boolean;
+  concurrency: number | null;
+  latest_deployment: CiDeployment | null;
+  /** On the board and one environment's page. */
+  repo?: string;
+  waiting?: CiEnvWait[];
+}
+
 export interface CiAnnotation {
   leg: string;
   leg_key: string;
@@ -315,7 +381,14 @@ export interface CiDiagnostic {
   message: string;
   path: string;
   /** Lines and columns from 1; offsets (bytes) aren't always there. */
-  range: { start: { line: number; col: number; offset?: number }; end: { line: number; col: number; offset?: number } };
+  range: CiRange;
+  /** What would fix it: replacements of ranges by text, under a title (the editor's quick fix). */
+  fix?: { title: string; edits: { range: CiRange; text: string }[] };
+}
+
+export interface CiRange {
+  start: { line: number; col: number; offset?: number };
+  end: { line: number; col: number; offset?: number };
 }
 
 export interface CiPreview {
@@ -427,6 +500,8 @@ export interface CiCatalogEntry {
   uses: string;
   versions?: { ref: string; sha: string }[];
   description?: string;
+  /** A built-in's inputs, as its `action.yml` would have them (a mirrored action's are in `action`). */
+  inputs?: Record<string, { description: string | null; required: boolean; default: string | null }>;
   action?: {
     name: string | null;
     description: string | null;
@@ -714,6 +789,23 @@ export const ci = {
   approve: (id: string, environments: string[], state: "approved" | "rejected", comment: string) =>
     request<{ run: string; environments?: string[]; approval?: "run"; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
+  /** A repository's environments (W15). */
+  environments: (repo: string, signal?: AbortSignal) => request<{ repo: string; environments: CiEnvironment[] }>("GET", `/api/ci/environments?repo=${enc(repo)}`, undefined, { signal }),
+  /** Every environment of every repository the caller may read (W15-R09). */
+  environmentsBoard: (signal?: AbortSignal) => request<{ environments: CiEnvironment[] }>("GET", "/api/ci/environments/board", undefined, { signal }),
+  environment: (repo: string, name: string, signal?: AbortSignal) => request<CiEnvironment>("GET", `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`, undefined, { signal }),
+  /** Makes an environment in kiln, or changes one made here; what it would meet now comes back with it. */
+  saveEnvironment: (repo: string, name: string, body: { kind: CiEnvKind | null; targets: CiEnvTargets; protection: CiProtection; url: string | null; concurrency: number | null }) =>
+    request<CiEnvironment & { diagnostics?: { level: string; message: string }[]; preview?: { trunk: string; a_deployment_from_the_trunk: string } }>(
+      "PUT",
+      `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`,
+      body,
+    ),
+  deleteEnvironment: (repo: string, name: string) => request<void>("DELETE", `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`),
+  /** A repository's dev, staging and production, each unless it has one of that name (W15-R08). */
+  starterEnvironments: (repo: string) => request<{ repo: string; made: string[]; kept: string[] }>("POST", `/api/ci/environments/starter?repo=${enc(repo)}`, {}),
+  deployments: (repo: string, name: string, signal?: AbortSignal) =>
+    request<{ deployments: CiDeployment[] }>("GET", `/api/ci/environments/${enc(name)}/deployments?repo=${enc(repo)}&limit=50`, undefined, { signal }),
   /** A kept leg kept `minutes` more from now, or let go (W17-R02). */
   keep: (leg: string, minutes: number) => request<{ leg: string; kept_until: number }>("POST", `/api/ci/legs/${enc(leg)}/keep`, { minutes }),
   release: (leg: string) => request<void>("POST", `/api/ci/legs/${enc(leg)}/release`, {}),

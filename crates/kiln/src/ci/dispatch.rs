@@ -1059,12 +1059,22 @@ impl Dispatch {
             Err(e) => return serde_json::json!({ "error": e }),
         };
         let workflow = s.workflow.name.clone().unwrap_or_default();
+        let envs = super::environments::defs(&self.hub, &s.repo).await.unwrap_or_default();
         let legs: Vec<serde_json::Value> = p
             .legs
             .iter()
             .map(|spec| {
                 let untrusted = (!trusted_of(&self.hub.cfg.ci, &s.repo, &s.event)).then(|| self.hub.cfg.ci.untrusted.route());
-                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local, untrusted));
+                let mut route = route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local, untrusted);
+                // Where its environment deploys, as its gate adds it (W15-R02).
+                if let Some(d) = spec.environment.as_ref().and_then(|e| envs.get(&e.name.to_ascii_lowercase())) {
+                    for q in super::environments::routing(d) {
+                        if !route.requires.contains(&q) {
+                            route.requires.push(q);
+                        }
+                    }
+                }
+                let (req, runners) = self.sched.explain_route(&route);
                 let mut v = serde_json::to_value(spec).unwrap_or_default();
                 if let Some(o) = v.as_object_mut() {
                     let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
@@ -1334,9 +1344,15 @@ impl Dispatch {
                     self.hub.emit_job(id).await;
                     return Ok(());
                 }
-                let Some(h) = self.held.remove(id) else { return Ok(()) };
+                let Some(mut h) = self.held.remove(id) else { return Ok(()) };
                 runs::wait_reason(&self.hub, id, &serde_json::Value::Null).await?;
                 self.hub.emit_job(id).await;
+                // A host, container or microVM environment's jobs run on its runners (W15-R02).
+                for q in super::environments::routing(&def) {
+                    if !h.leg.route.requires.contains(&q) {
+                        h.leg.route.requires.push(q);
+                    }
+                }
                 let cmds = self.sched.handle(Input::LegQueued(Box::new(h.leg)), now_ms());
                 Box::pin(self.commands(cmds)).await;
             }
@@ -1760,6 +1776,14 @@ impl Dispatch {
                 }
                 names.push((name.to_owned(), false));
             }
+        }
+        // A platform environment's integration, for the jobs deploying there (W15-R02).
+        if let Some(env) = l.spec.environment.as_ref().map(|e| e.name.clone()).filter(|n| !n.is_empty())
+            && let Ok(def) = super::environments::ensure(&self.hub, &r.repo, &env).await
+            && def.kind.as_deref() == Some("platform")
+            && let Some(i) = def.targets.integration.filter(|i| !i.is_empty())
+        {
+            names.push((i, true));
         }
         if names.is_empty() {
             return Ok(Vec::new());

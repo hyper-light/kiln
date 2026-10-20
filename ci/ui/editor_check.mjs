@@ -1,8 +1,9 @@
 // W21-AC02's second part (docs/ci.md), against signin_setup.py's server in Chromium and WebKit:
-// the editor completes `needs.`, `needs.<job>.outputs.`, `steps.`, `matrix.`, `secrets.` and
-// `uses:` from a fixture, and a commented file goes through the flow view and back with nothing
-// changed, then with one edit made and its comments kept. (The first part, every negative-corpus
-// file at its range, is ci/ui/editor_ranges_check.ts.)
+// the editor completes `needs.`, `needs.<job>.outputs.`, `steps.`, `matrix.`, `secrets.`, `uses:`
+// and a step's `with:` (the inputs of the action it uses) from a fixture; a diagnostic's fix is
+// taken from it (W21-R01's quick actions); and a commented file goes through the flow view and
+// back with nothing changed, then with one edit made and its comments kept. (The first part,
+// every negative-corpus file at its range, is ci/ui/editor_ranges_check.ts.)
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/editor-shots:/shots \
@@ -67,10 +68,10 @@ for (const [name, type] of [
     await content.waitFor({ timeout: 30000 });
     const doc = async () => (await content.innerText()).replace(/ /g, " ");
     // The fixture in place of the file, checked (the completions read what the check found).
-    const load = async () => {
+    const load = async (text = FIXTURE) => {
       await content.click();
       await page.keyboard.press("ControlOrMeta+A");
-      await page.keyboard.insertText(FIXTURE);
+      await page.keyboard.insertText(text);
       await until(async () => (await doc()).includes("echo test"), 5000);
       // Checked a moment after the typing stops (its check is what the completions read).
       await page.waitForTimeout(1200);
@@ -95,10 +96,20 @@ for (const [name, type] of [
       ["matrix.", "- run: echo build", "\n      - run: echo ${{ ", "matrix.", (l) => l.some((x) => x.startsWith("os"))],
       ["secrets.", "- run: echo build", "\n      - run: echo ${{ ", "secrets.", (l) => l.some((x) => x.startsWith("GITHUB_TOKEN"))],
       ["uses:", "- run: echo build", "\n      - ", "uses: kiln/c", (l) => l.some((x) => x.startsWith("kiln/checkout@"))],
+      ["with:", "- run: echo build", "\n      - uses: kiln/checkout@v1\n        with:\n          ", "fe", (l) => l.some((x) => x.startsWith("fetch-depth"))],
     ]) {
       const labels = await offered(line, typed, trigger);
       check(name, `completes ${what}`, want(labels), labels.slice(0, 8).join(", ") || "nothing offered");
     }
+    // A diagnostic's fix, taken from it: the key it likely means, in place of the unknown one.
+    await load(FIXTURE.replace("    runs-on: local\n    strategy", "    runs_on: local\n    strategy"));
+    const mark = page.locator(".cm-lintRange-error").first();
+    await until(async () => (await mark.count()) > 0, 15000);
+    await mark.hover();
+    const fix = page.locator(".cm-diagnosticAction", { hasText: "Rename it" }).first();
+    const offeredFix = await until(async () => (await fix.count()) > 0, 8000);
+    if (offeredFix) await fix.click();
+    check(name, "a diagnostic's fix, taken from it", offeredFix && (await until(async () => !(await doc()).includes("runs_on") && (await doc()).includes("  build:   # first\n    runs-on: local"), 5000)), (await doc()).slice(0, 160));
     // Through the flow view and back, nothing touched: the same text, its comments with it.
     await load();
     const view = page.getByRole("group", { name: "View" });

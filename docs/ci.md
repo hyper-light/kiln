@@ -186,13 +186,13 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); microVM and k8s executors and pool kinds left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); the rest of the REST left |
-| W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); previews, pages and board left (with CD) |
+| W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container and microVM deploying, previews and the live-cluster ACs left (with CD) |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, microVM containment (W13) left |
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); attachments, experiments left |
-| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; the rest left |
+| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04; the run's data flow left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 43 of F-21's 50 green (the rest need accounts, GitHub's Sigstore or a disposable runner); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
@@ -4269,8 +4269,9 @@ environment model both use.
 - **W15-AC05 Board.** Shows revisions, health, waits and drift for the live cluster's apps, in
   Chromium and WebKit. *UI check.*
 
-**Progress.** In progress: CI's half of R01, R03, R04 and R08 (CD owns the kinds, deploying,
-previews and the board).
+**Progress.** In progress: R01, R03, R04, R05, R06, R08 and R09 are done, with R02's kinds on
+CI's side; deploying to container and microVM environments, previews and the ACs that need the
+live cluster are left (with CD).
 
 - *Done.*
   - `kiln_ci::env`: GitHub's protection rules (required reviewers, `prevent-self-review`, a wait
@@ -4364,9 +4365,50 @@ previews and the board).
     production took a commit after staging had it for four seconds and its smoke workflow
     passed, the leg waiting `promotion` and `gate` meanwhile; a commit whose smoke run failed
     never deployed there.
-- *Left.*
-  - The environment pages (R08) and the board (R09).
-  - R02, R07 and AC02 to AC05, which are CD's or shared with it.
+- *Done.* R02's kinds, CI's half, and R08 (`crates/kiln/src/ci/environments.rs`):
+  - An environment has a kind and where it deploys: `kubernetes` (kiln CD's clusters and a
+    namespace: CD syncs its apps there), `host`, `container` and `microvm` (the runners it
+    deploys on, a routing constraint: `label deploy-web`, `os == linux && label web`) and
+    `platform` (one of kiln's integrations). In `.kiln/environments.yaml` they are `kind`,
+    `clusters` (CD's key too), `namespace`, `runners` and `integration`; without `kind`, the
+    targets say it. Made in kiln, through the API, `kiln env create staging --kind kubernetes
+    --cluster dev --namespace web` and the environment's page; a kind without its targets, a
+    constraint that doesn't parse or a kind there isn't is refused, saying why.
+  - A host environment's deploying jobs run on its runners; a container one's on those of them
+    with Docker, a microVM one's on those that run Firecracker or shards: the constraints join
+    the leg's routing as its gate lets it go (and the plan preview's), so a leg no runner of
+    them can take waits, unroutable, saying which. A platform environment's jobs get its
+    integration's credentials, as `integrations:` would give them; one the repository may not use
+    fails the job before it starts, saying so.
+  - The starter set: `dev`, `staging` (the trunk only) and `production` (the trunk only, once
+    whoever made the set approves) in one step for a repository, each unless it has one of that
+    name (`POST /api/ci/environments/starter`, `kiln env starter`, `ci.environments.starter`, and
+    on the board).
+  - An environment's page (`/deployments/environments/:name?repo=`), in place: its kind and
+    where (pickers of kiln CD's clusters, the runners' labels and kiln's integrations), who may
+    deploy and when (reviewers, the self-review rule, the wait timer, branches and tags, the
+    environment it comes after and for how long, the concurrency limit, the URL; its windows and
+    gates kept as written), what a deployment from the trunk would meet once saved, what waits to
+    deploy there, kiln CD's apps there, its deployments, and its secrets and variables. One from
+    the file is read only, saying where it's changed; one made here, or named by a job, is
+    removed here.
+- *Done.* R09, the board (`/deployments/environments`; `GET /api/ci/environments/board`,
+  `ci.environments.board`): every environment of every repository the caller may read runs of, by
+  repository, a row each: what it deploys to and its rules; what runs there, its latest deployment
+  (state, commit, ref, who, its run and URL) and kiln CD's apps there that the repository's deploy
+  file makes (revision, health, drifted when out of sync, who synced it); and what waits to deploy
+  there (each leg held for a review, a wait timer, a window, a promotion, a gate or its turn, with
+  why). The deploy API's environments keep their own board (Releases).
+- Checked by `tests/hosting.rs` (`w15_r08_kinds_the_starter_set_and_the_board`: the starter set
+  made and kept, kinds saved and refused, a kind from the file, a host environment's job on the
+  runner its constraint names and another's waiting unroutable, a platform environment's missing
+  integration failing its job, the board's deployments and waits, and someone who reads another
+  repository seeing none of them) and in Chromium and WebKit, desktop and phone
+  (`ci/ui/environments_check.mjs`: the board, a starter set made there, a kind changed in place
+  and read again, the file's environment read only, production's wait, history and secrets).
+- *Left.* R02's deploying for `container` and `microvm` environments (`kiln/deploy@v1` with a
+  Compose file or an image, CD's), R07 (previews, with CD), and AC02 to AC05, which need the live
+  cluster (W22-AC05).
 
 ### W16 Test results, flaky tests and benchmarks
 
@@ -5746,9 +5788,18 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   build and the UI's checks, on any Linux machine with Docker that builds kiln (`requires:`,
   W05-R22; a v1 pipeline keeps the key and goes by `runs-on`). Each check asserts W21-AC01's two
   page-wide asserts on every page it visits (`ci/ui/layout.mjs`), the review pages' included.
-- *Left.*
-  - R10 (with W15's pages, the CD board's).
-    R09 is the review pages W14-AC06 checks.
+- *Done.* R10: the environments board and an environment's page (W15-R08, R09, under
+  Deployments → Environments), checked in Chromium and WebKit, desktop and phone
+  (`ci/ui/environments_check.mjs`, in `ci/ui/run-all.sh`). R09 is the review pages W14-AC06
+  checks.
+- *Done.* R01, the rest: a step's `with:` completes the inputs of the action it uses (from the
+  catalog: a mirrored action's `action.yml`, kiln's own as theirs would say them), each with
+  whether it's required or its default; and a diagnostic that says what would fix it offers that
+  as its quick action (a script's untrusted input moved into `env:`; an unknown key renamed to the
+  one it likely means). A fix applies only to the text it was made for: once that has changed,
+  the next check's is the one to take. Checked in Chromium and WebKit (`ci/ui/editor_check.mjs`)
+  and by `w21_r01_an_unknown_keys_fix`.
+- *Left.* R04's data flow of outputs and exported environment (with W04-R23).
 
 ### W22 Conformance, end-to-end and performance testing
 

@@ -913,6 +913,49 @@ pub struct EnvArgs {
     cmd: EnvCmd,
 }
 
+/// `kiln env create`'s arguments.
+#[derive(clap::Args)]
+struct EnvCreate {
+    name: String,
+    #[arg(long)]
+    repo: String,
+    /// A required reviewer: a person, or `team:<name>` (repeatable).
+    #[arg(long = "reviewer")]
+    reviewers: Vec<String>,
+    #[arg(long)]
+    prevent_self_review: bool,
+    /// Minutes a job waits before it deploys.
+    #[arg(long, default_value_t = 0)]
+    wait_timer: u32,
+    /// Branches that may deploy (patterns, repeatable); with none and no `--tag`, any ref.
+    #[arg(long = "branch")]
+    branches: Vec<String>,
+    /// Tags that may deploy (patterns, repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    #[arg(long)]
+    url: Option<String>,
+    /// At most this many deployments at once; the rest wait their turn.
+    #[arg(long)]
+    concurrency: Option<u32>,
+    /// What it deploys to: kubernetes, host, container, microvm or platform.
+    #[arg(long)]
+    kind: Option<String>,
+    /// A kiln CD cluster it deploys to (kubernetes; repeatable).
+    #[arg(long = "cluster")]
+    clusters: Vec<String>,
+    /// The namespace it deploys to (kubernetes).
+    #[arg(long)]
+    namespace: Option<String>,
+    /// The runners it deploys on, as a constraint they meet (host, container, microvm):
+    /// `label deploy-web`, `os == linux && label web`.
+    #[arg(long)]
+    runners: Option<String>,
+    /// The integration it deploys through (platform).
+    #[arg(long)]
+    integration: Option<String>,
+}
+
 #[derive(clap::Subcommand)]
 enum EnvCmd {
     /// A repository's environments, their protection and latest deployment.
@@ -921,29 +964,12 @@ enum EnvCmd {
         repo: String,
     },
     /// Make an environment in kiln (or change one made here), with its protection rules.
-    Create {
-        name: String,
+    Create(Box<EnvCreate>),
+    /// Make a repository's starter environments in one step: dev, staging (the trunk only) and
+    /// production (the trunk only, once you approve), each unless it has one of that name.
+    Starter {
         #[arg(long)]
         repo: String,
-        /// A required reviewer: a person, or `team:<name>` (repeatable).
-        #[arg(long = "reviewer")]
-        reviewers: Vec<String>,
-        #[arg(long)]
-        prevent_self_review: bool,
-        /// Minutes a job waits before it deploys.
-        #[arg(long, default_value_t = 0)]
-        wait_timer: u32,
-        /// Branches that may deploy (patterns, repeatable); with none and no `--tag`, any ref.
-        #[arg(long = "branch")]
-        branches: Vec<String>,
-        /// Tags that may deploy (patterns, repeatable).
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        #[arg(long)]
-        url: Option<String>,
-        /// At most this many deployments at once; the rest wait their turn.
-        #[arg(long)]
-        concurrency: Option<u32>,
     },
     /// Remove an environment made in kiln.
     Delete {
@@ -984,16 +1010,36 @@ pub async fn env(args: EnvArgs, cfg: &Config) -> Result<()> {
                     rules.push(format!("{n} at once"));
                 }
                 let last = e.get("latest_deployment").filter(|d| !d.is_null()).map(|d| format!("; last: {} {} {}", s(d, "state"), s(d, "ref"), s(d, "sha").get(..8).unwrap_or_default())).unwrap_or_default();
-                println!("{:<16} ({}) {}{last}", s(&e, "name"), s(&e, "source"), if rules.is_empty() { "no protection".to_owned() } else { rules.join("; ") });
+                let kind = match s(&e, "kind").as_str() {
+                    "" => String::new(),
+                    k => {
+                        let t = e.get("targets").cloned().unwrap_or_default();
+                        let list = |k: &str| t.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                        let at = [list("clusters"), s(&t, "namespace"), s(&t, "runners"), s(&t, "integration")].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" / ");
+                        format!(" {k}{}", if at.is_empty() { String::new() } else { format!(" ({at})") })
+                    }
+                };
+                println!("{:<16} ({}){kind} {}{last}", s(&e, "name"), s(&e, "source"), if rules.is_empty() { "no protection".to_owned() } else { rules.join("; ") });
             }
         }
-        EnvCmd::Create { name, repo, reviewers, prevent_self_review, wait_timer, branches, tags, url, concurrency } => {
+        EnvCmd::Create(c) => {
+            let EnvCreate { name, repo, reviewers, prevent_self_review, wait_timer, branches, tags, url, concurrency, kind, clusters, namespace, runners, integration } = *c;
             let protection = json!({
                 "reviewers": reviewers, "prevent-self-review": prevent_self_review, "wait-timer": wait_timer,
                 "branches": (!branches.is_empty()).then_some(branches), "tags": (!tags.is_empty()).then_some(tags),
             });
-            api.call(Method::Put, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), Some(json!({ "protection": protection, "url": url, "concurrency": concurrency }))).await?;
+            let targets = json!({ "clusters": clusters, "namespace": namespace, "runners": runners, "integration": integration });
+            api.call(Method::Put, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), Some(json!({ "protection": protection, "url": url, "concurrency": concurrency, "kind": kind, "targets": targets }))).await?;
             println!("{name} saved in {repo}");
+        }
+        EnvCmd::Starter { repo } => {
+            let v = api.call(Method::Post, &format!("/environments/starter?repo={}", enc(&repo)), None).await?;
+            let names = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            match (names("made"), names("kept")) {
+                (made, kept) if made.is_empty() => println!("{repo} has them all already: {kept}"),
+                (made, kept) if kept.is_empty() => println!("made {made} in {repo}"),
+                (made, kept) => println!("made {made} in {repo} (it had {kept})"),
+            }
         }
         EnvCmd::Delete { name, repo } => {
             api.call(Method::Delete, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), None).await?;

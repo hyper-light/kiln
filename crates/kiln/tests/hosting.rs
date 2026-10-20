@@ -2183,6 +2183,137 @@ fn w15_r01_an_environments_deployments_one_at_a_time() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W15-R02, R08 and R09: environments of each kind, the starter set and the board. A host
+/// environment's jobs run on its runners: on the runner they name, or nowhere (waiting, unroutable)
+/// when no runner meets them. A platform environment's jobs get its integration (one the
+/// repository can't use fails the job before it starts). A kind comes from the file too, from its
+/// targets. The board has every environment, its latest deployment and what waits to deploy there,
+/// narrowed to the repositories its caller may read.
+#[test]
+fn w15_r08_kinds_the_starter_set_and_the_board() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    for name in ["acme/kinds", "acme/other"] {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+    }
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "kinds\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/kinds.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    // acme/other has no commits to look at: only acme/kinds is waited for.
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        let repos: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
+        let polled = repos.iter().any(|r| text(r, "name") == "acme/kinds" && r.get("last_polled_at").is_some_and(|t| !t.is_null()));
+        Ok((!polled).then_some(body))
+    })?;
+
+    // The starter set: made once, kept the second time.
+    let (st, body) = http(s.port, "POST", "/api/ci/environments/starter?repo=acme/kinds", &s.admin, Some(&json!({})))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    assert_eq!(serde_json::from_str::<Value>(&body)?.get("made"), Some(&json!(["dev", "staging", "production"])), "{body}");
+    let (_, body) = http(s.port, "POST", "/api/ci/environments/starter?repo=acme/kinds", &s.admin, Some(&json!({})))?;
+    let again: Value = serde_json::from_str(&body)?;
+    assert_eq!(again.get("made"), Some(&json!([])), "{body}");
+    assert_eq!(again.get("kept").and_then(Value::as_array).map(Vec::len), Some(3), "{body}");
+    let (_, body) = http(s.port, "GET", "/api/ci/environments/production?repo=acme/kinds", &s.admin, None)?;
+    let production: Value = serde_json::from_str(&body)?;
+    assert_eq!(production.pointer("/protection/reviewers"), Some(&json!(["owner"])), "made by the server's own token: {body}");
+    assert_eq!(production.pointer("/protection/branches"), Some(&json!(["main"])), "the trunk only: {body}");
+
+    // Kinds, saved and refused.
+    let save = |name: &str, body: Value| -> anyhow::Result<(u16, Value)> {
+        let (st, b) = http(s.port, "PUT", &format!("/api/ci/environments/{name}?repo=acme/kinds"), &s.admin, Some(&body))?;
+        Ok((st, serde_json::from_str(&b).unwrap_or(json!({ "text": b }))))
+    };
+    let (st, web) = save("web", json!({ "kind": "host", "targets": { "runners": "label local", "clusters": ["dropped"] } }))?;
+    anyhow::ensure!(st == 200, "{st} {web}");
+    assert_eq!(web.get("targets"), Some(&json!({ "runners": "label local" })), "only what its kind deploys to: {web}");
+    for (name, body, why) in [
+        ("bad", json!({ "kind": "host" }), "runners"),
+        ("bad", json!({ "kind": "kubernetes", "targets": { "clusters": [] } }), "clusters"),
+        ("bad", json!({ "kind": "space" }), "isn't a kind"),
+        ("bad", json!({ "kind": "host", "targets": { "runners": "label (" } }), "its runners"),
+        ("bad", json!({ "kind": "platform" }), "integration"),
+    ] {
+        let (st, v) = save(name, body.clone())?;
+        assert_eq!(st, 400, "{body}: {v}");
+        assert!(v.to_string().contains(why), "{body}: {v}");
+    }
+    for (name, body) in [("nowhere", json!({ "kind": "host", "targets": { "runners": "label nowhere" } })), ("site", json!({ "kind": "platform", "targets": { "integration": "nope" } }))] {
+        let (st, v) = save(name, body)?;
+        anyhow::ensure!(st == 200, "{st} {v}");
+    }
+
+    // A kind from the file, and the jobs deploying to each.
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/environments.yaml"), "cluster:\n  clusters: [in-cluster]\n  namespace: web\n")?;
+    let job = |id: &str, env: &str| format!("  {id}:\n    runs-on: local\n    checkout: false\n    environment: {env}\n    steps:\n      - run: echo deploying to {env}\n");
+    std::fs::write(work.join(".kiln/deploys.yaml"), format!("on: push\njobs:\n{}{}{}{}", job("toweb", "web"), job("tonowhere", "nowhere"), job("tosite", "site"), job("toprod", "production")))?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "deploys"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let (run, legs) = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/kinds&limit=5", &s.admin, None)?;
+        let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = list.into_iter().find(|r| text(r, "workflow").ends_with("deploys.yaml")) {
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(&r, "id")), &s.admin, None)?;
+            let legs = serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
+            let of = |job: &str| legs.iter().find(|l| text(l, "job") == job).cloned().unwrap_or_default();
+            let reason = |job: &str| of(job).pointer("/wait_reason/reason").and_then(Value::as_str).unwrap_or_default().to_owned();
+            if text(&of("toweb"), "status") == "succeeded" && text(&of("tosite"), "status") == "failed" && reason("tonowhere") == "unroutable" && reason("toprod") == "approval" {
+                break (text(&r, "id").to_owned(), legs);
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the deployments didn't settle: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let of = |job: &str| legs.iter().find(|l| text(l, "job") == job).cloned().unwrap_or_default();
+    assert!(of("tonowhere").pointer("/wait_reason/failing").is_some_and(|f| f.to_string().contains("label nowhere")), "the environment's runners: {}", of("tonowhere"));
+    let (_, notes) = http(s.port, "GET", &format!("/api/ci/runs/{run}/annotations"), &s.admin, None)?;
+    let said = serde_json::from_str::<Value>(&notes)?.get("annotations").and_then(Value::as_array).is_some_and(|a| a.iter().any(|n| text(n, "leg") == text(&of("tosite"), "id") && text(n, "message").contains("nope")));
+    assert!(said, "the platform's integration, said on its leg: {notes}");
+
+    // The board: the latest deployment, what waits, the file's kind (trunk's file is read again
+    // once what was read of it is 20 s old).
+    let mut body = String::new();
+    until(60, "the file's environment on the board", || {
+        let (st, b) = http(s.port, "GET", "/api/ci/environments/board", &s.admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {b}");
+        body = b.clone();
+        Ok((!b.contains("\"name\":\"cluster\"")).then_some(b))
+    })?;
+    let rows: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("environments").and_then(Value::as_array).cloned().unwrap_or_default();
+    let row = |name: &str| rows.iter().find(|e| text(e, "repo") == "acme/kinds" && text(e, "name") == name).cloned().unwrap_or_default();
+    assert_eq!(row("web").pointer("/latest_deployment/state").and_then(Value::as_str), Some("success"), "{body}");
+    assert!(row("production").get("waiting").and_then(Value::as_array).is_some_and(|w| w.iter().any(|w| w.pointer("/wait/reason").and_then(Value::as_str) == Some("approval") && text(w, "leg") == text(&of("toprod"), "id"))), "{body}");
+    assert_eq!(row("cluster").get("kind").and_then(Value::as_str), Some("kubernetes"), "from its clusters: {body}");
+    assert_eq!(row("cluster").get("targets"), Some(&json!({ "clusters": ["in-cluster"], "namespace": "web" })), "{body}");
+    assert_eq!(row("cluster").get("source").and_then(Value::as_str), Some("file"), "{body}");
+    let (_, body) = http(s.port, "GET", "/api/ci/environments/production?repo=acme/kinds", &s.admin, None)?;
+    assert!(serde_json::from_str::<Value>(&body)?.get("waiting").and_then(Value::as_array).is_some_and(|w| w.len() == 1), "one environment's page says what waits: {body}");
+
+    // Narrowed: someone who reads only acme/other sees none of acme/kinds.
+    let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "watcher", "grants": ["viewer@repo:acme/other"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "pat", "user": "watcher", "grants": ["owner"] })))?;
+    let watcher = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (st, body) = http(s.port, "GET", "/api/ci/environments/board", &watcher, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    assert!(!body.contains("acme/kinds"), "{body}");
+    let (st, _) = http(s.port, "GET", "/api/ci/environments?repo=acme/kinds", &watcher, None)?;
+    assert_eq!(st, 403);
+    Ok(())
+}
+
 /// W09-AC07: an environment's secret reaches a leg only after its deployment is approved. While
 /// the leg waits for its reviewer nothing is sent (the secret is never used); once approved, the
 /// leg gets it and its use is recorded.
