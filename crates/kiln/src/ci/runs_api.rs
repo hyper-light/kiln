@@ -152,6 +152,81 @@ pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<R
     Ok(srv::json(StatusCode::OK, &g))
 }
 
+/// `GET /api/ci/runs/:id/flow` (W04-R23), in the attempt asked for: each job output, from the
+/// step whose output it reads to the jobs that read it (where in each, and their legs), with the
+/// value each leg gave it (a secret's never, a long one cut); and each job's exported environment
+/// (the names its legs set) and the jobs that take it (`env-from`). Nothing for a run without a
+/// plan.
+pub async fn flow(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    run_json(hub, id).await?;
+    let run = id.to_owned();
+    let model: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT workflow FROM ci_plans WHERE run_id = ?1", [&run], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let Some(wf) = model.and_then(|m| serde_json::from_str::<kiln_ci::wf::Workflow>(&m).ok()) else {
+        return Ok(srv::json(StatusCode::OK, &json!({ "outputs": [], "exports": [] })));
+    };
+    let f = kiln_ci::wf::flow::flow(&wf);
+    let attempt = attempt_of(q);
+    let legs = legs(hub, id, attempt).await?;
+    // What each leg reported, by its key.
+    let run = id.to_owned();
+    let reports: HashMap<String, Value> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT leg, report FROM ci_plan_log WHERE run_id = ?1 AND kind = 'leg' AND attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY seq")?;
+            let rows = st.query_map(params![run, attempt], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, Option<String>>(1)?.unwrap_or_default())))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().map(|(k, r)| (k, serde_json::from_str(&r).unwrap_or(Value::Null))).collect())
+        })
+        .await
+        .map_err(internal)?;
+    let legs_of = |job: &str| legs.iter().filter(|l| l.get("job").and_then(Value::as_str).is_some_and(|j| j.eq_ignore_ascii_case(job))).collect::<Vec<_>>();
+    let brief = |l: &&Value| json!({ "leg": l.get("id"), "key": l.get("key"), "status": l.get("status") });
+    // A report's `[name, value]` pair of `name`, in its list `k`.
+    let pair = |r: Option<&Value>, k: &str, name: &str| -> Option<Value> {
+        r?.get(k)?.as_array()?.iter().find(|p| p.get(0).and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(name)))?.get(1).cloned()
+    };
+    let clip = |v: String| if v.chars().count() > 200 { format!("{}…", v.chars().take(200).collect::<String>()) } else { v };
+    let outputs: Vec<Value> = f
+        .outputs
+        .iter()
+        .map(|o| {
+            let values: Vec<Value> = legs_of(&o.job)
+                .into_iter()
+                .map(|l| {
+                    let key = l.get("key").and_then(Value::as_str).unwrap_or_default();
+                    let r = reports.get(key);
+                    let secret = o.secret || r.and_then(|r| r.get("secret_outputs")).and_then(Value::as_array).is_some_and(|a| a.iter().any(|n| n.as_str().is_some_and(|n| n.eq_ignore_ascii_case(&o.name))));
+                    let given = pair(r, "outputs", &o.name).and_then(|v| v.as_str().map(str::to_owned)).or_else(|| pair(r, "json_outputs", &o.name).map(|v| v.to_string()));
+                    json!({ "leg": l.get("id"), "key": key, "secret": secret, "value": if secret { None } else { given.map(clip) } })
+                })
+                .collect();
+            let readers: Vec<Value> = o.readers.iter().map(|r| json!({ "job": r.job, "at": r.at, "legs": legs_of(&r.job).iter().map(brief).collect::<Vec<_>>() })).collect();
+            json!({ "job": o.job, "name": o.name, "step": o.step.as_ref().map(|(i, id)| json!({ "index": i, "id": id })), "secret": o.secret, "values": values, "readers": readers })
+        })
+        .collect();
+    let exports: Vec<Value> = f
+        .exports
+        .iter()
+        .map(|e| {
+            let set: Vec<Value> = legs_of(&e.job)
+                .into_iter()
+                .map(|l| {
+                    let key = l.get("key").and_then(Value::as_str).unwrap_or_default();
+                    let names: Vec<String> = reports
+                        .get(key)
+                        .and_then(|r| r.get("env"))
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|p| p.get(0).and_then(Value::as_str).map(str::to_owned)).collect())
+                        .unwrap_or_default();
+                    json!({ "leg": l.get("id"), "key": key, "names": names })
+                })
+                .collect();
+            let readers: Vec<Value> = e.readers.iter().map(|r| json!({ "job": r, "legs": legs_of(r).iter().map(brief).collect::<Vec<_>>() })).collect();
+            json!({ "job": e.job, "names": e.names, "legs": set, "readers": readers })
+        })
+        .collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "outputs": outputs, "exports": exports })))
+}
+
 /// The workflow's jobs as the run's plan has them (W21-R04), each whether its legs are made yet
 /// or not (a job's are made once what it needs is done): its name, what it needs, whether its
 /// matrix comes from what it needs (`matrix_waits`: then how many legs it has is known only once

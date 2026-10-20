@@ -167,6 +167,10 @@ pub fn ops() -> &'static [Op] {
                     super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "asked": true, "ref": git_ref }))
                 }),
+            op!("ci.runs.flow", "A run's data flow (W04-R23): each job output, from the step that made it to the jobs that read it (where in each, and their legs), with each leg's value (never a secret's); and each job's exported environment and the jobs that take it.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "flow"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::flow(&cx.hub, &text(&v, "run")?, &HashMap::new()).await).await }),
             op!("ci.runs.compare", "What changed between two runs of a workflow, or since its last green run (`other`: a run's id or `last-green`, the default): the actions, variables, environment, images, machines and cache that differ, the files changed between the commits, and each leg's steps side by side.", ro: true, destructive: false,
                 input: || schema(json!({"run": {"type": "string", "description": RUN}, "other": {"type": "string", "description": "The run to compare with, or `last-green`."}}), &["run"]),
                 route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "compare", v.get("other").and_then(Value::as_str).unwrap_or("last-green")]), HashMap::new())),

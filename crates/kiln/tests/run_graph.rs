@@ -1,7 +1,7 @@
 //! The run graph's data (docs/ci.md W21-R04): every job of the workflow, its legs made or not (a
 //! job's are made once what it needs is done), with what it needs, whether its matrix waits on
-//! what it needs, its steps and how long it typically takes; and each matrix leg's values, where
-//! it sits in its job's grid.
+//! what it needs, its steps and how long it typically takes; each matrix leg's values, where it
+//! sits in its job's grid; and the run's data flow (W04-R23).
 
 #![cfg(unix)]
 
@@ -20,19 +20,21 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `fan`'s matrix comes from `plan`'s outputs; `last` needs `fan`. `plan` takes a while, so the
-/// graph is read while the other two have no legs.
+/// `fan`'s matrix comes from `plan`'s outputs; `last` needs `fan`, and takes `plan`'s exported
+/// environment. `plan` takes a while, so the graph is read while the other two have no legs.
 const WORKFLOW: &str = r#"on: push
 jobs:
   plan:
     runs-on: local
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
+    exports: { env: [PLAN_DIR] }
     steps:
       - id: m
         run: |
           sleep 4
           echo 'matrix={"n":[1,2],"os":["a"]}' >> "$GITHUB_OUTPUT"
+          echo "PLAN_DIR=/tmp/plan" >> "$GITHUB_ENV"
   fan:
     needs: plan
     runs-on: local
@@ -42,10 +44,11 @@ jobs:
       - run: echo "fan ${{ matrix.n }} ${{ matrix.os }}"
   last:
     name: The last one
-    needs: fan
+    needs: [fan, plan]
+    env-from: [plan]
     runs-on: local
     steps:
-      - run: 'true'
+      - run: test "$PLAN_DIR" = /tmp/plan
       - run: 'true'
 "#;
 
@@ -135,6 +138,21 @@ fn w21_r04_the_run_graph_from_the_plan() -> anyhow::Result<()> {
     fan.sort_by(|a, b| a.0.total_cmp(&b.0));
     assert_eq!(fan, [(1.0, "a".to_owned()), (2.0, "a".to_owned())], "each leg's values, as the run page reads them: {v1}");
     assert!(v1.get("jobs").and_then(Value::as_array).is_some_and(|l| l.iter().filter(|j| j.get("key").and_then(Value::as_str) == Some("plan")).all(|j| j.get("matrix").is_none())), "a leg of no matrix has none: {v1}");
+
+    // Its data flow (W04-R23): plan's output, from its step, read by fan's matrix in both of fan's
+    // legs; plan's exported environment, set by its leg and taken by last.
+    let flow = get(s.port, &s.admin, &format!("/api/ci/runs/{first}/flow"))?;
+    let out = flow.pointer("/outputs/0").cloned().unwrap_or_default();
+    assert_eq!(out.get("name").and_then(Value::as_str), Some("matrix"), "{flow}");
+    assert_eq!(out.pointer("/step/id").and_then(Value::as_str), Some("m"), "{flow}");
+    assert_eq!(out.pointer("/values/0/value").and_then(Value::as_str), Some(r#"{"n":[1,2],"os":["a"]}"#), "{flow}");
+    let fan = out.get("readers").and_then(Value::as_array).and_then(|r| r.iter().find(|r| r.get("job").and_then(Value::as_str) == Some("fan"))).cloned().unwrap_or_default();
+    assert!(fan.get("at").is_some_and(|a| a.to_string().contains("strategy.matrix")), "{flow}");
+    assert_eq!(fan.get("legs").and_then(Value::as_array).map(Vec::len), Some(2), "the legs that read it: {flow}");
+    let exported = flow.pointer("/exports/0").cloned().unwrap_or_default();
+    assert_eq!(exported.get("names"), Some(&serde_json::json!(["PLAN_DIR"])), "{flow}");
+    assert_eq!(exported.pointer("/legs/0/names"), Some(&serde_json::json!(["PLAN_DIR"])), "set by its leg: {flow}");
+    assert_eq!(exported.pointer("/readers/0/job").and_then(Value::as_str), Some("last"), "{flow}");
 
     // The next run: how long each job took the last time it succeeded.
     std::fs::write(repo.join("README.md"), "graph, again\n")?;

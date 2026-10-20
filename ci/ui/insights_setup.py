@@ -190,6 +190,61 @@ while True:
     assert time.time() < deadline, f"the diff's run didn't finish: {rl}"
     time.sleep(0.5)
 
+# W04-R23's data flow, in a repository of its own: one job's output and exported environment,
+# which a second job reads and takes.
+call("POST", "/api/repos", admin, {"name": "acme/flow", "mode": "native"})
+flow_url = f"http://x:{admin}@127.0.0.1:{port}/git/acme/flow.git"
+flow_repo = os.path.join(work, "flow")
+os.makedirs(flow_repo)
+git(flow_repo, "init", "-q", "-b", "main")
+open(os.path.join(flow_repo, "README.md"), "w").write("flow\n")
+git(flow_repo, "add", ".")
+git(flow_repo, "commit", "-qm", "first")
+git(flow_repo, "push", "-q", flow_url, "main")
+deadline = time.time() + 60
+while time.time() < deadline:
+    rs = call("GET", "/api/repos", admin)
+    rs = rs.get("repos", rs) if isinstance(rs, dict) else rs
+    if any(r.get("name") == "acme/flow" and r.get("last_polled_at") for r in rs):
+        break
+    time.sleep(0.5)
+os.makedirs(os.path.join(flow_repo, ".kiln"))
+open(os.path.join(flow_repo, ".kiln", "flow.yaml"), "w").write("""on: push
+jobs:
+  make:
+    runs-on: local
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    exports: { env: [TOOL_HOME] }
+    steps:
+      - run: echo setting up
+      - id: v
+        run: |
+          echo "version=4.2.0" >> "$GITHUB_OUTPUT"
+          echo "TOOL_HOME=/opt/tool" >> "$GITHUB_ENV"
+  use:
+    needs: make
+    runs-on: local
+    env-from: [make]
+    env:
+      VERSION: ${{ needs.make.outputs.version }}
+    steps:
+      - run: echo "$VERSION from $TOOL_HOME"
+""")
+git(flow_repo, "add", ".")
+git(flow_repo, "commit", "-qm", "flow")
+git(flow_repo, "push", "-q", flow_url, "main")
+deadline = time.time() + 240
+flow_run = None
+while flow_run is None:
+    rl = call("GET", "/api/ci/runs?repo=acme/flow&limit=5", admin).get("runs", [])
+    done = [r for r in rl if r.get("workflow", "").endswith("flow.yaml") and r.get("finished_at")]
+    if done:
+        flow_run = done[0]["id"]
+        break
+    assert time.time() < deadline, f"the flow's run didn't finish: {rl}"
+    time.sleep(0.5)
+
 # A second kind of runner: the same metrics, a little faster, one a day over the last ten days.
 dbs = [p for p in glob.glob(os.path.join(data, "**", "*.db"), recursive=True)]
 db = None
@@ -219,4 +274,4 @@ for name, rs in by_name.items():
 db.commit()
 fp = db.execute("SELECT DISTINCT fingerprint FROM metrics").fetchall()
 db.close()
-print(json.dumps({"base": base, "admin": admin, "pid": proc.pid, "runs": runs, "fingerprints": [f[0] for f in fp]}))
+print(json.dumps({"base": base, "admin": admin, "pid": proc.pid, "runs": runs, "fingerprints": [f[0] for f in fp], "flow_run": flow_run}))

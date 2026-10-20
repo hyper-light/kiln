@@ -180,6 +180,27 @@ export interface CiEnvironment {
   waiting?: CiEnvWait[];
 }
 
+/** A run's data flow (W04-R23): its outputs from where they're made to who reads them, and its exports. */
+export interface CiFlow {
+  outputs: {
+    job: string;
+    name: string;
+    /** The step whose output it reads (by index from 0, and id); null when the job sets it as a whole. */
+    step: { index: number; id: string } | null;
+    secret: boolean;
+    /** Each of the job's legs, with the value it gave (never a secret's). */
+    values: { leg: string; key: string; secret: boolean; value: string | null }[];
+    /** The jobs that read it, where in each (`if`, `env.VERSION`, `steps[1].run`), and their legs. */
+    readers: { job: string; at: string[]; legs: { leg: string; key: string; status: string }[] }[];
+  }[];
+  exports: {
+    job: string;
+    names: string[];
+    legs: { leg: string; key: string; names: string[] }[];
+    readers: { job: string; legs: { leg: string; key: string; status: string }[] }[];
+  }[];
+}
+
 export interface CiAnnotation {
   leg: string;
   leg_key: string;
@@ -719,6 +740,7 @@ export const ci = {
   buildImage: (repo: string, body: { name: string; kind: "dockerfile" | "agentfile"; content: string; platforms: string[]; runs_on: string; push: boolean }) =>
     request<{ run: string; sha: string; trusted: boolean }>("POST", `/api/ci/images/build?repo=${enc(repo)}`, body),
   graph: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<CiGraph>("GET", `/api/ci/runs/${enc(id)}/graph${at(attempt)}`, undefined, { signal }),
+  flow: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<CiFlow>("GET", `/api/ci/runs/${enc(id)}/flow${at(attempt)}`, undefined, { signal }),
   annotations: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),
   summaries: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<{ summaries: CiSummary[] }>("GET", `/api/ci/runs/${enc(id)}/summary${at(attempt)}`, undefined, { signal }),

@@ -13,6 +13,7 @@
 
 pub mod action;
 pub mod diag;
+pub mod flow;
 pub mod front;
 pub mod ir;
 pub mod keys;

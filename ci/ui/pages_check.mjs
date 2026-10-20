@@ -2,6 +2,8 @@
 // Chromium and WebKit at 1440×900 and 390×844: each page's primary task end to end, then nothing on
 // it scrolling sideways and nothing fixed but the shell's own (layout.mjs), and a screenshot.
 // - A leg's page: its step's log opened and searched for what the step printed.
+// - A run's data flow (W04-R23): an output from its step to the job that reads it and where, and
+//   an exported environment and the job that takes it.
 // - Comparing two runs: what differs, the files changed between them, the steps side by side.
 // - Log search: what every run printed, found among the repository's runs.
 // - The land queue, and a diff's stack.
@@ -77,6 +79,23 @@ for (const [name, type, phone] of [
         check(who, "a leg's page: its step's log, searched", await until(async () => (await found.count()) > 0, 20000), await text(page.locator("main").first()));
         await checkLayout(check, `${who}: a leg's page`, page);
         await shot("leg");
+      });
+
+      await flow(`${who}: a run's data flow`, async () => {
+        await page.goto(`${cfg.base}/runs/${cfg.flow_run}`);
+        const panel = page.getByRole("list", { name: "The run's outputs and exports" });
+        check(
+          who,
+          "a run's data flow: the output, its step and value, the job that reads it and where",
+          await until(async () => {
+            const t = await text(panel);
+            return /make\.outputs\.version/.test(t) && /from its step v/.test(t) && /4\.2\.0/.test(t) && /use/.test(t) && /env\.VERSION/.test(t);
+          }, 20000),
+          await text(panel),
+        );
+        check(who, "and the exported environment, the job that takes it", /make\.exports\.env/.test(await text(panel)) && /TOOL_HOME/.test(await text(panel)) && /env-from/.test(await text(panel)), await text(panel));
+        await checkLayout(check, `${who}: a run's data flow`, page);
+        await shot("flow");
       });
 
       await flow(`${who}: comparing runs`, async () => {

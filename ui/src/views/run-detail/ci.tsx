@@ -9,8 +9,12 @@ import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { DataFlow } from "./flow";
+
+/** The data flow's values come as legs end: it's read again as the run moves. */
+const FLOW_OPTS = { on: ["run"], pollMs: 30_000 } as const;
 
 const Markdown = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
 const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
@@ -237,11 +241,20 @@ function DeployReview({ detail }: { detail: CiRunDetail }) {
 /** What the run left: summaries, annotations, artifacts, and the actions it pinned. */
 export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: number | undefined }) {
   const id = detail.run.id;
-  const summaries = useSuspenseResource(`ci-run/${id}/summary/${attempt ?? ""}`, (s) => ci.summaries(id, attempt, s)).data.summaries;
-  const annotations = useSuspenseResource(`ci-run/${id}/annotations/${attempt ?? ""}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
+  const a = attempt ?? "";
+  // Each read below suspends before the next would start: fetched at once instead.
+  preload(`ci-run/${id}/summary/${a}`, (s) => ci.summaries(id, attempt, s));
+  preload(`ci-run/${id}/annotations/${a}`, (s) => ci.annotations(id, attempt, s));
+  preload(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s));
+  preload(`ci-run/${id}/tests/${a}`, (s) => ci.tests(id, attempt, s));
+  preload(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s));
+  preload(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), FLOW_OPTS);
+  const summaries = useSuspenseResource(`ci-run/${id}/summary/${a}`, (s) => ci.summaries(id, attempt, s)).data.summaries;
+  const annotations = useSuspenseResource(`ci-run/${id}/annotations/${a}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
   const artifacts = useSuspenseResource(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s)).data.artifacts;
-  const tests = useSuspenseResource(`ci-run/${id}/tests/${attempt ?? ""}`, (s) => ci.tests(id, attempt, s)).data;
+  const tests = useSuspenseResource(`ci-run/${id}/tests/${a}`, (s) => ci.tests(id, attempt, s)).data;
   const metrics = useSuspenseResource(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s)).data.metrics;
+  const flow = useSuspenseResource(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), FLOW_OPTS).data;
   return (
     <div className="mt-6 flex flex-col gap-4">
       {tests.tests.length > 0 && <Tests list={tests.tests} counts={tests.counts} />}
@@ -276,6 +289,7 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
           </ul>
         </Panel>
       )}
+      {flow.outputs.length + flow.exports.length > 0 && <DataFlow flow={flow} run={id} />}
       {detail.actions.length > 0 && (
         <Panel
           eyebrow={`Actions · ${detail.actions.length}`}

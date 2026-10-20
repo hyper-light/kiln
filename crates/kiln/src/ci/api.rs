@@ -287,6 +287,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::GET, ["runs", id]) => boxed(|| super::runs_api::get(hub, id, q)).await,
         (&Method::GET, ["runs", id, "graph"]) => boxed(|| super::runs_api::graph(hub, id, q)).await,
+        (&Method::GET, ["runs", id, "flow"]) => boxed(|| super::runs_api::flow(hub, id, q)).await,
         // W19-R03: what changed between two runs or legs (`last-green`: since the last success).
         (&Method::GET, ["runs", id, "compare", other]) => boxed(|| super::compare::runs(hub, id, other)).await,
         (&Method::GET, ["runs", id, "attestations"]) => boxed(|| super::attest::for_run(hub, id)).await,
