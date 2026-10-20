@@ -150,9 +150,10 @@ struct Sink {
     now_ns: i64,
     /// What each line is asked before a record is made of it ([`Compiled::write`]).
     filters: PipelineFilters,
-    /// A line's room, back from one written as its row (or left out), for the next line's text;
-    /// and the room a mask writes a line into.
-    line: String,
+    /// Lines' room, back from those written as their rows (or left out), for the next lines' text
+    /// (two: a container's line, and the line it joins into); and the room a mask writes a line
+    /// into.
+    lines: Vec<String>,
     mask: String,
 }
 
@@ -161,19 +162,19 @@ const LINE_ROOM: usize = 64 << 10;
 
 impl Sink {
     fn new(now_ns: i64) -> Self {
-        Self { batch: Batch::default(), excluded: 0, truncated: 0, now_ns, filters: PipelineFilters::default(), line: String::new(), mask: String::new() }
+        Self { batch: Batch::default(), excluded: 0, truncated: 0, now_ns, filters: PipelineFilters::default(), lines: Vec::with_capacity(2), mask: String::new() }
     }
 
-    /// Room for a line's text: the last line's, if it came back.
+    /// Room for a line's text: a line's before it, if one came back.
     fn room(&mut self) -> String {
-        let mut s = std::mem::take(&mut self.line);
+        let mut s = self.lines.pop().unwrap_or_default();
         s.clear();
         s
     }
 
     fn give(&mut self, text: String) {
-        if text.capacity() <= LINE_ROOM {
-            self.line = text;
+        if text.capacity() <= LINE_ROOM && self.lines.len() < 2 {
+            self.lines.push(text);
         }
     }
 }
@@ -383,7 +384,7 @@ impl Tail {
         let whole = match c.format {
             Format::Cri => match cri(&text) {
                 Some((ts, stream, partial, msg)) => {
-                    let p = self.part.get_or_insert_with(|| Line { ts, stream: Some(stream), ..Line::default() });
+                    let p = self.part.get_or_insert_with(|| Line { ts, stream: Some(stream), text: sink.room(), ..Line::default() });
                     if p.text.len() + msg.len() <= MAX_LINE {
                         p.text.push_str(msg);
                     } else {
@@ -400,7 +401,7 @@ impl Tail {
             },
             Format::Docker => match docker(&text) {
                 Some((ts, stream, partial, log)) => {
-                    let p = self.part.get_or_insert_with(|| Line { ts, stream: Some(stream), ..Line::default() });
+                    let p = self.part.get_or_insert_with(|| Line { ts, stream: Some(stream), text: sink.room(), ..Line::default() });
                     if p.text.len() + log.len() <= MAX_LINE {
                         p.text.push_str(&log);
                     } else {

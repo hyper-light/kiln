@@ -415,25 +415,36 @@ pub(crate) struct PipelineFilters {
     pub scratch: super::pipeline::Scratch,
 }
 
-/// A text line's fields as its record would hold them ([`Compiled::record`]), borrowed: what a
-/// pipeline's filter is asked of, and what its row is written of, with no record made.
+/// A line's fields as its record would hold them ([`Compiled::record`]), borrowed (a JSON line's
+/// from the room its reading keeps): what a pipeline's filter is asked of, and what its row is
+/// written of, with no record made.
 struct LineView<'a> {
     message: &'a str,
     service: &'a str,
     host: &'a str,
     source: &'a str,
     severity: u8,
+    /// A JSON line's fields: its record's first attributes.
+    fields: Option<&'a Flat>,
     origin: &'a [(String, String)],
     stream: Option<&'a str>,
     truncated: bool,
     tags: &'a [(String, String)],
+    trace_id: Option<[u8; 16]>,
+    span_id: Option<[u8; 8]>,
 }
 
 impl<'a> LineView<'a> {
     /// Its attributes, in its record's order.
     fn attrs(&self) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
         let pair = |(k, v): &'a (String, String)| (k.as_str(), v.as_str());
-        self.origin.iter().map(pair).chain(self.stream.map(|s| ("log.iostream", s))).chain(self.truncated.then_some(("truncated", "true"))).chain(self.tags.iter().map(pair))
+        self.fields
+            .into_iter()
+            .flat_map(Flat::iter)
+            .chain(self.origin.iter().map(pair))
+            .chain(self.stream.map(|s| ("log.iostream", s)))
+            .chain(self.truncated.then_some(("truncated", "true")))
+            .chain(self.tags.iter().map(pair))
     }
 }
 
@@ -457,10 +468,10 @@ impl kiln_obs::logs::search::Fields for LineView<'_> {
         self.attrs().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
     fn trace_id(&self) -> Option<[u8; 16]> {
-        None
+        self.trace_id
     }
     fn span_id(&self) -> Option<[u8; 8]> {
-        None
+        self.span_id
     }
 }
 
@@ -499,88 +510,111 @@ impl Compiled {
         true
     }
 
-    /// A line into `b`: a text line no active pipeline reads as its row, written from the line as
-    /// it is, nothing else made of it (the row its record would write: a test holds them alike),
-    /// and its text back (only read) for the next line's; any other as its record
-    /// ([`Compiled::record`]), for the pipelines that read it, a JSON line's fields, or a service
-    /// check's status.
-    pub(crate) fn write<M>(&self, line: Line, origin: &Origin, now_ns: i64, b: &mut Batch<M>, filters: &mut PipelineFilters) -> Option<String> {
-        let json = match self.format {
+    /// Whether a line is read as JSON: its format's say, or (`auto`, a container's) an object's `{`.
+    fn json(&self, text: &str) -> bool {
+        match self.format {
             Format::Json => true,
-            Format::Auto | Format::Cri | Format::Docker => line.text.trim_start().starts_with('{'),
+            Format::Auto | Format::Cri | Format::Docker => text.trim_start().starts_with('{'),
             Format::Text => false,
-        };
-        if json || self.source == kiln_obs::monitor::checks::SOURCE {
+        }
+    }
+
+    /// A line into `b`: one no active pipeline reads as its row, written from the line as it was
+    /// read (a JSON line's fields from the room its reading keeps), nothing else made of it (the
+    /// row its record would write: a test holds them alike), and its text back for the next
+    /// line's; one a pipeline reads, or a service check's run, as its record
+    /// ([`Compiled::record`]).
+    pub(crate) fn write<M>(&self, line: Line, origin: &Origin, now_ns: i64, b: &mut Batch<M>, filters: &mut PipelineFilters) -> Option<String> {
+        if self.source == kiln_obs::monitor::checks::SOURCE {
             b.push(self.record(line, origin, now_ns));
             return None;
         }
-        let view = LineView {
-            // As its record keeps it (`cloud::message`), so a filter reads what a record's would.
-            message: kiln_obs::logs::record::cut(&line.text, kiln_obs::logs::record::MAX_MESSAGE_BYTES),
-            service: self.service.as_deref().or(origin.service.as_deref()).unwrap_or(&self.name),
-            host: &self.host,
-            source: &self.source,
-            severity: super::cloud::severity_of(&line.text),
-            origin: &origin.attrs,
-            stream: line.stream,
-            truncated: line.truncated,
-            tags: &self.tags,
-        };
-        let PipelineFilters { pipelines, scratch } = filters;
-        if pipelines.iter().any(|p| p.reads(&view, scratch)) {
-            b.push(self.record(line, origin, now_ns));
-            return None;
-        }
-        let ts = line.ts.unwrap_or(now_ns);
-        let ts = if ts > now_ns + AHEAD_MS * 1_000_000 { now_ns } else { ts };
-        // An error's issue, as `kiln_obs::errors::put_log_issue` gives a record one: one it came
-        // with left out, its own put last.
-        let error = view.severity >= 17;
-        let issue = error.then(|| kiln_obs::errors::log_issue(view.service, view.severity, &kiln_obs::errors::Error::of(view.attrs()))).flatten().map(kiln_obs::errors::hex);
-        let kept = |(k, _): &(&str, &str)| !error || *k != "issue.id";
-        let count = view.attrs().filter(kept).count() + usize::from(issue.is_some());
-        let attrs = view.attrs().filter(kept).chain(issue.as_deref().map(|id| ("issue.id", id)));
-        b.push_row(ts, view.severity, [view.service, view.host, view.source], view.message, attrs, count);
-        Some(line.text)
+        let json = self.json(&line.text);
+        let mut line = line;
+        let mut text = std::mem::take(&mut line.text);
+        with_room(|room| {
+            let read = if json { self.json_fields(&mut text, room) } else { None };
+            let room = &*room;
+            let view = LineView {
+                // As its record keeps it (`cloud::message`), so a filter reads what a record's would.
+                message: kiln_obs::logs::record::cut(&text, kiln_obs::logs::record::MAX_MESSAGE_BYTES),
+                service: self.service_of(read.as_ref(), &room.service, origin),
+                host: &self.host,
+                source: &self.source,
+                severity: severity(read.as_ref(), &text),
+                fields: read.as_ref().map(|_| &room.attrs),
+                origin: &origin.attrs,
+                stream: line.stream,
+                truncated: line.truncated,
+                tags: &self.tags,
+                trace_id: read.as_ref().and_then(|j| j.trace_id),
+                span_id: read.as_ref().and_then(|j| j.span_id),
+            };
+            let PipelineFilters { pipelines, scratch } = filters;
+            if pipelines.iter().any(|p| p.reads(&view, scratch)) {
+                b.push(self.record_of(text, &line, read.as_ref(), room, origin, now_ns));
+                return None;
+            }
+            let ts = read.as_ref().and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns);
+            let ts = if ts > now_ns + AHEAD_MS * 1_000_000 { now_ns } else { ts };
+            // An error's issue, as `kiln_obs::errors::put_log_issue` gives a record one: one it came
+            // with left out, its own put last.
+            let error = view.severity >= 17;
+            let issue = error.then(|| kiln_obs::errors::log_issue(view.service, view.severity, &kiln_obs::errors::Error::of(view.attrs()))).flatten().map(kiln_obs::errors::hex);
+            let kept = |(k, _): &(&str, &str)| !error || *k != "issue.id";
+            let count = view.attrs().filter(kept).count() + usize::from(issue.is_some());
+            let attrs = view.attrs().filter(kept).chain(issue.as_deref().map(|id| ("issue.id", id)));
+            b.push_row(ts, view.severity, [view.service, view.host, view.source], view.message, attrs, count, (view.trace_id, view.span_id));
+            Some(text)
+        })
     }
 
     /// A line's record: a JSON line's message, level, time, trace and fields, or a text line's
     /// text and the level it starts with.
     ///
     /// A JSON line is read in place (`kiln_obs::json`): no tree of it is made, its fields borrowed
-    /// from it until each is an attribute, the lists that hold them kept from line to line, its
-    /// message written into the line's own room.
+    /// from it until each is an attribute, the lists that hold them and its attributes' text kept
+    /// from line to line, its message written into the line's own room.
     pub(crate) fn record(&self, line: Line, origin: &Origin, now_ns: i64) -> Record {
-        let parse = match self.format {
-            Format::Json => true,
-            Format::Auto | Format::Cri | Format::Docker => line.text.trim_start().starts_with('{'),
-            Format::Text => false,
-        };
+        let json = self.json(&line.text);
+        let mut line = line;
+        let mut text = std::mem::take(&mut line.text);
+        with_room(|room| {
+            let read = if json { self.json_fields(&mut text, room) } else { None };
+            self.record_of(text, &line, read.as_ref(), room, origin, now_ns)
+        })
+    }
+
+    /// The service a line's record names: the source's, else its container's, else one a JSON
+    /// line names (`named`, as `read` says), else the source's name.
+    fn service_of<'a>(&'a self, read: Option<&JsonRead>, named: &'a str, origin: &'a Origin) -> &'a str {
+        match read {
+            Some(j) if j.service => named,
+            _ => self.service.as_deref().or(origin.service.as_deref()).unwrap_or(&self.name),
+        }
+    }
+
+    /// A line's record of what its reading found (`read`, its fields in `room`; none, a text
+    /// line's), `text` its message, `line` the rest of it.
+    fn record_of(&self, text: String, line: &Line, read: Option<&JsonRead>, room: &JsonRoom, origin: &Origin, now_ns: i64) -> Record {
         let mut r = Record {
-            ts: line.ts.unwrap_or(now_ns),
-            service: self.service.clone().or_else(|| origin.service.clone()).unwrap_or_else(|| self.name.clone()),
+            ts: read.and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns),
+            severity: severity(read, &text),
+            service: self.service_of(read, &room.service, origin).to_owned(),
             host: self.host.clone(),
             source: self.source.clone(),
+            trace_id: read.and_then(|j| j.trace_id),
+            span_id: read.and_then(|j| j.span_id),
             ..Record::default()
         };
-        // Its attributes sized once: the line's fields, where it came from, the source's tags.
-        let more = origin.attrs.len() + self.tags.len() + 2;
-        let mut text = line.text;
-        let read = if parse { with_room(|room| self.json_fields(&mut text, more, room, &mut r)) } else { None };
-        match read {
-            Some(Level::Said(l)) => r.severity = l,
-            // A JSON line that names no message is its own: its level the first of its fields'
-            // that `severity_of` reads a JSON message's from, found already, else its words'.
-            Some(Level::Whole(l)) => r.severity = l.unwrap_or_else(|| super::cloud::severity_of_words(&text)),
-            Some(Level::Message) => r.severity = super::cloud::severity_of(&text),
-            None => {
-                r.attrs.reserve_exact(more);
-                r.severity = super::cloud::severity_of(&text);
-            }
-        }
-        r.message = super::cloud::message(text);
         if r.ts > now_ns + AHEAD_MS * 1_000_000 {
             r.ts = now_ns;
+        }
+        // Its attributes sized once: the line's fields, where it came from, the source's tags.
+        let fields = read.map_or(0, |_| room.attrs.len());
+        r.attrs.reserve_exact(fields + origin.attrs.len() + self.tags.len() + 2);
+        if read.is_some() {
+            r.attrs.extend(room.attrs.iter().map(|(k, v)| (k.to_owned(), v.to_owned())));
         }
         r.attrs.extend(origin.attrs.iter().cloned());
         if let Some(s) = line.stream {
@@ -590,14 +624,16 @@ impl Compiled {
             r.attrs.push(("truncated".into(), "true".into()));
         }
         r.attrs.extend(self.tags.iter().cloned());
+        r.message = super::cloud::message(text);
         r
     }
 
-    /// A JSON line's fields into `r` (its time, service, ids and attributes), `text` left its
-    /// message (the line whole where it names none): how its level is read; none when it is not an
-    /// object.
-    fn json_fields(&self, text: &mut String, more: usize, room: &mut JsonRoom, r: &mut Record) -> Option<Level> {
-        let JsonRoom { levels, scratch, text: msg, key: buf, path } = room;
+    /// A JSON line read into `room` (its fields flattened, a service it names), `text` left its
+    /// message (the line whole where it names none): what it says beside its fields; none when it
+    /// is not an object.
+    fn json_fields(&self, text: &mut String, room: &mut JsonRoom) -> Option<JsonRead> {
+        let JsonRoom { levels, scratch, text: msg, key: buf, path, attrs, service } = room;
+        attrs.clear();
         let mut pool = levels_for(std::mem::take(levels));
         pool.resize_with(JSON_DEPTH, Vec::new);
         let read = (|| {
@@ -619,34 +655,37 @@ impl Compiled {
                 taken[1] = i;
             }
             let at = find(&TIME_KEYS, false);
-            if let (Some(i), Some(ts)) = (at, value(at).and_then(|v| time_of(v, buf))) {
+            let mut ts = None;
+            if let (Some(i), Some(t)) = (at, value(at).and_then(|v| time_of(v, buf))) {
                 taken[2] = i;
-                r.ts = ts;
+                ts = Some(t);
             }
+            let mut named = false;
             if self.service.is_none() {
-                let named = find(&["service"], false).or_else(|| find(&["service.name"], false));
-                if let Some(Val::Str(s)) = value(named)
+                let field = find(&["service"], false).or_else(|| find(&["service.name"], false));
+                if let Some(Val::Str(s)) = value(field)
                     && !s.raw.is_empty()
                 {
-                    r.service = s.owned();
+                    service.clear();
+                    service.push_str(s.text(buf));
+                    named = true;
                 }
             }
-            r.trace_id = TRACE_KEYS.iter().find_map(|k| match value(find(&[k], false)) {
+            let trace_id = TRACE_KEYS.iter().find_map(|k| match value(find(&[k], false)) {
                 Some(Val::Str(s)) => hex_id::<16>(s.text(buf)),
                 _ => None,
             });
-            r.span_id = SPAN_KEYS.iter().find_map(|k| match value(find(&[k], false)) {
+            let span_id = SPAN_KEYS.iter().find_map(|k| match value(find(&[k], false)) {
                 Some(Val::Str(s)) => hex_id::<8>(s.text(buf)),
                 _ => None,
             });
-            r.attrs.reserve_exact(top.len() + more);
             for (i, &(k, v)) in top.iter().enumerate() {
                 if taken.contains(&i) || SKIPPED.iter().any(|s| k.is(s)) {
                     continue;
                 }
                 path.clear();
                 path.push_str(k.text(buf));
-                flatten(path, v, 1, nested, scratch, buf, &mut r.attrs);
+                flatten(path, v, 1, nested, scratch, buf, attrs);
             }
             let found = taken[0] != usize::MAX;
             let level = match level {
@@ -664,16 +703,73 @@ impl Compiled {
                         .and_then(|s| kiln_obs::logs::record::severities(s.text(buf)).map(|r| *r.start())),
                 ),
             };
-            Some((found, level))
+            Some((found, JsonRead { level, ts, service: named, trace_id, span_id }))
         })();
         *levels = levels_for(pool);
-        let (found, level) = read?;
+        let (found, read) = read?;
         if found {
             // The message into the line's own room: no longer than the line.
             text.clear();
             text.push_str(msg);
         }
-        Some(level)
+        Some(read)
+    }
+}
+
+/// What a JSON line says beside its fields (its room holds those, and a service it names).
+#[derive(Debug, Clone, Copy)]
+struct JsonRead {
+    level: Level,
+    ts: Option<i64>,
+    /// It names its service (`JsonRoom::service`).
+    service: bool,
+    trace_id: Option<[u8; 16]>,
+    span_id: Option<[u8; 8]>,
+}
+
+/// A line's level: a JSON line's as its reading says ([`Level`]), else the one its text starts
+/// with.
+fn severity(read: Option<&JsonRead>, text: &str) -> u8 {
+    match read.map(|j| j.level) {
+        Some(Level::Said(l)) => l,
+        // A JSON line that names no message is its own: its level the first of its fields' that
+        // `severity_of` reads a JSON message's from, found already, else its words'.
+        Some(Level::Whole(l)) => l.unwrap_or_else(|| super::cloud::severity_of_words(text)),
+        Some(Level::Message) | None => super::cloud::severity_of(text),
+    }
+}
+
+/// A JSON line's attributes as its reading flattens them, in one text kept from line to line:
+/// each key and its value side by side, where they end noted (nothing allocated a line once it
+/// has grown).
+#[derive(Default)]
+struct Flat {
+    text: String,
+    /// Each attribute's key's start, its value's start (the key's end) and its value's end.
+    spans: Vec<(usize, usize, usize)>,
+}
+
+impl Flat {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.spans.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// An attribute: `key`, and its value as `value` writes it after the key.
+    fn push(&mut self, key: &str, value: impl FnOnce(&mut String)) {
+        let k = self.text.len();
+        self.text.push_str(key);
+        let v = self.text.len();
+        value(&mut self.text);
+        self.spans.push((k, v, self.text.len()));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.spans.iter().map(|&(k, v, e)| (self.text.get(k..v).unwrap_or_default(), self.text.get(v..e).unwrap_or_default()))
     }
 }
 
@@ -704,7 +800,8 @@ const SKIPPED: [&str; 8] = ["trace_id", "traceId", "trace.id", "span_id", "spanI
 use kiln_obs::json::{Str, Val};
 
 /// Room a JSON line's reading keeps from line to line: a list of fields for each depth, the
-/// reader's, a message and a key decoded, a dotted key's path.
+/// reader's, a message and a key decoded, a dotted key's path, the line's attributes and a service
+/// it names.
 #[derive(Default)]
 struct JsonRoom {
     levels: Vec<Vec<(Str<'static>, Val<'static>)>>,
@@ -712,6 +809,8 @@ struct JsonRoom {
     text: String,
     key: String,
     path: String,
+    attrs: Flat,
+    service: String,
 }
 
 /// Lists of fields emptied, as lists of borrows of another lifetime, their room kept (collected in
@@ -824,7 +923,7 @@ fn cut_str(s: &str) -> &str {
 /// string decoded, a number as written, an array or an object nested too deep as its JSON without
 /// its spaces.
 #[allow(clippy::too_many_arguments)]
-fn flatten<'a>(path: &mut String, v: Val<'a>, depth: usize, pool: &mut [Vec<(Str<'a>, Val<'a>)>], scratch: &mut kiln_obs::json::Scratch, buf: &mut String, out: &mut Vec<(String, String)>) {
+fn flatten<'a>(path: &mut String, v: Val<'a>, depth: usize, pool: &mut [Vec<(Str<'a>, Val<'a>)>], scratch: &mut kiln_obs::json::Scratch, buf: &mut String, out: &mut Flat) {
     if out.len() >= ATTRS_MAX {
         return;
     }
@@ -846,15 +945,17 @@ fn flatten<'a>(path: &mut String, v: Val<'a>, depth: usize, pool: &mut [Vec<(Str
         }
         Val::Null => {}
         // A stack whole: its row keeps its ends (`kiln_obs::errors::stack_ends`).
-        Val::Str(s) if kiln_obs::errors::STACK_KEYS.contains(&path.as_str()) => out.push((path.clone(), s.text(buf).to_owned())),
-        Val::Str(s) => out.push((path.clone(), cut_str(s.text(buf)).to_owned())),
-        Val::Num(n) => out.push((path.clone(), n.to_owned())),
-        Val::Bool(b) => out.push((path.clone(), if b { "true" } else { "false" }.to_owned())),
-        Val::Array(raw) | Val::Object(raw) => {
-            let mut s = String::with_capacity(raw.len().min(VALUE_MAX));
-            kiln_obs::json::compact(raw, &mut s);
-            out.push((path.clone(), cut_str(&s).to_owned()));
-        }
+        Val::Str(s) if kiln_obs::errors::STACK_KEYS.contains(&path.as_str()) => out.push(path, |t| t.push_str(s.text(buf))),
+        Val::Str(s) => out.push(path, |t| t.push_str(cut_str(s.text(buf)))),
+        Val::Num(n) => out.push(path, |t| t.push_str(n)),
+        Val::Bool(b) => out.push(path, |t| t.push_str(if b { "true" } else { "false" })),
+        // As its JSON, compact, cut as a value is.
+        Val::Array(raw) | Val::Object(raw) => out.push(path, |t| {
+            let at = t.len();
+            kiln_obs::json::compact(raw, t);
+            let kept = t.get(at..).map_or(0, |v| cut_str(v).len());
+            t.truncate(at + kept);
+        }),
     }
 }
 
@@ -1320,12 +1421,21 @@ impl<M> Batch<M> {
 
     /// A record written as its row (a line no pipeline reads), into the segment being written.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_row<'a>(&mut self, ts: i64, severity: u8, names: [&str; 3], message: &str, attrs: impl Iterator<Item = (&'a str, &'a str)>, attr_count: usize) {
+    pub(crate) fn push_row<'a>(
+        &mut self,
+        ts: i64,
+        severity: u8,
+        names: [&str; 3],
+        message: &str,
+        attrs: impl Iterator<Item = (&'a str, &'a str)>,
+        attr_count: usize,
+        ids: (Option<[u8; 16]>, Option<[u8; 8]>),
+    ) {
         if self.open.capacity() == 0 {
             self.open.reserve(ROW_SEGMENT_START);
         }
         let before = self.open.len();
-        kiln_obs::logs::record::put_fields(&mut self.open, ts, severity, names, message, attrs, attr_count, None, None, self.prev, kiln_obs::batch::MAX_NAME_BYTES);
+        kiln_obs::logs::record::put_fields(&mut self.open, ts, severity, names, message, attrs, attr_count, ids.0, ids.1, self.prev, kiln_obs::batch::MAX_NAME_BYTES);
         self.prev = ts;
         self.open_rows += 1;
         self.bytes += self.open.len() - before;
@@ -1461,12 +1571,13 @@ impl<M> InFlight<M> {
 mod tests {
     use super::*;
 
-    /// A text line no pipeline reads, written as its row, is the row its record writes (with the
-    /// issue the owner gives a record of an error's), to the byte: whatever it holds (a level's
-    /// word, an `issue.id` tag on an error's line, characters of every width, a line past a
-    /// record's message, a time ahead of now), its stream, its being cut short, its origin's
-    /// attributes and service; its text back, as it was, for the next line's. With kiln's nginx
-    /// pipeline on, a line it reads is its record still, and another source's a row.
+    /// A line no pipeline reads, written as its row, is the row its record writes (with the issue
+    /// the owner gives a record of an error's), to the byte: a text line whatever it holds (a
+    /// level's word, an `issue.id` tag on an error's line, characters of every width, a line past
+    /// a record's message, a time ahead of now), a JSON line whatever its fields (nested, escaped,
+    /// its message, level, time, service and ids, broken JSON read as text), its stream, its being
+    /// cut short, its origin's attributes and service; its text back for the next line's. With
+    /// kiln's nginx pipeline on, a line it reads is its record still, and another source's a row.
     #[test]
     fn a_line_written_as_its_row_is_its_record_s_row() -> anyhow::Result<()> {
         const NOW: i64 = 1_792_324_800_000_000_000;
@@ -1476,11 +1587,11 @@ mod tests {
             .map_err(anyhow::Error::msg)?;
         let mut rng = kiln_obs::testkit::Rng::new(12);
         let words = ["ERROR", "error:", "[WARN]", "info", "connection", "refused", "é", "漢字", "🙂", "\t", "  ", "{", "level=error", "panic:", "x"];
-        let (mut rows, mut records) = (0, 0);
-        for i in 0..4000 {
+        let (mut rows, mut json) = (0, 0);
+        for i in 0..8000 {
             let c = if i % 2 == 0 { &plain } else { &tagged };
             let n = if rng.below(50) == 0 { 30_000 } else { rng.below(12) as usize };
-            let text: String = (0..n).map(|_| words.get(rng.below(words.len() as u64) as usize).copied().unwrap_or("")).collect::<Vec<_>>().join(" ");
+            let text: String = if i % 4 < 2 { (0..n).map(|_| words.get(rng.below(words.len() as u64) as usize).copied().unwrap_or("")).collect::<Vec<_>>().join(" ") } else { log_line(&mut rng) };
             let ts = [None, Some(NOW - 5_000_000_000), Some(NOW + 3_600_000_000_000)].get(rng.below(3) as usize).copied().flatten();
             let stream = [None, Some("stdout"), Some("stderr")].get(rng.below(3) as usize).copied().flatten();
             let truncated = rng.below(5) == 0;
@@ -1489,12 +1600,10 @@ mod tests {
             let mut b: Batch<()> = Batch::default();
             let back = c.write(line(), &origin, NOW, &mut b, &mut PipelineFilters::default());
             b.seal();
-            if text.trim_start().starts_with('{') {
-                anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Records(r)] if r.len() == 1) && back.is_none(), "a JSON-looking line is its record: {text:?}");
-                records += 1;
-                continue;
-            }
-            anyhow::ensure!(back.as_deref() == Some(text.as_str()), "a row's text comes back as it was");
+            // A JSON line's text comes back its message.
+            let object = c.json(&text) && serde_json::from_str::<serde_json::Map<String, Value>>(&text).is_ok();
+            anyhow::ensure!(back.is_some() && (object || back.as_deref() == Some(text.as_str())), "a row's text comes back: {text:?}");
+            json += usize::from(object);
             let mut r = c.record(line(), &origin, NOW);
             kiln_obs::errors::put_log_issue(&mut r);
             let mut want = Vec::new();
@@ -1502,7 +1611,7 @@ mod tests {
             anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Rows { raw, rows: 1, last_ts }] if *raw == want && *last_ts == r.ts), "{text:?}");
             rows += 1;
         }
-        anyhow::ensure!(rows > 3000 && records > 100, "{rows} rows, {records} records");
+        anyhow::ensure!(rows == 8000 && json > 1000, "{rows} rows, {json} of JSON lines");
         let pipelines: Vec<_> = crate::observe::pipeline::builtin::all().into_iter().filter_map(|(_, d)| d.compile().ok()).collect();
         let mut filters = PipelineFilters { pipelines: Arc::new(pipelines), ..PipelineFilters::default() };
         let nginx = Source { source: Some("nginx".into()), ..file_source() }.compile("nginx", "web-1").map_err(anyhow::Error::msg)?;
@@ -1510,8 +1619,17 @@ mod tests {
         let access = r#"192.0.2.10 - - [18/Oct/2026:12:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "curl/8.5.0""#;
         anyhow::ensure!(nginx.write(Line { text: access.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_none(), "a record keeps its text");
         anyhow::ensure!(plain.write(Line { text: "an app's line".into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(), "a row's text comes back");
+        anyhow::ensure!(
+            nginx.write(Line { text: r#"{"msg":"an app's JSON","level":"warn"}"#.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_none(),
+            "a pipeline reads it"
+        );
+        anyhow::ensure!(plain.write(Line { text: r#"{"msg":"an app's JSON","level":"warn"}"#.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(), "none reads it");
         b.seal();
-        anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Records(r), LogPart::Rows { rows: 1, .. }] if r.len() == 1), "{:?}", b.parts);
+        anyhow::ensure!(
+            matches!(b.parts.as_slice(), [LogPart::Records(r), LogPart::Rows { rows: 1, .. }, LogPart::Records(j), LogPart::Rows { rows: 1, .. }] if r.len() == 1 && j.len() == 1),
+            "{:?}",
+            b.parts
+        );
         Ok(())
     }
 

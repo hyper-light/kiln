@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
-| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second); a text line no pipeline reads handed over as its row, in the order read beside records, a write's rows one item (9 allocations a line to 0.01, 70% more lines a second through the batcher). Next: JSON lines handed over as rows; the Event Log on a Windows machine | in progress |
+| O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second); a line no pipeline reads, text or JSON, handed over as its row, in the order read beside records, a write's rows one item (a JSON line 18 allocations to 0.01, a text line 9 to 0.01; 50–100% more lines a second through the batcher, §12.17). Next: the Event Log on a Windows machine | in progress |
 | O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). Next: a matcher of grok's own, its groups in one pass | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
@@ -779,13 +779,14 @@ level is read from its first words as a log pipeline's status remapper reads it;
 was read. A time more than a minute ahead of the machine's clock is taken as now (one without a zone
 read as UTC on a machine west of it).
 
-A text line no pipeline reads (§8.2: each one's filter asked of the line itself, as of its record) is
-handed over as the row its record would write, written where it is read from the line as it is (its
-message, the source's names, its file's or container's attributes, its tags, an error's issue): no
-record is made of it, and a test holds the row and the record's alike over every kind of line. A
-JSON line, a line a pipeline reads, and a service check's run go as records. What a machine reads
-goes in the order it was read, rows beside records, and the batcher writes it so: a write's records
-and rows one item, compressed whole (§12.17).
+A line no pipeline reads (§8.2: each one's filter asked of the line itself, as of its record) is
+handed over as the row its record would write, written where it is read: a text line from the line
+as it is (its message, the source's names, its file's or container's attributes, its tags, an
+error's issue), a JSON line from its fields as its reading flattens them into room kept from line
+to line. No record is made of it, and a test holds the row and the record's alike over every kind
+of line, JSON lines of every shape among them. A line a pipeline reads, and a service check's run,
+go as records. What a machine reads goes in the order it was read, rows beside records, and the
+batcher writes it so: a write's records and rows one item, compressed whole (§12.17).
 
 **Each line once.** A line's place (a file's offset, the journal's cursor) is kept only once the
 write that holds its record is applied by the group (`crate::observe::ingest::Ack`: the batcher
@@ -2645,37 +2646,45 @@ segments by their raw bytes and joining them into one item, compressed whole, ea
 time chained again from the last before it (`kiln_obs::logs::record::put_rows_after`, a test over
 runs of any times). Its compressed form is written into room the batch's builder keeps.
 
+Then JSON lines the same way (2026-10-20): a JSON line's fields flattened into one text kept from
+line to line (each key and its value side by side, their ends noted), which the pipelines' filters,
+the row writer and the error's issue all read; a level's name read without lowercasing it into a
+new string first (`severities`: one allocation a line, the search's readers and the pipelines'
+status remapper too); a container's line joined in room kept too (two rooms a source: the
+container's line and the line it joins into). The test that holds a row to its record's reads
+4,000 JSON lines of every shape beside 4,000 text lines.
+
 Measured with the bench's `KOBS_WRITTEN=1` (each offer through a batcher into its writes, each
 answered at once, as a runner's thread takes them, and the bytes of the writes counted): HEAD's
 collector with that mode patched in against this one, the same bench built alike, run in turn on one
-core of fedora (others' work at a load of 8 to 24), three rounds each, 300,000 lines a file:
+core of fedora (others' builds at a load of 14 to 23 through it: rates as ranges, allocations and
+bytes exact), three rounds each, 300,000 lines a file:
 
 | | allocations a line | bytes a line | lines a second | bytes written a line |
 | --- | --- | --- | --- | --- |
-| text (an nginx access log), before | 9.01 | 1,299 | 1.57–1.61 M | 22.2 |
-| text (an nginx access log), after | 0.01 | 477 | 2.68–3.09 M | 22.1 |
-| the access log, an exclude and a mask, before | 9.14 | 1,293 | 1.34–1.56 M | 13.0 |
-| the access log, an exclude and a mask, after | 0.03 | 410 | 2.12–2.45 M | 13.2 |
-| Java stack traces, `multi_line`, before | 2.22 | 258 | 6.7–7.6 M | 2.0 |
-| Java stack traces, `multi_line`, after | 0.12 | 129 | 9.5–11.1 M | 2.0 |
-| JSON lines, before | 18.01 | 1,545 | 732–754 k | 15.6 |
-| JSON lines, after | 18.00 | 1,113 | 785–890 k | 15.6 |
-| CRI, JSON in it, before | 21.01 | 1,907 | 651–704 k | 16.1 |
-| CRI, JSON in it, after | 20.00 | 1,187 | 713–799 k | 16.2 |
-| through kiln's nginx pipeline, before | 49.03 | 3,853 | 175–210 k | 51.1 |
-| through kiln's nginx pipeline, after | 49.04 | 3,187 | 176–202 k | 51.2 |
+| JSON lines, before | 18.01 | 1,545 | 577–583 k | 15.6 |
+| JSON lines, after | 0.01 | 343 | 0.87–1.20 M | 15.3 |
+| CRI, JSON in it, before | 21.01 | 1,907 | 510–529 k | 16.1 |
+| CRI, JSON in it, after | 0.01 | 410 | 0.80–1.11 M | 16.2 |
+| text (an nginx access log), before | 9.01 | 1,299 | 1.22–1.24 M | 22.2 |
+| text (an nginx access log), after | 0.01 | 477 | 1.94–2.63 M | 22.1 |
+| the access log, an exclude and a mask, before | 9.14 | 1,293 | 1.04–1.07 M | 13.0 |
+| the access log, an exclude and a mask, after | 0.03 | 410 | 1.58–2.12 M | 13.2 |
+| Java stack traces, `multi_line`, before | 2.22 | 258 | 5.15–5.22 M | 2.0 |
+| Java stack traces, `multi_line`, after | 0.02 | 128 | 6.99–9.58 M | 2.0 |
+| through kiln's nginx pipeline, before | 49.03 | 3,853 | 148–150 k | 51.1 |
+| through kiln's nginx pipeline, after | 48.04 | 3,185 | 146–197 k | 51.2 |
 
-The collector alone (its offers dropped, as the tables above measure it): a text line 9.00
-allocations to 0.01, 2.29 M lines a second to 4.85 M; a `multi_line` record's line 11.0 M to 16.9 M;
-the masked log 2.20 M to 3.57 M. A JSON line's eighteen allocations are its attributes' strings, a
-record's as `kiln_obs` keeps one; JSON lines written as rows from the line read in place are next.
-What is written is what was: a write's rows one item as before, compressed as well (the first
-measure of this step wrote an item a segment, each offer's, and lost that).
+The collector alone (its offers dropped, as the tables above measure it), the same run: a JSON line
+18.00 allocations to none, 760 k lines a second to 1.19 M; a CRI line 21.00 to 0.01, 798 k to 1.07
+M; a text line 9.00 to 0.01, 2.09 M to 3.47 M. What is left is a record's where a pipeline reads its
+line: its strings, the attributes the pipeline sets among them (48 a line through kiln's nginx
+pipeline, §8.2). What is written is what was: a write's rows one item as before, compressed as well
+(the first measure of this step wrote an item a segment, each offer's, and lost that).
 
-Page faults with glibc's trimming as it is moved both ways (text 3.8 k to 5.5 k a read, JSON 1.6 k
-to 3.4 k, through the pipeline 5 k to 35–44 k; CRI 2.2 k to 0.1 k, the masked log 0.6 k to none): the
-heap's top handed back and faulted in again, as before (with trimming off, text 16.2 k both, the
-pipeline 9.8 k to 4.1 k). Rates there are within the machine's noise.
+Page faults with glibc's trimming as it is moved both ways (JSON 1.6–3.1 k to 1.1 k a read, CRI 2.1
+k to 1.0 k; text 3.8 k to 5.5 k, through the pipeline 5–6 k to 26–43 k): the heap's top handed back
+and faulted in again, as before (with trimming off, text 16.2 k both, the pipeline 9.8 k to 4.1 k).
 
 Two things the runs found beside it. Metrics from logs learned how late records come from each
 write's first item alone (a write held one item before): a write's records are one batch again,

@@ -132,18 +132,31 @@ pub fn level(severity: u8) -> &'static str {
     }
 }
 
-/// The severity numbers a level (or Datadog's and syslog's names for it) covers.
+/// The names of levels (Datadog's and syslog's among them) and the severity numbers each covers.
+const LEVEL_NAMES: [(&str, u8, u8); 17] = [
+    ("trace", 1, 4),
+    ("debug", 5, 8),
+    ("info", 9, 12),
+    ("information", 9, 12),
+    ("notice", 9, 12),
+    ("ok", 9, 12),
+    ("warn", 13, 16),
+    ("warning", 13, 16),
+    ("error", 17, 20),
+    ("err", 17, 20),
+    ("fatal", 21, 24),
+    ("critical", 21, 24),
+    ("crit", 21, 24),
+    ("alert", 21, 24),
+    ("emergency", 21, 24),
+    ("emerg", 21, 24),
+    ("unspecified", 0, 0),
+];
+
+/// The severity numbers a level (or Datadog's and syslog's names for it) covers, its case
+/// ignored (nothing allocated: a JSON line's level is read a line at a time).
 pub fn severities(level: &str) -> Option<std::ops::RangeInclusive<u8>> {
-    Some(match level.to_ascii_lowercase().as_str() {
-        "trace" => 1..=4,
-        "debug" => 5..=8,
-        "info" | "information" | "notice" | "ok" => 9..=12,
-        "warn" | "warning" => 13..=16,
-        "error" | "err" => 17..=20,
-        "fatal" | "critical" | "crit" | "alert" | "emergency" | "emerg" => 21..=24,
-        "unspecified" => 0..=0,
-        _ => return None,
-    })
+    LEVEL_NAMES.iter().find(|(name, ..)| name.eq_ignore_ascii_case(level)).map(|&(_, a, b)| a..=b)
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -359,6 +372,19 @@ mod tests {
             }
         }
         assert!(!put_rows_after(&mut Vec::new(), &[0x80], 5), "a time that does not read");
+    }
+
+    /// A level's name read whatever its case, as lowercasing it first reads it; anything else none.
+    #[test]
+    fn levels_are_read_whatever_their_case() {
+        for &(name, a, b) in &LEVEL_NAMES {
+            for spelled in [name.to_owned(), name.to_ascii_uppercase(), name.chars().enumerate().map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c }).collect()] {
+                assert_eq!(severities(&spelled), Some(a..=b), "{spelled}");
+            }
+        }
+        for none in ["", "inf", "infos", "warnings", " info", "info ", "İnfo", "debug\0", "erreur"] {
+            assert_eq!(severities(none), None, "{none:?}");
+        }
     }
 
     #[test]
