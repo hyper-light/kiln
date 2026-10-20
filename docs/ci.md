@@ -179,7 +179,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node left |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit, speed left |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` (AC03); `type=registry`, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault, Vault, Infisical, Doppler, 1Password), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); Vault, Infisical, Doppler and 1Password as stores (R08); AC02 (every read and read-only tool walked, none with a value); AC06 (declarations end to end, an action's undeclared reads reported); AC08 (W18-AC03's); a repository's and a workflow's secrets on their pages; R11 on environments' pages left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
@@ -2654,14 +2654,20 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   - Checked against a fake S3 that checks each request's signature as S3 does
     (`w08_r02_chunks_in_a_bucket`), and against RustFS, a real S3-compatible store
     (`w08_r02_a_real_store`, run by hand with its address and keys).
+- *Done.* R11's `type=gha`, and AC03, end to end on a Docker runner
+  (`w08_ac03_buildkit_gha_cache`): a build on a BuildKit builder of the run's own exports its
+  layers' cache to kiln's (`mode=max`), and the next run's build, on a fresh builder, takes every
+  layer from it. It found that BuildKit's cache client (`go-actions-cache`) reads the runtime
+  token's `ac` claim only as GitHub writes it, a string holding the scopes' JSON; kiln's was a
+  list. It is the string now, and a list minted before is still read.
 - *Left.*
-  - R11 (BuildKit's `type=gha` and `type=registry` caches, end to end).
+  - R11's `type=registry`, against W12's registry, end to end.
   - R12 and AC08 on a real 10 GbE LAN. The store's part is measured by `kiln ci bench`
     (W22-AC08): a 1 GiB entry restored at 7,962 MiB/s, against 500. R13's insights are done
     (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key
     prefix, with the time hits saved).
   - A diff that only rebases reusing what it didn't touch (W14).
-  - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC03, AC06, AC09.
+  - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC06, AC09.
 
 ### W09 Secrets and variables
 
