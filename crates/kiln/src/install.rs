@@ -126,7 +126,7 @@ fn say(msg: impl AsRef<str>) {
 }
 
 /// Copy the running executable to `dest` atomically (no-op if it already is `dest`).
-fn place_binary(dest: &Path) -> anyhow::Result<()> {
+pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     if exe.canonicalize().ok() == dest.canonicalize().ok() {
         return Ok(());
@@ -954,7 +954,7 @@ fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
 // --------------------------------------------------------------------- Windows Task Scheduler
 
 /// Quote one argument for a Windows command line (the rules `CommandLineToArgvW` undoes).
-fn win_quote(s: &str) -> String {
+pub(crate) fn win_quote(s: &str) -> String {
     if !s.is_empty() && !s.contains([' ', '\t', '"']) {
         return s.to_owned();
     }
@@ -1055,7 +1055,7 @@ fn task_xml(i: &Install<'_>, start: TaskStart) -> String {
 }
 
 /// The Startup-folder fallback: a `.cmd` the shell runs at logon.
-fn startup_script(unit: &str) -> PathBuf {
+pub(crate) fn startup_script(unit: &str) -> PathBuf {
     crate::os::config_home()
         .join("Microsoft")
         .join("Windows")
@@ -1169,10 +1169,10 @@ fn task_now(i: &Install<'_>) -> anyhow::Result<bool> {
 
 /// What a Scheduled Task runs, as Task Scheduler has it.
 #[derive(Debug, PartialEq, Eq)]
-struct TaskDefinition {
-    command: String,
-    arguments: String,
-    at_boot: bool,
+pub(crate) struct TaskDefinition {
+    pub(crate) command: String,
+    pub(crate) arguments: String,
+    pub(crate) at_boot: bool,
 }
 
 impl TaskDefinition {
@@ -1187,7 +1187,7 @@ impl TaskDefinition {
 }
 
 /// Scheduled Task `unit`, if there is one.
-fn task_definition(unit: &str) -> Option<TaskDefinition> {
+pub(crate) fn task_definition(unit: &str) -> Option<TaskDefinition> {
     let out = Command::new("schtasks").args(["/Query", "/TN", unit, "/XML"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| parse_task(&String::from_utf8_lossy(&out.stdout))).flatten()
 }
@@ -1505,6 +1505,9 @@ mod tests {
             create_task(&i, TaskStart::SignIn, false).map_err(anyhow::Error::msg)?;
             let read = task_definition(&unit).ok_or_else(|| anyhow::anyhow!("not registered"))?;
             anyhow::ensure!(read.runs(&i) && !read.at_boot, "read back as {read:?}");
+            // What `kiln install --agent --upgrade` finds to replace.
+            let found = crate::upgrade::find_existing(&unit).ok_or_else(|| anyhow::anyhow!("an upgrade finds no {unit}"))?;
+            anyhow::ensure!(found.boot == "task" && found.bin == bin && found.args == ["agent", "--name", "box <1> & co"], "an upgrade finds {found:?}");
             match create_task(&i, TaskStart::Boot, false) {
                 Ok(()) => {
                     anyhow::ensure!(crate::os::elevated(), "registered at boot without administrator rights");
@@ -1518,6 +1521,33 @@ mod tests {
         remove_task(&unit);
         anyhow::ensure!(task_definition(&unit).is_none(), "{unit} is still there");
         result
+    }
+
+    /// An upgrade for real (Windows, by hand): the binary a task starts is replaced while it runs,
+    /// the running one moved aside, as `kiln install --agent --upgrade` does to a runner. Only a
+    /// throwaway task and binary of its own (a copy of `ping`, standing in for the runner).
+    #[test]
+    #[ignore = "drives this machine's Task Scheduler"]
+    fn an_upgrade_replaces_the_binary_a_task_starts_while_it_runs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let unit = format!("kiln-test-{}", std::process::id());
+        let bin = dir.path().join("kiln.exe");
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &bin)?;
+        let args = ["supervise", "--", "agent", "--name", "box"].map(str::to_owned);
+        let i = Install { system: false, unit: &unit, bin: &bin, args: &args, config: Path::new("kiln.toml"), state_dir: dir.path(), env: None, ask: false };
+        create_task(&i, TaskStart::SignIn, false).map_err(anyhow::Error::msg)?;
+        let mut runner = Command::new(&bin).args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).spawn()?;
+        let owned = unit.clone();
+        let upgraded = crate::rt::block_on(async move { crate::upgrade::install_alongside(&owned, &|_: String| {}).await });
+        let _ = runner.kill();
+        let _ = runner.wait();
+        remove_task(&unit);
+        upgraded?;
+        let me = std::fs::metadata(std::env::current_exe()?)?.len();
+        anyhow::ensure!(std::fs::metadata(&bin)?.len() == me, "{} is still the old binary", bin.display());
+        let aside = std::fs::read_dir(dir.path())?.flatten().any(|e| e.file_name().to_string_lossy().contains(".old-"));
+        anyhow::ensure!(aside, "the running binary wasn't moved aside");
+        Ok(())
     }
 
     /// The administrator prompt for real (Windows, by hand: say yes, twice): a task at boot is
