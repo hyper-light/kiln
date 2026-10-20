@@ -42,3 +42,116 @@ impl kiln_seams::HarnessPort for Hub {
         })
     }
 }
+
+/// kiln's registry against kiln-seams' HarnessPort suite: the clauses it holds today (HARNESS-1,
+/// HARNESS-2, HARNESS-4), on sessions of the hub's own machine whose harness is a program that
+/// isn't there. HARNESS-3 and HARNESS-5 wait on CP-T3.2 and CP-T3.3.
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use futures::future::BoxFuture;
+    use kiln_seams::HarnessPort;
+    use kiln_seams::harness::{HarnessFixture, Sent, cases};
+    use parking_lot::Mutex;
+    use serde_json::Value;
+
+    use crate::harness::model::{Command, SendMode};
+    use crate::harness::session::{Info, Spec};
+    use crate::hub::Hub;
+
+    /// The clauses kiln's registry holds until sends are acknowledged end to end.
+    const HOLDS_TODAY: [&str; 3] = ["HARNESS-1", "HARNESS-2", "HARNESS-4"];
+
+    /// The registry, its agents under the names the cases give them (it names its own).
+    struct Named {
+        hub: Arc<Hub>,
+        ids: Mutex<HashMap<String, String>>,
+    }
+
+    impl Named {
+        fn real(&self, name: &str) -> String {
+            self.ids.lock().get(name).cloned().unwrap_or_else(|| name.to_owned())
+        }
+    }
+
+    impl HarnessPort for Named {
+        type Agent = Info;
+        type Command = Command;
+        fn agents(&self) -> Vec<Info> {
+            self.hub.agents()
+        }
+        fn agent(&self, name: &str) -> Option<Info> {
+            HarnessPort::agent(self.hub.as_ref(), &self.real(name))
+        }
+        fn catalog(&self, name: &str) -> Option<Value> {
+            self.hub.catalog(&self.real(name))
+        }
+        fn send<'a>(&'a self, name: &'a str, command: Command) -> BoxFuture<'a, Sent> {
+            let id = self.real(name);
+            Box::pin(async move { HarnessPort::send(self.hub.as_ref(), &id, command).await })
+        }
+    }
+
+    struct RegistryFixture {
+        port: Named,
+        /// Where its agents work.
+        cwd: std::path::PathBuf,
+    }
+
+    impl HarnessFixture for RegistryFixture {
+        type Port = Named;
+        fn port(&self) -> &Named {
+            &self.port
+        }
+        fn open<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let spec = Spec {
+                    kind: "claude".into(),
+                    name: Some(name.to_owned()),
+                    cwd: Some(self.cwd.to_string_lossy().into_owned()),
+                    program: Some(self.cwd.join("no-such-claude").to_string_lossy().into_owned()),
+                    ..Spec::default()
+                };
+                let hub = &self.port.hub;
+                let opened = hub.harness.open(hub, "local", spec, 1).await.map_err(|e| format!("{e:#}"))?;
+                let info = opened.into_iter().next().ok_or("nothing opened")?;
+                self.port.ids.lock().insert(name.to_owned(), info.id);
+                Ok(())
+            })
+        }
+        fn close<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let hub = &self.port.hub;
+                if hub.harness.close(hub, &self.port.real(name)).await { Ok(()) } else { Err(format!("{name} wasn't closed")) }
+            })
+        }
+        fn say(&self, text: &str) -> Command {
+            Command::Send { id: crate::util::new_id(), text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+        }
+        fn heard<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Vec<String>> {
+            // What reached the agent isn't observable here until sends are acknowledged (CP-T3.3).
+            Box::pin(async { Vec::new() })
+        }
+        fn id_of(&self, agent: &Info) -> String {
+            self.port.ids.lock().iter().find(|(_, id)| **id == agent.id).map_or_else(|| agent.id.clone(), |(name, _)| name.clone())
+        }
+    }
+
+    #[test]
+    fn kiln_s_registry_passes_the_harness_port_clauses_it_holds_today() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            let cases: Vec<_> = cases::<RegistryFixture>().into_iter().filter(|c| HOLDS_TODAY.contains(&c.id)).collect();
+            anyhow::ensure!(cases.len() == HOLDS_TODAY.len(), "a clause the registry holds is missing from the suite");
+            let dir = tempfile::tempdir()?;
+            let make = || {
+                let (hub, cwd) = (Arc::clone(&hub), dir.path().to_path_buf());
+                async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()) }, cwd } }
+            };
+            kiln_seams::conformance::run("HarnessPort (kiln's registry)", &cases, make).await.into_result().map_err(anyhow::Error::msg)?;
+            Ok(())
+        })
+    }
+}
