@@ -148,7 +148,10 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
             marked.entry(id.to_owned()).or_default().push(*pid);
         }
     }
-    let skip = |pid: Pid| sys.process(pid).is_none_or(|p| helper(&command_of(p.cmd())) || p.parent().and_then(|pp| sys.process(pp)).is_some_and(|pp| helper(&command_of(pp.cmd()))));
+    // PID 1 may be kiln itself in a container: what it adopted needn't be a helper's child.
+    let skip = |pid: Pid| {
+        sys.process(pid).is_none_or(|p| helper(&command_of(p.cmd())) || p.parent().filter(|pp| pp.as_u32() != 1).and_then(|pp| sys.process(pp)).is_some_and(|pp| helper(&command_of(pp.cmd()))))
+    };
     sessions
         .iter()
         .map(|(id, harness)| {
