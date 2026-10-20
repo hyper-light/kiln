@@ -395,6 +395,19 @@ struct Starts {
     kept: std::collections::HashSet<String>,
 }
 
+impl Starts {
+    /// The newest kiln moved to `commit`: kept for it afresh. Another commit's binaries may have
+    /// been kept since this one's were (a server just started, its own commit not yet fetched,
+    /// takes a runner's older one as the newest for a moment): its runs' are kept again.
+    fn moved(&mut self, commit: &str, was: &mut String) {
+        if commit != was {
+            self.last = None;
+            self.kept.clear();
+            was.clone_from(&commit.to_owned());
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Next {
     /// One is on its way or done, or builds of it failed enough.
@@ -451,10 +464,7 @@ pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         // The newest kiln (`crate::fleet`): the server's commit, or a newer one a runner runs.
         let commit = hub.updates.fleet.target().map_or_else(|| crate::api::COMMIT.to_owned(), |t| t.commit);
-        if commit != was {
-            starts.last = None;
-            was.clone_from(&commit);
-        }
+        starts.moved(&commit, &mut was);
         if let Err(e) = keep_in_step(&hub, &commit, &mut starts).await {
             tracing::warn!(commit = short(&commit), error = %format!("{e:#}"), "couldn't build every platform from the newest commit");
         }
@@ -2442,6 +2452,24 @@ mod tests {
         assert_eq!(next(&[run(Failed, Some(now - 7200))], &Starts { last: Some(now - 11 * 60), ..Starts::default() }, now), Next::Build);
         let failed3 = [run(Failed, Some(now - 9000)), run(Failed, Some(now - 8000)), run(Failed, Some(now - 7200))];
         assert_eq!(next(&failed3, &none, now), Next::Nothing);
+    }
+
+    /// A server just started took a runner's older commit as the newest for a moment (its own not
+    /// fetched yet), and kept that commit's binaries over its own: back on its own, its release
+    /// run's binaries are kept again (2026-10-20: jupiter waited for a Windows build of 5806c0d
+    /// its server had, overwritten by df17c34's).
+    #[test]
+    fn the_newest_moving_back_keeps_its_binaries_again() {
+        let mut starts = Starts { last: Some(5), ..Starts::default() };
+        let mut was = String::new();
+        starts.moved("5806c0d", &mut was);
+        starts.kept.insert("release-597-windows".to_owned());
+        starts.moved("5806c0d", &mut was);
+        assert!(starts.kept.contains("release-597-windows"), "still the same commit: nothing kept again");
+        starts.moved("df17c34", &mut was);
+        starts.kept.insert("release-525-windows".to_owned());
+        starts.moved("5806c0d", &mut was);
+        assert!(starts.kept.is_empty() && starts.last.is_none() && was == "5806c0d", "{starts:?}");
     }
 
     #[test]
