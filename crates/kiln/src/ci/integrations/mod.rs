@@ -172,6 +172,7 @@ pub const KINDS: &[KindInfo] = &[
             f("url", true, "its API server: https://argocd.example.com"),
             f("namespace", false, "where its Applications live (argocd)"),
             f("ca", false, "the PEM of the CA its certificate is signed by, when it isn't a public one"),
+            f("kiln_url", false, "where it reaches kiln, to read release repositories, when that isn't kiln's public URL"),
         ],
         secret: Some("an account's API token (argocd account generate-token --account <name>)"),
         built: true,
