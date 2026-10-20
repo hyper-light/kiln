@@ -187,6 +187,20 @@ fn widget(w: &Value, scale: &Scale, in_group: bool, vars: &[TemplateVariable], r
             k.search = text(def, "query").to_owned();
             Ok(None)
         }
+        "check_status" => {
+            // A service check's status (`super::api`'s `checks/status`): every group's (Datadog's
+            // cluster), or one group's.
+            let tags = |key: &str| def.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+            let check = text(def, "check").trim();
+            if check.is_empty() {
+                Err("a check status without its check".into())
+            } else {
+                k.kind = "check".into();
+                let grouping = if text(def, "grouping") == "check" { "check" } else { "cluster" };
+                k.options = json!({ "check": check, "grouping": grouping, "group": text(def, "group"), "group_by": tags("group_by"), "tags": tags("tags") });
+                Ok(None)
+            }
+        }
         "manage_status" => {
             k.kind = "monitors".into();
             k.search = monitor_filter(text(def, "query"));
@@ -498,6 +512,14 @@ fn export_widget(w: &Widget) -> Value {
         }),
         "events" => json!({ "type": "event_stream", "query": w.search, "event_size": "s" }),
         "monitors" => json!({ "type": "manage_status", "query": w.search, "summary_type": "monitors" }),
+        "check" => {
+            let list = |key: &str| w.options.get(key).cloned().filter(Value::is_array).unwrap_or_else(|| json!([]));
+            let mut d = json!({ "type": "check_status", "check": opt("check").unwrap_or(""), "grouping": opt("grouping").unwrap_or("cluster"), "group_by": list("group_by"), "tags": list("tags") });
+            if let (Some(g), Some(o)) = (opt("group").filter(|g| !g.is_empty()), d.as_object_mut()) {
+                o.insert("group".into(), json!(g));
+            }
+            d
+        }
         "group" => json!({ "type": "group", "layout_type": "ordered", "widgets": w.widgets.iter().map(export_widget).collect::<Vec<_>>() }),
         _ => json!({ "type": "note", "content": w.text }),
     };
@@ -619,7 +641,8 @@ mod tests {
                 { "definition": { "type": "change", "title": "Day over day", "requests": [{ "q": "sum:shop.orders{*} by {region}.as_count()", "compare_to": "day_before", "change_type": "relative" }] }, "layout": { "x": 0, "y": 14, "width": 6, "height": 3 } },
                 { "definition": { "type": "slo", "title": "Checkout SLO", "slo_id": "abc", "view_type": "detail" }, "layout": { "x": 6, "y": 14, "width": 6, "height": 3 } },
                 { "definition": { "type": "image", "url": "/static/images/logos/shop_large.svg" }, "layout": { "x": 0, "y": 17, "width": 2, "height": 2 } },
-                { "definition": { "type": "manage_status", "title": "Monitors", "query": "tag:(service:shop) status:alert", "summary_type": "monitors" }, "layout": { "x": 2, "y": 17, "width": 10, "height": 3 } }
+                { "definition": { "type": "manage_status", "title": "Monitors", "query": "tag:(service:shop) status:alert", "summary_type": "monitors" }, "layout": { "x": 2, "y": 17, "width": 10, "height": 3 } },
+                { "definition": { "type": "check_status", "title": "Agent up", "check": "datadog.agent.up", "grouping": "cluster", "group_by": [], "tags": ["$env"] }, "layout": { "x": 0, "y": 20, "width": 2, "height": 2 } }
             ]
         });
         let (d, report) = imp(&v)?;
@@ -655,7 +678,9 @@ mod tests {
         anyhow::ensure!(slo.kind == "note" && slo.text.contains("Datadog's `slo` widget, not drawn"), "kept, in its place: {slo:?}");
         anyhow::ensure!(by_title("Monitors")?.kind == "monitors" && by_title("Monitors")?.search == "service:shop");
         anyhow::ensure!(!all.iter().any(|w| w.text.contains("logos")), "Datadog's own image left out");
-        anyhow::ensure!(report.widgets == 12 && report.drawn == 9, "{report:?}");
+        let up = by_title("Agent up")?;
+        anyhow::ensure!(up.kind == "check" && up.options.get("check") == Some(&json!("datadog.agent.up")) && up.options.get("tags") == Some(&json!(["$env"])), "{up:?}");
+        anyhow::ensure!(report.widgets == 13 && report.drawn == 10, "{report:?}");
         anyhow::ensure!(report.otherwise.len() == 1 && report.not_drawn.len() == 2, "{report:?}");
         // Kept as kiln keeps dashboards.
         let dir = tempfile::tempdir()?;
@@ -740,15 +765,16 @@ mod tests {
                 w("b", "timeseries", &[r#"100 * logs("status:error").by("service") / logs("*").by("service")"#], 6, 0),
                 w("c", "query_value", &[r#"sum:requests{*}.as_count() + spans("service:web").rollup("count")"#], 0, 4),
                 w("d", "pie", &[r#"logs("*").rollup("cardinality", "@user").by("service")"#], 6, 4),
+                Widget { options: json!({ "check": "db.can_connect", "grouping": "check", "group": "host:db-1", "group_by": ["host"], "tags": ["env:prod"] }), ..w("e", "check", &[], 0, 8) },
             ],
             builtin: false,
             created: 0,
             modified: 0,
         };
         let (back, report) = imp(&export(&d))?;
-        anyhow::ensure!(report.drawn == 4 && report.not_drawn.is_empty(), "{report:?}");
+        anyhow::ensure!(report.drawn == 5 && report.not_drawn.is_empty(), "{report:?}");
         for (a, b) in d.widgets.iter().zip(&back.widgets) {
-            anyhow::ensure!(a.kind == b.kind && a.layout == b.layout, "{a:?} {b:?}");
+            anyhow::ensure!(a.kind == b.kind && a.layout == b.layout && (a.kind != "check" || a.options == b.options), "{a:?} {b:?}");
             // The same query, read alike (Datadog's formula brackets each named query, and a count
             // says no rollup).
             for (qa, qb) in a.queries.iter().zip(&b.queries) {
@@ -816,12 +842,14 @@ mod tests {
             let (a, b) = (flat(&d), flat(&again));
             anyhow::ensure!(a.len() == b.len(), "{}: {} widgets came back {}", f.display(), a.len(), b.len());
             // Each widget found again by what it is (a top a row apart can change the order two
-            // widgets are read in): its kind, title, search, text and queries, read alike.
+            // widgets are read in): its kind, title, search, text and queries, read alike (and a
+            // check status's check, groups and tags).
             let same = |x: &Widget, y: &Widget| {
                 x.kind == y.kind
                     && x.title == y.title
                     && x.search == y.search
                     && x.text == y.text
+                    && (x.kind != "check" || x.options == y.options)
                     && x.queries.len() == y.queries.len()
                     && x.queries.iter().zip(&y.queries).all(|(qa, qb)| read(qa, &d.template_variables).ok() == read(qb, &again.template_variables).ok())
             };

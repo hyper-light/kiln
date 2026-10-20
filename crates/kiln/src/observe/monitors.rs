@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kiln_obs::monitor::checks::{self, CheckQuery, CheckThresholds};
 use kiln_obs::monitor::composite::{self, Composite, Group};
 use kiln_obs::monitor::{self, State, Thresholds, Transition, Vars};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,9 @@ const EVERY_MIN_S: u32 = 10;
 /// with no data at all is kept.
 const GROUPS: usize = 10_000;
 const FORGET_MS: i64 = 86_400_000;
+/// How long a service check's group may go without a run before it is not found (and NO DATA, when
+/// asked), unless its monitor says: Datadog's default for a service check, a day.
+const CHECK_NO_DATA_MS: i64 = 86_400_000;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -47,6 +51,10 @@ pub struct ThresholdsIn {
     pub warning: Option<f64>,
     pub critical_recovery: Option<f64>,
     pub warning_recovery: Option<f64>,
+    /// A service check monitor's: OK runs in a row to recover.
+    pub ok: Option<f64>,
+    /// A service check monitor's: UNKNOWN runs in a row to NO DATA (none: never).
+    pub unknown: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -66,8 +74,10 @@ pub struct Options {
 
 /// Datadog's type for a composite monitor.
 pub const COMPOSITE: &str = "composite";
+/// Datadog's type for a service check monitor.
+pub const SERVICE_CHECK: &str = "service check";
 /// Datadog's types of the monitors whose kind their query says, as its API names them.
-pub const TYPES: [&str; 6] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert"];
+pub const TYPES: [&str; 7] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert", SERVICE_CHECK];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
@@ -151,11 +161,21 @@ fn issue_vars(store: &kiln_obs::store::Store, i: &super::errors::Issue, template
     out
 }
 
+/// A service check monitor's group's variables for its message: Datadog's `{{check_message}}`, its
+/// latest run's message, and that run's status (`{{check_status}}`: OK, WARNING, CRITICAL, UNKNOWN).
+fn check_vars(store: &kiln_obs::store::Store, q: &CheckQuery, group: &[(String, String)], now: i64) -> Vec<(String, String)> {
+    let run = checks::latest_run(store, &q.check, group, now, CHECK_NO_DATA_MS);
+    let status = run.as_ref().and_then(|r| r.attrs.iter().find(|(k, _)| k == "check_status")).map_or(checks::UNKNOWN, |(_, v)| checks::code(v));
+    vec![("check_message".into(), run.map(|r| r.message).unwrap_or_default()), ("check_status".into(), checks::name(status).into())]
+}
+
 /// A monitor, compiled: a query of the store and its thresholds, or a composite of other monitors.
 #[derive(Debug, Clone)]
 pub enum Compiled {
     Query(monitor::Query, Thresholds),
     Composite(Composite),
+    /// A service check monitor: its query, and its thresholds of runs in a row.
+    Check(CheckQuery, CheckThresholds),
 }
 
 impl Monitor {
@@ -177,6 +197,9 @@ impl Monitor {
             Some(t) if TYPES.contains(&t) => {}
             Some(other) => return Err(format!("a monitor's type: {other} ({COMPOSITE}, {}, or none: the query says)", TYPES.join(", "))),
         }
+        if checks::is_check(&self.query) || self.kind.as_deref() == Some(SERVICE_CHECK) {
+            return self.compiled_check().map(|(q, t)| Compiled::Check(q, t));
+        }
         let q = monitor::parse(&self.query).map_err(|e| e.to_string())?;
         if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
             return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
@@ -189,6 +212,34 @@ impl Monitor {
         }
         let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery };
         Ok(Compiled::Query(q, t))
+    }
+
+    /// A service check monitor's query and thresholds: runs in a row, whole numbers 1 to
+    /// [`checks::MAX_RUNS`] (critical and ok 1 unless said, Datadog's), its query reading at least
+    /// the most of them (Datadog's rule).
+    fn compiled_check(&self) -> Result<(CheckQuery, CheckThresholds), String> {
+        if let Some(t) = self.kind.as_deref()
+            && t != SERVICE_CHECK
+        {
+            return Err(format!("a service check's query in a monitor of type {t}: its type is {SERVICE_CHECK}"));
+        }
+        let q = checks::parse(&self.query).map_err(|e| e.to_string())?;
+        let runs = |what: &str, v: Option<f64>| match v {
+            None => Ok(None),
+            Some(n) if n.fract() == 0.0 && (1.0..=f64::from(checks::MAX_RUNS)).contains(&n) => Ok(Some(n as u32)),
+            Some(n) => Err(format!("a service check's {what} threshold: {n} runs in a row, 1 to {}", checks::MAX_RUNS)),
+        };
+        let (o, d) = (&self.options.thresholds, CheckThresholds::default());
+        let t = CheckThresholds {
+            critical: runs("critical", o.critical)?.unwrap_or(d.critical),
+            warning: runs("warning", o.warning)?,
+            ok: runs("ok", o.ok)?.unwrap_or(d.ok),
+            unknown: runs("unknown", o.unknown)?,
+        };
+        if q.last < t.most() {
+            return Err(format!(".last({}) reads fewer runs than its thresholds ask in a row ({}): at least that many", q.last, t.most()));
+        }
+        Ok((q, t))
     }
 
     /// The monitors a composite reads (none for the rest).
@@ -244,6 +295,7 @@ struct Said {
 fn said_of(m: &Monitor) -> Said {
     match m.compiled() {
         Ok(Compiled::Query(q, t)) => Said { threshold: q.threshold, warning: t.warning },
+        Ok(Compiled::Check(_, t)) => Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) },
         _ => Said { threshold: f64::NAN, warning: None },
     }
 }
@@ -482,7 +534,11 @@ impl Monitors {
     /// One monitor's evaluation: each group's next state, events and notifications for changes.
     /// Whether any state changed.
     fn evaluate(&self, store: &kiln_obs::store::Store, m: &Monitor, now: i64) -> bool {
-        let Ok(Compiled::Query(q, t)) = m.compiled() else { return false };
+        let (q, t) = match m.compiled() {
+            Ok(Compiled::Query(q, t)) => (q, t),
+            Ok(Compiled::Check(q, t)) => return self.evaluate_check(store, m, &q, &t, now),
+            _ => return false,
+        };
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
         let values = match &q.kind {
             monitor::Kind::Slo { id, burn } => slo_values(store, id, *burn, now - delay),
@@ -497,7 +553,7 @@ impl Monitors {
             }
         };
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * Monitor::window_ms(&q), |mins| i64::from(mins) * 60_000);
-        let mut found: Vec<(Group, Option<f64>, State)> = values.into_iter().map(|v| (v.group, Some(v.value), State::Ok)).collect();
+        let mut found: Vec<(Group, Option<f64>, Option<State>)> = values.into_iter().map(|v| (v.group, Some(v.value), None)).collect();
         // An Error Tracking monitor's group in trouble that it no longer finds (its issue resolved,
         // ignored, no longer new, or without errors in the window) counts none, and recovers: a
         // count of a group gone quiet is zero, as Datadog evaluates its event monitors' groups.
@@ -505,10 +561,23 @@ impl Monitors {
             let have: HashSet<&Group> = found.iter().map(|(g, _, _)| g).collect();
             let gone: Vec<Group> =
                 lock(&self.states).get(&m.id).map(|gs| gs.values().filter(|g| g.state != State::Ok.as_str() && !have.contains(&g.group)).map(|g| g.group.clone()).collect()).unwrap_or_default();
-            found.extend(gone.into_iter().map(|g| (g, Some(0.0), State::Ok)));
+            found.extend(gone.into_iter().map(|g| (g, Some(0.0), None)));
         }
         let said = Said { threshold: q.threshold, warning: t.warning };
         self.apply(store, m, now, no_data_ms, found, |prev, value, _| monitor::next(prev, value, q.op, &t, m.options.notify_no_data), said)
+    }
+
+    /// A service check monitor's evaluation: each group moved by its last runs
+    /// (`kiln_obs::monitor::checks`), or left as it is where they settle nothing. A group is found
+    /// while it has a run within the no-data timeframe (a day unless the monitor says, Datadog's for
+    /// a service check); one not found has had none for that long, and goes to NO DATA at once
+    /// when the monitor asks to be told.
+    fn evaluate_check(&self, store: &kiln_obs::store::Store, m: &Monitor, q: &CheckQuery, t: &CheckThresholds, now: i64) -> bool {
+        let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
+        let lookback = m.options.no_data_timeframe.map_or(CHECK_NO_DATA_MS, |mins| i64::from(mins) * 60_000);
+        let found = checks::evaluate(store, q, t, now - delay, lookback).into_iter().map(|g| (g.group, Some(f64::from(g.status)), g.state)).collect();
+        let said = Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) };
+        self.apply(store, m, now, 0, found, |prev, _, made| made.unwrap_or(prev), said)
     }
 
     /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
@@ -523,12 +592,12 @@ impl Monitors {
         let every_ms = i64::from(m.options.every.unwrap_or(EVERY_S).max(EVERY_MIN_S)) * 1000;
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * every_ms, |mins| i64::from(mins) * 60_000);
         let notify = m.options.notify_no_data;
-        let found: Vec<(Group, Option<f64>, State)> = results.into_iter().map(|(g, s)| (g, None, s)).collect();
-        self.apply(store, m, now, no_data_ms, found, |prev, _, s| if s == State::NoData && !notify { prev } else { s }, Said { threshold: f64::NAN, warning: None })
+        let found: Vec<(Group, Option<f64>, Option<State>)> = results.into_iter().map(|(g, s)| (g, None, Some(s))).collect();
+        self.apply(store, m, now, no_data_ms, found, |prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said { threshold: f64::NAN, warning: None })
     }
 
     /// What an evaluation found, applied: each group found moves from its last state to what
-    /// `next(last, its value, what the evaluation made of it)` says; groups not found go to NO DATA
+    /// `next(last, its value, the state the evaluation found it in, if any)` says; groups not found go to NO DATA
     /// after `no_data_ms` when the monitor asks to be told, and are forgotten after a day. Changes
     /// are said, and groups in trouble said again when due. Whether any state changed.
     #[allow(clippy::too_many_arguments)]
@@ -538,8 +607,8 @@ impl Monitors {
         m: &Monitor,
         now: i64,
         no_data_ms: i64,
-        found: Vec<(Group, Option<f64>, State)>,
-        next: impl Fn(State, Option<f64>, State) -> State,
+        found: Vec<(Group, Option<f64>, Option<State>)>,
+        next: impl Fn(State, Option<f64>, Option<State>) -> State,
         said: Said,
     ) -> bool {
         let renotify_ms = m.options.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0);
@@ -611,7 +680,11 @@ impl Monitors {
             Some(i) => format!("{}/observe/errors/{}", self.link_base, i.id),
             None => format!("{}/observe/monitors/{}", self.link_base, m.id),
         };
-        let extra = issue.as_ref().map(|i| issue_vars(store, i, &m.message, now)).unwrap_or_default();
+        let extra = match (&issue, m.compiled()) {
+            (Some(i), _) => issue_vars(store, i, &m.message, now),
+            (None, Ok(Compiled::Check(q, _))) => check_vars(store, &q, &g.group, now),
+            _ => Vec::new(),
+        };
         let tr = Transition { from, to };
         let vars = Vars { monitor: &m.name, value: g.value, threshold: said.threshold, warn_threshold: said.warning, group: &g.group, link: &link, extra: &extra };
         let message = monitor::render(&m.message, tr, &vars);
@@ -723,5 +796,44 @@ mod tests {
         assert!(m(None, false).compiled().is_ok());
         assert!(m(Some("rum alert"), false).compiled().is_err());
         assert!(m(Some("error-tracking alert"), true).compiled().is_err());
+    }
+
+    /// A service check monitor: of Datadog's type or none, its thresholds runs in a row (an alert
+    /// on the first failure and a recovery on the first success unless it says), its query reading
+    /// at least the most of them; another type's, or thresholds that are not runs, refused.
+    #[test]
+    fn a_service_check_monitor_counts_runs_in_a_row() -> anyhow::Result<()> {
+        let m = |kind: Option<&str>, query: &str, thresholds: ThresholdsIn| Monitor {
+            id: String::new(),
+            name: "agent up".into(),
+            kind: kind.map(str::to_owned),
+            query: query.into(),
+            message: String::new(),
+            tags: Vec::new(),
+            priority: None,
+            options: Options { thresholds, ..Options::default() },
+            muted_until: None,
+            created: 0,
+            modified: 0,
+        };
+        let compiled = |kind: Option<&str>, query: &str, thresholds: ThresholdsIn| match m(kind, query, thresholds).compiled() {
+            Ok(Compiled::Check(_, t)) => Ok(t),
+            Ok(_) => Err("not a service check's".to_owned()),
+            Err(e) => Err(e),
+        };
+        let runs = |critical: Option<f64>, warning: Option<f64>, ok: Option<f64>, unknown: Option<f64>| ThresholdsIn { critical, warning, ok, unknown, ..ThresholdsIn::default() };
+        let q = r#""datadog.agent.up".over("*").by("host").last(3).count_by_status()"#;
+        anyhow::ensure!(compiled(Some(SERVICE_CHECK), q, ThresholdsIn::default()) == Ok(CheckThresholds::default()));
+        anyhow::ensure!(compiled(None, q, runs(Some(3.0), Some(2.0), Some(2.0), Some(1.0))) == Ok(CheckThresholds { critical: 3, warning: Some(2), ok: 2, unknown: Some(1) }));
+        for (kind, query, thresholds) in [
+            (Some(SERVICE_CHECK), q, runs(Some(4.0), None, None, None)),
+            (Some(SERVICE_CHECK), q, runs(Some(1.5), None, None, None)),
+            (Some(SERVICE_CHECK), q, runs(None, None, Some(0.0), None)),
+            (Some("metric alert"), q, ThresholdsIn::default()),
+            (Some(SERVICE_CHECK), "avg(last_5m):cpu{*} > 1", ThresholdsIn::default()),
+        ] {
+            anyhow::ensure!(m(kind, query, thresholds).compiled().is_err(), "{kind:?} {query} taken");
+        }
+        Ok(())
     }
 }

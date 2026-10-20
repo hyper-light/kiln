@@ -7,6 +7,7 @@
 //   [BROWSER=chromium|webkit] [PHONE=1] [ONLY=<part of a scenario's name>] [SHOTS=<folder>] \
 //   [RECEIVER=http://127.0.0.1:17199 RECEIVED=<the jsonl it keeps what it is sent in>] \
 //   [LOGS_DIR=<a folder this script writes in and the server reads>] \
+//   [KILN_INGEST_TOKEN=<observe's ingest token: what Datadog's Agent sends with, <data>/observe/ingest.token>] \
 //   node ui/e2e/observe.mjs
 //
 // The server needs observe's data to look at: metrics of `app.latency.p95` by `service` and logs
@@ -580,6 +581,68 @@ const scenarios = {
     await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
     await page.waitForURL(/\/observe\/monitors$/);
     expect((await api("GET", `/api/observe/v1/monitors/${id}`)).status === 404, "the monitor gone");
+  },
+
+  /** A service check's runs sent as Datadog's Agent sends them: its status on a dashboard (the
+   * failing host by name), and a monitor of it made from the form alerting that host once its check
+   * has failed twice in a row, its page saying so. */
+  async "a service check's status is drawn, and its monitor made from the form alerts the failing host"() {
+    const ingest = process.env.KILN_INGEST_TOKEN;
+    if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
+    const check = `e2e.${run}.db.can_connect`;
+    const s = Math.floor(Date.now() / 1000);
+    const runs = [
+      ["web-1", 0, s - 40, "connected"],
+      ["web-2", 0, s - 40, "connected"],
+      ["web-1", 2, s - 30, "connection refused"],
+      ["web-2", 0, s - 30, "connected"],
+      ["web-1", 2, s - 20, "connection refused"],
+    ];
+    const sent = await fetch(`${BASE}/api/v1/check_run`, {
+      method: "POST",
+      headers: { "DD-API-KEY": ingest, "content-type": "application/json" },
+      body: JSON.stringify(runs.map(([host_name, status, timestamp, message]) => ({ check, host_name, status, timestamp, message, tags: ["env:e2e"] }))),
+    });
+    expect(sent.status === 202, `the runs taken: ${sent.status}`);
+    const status = () => api("POST", "/api/observe/v1/checks/status", { check, tags: ["env:e2e"], group_by: ["host"], from: Date.now() - 3_600_000, to: Date.now() + 60_000 });
+    await until("the runs stored", async () => (await status()).body?.total === 2);
+    const widget = {
+      title: "Database reachable",
+      kind: "check",
+      queries: [],
+      search: "",
+      text: "",
+      layout: { x: 0, y: 0, w: 6, h: 3 },
+      options: { check, grouping: "cluster", group_by: ["host"], tags: ["env:e2e"] },
+    };
+    const d = await api("POST", "/api/observe/v1/dashboards", { title: `E2E checks ${run}`, widgets: [widget] });
+    expect(d.status === 201, `the dashboard: ${d.status}`);
+    await page.goto(`${BASE}/observe/dashboards/${d.body.id}`);
+    // Its counts, the worst first.
+    await page.getByText("1 Critical · 1 OK", { exact: true }).waitFor();
+    await page.getByRole("list", { name: "Groups not OK" }).getByText("host:web-1", { exact: true }).waitFor();
+    await fitsAcross("a check's status");
+    // Its monitor, from the form: two failures in a row alert.
+    const query = `"${check}".over("env:e2e").by("host").last(2).count_by_status()`;
+    await page.goto(`${BASE}/observe/monitors/new?query=${encodeURIComponent(query)}`);
+    await fillIn(page.getByLabel("Name", { exact: true }), `E2E db ${run}`);
+    await fillIn(page.getByLabel("Alerts after CRITICAL runs in a row", { exact: true }), "2");
+    await fillIn(page.getByLabel("Evaluate every (seconds)", { exact: true }), "10");
+    await page.getByRole("button", { name: "Create", exact: true }).click();
+    await page.waitForURL(/\/observe\/monitors\/m[0-9a-f]+$/);
+    const id = page.url().split("/").pop();
+    const m = await api("GET", `/api/observe/v1/monitors/${id}`);
+    expect(m.body.type === "service check" && m.body.options.thresholds.critical === 2 && m.body.message.includes("{{check_message}}"), `kept as made: ${JSON.stringify(m.body).slice(0, 300)}`);
+    await until("the failing host alerting", async () => (await api("GET", `/api/observe/v1/monitors/${id}`)).body.state === "ALERT", 45_000);
+    await page.reload();
+    const row = page.getByRole("row", { name: /host:web-1/ });
+    await row.getByText("Critical", { exact: true }).waitFor();
+    await row.getByText("Alert", { exact: true }).waitFor();
+    await page.getByText("2 CRITICAL in a row", { exact: true }).waitFor();
+    await fitsAcross("a service check monitor");
+    const groups = (await api("GET", `/api/observe/v1/monitors/${id}`)).body.groups.map((g) => `${g.group.map(([k, v]) => `${k}:${v}`).join(",")}=${g.state}`).sort();
+    expect(JSON.stringify(groups) === JSON.stringify(["host:web-1=ALERT", "host:web-2=OK"]), `its groups: ${groups}`);
+    expect((await api("DELETE", `/api/observe/v1/monitors/${id}`)).status < 300 && (await api("DELETE", `/api/observe/v1/dashboards/${d.body.id}`)).status < 300, "removed");
   },
 
   /** A signed webhook added, tested (the receiver gets a signed notice), and removed. */

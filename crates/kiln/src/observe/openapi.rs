@@ -90,6 +90,34 @@ fn schemas() -> Map<String, Value> {
         ),
     );
     put(
+        "CheckStatusRequest",
+        object(
+            &[
+                ("check", describe(string(), "a service check's name: `datadog.agent.up`")),
+                ("tags", describe(array(string()), "the runs it reads: `key:value` (a value with `*` a glob) or a bare tag, each; `*` or none, every run")),
+                ("group_by", describe(array(string()), "what a group is (none: each of the check's series apart)")),
+                ("group", describe(nullable(string()), "one group's tags, `key:value` comma-separated (Datadog's grouping by check)")),
+                ("from", ms()),
+                ("to", ms()),
+            ],
+            &["check", "from", "to"],
+        ),
+    );
+    let check_status = one_of(&["OK", "WARNING", "CRITICAL", "UNKNOWN"]);
+    put(
+        "CheckStatus",
+        object(
+            &[
+                ("check", string()),
+                ("status", describe(nullable(check_status.clone()), "the worst group's (none: no run in the time)")),
+                ("counts", describe(map_of(integer()), "groups in each status")),
+                ("groups", describe(array(object(&[("tags", tags.clone()), ("status", check_status), ("at", ms())], &["tags", "status", "at"])), "each group's, the first 1,000")),
+                ("total", describe(integer(), "groups")),
+            ],
+            &["check", "status", "counts", "groups", "total"],
+        ),
+    );
+    put(
         "Grid",
         object(
             &[
@@ -462,7 +490,17 @@ fn schemas() -> Map<String, Value> {
             &["role", "member", "leader", "applied", "series", "blocks", "digest_hex", "disk_low"],
         ),
     );
-    let thresholds = object(&[("critical", nullable(number())), ("warning", nullable(number())), ("critical_recovery", nullable(number())), ("warning_recovery", nullable(number()))], &[]);
+    let thresholds = object(
+        &[
+            ("critical", nullable(number())),
+            ("warning", nullable(number())),
+            ("critical_recovery", nullable(number())),
+            ("warning_recovery", nullable(number())),
+            ("ok", describe(nullable(number()), "a service check monitor's: OK runs in a row to recover (its critical and warning: runs in a row too)")),
+            ("unknown", describe(nullable(number()), "a service check monitor's: UNKNOWN runs in a row to NO DATA")),
+        ],
+        &[],
+    );
     let options = object(
         &[
             ("thresholds", thresholds),
@@ -480,17 +518,17 @@ fn schemas() -> Map<String, Value> {
             "type",
             describe(
                 string(),
-                "`composite` for a composite (its query an expression of monitors' ids); else the query says (none, or Datadog's type: `metric alert`, `query alert`, `log alert`, `trace-analytics alert`, `slo alert`, `error-tracking alert`)",
+                "`composite` for a composite (its query an expression of monitors' ids); else the query says (none, or Datadog's type: `metric alert`, `query alert`, `log alert`, `trace-analytics alert`, `slo alert`, `error-tracking alert`, `service check`)",
             ),
         ),
         (
             "query",
             describe(
                 string(),
-                "Datadog's monitor query: `avg(last_5m):avg:system.load.1{*} by {host} > 4`, `logs(\"status:error\").last(\"5m\") > 10`, `error-tracking(\"service:shop\").source(\"backend\").new().rollup(\"count\").by(\"issue.id\").last(\"1d\") > 0`",
+                "Datadog's monitor query: `avg(last_5m):avg:system.load.1{*} by {host} > 4`, `logs(\"status:error\").last(\"5m\") > 10`, `error-tracking(\"service:shop\").source(\"backend\").new().rollup(\"count\").by(\"issue.id\").last(\"1d\") > 0`, `\"datadog.agent.up\".over(\"*\").by(\"host\").last(2).count_by_status()`",
             ),
         ),
-        ("message", describe(string(), "Datadog's template variables (an Error Tracking monitor's `{{issue.attributes.error.type}}`, `.message`, `.file`, `.stack`) and @-mentions of integrations")),
+        ("message", describe(string(), "Datadog's template variables (an Error Tracking monitor's `{{issue.attributes.error.type}}`, `.message`, `.file`, `.stack`; a service check monitor's `{{check_message}}`, `{{check_status}}`) and @-mentions of integrations")),
         ("tags", array(string())),
         ("priority", nullable(integer())),
         ("options", options),
@@ -1302,6 +1340,7 @@ fn ops() -> Vec<Op<'static>> {
     let accepted = |s: Value| ("202", answer_of("taken", s));
     let mut v = vec![
         op("post", "/query", "Asks a metric query: its series on a grid (or a heatmap, with `heatmap`)", "observe.read", Some(body("QueryRequest")), vec![("200", answer_of("the series, or the heatmap", json!({ "oneOf": [schema("QueryAnswer"), schema("HeatmapAnswer")] })))]),
+        op("post", "/checks/status", "A service check's status by group (Datadog's check status widget)", "observe.read", Some(body("CheckStatusRequest")), vec![ok("CheckStatus")]),
         Op {
             params: vec![
                 param("query", "query", true, string(), "a metric query"),

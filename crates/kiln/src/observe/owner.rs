@@ -539,6 +539,9 @@ impl Observe {
         if records.is_empty() && ack.is_none() {
             return Ok(());
         }
+        // Each service check's status as a sample of its series, from the run as it came
+        // (`kiln_obs::monitor::checks`): written once its record is taken.
+        let statuses: Vec<(SeriesKey, Vec<(i64, f64)>)> = records.iter().filter_map(kiln_obs::monitor::checks::status_sample).map(|(key, ms, v)| (key, vec![(ms, v)])).collect();
         // The pipelines, where the records are taken. A reader's (acked) records were processed as
         // it gathered them: one refused comes back to be offered again, and is not processed twice.
         if ack.is_none() {
@@ -567,6 +570,7 @@ impl Observe {
                 _ => Vec::new(),
             });
         }
+        self.write(statuses);
         Ok(())
     }
 

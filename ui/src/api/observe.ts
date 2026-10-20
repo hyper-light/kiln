@@ -134,7 +134,8 @@ export interface ObserveStatus {
 export type MonitorState = "OK" | "WARN" | "ALERT" | "NO DATA";
 
 export interface MonitorOptions {
-  thresholds: { critical?: number | null; warning?: number | null; critical_recovery?: number | null; warning_recovery?: number | null };
+  /** A service check monitor's critical, warning, ok and unknown: runs of that status in a row. */
+  thresholds: { critical?: number | null; warning?: number | null; critical_recovery?: number | null; warning_recovery?: number | null; ok?: number | null; unknown?: number | null };
   notify_no_data: boolean;
   no_data_timeframe?: number | null;
   renotify_interval?: number | null;
@@ -208,8 +209,10 @@ export interface MonitorCheck {
   ok: boolean;
   op?: string;
   threshold?: number;
-  kind?: "metric" | "change" | "logs" | "spans" | "composite" | "forecast" | "slo" | "error-tracking";
-  watched?: { query?: string | null; search?: string };
+  kind?: "metric" | "change" | "logs" | "spans" | "composite" | "forecast" | "slo" | "error-tracking" | "service-check";
+  /** A service check monitor's: its check, the tags of the runs it reads, its groups, and how many
+   * of a group's latest runs it reads. */
+  watched?: { query?: string | null; search?: string; check?: string; over?: string[]; by?: string[]; last?: number };
   composite?: CompositeOf;
   window_ms?: number;
   error?: string;
@@ -786,7 +789,7 @@ export interface CloudTest {
   warnings?: string[];
 }
 
-export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "heatmap" | "distribution" | "pie" | "logs" | "events" | "monitors" | "note" | "group";
+export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "heatmap" | "distribution" | "pie" | "logs" | "events" | "monitors" | "check" | "note" | "group";
 
 /** A query's heatmap: each row's `[lo, hi]`, and each bucket of time's count in each row (a
  * distribution's rows its buckets). */
@@ -805,9 +808,43 @@ export interface Widget {
   search: string;
   text: string;
   layout: { x: number; y: number; w: number; h: number };
-  options: { unit?: string; display?: "line" | "bars" | "area"; aggregator?: string; limit?: number; order?: "asc" | "desc" } | null;
+  options: {
+    unit?: string;
+    display?: "line" | "bars" | "area";
+    aggregator?: string;
+    limit?: number;
+    order?: "asc" | "desc";
+    /** A check widget's: its service check, the tags of its runs, what a group is, and whether it
+     * shows every group's status (`cluster`) or one group's (`check`, `group` its tags). */
+    check?: string;
+    tags?: string[];
+    group_by?: string[];
+    grouping?: "cluster" | "check";
+    group?: string;
+  } | null;
   /** A group's widgets, on a grid of its own. */
   widgets?: Widget[];
+}
+
+/** A service check run's status, as Datadog names it. */
+export type CheckState = "OK" | "WARNING" | "CRITICAL" | "UNKNOWN";
+
+/** A service check's status (`POST checks/status`): the worst group's, how many groups are in
+ * each status, and each group's (the worst of its series' latest runs). */
+export interface CheckStatus {
+  check: string;
+  status: CheckState | null;
+  counts: Record<CheckState, number>;
+  groups: { tags: Record<string, string>; status: CheckState; at: number }[];
+  total: number;
+}
+
+/** What a check status asks: its check, the tags of its runs, what a group is, or one group. */
+export interface CheckStatusAsk {
+  check: string;
+  tags?: string[];
+  group_by?: string[];
+  group?: string;
 }
 
 /** What became of a Datadog dashboard's widgets as kiln took it: those drawn as Datadog draws
@@ -1017,6 +1054,7 @@ export const observeApi = {
   setIssueStatus: (id: string, status: IssueStatus) => request<Issue>("PUT", `${BASE}/errors/issues/${enc(id)}`, { status }),
   query: (body: { query: string; from: number; to: number; step?: number; points?: number }, signal?: AbortSignal) => request<QueryAnswer>("POST", `${BASE}/query`, body, { signal }),
   heatmap: (body: { query: string; from: number; to: number; points?: number; heatmap: number }, signal?: AbortSignal) => request<HeatmapAnswer>("POST", `${BASE}/query`, body, { signal }),
+  checkStatus: (body: CheckStatusAsk & { from: number; to: number }, signal?: AbortSignal) => request<CheckStatus>("POST", `${BASE}/checks/status`, body, { signal }),
   metrics: (match: string | undefined, signal?: AbortSignal) =>
     request<{ metrics: string[] }>("GET", `${BASE}/metrics${match ? `?match=${enc(match)}&limit=200` : "?limit=200"}`, undefined, { signal }),
   tagValues: (key: string, signal?: AbortSignal) => request<{ key: string; values: string[] }>("GET", `${BASE}/tags?key=${enc(key)}&limit=500`, undefined, { signal }),

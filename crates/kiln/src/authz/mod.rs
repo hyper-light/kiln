@@ -401,6 +401,7 @@ pub static ROUTES: &[Rule] = &[
     // on tokens of their own.
     r("GET", "/api/observe/v1/**", "observe.read", At::Server),
     r("POST", "/api/observe/v1/query", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/checks/status", "observe.read", At::Server),
     r("POST", "/api/observe/v1/logs/search", "observe.read", At::Server),
     r("POST", "/api/observe/v1/logs/aggregate", "observe.read", At::Server),
     r("POST", "/api/observe/v1/logs/facets", "observe.read", At::Server),

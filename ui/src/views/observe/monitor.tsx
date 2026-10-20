@@ -20,8 +20,23 @@ import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
 import { invalidate } from "@/lib/resource";
-import { Histogram, QueryChart, RangePicker, StateBadge, histogramRes, integrationsRes, logsOnly, monitorRes, monitorsRes, spanHistogramRes, useRange, type Mark, type Range } from "./parts";
-import { Stream } from "./widgets";
+import {
+  CHECK_WORDS,
+  Histogram,
+  QueryChart,
+  RangePicker,
+  StateBadge,
+  histogramRes,
+  integrationsRes,
+  logsOnly,
+  monitorRes,
+  monitorsRes,
+  spanHistogramRes,
+  useRange,
+  type Mark,
+  type Range,
+} from "./parts";
+import { CheckRuns, Stream } from "./widgets";
 
 const checkRes = (query: string): Res<MonitorCheck> => ({ key: `observe/monitor-check/${query}`, fetch: (s) => observeApi.validateMonitor(query, s) });
 
@@ -54,18 +69,26 @@ const COMPOSITE = "composite";
 /** A composite's monitors' letters, as Datadog's form gives them: ten at the most. */
 const LETTERS = "abcdefghij";
 
-/** A new monitor's message: a query monitor's says its value; a composite has none. */
+/** A new monitor's message: a query monitor's says its value, a service check's its run's message;
+ * a composite has none. */
 const MESSAGE = {
   query: "{{#is_alert}}{{monitor.name}} is alerting: {{value}}{{/is_alert}}\n{{#is_recovery}}{{monitor.name}} recovered{{/is_recovery}}",
+  check: "{{#is_alert}}{{monitor.name}}: {{check_message}}{{/is_alert}}\n{{#is_recovery}}{{monitor.name}} recovered{{/is_recovery}}",
   composite: "{{#is_alert}}{{monitor.name}} is alerting{{/is_alert}}\n{{#is_recovery}}{{monitor.name}} recovered{{/is_recovery}}",
 };
+
+/** Datadog's type of a service check monitor, whose query starts with its check's name, quoted. */
+const SERVICE_CHECK = "service check";
+const isCheckQuery = (q: string) => /^\s*"/.test(q);
+/** A service check monitor's group's value: its latest run's status. */
+const CHECK_CODES = ["OK", "WARNING", "CRITICAL", "UNKNOWN"] as const;
 
 const blank = (query: string, type: string | null): Monitor => ({
   id: "",
   name: "",
   type: type === COMPOSITE ? COMPOSITE : null,
   query,
-  message: type === COMPOSITE ? MESSAGE.composite : MESSAGE.query,
+  message: type === COMPOSITE ? MESSAGE.composite : isCheckQuery(query) ? MESSAGE.check : MESSAGE.query,
   tags: [],
   priority: null,
   options: { thresholds: {}, notify_no_data: false },
@@ -155,15 +178,30 @@ function MonitorView({ id }: { id: string }) {
               items={[
                 ...(m.composite
                   ? [{ label: "Alerts when", value: m.composite.expression }]
-                  : [
-                      { label: "Critical", value: m.options.thresholds.critical ?? "the query's" },
-                      { label: "Warning", value: m.options.thresholds.warning ?? "—" },
-                      {
-                        label: "Recovers below",
-                        value: [m.options.thresholds.critical_recovery, m.options.thresholds.warning_recovery].filter((v) => v !== null && v !== undefined).join(" / ") || "its thresholds",
-                      },
-                    ]),
-                { label: "No data", value: m.options.notify_no_data ? `after ${m.options.no_data_timeframe ?? "two windows'"} min` : "keeps its state" },
+                  : isCheckQuery(m.query)
+                    ? [
+                        { label: "Alerts after", value: `${m.options.thresholds.critical ?? 1} CRITICAL in a row` },
+                        { label: "Warns after", value: m.options.thresholds.warning ? `${m.options.thresholds.warning} WARNING in a row` : "—" },
+                        { label: "Recovers after", value: `${m.options.thresholds.ok ?? 1} OK in a row` },
+                      ]
+                    : [
+                        { label: "Critical", value: m.options.thresholds.critical ?? "the query's" },
+                        { label: "Warning", value: m.options.thresholds.warning ?? "—" },
+                        {
+                          label: "Recovers below",
+                          value: [m.options.thresholds.critical_recovery, m.options.thresholds.warning_recovery].filter((v) => v !== null && v !== undefined).join(" / ") || "its thresholds",
+                        },
+                      ]),
+                {
+                  label: "No data",
+                  value: m.options.notify_no_data
+                    ? m.options.no_data_timeframe
+                      ? `after ${m.options.no_data_timeframe} min`
+                      : isCheckQuery(m.query)
+                        ? "after a day"
+                        : "after two windows"
+                    : "keeps its state",
+                },
                 { label: "Told again", value: m.options.renotify_interval ? `every ${m.options.renotify_interval} min` : "once" },
                 { label: "Evaluated", value: `every ${m.options.every ?? 60} s${m.options.evaluation_delay ? `, ${m.options.evaluation_delay} s late` : ""}` },
               ]}
@@ -232,6 +270,8 @@ function Watched({ m, range }: { m: Monitor; range: Range }) {
   const check = useRes(checkRes(m.query)).data;
   if (!check.ok) return <p className="empty-line py-10 text-center">{check.error}</p>;
   if (check.kind === "logs") return <LogsWatched search={check.watched?.search ?? ""} range={range} />;
+  // A service check's groups, each one's latest run.
+  if (check.kind === "service-check") return <CheckRuns ask={{ check: check.watched?.check ?? "", tags: check.watched?.over ?? [], group_by: check.watched?.by ?? [] }} range={range} height={220} />;
   if (check.kind === "spans") return <SpansWatched search={check.watched?.search ?? ""} range={range} />;
   // An Error Tracking monitor's issues' errors, by issue: drawn when its search says tags alone.
   if (check.kind === "error-tracking")
@@ -288,7 +328,7 @@ function Groups({ m }: { m: Monitor }) {
                   <td>
                     <StateBadge state={g.state} />
                   </td>
-                  <td className="num cell-mono">{g.value === null ? "—" : String(Number(g.value.toPrecision(4)))}</td>
+                  <td className="num cell-mono">{g.value === null ? "—" : isCheckQuery(m.query) ? CHECK_WORDS[CHECK_CODES[g.value] ?? "UNKNOWN"] : String(Number(g.value.toPrecision(4)))}</td>
                   <td className="cell-mono">{relativeTime(g.since / 1000, now)}</td>
                   <td className="cell-mono">{g.last_data ? relativeTime(g.last_data / 1000, now) : "—"}</td>
                 </tr>
@@ -328,6 +368,10 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
   const [tags, setTags] = React.useState(initial.tags.join(", "));
   const [priority, setPriority] = React.useState(str(initial.priority));
   const t = initial.options.thresholds;
+  const isCheck = !composite && isCheckQuery(query);
+  // A service check's: runs in a row.
+  const [crit, setCrit] = React.useState(str(t.critical));
+  const [okRuns, setOkRuns] = React.useState(str(t.ok));
   const [warning, setWarning] = React.useState(str(t.warning));
   const [critRec, setCritRec] = React.useState(str(t.critical_recovery));
   const [warnRec, setWarnRec] = React.useState(str(t.warning_recovery));
@@ -344,7 +388,7 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
   const sent = (): { query: string } | { error: string } => (composite ? lettersToIds(cond.trim(), parts) : { query: query.trim() });
   const body = (q: string): MonitorIn => ({
     name: name.trim(),
-    ...(composite ? { type: COMPOSITE } : {}),
+    ...(composite ? { type: COMPOSITE } : isCheck ? { type: SERVICE_CHECK } : {}),
     query: q,
     message,
     tags: tags
@@ -353,7 +397,7 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
       .filter(Boolean),
     priority: num(priority),
     options: {
-      thresholds: { warning: num(warning), critical_recovery: num(critRec), warning_recovery: num(warnRec) },
+      thresholds: isCheck ? { critical: num(crit), warning: num(warning), ok: num(okRuns) } : { warning: num(warning), critical_recovery: num(critRec), warning_recovery: num(warnRec) },
       notify_no_data: noData,
       no_data_timeframe: num(noDataMin),
       renotify_interval: num(renotify),
@@ -425,6 +469,9 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
                   onChange={(e) => {
                     setQuery(e.target.value);
                     setCheck(null);
+                    // The default message follows what it watches; one written stays.
+                    const next = isCheckQuery(e.target.value) ? MESSAGE.check : MESSAGE.query;
+                    if (message === MESSAGE.query || message === MESSAGE.check) setMessage(next);
                   }}
                   placeholder="avg(last_5m):max:system.disk.in_use{*} by {host,mount} > 0.9"
                   spellCheck={false}
@@ -433,7 +480,11 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
               </div>
               <div className="field-hint flex flex-wrap items-center gap-3">
                 {check ? (
-                  check.ok ? (
+                  check.ok && check.kind === "service-check" ? (
+                    <span>
+                      Moves each group{check.watched?.by?.length ? ` (by ${check.watched.by.join(", ")})` : ""} of <code className="font-mono">{check.watched?.check}</code> by its latest runs.
+                    </span>
+                  ) : check.ok ? (
                     <span>
                       Alerts when{" "}
                       {check.kind === "logs" || check.kind === "spans"
@@ -451,18 +502,26 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
                     <span className="text-[#e2c4c6]">{check.error}</span>
                   )
                 ) : (
-                  <span>Datadog&apos;s monitor syntax: a metric, its change, or logs counted.</span>
+                  <span>Datadog&apos;s monitor syntax: a metric, its change, logs counted, or a service check&apos;s runs.</span>
                 )}
                 <button type="button" className="text-link" onClick={() => void observeApi.validateMonitor(query.trim()).then(setCheck)}>
                   Check
                 </button>
               </div>
             </div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              <TextField label="Warning at" inputMode="decimal" value={warning} onChange={(e) => setWarning(e.target.value)} />
-              <TextField label="Recovers from critical at" inputMode="decimal" value={critRec} onChange={(e) => setCritRec(e.target.value)} />
-              <TextField label="Recovers from warning at" inputMode="decimal" value={warnRec} onChange={(e) => setWarnRec(e.target.value)} />
-            </div>
+            {isCheck ? (
+              <div className="grid gap-3 sm:grid-cols-3">
+                <TextField label="Alerts after CRITICAL runs in a row" inputMode="numeric" value={crit} onChange={(e) => setCrit(e.target.value)} placeholder="1" />
+                <TextField label="Warns after WARNING runs in a row" inputMode="numeric" value={warning} onChange={(e) => setWarning(e.target.value)} placeholder="never" />
+                <TextField label="Recovers after OK runs in a row" inputMode="numeric" value={okRuns} onChange={(e) => setOkRuns(e.target.value)} placeholder="1" />
+              </div>
+            ) : (
+              <div className="grid gap-3 sm:grid-cols-3">
+                <TextField label="Warning at" inputMode="decimal" value={warning} onChange={(e) => setWarning(e.target.value)} />
+                <TextField label="Recovers from critical at" inputMode="decimal" value={critRec} onChange={(e) => setCritRec(e.target.value)} />
+                <TextField label="Recovers from warning at" inputMode="decimal" value={warnRec} onChange={(e) => setWarnRec(e.target.value)} />
+              </div>
+            )}
           </>
         )}
         <div>

@@ -570,6 +570,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
     let method = req.method().clone();
     match (&method, rest) {
         (&Method::POST, ["query"]) => query(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["checks", "status"]) => check_status(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::GET, ["query"]) => {
             let body = QueryBody { query: q.get("query").cloned().unwrap_or_default(), from: num(q, "from")?, to: num(q, "to")?, step: q.get("step").map(|s| s.parse()).transpose().map_err(|_| fail(StatusCode::BAD_REQUEST, "step"))?, points: None, max_series: None, heatmap: None };
             query(body).await
@@ -703,6 +704,20 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                         Some(bad) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": format!("{bad}: no monitor, or a composite") })),
                         None => srv::json(StatusCode::OK, &json!({ "ok": true, "kind": "composite", "composite": composite_json(ms, &c) })),
                     },
+                    Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
+                });
+            }
+            // A service check's: its check, the runs it reads and its groups.
+            if kiln_obs::monitor::checks::is_check(&v.query) || v.kind.as_deref() == Some(super::monitors::SERVICE_CHECK) {
+                return Ok(match kiln_obs::monitor::checks::parse(&v.query) {
+                    Ok(c) => {
+                        let value = |v: &kiln_obs::index::ValueMatch| match v {
+                            kiln_obs::index::ValueMatch::Exact(s) | kiln_obs::index::ValueMatch::Glob(s) => s.clone(),
+                            kiln_obs::index::ValueMatch::Any => "*".into(),
+                        };
+                        let over: Vec<String> = c.over.iter().flat_map(|o| o.values.iter().map(|v| if o.key.is_empty() { value(v) } else { format!("{}:{}", o.key, value(v)) })).collect();
+                        srv::json(StatusCode::OK, &json!({ "ok": true, "kind": "service-check", "watched": { "check": c.check, "over": over, "by": c.by, "last": c.last } }))
+                    }
                     Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
                 });
             }
@@ -1291,6 +1306,65 @@ struct QueryBody {
     /// (`kiln_obs::query::eval::heatmap`).
     #[serde(default)]
     heatmap: Option<usize>,
+}
+
+/// A check status widget's question (Datadog's `check_status`): a check, the tags of the runs it
+/// reads, what a group is, and over what time.
+#[derive(Debug, Deserialize)]
+struct CheckStatusBody {
+    check: String,
+    /// `key:value` (a value with `*` a glob) or a bare tag, each; `*` or none: every run's.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// What a group is (none: each of the check's series apart).
+    #[serde(default)]
+    group_by: Vec<String>,
+    /// One group's tags (Datadog's grouping by check), `key:value` comma-separated: its status.
+    #[serde(default)]
+    group: Option<String>,
+    /// Milliseconds since the epoch.
+    from: i64,
+    to: i64,
+}
+
+/// The most groups a check's status names (its counts are of all of them).
+const CHECK_GROUPS: usize = 1_000;
+
+/// Each group's status, how many groups are in each, and the worst (Datadog's check status
+/// widget): of each group's series the latest run in the time, the worst of them.
+async fn check_status(body: CheckStatusBody) -> Result<Response, Fail> {
+    let check = body.check.trim().to_owned();
+    if check.is_empty() || body.to <= body.from {
+        return Err(fail(StatusCode::BAD_REQUEST, "a check's name, and a time from before to"));
+    }
+    let store = shared()?;
+    crate::rt::blocking(move || {
+        use kiln_obs::monitor::checks;
+        let s = store.read().unwrap_or_else(PoisonError::into_inner);
+        let tags = body.tags.iter().map(String::as_str).chain(body.group.iter().flat_map(|g| g.split(',')));
+        let over: Vec<_> = tags.map(str::trim).filter(|t| !t.is_empty() && *t != "*").map(checks::tag_clause).collect();
+        let by = (!body.group_by.is_empty()).then_some(body.group_by.as_slice());
+        let groups = checks::latest(&s, &check, &over, by, body.to, body.to - body.from);
+        let mut counts = [0u64; 4];
+        for g in &groups {
+            if let Some(n) = counts.get_mut(usize::from(g.status.min(checks::UNKNOWN))) {
+                *n += 1;
+            }
+        }
+        let [ok, warning, critical, unknown] = counts;
+        let worst = groups.iter().map(|g| g.status).max_by_key(|&c| checks::rank(c));
+        let named: Vec<Value> = groups
+            .iter()
+            .take(CHECK_GROUPS)
+            .map(|g| json!({ "tags": g.group.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(), "status": checks::name(g.status), "at": g.at }))
+            .collect();
+        Ok(srv::json(
+            StatusCode::OK,
+            &json!({ "check": check, "status": worst.map(checks::name), "counts": { "OK": ok, "WARNING": warning, "CRITICAL": critical, "UNKNOWN": unknown }, "groups": named, "total": groups.len() }),
+        ))
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
 }
 
 async fn query(body: QueryBody) -> Result<Response, Fail> {

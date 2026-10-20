@@ -31,7 +31,8 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
 | O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Datadog's Agent's traces (§8.7: its indexed and inline forms, 532 ns a span, §12.23) and its stats as the trace metrics (every span counted before it sampled, its DDSketches' four mappings read within their accuracy; 6 µs and 0.2 allocations a grouped stat), checked live against Agent 7.84 and ddtrace 4.16 with traces kept and dropped (§13). Datadog's tracers straight to kiln on every runner (kiln in the Agent's place on its port: `/v0.4/traces`, `/v0.5/traces`, `/info`; 490 ns a span), every span counted by the runner's concentrator before a dropped trace is let go, as the Agent counts (133 ns a span); checked live with ddtrace 4.16, no Agent (§13). The Agent's priority sampler on every runner (each tracer told its services' rates, `rate_by_service`: ten traces a second a node, each service its share by water-filling), checked live: a busy service's rate falling to its share, every trace counted, kept or not (§13). A runner's last spans and buckets written as it stops, a bucket two of its lives write added and not written over, checked live across a stop (§13). The map's figures from the trace metrics, each edge its share of the groups that count its calls (the ratio estimator), so a sampled service's calls are every call: checked live through the Agent, straight to a runner under the sampler, and with OpenTelemetry's SDK (§13). CI runs as traces, span monitors | in progress |
 | O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24); Datadog's Error Tracking monitors (new issues and regressions, impact; §9) telling integrations, an ignored issue muted, checked live and in browsers (§13); reading an error without allocating, 0.6 to 1.1 µs (§12.24) | done |
-| O-20 | Datadog's dashboards (§7, §11): their JSON imported as kiln's and any dashboard given back as Datadog's, every widget kept (drawn as Datadog draws it, drawn otherwise and said, or a note saying what it was); groups, pies; logs, spans and events as operands of formulas, as Datadog's formulas mix them (§6); Datadog's boolean filters, a search's value lists, `max` and `min`, arithmetic without spaces; Datadog's 678 integration dashboards taken and given back the same, 89.9% of their widgets drawn as Datadog draws them, 107 µs an import (§12.25); checked in browsers (§13) | done |
+| O-20 | Datadog's dashboards (§7, §11): their JSON imported as kiln's and any dashboard given back as Datadog's, every widget kept (drawn as Datadog draws it, drawn otherwise and said, or a note saying what it was); groups, pies; logs, spans and events as operands of formulas, as Datadog's formulas mix them (§6); Datadog's boolean filters, a search's value lists, `max` and `min`, arithmetic without spaces; Datadog's 678 integration dashboards taken and given back the same, 90.8% of their widgets drawn as Datadog draws them (with service checks', O-21), 105 µs an import (§12.25); checked in browsers (§13) | done |
+| O-21 | Service checks (§9.4): each run, the Agent's (`/api/v1/check_run`) or DogStatsD's (`_sc`), a record and a sample of its status, read from its check's series; Datadog's service check monitor (`"check".over(...).by(...).last(n).count_by_status()`, its thresholds runs in a row, `{{check_message}}`); the check status widget, `POST checks/status`, Datadog's `check_status` imported and given back; the monitor form and page; checked live (a host alerting on its second failure in a row, not its first, its notice the run's message, recovering on its first OK) and in browsers (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -571,6 +572,7 @@ its schema (§13). Built:
 
 | | |
 | --- | --- |
+| `POST checks/status` | a service check's status over a time (`check`, `tags`, `group_by` or one `group`, `from`, `to`): each group's (the worst of its series' latest runs), how many groups are in each status, and the worst (§9.4) |
 | `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at; a series with a band (`anomalies()`, `forecast()`) has `bounds` (`lower`, `upper`, `score`, `k`, `algorithm`, and a forecast's `forecast_from`, its first bucket forecast; `to` past now draws it). With `heatmap: <rows>`, a heatmap instead: `rows` (each `[lo, hi]`) and `counts` (each bucket of time, each row's): a distribution's merged buckets (made coarser until they fit), or another query's series' values in equal rows |
 | `GET metrics?match=` , `GET tags?key=&match=` | metric names and tag values, sorted (autocomplete) |
 | `GET metrics/summary?match=&limit=`, `GET metrics/summary/{name}` | what each metric is and costs, Datadog's Metrics Summary: its series (its cardinality) by kind, each tag's values and the series carrying it (the tag of most values first; a metric's own with each tag's ten values of most series), the samples applied since the server started and of late a second, its newest sample's time; the metrics of most series first (100 unless said, 1,000 at the most), and how many matched. From the index and the counts kept as samples are applied: nothing read from disk |
@@ -935,7 +937,8 @@ client at kiln on its own host and nothing else changes.
   reading thread's scheduling delay on a loaded machine (the Agent leaves the system's 208 KiB); the
   system grants what its bound allows (`net.core.rmem_max`), and the listener says what it got.
 - **What.** Protocol 1.3 (Datadog's "Datagram Format"): a metric, several values a message, a
-  sample rate, tags, a container and a timestamp; events and service checks. A message's context is
+  sample rate, tags, a container and a timestamp; events and service checks (each run a record, and
+  its status a sample of its check's series, §9.4). A message's context is
   its name, how it aggregates, its host (a `host:` tag's, else the machine's) and its tags in any
   order, a key once (its first value: a series has one value a key, so `#team:a,team:b` keeps
   `team:a`, counted); the listener's own tags go where the message has not the key.
@@ -1018,7 +1021,7 @@ capturing endpoint in kiln's place), and the live scenario (§13) runs that Agen
 | `POST /api/v2/series` | its metrics, protobuf (`MetricPayload`) | series: its tags (a key once: its first value), `host` and `device` from its resources; a gauge a gauge, a count a count, a rate (DogStatsD's counts, a histogram's `.count`) the count it was, its value times its interval, as kiln's own DogStatsD writes it (§8.4) |
 | `POST /api/v1/series` | the same, JSON (older Agents) | the same |
 | `POST /api/beta/sketches` | distributions' sketches (`SketchPayload`) | kiln's distributions (§4.4): each bin at its value (the Agent's γ = 1 + 1/64, a key the logarithm rounded to the even and offset by 1338: values 1, 10, 100, 1000, 0.5 and −3 sent through an Agent came back as keys 1338, 1487, 1635, 1784, 1293 and −1409) counted into kiln's buckets, its count, sum, least and most exact |
-| `POST /api/v1/check_run` | service checks | records as DogStatsD's are (`source:service_check`) |
+| `POST /api/v1/check_run` | service checks | records as DogStatsD's are (`source:service_check`), each run's status a sample of its check's series besides (§9.4) |
 | `POST /intake/` | events, and host metadata | kiln's events (`source:kiln.event`, `@event.source` the source's name); the metadata passed over |
 | `POST /api/v2/logs` | its logs, JSON | records, `ddtags` and any other field attributes (nested keys joined by dots, as Datadog's intake reads them) |
 | `POST /api/v0.2/traces` | its tracers' spans (`AgentPayload`, protobuf) | spans (§8.7), `source:datadog-agent` |
@@ -1504,6 +1507,37 @@ nothing. A window's end is told once whatever the server does meanwhile: the win
 looked at each second, an end found when the one that held is gone. Canceling keeps a downtime (its
 status `canceled`); one canceled or ended is forgotten after 30 days. `<observe>/downtimes.json`.
 
+### 9.4 Service checks
+
+Datadog's service checks (`kiln_obs::monitor::checks`): a check's run, as the Agent submits it
+(`/api/v1/check_run`, §8.6) or as DogStatsD's `_sc` datagram (§8.4), is a record
+(`source:service_check`, its check, status, message and tags) and a sample of its status besides:
+`kiln.service_check.status` (0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN, Datadog's codes) of the series
+its check, host and tags name, written beside its record as kiln's own point. A check's last runs
+are read from its series, a few compressed samples (a run's status a constant gauge's: a bit or two
+a run), never from the blocks of every record; the record keeps what a run says.
+
+Datadog's service check monitor (`type: "service check"`) reads them:
+`"datadog.agent.up".over("*").by("host").last(2).count_by_status()`: the runs of the check's series
+whose tags hold `.over`'s (a value with `*` a glob; `"*"` all), grouped by `.by`'s tags (none: one
+group), each group's latest `.last(n)` runs in time order across its series (two series' runs at one
+time, the worse the later). Its thresholds are runs in a row, the latest among them, as Datadog's
+are: `critical` CRITICAL to ALERT, `warning` WARNING or worse to WARN, `unknown` UNKNOWN to NO DATA
+(Datadog's "notify for Unknown status"; never unless said), `ok` OK back to OK; runs that settle none
+of these leave a group as it was (one failure of two asked for does not alert, and does not
+recover). Critical and ok are 1 unless said (Datadog's: the first failure alerts, the first success
+recovers); `.last(n)` reads at least the most of them (Datadog's rule; 1 to 100). A group's runs are
+read over the last quarter hour first (the Agent runs a check every 15 s) and further back only when
+that holds fewer than it reads. A group is found while it has a run within the no-data timeframe (a
+day unless the monitor says, Datadog's for a service check); one with none for that long goes to NO
+DATA at once when the monitor asks. Its messages have Datadog's `{{check_message}}`, the group's
+latest run's message (its record's, found by its check and the group's tags), and
+`{{check_status}}`.
+
+The check status widget (Datadog's `check_status`, §11) asks `POST checks/status`: of the check's
+runs over the time whose tags hold its tags, each group's status, the worst of its series' latest
+runs (CRITICAL, then WARNING, UNKNOWN, OK); by `group_by`'s tags, or each series a group of its own.
+
 ## 10. Integrations
 
 Notifications (`crate::observe::notify`), each in its service's format: Slack (incoming webhook,
@@ -1746,7 +1780,9 @@ time range and the search in the address (a page is a link).
   for them).
 - **Dashboards**: Datadog's model near enough. Widgets on a grid of twelve columns (one column on a
   phone): timeseries (lines, areas or bars), query value, top list (its limit and order), table,
-  heatmap, distribution, pie, log stream, event stream, monitors, note (Markdown), and groups (a
+  heatmap, distribution, pie, log stream, event stream, monitors, check status (a service check's:
+  of every group the worst status, how many are in each, and those not OK by name; or one group's
+  and when it last ran, §9.4; each status its tone's dot and its word), note (Markdown), and groups (a
   title over widgets of their own on a grid of their own, edited in place as the dashboard's). A
   pie is its series over the range as shares of a ring, the three largest in hues and the rest one
   grey slice ("Other"), each named in its legend with its value and share: in a ring any two slices
@@ -2848,14 +2884,14 @@ widgets:
 
 | widgets | count | share |
 | --- | --- | --- |
-| drawn as Datadog draws them | 19,267 | 89.9% |
+| drawn as Datadog draws them | 19,447 | 90.8% |
 | drawn otherwise, as said | 715 | 3.3% |
-| kept as a note saying what they were, not drawn | 1,442 | 6.7% |
+| kept as a note saying what they were, not drawn | 1,262 | 5.9% |
 
 Drawn otherwise: an image of the web as a link to it (325), a geomap as a top list of its places
 (235), a bar chart, a change and a host map as top lists (118), a treemap as a pie (37). Not
-drawn, nearly all data kiln does not hold: Cloud SIEM's security signals (762), the status of
-Datadog's service checks (180), Datadog's own images, its integrations' logos (165), cloud costs
+drawn, nearly all data kiln does not hold: Cloud SIEM's security signals (762), Datadog's own
+images, its integrations' logos (165), cloud costs
 (97), network paths and device flows (142), database queries, LLM observability and processes (16);
 widgets kiln has no form of (flame graphs, Sankey diagrams, topology maps, Vega's wildcard, an
 iframe, a scatter plot: 25); lists kiln does not keep (infrastructure, log patterns, trace streams
@@ -2869,10 +2905,11 @@ every spelling against each series' tags read directly); `max` and `min`; arithm
 spaces (a number outside a filter ends where an operator starts: before, `2*avg:cpu{*}` lexed as a
 metric named `2*avg:cpu`, a glob matching nothing, and answered nothing without an error); a log
 search's value lists (before, `@evt.name:(a OR b)` was read as the attribute empty and a word of
-the message, a wrong answer and no error); `status:*`; `.fill(0)`. Now 89.9%, 12 unread.
+the message, a wrong answer and no error); `status:*`; `.fill(0)`: 89.9%, 12 unread. Then service
+checks (§9.4): the 180 check status widgets drawn, 90.8%.
 
-An import costs 107 to 112 µs a dashboard (three runs, a release build, fedora), from 133 to 157
-µs: the lexer tells a filter's `*` from a product by the braces it has open, counted as it goes,
+An import costs 105 to 112 µs a dashboard (three runs each, a release build, fedora), from 133 to
+157 µs: the lexer tells a filter's `*` from a product by the braces it has open, counted as it goes,
 where it scanned its tokens back each time.
 
 ## 13. Scenarios
@@ -3006,11 +3043,19 @@ kiln does not draw; a group of a sunburst and a log stream): its group drawn und
 sunburst a pie of the service's logs by status (the errors a third), the formula's chart, the SLO
 kept as a note saying what it was, the page within the screen's width; the boolean filter selecting
 the requests through the query API and its opposite none; the dashboard given back as Datadog's JSON
-(2026-10-20: passes in Chromium at 1,440 px and as a phone, and in WebKit as a phone, on fedora).
+(2026-10-20: passes in Chromium at 1,440 px and as a phone, and in WebKit as a phone, on fedora); a
+service check's runs sent as Datadog's Agent sends them (with observe's ingest token,
+`KILN_INGEST_TOKEN`): its status on a dashboard (`1 Critical · 1 OK`, the failing host by name), and a
+monitor of it made from the form (two CRITICAL in a row, evaluated every ten seconds) alerting that
+host and not the other, its page saying `2 CRITICAL in a row` and the host's value `Critical`, both
+pages within the screen's width (2026-10-20: passes in Chromium at 1,440 px and as a phone, and in
+WebKit as a phone, on fedora).
 Each makes its own records and checks through the API, not the page. 2026-10-20, after Datadog's
 boolean filters and the lexer's numbers: all 31 pass in Chromium at 1,440 px and in WebKit as a
 phone, on fedora (a server seeded with three services' latency and 300 logs, a receiver and a logs
-folder of the scenarios'). 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
+folder of the scenarios'); after service checks, the same 31 pass again in both, and the service
+check scenario, made to wait for its runs to be stored before it opens the page, passes in both on
+its own. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
 webhook and to Slack. Run again and again, two flakes showed and are gone: WebKit, a moment after a
@@ -3049,6 +3094,16 @@ other web04–09, and their composite `a && b`: it alerts web04 and web05 and no
 hears of those two alone; web04 recovering in one recovers it in the composite, and is said; a
 monitor it reads is refused deletion (409, naming it) until it goes; a composite of a composite or of
 a monitor that isn't there is refused. 2026-10-18: passes (53 s).
+
+**Service checks** (`observe_live.rs`): a server, a webhook and a DogStatsD listener of the server's;
+a check's runs sent as Datadog's Agent sends them (`/api/v1/check_run`, the ingest token) and as
+`_sc` datagrams, each at its own second; a service check monitor by host, two CRITICAL in a row to
+alert. web-1 passing then failing once is evaluated (its group's value CRITICAL's code) and stays OK,
+nothing said, while the check status widget's answer says CRITICAL, one host OK and one CRITICAL; its
+second failure alerts it, the webhook's notice the run's message (`web-1: connection refused by
+10.0.0.7:5432 (CRITICAL)`), web-2 OK all along; its first OK, by DogStatsD, recovers it (`web-1 is
+reachable`) and the widget's answer is OK for both; each of the six runs a record too. 2026-10-20:
+passes (with the roles and OpenAPI scenarios, 39 s).
 
 **Under load** (`crates/kiln/tests/observe_load.rs`): the flood of §12.11, every point taken
 stored exactly once, the replicas alike; and a runner flooded while its server is killed (SIGKILL)

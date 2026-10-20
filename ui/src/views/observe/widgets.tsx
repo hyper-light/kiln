@@ -1,20 +1,23 @@
 /**
  * A dashboard's widgets, each kind drawn from what it asks: series over the range (timeseries),
  * one number (query value), series ranked (toplist), tabled or as shares of a ring (pie), the
- * newest log records or events, monitors' states, or text. A group's widgets are drawn by the
- * dashboard, on a grid of the group's own.
+ * newest log records or events, monitors' states, a service check's status, or text. A group's
+ * widgets are drawn by the dashboard, on a grid of the group's own.
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
-import type { Widget } from "@/api/observe";
+import type { CheckState, CheckStatusAsk, Widget } from "@/api/observe";
 import { SERIES } from "@/components/charts/types";
 import { useRes } from "@/lib/data";
 import {
+  CHECK_WORDS,
+  CheckBadge,
   PALETTE,
   QueryChart,
   STATUS_COLOR,
   StateBadge,
   aggregate,
+  checkStatusRes,
   dataOf,
   firstLine,
   formatValue,
@@ -50,6 +53,7 @@ export const KIND_WORDS: Record<Widget["kind"], string> = {
   logs: "Log stream",
   events: "Event stream",
   monitors: "Monitors",
+  check: "Check status",
   note: "Note",
   group: "Group",
 };
@@ -84,6 +88,8 @@ export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: R
       return <Stream query={within("source:kiln.event", fillSearch(w.search))} range={range} height={height} kind="events" />;
     case "monitors":
       return <Monitors filter={w.search} height={height} />;
+    case "check":
+      return w.options?.check ? <CheckStatusView w={w} range={range} height={height} fill={fill} /> : <Empty height={height} what="check" />;
     case "note":
       return (
         <div className="obs-note overflow-y-auto" style={{ maxHeight: height }}>
@@ -309,6 +315,50 @@ export function Stream({ query, range, height, kind }: { query: string; range: R
 }
 
 /** Monitors whose name or tags hold `filter` (all of them for none), in trouble first. */
+const CHECK_ORDER: CheckState[] = ["CRITICAL", "WARNING", "UNKNOWN", "OK"];
+
+/** A check widget: its tags' template variables filled (one of a variable stands for its value, or
+ * for any: `*`, left out). */
+function CheckStatusView({ w, range, height, fill }: { w: Widget; range: Range; height: number; fill: (q: string) => string }) {
+  const o = w.options ?? {};
+  const one = o.grouping === "check";
+  const tags = (o.tags ?? []).map((t) => fill(t).trim()).filter((t) => t && t !== "*");
+  return <CheckRuns ask={{ check: o.check ?? "", tags, group_by: o.group_by ?? [], group: one ? fill(o.group ?? "") : undefined }} range={range} height={height} one={one} />;
+}
+
+/** A service check's status over the range (Datadog's check status widget's): of every group, the
+ * worst, how many are in each status, and those not OK by name; or (`one`) one group's, and when it
+ * last ran. */
+export function CheckRuns({ ask, range, height, one }: { ask: CheckStatusAsk; range: Range; height: number; one?: boolean }) {
+  const s = useRes(checkStatusRes(ask, range)).data;
+  if (!s.status) return <Empty height={height} what={`runs of ${s.check}`} />;
+  const named = (t: Record<string, string>) =>
+    Object.entries(t)
+      .map(([k, v]) => `${k}:${v}`)
+      .join(", ") || s.check;
+  const first = s.groups[0];
+  const counts = CHECK_ORDER.filter((k) => s.counts[k] > 0)
+    .map((k) => `${s.counts[k]} ${CHECK_WORDS[k]}`)
+    .join(" · ");
+  const trouble = s.groups.filter((g) => g.status !== "OK").sort((a, b) => CHECK_ORDER.indexOf(a.status) - CHECK_ORDER.indexOf(b.status));
+  return (
+    <div className="flex flex-col gap-1.5 overflow-y-auto" style={{ maxHeight: height }}>
+      <CheckBadge status={s.status} className="text-[18px]" />
+      <p className="text-[12px] text-[#8c8f98]">{one && first ? `${named(first.tags)} · ${when(first.at * 1e6)}` : counts}</p>
+      {!one && trouble.length > 0 && (
+        <ul className="divide-y divide-[#1d1f23]" aria-label="Groups not OK">
+          {trouble.map((g) => (
+            <li key={named(g.tags)} className="flex items-center justify-between gap-3 py-1">
+              <span className="min-w-0 truncate font-mono text-[12px] text-[#d6d8dd]">{named(g.tags)}</span>
+              <CheckBadge status={g.status} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function Monitors({ filter, height }: { filter: string; height: number }) {
   const all = useRes(monitorsRes).data;
   const f = filter.trim().toLowerCase();

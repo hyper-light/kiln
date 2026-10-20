@@ -26,6 +26,9 @@ import {
   type LogMetric,
   type Downtime,
   type LogMetricCounting,
+  type CheckState,
+  type CheckStatus,
+  type CheckStatusAsk,
 } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
@@ -139,6 +142,16 @@ export const heatmapRes = (query: string, range: Range, rows = 40, points = 120)
   fetch: (signal) => {
     const now = Date.now();
     return observeApi.heatmap({ query, from: now - RANGES[range], to: now, points, heatmap: rows }, signal);
+  },
+  opts: { pollMs: pollFor(range) },
+});
+
+/** A service check's status over the last `range` (a check widget's): each group's latest. */
+export const checkStatusRes = (ask: CheckStatusAsk, range: Range): Res<CheckStatus> => ({
+  key: `observe/checks/${range}/${JSON.stringify(ask)}`,
+  fetch: (signal) => {
+    const now = Date.now();
+    return observeApi.checkStatus({ ...ask, from: now - RANGES[range], to: now }, signal);
   },
   opts: { pollMs: pollFor(range) },
 });
@@ -483,6 +496,22 @@ export function within(base: string, q: string) {
 /** A monitor's state as a tone (what the status dots and badges read), and as words. */
 const STATE_TONE: Record<string, string> = { OK: "succeeded", WARN: "timed_out", ALERT: "failed", "NO DATA": "skipped" };
 const STATE_WORDS: Record<string, string> = { OK: "OK", WARN: "Warn", ALERT: "Alert", "NO DATA": "No data" };
+
+const CHECK_TONE: Record<CheckState, string> = { OK: "succeeded", WARNING: "timed_out", CRITICAL: "failed", UNKNOWN: "skipped" };
+export const CHECK_WORDS: Record<CheckState, string> = { OK: "OK", WARNING: "Warning", CRITICAL: "Critical", UNKNOWN: "Unknown" };
+
+/** A service check's status: its tone's dot and its word. */
+export function CheckBadge({ status, className }: { status: CheckState; className?: string }) {
+  const tone = CHECK_TONE[status];
+  return (
+    <span className={`status ${className ?? ""}`}>
+      <i className="dot" data-status={tone} aria-hidden="true" />
+      <span className="status-text" data-status={tone}>
+        {CHECK_WORDS[status]}
+      </span>
+    </span>
+  );
+}
 
 /** A monitor's (or a group's) state, and whether it is muted. */
 export function StateBadge({ state, muted }: { state: string; muted?: boolean }) {

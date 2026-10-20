@@ -333,9 +333,17 @@ const isMetric = (k: WidgetKind) => k === "timeseries" || k === "query_value" ||
 /** A widget's kind, title, what it shows, and its size. */
 function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; onSave: (w: Widget) => void }) {
   const [x, setX] = React.useState(w);
-  const options = (x.options ?? {}) as { unit?: string; display?: "line" | "bars" | "area"; aggregator?: string };
+  const options = x.options ?? {};
   const setOption = (k: string, v: string) => setX((o) => ({ ...o, options: { ...(o.options ?? {}), [k]: v || undefined } }));
   const [queries, setQueries] = React.useState(w.queries.join("\n"));
+  // A check widget's tags as typed, made lists as it is kept.
+  const [checkTags, setCheckTags] = React.useState((w.options?.tags ?? []).join(", "));
+  const [checkBy, setCheckBy] = React.useState((w.options?.group_by ?? []).join(", "));
+  const list = (v: string) =>
+    v
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={w.id ? "Change the widget" : "Add a widget"}>
@@ -351,6 +359,7 @@ function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; 
                     .map((q) => q.trim())
                     .filter(Boolean)
                 : [],
+              options: x.kind === "check" ? { ...options, tags: list(checkTags), group_by: list(checkBy), grouping: options.grouping ?? "cluster" } : x.options,
             });
           }}
         >
@@ -387,6 +396,26 @@ function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; 
               onChange={(e) => setX((o) => ({ ...o, search: e.target.value }))}
               placeholder={x.kind === "monitors" ? "team:ci" : "service:api status:error"}
             />
+          )}
+          {x.kind === "check" && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <TextField label="Service check" className="font-mono" required value={options.check ?? ""} onChange={(e) => setOption("check", e.target.value)} placeholder="datadog.agent.up" />
+              <TextField label="Of the runs tagged" className="font-mono" value={checkTags} onChange={(e) => setCheckTags(e.target.value)} placeholder="env:prod, $host" />
+              <SelectField
+                label="Shows"
+                value={options.grouping ?? "cluster"}
+                onChange={(v) => setOption("grouping", v)}
+                options={[
+                  { value: "cluster", label: "Every group's status" },
+                  { value: "check", label: "One group's status" },
+                ]}
+              />
+              {options.grouping === "check" ? (
+                <TextField label="The group" className="font-mono" value={options.group ?? ""} onChange={(e) => setOption("group", e.target.value)} placeholder="host:db-1" />
+              ) : (
+                <TextField label="A group is each" className="font-mono" value={checkBy} onChange={(e) => setCheckBy(e.target.value)} placeholder="host (none: each check)" />
+              )}
+            </div>
           )}
           {x.kind === "note" && (
             <div>

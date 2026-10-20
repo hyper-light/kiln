@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 /// integration dashboards holds 126 (`super::ddash`'s corpus). And bytes it may be.
 pub const WIDGETS: usize = 200;
 pub const BYTES: usize = 1 << 20;
-pub const KINDS: &[&str] = &["timeseries", "query_value", "toplist", "table", "heatmap", "distribution", "pie", "logs", "events", "monitors", "note", "group"];
+pub const KINDS: &[&str] = &["timeseries", "query_value", "toplist", "table", "heatmap", "distribution", "pie", "logs", "events", "monitors", "check", "note", "group"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dashboard {
@@ -208,6 +208,24 @@ fn check(w: &mut Widget, vars: &[TemplateVariable], in_group: bool, ids: &mut st
     for q in &w.queries {
         let filled = filled_with_any(q, vars);
         kiln_obs::query::parse::parse(&filled).map_err(|e| format!("a widget's query {q:?}: {e}"))?;
+    }
+    // A service check's status (Datadog's check status widget): its check, how it groups, and the
+    // tags of its runs and groups.
+    if w.kind == "check" {
+        let o = &w.options;
+        if o.get("check").and_then(Value::as_str).is_none_or(|c| c.trim().is_empty()) {
+            return Err("a check widget's check: a service check's name".into());
+        }
+        if !matches!(o.get("grouping").and_then(Value::as_str), None | Some("cluster" | "check")) {
+            return Err("a check widget's grouping: cluster (its groups') or check (one group's)".into());
+        }
+        for key in ["group_by", "tags"] {
+            match o.get(key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(a)) if a.len() <= 32 && a.iter().all(Value::is_string) => {}
+                Some(_) => return Err(format!("a check widget's {key}: a list of tags, 32 at the most")),
+            }
+        }
     }
     if w.id.is_empty() {
         w.id = super::fresh_id("w", |id| ids.contains(id));

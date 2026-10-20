@@ -1460,6 +1460,115 @@ fn an_slo_s_standing_and_its_burn_rate_alert_are_the_workbook_s() -> anyhow::Res
 /// Whether `v` is what `schema` says, `doc` holding the schemas it names: OpenAPI 3.1's JSON Schema
 /// as far as the document uses it (`$ref`, `type`, `properties`, `required`, `items`, `enum`,
 /// `anyOf`, `oneOf`, `allOf`, `additionalProperties`); where it is not, the path to what is not.
+/// Datadog's service checks (docs/observe.md §9.4): runs sent as the Agent sends them
+/// (`/api/v1/check_run`, the ingest token) and as DogStatsD's `_sc` datagrams to a listener of the
+/// server's; a service check monitor by host alerting the host whose check fails twice in a row,
+/// and not after once, its notice saying the run's message, recovering on its first OK; a host
+/// whose check passes never told of; the check status widget's answer as each step leaves it.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn a_service_check_monitor_alerts_after_failures_in_a_row_and_says_the_check_s_message() -> anyhow::Result<()> {
+    const CHECK: &str = "e2e.db.can_connect";
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, b) = f.request("PUT", "/api/observe/v1/integrations/checks", Some(&json!({ "kind": "webhook", "url": mock.url("/checks") })))?;
+    anyhow::ensure!(code == 204, "the webhook: {code} {}", String::from_utf8_lossy(&b));
+    let port = common::free_port()?;
+    let (code, b) = f.request("PUT", "/api/observe/v1/statsd/e2e", Some(&json!({ "listen": [format!("udp://127.0.0.1:{port}")], "on": "server" })))?;
+    anyhow::ensure!(code == 204, "the listener: {code} {}", String::from_utf8_lossy(&b));
+    f.until(Duration::from_secs(30), "the listener listening", |_| {
+        f.call("GET", "/api/observe/v1/statsd", None).is_ok_and(|all| {
+            at(&all, &["statsd"])
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|l| at(l, &["machines"]).as_array().into_iter().flatten().any(|m| at(m, &["state", "listening"]).as_array().is_some_and(|a| !a.is_empty())))
+        })
+    })?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    // A run as the Agent submits it, and one as DogStatsD's datagram, each at its own second.
+    let agent = |host: &str, status: u8, at_s: i64, message: &str| -> anyhow::Result<()> {
+        let body = json!([{ "check": CHECK, "host_name": host, "status": status, "timestamp": at_s, "message": message, "tags": ["env:e2e", "db:orders"] }]);
+        let (code, b) = raw(f.http, "POST", "/api/v1/check_run", &format!("DD-API-KEY: {ingest}\r\nContent-Type: application/json\r\n"), body.to_string().as_bytes())?;
+        anyhow::ensure!(code == 202, "check_run: {code} {}", String::from_utf8_lossy(&b));
+        Ok(())
+    };
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let statsd = |host: &str, status: u8, at_s: i64, message: &str| -> anyhow::Result<()> {
+        udp.send_to(format!("_sc|{CHECK}|{status}|d:{at_s}|h:{host}|#env:e2e,db:orders|m:{message}").as_bytes(), ("127.0.0.1", port))?;
+        Ok(())
+    };
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e db reachable",
+            "type": "service check",
+            "query": format!("\"{CHECK}\".over(\"env:e2e\").by(\"host\").last(2).count_by_status()"),
+            "message": "{{#is_alert}}{{host.name}}: {{check_message}} ({{check_status}}) @webhook-checks{{/is_alert}}{{#is_recovery}}{{host.name}} is reachable @webhook-checks{{/is_recovery}}",
+            "options": { "every": 10, "thresholds": { "critical": 2, "ok": 1 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let group = |host: &str| -> anyhow::Result<Value> {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        Ok(at(&m, &["groups"]).as_array().into_iter().flatten().find(|g| at(g, &["group"]).to_string().contains(host)).cloned().unwrap_or(Value::Null))
+    };
+    let status = || -> anyhow::Result<Value> {
+        let now = now_ms();
+        f.call("POST", "/api/observe/v1/checks/status", Some(&json!({ "check": CHECK, "tags": ["env:e2e"], "group_by": ["host"], "from": now - 3_600_000, "to": now + 60_000 })))
+    };
+    // Each notice's message, its mention left out.
+    let notices = || {
+        mock.at("/checks").iter().map(|g| at(&g.json(), &["notice", "message"]).as_str().unwrap_or("").split_whitespace().filter(|w| !w.starts_with('@')).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>()
+    };
+    // web-1 passes, then fails once; web-2 passes twice, by DogStatsD.
+    let s0 = now_ms() / 1000;
+    agent("web-1", 0, s0 - 30, "connected")?;
+    agent("web-1", 2, s0 - 20, "connection refused")?;
+    statsd("web-2", 0, s0 - 30, "connected")?;
+    statsd("web-2", 0, s0 - 20, "connected")?;
+    // Evaluated with web-1's failure its latest (its value CRITICAL's code), and once is not enough.
+    let start = Instant::now();
+    loop {
+        let (one, two) = (group("web-1")?, group("web-2")?);
+        if at(&one, &["value"]).as_f64() == Some(2.0) && at(&two, &["value"]).as_f64() == Some(0.0) {
+            anyhow::ensure!(at(&one, &["state"]) == "OK" && at(&two, &["state"]) == "OK", "one failure alerted: {one} {two}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never evaluated: {one} {two}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let st = status()?;
+    anyhow::ensure!(at(&st, &["status"]) == "CRITICAL" && at(&st, &["counts", "OK"]) == 1 && at(&st, &["counts", "CRITICAL"]) == 1, "the widget's: {st}");
+    anyhow::ensure!(notices().is_empty(), "told of one failure: {:?}", notices());
+    // A second failure in a row: web-1 alerts, its notice the run's message.
+    agent("web-1", 2, s0 - 10, "connection refused by 10.0.0.7:5432")?;
+    let start = Instant::now();
+    while notices().is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never alerted: {}\n{}", group("web-1")?, f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(notices() == ["web-1: connection refused by 10.0.0.7:5432 (CRITICAL)"], "{:?}", notices());
+    anyhow::ensure!(at(&group("web-1")?, &["state"]) == "ALERT" && at(&group("web-2")?, &["state"]) == "OK");
+    // Its first OK, by DogStatsD now: it recovers, and the widget says every host is OK.
+    statsd("web-1", 0, s0, "connected")?;
+    let start = Instant::now();
+    while notices().len() < 2 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never recovered: {}\n{}", group("web-1")?, f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(notices().get(1).map(String::as_str) == Some("web-1 is reachable"), "{:?}", notices());
+    let st = status()?;
+    anyhow::ensure!(at(&st, &["status"]) == "OK" && at(&st, &["counts", "OK"]) == 2 && at(&st, &["total"]) == 2, "the widget's: {st}");
+    // Every run a record too, by both ways in.
+    let now = now_ms();
+    let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:service_check @check:{CHECK}"), "from": now - 3_600_000, "to": now + 60_000, "limit": 100 })))?;
+    anyhow::ensure!(at(&found, &["records"]).as_array().map_or(0, Vec::len) == 6, "the runs' records: {found}");
+    Ok(())
+}
+
 fn conforms(doc: &Value, schema: &Value, v: &Value, at: &str) -> Result<(), String> {
     if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
         let target = doc.pointer(r.trim_start_matches('#')).ok_or_else(|| format!("{at}: no schema {r}"))?;
