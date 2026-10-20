@@ -422,8 +422,8 @@ pub static ROUTES: &[Rule] = &[
     any("/api/deploy/apps/*/environments/*/secrets/*", "secrets.manage", At::Server),
     r("POST", "/api/deploy/secret-keys/rotate", "secrets.manage", At::Server),
     any("/api/deploy/**", "environments.manage", At::Server),
-    // Runners and machines.
-    r("GET", "/api/agents", "runners.read", At::Server),
+    // Runners and machines. The list is of the runners the caller may read (`crate::doctor::readable`).
+    r("GET", "/api/agents", "runners.read", At::Anywhere),
     r("GET", "/api/reach/runners", "runners.read", At::Server),
     r("GET", "/api/front-doors", "runners.read", At::Server),
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
@@ -435,6 +435,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),
+    // The runners the caller may read against the newest kiln (`updates.list`).
+    r("GET", "/api/updates/runners", "runners.read", At::Anywhere),
     r("POST", "/api/updates/binaries", "binaries.publish", At::Server),
     // A runner upgraded now, or its policy (`crate::doctor`'s `updates.retry` and `updates.policy`).
     r("POST", "/api/updates/runners/*", "runners.manage", At::Runner(3)),
@@ -443,6 +445,16 @@ pub static ROUTES: &[Rule] = &[
     any("/api/harness/**", "agents.run", At::Server),
     any("/api/ai-sessions", "agents.run", At::Server),
     any("/api/ai-sessions/**", "agents.run", At::Server),
+    // Attached agents and their incidents (docs/ci.md W20-R08 to R10): the handlers narrow by
+    // what each attachment looks after; reporting is an incident's agent's, or a person's who may
+    // attach there.
+    r("GET", "/api/attachments", "runs.read", At::Anywhere),
+    r("GET", "/api/attachments/*", "runs.read", At::Anywhere),
+    any("/api/attachments", "agents.attach", At::Anywhere),
+    any("/api/attachments/**", "agents.attach", At::Anywhere),
+    r("POST", "/api/incidents/*/report", SIGNED_IN, At::Server),
+    r("GET", "/api/incidents", "runs.read", At::Anywhere),
+    r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
     any("/api/places", "agents.run", At::Server),

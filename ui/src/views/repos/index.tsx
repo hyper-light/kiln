@@ -5,7 +5,8 @@
  * machines hold, each once, with the machines it is on. One filter field (kind, machine, OS,
  * architecture, labels, state, each with counts) and a sort, as the agents list has. A repository
  * opens under its row: where it is, the tasks that put it there, and putting it on more machines
- * (cloned, or kept in sync), moving it or giving it up, all in place.
+ * (cloned, or kept in sync), moving it or giving it up, all in place. Above the list, a section that
+ * opens shows sync at work: each copy's state and every change as it goes between machines.
  */
 import * as React from "react";
 import { Link, useSearchParams } from "@/lib/router";
@@ -29,6 +30,7 @@ import { AddRepoForm, DeleteRepo, type Notice, RunForm } from "./forms";
 import { DEFAULT_VIEW, type Entry, type ListView, SORTS, type SortId, browseUrl, dimsOf, entriesOf, facetsOf, isActive, isFiltered, machinesOf, matches, sortEntries, tildeOf } from "./model";
 import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
+import { SyncActivity } from "./sync-activity";
 import "./repos.css";
 
 /** Folders kept the same on several machines; read often, they move by the second. */
@@ -57,6 +59,12 @@ function useRepoParams() {
     setParams(n, { replace: true });
   };
   return { adding: params.get("add") === "1", syncing: params.get("sync") === "1", show: params.get("show"), repo: params.get("repo"), set };
+}
+
+/** The Sync section, opened on one repo's activity, brought into view. */
+function showActivity(set: (patch: Record<string, string | null>) => void, repo: string) {
+  set({ activity: repo });
+  document.getElementById("sync-activity")?.scrollIntoView({ block: "start", behavior: "smooth" });
 }
 
 export default function Repos() {
@@ -232,6 +240,8 @@ function ReposBody() {
         </section>
       )}
 
+      <SyncActivity sync={sync.data} />
+
       {entries.length === 0 ? (
         <EmptyState
           icon={<GitBranch size={24} />}
@@ -288,6 +298,7 @@ function ReposBody() {
                         places.reload();
                       }}
                       onChange={changed}
+                      onActivity={(id) => showActivity(set, id)}
                     />
                   )}
                 </Row>
@@ -510,6 +521,7 @@ function Details({
   onNotice,
   onDeleted,
   onChange,
+  onActivity,
 }: {
   entry: Entry;
   machines: Map<string, PlaceMachine>;
@@ -521,6 +533,8 @@ function Details({
   onNotice: (n: Notice) => void;
   onDeleted: () => void;
   onChange: () => void;
+  /** Open the Sync section on a synced repo's activity. */
+  onActivity: (repo: string) => void;
 }) {
   const r = e.built;
   return (
@@ -558,6 +572,11 @@ function Details({
       {e.synced && (
         <section className="repo-section">
           <RepoBlock repo={e.synced} machines={machineNames} onChange={onChange} title="Kept in sync" copies={false} />
+          <div>
+            <Button size="xs" variant="ghost" onClick={() => e.synced && onActivity(e.synced.id)}>
+              Its sync activity: each change and the copies that have it
+            </Button>
+          </div>
         </section>
       )}
     </div>

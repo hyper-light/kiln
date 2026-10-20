@@ -421,6 +421,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "audit"]) => boxed(|| audit(&hub, &q)).await,
         (&Method::GET, ["api", "updates"]) => Ok(boxed(|| updates_overview(&hub, false)).await),
         (&Method::POST, ["api", "updates", "check"]) => Ok(boxed(|| updates_overview(&hub, true)).await),
+        (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::updates_for(&hub, &caller)).await)),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(boxed(|| upgrade_all_runners(&hub)).await),
         (&Method::POST, ["api", "updates", "build"]) => boxed(|| build_every_platform(&hub)).await,
         (&Method::POST, ["api", "updates", "runners", name]) => boxed(|| upgrade_runner(&hub, name, req)).await,
@@ -462,7 +463,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
-        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.agent_list()).await)),
+        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::runners_for(&hub, &caller)).await)),
         (&Method::GET, ["api", "reach", "runners"]) => {
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())
@@ -517,6 +518,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => boxed(|| ai_takeover(&hub, machine, pid, &q, req)).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => boxed(|| ai_fork(&hub, machine, pid)).await,
         (&Method::GET, ["api", "sync"]) => Ok(srv::json(StatusCode::OK, &hub.sync.view())),
+        (&Method::GET, ["api", "sync", "activity"]) => Ok(sync_activity(&hub, &req)),
         (&Method::POST, ["api", "sync"]) => boxed(|| sync_create(&hub, req)).await,
         (&Method::DELETE, ["api", "sync", id]) => boxed(|| sync_ask(&hub, "sync.delete", id, crate::sync::server::Ask::Delete { repo: (*id).to_owned() })).await,
         (&Method::POST, ["api", "sync", id, "copies"]) => boxed(|| sync_add_copy(&hub, id, req)).await,
@@ -543,6 +545,36 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             } else {
                 Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
             }
+        }
+        // Agents attached to what they look after, and their incidents (docs/ci.md W20-R08 to R10).
+        (&Method::GET, ["api", "attachments"]) => boxed(|| own_op(&hub, &caller, "attachments.list", query_value(&q))).await,
+        (&Method::POST, ["api", "attachments", "pause"]) => {
+            let body = body_value(req).await?;
+            boxed(|| own_op(&hub, &caller, "attachments.pause", body)).await
+        }
+        (&Method::POST, ["api", "attachments"]) => {
+            let body = body_value(req).await?;
+            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
+        }
+        (&Method::GET, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.get", json!({ "attachment": a }))).await,
+        (&Method::PUT, ["api", "attachments", a]) => {
+            let a = (*a).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("attachment".into(), json!(a));
+            }
+            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
+        }
+        (&Method::DELETE, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.remove", json!({ "attachment": a }))).await,
+        (&Method::GET, ["api", "incidents"]) => boxed(|| own_op(&hub, &caller, "incidents.list", query_value(&q))).await,
+        (&Method::GET, ["api", "incidents", i]) => boxed(|| own_op(&hub, &caller, "incidents.get", json!({ "incident": i }))).await,
+        (&Method::POST, ["api", "incidents", i, "report"]) => {
+            let i = (*i).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("incident".into(), json!(i));
+            }
+            boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
         }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
@@ -701,9 +733,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             }
         }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
-        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, id, action)).await,
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, &caller, id, action)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -1280,17 +1312,55 @@ fn sync_token_ok(hub: &Hub, req: &Request) -> bool {
         || authed(hub, req.headers())
 }
 
+/// What happened in the synced repos (`?since=` the number to start from, `&repo=`, `&limit=`):
+/// the newest events first, and the number the next one gets.
+fn sync_activity(hub: &Hub, req: &Request) -> Response {
+    let q = srv::query(req);
+    let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100).min(500);
+    let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+    let (events, next) = hub.sync.activity(since, repo, limit);
+    srv::json(StatusCode::OK, &serde_json::json!({ "events": events, "next": next }))
+}
+
+/// A machine's request for contents, counted: `direction` `up` (sent, or asked whether the server
+/// has it) or `down` (fetched). Its machine is named only once its token checked out.
+fn sync_blob_counted(machine: &str, direction: &str, result: &str, bytes: u64) {
+    let m = crate::metrics::sync();
+    m.blob_requests.inc(&[machine, direction, result]);
+    if bytes > 0 {
+        m.blob_bytes.add(&[machine, direction], bytes);
+    }
+}
+
+/// The machine a blob request names.
+fn sync_machine(req: &Request) -> String {
+    srv::query(req).get("machine").cloned().unwrap_or_default()
+}
+
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
 fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
+    let direction = if req.method() == Method::HEAD { "up" } else { "down" };
     if !sync_token_ok(hub, req) {
+        sync_blob_counted("", direction, "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
+    let machine = sync_machine(req);
     let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
-    let path = blobs.path(hash).filter(|p| p.is_file()).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    let Some(path) = blobs.path(hash).filter(|p| p.is_file()) else {
+        sync_blob_counted(&machine, direction, "missing", 0);
+        return Err(err(StatusCode::NOT_FOUND, "no such blob"));
+    };
     if req.method() == Method::HEAD {
+        sync_blob_counted(&machine, direction, "present", 0);
         return Ok(srv::status(StatusCode::OK));
     }
-    let body = crate::rt::file_source(path).map_err(|_| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let Ok(body) = crate::rt::file_source(path) else {
+        sync_blob_counted(&machine, direction, "missing", 0);
+        return Err(err(StatusCode::NOT_FOUND, "no such blob"));
+    };
+    sync_blob_counted(&machine, direction, "ok", bytes);
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
@@ -1303,26 +1373,44 @@ const SYNC_DISK_FLOOR: u64 = 2 << 30;
 /// [`SYNC_BLOB_MAX`], or while the server's disk has less than [`SYNC_DISK_FLOOR`] free.
 async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     if !sync_token_ok(hub, &req) {
+        sync_blob_counted("", "up", "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
+    let machine = sync_machine(&req);
+    let counted = |result: &str, bytes: u64| sync_blob_counted(&machine, "up", result, bytes);
     let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
     if !crate::sync::blobs::valid_hash(hash) {
+        counted("refused", 0);
         return Err(err(StatusCode::BAD_REQUEST, "not a SHA-256"));
     }
     if blobs.has(hash) {
+        counted("present", 0);
         return Ok(srv::status(StatusCode::OK));
     }
     let length = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if length.is_some_and(|n| n > SYNC_BLOB_MAX) {
+        counted("refused", 0);
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("contents are synced up to {} MiB", SYNC_BLOB_MAX >> 20)));
     }
     if blobs.free_bytes().is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+        counted("refused", 0);
+        tracing::warn!(target: "kiln.sync", event = "sync.blob_refused", machine = %machine, reason = "disk_full", "the server's disk is nearly full: sync takes no more contents");
         return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full: sync takes no more contents until there is room"));
     }
     let tmp = blobs.incoming();
-    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX)?;
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX).inspect_err(|_| counted("failed", 0))?;
     let mut body = req.into_body();
-    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+    let mut bytes = 0u64;
+    loop {
+        let chunk = match srv::next_chunk(&mut body).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                counted("failed", 0);
+                return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
+            }
+        };
+        bytes = bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         if sink.send(chunk).await.is_err() {
             break;
         }
@@ -1330,15 +1418,28 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     drop(sink);
     if let Err(e) = done.await {
         let _ = std::fs::remove_file(&tmp);
+        counted("failed", 0);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
     }
     let store = blobs.clone();
     let name = hash.to_owned();
-    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| {
+        counted("failed", 0);
+        err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    })?;
     match kept {
-        Ok(true) => Ok(srv::status(StatusCode::CREATED)),
-        Ok(false) => Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name")),
-        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Ok(true) => {
+            counted("ok", bytes);
+            Ok(srv::status(StatusCode::CREATED))
+        }
+        Ok(false) => {
+            counted("refused", 0);
+            Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name"))
+        }
+        Err(e) => {
+            counted("failed", 0);
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
     }
 }
 
@@ -1498,6 +1599,7 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
     match e {
         crate::plans::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
         crate::plans::Error::Missing => err(StatusCode::NOT_FOUND, "no such plan"),
+        crate::plans::Error::Refused(c, m) => err(c, m),
         crate::plans::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -3390,11 +3492,18 @@ struct GoalsSet {
     goals: Vec<crate::goals::Given>,
 }
 
+/// Whether `caller` may change agent `id`'s goals: a person any agent's, an agent its own and those
+/// of the agents it started (`crate::harness::lineage::may_steer`).
+fn may_steer_goals(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), ApiError> {
+    crate::harness::lineage::may_steer(hub, caller, id).map_err(|(c, m)| err(c, m))
+}
+
 /// An agent's goals not yet started, as they should be (`crate::goals::set`).
-async fn goals_set(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.set".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
@@ -3406,18 +3515,20 @@ struct GoalsAdd {
 }
 
 /// Goals lined up after the agent's others (`crate::goals::add`).
-async fn goals_add(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.add".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
 /// Start, pause, skip or clear an agent's goal stack.
-async fn goals_control(hub: &Hub, id: &str, action: &str) -> R {
+async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
     let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
+    may_steer_goals(hub, caller, id)?;
     let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.control".into(), format!("{id}: {action}")).await;
+    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 

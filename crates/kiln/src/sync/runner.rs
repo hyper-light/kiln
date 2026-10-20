@@ -21,9 +21,10 @@ use super::blobs::Blobs;
 use super::disk::{self, Store, SyncLog};
 use super::group::{self, Feed, SERVER, TICK};
 use super::scan::Limits;
-use super::wire::{self, CopySpec, CopyStatus, Joiner, Msg};
+use super::wire::{self, CopySpec, CopyStatus, Joiner, Msg, Traffic};
 use super::{Step, Version};
 use crate::http::client::Client;
+use crate::metrics;
 use crate::proto::AgentMsg;
 
 /// How often each folder is looked at for what changed.
@@ -56,8 +57,10 @@ enum Input {
     Wake,
     Heard(Box<Msg>, Vec<u8>),
     Connected(bool),
-    Fetched(String, Got),
-    Uploaded(String, bool),
+    Fetched(String, Got, Moved),
+    Uploaded(String, Put, Moved),
+    /// Something to tell the server (an agent session's move, `crate::harness::session`).
+    Tell(Box<Msg>),
     /// Look at once at the copy a folder is in (a session leaving it), and say what that found.
     LookNow(PathBuf, futures::channel::oneshot::Sender<Option<Looked>>),
     /// How the copy a folder is in stands.
@@ -87,6 +90,8 @@ pub struct Looked {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Standing {
     pub repo: String,
+    /// The repo's name.
+    pub name: String,
     /// The copy's folder.
     pub folder: String,
     /// Files its last look left out, too big for sync (relative to its folder).
@@ -122,6 +127,23 @@ enum Got {
     Failed,
 }
 
+/// What an upload did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Put {
+    Sent,
+    /// The server had it already (another copy sent it).
+    There,
+    Failed,
+}
+
+/// What a transfer moved: its bytes, how long it took, and why it failed.
+#[derive(Debug, Default)]
+struct Moved {
+    bytes: u64,
+    took: Duration,
+    why: Option<String>,
+}
+
 enum Transfer {
     Fetch(String),
     Upload(String),
@@ -151,14 +173,17 @@ impl Runner {
             while let Ok((job, token)) = job_rx.recv().await {
                 let (http, server, back, blobs, me) = (http.clone(), server.clone(), back.clone(), blobs.clone(), me.clone());
                 crate::rt::spawn(async move {
+                    let started = Instant::now();
                     match job {
                         Transfer::Fetch(hash) => {
-                            let got = fetch(&http, &server, &me, &token, &blobs, &hash).await;
-                            let _ = back.send(Input::Fetched(hash, got));
+                            let (got, mut moved) = fetch(&http, &server, &me, &token, &blobs, &hash).await;
+                            moved.took = started.elapsed();
+                            let _ = back.send(Input::Fetched(hash, got, moved));
                         }
                         Transfer::Upload(hash) => {
-                            let ok = upload(&http, &server, &me, &token, &blobs, &hash).await;
-                            let _ = back.send(Input::Uploaded(hash, ok));
+                            let (put, mut moved) = upload(&http, &server, &me, &token, &blobs, &hash).await;
+                            moved.took = started.elapsed();
+                            let _ = back.send(Input::Uploaded(hash, put, moved));
                         }
                     }
                 });
@@ -193,6 +218,11 @@ impl Runner {
         self.tx.send(Input::Standing(folder.to_path_buf(), tx)).ok()?;
         rx.await.ok().flatten()
     }
+
+    /// Tells the server `msg` on the sync lane, if it is connected.
+    pub fn tell(&self, msg: Msg) {
+        let _ = self.tx.send(Input::Tell(Box::new(msg)));
+    }
 }
 
 /// Where a blob is asked for or sent.
@@ -204,58 +234,118 @@ fn blob_url(server: &str, me: &str, hash: &str) -> String {
     format!("{}/api/sync/blobs/{hash}?machine={machine}", server.trim_end_matches('/'))
 }
 
-async fn fetch(http: &Client, server: &str, me: &str, token: &str, blobs: &Blobs, hash: &str) -> Got {
+async fn fetch(http: &Client, server: &str, me: &str, token: &str, blobs: &Blobs, hash: &str) -> (Got, Moved) {
+    let failed = |why: String| (Got::Failed, Moved { why: Some(why), ..Moved::default() });
     let resp = http.get(&blob_url(server, me, hash)).bearer(token).timeout(Duration::from_secs(900)).send().await;
     let mut resp = match resp {
-        Ok(r) if r.status() == 404 => return Got::Gone,
+        Ok(r) if r.status() == 404 => return (Got::Gone, Moved::default()),
         Ok(r) if r.is_success() => r,
-        Ok(r) => {
-            tracing::debug!(%hash, status = r.status(), "a sync blob did not come");
-            return Got::Failed;
-        }
-        Err(e) => {
-            tracing::debug!(%hash, error = %format!("{e:#}"), "a sync blob did not come");
-            return Got::Failed;
-        }
+        Ok(r) => return failed(format!("the server answered {}", r.status())),
+        Err(e) => return failed(format!("{e:#}")),
     };
     let tmp = blobs.incoming();
-    let Ok((sink, done)) = crate::rt::file_sink(tmp.clone(), 64 << 30) else { return Got::Failed };
-    let mut whole = true;
+    let sink = crate::rt::file_sink(tmp.clone(), 64 << 30);
+    let Ok((sink, done)) = sink else { return failed("no room to write it".to_owned()) };
+    let mut bytes = 0u64;
+    let mut broke: Option<String> = None;
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
+                bytes = bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
                 if sink.send(chunk).await.is_err() {
-                    whole = false;
+                    broke = Some("writing it failed".to_owned());
                     break;
                 }
             }
             Ok(None) => break,
-            Err(_) => {
-                whole = false;
+            Err(e) => {
+                broke = Some(format!("it broke off after {bytes} bytes: {e:#}"));
                 break;
             }
         }
     }
     drop(sink);
-    let written = done.await.is_ok();
+    let written = done.await;
+    if let Some(why) = broke {
+        let _ = std::fs::remove_file(&tmp);
+        return failed(why);
+    }
+    if let Err(e) = written {
+        return failed(format!("writing it: {e:#}"));
+    }
     let (store, h) = (blobs.clone(), hash.to_owned());
-    let adopted = whole && written && crate::rt::blocking(move || store.adopt(&tmp, &h)).await.is_ok_and(|r| r.unwrap_or(false));
-    if adopted { Got::Here } else { Got::Failed }
+    match crate::rt::blocking(move || store.adopt(&tmp, &h)).await {
+        Ok(Ok(true)) => (Got::Here, Moved { bytes, ..Moved::default() }),
+        Ok(Ok(false)) => failed("it didn't hash to its name".to_owned()),
+        Ok(Err(e)) => failed(format!("keeping it: {e}")),
+        Err(e) => failed(format!("keeping it: {e:#}")),
+    }
 }
 
-async fn upload(http: &Client, server: &str, me: &str, token: &str, blobs: &Blobs, hash: &str) -> bool {
+async fn upload(http: &Client, server: &str, me: &str, token: &str, blobs: &Blobs, hash: &str) -> (Put, Moved) {
+    let failed = |why: String| (Put::Failed, Moved { why: Some(why), ..Moved::default() });
     let url = blob_url(server, me, hash);
     // There already (another copy sent it): nothing to send.
     if let Ok(r) = http.request(crate::http::client::Method::Head, &url).bearer(token).timeout(Duration::from_secs(30)).send().await
         && r.is_success()
     {
-        return true;
+        return (Put::There, Moved::default());
     }
-    let Some(path) = blobs.path(hash) else { return false };
-    let Ok(body) = crate::rt::file_source(path) else { return false };
+    let Some(path) = blobs.path(hash) else { return failed("it isn't here any more".to_owned()) };
+    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let body = crate::rt::file_source(path);
+    let Ok(body) = body else { return failed("it couldn't be read".to_owned()) };
     match http.put(&url).bearer(token).header("content-type", "application/octet-stream").body_stream(body).timeout(Duration::from_secs(1800)).send().await {
-        Ok(r) => r.is_success(),
-        Err(_) => false,
+        Ok(r) if r.is_success() => (Put::Sent, Moved { bytes, ..Moved::default() }),
+        Ok(r) => failed(format!("the server answered {}", r.status())),
+        Err(e) => failed(format!("{e:#}")),
+    }
+}
+
+/// A look at a copy's folder (of repo `name`) took since `started` and proposed `steps`.
+fn looked(name: &str, started: Instant, steps: usize) {
+    let m = metrics::sync();
+    m.look_seconds.observe(&[name], started.elapsed().as_secs_f64());
+    if steps > 0 {
+        m.proposed.add(&[name], u64::try_from(steps).unwrap_or(u64::MAX));
+    }
+}
+
+/// What a copy's folder took from the log since last asked: other machines' steps counted, what
+/// they did to the files here, and how long they took to get here.
+fn took_in(h: &mut Held) {
+    let took = std::mem::take(&mut h.r.machine_mut().took);
+    let m = metrics::sync();
+    let name = h.spec.name.as_str();
+    let now = now_ms();
+    for t in took.iter().filter(|t| !t.ours) {
+        m.applied.inc(&[name]);
+        for (outcome, n) in [("applied", t.applied), ("conflict", t.conflicts), ("kept", t.kept), ("refused", t.refused)] {
+            if n > 0 {
+                m.folder_writes.add(&[name, outcome], u64::try_from(n).unwrap_or(u64::MAX));
+            }
+        }
+        // An image's files (no step, no time) say nothing of how long a change takes.
+        if t.at > 0 {
+            let ms = u64::try_from(now.saturating_sub(t.at)).unwrap_or(0);
+            #[allow(clippy::cast_precision_loss)]
+            m.apply_lag.observe(&[name], ms as f64 / 1000.0);
+            h.lag_ms = Some(ms);
+        }
+    }
+}
+
+/// A copy's errors that came up since last looked: counted and logged once each, until it goes
+/// right again.
+fn erred(h: &mut Held) {
+    for ((kind, error), counted) in ["group", "folder", "look"].into_iter().zip(&h.errors).zip(&mut h.erred) {
+        if let Some(e) = error
+            && !*counted
+        {
+            metrics::sync().errors.inc(&[&h.spec.name, kind]);
+            tracing::warn!(target: "kiln.sync", event = "sync.error", repo = %h.spec.name, kind, path = %h.spec.path, error = %e, "a synced copy has an error");
+        }
+        *counted = error.is_some();
     }
 }
 
@@ -302,6 +392,10 @@ struct Held {
     said_at: Option<Instant>,
     /// It has looked at its folder since it opened.
     looked: bool,
+    /// Which of its errors were counted: each once until it goes right again.
+    erred: [bool; 3],
+    /// How long the last change from another machine took to get to its folder (ms).
+    lag_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +432,11 @@ struct Owner {
     retry: HashMap<String, Instant>,
     gone: HashSet<String>,
     uploads: HashMap<String, Upload>,
+    /// The repo each transfer under way or failed is for (its id), and how often it failed.
+    owner_of: HashMap<String, String>,
+    tries: HashMap<String, u32>,
+    /// What each repo's copies moved with the server.
+    traffic: HashMap<String, Traffic>,
     looked: Instant,
     statused: Instant,
     resent: Instant,
@@ -405,6 +504,9 @@ impl Owner {
             retry: HashMap::new(),
             gone: HashSet::new(),
             uploads: HashMap::new(),
+            owner_of: HashMap::new(),
+            tries: HashMap::new(),
+            traffic: HashMap::new(),
             looked: long_ago,
             statused: long_ago,
             resent: long_ago,
@@ -446,8 +548,14 @@ impl Owner {
                     self.statused = Instant::now().checked_sub(STATUS).unwrap_or_else(Instant::now);
                 }
             }
-            Input::Fetched(hash, got) => {
+            Input::Fetched(hash, got, moved) => {
                 self.fetching.remove(&hash);
+                let result = match got {
+                    Got::Here => "ok",
+                    Got::Gone => "gone",
+                    Got::Failed => "failed",
+                };
+                self.moved(&hash, "down", result, &moved);
                 match got {
                     Got::Here => {}
                     Got::Gone => {
@@ -461,9 +569,16 @@ impl Owner {
                     }
                 }
             }
-            Input::Uploaded(hash, ok) => {
-                self.uploads.insert(hash, if ok { Upload::Done } else { Upload::Failed(Instant::now() + RETRY) });
+            Input::Uploaded(hash, put, moved) => {
+                let result = match put {
+                    Put::Sent => "ok",
+                    Put::There => "present",
+                    Put::Failed => "failed",
+                };
+                self.moved(&hash, "up", result, &moved);
+                self.uploads.insert(hash, if put == Put::Failed { Upload::Failed(Instant::now() + RETRY) } else { Upload::Done });
             }
+            Input::Tell(msg) => self.say(*msg, Vec::new()),
             Input::LookNow(folder, reply) => {
                 let _ = reply.send(self.look_now(&folder));
             }
@@ -489,7 +604,10 @@ impl Owner {
             return Some(out);
         }
         let feed = h.r.machine_mut();
-        match feed.copy.propose(&self.blobs, now_ms()) {
+        let started = Instant::now();
+        let proposed = feed.copy.propose(&self.blobs, now_ms());
+        looked(&h.spec.name, started, proposed.as_ref().map_or(0, Vec::len));
+        match proposed {
             Ok(steps) => {
                 h.errors[E_LOOK] = if steps.is_empty() { None } else { feed.save().err().map(|e| format!("the copy's state: {e}")) };
                 h.looked = true;
@@ -507,6 +625,7 @@ impl Owner {
         let (reached, behind) = feed.progress();
         Some(Standing {
             repo: h.spec.repo.clone(),
+            name: h.spec.name.clone(),
             folder: h.spec.path.clone(),
             skipped: feed.copy.skipped.iter().map(|s| s.path.clone()).collect(),
             reached,
@@ -539,8 +658,9 @@ impl Owner {
                     let _ = h.r.step(m);
                 }
             }
-            Msg::Want { hashes, .. } => {
+            Msg::Want { repo, hashes } => {
                 // Sent again, then the steps that name them.
+                self.retried(&repo, "upload", u64::try_from(hashes.len()).unwrap_or(u64::MAX));
                 for hash in hashes {
                     self.uploads.remove(&hash);
                 }
@@ -551,7 +671,7 @@ impl Owner {
                 let _ = self.repos.try_send(super::repos::Job::Order(msg));
             }
             // Only a runner says these.
-            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) => {}
+            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) | Msg::Move(_) => {}
         }
     }
 
@@ -600,7 +720,7 @@ impl Owner {
                 }
                 Err(e) => {
                     tracing::warn!(repo = %spec.name, path = %spec.path, error = %format!("{e:#}"), "a synced copy did not open");
-                    self.say(Msg::Status(CopyStatus { repo: spec.repo.clone(), member: spec.member, error: Some(format!("{e:#}")), at: now_ms() / 1000, ..CopyStatus::default() }), Vec::new());
+                    self.say(Msg::Status(Box::new(CopyStatus { repo: spec.repo.clone(), member: spec.member, error: Some(format!("{e:#}")), at: now_ms() / 1000, ..CopyStatus::default() })), Vec::new());
                 }
             }
         }
@@ -634,7 +754,7 @@ impl Owner {
         }
         let r = Replica::open(&group::settings(spec.member, depth)?, store, feed, Unbounded).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let compacted = r.applied().index;
-        Ok(Held { spec: spec.clone(), group, r, out: Output::default(), compacted, errors: [None, None, None], sent: 0, waiting: 0, said: None, said_at: None, looked: false })
+        Ok(Held { spec: spec.clone(), group, r, out: Output::default(), compacted, errors: [None, None, None], sent: 0, waiting: 0, said: None, said_at: None, looked: false, erred: [false; 3], lag_ms: None })
     }
 
     fn state_file(&self, spec: &CopySpec) -> PathBuf {
@@ -685,7 +805,8 @@ impl Owner {
             self.hold();
         }
         let now = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let mut wanted: Vec<String> = Vec::new();
+        // Contents the folders wait for, each with the repo it's for.
+        let mut wanted: Vec<(String, String)> = Vec::new();
         let mut frames: Vec<(Msg, Vec<u8>)> = Vec::new();
         let mut freed = false;
         for h in self.held.values_mut() {
@@ -704,11 +825,12 @@ impl Owner {
             match h.r.machine_mut().work(&self.blobs) {
                 Ok(missing) => {
                     h.waiting = missing.len();
-                    wanted.extend(missing);
+                    wanted.extend(missing.into_iter().map(|m| (m, h.spec.repo.clone())));
                     h.errors[E_FOLDER] = None;
                 }
                 Err(e) => h.errors[E_FOLDER] = Some(format!("the folder: {e}")),
             }
+            took_in(h);
             // An adopting folder the log has brought through its index: it is the group's now.
             let feed = h.r.machine_mut();
             if let Some(at) = feed.copy.state.adopt
@@ -750,22 +872,86 @@ impl Owner {
             self.statused = Instant::now();
         }
         self.status(every);
+        for h in self.held.values_mut() {
+            erred(h);
+        }
         if self.swept.elapsed() >= SWEEP {
             self.swept = Instant::now();
             self.sweep();
         }
     }
 
-    /// Asks the server for contents the folders wait for, a few at a time.
-    fn fetch(&mut self, mut wanted: Vec<String>) {
+    /// A synced repo's name, as metrics and logs label it, from its id.
+    fn name_of(&self, repo: &str) -> String {
+        self.held.values().find(|h| h.spec.repo == repo).map_or_else(|| repo.to_owned(), |h| h.spec.name.clone())
+    }
+
+    /// `n` of something (`what`) done again for `repo`.
+    fn retried(&mut self, repo: &str, what: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let name = self.name_of(repo);
+        metrics::sync().retries.add(&[&name, what], n);
+        tracing::debug!(target: "kiln.sync", event = "sync.retry", repo = %name, what, n, "tried again");
+        let t = self.traffic.entry(repo.to_owned()).or_default();
+        if what == "resend" {
+            t.resent = t.resent.saturating_add(n);
+        } else {
+            t.retried = t.retried.saturating_add(n);
+        }
+    }
+
+    /// A transfer is over (`direction` `up` or `down`): counted for the repo it was for, and a
+    /// failure logged the first time and every tenth after (a server away fails them all).
+    fn moved(&mut self, hash: &str, direction: &'static str, result: &'static str, moved: &Moved) {
+        let repo = if result == "failed" { self.owner_of.get(hash).cloned() } else { self.owner_of.remove(hash) }.unwrap_or_default();
+        let name = self.name_of(&repo);
+        let m = metrics::sync();
+        m.transfers.inc(&[&name, direction, result]);
+        m.transfer_seconds.observe(&[direction], moved.took.as_secs_f64());
+        if moved.bytes > 0 {
+            m.transfer_bytes.add(&[&name, direction], moved.bytes);
+        }
+        let t = self.traffic.entry(repo).or_default();
+        match (direction, result) {
+            ("up", "ok" | "present") => {
+                t.sent += 1;
+                t.sent_bytes = t.sent_bytes.saturating_add(moved.bytes);
+            }
+            ("down", "ok") => {
+                t.fetched += 1;
+                t.fetched_bytes = t.fetched_bytes.saturating_add(moved.bytes);
+            }
+            ("down", "gone") => t.gone += 1,
+            _ => {}
+        }
+        if result != "failed" {
+            self.tries.remove(hash);
+            return;
+        }
+        let why = moved.why.clone().unwrap_or_else(|| "it failed".to_owned());
+        t.failed += 1;
+        t.last_failure = Some(format!("{} {}: {why}", if direction == "up" { "sending" } else { "fetching" }, hash.get(..12).unwrap_or(hash)));
+        t.failed_at = now_ms() / 1000;
+        let n = self.tries.entry(hash.to_owned()).or_insert(0);
+        *n = n.saturating_add(1);
+        if *n == 1 || n.is_multiple_of(10) {
+            tracing::warn!(target: "kiln.sync", event = "sync.transfer_failed", repo = %name, direction, hash = %hash, tries = *n, error = %why, "contents didn't move: tried again in {}s", RETRY.as_secs());
+        }
+    }
+
+    /// Asks the server for contents the folders wait for (each with the repo it's for), a few at
+    /// a time.
+    fn fetch(&mut self, mut wanted: Vec<(String, String)>) {
         if !self.connected || self.token.is_empty() {
             return;
         }
         wanted.sort();
-        wanted.dedup();
+        wanted.dedup_by(|a, b| a.0 == b.0);
         let now = Instant::now();
         self.retry.retain(|_, at| *at > now);
-        for hash in wanted {
+        for (hash, repo) in wanted {
             if self.fetching.len() >= TRANSFERS {
                 break;
             }
@@ -773,6 +959,10 @@ impl Owner {
                 continue;
             }
             if self.jobs.try_send((Transfer::Fetch(hash.clone()), self.token.clone())).is_ok() {
+                if self.tries.get(&hash).is_some_and(|n| *n > 0) {
+                    self.retried(&repo, "fetch", 1);
+                }
+                self.owner_of.insert(hash.clone(), repo);
                 self.fetching.insert(hash);
             }
         }
@@ -791,7 +981,10 @@ impl Owner {
             if feed.copy.adopting() {
                 continue;
             }
-            match feed.copy.propose(&self.blobs, now_ms()) {
+            let started = Instant::now();
+            let proposed = feed.copy.propose(&self.blobs, now_ms());
+            looked(&h.spec.name, started, proposed.as_ref().map_or(0, Vec::len));
+            match proposed {
                 Ok(steps) if !steps.is_empty() => {
                     h.errors[E_LOOK] = feed.save().err().map(|e| format!("the copy's state: {e}"));
                     h.looked = true;
@@ -812,17 +1005,21 @@ impl Owner {
         }
         let now = Instant::now();
         let mut moving = self.uploads.values().filter(|u| **u == Upload::Moving).count();
-        let need: Vec<String> = self.held.values().flat_map(|h| h.r.machine().copy.state.sent.iter().flat_map(hashes).cloned().collect::<Vec<_>>()).collect();
-        for hash in need {
+        let need: Vec<(String, String)> = self.held.values().flat_map(|h| h.r.machine().copy.state.sent.iter().flat_map(hashes).map(|x| (x.clone(), h.spec.repo.clone())).collect::<Vec<_>>()).collect();
+        for (hash, repo) in need {
             if moving >= TRANSFERS {
                 break;
             }
-            let ready = match self.uploads.get(&hash) {
-                None => true,
-                Some(Upload::Failed(at)) => *at <= now,
-                Some(_) => false,
+            let (ready, again) = match self.uploads.get(&hash) {
+                None => (true, false),
+                Some(Upload::Failed(at)) => (*at <= now, true),
+                Some(_) => (false, false),
             };
             if ready && self.jobs.try_send((Transfer::Upload(hash.clone()), self.token.clone())).is_ok() {
+                if again {
+                    self.retried(&repo, "upload", 1);
+                }
+                self.owner_of.insert(hash.clone(), repo);
                 self.uploads.insert(hash, Upload::Moving);
                 moving += 1;
             }
@@ -836,6 +1033,7 @@ impl Owner {
             return;
         }
         let mut out = Vec::new();
+        let mut resent: Vec<(String, u64)> = Vec::new();
         for h in self.held.values_mut() {
             let sent = &h.r.machine().copy.state.sent;
             let ready: Vec<&Step> = sent.iter().take_while(|s| hashes(s).all(|x| self.uploads.get(x) == Some(&Upload::Done))).collect();
@@ -843,15 +1041,23 @@ impl Owner {
             if ready.is_empty() || (!again && newest <= h.sent) {
                 continue;
             }
+            let mut n = 0u64;
             for s in ready {
                 if again || s.seq > h.sent {
+                    if s.seq <= h.sent {
+                        n += 1;
+                    }
                     out.push(Msg::Steps { repo: h.spec.repo.clone(), steps: vec![s.clone()] });
                 }
             }
             h.sent = newest;
+            resent.push((h.spec.repo.clone(), n));
         }
         for msg in out {
             self.say(msg, Vec::new());
+        }
+        for (repo, n) in resent {
+            self.retried(&repo, "resend", n);
         }
     }
 
@@ -878,6 +1084,8 @@ impl Owner {
                 at: 0,
                 looked: h.looked,
                 adopting: feed.copy.adopting(),
+                traffic: self.traffic.get(&h.spec.repo).cloned().unwrap_or_default(),
+                lag_ms: h.lag_ms,
             };
             let changed = h.said.as_ref() != Some(&status);
             let soon = h.said_at.is_none_or(|t| t.elapsed() >= STATUS_SOON);
@@ -888,19 +1096,28 @@ impl Owner {
             }
         }
         for status in out {
-            self.say(Msg::Status(status), Vec::new());
+            self.say(Msg::Status(Box::new(status)), Vec::new());
+        }
+        if every {
+            let skipped = self.held.values().map(|h| (vec![h.spec.name.clone()], i64::try_from(h.r.machine().copy.skipped.len()).unwrap_or(i64::MAX)));
+            metrics::sync().skipped_files.replace(skipped.collect::<Vec<_>>());
         }
         if every && self.held.is_empty()
             && let Some(error) = &self.error
         {
             for spec in &self.wanted {
-                self.say(Msg::Status(CopyStatus { repo: spec.repo.clone(), member: spec.member, error: Some(error.clone()), at, ..CopyStatus::default() }), Vec::new());
+                self.say(Msg::Status(Box::new(CopyStatus { repo: spec.repo.clone(), member: spec.member, error: Some(error.clone()), at, ..CopyStatus::default() })), Vec::new());
             }
         }
     }
 
-    /// Drops contents no copy needs any more: the folders hold what they took.
-    fn sweep(&self) {
+    /// Drops contents no copy needs any more: the folders hold what they took. What transfers
+    /// over and done with were for goes too.
+    fn sweep(&mut self) {
+        let (fetching, retry, uploads) = (&self.fetching, &self.retry, &self.uploads);
+        let live = |h: &String| fetching.contains(h) || retry.contains_key(h) || uploads.get(h).is_some_and(|u| *u != Upload::Done);
+        self.owner_of.retain(|h, _| live(h));
+        self.tries.retain(|h, _| live(h));
         let named: HashSet<String> = self.held.values().flat_map(|h| h.r.machine().named()).collect();
         let Ok(all) = self.blobs.all() else { return };
         for (hash, modified) in all {

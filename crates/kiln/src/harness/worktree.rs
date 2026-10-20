@@ -195,8 +195,22 @@ fn inside(root: &Path, rel: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Git for the tests' own repositories, free of this machine's config (one that signs
+    /// commits would ask for a key).
     fn sh(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-        git(dir, args).map_err(anyhow::Error::msg)
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "kiln")
+            .env("GIT_AUTHOR_EMAIL", "kiln@localhost")
+            .env("GIT_COMMITTER_NAME", "kiln")
+            .env("GIT_COMMITTER_EMAIL", "kiln@localhost")
+            .output()?;
+        anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
     }
 
     fn put(dir: &Path, rel: &str, text: &str) -> anyhow::Result<()> {
@@ -222,7 +236,7 @@ mod tests {
         sh(&a, &["add", "."])?;
         sh(&a, &["commit", "-qm", "first"])?;
         let b = t.path().join("b");
-        let out = Command::new("git").args(["clone", "-q"]).arg(&a).arg(&b).output()?;
+        let out = Command::new("git").args(["clone", "-q"]).arg(&a).arg(&b).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output()?;
         anyhow::ensure!(out.status.success(), "clone");
         // On a: a worktree on its own branch, with a commit, a staged file, an edit, a deletion,
         // a new file and a .env.

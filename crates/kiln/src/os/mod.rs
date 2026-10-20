@@ -44,6 +44,24 @@ pub mod supervise;
 #[path = "supervise_windows.rs"]
 pub mod supervise;
 
+/// Each agent session's processes held together by the system, so everything an agent started is
+/// known (however it was parented since), whose a process is takes one look, and ending them all
+/// is one call: a cgroup of its own on Linux, a job object on Windows, followed fork by fork on
+/// macOS. Where there's none, `Group::of` is `None` and an agent's processes are found by their
+/// mark (`crate::harness::survivors`).
+#[cfg(target_os = "linux")]
+#[path = "contain_linux.rs"]
+pub mod contain;
+#[cfg(windows)]
+#[path = "contain_windows.rs"]
+pub mod contain;
+#[cfg(target_os = "macos")]
+#[path = "contain_macos.rs"]
+pub mod contain;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "contain_none.rs"]
+pub mod contain;
+
 /// PTY session I/O: [`crate::terminal`]'s plumbing.
 #[cfg(unix)]
 #[path = "pty_unix.rs"]

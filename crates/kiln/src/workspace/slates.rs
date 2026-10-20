@@ -554,7 +554,7 @@ mod end_to_end {
         sh(bare.path(), "git init -q --bare -b main")?;
         let work = tempfile::tempdir()?;
         let remote = bare.path().to_string_lossy().into_owned();
-        sh(work.path(), &format!("git init -q -b main && git config user.name Ada && git config user.email ada@example.com && printf 'target/\\n' > .gitignore && mkdir -p src target && echo a > src/a.rs && git add . && git commit -qm init && git remote add origin {remote} && git push -q origin main && echo built > target/out"))?;
+        sh(work.path(), &format!("git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && git config tag.gpgsign false && printf 'target/\\n' > .gitignore && mkdir -p src target && echo a > src/a.rs && git add . && git commit -qm init && git remote add origin {remote} && git push -q origin main && echo built > target/out"))?;
         let cwd = work.path().join("src").to_string_lossy().into_owned();
         let spec = Spec {
             kind: "claude".into(),
