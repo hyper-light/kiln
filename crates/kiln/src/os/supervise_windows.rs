@@ -103,6 +103,13 @@ pub fn stop_supervisors(subcommand: &str) -> usize {
     stopped
 }
 
+/// Stop these supervisors, with their children and the children's jobs.
+pub fn stop(pids: &[u32]) {
+    for pid in pids {
+        crate::os::proc::taskkill_tree(*pid);
+    }
+}
+
 /// In a supervised child, treat EOF on stdin (the supervisor closed it, or died) as a shutdown
 /// request.
 pub fn watch_supervisor(shutdown: crate::rt::Shutdown) {

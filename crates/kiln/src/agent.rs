@@ -354,28 +354,8 @@ impl Item {
 #[cfg(unix)]
 const RETIRE_QUIET: Duration = Duration::from_secs(8);
 
-/// This runner's arguments with `--instance` set to `id` (the new build runs as its own instance).
 #[cfg(unix)]
-fn with_instance(args: &[String], id: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 2);
-    let mut skip = false;
-    for a in args {
-        if std::mem::take(&mut skip) {
-            continue;
-        }
-        if a == "--instance" {
-            skip = true;
-            continue;
-        }
-        if a.starts_with("--instance=") {
-            continue;
-        }
-        out.push(a.clone());
-    }
-    out.push("--instance".to_owned());
-    out.push(id.to_owned());
-    out
-}
+use crate::upgrade::with_instance;
 
 /// This side's copies of a handed-over harness process's pipes, kept (not inherited by anything
 /// this runner starts) until the new build has them; `None` when one isn't open.

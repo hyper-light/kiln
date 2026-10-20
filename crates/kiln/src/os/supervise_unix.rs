@@ -122,6 +122,12 @@ pub fn stop_supervisors(_subcommand: &str) -> usize {
     0
 }
 
+/// Stop these supervisors: SIGTERM, which each passes on to its child with the child's grace
+/// period; SIGKILL to whatever is left after that.
+pub fn stop(pids: &[u32]) {
+    crate::os::stop_processes(pids, None, std::time::Duration::from_secs(30));
+}
+
 // ------------------------------------------------------------------ handing terminals over
 
 /// The handover channel's environment: the descriptor number of the child's end and the

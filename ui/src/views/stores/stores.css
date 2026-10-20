@@ -87,13 +87,20 @@
   fill: transparent;
   cursor: pointer;
 }
-.cv-hit:hover {
-  fill: #ffffff05;
+/* Only where there is a pointer to hover with: a tap leaves no box behind. */
+@media (hover: hover) {
+  .cv-hit:hover {
+    fill: #ffffff06;
+  }
 }
 .cv-text-heading,
 .cv-text-label,
 .cv-text-small,
-.cv-text-status {
+.cv-text-status,
+.cv-text-plate,
+.cv-text-name,
+.cv-text-tray,
+.cv-text-readout {
   font-family: var(--font-mono);
   font-weight: 400;
   font-variant-numeric: tabular-nums;
@@ -111,6 +118,28 @@
 .cv-text-small {
   fill: #a2b1c3;
   font-size: 10px;
+}
+/* A tray's name and a cabinet's readout, small on its face. */
+.cv-text-tray {
+  fill: #b7c3cf;
+  font-size: 7.5px;
+  letter-spacing: 0.06em;
+}
+.cv-text-readout {
+  fill: #c3cfdb;
+  font-size: 9px;
+}
+/* A machine's name, lettered on its header. */
+.cv-text-plate {
+  fill: #c9d4df;
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+}
+.cv-text-name {
+  fill: #bbc8d5;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 .cv-tabs {
   display: grid;
@@ -164,10 +193,9 @@
 .cv-panel {
   grid-area: 1 / 1;
   padding: 22px 24px;
-  visibility: hidden;
 }
-.cv-panel[data-active="true"] {
-  visibility: visible;
+.cv-panel[data-active="false"] {
+  display: none;
 }
 .cv-panel h4 {
   margin: 0 0 8px;
@@ -298,6 +326,16 @@
   display: block;
   min-width: 0;
   cursor: pointer;
+}
+/* A store's KPI footers say a little more than a phone's half-width holds: they wrap, never cut. */
+.cv-kpis .kpi-foot {
+  white-space: normal;
+}
+/* On a phone the name says the role (Server, a runner, its copy): the chip gives the File column room. */
+@media (max-width: 639px) {
+  .cv-table .cv-row .chip {
+    display: none;
+  }
 }
 .cv-table tr button.cv-row:focus-visible {
   outline: 2px solid #bfd0e4;

@@ -9,3 +9,6 @@ __pycache__/
 
 # The review UI check's server (ci/ui/review_setup.py).
 ci/ui/run/
+# KilnDB benchmark build output (bench/kilndb has a workspace of its own)
+/bench/kilndb/target/
+/bench/kilndb/Cargo.lock

@@ -40,7 +40,8 @@ pub struct InstanceRecord {
 /// The service a new instance replaces, and how to stop it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Replaces {
-    /// "systemd", "launchd" or "task".
+    /// "systemd", "launchd", "task" (a Windows Scheduled Task) or "startup" (its Startup-folder
+    /// fallback).
     pub boot: String,
     pub system: bool,
     /// The unit / label / task name.
@@ -339,7 +340,7 @@ pub fn parse_plist(body: &str, unit: &str, system: bool) -> Option<Existing> {
     })
 }
 
-fn xml_unescape(s: &str) -> String {
+pub(crate) fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
@@ -362,7 +363,89 @@ pub fn find_existing(unit: &str) -> Option<Existing> {
             return parse_unit(&body, unit, true);
         }
     }
+    if cfg!(windows) {
+        if let Some(task) = crate::install::task_definition(unit) {
+            let mut words = vec![task.command];
+            words.extend(split_windows_args(&task.arguments));
+            return windows_agent(&words, unit, "task");
+        }
+        // The Startup-folder fallback: `start "" /B <kiln> supervise --detach -- agent …`.
+        let script = std::fs::read_to_string(crate::install::startup_script(unit)).ok()?;
+        let line = script.lines().find_map(|l| l.trim().strip_prefix("start \"\" /B "))?;
+        return windows_agent(&split_windows_args(line), unit, "startup");
+    }
     None
+}
+
+/// The agent a Windows launcher starts (`<kiln> supervise [--detach] -- agent …`, its words), as
+/// [`Existing`] booted by `boot` (`task` or `startup`).
+fn windows_agent(words: &[String], unit: &str, boot: &str) -> Option<Existing> {
+    let (bin, rest) = words.split_first()?;
+    let sep = rest.iter().position(|w| w == "--")?;
+    let args = rest.get(sep + 1..)?.to_vec();
+    (rest.first().map(String::as_str) == Some("supervise") && args.first().map(String::as_str) == Some("agent")).then(|| Existing {
+        boot: boot.to_owned(),
+        system: false,
+        unit: unit.to_owned(),
+        bin: PathBuf::from(bin),
+        launcher: None,
+        args,
+        env: Vec::new(),
+    })
+}
+
+/// Split a Windows command line into its arguments as `CommandLineToArgvW` does (what
+/// `crate::install::win_quote` writes): whitespace separates them outside double quotes,
+/// backslashes are literal unless they come before a quote (`2n` of them then are `n`, and the
+/// quote quotes; `2n+1` are `n` and a literal quote), and `""` inside quotes is a quote.
+fn split_windows_args(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut any = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let mut n = 1;
+                while chars.next_if_eq(&'\\').is_some() {
+                    n += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    cur.push_str(&"\\".repeat(n / 2));
+                    if n % 2 == 1 {
+                        chars.next();
+                        cur.push('"');
+                    }
+                } else {
+                    cur.push_str(&"\\".repeat(n));
+                }
+                any = true;
+            }
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                cur.push('"');
+            }
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            ' ' | '\t' if !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
 }
 
 /// The value of `--flag` (or `--flag=value`) in agent arguments.
@@ -428,6 +511,14 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
         say(format!("runner      {} (taken up once its jobs are done; it keeps its terminals)", existing.bin.display()));
         return Ok(());
     }
+    // Windows: the binary the runner's Scheduled Task (or Startup-folder script) starts is
+    // replaced, the running one moved aside as Windows allows; its supervisor sees it change and
+    // restarts the runner into it.
+    if existing.boot == "task" || existing.boot == "startup" {
+        crate::install::place_binary(&existing.bin)?;
+        say(format!("runner      {} (its supervisor restarts the runner into it)", existing.bin.display()));
+        return Ok(());
+    }
     let state_dir = arg_value(&existing.args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
     let (machine_cert, key) = machine_credentials(&state_dir)?;
     let server = arg_value(&existing.args, "--server").or_else(|| crate::join::stored(&state_dir, "server")).ok_or_else(|| {
@@ -483,10 +574,10 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
     )?;
 
     let new_unit = instance_unit(unit, &id);
+    // Its own instance, in place of the one the runner it's beside may have (itself set up by an
+    // upgrade before): `agent` takes `--instance` once.
     let mut args = vec!["supervise".to_owned(), "--".to_owned()];
-    args.extend(existing.args.iter().cloned());
-    args.push("--instance".to_owned());
-    args.push(id.clone());
+    args.extend(with_instance(&existing.args, &id));
     crate::install::start_service(existing.system, &new_unit, &stable_bin, &args, &state_dir, &existing.env)?;
     say(format!("service     {new_unit} started beside {unit}"));
     // Wait until the new runner reached the server (its certificate and connection work).
@@ -497,6 +588,29 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
         format!("status      started; check `journalctl --user -u {new_unit}` if it does not appear in Runners")
     });
     Ok(())
+}
+
+/// A runner's arguments with `--instance` set to `id` (the new build runs as its own instance),
+/// any it had before left out.
+pub fn with_instance(args: &[String], id: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if a == "--instance" {
+            skip = true;
+            continue;
+        }
+        if a.starts_with("--instance=") {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out.push("--instance".to_owned());
+    out.push(id.to_owned());
+    out
 }
 
 /// The new runner writes `connected` into its instance directory once the server welcomed it.
@@ -530,6 +644,39 @@ mod tests {
         assert_eq!(arg_value(&["--state-dir=/x".to_owned()], "--state-dir").as_deref(), Some("/x"));
         assert!(parse_unit("ExecStart=/bin/kiln supervise -- server\n", "kiln", false).is_none());
         assert_eq!(instance_unit("kiln-agent", "0199a2b3-c4d5"), "kiln-agent-0199a2b3");
+        Ok(())
+    }
+
+    /// Upgraded beside a runner that is itself an instance (an upgrade before set it up), the new
+    /// one is told its own instance once, in place of that one's.
+    #[test]
+    fn a_runner_beside_an_instance_has_one_instance_of_its_own() -> anyhow::Result<()> {
+        let body = "[Service]\nExecStart=/home/u/.local/share/kiln/runner/kiln supervise -- agent --server http://10.0.0.2:7070 --name fedora --instance 01a14c4f-0eea\n";
+        let e = parse_unit(body, "kiln-agent-01a14c4f", false).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+        assert_eq!(with_instance(&e.args, "01a1576c-1b27"), ["agent", "--server", "http://10.0.0.2:7070", "--name", "fedora", "--instance", "01a1576c-1b27"]);
+        let first = ["agent".to_owned(), "--slots".to_owned(), "2".to_owned()];
+        assert_eq!(with_instance(&first, "g1"), ["agent", "--slots", "2", "--instance", "g1"]);
+        assert_eq!(with_instance(&["agent".to_owned(), "--instance=old".to_owned()], "g2"), ["agent", "--instance", "g2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_the_installed_agent_task() -> anyhow::Result<()> {
+        // What `kiln install` quotes, `CommandLineToArgvW` (and this) splits back.
+        let args = ["supervise", "--detach", "--", "agent", "--name", "bench box", "--labels", "a,b", "--note", r#"say "hi""#, r"C:\Program Files\kiln\", ""].map(str::to_owned);
+        let line = args.iter().map(|a| crate::install::win_quote(a)).collect::<Vec<_>>().join(" ");
+        assert_eq!(split_windows_args(&line), args);
+        // A Scheduled Task's command and arguments.
+        let bin = r"C:\Users\me\AppData\Local\Programs\kiln\kiln.exe";
+        let mut words = vec![bin.to_owned()];
+        words.extend(split_windows_args(&line));
+        let e = windows_agent(&words, "kiln-agent", "task").ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+        assert_eq!((e.boot.as_str(), e.bin.as_path()), ("task", Path::new(bin)));
+        assert_eq!(e.args.get(..3), Some(&["agent".to_owned(), "--name".to_owned(), "bench box".to_owned()][..]));
+        // The Startup-folder script's line, after `start "" /B `.
+        let startup = format!("{} {line}", crate::install::win_quote(bin));
+        assert_eq!(windows_agent(&split_windows_args(&startup), "kiln-agent", "startup").map(|e| e.bin), Some(PathBuf::from(bin)));
+        assert!(windows_agent(&split_windows_args(r"C:\kiln.exe supervise -- server"), "kiln", "task").is_none(), "not an agent");
         Ok(())
     }
 

@@ -36,6 +36,8 @@ const DOT: Record<ConvoStore["state"], string> = {
 const ROLE: Record<ConvoStore["role"], string> = { server: "server", runner: "runner", mirror: "mirror" };
 
 const perSec = (v: number | null | undefined) => (v == null ? "—" : `${v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString("en-US")}/s`);
+/** An axis's tick: whole when it is (the axis steps by 0.5 at small rates: 0, 0.5, 1, never 0, 1, 1). */
+const tick = (v: number) => (Number.isInteger(v) ? v.toLocaleString("en-US") : v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString("en-US"));
 
 /** A store's name: its machine, its role, and its id where it has one. */
 function storeName(s: ConvoStore) {
@@ -124,7 +126,7 @@ function StoresTable({ status, selected, onSelect }: { status: ConvoStatus; sele
                   </button>
                 </td>
                 <td className="cell-mono min-w-[96px] sm:whitespace-nowrap">{stateText(s, status.at)}</td>
-                <td className="num cell-mono">{f ? sizeText(f.bytes) : "—"}</td>
+                <td className="num cell-mono whitespace-nowrap">{f ? sizeText(f.bytes) : "—"}</td>
                 <td className="num cell-mono hidden sm:table-cell">{f && f.bytes ? `${Math.round((f.free / f.bytes) * 100)}%` : "—"}</td>
                 <td className="hidden md:table-cell">
                   <span className="inline-flex items-center gap-2">
@@ -183,7 +185,7 @@ function StoreKpis({ status, store }: { status: ConvoStatus; store: ConvoStore }
   const p99 = waitQuantile(store.report?.waits, 0.99);
   const blank = " ";
   return (
-    <div className="kpi-row !grid-cols-2 md:!grid-cols-3 xl:!grid-cols-6">
+    <div className="kpi-row cv-kpis !grid-cols-2 md:!grid-cols-3 xl:!grid-cols-6">
       <div className="kpi">
         <div className="label">File</div>
         <div className="kpi-value">{f ? sizeText(f.bytes) : blank}</div>
@@ -296,8 +298,8 @@ function StoreCharts({ store, win }: { store: ConvoStore; win: number }) {
           timeFormat={time}
           data={[s.t, s.writes, s.commits]}
           height={160}
-          yFormat={(v) => (v < 10 ? v.toFixed(1) : Math.round(v).toString())}
-          y2Format={(v) => v.toFixed(0)}
+          yFormat={tick}
+          y2Format={tick}
           series={[
             { label: "Writes/s", color: SERIES.violet, fill: true },
             { label: "Commits/s", color: SERIES.grey, width: 1, dash: [2, 4], scale: "y2" },
@@ -325,7 +327,7 @@ function StoreCharts({ store, win }: { store: ConvoStore; win: number }) {
             timeFormat={time}
             data={[s.t, s.batches, s.wire]}
             height={160}
-            yFormat={(v) => v.toFixed(1)}
+            yFormat={tick}
             y2Format={(v) => formatBytes(v, 0)}
             series={[
               { label: "Batches/s", color: SERIES.sand, fill: true },
@@ -345,7 +347,7 @@ function StoreCharts({ store, win }: { store: ConvoStore; win: number }) {
             data={[s.t, s.behind, s.batches]}
             height={160}
             yFormat={(v) => countText(Math.round(v))}
-            y2Format={(v) => v.toFixed(1)}
+            y2Format={tick}
             series={[
               { label: "Rows to come", color: SERIES.warn, fill: true },
               { label: "Batches/s", color: SERIES.grey, width: 1, scale: "y2" },
