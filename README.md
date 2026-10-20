@@ -53,19 +53,25 @@ binaries and `SHA256SUMS` for `x86_64`/`aarch64-unknown-linux-musl` (fully stati
 
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| `kiln install` starts on boot with | systemd (else cron `@reboot`, else XDG autostart) | launchd (LaunchAgent; LaunchDaemon as root) | a per-user Scheduled Task at logon (no admin rights) |
-| binary | `~/.local/bin` (`/usr/local/bin` as root) | same | `%LOCALAPPDATA%\Programs\kiln` |
+| `kiln install` starts on boot with | systemd (else cron `@reboot`, else XDG autostart) | launchd (LaunchAgent; LaunchDaemon as root) | a Scheduled Task at boot that runs as you, whether or not anyone signs in (administrator rights, asked for once; without them, at sign-in) |
+| binary | `~/.local/bin` (`/usr/local/bin` as root) | same | `%LOCALAPPDATA%\Programs\kiln`, put on your PATH |
 | config / data | `~/.config/kiln`, `~/.local/share/kiln` (`/etc/kiln`, `/var/lib/kiln` as root) | same | `%APPDATA%\kiln`, `%LOCALAPPDATA%\kiln` |
 | job steps (no `shell:`) | `bash -eo pipefail`, else `sh -e` | same | PowerShell 7 (`pwsh`), else Windows PowerShell |
 | job process trees | process groups | process groups | job objects (they die with the agent) |
 
 A server hands out agents for every platform: `GET /dl/kiln/<target>` serves its own binary when
 it was built for that target and otherwise redirects to the matching release asset of the same
-version. On Windows, add an agent from PowerShell (no elevation needed):
+version. On Windows, add an agent from PowerShell:
 
 ```powershell
 & ([scriptblock]::Create((irm http://<server>:7070/install.ps1))) -Token <join-token> -Labels windows
 ```
+
+Windows asks once for administrator rights, to register the task that starts kiln at boot (an
+administrator PowerShell has them already). That task runs kiln as you through Windows' S4U
+logon, so no password is kept; as in an SSH session with a key, kiln there has none of your
+network credentials or Credential Manager secrets, and no desktop to show windows on. Say no (or
+install with `--boot logon`) and kiln starts when you sign in, in your session, instead.
 
 Give Windows and macOS agents their own labels (`windows`, `macos`) so `runs-on: [baremetal]`
 jobs written for Linux do not land on them.

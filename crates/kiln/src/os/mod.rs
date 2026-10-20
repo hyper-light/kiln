@@ -22,6 +22,9 @@ pub use unix::*;
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
+/// The Win32 calls installing needs (elevation, the user's `Path`, UAC), declared by hand.
+#[cfg(windows)]
+mod win32;
 
 pub mod battery;
 pub mod cgroup;
@@ -73,6 +76,49 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// Whether `name` is an executable on `PATH`.
 pub fn have(name: &str) -> bool {
     which(name).is_some()
+}
+
+/// A Windows `Path` value (`;`-separated, as the registry keeps it) with `dir` added at its end,
+/// or `None` when one of its entries is `dir` already. Entries are compared as Windows compares
+/// folders: without case, quotes or a trailing `\`, and with `%VARIABLES%` expanded by `var`.
+pub fn path_list_with(list: &str, dir: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let norm = |entry: &str| {
+        let expanded = expand_percent_vars(entry.trim().trim_matches('"'), &var);
+        expanded.trim_end_matches(['\\', '/']).to_lowercase()
+    };
+    let want = norm(dir);
+    if list.split(';').any(|e| norm(e) == want) {
+        return None;
+    }
+    let kept = list.trim_end_matches(';');
+    Some(if kept.is_empty() { dir.to_owned() } else { format!("{kept};{dir}") })
+}
+
+/// `%NAME%` replaced by `var(NAME)`; a name it doesn't know, and a lone `%`, stay as they are.
+fn expand_percent_vars(s: &str, var: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        let (before, from) = rest.split_at(start);
+        out.push_str(before);
+        let after = from.get(1..).unwrap_or_default();
+        match after.find('%') {
+            Some(end) => {
+                let name = after.get(..end).unwrap_or_default();
+                match var(name).filter(|_| !name.is_empty()) {
+                    Some(value) => out.push_str(&value),
+                    None => out.push_str(from.get(..end + 2).unwrap_or_default()),
+                }
+                rest = after.get(end + 1..).unwrap_or_default();
+            }
+            None => {
+                out.push_str(from);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Bytes this user may still write on the volume holding `path` (None: unknown).
@@ -205,6 +251,22 @@ mod tests {
         assert_eq!(program_stem("/usr/bin/bash"), "bash");
         assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
         assert_eq!(program_stem("CMD.EXE"), "cmd");
+    }
+
+    #[test]
+    fn a_folder_goes_on_a_windows_path_once() {
+        let var = |name: &str| (name == "LOCALAPPDATA").then(|| r"C:\Users\me\AppData\Local".to_owned());
+        let kiln = r"C:\Users\me\AppData\Local\Programs\kiln";
+        assert_eq!(path_list_with("", kiln, var).as_deref(), Some(kiln));
+        assert_eq!(path_list_with(r"C:\a;C:\b", kiln, var), Some(format!(r"C:\a;C:\b;{kiln}")));
+        assert_eq!(path_list_with(r"C:\a;;C:\b;", kiln, var), Some(format!(r"C:\a;;C:\b;{kiln}")), "the user's list kept as it is");
+        // Already there: another case, quoted, a trailing backslash, or through a variable.
+        assert_eq!(path_list_with(r"C:\a;c:\users\ME\appdata\local\programs\KILN", kiln, var), None);
+        assert_eq!(path_list_with(r#"C:\a;"C:\Users\me\AppData\Local\Programs\kiln\""#, kiln, var), None);
+        assert_eq!(path_list_with(r"%LOCALAPPDATA%\Programs\kiln;C:\a", kiln, var), None);
+        // A variable it can't expand stays as written, and is no match.
+        assert!(path_list_with(r"%NOPE%\Programs\kiln", kiln, var).is_some());
+        assert_eq!(expand_percent_vars(r"%NOPE%\x;100%;%%", &var), r"%NOPE%\x;100%;%%");
     }
 
     #[test]

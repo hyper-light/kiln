@@ -12,6 +12,22 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
+/// Running with full rights: as root.
+pub fn elevated() -> bool {
+    is_root()
+}
+
+/// Windows only (its UAC prompt): elsewhere installs ask through `sudo`.
+pub fn run_elevated(_program: &Path, _parameters: &str, _timeout: std::time::Duration) -> io::Result<u32> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "only Windows asks for administrator rights this way"))
+}
+
+/// Windows only: on Linux and macOS kiln goes where PATH usually looks already
+/// (`~/.local/bin`, `/usr/local/bin`), and shells keep PATH in their own profiles.
+pub fn add_to_user_path(_dir: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// The real user id (launchd's per-user domains are `gui/<uid>` and `user/<uid>`).
 pub fn uid() -> u32 {
     nix::unistd::getuid().as_raw()
@@ -73,6 +89,12 @@ pub fn with_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
 /// Mark a file executable (`0755`).
 pub fn make_executable(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
+/// Open `path` to read it. (Windows keeps others from changing it meanwhile; Unix has no share
+/// modes, and nothing here hands a file to a more privileged process.)
+pub fn open_unchangeable(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 /// Read at `offset` without moving a shared cursor.

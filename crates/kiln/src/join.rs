@@ -1007,7 +1007,8 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         }));
     }
     crate::install::install(crate::install::InstallArgs {
-        unattended: true,
+        // At a terminal, Windows may ask for administrator rights to start kiln at boot.
+        unattended: !interactive,
         system: false,
         agent: true,
         boot: a.boot,
@@ -1022,7 +1023,8 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         service: "kiln-agent".to_owned(),
     })
     .await?;
-    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}. It starts on boot.", joined.name, joined.server));
+    // When it starts (at boot, or at sign-in) is the install's to say: it's the `boot` line above.
+    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.", joined.name, joined.server));
     Ok(None)
 }
 
