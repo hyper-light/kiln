@@ -161,6 +161,21 @@ pub struct Target {
     pub path: String,
 }
 
+/// Forgets the tasks over for longer than they're kept, and the oldest past the most kept: whether
+/// it forgot any.
+fn prune(tasks: &mut Vec<Task>, now: i64) -> bool {
+    let before = tasks.len();
+    tasks.retain(|t| !t.over() || now - t.updated < KEEP_FOR);
+    let over = tasks.iter().filter(|t| t.over()).count();
+    if over > KEEP {
+        let mut old: Vec<(i64, String)> = tasks.iter().filter(|t| t.over()).map(|t| (t.updated, t.id.clone())).collect();
+        old.sort();
+        let drop: HashSet<String> = old.into_iter().take(over - KEEP).map(|(_, id)| id).collect();
+        tasks.retain(|t| !drop.contains(&t.id));
+    }
+    tasks.len() != before
+}
+
 impl Tasks {
     /// The tasks kept in `dir`; any a restart cut short failed.
     pub fn open(dir: &Path) -> Self {
@@ -174,12 +189,14 @@ impl Tasks {
             t.updated = now;
             cut = true;
         }
+        let pruned = prune(&mut tasks, now);
         let bundles = dir.join("bundles");
         let _ = std::fs::remove_dir_all(&bundles);
         let _ = std::fs::create_dir_all(&bundles);
         let me = Self { file, dir: bundles, inner: Mutex::new(Inner { tasks, ..Inner::default() }), changed: event_listener::Event::new() };
-        // Written again only when the restart failed one under way: unchanged, the file stands.
-        if cut {
+        // Written again only when the restart failed one under way, or forgot ones kept long
+        // enough: unchanged, the file stands.
+        if cut || pruned {
             me.save();
         }
         me
@@ -223,15 +240,7 @@ impl Tasks {
     fn save(&self) {
         let bytes = {
             let mut inner = self.inner.lock();
-            let now = crate::util::now_unix();
-            inner.tasks.retain(|t| !t.over() || now - t.updated < KEEP_FOR);
-            let over = inner.tasks.iter().filter(|t| t.over()).count();
-            if over > KEEP {
-                let mut old: Vec<(i64, String)> = inner.tasks.iter().filter(|t| t.over()).map(|t| (t.updated, t.id.clone())).collect();
-                old.sort();
-                let drop: HashSet<String> = old.into_iter().take(over - KEEP).map(|(_, id)| id).collect();
-                inner.tasks.retain(|t| !drop.contains(&t.id));
-            }
+            prune(&mut inner.tasks, crate::util::now_unix());
             serde_json::to_vec(&inner.tasks).unwrap_or_default()
         };
         if let Err(e) = super::group::save_atomic(&self.file, &bytes) {
