@@ -349,7 +349,12 @@ fn request(r: &Value) -> Result<Vec<String>, String> {
             return Ok(vec![records(src, search, compute.as_ref(), lq.get("group_by"))?]);
         }
     }
-    let Some(queries) = r.get("queries").and_then(Value::as_array) else { return Err("a request kiln does not read".into()) };
+    // A distribution's newer request names one query, not a list (`request_type: histogram`).
+    let queries: &[Value] = match (r.get("queries").and_then(Value::as_array), r.get("query")) {
+        (Some(q), _) => q,
+        (None, Some(q)) if q.is_object() => std::slice::from_ref(q),
+        _ => return Err("a request kiln does not read".into()),
+    };
     let mut named: HashMap<&str, String> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
     for q in queries {
@@ -685,6 +690,17 @@ mod tests {
         // Kept as kiln keeps dashboards.
         let dir = tempfile::tempdir()?;
         super::super::dashboards::Dashboards::open(dir.path()).put(d).map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    }
+
+    /// A distribution's newer request, one query rather than a list, is read as one.
+    #[test]
+    fn a_request_of_one_query_is_read_as_its_query() -> anyhow::Result<()> {
+        let v = json!({ "title": "x", "layout_type": "ordered", "widgets": [
+            { "definition": { "type": "distribution", "title": "Sizes", "requests": [{ "request_type": "histogram", "query": { "data_source": "metrics", "name": "query1", "aggregator": "avg", "query": "avg:payload.size{$env}" } }] } }
+        ] });
+        let (d, report) = imp(&v)?;
+        anyhow::ensure!(report.drawn == 1 && d.widgets.first().is_some_and(|w| w.kind == "distribution" && w.queries == ["avg:payload.size{$env}"]), "{report:?} {:?}", d.widgets);
         Ok(())
     }
 

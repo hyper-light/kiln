@@ -2925,9 +2925,9 @@ widgets:
 
 | widgets | count | share |
 | --- | --- | --- |
-| drawn as Datadog draws them | 19,455 | 90.8% |
+| drawn as Datadog draws them | 19,459 | 90.8% |
 | drawn otherwise, as said | 715 | 3.3% |
-| kept as a note saying what they were, not drawn | 1,254 | 5.9% |
+| kept as a note saying what they were, not drawn | 1,250 | 5.8% |
 
 Drawn otherwise: an image of the web as a link to it (325), a geomap as a top list of its places
 (235), a bar chart, a change and a host map as top lists (118), a treemap as a pie (37). Not
@@ -2936,7 +2936,7 @@ images, its integrations' logos (165), cloud costs
 (97), network paths and device flows (142), database queries, LLM observability and processes (16);
 widgets kiln has no form of (flame graphs, Sankey diagrams, topology maps, Vega's wildcard, an
 iframe, a scatter plot: 25); lists kiln does not keep (infrastructure, log patterns, trace streams
-and two more: 31); requests of a form kiln does not read (11). Queries kiln cannot read: 4
+and two more: 31); requests of a form kiln does not read (7). Queries kiln cannot read: 4
 (`reduce(…, 'last')` over `sum(…, { * })`, 3, a form no page of Datadog's describes; a filter of
 Datadog's own that is not one, `{(status:400 OR s) …}`, 1).
 
@@ -2948,7 +2948,8 @@ metric named `2*avg:cpu`, a glob matching nothing, and answered nothing without 
 search's value lists (before, `@evt.name:(a OR b)` was read as the attribute empty and a word of
 the message, a wrong answer and no error); `status:*`; `.fill(0)`: 89.9%, 12 unread. Then service
 checks (§9.4): the 180 check status widgets drawn; and distributions' threshold counts
-(`count(v: v>=0):…`) and a rollup's seconds alone (`.rollup(10)`): 8 more, 90.8%, 4 unread.
+(`count(v: v>=0):…`) and a rollup's seconds alone (`.rollup(10)`): 8 more, 90.8%, 4 unread. Then a
+distribution's newer request, one `query` rather than a list (`request_type: histogram`): 4 more.
 
 An import costs 105 to 112 µs a dashboard (three runs each, a release build, fedora), from 133 to
 157 µs: the lexer tells a filter's `*` from a product by the braces it has open, counted as it goes,
