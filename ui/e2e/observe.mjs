@@ -70,6 +70,22 @@ const navs = [];
 page.on("framenavigated", (f) => f === page.mainFrame() && navs.push(`${Date.now() % 100_000} navigated ${f.url().replace(BASE, "")}`));
 page.on("load", () => navs.push(`${Date.now() % 100_000} load`));
 if (process.env.TRACE) page.on("request", (r) => r.url().includes("/api/") && console.log(`  ${Date.now() % 100000} ${r.method()} ${r.url().replace(BASE, "")}`));
+/** Nothing on the page wider than the screen: a phone never scrolls it sideways (what is wider, a
+ * stack's lines, scrolls in its own box). Says what sticks out when something does. */
+const fitsAcross = async (what) => {
+  const out = await page.evaluate(() => {
+    const w = document.documentElement.clientWidth;
+    if (document.documentElement.scrollWidth <= w) return null;
+    const clipped = (e) => {
+      for (let p = e.parentElement; p && p !== document.body; p = p.parentElement) if (getComputedStyle(p).overflowX !== "visible") return true;
+      return false;
+    };
+    const name = (e) => [e.tagName.toLowerCase(), ...String(e.className).trim().split(/\s+/).filter(Boolean)].join(".");
+    const over = [...document.body.querySelectorAll("*")].filter((e) => e.getBoundingClientRect().right > w + 1 && !clipped(e));
+    return `${document.documentElement.scrollWidth} px across a ${w} px screen: ${over.slice(0, 4).map(name).join(", ")}`;
+  });
+  expect(out === null, `${what} within the screen's width, not ${out}`);
+};
 
 const scenarios = {
   /** A query explored, put on a new dashboard, the dashboard given a note and saved. */
@@ -252,6 +268,51 @@ const scenarios = {
     await page.goto(`${BASE}/observe/dashboards`);
     await page.getByRole("link", { name: "Hosts (copy)" }).first().waitFor();
     await api("DELETE", `/api/observe/v1/dashboards/${id}`);
+  },
+
+  /** An error's logs made an issue (six of them, their messages differing in their numbers and what
+   * they quote): found in Error Tracking by its service, opened, its stack shown, resolved from its
+   * page, as the API keeps it. */
+  async "an error's issue is found in Error Tracking, opened and resolved from its page"() {
+    const service = `e2e-${run}-checkout`;
+    const fn = `total_${run}`;
+    const stack = `Traceback (most recent call last):\n  File "/usr/lib/python3.12/site-packages/flask/app.py", line 902, in dispatch_request\n    return view()\n  File "/app/checkout.py", line 42, in ${fn}\n    raise ValueError(item)\nValueError: bad item\n`;
+    const logs = Array.from({ length: 6 }, (_, i) => ({
+      message: "checkout failed",
+      status: "error",
+      service,
+      hostname: "e2e",
+      source: "python",
+      attributes: { "error.kind": "ValueError", "error.message": `bad item ${i} in cart 'c-${i * 7}'`, "error.stack": stack, env: "e2e", version: "1.0" },
+    }));
+    expect((await api("POST", "/api/observe/v1/logs", logs)).status === 202, "posting the errors");
+    const issue = await until(
+      "its issue, every error counted",
+      async () => {
+        const r = await api("GET", `/api/observe/v1/errors/issues?from=${Date.now() - 3_600_000}&to=${Date.now() + 60_000}&all=true&query=${encodeURIComponent(service)}`);
+        const i = r.body?.issues?.find((x) => x.service === service);
+        return i && i.errors === 6 ? i : null;
+      },
+      120_000,
+    );
+    expect(issue.type === "ValueError" && issue.function === fn && issue.status === "for_review" && issue.source === "log", JSON.stringify(issue));
+    await page.goto(`${BASE}/observe/errors`);
+    await fillIn(page.locator("#observe-search"), service);
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await page.waitForURL(/q=e2e-/);
+    const row = page.getByRole("link", { name: new RegExp(`ValueError.*${fn}`) }).first();
+    await row.waitFor();
+    await fitsAcross("the issues");
+    if (process.env.SHOTS) await page.screenshot({ path: `${process.env.SHOTS}/errors-${which}${phone ? "-phone" : ""}.png`, fullPage: true });
+    await row.click();
+    await page.waitForURL(new RegExp(`/observe/errors/${issue.id}`));
+    await page.getByRole("heading", { name: "ValueError" }).waitFor();
+    await page.locator("pre").getByText(`in ${fn}`).waitFor();
+    await fitsAcross("the issue's page");
+    if (process.env.SHOTS) await page.screenshot({ path: `${process.env.SHOTS}/issue-${which}${phone ? "-phone" : ""}.png`, fullPage: true });
+    await page.getByRole("group", { name: "Its status", exact: true }).getByRole("button", { name: "Resolved", exact: true }).click();
+    await until("resolved, as the API keeps it", async () => (await api("GET", `/api/observe/v1/errors/issues/${issue.id}`)).body?.issue?.status === "resolved");
+    await page.getByText("by a user", { exact: true }).first().waitFor();
   },
 
   /** Logs searched, narrowed by a facet, a record opened and one of its attributes searched. */

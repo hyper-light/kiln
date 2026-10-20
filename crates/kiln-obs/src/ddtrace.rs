@@ -64,7 +64,7 @@ use crate::msgpack::{MsgpackError, Reader};
 use crate::otlp::metrics::{Decoded, Keys, MAX_DEPTH, OtlpError, push_f64, push_json_str};
 use crate::otlp::pb::{Fields, PbError, Wire, doubles};
 use crate::otlp::traces::{
-    Attr, KINDS, MAX_VALUE_BYTES, PEER_SOURCES, SEVERITY_ERROR, SEVERITY_OK, SPARES, Seg, Spans, Val, attrs_for, cut, find, finish_segment, id, merge_under, parts_for, resolve, write_row,
+    Attr, KINDS, MAX_VALUE_BYTES, PEER_SOURCES, SEVERITY_ERROR, SEVERITY_OK, SPARES, Seg, Spans, Val, attrs_for, cut, find, finish_segment, id, merge_under, parts_for, put_issue, resolve, write_row,
 };
 
 /// The `source` of a span an Agent sent.
@@ -72,11 +72,12 @@ pub const SOURCE: &str = "datadog-agent";
 
 /// kiln's own attributes on a Datadog span at the most (`span.kind`, `duration`, `parent_id`,
 /// `operation_name`, `span.type`, `component`, `env`, `version`, `error.type`, `error.message`,
-/// `error.stack`, `http.status_code`, `peer.service`, `events`, `links`): room kept for them under
-/// [`MAX_TAGS`].
-const OWN: usize = 15;
-/// kiln's own that a tag of the same name never stands for, and the tags read into a row's fields.
-const FIXED: [&str; 8] = ["span.kind", "duration", "parent_id", "operation_name", "span.type", "component", "_dd.p.tid", "_dd.hostname"];
+/// `error.stack`, `http.status_code`, `peer.service`, `events`, `links`, `issue.id`): room kept for
+/// them under [`MAX_TAGS`].
+const OWN: usize = 16;
+/// kiln's own that a tag of the same name never stands for (an issue's id kiln's alone), and the
+/// tags read into a row's fields.
+const FIXED: [&str; 9] = ["span.kind", "duration", "parent_id", "operation_name", "span.type", "component", "_dd.p.tid", "_dd.hostname", "issue.id"];
 /// Tags that hold others, each `key:value` and comma-separated: the Agent's container's and the
 /// tracer's process's.
 const PACKED: [&str; 2] = ["_dd.tags.container", "_dd.tags.process"];
@@ -126,6 +127,9 @@ pub struct Decoder {
     parts: Vec<(u32, &'static [u8])>,
     /// A tracer's chunk's spans' ids and services, to tell its top-level spans.
     ids: Vec<(u64, &'static str)>,
+    /// A chunk's spans as its first pass reads them, and those whose errors are issues.
+    briefs: Vec<Brief<'static>>,
+    carriers: Vec<u64>,
     /// Row buffers handed back ([`Decoder::give`]).
     spare: Vec<Vec<u8>>,
 }
@@ -220,12 +224,14 @@ impl Decoder {
             attrs: attrs_for(std::mem::take(&mut self.attrs)),
             parts: parts_for(std::mem::take(&mut self.parts)),
             ids: ids_for(std::mem::take(&mut self.ids)),
+            briefs: briefs_for(std::mem::take(&mut self.briefs)),
+            carriers: std::mem::take(&mut self.carriers),
             spare: &mut self.spare,
             seg: None,
         };
         let r = f(&mut cx, out);
         finish_segment(&mut cx.seg, out);
-        let Cx { mut text, mut tmp, strings, payload, chunk, tags, attrs, parts, ids, .. } = cx;
+        let Cx { mut text, mut tmp, strings, payload, chunk, tags, attrs, parts, ids, briefs, mut carriers, .. } = cx;
         text.clear();
         tmp.clear();
         (self.text, self.tmp) = (text, tmp);
@@ -236,6 +242,9 @@ impl Decoder {
         self.attrs = attrs_for(attrs);
         self.parts = parts_for(parts);
         self.ids = ids_for(ids);
+        self.briefs = briefs_for(briefs);
+        carriers.clear();
+        self.carriers = carriers;
         r.map_err(DdError::from)
     }
 }
@@ -243,6 +252,76 @@ impl Decoder {
 fn ids_for<'b>(mut v: Vec<(u64, &str)>) -> Vec<(u64, &'b str)> {
     v.clear();
     v.into_iter().map(|_| (0, "")).collect()
+}
+
+fn briefs_for<'b>(mut v: Vec<Brief<'_>>) -> Vec<Brief<'b>> {
+    v.clear();
+    v.into_iter().map(|_| Brief::default()).collect()
+}
+
+/// What a chunk's first pass reads of a span: its id, its parent's, its service, whether it erred,
+/// and whether with its error's details (its type, message and stack, as Datadog's Error Tracking
+/// asks of a span).
+#[derive(Debug, Clone, Copy, Default)]
+struct Brief<'a> {
+    span: u64,
+    parent: u64,
+    service: &'a str,
+    error: bool,
+    detailed: bool,
+}
+
+/// How far up its service's spans a span's error is followed to its entry at the most.
+const WALK: u32 = 64;
+
+/// Which of an error's details a tag says (Datadog's Error Tracking's: `error.type` 1,
+/// `error.message` or older tracers' `error.msg` 2, `error.stack` 4), a blank one none.
+fn error_detail(k: &str, v: &str) -> u8 {
+    let bit = match k {
+        "error.type" => 1,
+        "error.message" | "error.msg" => 2,
+        "error.stack" => 4,
+        _ => return 0,
+    };
+    if v.trim().is_empty() { 0 } else { bit }
+}
+
+/// A chunk's spans (`briefs`) whose errors are issues, their ids into `out` (sorted): of each
+/// service's segment of the trace (its entry span, a root or a span whose parent is another
+/// service's or none of the chunk's, and its service's spans under it) whose entry erred, the
+/// top-most span with its error's details. A tracer may set them on its entry (OpenTelemetry's SDKs
+/// do) or below it (ddtrace's Flask: on the request's dispatching span, its entry only a 500); an
+/// error reported by many spans of a service is one, its top-most (Datadog's). A span more than
+/// [`WALK`] spans of its service below its entry is passed over.
+fn carriers(briefs: &mut [Brief<'_>], out: &mut Vec<u64>) {
+    out.clear();
+    if !briefs.iter().any(|b| b.error && b.detailed) {
+        return;
+    }
+    briefs.sort_unstable_by_key(|b| b.span);
+    let find = |id: u64| briefs.binary_search_by_key(&id, |b| b.span).ok().and_then(|i| briefs.get(i));
+    // Each entry's: its top-most such span's depth, and its id.
+    let mut best: Vec<(u64, u32, u64)> = Vec::new();
+    for b in briefs.iter().filter(|b| b.error && b.detailed) {
+        let (mut entry, mut depth) = (*b, 0u32);
+        while let Some(p) = find(entry.parent).filter(|p| p.service == entry.service && p.span != entry.span) {
+            entry = *p;
+            depth += 1;
+            if depth > WALK {
+                break;
+            }
+        }
+        if depth > WALK || !entry.error {
+            continue;
+        }
+        match best.iter_mut().find(|x| x.0 == entry.span) {
+            Some(x) if (depth, b.span) < (x.1, x.2) => (x.1, x.2) = (depth, b.span),
+            Some(_) => {}
+            None => best.push((entry.span, depth, b.span)),
+        }
+    }
+    out.extend(best.iter().map(|x| x.2));
+    out.sort_unstable();
 }
 
 /// What a tracer's request says of it beyond its spans: its headers, and where it came.
@@ -292,6 +371,8 @@ struct Cx<'a, 'd> {
     attrs: Vec<Attr<'a>>,
     parts: Vec<(u32, &'a [u8])>,
     ids: Vec<(u64, &'a str)>,
+    briefs: Vec<Brief<'a>>,
+    carriers: Vec<u64>,
     spare: &'d mut Vec<Vec<u8>>,
     seg: Option<Seg>,
 }
@@ -538,6 +619,17 @@ impl<'a> Cx<'a, '_> {
         }
         let at = self.text.len();
         let spans = if form == Form::Indexed { 4 } else { 3 };
+        // The spans whose errors are issues: a first pass, of each span its brief.
+        self.briefs.clear();
+        for f in Fields::new(msg) {
+            if let (n, w) = f?
+                && n == spans
+            {
+                let b = self.brief(form, w.bytes().unwrap_or(&[]))?;
+                self.briefs.push(b);
+            }
+        }
+        carriers(&mut self.briefs, &mut self.carriers);
         for f in Fields::new(msg) {
             match f? {
                 (n, w) if n == spans => {
@@ -545,12 +637,57 @@ impl<'a> Cx<'a, '_> {
                         Form::Indexed => self.indexed_span(w.bytes().unwrap_or(&[]), trace, at)?,
                         Form::Inline => self.inline_span(w.bytes().unwrap_or(&[]), hi.unwrap_or(0), at)?,
                     };
-                    self.row(&s, form, pl, agent, now_ns, out)?;
+                    let issue = self.carries(&s);
+                    self.row(&s, form, pl, agent, now_ns, issue, out)?;
                 }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// Whether span `s` carries its service's segment's error ([`carriers`]).
+    fn carries(&self, s: &Span<'a>) -> bool {
+        s.span.is_some_and(|id| self.carriers.binary_search(&u64::from_be_bytes(id)).is_ok())
+    }
+
+    /// An Agent's chunk's span, as the first pass reads it ([`Brief`]).
+    fn brief(&self, form: Form, msg: &'a [u8]) -> Result<Brief<'a>, OtlpError> {
+        let mut b = Brief::default();
+        let mut details = 0u8;
+        for f in Fields::new(msg) {
+            match (form, f?) {
+                (Form::Indexed, (1, w)) => b.service = self.string(w),
+                (Form::Indexed, (4, w)) | (Form::Inline, (5, w)) => b.span = w.u64().unwrap_or(0),
+                (Form::Indexed, (5, w)) | (Form::Inline, (6, w)) => b.parent = w.u64().unwrap_or(0),
+                (Form::Indexed, (8, w)) | (Form::Inline, (9, w)) => b.error = w.u64().is_some_and(|e| e != 0),
+                (Form::Inline, (1, w)) => b.service = w.str().unwrap_or(""),
+                (Form::Indexed, (9, w)) => {
+                    let (mut k, mut v) = ("", "");
+                    for g in Fields::new(w.bytes().unwrap_or(&[])) {
+                        match g? {
+                            (1, x) => k = self.string(x),
+                            (2, x) => {
+                                for h in Fields::new(x.bytes().unwrap_or(&[])) {
+                                    if let (1, y) = h? {
+                                        v = self.string(y);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    details |= error_detail(k, v);
+                }
+                (Form::Inline, (10, w)) => {
+                    let (k, v) = entry(w.bytes().unwrap_or(&[]))?;
+                    details |= error_detail(k, v);
+                }
+                _ => {}
+            }
+        }
+        b.detailed = details == 7;
+        Ok(b)
     }
 
     /// An indexed span's fields, its attributes into `tags`.
@@ -638,7 +775,8 @@ impl<'a> Cx<'a, '_> {
     }
 
     /// A span's row: kiln's own attributes, the span's, its chunk's and payload's, what kiln adds.
-    fn row(&mut self, s: &Span<'a>, form: Form, pl: &Payload<'a>, agent: &Agent<'a>, now_ns: i64, out: &mut Spans) -> Result<(), OtlpError> {
+    #[allow(clippy::too_many_arguments)]
+    fn row(&mut self, s: &Span<'a>, form: Form, pl: &Payload<'a>, agent: &Agent<'a>, now_ns: i64, issue: bool, out: &mut Spans) -> Result<(), OtlpError> {
         let (Some(trace), Some(span)) = (s.trace, s.span) else {
             out.invalid += 1;
             return Ok(());
@@ -711,6 +849,11 @@ impl<'a> Cx<'a, '_> {
         }
         self.events_and_error(form, s.start)?;
         self.links(form)?;
+        // An error's issue (`crate::errors`): its service's segment's, where this span carries it
+        // ([`carriers`]).
+        if s.error && issue {
+            put_issue(&mut self.attrs, &mut self.text, Some(Val::Str(s.service)), true);
+        }
         // The row.
         let ts = if s.start != 0 { i64::try_from(s.start).unwrap_or(i64::MAX) } else { now_ns };
         let host = find(&self.tags, "_dd.hostname").map(|v| resolve(v, &self.text)).filter(|h| !h.is_empty()).unwrap_or(if pl.host.is_empty() { agent.host } else { pl.host });
@@ -931,6 +1074,8 @@ struct Head<'a> {
     rates: (Option<f64>, Option<f64>),
     /// The trace's high 64 bits (`_dd.p.tid`), 0 if not said.
     hi: u64,
+    /// Which of its error's details it says: its type (1), message (2), stack (4).
+    details: u8,
 }
 
 impl<'a> Head<'a> {
@@ -938,8 +1083,12 @@ impl<'a> Head<'a> {
         match k {
             "_dd.p.tid" => self.hi = hex64(v).unwrap_or(0),
             "env" => self.env = v,
-            _ => {}
+            _ => self.details |= error_detail(k, v),
         }
+    }
+
+    fn brief(&self) -> Brief<'a> {
+        Brief { span: self.span, parent: self.parent, service: self.service, error: self.error, detailed: self.details == 7 }
     }
 
     fn metric(&mut self, k: &str, v: f64) {
@@ -1003,12 +1152,14 @@ impl<'a> Cx<'a, '_> {
             let at = r.pos();
             let n = r.array()?;
             self.ids.clear();
+            self.briefs.clear();
             let (mut priority, mut erred, mut hi) = (None, false, 0u64);
             // The trace's root: its first span of no parent, else its first.
             let mut root: Option<(bool, Root<'a>)> = None;
             for _ in 0..n {
                 let h = self.head(&mut r, v5)?;
                 self.ids.push((h.span, h.service));
+                self.briefs.push(h.brief());
                 priority = priority.or(h.priority);
                 erred |= h.error;
                 if hi == 0 {
@@ -1024,6 +1175,7 @@ impl<'a> Cx<'a, '_> {
                 roots.push(x);
             }
             self.ids.sort_unstable_by_key(|x| x.0);
+            carriers(&mut self.briefs, &mut self.carriers);
             // Dropped by its tracer: a user's rejection, or an automatic one with no error in it
             // (the Agent's error sampler keeps those; kiln keeps every one).
             let keep = match priority {
@@ -1036,11 +1188,13 @@ impl<'a> Cx<'a, '_> {
             again.array()?;
             for _ in 0..n {
                 let (span, marked) = self.tracer_span(&mut again, v5, hi)?;
-                if let Some(st) = self.stat_of(&span, marked) {
+                let top = self.top_level(&span, marked);
+                if let Some(st) = self.stat_of(&span, top) {
                     stats.push(st);
                 }
                 if keep {
-                    self.row(&span, Form::Inline, &pl, &agent, now_ns, out)?;
+                    let issue = self.carries(&span);
+                    self.row(&span, Form::Inline, &pl, &agent, now_ns, issue, out)?;
                 }
             }
         }
@@ -1181,10 +1335,20 @@ impl<'a> Cx<'a, '_> {
         Ok((s, marked))
     }
 
+    /// Whether a tracer's span is top-level: marked so, or its parent none of its trace's, or
+    /// another service's (the Agent's `traceutil.ComputeTopLevel`).
+    fn top_level(&self, s: &Span<'a>, marked: bool) -> bool {
+        marked
+            || s.parent == 0
+            || match self.ids.binary_search_by_key(&s.parent, |x| x.0) {
+                Ok(i) => self.ids.get(i).is_some_and(|x| x.1 != s.service),
+                Err(_) => true,
+            }
+    }
+
     /// A span as the concentrator counts it, if it does: a server's or a consumer's (an entry), a
-    /// client's or a producer's (an exit), or another kind's that is top-level (marked so, or its
-    /// parent none of its trace's, or another service's).
-    fn stat_of(&self, s: &Span<'a>, marked: bool) -> Option<SpanStat<'a>> {
+    /// client's or a producer's (an exit), or another kind's that is top-level (`top_level`).
+    fn stat_of(&self, s: &Span<'a>, top: bool) -> Option<SpanStat<'a>> {
         let tag = |k: &str| {
             self.tags.iter().find(|a| a.key == k).and_then(|a| match a.val {
                 Val::Str(v) => Some(v),
@@ -1192,12 +1356,6 @@ impl<'a> Cx<'a, '_> {
             })
         };
         let kind = tag("span.kind").and_then(|t| KINDS.iter().find(|k| k.eq_ignore_ascii_case(t.trim())).copied()).unwrap_or("internal");
-        let top = marked
-            || s.parent == 0
-            || match self.ids.binary_search_by_key(&s.parent, |x| x.0) {
-                Ok(i) => self.ids.get(i).is_some_and(|x| x.1 != s.service),
-                Err(_) => true,
-            };
         let outbound = match kind {
             "server" | "consumer" => false,
             "client" | "producer" => true,
@@ -2376,6 +2534,25 @@ mod tests {
         let raised = span(&rows, "a29018e06517f968");
         assert_eq!((raised.severity, raised.attr("error.message"), raised.attr("error.type")), (SEVERITY_ERROR, Some("cart 3 is locked"), Some("builtins.ValueError")));
         assert!(raised.attr("error.stack").unwrap().starts_with("Traceback (most recent call last):"));
+        // Its error an issue (`crate::errors`): the span that raised its service's entry (the
+        // database's own, top-level), its error's type, message and stack said; the request's 500,
+        // its error said with no stack, none.
+        let e = crate::errors::Error::of(raised.attrs());
+        let id = crate::errors::span_issue(raised.service, true, &e).map(crate::errors::hex);
+        assert!(id.is_some());
+        assert_eq!(raised.attr("issue.id"), id.as_deref());
+        assert_eq!(failed.attr("issue.id"), None, "{:?}", failed.attrs().collect::<Vec<_>>());
+        // The service whose request failed (its entry a 500, its error's details on the spans its
+        // Flask integration made under it): one issue, its top-most such span's, of its request.
+        let carried: Vec<&RecordRef<'_>> = rows.iter().filter(|r| r.service == "shop" && r.attr("issue.id").is_some()).collect();
+        assert_eq!(carried.len(), 1, "one error of the request, once");
+        let c = carried[0];
+        // Its entry a 500 (`9b132bbe41d2501c`), under it Flask's request span (`4927ac6e83c83aff`, no
+        // error), under that the two that say the error (the request's dispatching and its handling of
+        // the exception): the top-most of them carries it, not the view's span below.
+        assert!(matches!(c.message, "flask.dispatch_request" | "flask.handle_user_exception"), "{}", c.message);
+        assert_eq!(c.attr("parent_id"), Some("4927ac6e83c83aff"));
+        assert_eq!(c.attr("error.type"), Some("builtins.ValueError"));
         // Every span of a chunk is of its trace, and every parent named is a span sent.
         let ids: std::collections::HashSet<String> = rows.iter().map(|r| hex(&r.span_id.unwrap())).collect();
         for r in &rows {

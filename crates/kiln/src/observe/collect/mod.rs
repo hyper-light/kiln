@@ -727,6 +727,8 @@ fn flatten<'a>(path: &mut String, v: Val<'a>, depth: usize, pool: &mut [Vec<(Str
             path.truncate(at);
         }
         Val::Null => {}
+        // A stack whole: its row keeps its ends (`kiln_obs::errors::stack_ends`).
+        Val::Str(s) if kiln_obs::errors::STACK_KEYS.contains(&path.as_str()) => out.push((path.clone(), s.text(buf).to_owned())),
         Val::Str(s) => out.push((path.clone(), cut_str(s.text(buf)).to_owned())),
         Val::Num(n) => out.push((path.clone(), n.to_owned())),
         Val::Bool(b) => out.push((path.clone(), if b { "true" } else { "false" }.to_owned())),

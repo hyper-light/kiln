@@ -38,6 +38,10 @@ name = "codec"
 harness = false
 
 [[bench]]
+name = "errors"
+harness = false
+
+[[bench]]
 name = "store"
 harness = false
 

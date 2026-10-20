@@ -39,6 +39,7 @@ const SECTIONS = [
   { to: "/observe/metrics", label: "Metrics" },
   { to: "/observe/logs", label: "Logs" },
   { to: "/observe/apm", label: "APM" },
+  { to: "/observe/errors", label: "Errors" },
   { to: "/observe/events", label: "Events" },
   { to: "/observe/monitors", label: "Monitors" },
   { to: "/observe/slos", label: "SLOs" },

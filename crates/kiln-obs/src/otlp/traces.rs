@@ -59,10 +59,12 @@ const ROW_OVERHEAD: usize = 64;
 
 /// kiln's own attributes on a span at the most (`span.kind`, `duration`, `parent_id`,
 /// `otel.status_code`, `env`, `version`, `error.type`, `error.message`, `error.stack`,
-/// `peer.service`, `http.status_code`, `events`, `links`): room kept for them under [`MAX_TAGS`].
-const OWN: usize = 13;
-/// kiln's own that a span's attribute of the same name never stands for.
-const FIXED: [&str; 4] = ["span.kind", "duration", "parent_id", "otel.status_code"];
+/// `peer.service`, `http.status_code`, `events`, `links`, `issue.id`): room kept for them under
+/// [`MAX_TAGS`].
+const OWN: usize = 14;
+/// kiln's own that a span's attribute of the same name never stands for (an issue's id is kiln's
+/// alone: one a span came with is not taken).
+const FIXED: [&str; 5] = ["span.kind", "duration", "parent_id", "otel.status_code", "issue.id"];
 /// Where a client's or a producer's span's `peer.service` comes from when it does not say one: the
 /// first of these it has, as Datadog infers a service from its peer tags (the database's system, the
 /// messaging system, the RPC service, the address called).
@@ -70,8 +72,10 @@ pub const PEER_SOURCES: [&str; 9] = ["peer.service", "db.system.name", "db.syste
 
 /// `Span.SpanKind`'s names by number; UNSPECIFIED read as INTERNAL, as the specification allows.
 pub const KINDS: [&str; 6] = ["internal", "internal", "server", "client", "producer", "consumer"];
+const KIND_SERVER: u64 = 2;
 const KIND_CLIENT: u64 = 3;
 const KIND_PRODUCER: u64 = 4;
+const KIND_CONSUMER: u64 = 5;
 /// `Status.StatusCode`.
 const STATUS_OK: u64 = 1;
 const STATUS_ERROR: u64 = 2;
@@ -196,6 +200,21 @@ pub(crate) fn resolve<'a>(v: Val<'a>, text: &'a str) -> &'a str {
     match v {
         Val::Str(s) => s,
         Val::Text(a, b) => text.get(a..b).unwrap_or(""),
+    }
+}
+
+/// A span's error's issue as `issue.id` (sixteen hex digits), where it is one
+/// ([`crate::errors::span_issue`]).
+pub(crate) fn put_issue(attrs: &mut Vec<Attr<'_>>, text: &mut String, service: Option<Val<'_>>, entry: bool) {
+    let id = {
+        let t: &str = text;
+        let service = service.map_or("", |v| resolve(v, t));
+        crate::errors::span_issue(service, entry, &crate::errors::Error::of(attrs.iter().map(|a| (a.key, resolve(a.val, t)))))
+    };
+    if let Some(id) = id {
+        let at = text.len();
+        let _ = write!(text, "{id:016x}");
+        attrs.push(Attr { key: "issue.id", val: Val::Text(at, text.len()) });
     }
 }
 
@@ -500,6 +519,12 @@ impl<'a> Cx<'a, '_> {
         }
         self.events_and_error(status, status_msg, start)?;
         self.links()?;
+        // An error's issue (`crate::errors`): a service's entry span's (its first, a server's, a
+        // consumer's).
+        if status == STATUS_ERROR {
+            let entry = parent.is_none() || kind == KIND_SERVER || kind == KIND_CONSUMER;
+            put_issue(&mut self.attrs, &mut self.text, res.service, entry);
+        }
         // The row.
         let ts = if start != 0 {
             start
@@ -589,11 +614,12 @@ impl<'a> Cx<'a, '_> {
             self.text.push(']');
             events = Some(Val::Text(at, self.text.len()));
         }
+        // A stack whole: its row keeps its ends (`crate::errors::stack_ends`).
         let error = |key: &'static str, v: Option<&'a str>, attrs: &mut Vec<Attr<'a>>| {
             if let Some(v) = v
                 && !attrs.iter().any(|a| a.key == key)
             {
-                attrs.push(Attr { key, val: Val::Str(cut(v, MAX_VALUE_BYTES)) });
+                attrs.push(Attr { key, val: Val::Str(if key == "error.stack" { v } else { cut(v, MAX_VALUE_BYTES) }) });
             }
         };
         let message = message.or_else(|| (status == STATUS_ERROR && !status_msg.is_empty()).then_some(status_msg));
@@ -827,6 +853,53 @@ mod tests {
             });
         });
         req
+    }
+
+    /// An error is an issue at its service's entry (`crate::errors`): a root's or a server's span
+    /// in error with its exception's type, message and stack; not a call's, nor a span not in error
+    /// (an exception handled), and an `issue.id` a span came with is never kept.
+    #[test]
+    fn an_entry_span_s_error_is_an_issue_and_a_call_s_is_not() {
+        let text = include_str!("../fixtures/errors/python.txt");
+        let stack = text.split("---- app\n").nth(1).and_then(|t| t.split("---- ").next()).unwrap();
+        let mut req = Writer::default();
+        req.message(1, |rs| {
+            rs.message(1, |res| kv(res, 1, "service.name", "checkout"));
+            rs.message(2, |ss| {
+                for (id, parent, kind, status, exception) in [(1u8, None, 2u64, 2u64, true), (2, Some(1u8), 3, 2, true), (3, None, 2, 1, true), (4, None, 2, 2, false)] {
+                    ss.message(2, |s| {
+                        s.bytes(1, &[0xab; 16]);
+                        s.bytes(2, &[id; 8]);
+                        if let Some(p) = parent {
+                            s.bytes(4, &[p; 8]);
+                        }
+                        s.str(5, "POST /cart");
+                        s.varint(6, kind);
+                        s.fixed64(7, 1_700_000_000_000_000_000);
+                        s.fixed64(8, 1_700_000_000_001_000_000);
+                        kv(s, 9, "issue.id", "deadbeefdeadbeef");
+                        if exception {
+                            s.message(11, |e| {
+                                e.str(2, "exception");
+                                kv(e, 3, "exception.type", "ValueError");
+                                kv(e, 3, "exception.message", "bad item -42 in cart 'c--294'");
+                                kv(e, 3, "exception.stacktrace", stack);
+                            });
+                        }
+                        s.message(15, |st| st.varint(3, status));
+                    });
+                }
+            });
+        });
+        let mut d = Decoder::new();
+        let mut out = Spans::default();
+        d.decode(&req.buf, 0, &mut out).unwrap();
+        let r = rows(&out);
+        let want =
+            crate::errors::span_issue("checkout", true, &crate::errors::Error { kind: Some("ValueError"), message: Some("bad item -42 in cart 'c--294'"), stack: Some(stack), fingerprint: None })
+                .unwrap();
+        let ids: Vec<Option<&str>> = r.iter().map(|x| x.attr("issue.id")).collect();
+        assert_eq!(ids, vec![Some(crate::errors::hex(want).as_str()), None, None, None], "the entry's in error alone; none of the span's own");
     }
 
     #[test]

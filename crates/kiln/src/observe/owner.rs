@@ -544,6 +544,10 @@ impl Observe {
         if ack.is_none() {
             super::pipeline::kept::process(&mut records);
         }
+        // Each error's issue (`kiln_obs::errors`), after the pipelines that name its parts.
+        for r in &mut records {
+            kiln_obs::errors::put_log_issue(r);
+        }
         let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
         let a = &self.admission;
         if !records.is_empty() && ((!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max)) {

@@ -358,6 +358,53 @@ fn schemas() -> Map<String, Value> {
         ),
     );
     put(
+        "Issue",
+        object(
+            &[
+                ("id", describe(string(), "sixteen hex digits: the `issue.id` its errors carry")),
+                ("source", one_of(&["span", "log", ""])),
+                ("service", string()),
+                ("type", describe(string(), "its errors' type (error.type, a log's error.kind)")),
+                ("message", describe(string(), "its first error's message")),
+                ("file", describe(string(), "the file of the frame its errors are grouped by")),
+                ("function", describe(string(), "that frame's function")),
+                ("first_seen", ms()),
+                ("last_seen", ms()),
+                ("versions", describe(array(string()), "the versions its errors were of, in the order they came")),
+                ("envs", array(string())),
+                ("status", one_of(&["for_review", "reviewed", "resolved", "ignored"])),
+                ("status_at", ms()),
+                ("regression", describe(boolean(), "back for review: it erred again once resolved, in a version it had not been seen in")),
+                ("activity", array(object(&[("at", ms()), ("status", string()), ("by", one_of(&["kiln", "user"])), ("why", string())], &["at", "status", "by", "why"]))),
+                ("errors", describe(nullable(number()), "its errors over the range asked")),
+            ],
+            &["id", "service", "type", "message", "first_seen", "last_seen", "status", "regression", "errors"],
+        ),
+    );
+    put("IssueStatus", object(&[("status", one_of(&["for_review", "reviewed", "resolved", "ignored"]))], &["status"]));
+    put(
+        "IssueList",
+        object(
+            &[("from", ms()), ("to", ms()), ("total", describe(integer(), "issues that match, before the limit")), ("issues", describe(array(schema("Issue")), "the most errors first"))],
+            &["from", "to", "total", "issues"],
+        ),
+    );
+    put(
+        "IssueDetail",
+        object(
+            &[
+                ("issue", schema("Issue")),
+                ("from", ms()),
+                ("to", ms()),
+                ("timeline", object(&[("from", ms()), ("step", describe(integer(), "ms")), ("values", array(number()))], &["from", "step", "values"])),
+                ("versions", array(object(&[("version", string()), ("errors", number())], &["version", "errors"]))),
+                ("envs", array(object(&[("env", string()), ("errors", number())], &["env", "errors"]))),
+                ("latest", describe(nullable(schema("Record")), "its latest error in the range, whole: its stack, its trace")),
+            ],
+            &["issue", "from", "to", "timeline", "versions", "envs"],
+        ),
+    );
+    put(
         "PatternsAnswer",
         object(
             &[
@@ -1263,6 +1310,52 @@ fn ops() -> Vec<Op<'static>> {
         Op {
             params: vec![param("from", "query", false, integer(), "ms since the epoch (15 minutes before to)"), param("to", "query", false, integer(), "ms since the epoch"), param("env", "query", false, string(), "one environment")],
             ..op("get", "/apm/map", "The service map over the range: who calls whom, from the spans; its figures from the trace metrics (every request and call, whatever traces were kept), each edge its share of the groups that count its calls", "observe.read", None, vec![ok("ServiceMap")])
+        },
+        Op {
+            params: vec![
+                param("from", "query", false, integer(), "ms since the epoch (a day before to)"),
+                param("to", "query", false, integer(), "ms since the epoch (now)"),
+                param("service", "query", false, string(), "one service"),
+                param("env", "query", false, string(), "one environment"),
+                param("status", "query", false, string(), "statuses, comma-separated: for_review, reviewed, resolved, ignored"),
+                param("query", "query", false, string(), "words of its type, message, service, file or function"),
+                param("all", "query", false, boolean(), "those with no error in the range too, the latest first"),
+                param("limit", "query", false, integer(), "issues at the most (100; 1,000)"),
+            ],
+            ..op(
+                "get",
+                "/errors/issues",
+                "Error Tracking: the issues with errors in the range, the most first (an entry span's or a log's errors, grouped as Datadog groups them)",
+                "observe.read",
+                None,
+                vec![ok("IssueList")],
+            )
+        },
+        Op {
+            params: vec![
+                path_param("id", "the issue's id"),
+                param("from", "query", false, integer(), "ms since the epoch (a day before to)"),
+                param("to", "query", false, integer(), "ms since the epoch"),
+            ],
+            ..op(
+                "get",
+                "/errors/issues/{id}",
+                "An issue: its errors over the range by bucket, version and env, its latest error whole, its activity",
+                "observe.read",
+                None,
+                vec![ok("IssueDetail"), ("404", answer("no such issue", Some("Error")))],
+            )
+        },
+        Op {
+            params: vec![path_param("id", "the issue's id")],
+            ..op(
+                "put",
+                "/errors/issues/{id}",
+                "Sets an issue's status (`{\"status\": \"reviewed\"}`: for_review, reviewed, resolved or ignored)",
+                "observe.write",
+                Some(body("IssueStatus")),
+                vec![ok("Issue"), ("400", answer("not a status", Some("Error"))), ("404", answer("no such issue", Some("Error")))],
+            )
         },
         Op {
             params: vec![param("query", "query", false, string(), "a log search"), param("rate", "query", false, integer(), "records a second at the most, a uniform sample past it")],

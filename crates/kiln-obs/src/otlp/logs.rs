@@ -10,11 +10,15 @@
 //!   name, else "otlp".
 //! - The message is the body: a string as it is, anything else as compact JSON.
 //! - The attributes are the record's over its resource's (but the two named above), each value as
-//!   text, at most `MAX_TAGS`; the event's name, if any, is the attribute `event.name`.
+//!   text (of a span's attribute's bound: a log's holds a stack), at most `MAX_TAGS`; the event's
+//!   name, if any, is the attribute `event.name`; `env` and `version` the resource's
+//!   `deployment.environment.name` (or `deployment.environment`) and `service.version` where the
+//!   record says neither (Datadog's unified service tags, as spans take them).
 //! - A trace id of 16 bytes and a span id of 8 are kept; others (empty: none) are not.
 
-use super::metrics::{OtlpError, any_value_text_within, key_value};
+use super::metrics::{OtlpError, any_value_text_within, key_value_within};
 use super::pb::Fields;
+use super::traces::MAX_VALUE_BYTES;
 use crate::batch::MAX_TAGS;
 use crate::logs::record::{MAX_MESSAGE_BYTES, Record, severities};
 
@@ -45,7 +49,7 @@ fn resource_logs(msg: &[u8], now_ns: i64, out: &mut DecodedLogs) -> Result<(), O
             (1, w) => {
                 for f in Fields::new(w.bytes().unwrap_or(&[])) {
                     if let (1, kv) = f?
-                        && let Some(t) = key_value(kv.bytes().unwrap_or(&[]))?
+                        && let Some(t) = key_value_within(kv.bytes().unwrap_or(&[]), MAX_VALUE_BYTES)?
                     {
                         resource.push(t);
                     }
@@ -99,7 +103,10 @@ fn record(msg: &[u8], service: &str, host: &str, source: &str, resource: &[(Stri
             (3, w) => text = w.str().unwrap_or("").to_owned(),
             (5, w) => body = any_value_text_within(w.bytes().unwrap_or(&[]), MAX_MESSAGE_BYTES)?,
             (6, w) => {
-                if let Some(t) = key_value(w.bytes().unwrap_or(&[]))? {
+                // A stack read whole (its row keeps its ends), any other value to a span's bound.
+                let kv = w.bytes().unwrap_or(&[]);
+                let stack = Fields::new(kv).any(|f| matches!(f, Ok((1, k)) if k.str().is_some_and(|k| crate::errors::STACK_KEYS.contains(&k))));
+                if let Some(t) = key_value_within(kv, if stack { MAX_MESSAGE_BYTES } else { MAX_VALUE_BYTES })? {
                     attrs.push(t);
                 }
             }
@@ -112,6 +119,14 @@ fn record(msg: &[u8], service: &str, host: &str, source: &str, resource: &[(Stri
     for (k, v) in resource {
         if !attrs.iter().any(|(ak, _)| ak == k) {
             attrs.push((k.clone(), v.clone()));
+        }
+    }
+    // The unified service tags where the record says none.
+    for (tag, from) in [("env", &["deployment.environment.name", "deployment.environment"][..]), ("version", &["service.version"][..])] {
+        if !attrs.iter().any(|(k, _)| k == tag)
+            && let Some(v) = from.iter().find_map(|f| attrs.iter().find(|(k, v)| k == f && !v.is_empty()).map(|(_, v)| v.clone()))
+        {
+            attrs.push((tag.to_owned(), v));
         }
     }
     if let Some(e) = event {

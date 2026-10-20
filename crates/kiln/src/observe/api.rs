@@ -40,6 +40,17 @@ fn monitors() -> Result<&'static std::sync::Arc<super::monitors::Monitors>, Fail
     MONITORS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "monitors are kept by the server"))
 }
 
+/// The server's Error Tracking issues, once it started.
+static ISSUES: OnceLock<std::sync::Arc<super::errors::Issues>> = OnceLock::new();
+
+pub fn set_issues(i: std::sync::Arc<super::errors::Issues>) {
+    let _ = ISSUES.set(i);
+}
+
+pub(super) fn issues() -> Result<&'static std::sync::Arc<super::errors::Issues>, Fail> {
+    ISSUES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "Error Tracking's issues are kept by the server"))
+}
+
 /// The server's dashboards, once it started.
 static DASHBOARDS: OnceLock<std::sync::Arc<super::dashboards::Dashboards>> = OnceLock::new();
 
@@ -616,6 +627,10 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::GET, ["apm", "services"]) => super::apm::services(q).await,
         (&Method::GET, ["apm", "services", name]) => super::apm::service(name, q).await,
         (&Method::GET, ["apm", "map"]) => super::apm::map(q).await,
+        // Error Tracking (`super::errors`): spans' and logs' errors as issues.
+        (&Method::GET, ["errors", "issues"]) => super::errors::list(q).await,
+        (&Method::GET, ["errors", "issues", id]) => super::errors::detail(id, q).await,
+        (&Method::PUT, ["errors", "issues", id]) => super::errors::update(id, &read_json::<Value>(req.into_body(), QUERY_BODY).await?),
         (&Method::POST, ["events"]) => post_event(read_json(req.into_body(), QUERY_BODY).await?),
         (&Method::POST, ["events", "search"]) => {
             let mut b: SearchBody = read_json(req.into_body(), QUERY_BODY).await?;

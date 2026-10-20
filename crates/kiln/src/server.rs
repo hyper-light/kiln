@@ -174,6 +174,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let span_metrics = crate::observe::logmetrics::LogMetrics::open_spans(&cfg.data("observe"));
         crate::observe::api::set_span_metrics(span_metrics.clone());
         crate::rt::spawn(span_metrics.run(shutdown.clone()));
+        // Error Tracking's issues, from the errors those count (`crate::observe::errors`).
+        let issues = crate::observe::errors::Issues::open(&cfg.data("observe"));
+        crate::observe::api::set_issues(issues.clone());
+        crate::rt::spawn(issues.run(shutdown.clone()));
         child!("observe", h => crate::observe::hub::send_loop(h));
         match crate::http::client::Client::public() {
             Ok(http) => {

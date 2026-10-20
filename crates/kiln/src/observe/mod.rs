@@ -10,6 +10,7 @@ pub mod dashboards;
 pub mod ddagent;
 pub mod ddtrace;
 pub mod downtimes;
+pub mod errors;
 pub mod github;
 pub mod host;
 pub mod hub;

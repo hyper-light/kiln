@@ -930,6 +930,60 @@ export interface ServiceMap {
   took_ms: number;
 }
 
+/** Error Tracking's: an issue's status, Datadog's. */
+export type IssueStatus = "for_review" | "reviewed" | "resolved" | "ignored";
+
+/** An issue: errors of a service of one type, alike in their words, thrown at one place. */
+export interface Issue {
+  id: string;
+  source: "span" | "log" | "";
+  service: string;
+  type: string;
+  message: string;
+  file: string;
+  function: string;
+  first_seen: number;
+  last_seen: number;
+  versions: string[];
+  envs: string[];
+  status: IssueStatus;
+  status_at: number;
+  regression: boolean;
+  activity: { at: number; status: IssueStatus; by: "kiln" | "user"; why: string }[];
+  /** Its errors over the range asked. */
+  errors: number | null;
+}
+
+export interface IssueList {
+  from: number;
+  to: number;
+  total: number;
+  issues: Issue[];
+}
+
+/** An error's record, whole: a span's or a log's. */
+export interface ErrorRecord {
+  ts_ns: number;
+  status: string;
+  service: string;
+  host: string;
+  source: string;
+  message: string;
+  attributes: Record<string, string>;
+  trace_id: string | null;
+  span_id: string | null;
+}
+
+export interface IssueDetail {
+  issue: Issue;
+  from: number;
+  to: number;
+  timeline: { from: number; step: number; values: number[] };
+  versions: { version: string; errors: number }[];
+  envs: { env: string; errors: number }[];
+  latest: ErrorRecord | null;
+}
+
 const rangeQuery = (from: number, to: number, env?: string) => `from=${Math.floor(from)}&to=${Math.ceil(to)}${env && env !== "*" ? `&env=${enc(env)}` : ""}`;
 
 export const observeApi = {
@@ -941,6 +995,15 @@ export const observeApi = {
   service: (name: string, from: number, to: number, env: string | undefined, signal?: AbortSignal) =>
     request<ServiceDetail>("GET", `${BASE}/apm/services/${enc(name)}?${rangeQuery(from, to, env)}`, undefined, { signal }),
   serviceMap: (from: number, to: number, env: string | undefined, signal?: AbortSignal) => request<ServiceMap>("GET", `${BASE}/apm/map?${rangeQuery(from, to, env)}`, undefined, { signal }),
+  issues: (from: number, to: number, q: { status?: string; query?: string; env?: string }, signal?: AbortSignal) =>
+    request<IssueList>(
+      "GET",
+      `${BASE}/errors/issues?${rangeQuery(from, to, q.env)}&all=true${q.status ? `&status=${enc(q.status)}` : ""}${q.query ? `&query=${enc(q.query)}` : ""}&limit=200`,
+      undefined,
+      { signal },
+    ),
+  issue: (id: string, from: number, to: number, signal?: AbortSignal) => request<IssueDetail>("GET", `${BASE}/errors/issues/${enc(id)}?${rangeQuery(from, to)}`, undefined, { signal }),
+  setIssueStatus: (id: string, status: IssueStatus) => request<Issue>("PUT", `${BASE}/errors/issues/${enc(id)}`, { status }),
   query: (body: { query: string; from: number; to: number; step?: number; points?: number }, signal?: AbortSignal) => request<QueryAnswer>("POST", `${BASE}/query`, body, { signal }),
   heatmap: (body: { query: string; from: number; to: number; points?: number; heatmap: number }, signal?: AbortSignal) => request<HeatmapAnswer>("POST", `${BASE}/query`, body, { signal }),
   metrics: (match: string | undefined, signal?: AbortSignal) =>

@@ -839,13 +839,14 @@ pub(crate) fn push_f64(out: &mut String, v: f64) {
     }
 }
 
-/// A `KeyValue`: its key and its value as text.
-pub(crate) fn key_value(msg: &[u8]) -> Result<Option<(String, String)>, OtlpError> {
+/// A `KeyValue`: its key, and its value's text of at most `max` bytes (a log's attribute holds a
+/// stack: a span's attribute's bound, not a tag's).
+pub(crate) fn key_value_within(msg: &[u8], max: usize) -> Result<Option<(String, String)>, OtlpError> {
     let (mut key, mut value) = (None, None);
     for f in Fields::new(msg) {
         match f? {
             (1, w) => key = w.str().map(str::to_owned),
-            (2, w) => value = Some(any_value_text(w.bytes().unwrap_or(&[]))?),
+            (2, w) => value = Some(any_value_text_within(w.bytes().unwrap_or(&[]), max)?),
             _ => {}
         }
     }
@@ -1350,7 +1351,7 @@ mod tests {
                 });
             });
         });
-        assert_eq!(key_value(&w.buf).unwrap(), Some(("k".to_owned(), r#"{"x":[1,"two"]}"#.to_owned())));
+        assert_eq!(key_value_within(&w.buf, MAX_NAME_BYTES).unwrap(), Some(("k".to_owned(), r#"{"x":[1,"two"]}"#.to_owned())));
         // Nested past the bound: cut, not followed.
         let mut deep = Writer::default();
         deep.str(1, "v");
@@ -1364,7 +1365,7 @@ mod tests {
             inner = any;
         }
         deep.bytes(2, &inner.buf);
-        let (_, v) = key_value(&deep.buf).unwrap().unwrap();
+        let (_, v) = key_value_within(&deep.buf, MAX_NAME_BYTES).unwrap().unwrap();
         assert!(v.contains('…'), "{v}");
         let req = request();
         let mut rng = crate::testkit::Rng::new(6);

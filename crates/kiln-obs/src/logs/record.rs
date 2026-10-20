@@ -170,7 +170,8 @@ fn cut(s: &str, max: usize) -> &str {
 }
 
 /// Appends `r`'s row to `out`; `prev_ts` is the row before's time (0 for the first). Its
-/// attributes' values are cut at a tag's length ([`crate::batch::MAX_NAME_BYTES`]), as a log's are.
+/// attributes' values are cut at a tag's length ([`crate::batch::MAX_NAME_BYTES`]), as a log's are,
+/// but a stack's ([`crate::errors::STACK_KEYS`]: its ends kept, [`crate::errors::STACK_VALUE_BYTES`]).
 pub fn put_row(out: &mut Vec<u8>, r: &Record, prev_ts: i64) {
     put_fields(out, r.ts, r.severity, [&r.service, &r.host, &r.source], &r.message, r.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())), r.attrs.len(), r.trace_id, r.span_id, prev_ts, crate::batch::MAX_NAME_BYTES);
 }
@@ -195,7 +196,20 @@ pub fn put_fields<'a>(out: &mut Vec<u8>, ts: i64, severity: u8, names: [&str; 3]
     varint::put(out, n as u64);
     for (k, v) in attrs.take(n) {
         put_str(out, cut(k, crate::batch::MAX_NAME_BYTES));
-        put_str(out, cut(v, value_max));
+        if crate::errors::STACK_KEYS.contains(&k) {
+            // A stack: longer than another value, its ends kept (`crate::errors::stack_ends`).
+            let (head, tail) = crate::errors::stack_ends(v, value_max.max(crate::errors::STACK_VALUE_BYTES));
+            if tail.is_empty() {
+                put_str(out, head);
+            } else {
+                varint::put(out, (head.len() + crate::errors::STACK_GAP.len() + tail.len()) as u64);
+                out.extend_from_slice(head.as_bytes());
+                out.extend_from_slice(crate::errors::STACK_GAP.as_bytes());
+                out.extend_from_slice(tail.as_bytes());
+            }
+        } else {
+            put_str(out, cut(v, value_max));
+        }
     }
     out.push(u8::from(trace_id.is_some()) | (u8::from(span_id.is_some()) << 1));
     if let Some(t) = trace_id {

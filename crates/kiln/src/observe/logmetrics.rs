@@ -47,7 +47,7 @@ const SETTLE_MAX_MS: i64 = 30_000;
 /// The least a window counted waits to be counted again.
 const AGAIN_MIN_MS: i64 = 1_000;
 /// Names kiln writes itself, and Datadog keeps for its own.
-const RESERVED: [&str; 3] = ["kiln.", "system.", "datadog."];
+const RESERVED: [&str; 4] = ["kiln.", "system.", "datadog.", "error_tracking."];
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -407,9 +407,12 @@ impl LogMetrics {
         self.spans
     }
 
-    /// kiln's own metrics counted with those defined: of spans, its trace metrics.
+    /// kiln's own metrics counted with those defined: of spans, its trace metrics; of both, Error
+    /// Tracking's (`kiln_obs::errors::metrics`).
     pub fn builtin(&self) -> Vec<LogMetric> {
-        if self.spans { kiln_obs::apm::trace_metrics() } else { Vec::new() }
+        let mut out = if self.spans { kiln_obs::apm::trace_metrics() } else { Vec::new() };
+        out.extend(kiln_obs::errors::metrics(self.spans));
+        out
     }
 
     fn recompile(&self) {
@@ -659,7 +662,7 @@ mod tests {
         assert_eq!(k.def, changed);
         let again = LogMetrics::open(dir.path());
         assert_eq!(again.list().iter().map(|k| k.def.name.as_str()).collect::<Vec<_>>(), vec!["lat", "hits"]);
-        assert_eq!(lock(&again.compiled).len(), 2);
+        assert_eq!(lock(&again.compiled).len(), again.builtin().len() + 2, "kiln's own (Error Tracking's) and the two defined");
     }
 
     #[test]

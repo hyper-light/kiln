@@ -192,7 +192,7 @@ fn hex_id<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-fn range(q: &HashMap<String, String>, default_ms: i64) -> Result<(i64, i64), Fail> {
+pub(super) fn range(q: &HashMap<String, String>, default_ms: i64) -> Result<(i64, i64), Fail> {
     let num = |k: &str| q.get(k).map(|v| v.parse::<i64>().map_err(|_| fail(StatusCode::BAD_REQUEST, format!("{k}: milliseconds since the epoch")))).transpose();
     let to = num("to")?.unwrap_or_else(super::clock_ms);
     let from = num("from")?.unwrap_or(to - default_ms);
@@ -268,7 +268,7 @@ fn red_json(r: &kiln_obs::apm::Red, key: &str) -> Value {
     json!({ key: r.group, "hits": r.hits, "errors": r.errors, "error_rate": rate, "avg_s": avg, "p50_s": r.p50, "p95_s": r.p95, "p99_s": r.p99, "max_s": r.max })
 }
 
-fn env_filter(q: &HashMap<String, String>) -> Option<String> {
+pub(super) fn env_filter(q: &HashMap<String, String>) -> Option<String> {
     q.get("env").map(|e| e.trim().to_owned()).filter(|e| !e.is_empty() && e != "*")
 }
 

@@ -514,6 +514,16 @@ fn traced(f: &Fleet, name: &str, apm: u16) -> anyhow::Result<()> {
     )
 }
 
+/// Waits until a trace sent to runner `apm`'s receiver is stored on the server (its service
+/// `probe`): the runner's way to the server writes. A runner's first link over the HTTP tunnel (UDP
+/// to the server dropped here) can stall some fifteen seconds and be made again; what a runner takes
+/// as it stops is written only while it reaches the server (three seconds at the most).
+fn writing(f: &Fleet, apm: u16, probe: &str) -> anyhow::Result<()> {
+    put_traces(apm, &v04_trace(probe, 0x5eed_0000_0000_0001u64.wrapping_add(probe.len() as u64), now_ms() * 1_000_000, 1.0))?;
+    let (from, to) = (now_ms() - 600_000, now_ms() + 600_000);
+    until("the runner's writes reaching the server", Duration::from_secs(90), || Ok(span_count(f, &format!("service:{probe}"), from, to)? >= 2), &|| f.logs())
+}
+
 /// [`start_traced`], then [`traced`].
 fn traced_runner(f: &mut Fleet, name: &str, apm: u16, env: &[(&str, &str)]) -> anyhow::Result<()> {
     start_traced(f, name, apm, env)?;
@@ -598,6 +608,7 @@ fn a_runner_stopped_and_started_again_counts_every_trace_once() -> anyhow::Resul
     let apm = free_port()?;
     let keep_all = [("KILN_DD_TARGET_TPS", "0")];
     traced_runner(&mut f, "web-1", apm, &keep_all)?;
+    writing(&f, apm, "probe-first")?;
     let bucket = (now_ms() + 40_000) / 10_000 * 10_000;
     let send = |from: u64| -> anyhow::Result<()> {
         for t in from..from + HALF {
@@ -614,6 +625,7 @@ fn a_runner_stopped_and_started_again_counts_every_trace_once() -> anyhow::Resul
     until("the runner finding its port held", Duration::from_secs(60), || Ok(f.logs().contains("the receiver's port is held")), &|| f.logs())?;
     drop(held);
     traced(&f, "web-1", apm)?;
+    writing(&f, apm, "probe-again")?;
     // The bucket is written twenty seconds past its end: the runner must be back before then.
     let back = now_ms();
     anyhow::ensure!(back < bucket + 25_000, "the runner was back {} s after the bucket began: too late for this scenario", (back - bucket) / 1000);

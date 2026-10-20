@@ -16,6 +16,7 @@ pub mod crc32c;
 pub mod ddagent;
 pub mod ddtrace;
 pub mod dist;
+pub mod errors;
 pub mod forecast;
 pub mod gorilla;
 pub mod group;
