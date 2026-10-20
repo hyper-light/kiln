@@ -389,6 +389,19 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
     pump(pid, input, out, err, exit_rx)
 }
 
+/// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): the process joins
+/// it before it runs anything, so everything it starts is in it too.
+pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+    if let Some(g) = group {
+        g.enter(&mut cmd);
+    }
+    let d = spawn_duplex(cmd)?;
+    if let Some(g) = group {
+        g.started(d.pid);
+    }
+    Ok(d)
+}
+
 /// Take over a harness process the previous image of this process let go of ([`Duplex::detach`]):
 /// its pipes by their descriptors, and its exit (it is still this process's child).
 pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {

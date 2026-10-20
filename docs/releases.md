@@ -177,10 +177,14 @@ the machine itself, and come back with what they did.
 |---|---|---|
 | GET | `/api/agents/{name}/diagnose` | `{runner, at, worst, findings: [{id, level, title, detail?, fix?: {action, label, way?}}], machine_checked, why, updates}`, worst first (`runners.read`) |
 | POST | `/api/agents/{name}/repair` | `{action, way?}` → `{ok, action, message}` (or `{ok, action, job}` for an upgrade); 409 with why when it can't (`runners.manage`) |
+| GET | `/api/updates/runners` | `{runners, jobs}`: the runners the caller may read against the newest kiln, and their latest upgrades (`runners.read` anywhere; a caller with it on some runners sees those) |
 
 Agents do the same through kiln's operations (`runners.list`, `runners.diagnose`, `runners.repair`,
 `updates.list`, `updates.retry`, `updates.policy`), with the rights of whoever they act for: a person
-who can't manage runners can't have an agent repair one.
+who can't manage runners can't have an agent repair one. `runners.list` (`GET /api/agents`) and
+`updates.list` list the runners the caller may read: an agent attached to one runner sees that one.
+When an upgrade goes through, the agent of an incident about that runner's upgrading (open, or
+reported on) is told, so it checks the runner and resolves the incident rather than wait on it.
 
 An upgrade kiln stopped waiting for can still finish: the runner switches once it's idle. When its
 new build reports in later (and, upgrading blue/green, takes over), the job reads as done after all

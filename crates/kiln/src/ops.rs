@@ -68,10 +68,10 @@ pub fn path(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// kiln's own operations: agents', plans', goal stacks' and runners', in the order they're listed.
+/// kiln's own operations: agents', plans', goal stacks', runners' and attachments', in the order they're listed.
 pub fn own() -> &'static [Op] {
     static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
-    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).collect())
+    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).chain(crate::ci::attach::list_ops()).collect())
 }
 
 /// Every operation this server has: CI's, deployments' when they're on, and kiln's own.
@@ -91,9 +91,25 @@ pub fn listed(cd: bool) -> Vec<Info> {
     out
 }
 
+/// Operations on one agent that an agent calling them without `agent` means for itself: its own
+/// goal stack, and putting its own work up for review.
+const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "agents.change"];
+
+/// `input` to operation `name` as `caller` means it: an agent's own id where it left out `agent`
+/// on one of [`YOURS`].
+fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
+    if YOURS.contains(&name)
+        && let (Some(me), Some(o)) = (caller.agent.as_deref(), input.as_object_mut())
+        && o.get("agent").and_then(Value::as_str).is_none_or(|a| a.trim().is_empty())
+    {
+        o.insert("agent".into(), json!(me));
+    }
+    input
+}
+
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
-    let input = if input.is_null() { json!({}) } else { input };
+    let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
     if name.starts_with("ci.") {
         return crate::ci::ops::call(cx, name, input).await;
     }
@@ -154,7 +170,7 @@ mod tests {
     /// runners' `runners.read` or `runners.manage`), and reads exactly when its route is a GET.
     #[test]
     fn kiln_s_own_operations_are_routes_of_the_table() {
-        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto"});
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1"});
         assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
         for op in own() {
             let route = (op.route)(&probe);
@@ -166,6 +182,11 @@ mod tests {
             let needs = match op.name {
                 "runners.list" | "runners.diagnose" | "updates.list" => "runners.read",
                 "runners.repair" | "updates.retry" | "updates.policy" => "runners.manage",
+                // Attachments and incidents: reading them is reading runs (each narrowed to what it
+                // looks after); attaching is `agents.attach`; reporting, the incident's own check.
+                "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",
+                "attachments.save" | "attachments.remove" | "attachments.pause" => "agents.attach",
+                "incidents.report" => crate::authz::SIGNED_IN,
                 _ => "agents.run",
             };
             assert_eq!(rule.capability, needs, "{}", op.name);
@@ -175,5 +196,19 @@ mod tests {
         // Listed whether deployments are on or not.
         assert!(listed(false).iter().any(|o| o.name == "agents.wait"));
         assert!(listed(false).iter().any(|o| o.name == "plans.create"));
+    }
+
+    /// An agent's own goal stack and change request need no id: left out, `agent` is the agent
+    /// calling. One it names stays; a person's input, and other operations', are as they came.
+    #[test]
+    fn an_agent_s_own_goals_and_change_need_no_id() {
+        let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:01a1", None, None);
+        agent.agent = Some("01a1".into());
+        assert_eq!(yours(&agent, "goals.add", json!({"goals": ["g"]})), json!({"goals": ["g"], "agent": "01a1"}));
+        assert_eq!(yours(&agent, "goals.control", json!({"agent": " ", "action": "start"})), json!({"agent": "01a1", "action": "start"}));
+        assert_eq!(yours(&agent, "agents.change", json!({})), json!({"agent": "01a1"}));
+        assert_eq!(yours(&agent, "goals.get", json!({"agent": "child"})), json!({"agent": "child"}));
+        assert_eq!(yours(&agent, "agents.stop", json!({})), json!({}), "ending an agent always names it");
+        assert_eq!(yours(&Caller::owner(), "goals.add", json!({"goals": ["g"]})), json!({"goals": ["g"]}));
     }
 }

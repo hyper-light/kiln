@@ -12,10 +12,14 @@
 //! - `runners`: which machines there are, best first for what the work needs;
 //! - `run`: a command on one of them (by name, or by what it must be: `linux/amd64`), this
 //!   repository synced over first; returns its output and exit code, or runs on in the background;
-//! - `output` / `stop`: a background run's new output, and stopping it.
+//! - `output` / `stop`: a background run's new output, and stopping it;
+//! - `agents_*`, `goals_*`, `plans_*`: kiln's operations an agent uses most, as tools of their own
+//!   (the agents it starts, its own goal stack, plans kept and run), asked of the server like the
+//!   rest.
 //!
 //! The session's preferred runner (`KILN_REACH_ON`) is the default for `on`; the session itself
-//! (`KILN_SESSION`) is whom kiln's operations are asked for.
+//! (`KILN_SESSION`) is whom kiln's operations are asked for, and the instructions tell the agent
+//! that's who it is.
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
@@ -40,7 +44,7 @@ const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
 
-fn instructions(prefer: Option<&str>, machines: &str) -> String {
+fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
 When a step has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself: \
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
@@ -55,7 +59,8 @@ the other machine first (only what changed; git sees the same state there), and 
 folder, so edit here and build or test there; for a command that isn't about this repository, pass sync: false (it runs \
 in that machine's home folder). `runners` lists the machines, best first. Long commands can run in the background \
 (background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
-`agents_start` them with a clear brief, `agents_wait` for them and read what they concluded with `agents_result`: \
+`agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
+when you can't go on without one), and `agents_result` reads what it concluded: \
 they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
 skill says how). To show the person a file from this machine (a screenshot, a recording, a PDF, a log), write its full \
 path in your message, as a Markdown image for a picture (`![phone view](/tmp/shot.png)`) or a link for the rest: kiln \
@@ -64,6 +69,12 @@ table, a diagram, a mock-up, a small tool to try), write a page and show it with
 sized to fit, in kiln's look; look at it with preview_page first. A page that needs this machine (your dev server, its files) \
 you show live with show_live: it streams to them as they look, and use_live lets you use it with them."
         .to_owned();
+    s.push(' ');
+    s.push_str(crate::mcp::GOALS_AND_PLANS);
+    if !session.is_empty() {
+        s.push(' ');
+        s.push_str(&crate::mcp::you_are(session));
+    }
     if !machines.is_empty() {
         s.push_str(&format!(" This kiln's machines: {machines}."));
     }
@@ -130,10 +141,20 @@ fn command_schema(waits: bool) -> Value {
     json!({"type": "object", "properties": props, "required": ["command"]})
 }
 
-/// kiln's `agents.*` operations as tools of their own (`agents_start`, …), asked of the server
-/// for this session like the rest of kiln's operations: what an agent starts here is its child.
+/// The plans operations an agent has as tools: keeping plans, running them and following their
+/// runs (a plan's versions, and deleting one, are code mode's).
+const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
+
+/// kiln's operations an agent uses most: `agents.*`, `goals.*` and most of `plans.*`.
+fn agent_ops() -> Vec<crate::ops::Op> {
+    crate::harness::ops::list_ops().into_iter().chain(crate::goals::ops::list_ops()).chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name))).collect()
+}
+
+/// [`agent_ops`] as tools of their own (`agents_start`, `goals_add`, `plans_run`, …), asked of the
+/// server for this session like the rest of kiln's operations: what an agent starts here is its
+/// child, and the goals it lines up without naming an agent are its own.
 fn agent_tools() -> Vec<Value> {
-    crate::harness::ops::list_ops()
+    agent_ops()
         .iter()
         .map(|o| {
             json!({
@@ -147,9 +168,9 @@ fn agent_tools() -> Vec<Value> {
         .collect()
 }
 
-/// The agents operation a tool is, by its name (`agents_start` is `agents.start`).
+/// The operation of [`agent_ops`] a tool is, by its name (`agents_start` is `agents.start`).
 fn agent_op(tool: &str) -> Option<&'static str> {
-    crate::harness::ops::list_ops().iter().map(|o| o.name).find(|n| crate::mcp::tool_name(n) == tool)
+    agent_ops().iter().map(|o| o.name).find(|n| crate::mcp::tool_name(n) == tool)
 }
 
 fn tools() -> Value {
@@ -711,7 +732,7 @@ impl Server {
                 let (v, failed) = self.stop(&id, OUTPUT_MAX);
                 text_result(&v, failed)
             }
-            // kiln's agents operations, asked of the server for this session.
+            // kiln's agents, goals and plans operations, asked of the server for this session.
             other => match agent_op(other) {
                 Some(op) => match self.ask(json!({"op": "call", "name": op, "input": args})) {
                     Ok(a) => match a.get("ok") {
@@ -849,7 +870,7 @@ pub fn serve() -> anyhow::Result<()> {
                             "protocolVersion": version,
                             "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
                             "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                            "instructions": instructions(server.prefer.as_deref(), &machines),
+                            "instructions": instructions(server.prefer.as_deref(), &machines, &server.session),
                         }),
                     ),
                 );
@@ -967,12 +988,29 @@ mod tests {
         assert_eq!(live.pointer("/inputSchema/properties/engine/enum"), Some(&json!(["chromium", "firefox", "webkit"])));
         assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
         assert_eq!(agent_op("run"), None);
-        assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));
-        let i = instructions(None, "");
+        // Its own goal stack and plans are tools too, the agent's own without naming it.
+        for (tool, op) in [
+            ("goals_add", "goals.add"),
+            ("goals_get", "goals.get"),
+            ("goals_control", "goals.control"),
+            ("plans_create", "plans.create"),
+            ("plans_run", "plans.run"),
+            ("plans_runs_get", "plans.runs.get"),
+        ] {
+            assert!(names.contains(&tool), "{tool}: {names:?}");
+            assert_eq!(agent_op(tool), Some(op));
+        }
+        assert_eq!(agent_op("plans_delete"), None, "deleting a plan is code mode's");
+        let add = t.as_array().into_iter().flatten().find(|t| t.get("name") == Some(&json!("goals_add"))).cloned().unwrap_or_default();
+        assert_eq!(add.pointer("/inputSchema/required"), Some(&json!(["goals"])), "an agent's own goals need no id");
+        assert!(instructions(Some("adacachy"), "", "").contains("prefers commands to run on adacachy"));
+        let i = instructions(None, "", "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));
+        assert!(i.contains("goals_add") && i.contains("plans_run") && !i.contains("You are kiln agent"), "{i}");
+        assert!(instructions(None, "", "01a14ab9").contains("You are kiln agent 01a14ab9"), "an agent is told who it is");
         let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});
         assert_eq!(describe(&v), "adacachy (linux/x86_64, this machine), mac (macos/aarch64), box (windows/x86_64)");
-        assert!(instructions(None, &describe(&v)).contains("This kiln's machines: adacachy (linux/x86_64, this machine), mac (macos/aarch64)"));
+        assert!(instructions(None, &describe(&v), "").contains("This kiln's machines: adacachy (linux/x86_64, this machine), mac (macos/aarch64)"));
         Ok(())
     }
 

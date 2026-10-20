@@ -512,6 +512,7 @@ impl Host {
     /// timeline and state as the conversation store kept them (`crate::convo`), when it kept any;
     /// otherwise as before (a Claude Code session's history from its transcript).
     pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
+        tracing::info!(how = %crate::os::contain::how(), "agents' processes are held together by");
         let mut handed = self.take_handover();
         let saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
             Some((file, Ok(raw))) => serde_json::from_slice(&raw).unwrap_or_else(|e| {

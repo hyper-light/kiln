@@ -25,6 +25,11 @@ any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...
   folder); naming only the agent (`source.session`) is enough, kiln fills in the rest.
 - **Agents** keep theirs with kiln's MCP tools: `plans_create` (and `plans_list`, `plans_get`,
   `plans_update`, `plans_versions`, `plans_run`, `plans_delete`), or `kiln.plans.*` in code mode.
+  An agent on a runner has `plans_create`, `plans_list`, `plans_get`, `plans_update`, `plans_run`
+  and the `plans_runs_*` tools as tools of its own (the rest in code mode). An agent that runs a
+  plan without `session` or `new` runs it itself; with one agent per step (`mode: "agents"`), the
+  steps' agents start in its harness, on its machine and in its folder unless it says otherwise.
+  The kiln-plans skill says how.
 
 A plan's **steps** are the ones written with their parts; a plan written only as text has the
 items of its top-level lists (`1.`, `-`, `*`, `- [ ]`) as its steps (lines indented under an
