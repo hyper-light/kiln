@@ -398,9 +398,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
     r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/pools", "runners.read", At::Server),
-    r("GET", "/api/ci/pools/:name", "runners.read", At::Server),
-    r("PUT", "/api/ci/pools/:name", "pools.manage", At::Server),
-    r("DELETE", "/api/ci/pools/:name", "pools.manage", At::Server),
+    r("GET", "/api/ci/pools/*", "runners.read", At::Server),
+    r("PUT", "/api/ci/pools/*", "pools.manage", At::Server),
+    r("DELETE", "/api/ci/pools/*", "pools.manage", At::Server),
     r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),
     r("GET", "/api/ci/runs", "runs.read", At::Anywhere),
     r("GET", "/api/ci/runs/*", "runs.read", At::Run(3)),
@@ -636,6 +636,19 @@ mod tests {
 
     fn segs(p: &str) -> Vec<&str> {
         p.trim_matches('/').split('/').collect()
+    }
+
+    /// Each pattern's segments are what [`matches`] knows: a word, `*` or `**`. A `:name` would
+    /// never match, and its route would fall to [`UNNAMED`] (as the pools' once did).
+    #[test]
+    fn w10_r05_patterns_match_their_routes() {
+        for r in ROUTES {
+            for s in segs(r.pattern) {
+                assert!(!s.starts_with(':') && !s.starts_with('{'), "{}: `{s}` is no segment the table matches (use `*`)", r.pattern);
+            }
+        }
+        assert_eq!(rule(&Method::PUT, &segs("/api/ci/pools/linux")).capability, "pools.manage");
+        assert_eq!(rule(&Method::GET, &segs("/api/ci/pools/linux")).capability, "runners.read");
     }
 
     #[test]
