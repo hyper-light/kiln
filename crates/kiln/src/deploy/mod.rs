@@ -7,7 +7,9 @@
 //! - [`store`]: where the records are kept (kiln's store, until KilnDB).
 //! - [`repo`]: the release repository's layout.
 //! - [`host`]: kiln's own git server.
-//! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD; [`provider`]: what they answer.
+//! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD ([`appset`]: an environment's
+//!   ApplicationSet there); [`provider`]: what they answer; [`moves`]: an environment moved from one
+//!   to the other.
 //! - [`check`]: what a release is checked for before it is recorded; [`gates`]: what it waits for
 //!   before its commit.
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
@@ -16,7 +18,9 @@
 //! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
 //!   operations agents reach through MCP and code mode.
 
+pub mod actions;
 pub mod api;
+pub mod appset;
 pub mod argocd;
 pub mod check;
 pub mod cli;
@@ -27,6 +31,7 @@ pub mod init;
 pub mod kilncd;
 pub mod metrics;
 pub mod model;
+pub mod moves;
 pub mod ops;
 pub mod preflight;
 pub mod provider;
@@ -52,6 +57,8 @@ pub struct Deploy {
     pub wake: crate::rt::Notify,
     /// Each release that moved, by id, for whoever waits on one.
     pub changes: crate::rt::Broadcast<i64>,
+    /// What each Argo CD's stream says of the Applications kiln made.
+    pub argo: argocd::Watches,
 }
 
 static DEPLOY: RwLock<Option<Arc<Deploy>>> = RwLock::new(None);
@@ -73,6 +80,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         owner: format!("server-{}", crate::util::new_id()),
         wake: crate::rt::Notify::new(),
         changes: crate::rt::Broadcast::new(256),
+        argo: argocd::Watches::default(),
         hub: Arc::clone(&hub),
     });
     *DEPLOY.write() = Some(Arc::clone(&d));
@@ -87,6 +95,8 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "deploy: environments can't be read"),
     }
+    // Moves between providers under way go on (§8.4).
+    moves::resume(&d).await;
     let result = flow::work(&d).await;
     *DEPLOY.write() = None;
     result

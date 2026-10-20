@@ -297,13 +297,17 @@ production:
   watch: { timeout: 15m, settle: 30s, refused: 60s }
   concurrency: queue                  # a second release waits; or reject
   agents: { deploy: false, approve: false }   # what agents may do here (cd-targets.md D6)
+  argocd: { applications: false }     # Argo CD: true, kiln writes each Application (no ApplicationSet)
   notify: { chat: ["#deploys"], webhooks: [] }
 ```
 
 - An environment names one CD provider. Staging may run on KilnCD while production has its own
   Argo CD, and the same app moves between them.
 - An environment on KilnCD may name targets of any kind; one on Argo CD names clusters registered
-  in that Argo CD.
+  in that Argo CD. Its apps run in its first cluster, on either provider.
+- On Argo CD, one ApplicationSet makes the environment's Applications (§8.3); `argocd:
+  { applications: true }` has kiln write each one instead, for an Argo CD that doesn't allow
+  ApplicationSets. Its provider changes by a move once apps are registered there (§8.4).
 - `via: pull-request` makes every release in the environment a pull request (a merge request on
   GitLab) on the release repository: the approval is the merge, made on the git host.
 - `agents` says what agents may do there: release (`deploy`: every kind of release, a cancel, a
@@ -357,7 +361,10 @@ From then on:
   },
   "requested_by": "ada",
   "at": "2026-10-18T20:00:00Z",
-  "rollback_of": null
+  "rollback_of": null,
+  "namespace": "web",
+  "set": { "image.tag": "1.4.2" },
+  "helm": true
 }
 ```
 
@@ -368,6 +375,15 @@ From then on:
   was delivered, is reverted by a commit of kiln's (`Kiln-Reverts: 1042`) that puts its files back
   as they were, unless someone changed them since. A release that ran and then failed stays: roll
   back, or fix it forward. So does a commit kiln didn't make: it fails, and git keeps it.
+- **Every provider reads it, the same.** What runs is the package at `version` (a chart's
+  `chart_version` filled for the release), with what it `set`s (the package's `set`, filled from
+  the release's version and artifacts; those filled stay strings), the registration's
+  `values.yaml`, in `namespace`, rendered with Helm when `helm` says so (a Helm package, or a git
+  path that holds a chart or sets something). KilnCD reads it at the release's commit; Argo CD's
+  ApplicationSet makes each Application from it (§8.3). A hand edit to it is a release like any
+  other, and both providers run it the same. A file from before kiln wrote `namespace`, `set`
+  and `helm` is read as it was (the app's namespace, its package's `set` filled), and gets them
+  with its next release.
 - **JSON for kiln, YAML for people.** Argo CD's git files generator reads `release.json`'s keys as
   parameters. People edit `values.yaml` and `app.yaml` in pull requests like any file.
 - **Safe writes.** kiln commits against the branch head it read and retries on a newer one, keeping
@@ -423,7 +439,7 @@ deployment, read a push webhook, and create a repository from a template.
 | `status(app, env)` / `watch(app, env)` | per target: the commit and release it runs, synced, health, the operation under way, a message |
 | `diff(app, env, release)` / `manifests(app, env, release)` | what a release would change, and what it renders to, before it lands |
 | `resources`, `logs`, `events` | what runs, as the provider sees it |
-| `action(app, env, object, action)` | restart, scale, suspend, resume, delete a pod: what the provider offers |
+| `action(app, env, object, action)` | restart, scale, suspend, resume, delete a pod: what the provider offers (Argo CD's resource actions; on KilnCD, kiln's: restart a workload, pause and resume a Deployment's rollout, scale, suspend and resume a CronJob or run it now, delete a pod) |
 | `automation(app, env, on)` | pause or resume the provider's automation (§5) |
 
 **When a release is done.** The provider reports, on every target of the environment, the release's
@@ -481,42 +497,99 @@ the registration degraded too. Kiln never retries a release by itself.
 
 ### 8.3 Argo CD
 
-- **Connect** (`POST /api/deploy/providers`): the URL, a token (an Argo CD account's API key, or an
-  AppProject role's token), TLS settings, and the namespace Applications live in. kiln checks the
-  version (`GET /api/version`) and its rights (`GET /api/v1/account/can-i/…`) and says what's
-  missing.
-- **Register**: through Argo CD's API, kiln keeps in place:
-  - the release repository (`POST /api/v1/repositories?upsert=true`), with a read token: kiln's own
-    server's URL, or the GitHub, GitLab or Bitbucket one;
-  - an AppProject per kiln project (`POST /api/v1/projects`): the sources allowed (the release
-    repository, the app's chart repositories) and the destinations (the environment's clusters,
-    the template's namespace pattern, cluster-scoped kinds only for templates that allow them);
-  - one ApplicationSet per environment (`POST /api/v1/applicationsets?upsert=true`), whose git files
-    generator reads `<root>/*/*/<env>/release.json` (crossed with the environment's clusters when
-    it has several) and makes one Application per app and target: the package at `version`, values
-    from the release repository, `kiln.release=<id>` as a Helm parameter (a label otherwise), the
-    environment's sync policy, and registrations with `enabled: false` left out.
+- **Connect**: an Argo CD instance is an integration of kind `argocd` (Settings → Integrations):
+  its URL, an account's token (an API key, or an AppProject role's token), a CA when its
+  certificate isn't public, the namespace its Applications live in, and `kiln_url`, the address
+  it reaches kiln at when that isn't kiln's public URL (an Argo CD in another cluster reads the
+  release repository there). Verify checks its version (`GET /api/version`) and its rights
+  (`GET /api/v1/account/can-i/…`: repositories, kiln's projects and ApplicationSets, syncing their
+  Applications) and says what's missing.
+- **Register**: through Argo CD's API, kiln keeps in place, before an environment says it's there
+  and again with each release:
+  - the release repository (`POST /api/v1/repositories?upsert=true`), as
+    `<kiln_url>/git/<owner>/<name>.git`, read with a token kiln makes for it that reads that
+    repository and nothing else (`git.read` on it: no push, no API). It lasts 90 days and is
+    replaced a month before it ends, or as soon as Argo CD can't read with it; the one it replaces
+    is revoked. Argo CD tries it as it's put: one it can't read refuses the environment, saying
+    where it looked;
+  - an AppProject per kiln project, `kiln-<project>` (`POST /api/v1/projects`, upserted): the
+    sources its apps come from (each app's chart or git repository, and the release
+    repositories), where they run (each environment's cluster, each app's namespace), and the
+    cluster-scoped kinds they make: a Namespace (for `CreateNamespace`), and those its apps'
+    templates allow (`cluster_kinds`);
+  - one ApplicationSet per environment, `kiln-<env>` (`POST /api/v1/applicationsets?upsert=true`),
+    whose git files generator reads `<root>/*/*/<env>/release.json` and makes one Application per
+    registration, `<env>-<app>`, in its app's project: the package at the release's version, its
+    values from the release repository (a second source, `ref: release`, read as
+    `$release/<root>/<project>/<app>/<env>/values.yaml`), what the release sets and
+    `kiln.release=<id>` as Helm parameters, the environment's sync policy and `CreateNamespace`.
+    Its template patch builds the sources from `release.json`'s keys (Go templates), so both
+    providers run the same file (§6). Registrations disabled, without a version yet, or of a
+    platform are left out. It creates and updates Applications and never deletes one
+    (`applicationsSync: create-update`, `preserveResourcesOnDeletion`): kiln deletes an
+    Application once the ApplicationSet no longer makes it, with what it runs unless that's to be
+    kept. A pause changes an Application's sync policy, which the ApplicationSet leaves to kiln
+    (`ignoreApplicationDifferences`).
 
-  Where ApplicationSets aren't allowed, kiln writes each Application itself
-  (`POST`/`PUT /api/v1/applications`), with the same spec.
-- **Deliver**: a hard refresh (`GET /api/v1/applications/{name}?refresh=hard`), then
-  `POST /api/v1/applications/{name}/sync` when the environment syncs on demand.
-- **Status**: `GET /api/v1/stream/applications?name=…` streams each Application. The release has
-  landed when `status.sync.revision` is its commit, `status.sync.status` is Synced,
-  `status.health.status` is Healthy, and the spec's `kiln.release` parameter is its id: txst's check,
-  with the commit added.
-- **Diff, manifests, resources, logs, actions**: `/server-side-diff`, `/manifests?revision=`,
-  `/resource-tree`, `/logs`, `/resource/actions`.
-- **Pause**: the Application's automated policy off; the next release turns it back on.
-- **Adopting**: an Argo CD Application kiln didn't make becomes a registration. kiln writes its
-  path in the release repository, and the ApplicationSet takes the Application over.
+  Where ApplicationSets aren't allowed (`argocd: { applications: true }`), kiln writes each
+  Application itself (`POST /api/v1/applications?upsert=true`), the same spec with the values
+  inline, in the `default` project.
+- **Deliver**: the ApplicationSet is put again with its refresh annotation, so it reads the
+  release repository at once; once the release's Application is made from its `release.json` (its
+  `kiln.dev/release`), it is refreshed hard, once. A release turns a paused Application's
+  automation back on (§5).
+- **Status**: kiln follows the Applications it made through Argo CD's stream of them
+  (`GET /api/v1/stream/applications?selector=app.kubernetes.io/managed-by=kiln`), one stream per
+  Argo CD: each change wakes the release in flight for its registration, and Argo CD is asked
+  directly only for what the stream doesn't hold (it is down, or just started). A release has
+  landed when Argo CD compared its spec (its `kiln.release`, or its version for plain manifests)
+  with the release repository at a commit that holds the release's files (its `release.json` and
+  `values.yaml` as the release's commit has them), and reports it Synced and Healthy, steady for
+  `watch.settle`: txst's check, with the commit added.
+- **Disable, deregister**: the files change first (the release, or the deregistration's commit);
+  once the ApplicationSet has read them (its refresh done), kiln deletes the Application, keeping
+  what it runs when asked: deleted before, it would be made again.
+- **Diff, manifests, resources, logs**: `/managed-resources`, `/manifests` (another version
+  previewed with `?revisions=<version>&sourcePositions=1`), the Application's resources, `/logs`.
+- **Actions**: `GET /api/v1/applications/{name}/resource/actions` and `POST
+  …/resource/actions/v2` (with parameters: a scale's replicas): Argo CD's built-in actions and any
+  it was given; and a pod deleted (`DELETE …/resource`) for its workload to make again.
+- **Pause**: the Application's automated sync off; the next release turns it back on.
+- **Adopting**: an Application named as the ApplicationSet names it (`<env>-<app>`), one kiln
+  wrote itself before the environment had an ApplicationSet among them, is taken over by the
+  ApplicationSet with what it runs.
 
 ### 8.4 Changing an environment's provider
 
-The release repository stays as it is. kiln registers every app with the new provider in shadow
-mode (it compares and never writes), shows where the two disagree, and hands over when they agree:
-KilnCD already takes objects over from Argo CD by its tracking (cd.md), and Argo CD adopts objects
-kiln deployed through its own tracking annotation. Nothing is recreated either way.
+`POST /api/deploy/environments/{env}/move` with `{to, handover, force}` (`kiln deploy env move
+<env> --to <provider> [--handover [--force]]`, the environment's page, or
+`deploy.environments.move`). The release repository stays as it is: both providers read the same
+`release.json` (§6).
+
+1. **Shadow.** The new provider gets every app that runs there, and compares, never writing:
+   KilnCD apps with their automation off; on Argo CD the environment's ApplicationSet, its
+   Applications' automation off (or Applications kiln writes, likewise).
+2. **Compare.** For each app, where the new provider would change what runs beyond each
+   provider's own tracking marks (`kiln.dev/*`, Argo CD's tracking id and instance label): the
+   objects and their diffs (`GET …/move`). A move that agrees everywhere hands over when asked
+   (`handover`); one that doesn't, only when told to anyway (`force`). Before it hands over, a move
+   can be cancelled (`DELETE …/move`): the shadows go, and what runs, which they never touched,
+   stays with the old provider.
+3. **Hand over**, app by app: the old provider's automation off, the new one's on; it syncs,
+   taking each object over by its tracking (KilnCD takes objects over from Argo CD's tracking,
+   cd.md; Argo CD adopts objects KilnCD deployed through its own), and kiln waits until it runs
+   the app Synced and Healthy. Then the old provider lets go, keeping what runs: on Argo CD, each
+   Application's resources finalizer taken off, the ApplicationSet deleted, each Application
+   deleted without its objects; on KilnCD, each app removed, its objects orphaned. The environment
+   names its new provider.
+4. **Nothing made again.** Each object's uid is read as the handover begins and after it: one whose
+   uid changed, or that's gone, is named as made again.
+
+A move goes on in the background, kept by the server and taken up again after a restart; a
+handover stopped part-way (a provider away) is finished by asking again, and goes only forward.
+While an environment moves, its releases, registrations and pauses wait (`409`). Once apps are
+registered in an environment, its provider changes only by a move. Its clusters must carry the
+same names in both providers.
 
 ## 9. Releases
 
@@ -633,7 +706,7 @@ signed with kiln's OIDC issuer (ci.md W10), as txst signs its deployment tokens.
 | `/api/deploy/git-hosts` | list, add, test, update, remove |
 | `/api/deploy/providers` | list, add (Argo CD connections; KilnCD is always there), test, update, remove |
 | `/api/deploy/templates` | list, add, update, remove |
-| `/api/deploy/environments` | list, add, show, update, remove |
+| `/api/deploy/environments` | list, add, show, update, remove, `move` (§8.4) |
 | `/api/deploy/apps` | list (filters: owner, template, name), create, show, update, archive, delete |
 | `/api/deploy/apps/{app}/environments/{env}` | register, show (status, history, candidates), update, deregister, `pause`, `resume`, `enable`, `disable`, `diff`, `manifests`, `resources`, `logs`, `actions` |
 | `/api/deploy/releases` | create, list (filters: app, environment, state, kind, person, time), show, `approve`, `reject`, `cancel`, `rollback` |
@@ -654,6 +727,8 @@ kiln deploy history web --env production
 kiln deploy rollback web --env production [--to 1040]
 kiln deploy approve 1042 [--note …]          # or reject: cancelled, with why
 kiln deploy env add production --provider argocd/prod-argo --repo github:acme/releases
+kiln deploy env move staging --to kilncd --handover   # compared in shadow, then handed over
+kiln deploy action web --env production Deployment/web restart
 ```
 
 Environments are `kiln deploy env …`: `kiln env` is CI's (a repository's environments, ci.md W15)
@@ -682,6 +757,8 @@ until the two become one.
   | `deploy.environments.list`, `.get`, `.put` | environments |
   | `deploy.apps.list`, `.get`, `.put` | apps |
   | `deploy.registrations.get`, `.create`, `.delete`, `.pause`, `.resume`, `.candidates` | registrations: what runs, register, deregister, the provider's automation, what a rollback can go to |
+  | `deploy.registrations.actions`, `.action` | what can be done to an object an app runs, and doing it (agents only where they may deploy) |
+  | `deploy.environments.move`, `.move_status`, `.move_cancel` | an environment moved to another provider (a person's to start) |
   | `deploy.releases.list`, `.get`, `.create`, `.rollback`, `.cancel` | releases; `create` and `rollback` take an `idempotency_key` |
   | `deploy.releases.wait` | until a release is done, or moves at all (`until: any`), for up to 600 s: no polling |
 

@@ -15,7 +15,7 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::argocd;
+use super::{appset, argocd};
 use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
@@ -143,6 +143,32 @@ fn provider_name(env: &Environment) -> &'static str {
     if argo_of(env).is_some() { "Argo CD" } else { "KilnCD" }
 }
 
+/// Refused while an environment moves between providers (§8.4): what runs there is changing hands.
+async fn not_moving(d: &Deploy, env: &str) -> Result<(), Fail> {
+    match super::moves::under_way(d, env).await.map_err(internal)? {
+        Some(m) => Err(conflict(format!("{env} is moving to {}: releases there wait until the move is done or cancelled", m.to))),
+        None => Ok(()),
+    }
+}
+
+/// Follows an Argo CD's Applications by its stream from now on, unless kiln already does: each
+/// change wakes the release of its registration in flight.
+fn watch_argo(d: &Deploy, integration: &str) {
+    let changed: argocd::Changed = Arc::new(|app: &Value| {
+        let label = |k: &str| app.pointer(&format!("/metadata/labels/{}", k.replace('/', "~1"))).and_then(Value::as_str).map(str::to_owned);
+        let (Some(a), Some(e), Some(d)) = (label("kiln.dev/app"), label("kiln.dev/environment"), super::get()) else { return };
+        crate::rt::spawn(async move {
+            if let Ok(Some(r)) = store::in_flight(&d.hub.store, &a, &e).await
+                && r.state == State::Delivering
+                && store::schedule(&d.hub.store, r.id, crate::util::now_unix()).await.is_ok()
+            {
+                d.wake.notify();
+            }
+        });
+    });
+    d.argo.ensure(&d.hub, integration, changed);
+}
+
 /// A commit, as messages show it.
 fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
@@ -209,7 +235,34 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     if e.watch.timeout_secs < 30 || e.watch.settle_secs > e.watch.timeout_secs || e.watch.refused_secs > e.watch.timeout_secs {
         return Err(bad("watch: timeout_secs at least 30, settle_secs and refused_secs at most timeout_secs"));
     }
+    let before = store::environment(&d.hub.store, &e.name).await.map_err(internal)?;
+    // Its provider changes by a move, which hands what runs over (§8.4).
+    if let Some(b) = &before
+        && b.provider != e.provider
+        && !store::registrations(&d.hub.store, None, Some(&e.name)).await.map_err(internal)?.is_empty()
+    {
+        return Err(conflict(format!(
+            "{} has apps registered on {}: move it (POST /api/deploy/environments/{}/move, `kiln deploy env move`), which hands what runs to {} with nothing made again",
+            e.name, b.provider, e.name, e.provider
+        )));
+    }
     ensure_release_repo(d, &e.release_repo).await.map_err(bad)?;
+    // On Argo CD: its ApplicationSet, and what it needs, in place before the environment says so
+    // (or none, where kiln writes the Applications). Only what they read asks Argo CD: a freeze or a
+    // gate changes while it's away.
+    let argo_reads = before.as_ref().is_none_or(|b| b.provider != e.provider || b.release_repo != e.release_repo || b.targets != e.targets || b.sync != e.sync || b.argocd != e.argocd);
+    if argo_reads && let Some(name) = argo_of(&e) {
+        let argo = argocd::Argo::of(&d.hub, name).await.map_err(|why| (StatusCode::BAD_GATEWAY, why))?;
+        match appset::integration_of(&e) {
+            Some(_) => appset::ensure(d, &argo, &e).await.map_err(|why| (StatusCode::BAD_GATEWAY, why.to_string()))?,
+            // kiln takes to writing the Applications: their ApplicationSet goes, and they stay
+            // (kiln's ApplicationSets never delete theirs).
+            None if before.as_ref().is_some_and(|b| appset::integration_of(b) == Some(name)) => {
+                argo.delete_application_set(&argocd::set_name(&e.name)).await.map_err(|why| (StatusCode::BAD_GATEWAY, why))?;
+            }
+            None => {}
+        }
+    }
     store::put_environment(&d.hub.store, &e).await.map_err(internal)?;
     // Its gates may have changed: what waits on them looks again now.
     let held = store::releases(&d.hub.store, store::ReleaseQuery { app: None, environment: Some(e.name.clone()), state: None, version: None, limit: 1000 }).await.map_err(internal)?;
@@ -268,6 +321,17 @@ pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(
     if !regs.is_empty() {
         let apps: Vec<&str> = regs.iter().map(|r| r.app.as_str()).collect();
         return Err(conflict(format!("{name} has apps registered: {}. Deregister them first", apps.join(", "))));
+    }
+    let env = environment(d, name).await?;
+    // Its ApplicationSet goes with it (it makes nothing: nothing is registered).
+    if let Some(integration) = appset::integration_of(&env) {
+        let gone = match argocd::Argo::of(&d.hub, integration).await {
+            Ok(argo) => argo.delete_application_set(&argocd::set_name(name)).await,
+            Err(e) => Err(e),
+        };
+        if let Err(why) = gone {
+            tracing::warn!(environment = %name, error = %why, "deploy: an environment's ApplicationSet couldn't be deleted with it");
+        }
     }
     if !store::delete_environment(&d.hub.store, name).await.map_err(internal)? {
         return Err(missing(format!("no environment {name}")));
@@ -631,6 +695,7 @@ async fn commit_files(d: &Deploy, env: &Environment, changes: Vec<Change>, messa
 }
 
 pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -> Result<Registration, Fail> {
+    not_moving(d, env_name).await?;
     let (a, env) = (app(d, app_name).await?, environment(d, env_name).await?);
     if a.archived {
         return Err(conflict(format!("{app_name} is archived")));
@@ -673,12 +738,23 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     commit_files(d, &env, changes, message, actor).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let reg = Registration { app: app_name.to_owned(), environment: env_name.to_owned(), enabled: false, paused: false, running: None, created_at: crate::util::now_unix(), degraded: None };
     store::put_registration(&d.hub.store, &reg).await.map_err(internal)?;
+    // On Argo CD, its project allows it from now (the first release does, if Argo CD is away now).
+    if let Some(integration) = appset::integration_of(&env) {
+        let ready = match argocd::Argo::of(&d.hub, integration).await {
+            Ok(argo) => appset::ensure(d, &argo, &env).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(why) = ready {
+            tracing::warn!(app = %app_name, environment = %env_name, error = %why, "deploy: Argo CD isn't ready for a registration yet; its first release makes it so");
+        }
+    }
     audit(d, actor, "deploy.register", format!("{app_name} in {env_name}")).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "registration": reg }));
     Ok(reg)
 }
 
 pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, keep: bool) -> Result<(), Fail> {
+    not_moving(d, env_name).await?;
     let actor = who.name.as_str();
     let (a, env) = (app(d, app_name).await?, environment(d, env_name).await?);
     agents_may(who, &env, "deregister apps")?;
@@ -686,7 +762,11 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
     if let Some(r) = store::in_flight(&d.hub.store, app_name, env_name).await.map_err(internal)? {
         return Err(conflict(format!("release {} is in flight for {app_name} in {env_name}: wait for it, or cancel it", r.id)));
     }
-    if reg.running.is_some() || reg.enabled {
+    let runs = reg.running.is_some() || reg.enabled;
+    // Through an ApplicationSet, its files go first: deleted before, its Application would be made
+    // again from them.
+    let through_set = appset::integration_of(&env).is_some();
+    if runs && !through_set {
         match argo_of(&env) {
             Some(name) => {
                 let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -702,6 +782,13 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
     let changes = vec![Change { path: repo::release_file(rr, &a, env_name), content: None }, Change { path: repo::values_file(rr, &a, env_name), content: None }];
     let message = format!("deregister {app_name} from {env_name}\n\n{REGISTRATION_TRAILER}: {app_name}/{env_name}\n{}: {actor}\n", repo::REQUESTED_BY_TRAILER);
     commit_files(d, &env, changes, message, actor).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    if runs
+        && through_set
+        && let Some(name) = argo_of(&env)
+    {
+        let argo = argocd::Argo::of(&d.hub, name).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+        appset::remove(d, &argo, &env, &argocd::application_name(&a, env_name), keep).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    }
     store::delete_registration(&d.hub.store, app_name, env_name).await.map_err(internal)?;
     audit(d, actor, "deploy.deregister", format!("{app_name} from {env_name}{}", if keep { " (objects kept)" } else { "" })).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "removed": { "app": app_name, "environment": env_name } }));
@@ -715,6 +802,7 @@ async fn registration(d: &Deploy, app_name: &str, env_name: &str) -> Result<Regi
 /// Pauses (or resumes) the provider's automation for a registration, git left as it is: hand edits
 /// survive until the next release, which resumes it.
 pub async fn pause(d: &Deploy, actor: &str, app_name: &str, env_name: &str, paused: bool) -> Result<Registration, Fail> {
+    not_moving(d, env_name).await?;
     let a = app(d, app_name).await?;
     let env = environment(d, env_name).await?;
     let mut reg = registration(d, app_name, env_name).await?;
@@ -939,6 +1027,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     if a.archived {
         return Err(conflict(format!("{} is archived: no new releases", a.name)));
     }
+    not_moving(d, &env.name).await?;
     let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some(), ask.secrets.is_some()].iter().filter(|b| **b).count();
     if asked != 1 {
         return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, promote_from, or secrets"));
@@ -1351,10 +1440,13 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     failed(d, r, why).await?;
                 }
                 Ok((Landed::No, view)) => {
+                    // What it waits on, where the provider says; a stream wakes it as that changes,
+                    // so it looks less often by itself.
+                    let watched = view.get("watched").and_then(Value::as_bool) == Some(true);
+                    r.message = view.get("waiting").and_then(Value::as_str).map(|w| format!("waiting for {w}"));
                     r.provider = view;
-                    r.message = None;
                     store::update_release(st, &r, State::Delivering).await?;
-                    store::schedule(st, id, now + 3).await?;
+                    store::schedule(st, id, now + if watched { 15 } else { 3 }).await?;
                 }
                 // The provider never held it: nothing changed there, and git goes back too.
                 Err(e) if now - committed_at > timeout && delivered.is_none() => {
@@ -1437,6 +1529,15 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     let pinned = crate::secrets::of(&d.hub).current(&crate::secrets::Scope::of(&a.name, &env.name)).await.map_err(|e| format!("the app's secrets: {e:#}"))?;
     file.secrets = crate::secrets::versions_text(pinned.iter().map(|(n, v)| (n.as_str(), *v)));
     let changed = secrets_changed(prior.as_ref().map_or("", |p| p.secrets.as_str()), &file.secrets);
+    // What it runs, filled in for every provider to read the same (§6): a git path is looked at
+    // for a chart where KilnCD can look.
+    let chart = match (&a.package, crate::cd::get(), file.version.as_deref()) {
+        (Package::Git { .. }, Some(cd), Some(v)) => kilncd::git_chart(&cd, &a.package, v).await,
+        _ => false,
+    };
+    if let Err(why) = repo::resolve(&mut file, &a, chart) {
+        return Ok(Committed::Refused(why));
+    }
     // Checked before it changes anything: its secrets, its images, and on KilnCD its render and
     // its cluster's dry run (§8.1).
     let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
@@ -1466,7 +1567,7 @@ fn secrets_changed(before: &str, after: &str) -> String {
 }
 
 /// What a release's commit holds for its registration.
-async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<ReleaseFile, String> {
+pub(super) async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<ReleaseFile, String> {
     let (hosted, rr, path, commit) = (d.hosted.clone(), env.release_repo.clone(), repo::release_file(&env.release_repo, a, &env.name), commit.to_owned());
     let bytes = crate::rt::blocking(move || hosted.read(&rr.repo, &commit, &path)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
     let bytes = bytes.ok_or("the commit holds no release.json for the registration")?;
@@ -1494,8 +1595,16 @@ pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, versi
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
     let chart = kilncd::git_chart(&cd, &a.package, version).await;
+    // Filled again for that version, as a release of it would be.
+    file.package = a.package.clone();
+    repo::resolve(&mut file, a, chart).map_err(bad)?;
     let then = kilncd::definition(a, env, &reg, &file, &commit, &url, chart).map_err(bad)?;
     futures::try_join!(cd.render_definition(now), cd.render_definition(then)).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))
+}
+
+/// A registration's values at a commit (`None`: it has none).
+pub(super) async fn values_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<Option<String>, String> {
+    file_at(d, env, commit, repo::values_file(&env.release_repo, a, &env.name)).await
 }
 
 /// A file of a release's commit, for its registration (`None`: the commit has none).
@@ -1519,17 +1628,23 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
     }
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
+        watch_argo(d, name);
+        if let (Package::Helm { repo, .. }, Some(_)) = (&file.package, &file.version)
+            && let Some(oci) = repo.strip_prefix("oci://")
+        {
+            argo.ensure_oci_repo(oci.trim_end_matches('/')).await?;
+        }
+        // Through the environment's ApplicationSet: it's read again now, and makes or updates the
+        // release's Application; following the release does the rest, a deletion included.
+        if appset::integration_of(&env).is_some() {
+            return appset::ensure(d, &argo, &env).await;
+        }
         let app_name = argocd::application_name(&a, &env.name);
         if !file.enabled {
             return Ok(argo.delete_application(&app_name, r.keep).await?);
         }
         if file.version.is_none() {
             return Ok(());
-        }
-        if let super::model::Package::Helm { repo, .. } = &a.package
-            && let Some(oci) = repo.strip_prefix("oci://")
-        {
-            argo.ensure_oci_repo(oci.trim_end_matches('/')).await?;
         }
         let values = file_at(d, &env, &commit, repo::values_file(&env.release_repo, &a, &env.name)).await?;
         let spec = argocd::application(&argo.namespace, &a, &env, &reg, &file, values.as_deref(), &commit).map_err(Undelivered::Refused)?;
@@ -1562,8 +1677,17 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     let file = release_file_at(d, &a, &env, commit).await?;
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
+        watch_argo(d, name);
+        if appset::integration_of(&env).is_some() {
+            let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+            return appset::follow(d, &argo, r, &a, &env, &reg, &file, commit).await;
+        }
         let app_name = argocd::application_name(&a, &env.name);
-        let current = argo.application(&app_name, None).await?;
+        // What its stream last said, or Argo CD asked.
+        let current = match d.argo.application(name, &app_name) {
+            Some(app) => Some(app),
+            None => argo.application(&app_name, None).await?,
+        };
         if !file.enabled {
             // Still there and not on its way out: the delete didn't happen, and is asked for again.
             if current.as_ref().is_some_and(|c| c.pointer("/metadata/deletionTimestamp").is_none()) {
@@ -2039,6 +2163,7 @@ mod tests {
             watch: Default::default(),
             concurrency: Default::default(),
             agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
+            argocd: Default::default(),
         }
     }
 

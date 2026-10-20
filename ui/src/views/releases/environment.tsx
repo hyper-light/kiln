@@ -2,13 +2,15 @@
  * An environment deployed to by API (docs/deploy-api.md §4): its provider and release repository,
  * where it deploys, the gates each release passes there and who may release; what runs there; and
  * a freeze, put on and lifted here with why (an incident, a holiday): nothing goes until it's lifted.
- * Its gates, concurrency and what agents may do are changed here too.
+ * Its gates, concurrency and what agents may do are changed here too, and it moves to another
+ * provider here (§8.4): the new one compares in shadow, then takes over with nothing made again.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
-import { Plus, Snowflake, Sun, Trash2 } from "lucide-react";
+import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
-import { boardHref, deployApi, describe, providerName, releaseAppHref, releaseHref, type Environment, type Gates } from "@/api/deploy";
+import { api } from "@/api/client";
+import { boardHref, deployApi, describe, providerName, releaseAppHref, releaseHref, type Environment, type Gates, type Move } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
@@ -225,6 +227,149 @@ function Freeze({ e }: { e: Environment }) {
   );
 }
 
+const PHASE_WORDS: Record<Move["phase"], string> = {
+  comparing: "comparing in shadow",
+  compared: "compared",
+  handing_over: "handing over",
+  moved: "moved",
+  failed: "stopped",
+  cancelled: "cancelled",
+};
+
+/** How a move stands: each app, whether the new provider agrees with what runs, and, handed over, whether anything was made again. */
+function MoveReport({ m }: { m: Move }) {
+  return (
+    <div className="rel-move">
+      <p className="cd-meta">
+        To {providerName(m.to)}: {PHASE_WORDS[m.phase]}
+        {m.message ? ` · ${m.message}` : ""}
+      </p>
+      {m.registrations.length > 0 && (
+        <ol className="rel-history">
+          {m.registrations.map((r) => (
+            <li key={r.app}>
+              <Link to={releaseAppHref(r.app)}>{r.app}</Link>
+              <span className="rel-what">
+                {r.agrees === undefined ? "not compared yet" : r.agrees ? "agrees with what runs" : `would change ${r.differences?.length ?? 0} object${r.differences?.length === 1 ? "" : "s"}`}
+              </span>
+              <span className="rel-who">
+                {r.remade === undefined ? "" : r.remade.length ? `made again: ${r.remade.join(", ")}` : `nothing made again (${Object.keys(r.uids ?? {}).length} objects)`}
+              </span>
+              {!!r.differences?.length && (
+                <details className="rel-manifest">
+                  <summary>Where it disagrees</summary>
+                  {r.differences.map((d) => (
+                    <pre key={`${d.key.kind}/${d.key.namespace}/${d.key.name}`} className="rel-log">
+                      {`${d.key.kind} ${d.key.namespace}/${d.key.name}\n`}
+                      {d.hunks.flatMap((h) => h.lines).join("\n")}
+                    </pre>
+                  ))}
+                </details>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+/** Its provider, and moving it to another (§8.4): compared in shadow first, then handed over. */
+function Provider({ e }: { e: Environment }) {
+  const move = useSuspenseResource(`deploy/move/${e.name}`, (s) => deployApi.move(e.name, s), { on: DEPLOY_EVENTS, pollMs: 10_000 }).data;
+  const integrations = useSuspenseResource("deploy/integrations", (s) => api.integrations(s)).data.integrations.filter((i) => i.kind === "argocd");
+  const options = [{ value: "kilncd", label: "KilnCD (kiln's own)" }, ...integrations.map((i) => ({ value: `argocd/${i.name}`, label: `Argo CD ${i.name}` }))].filter((o) => o.value !== e.provider);
+  const [to, setTo] = React.useState(options[0]?.value ?? "");
+  const [applications, setApplications] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const open = !!move && (["comparing", "compared", "handing_over"].includes(move.phase) || (move.phase === "failed" && move.handing_over));
+  const agree = !!move && move.registrations.every((r) => r.agrees);
+  const argo = e.provider.startsWith("argocd/");
+  const ask = async (handover: boolean, force = false) => {
+    setBusy(true);
+    try {
+      const target = open && move ? move.to : to;
+      const m = await deployApi.startMove(e.name, { to: target, handover, force, argocd: { applications: open && move ? move.argocd.applications : applications } });
+      toast({
+        title: handover ? `Handing ${e.name} over to ${providerName(m.to)}` : `Comparing ${e.name} on ${providerName(m.to)}`,
+        description: "It goes on by itself; this page follows it.",
+        tone: "info",
+      });
+      invalidate(`deploy/move/${e.name}`);
+    } catch (err) {
+      toast({ title: "Not moved", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const cancel = async () => {
+    setBusy(true);
+    try {
+      await deployApi.cancelMove(e.name);
+      toast({ title: "Move cancelled", description: `${e.name} stays on ${providerName(e.provider)}.`, tone: "info" });
+      invalidate(`deploy/move/${e.name}`);
+    } catch (err) {
+      toast({ title: "Not cancelled", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Panel
+      eyebrow="Provider"
+      title={providerName(e.provider)}
+      description={
+        argo
+          ? e.argocd?.applications
+            ? "kiln writes each app's Application itself."
+            : "One ApplicationSet makes each app's Application from its release.json."
+          : "kiln's own engine runs each app from the release repository."
+      }
+    >
+      {move && <MoveReport m={move} />}
+      {!open ? (
+        options.length > 0 && (
+          <div className="rel-register">
+            <SelectField label="Move it to" value={to} onChange={setTo} options={options} />
+            {to.startsWith("argocd/") && (
+              <label className="rel-check">
+                <input type="checkbox" className="check" checked={applications} onChange={(ev) => setApplications(ev.target.checked)} />
+                <span>kiln writes each Application (no ApplicationSet)</span>
+              </label>
+            )}
+            <Button size="sm" variant="secondary" disabled={busy || !to} onClick={() => void ask(false)}>
+              <ArrowRightLeft /> Compare there
+            </Button>
+          </div>
+        )
+      ) : (
+        <div className="rel-register">
+          {move?.phase === "compared" && (
+            <Button size="sm" disabled={busy || !agree} onClick={() => void ask(true)}>
+              Hand over to {providerName(move.to)}
+            </Button>
+          )}
+          {move?.phase === "compared" && !agree && (
+            <Button size="sm" variant="ghost-danger" disabled={busy} onClick={() => void ask(true, true)}>
+              Hand over anyway
+            </Button>
+          )}
+          {move?.phase === "failed" && move.handing_over && (
+            <Button size="sm" disabled={busy} onClick={() => void ask(true)}>
+              Finish the handover
+            </Button>
+          )}
+          {move?.phase === "compared" && (
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>
+              Cancel the move
+            </Button>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 /** What runs here, app by app, and what's on its way. */
 function Here({ env }: { env: string }) {
   const board = useRes(boardRes).data;
@@ -276,6 +421,9 @@ function EnvView({ name }: { name: string }) {
           {gates.length > 0 && <Facts items={gates} />}
         </Panel>
         <Freeze e={e} />
+        <Loadable label="its provider">
+          <Provider e={e} />
+        </Loadable>
       </div>
       <Loadable label="what runs here">
         <Here env={e.name} />

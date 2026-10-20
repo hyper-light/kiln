@@ -29,6 +29,50 @@ pub async fn mint_reader(hub: &Hub, repo: &str, days: Option<i64>, note: &str) -
     Ok((id, token))
 }
 
+/// The readers made with `note` that are neither revoked nor expiring within `margin` seconds:
+/// each one's id and when it expires.
+pub async fn readers(hub: &Hub, note: &str, margin: i64) -> anyhow::Result<Vec<(String, Option<i64>)>> {
+    let (note, after) = (note.to_owned(), crate::util::now_unix() + margin);
+    hub.store
+        .call(move |c| {
+            let mut q = c.prepare(
+                "SELECT id, expires_at FROM tokens WHERE kind = 'pat' AND revoked_at IS NULL AND json_extract(scopes, '$.reader') = 1 AND json_extract(scopes, '$.note') = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+            )?;
+            let rows = q.query_map(params![note, after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+}
+
+/// Revokes one reader, made in vain.
+pub async fn revoke_reader(hub: &Hub, id: &str) -> anyhow::Result<()> {
+    let (id, now) = (id.to_owned(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            c.execute("UPDATE tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL", params![id, now])?;
+            Ok(())
+        })
+        .await
+}
+
+/// Revokes the readers made with `note`, but `keep`: those a new one replaced.
+pub async fn revoke_readers(hub: &Hub, note: &str, keep: &str) -> anyhow::Result<usize> {
+    let (n, k, now) = (note.to_owned(), keep.to_owned(), crate::util::now_unix());
+    let revoked = hub
+        .store
+        .call(move |c| {
+            Ok(c.execute(
+                "UPDATE tokens SET revoked_at = ?3 WHERE kind = 'pat' AND revoked_at IS NULL AND json_extract(scopes, '$.reader') = 1 AND json_extract(scopes, '$.note') = ?1 AND id != ?2",
+                params![n, k, now],
+            )?)
+        })
+        .await?;
+    if revoked > 0 {
+        hub.store.audit("kiln".into(), "tokens.revoke".into(), format!("{revoked} reader(s) replaced: {note}")).await;
+    }
+    Ok(revoked)
+}
+
 /// An agent token kiln makes for one of its own agent sessions (`agent:<label>`), acting for the
 /// user `user` (their id, or `owner` on a kiln nobody else signs in to) with `grants`
 /// (`developer@repo:acme/app`; never more than the user may):
