@@ -852,6 +852,9 @@ impl Dispatch {
         if caps & CAP_DOCKER == 0 {
             facts.executors.remove("docker");
         }
+        if caps & crate::proto::CAP_FIRECRACKER == 0 {
+            facts.executors.remove("firecracker");
+        }
         facts.executors.entry("host".to_owned()).or_default();
         RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
     }
@@ -1984,7 +1987,13 @@ impl Dispatch {
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
             leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total") },
-            executor: wire::ExecutorSpec { image: if executor.as_deref() == Some("docker") { image } else { None }, kind: executor.unwrap_or_else(|| "host".into()), options: serde_json::Value::Null, slot: None },
+            // The image for container and microVM executors (W13-R04, R05).
+            executor: wire::ExecutorSpec {
+                image: if matches!(executor.as_deref(), Some("docker" | "firecracker")) { image } else { None },
+                kind: executor.unwrap_or_else(|| "host".into()),
+                options: serde_json::Value::Null,
+                slot: None,
+            },
             container: spec.container.clone(),
             services: spec.services.iter().cloned().collect(),
             job_container: job.and_then(|j| j.container.clone()),

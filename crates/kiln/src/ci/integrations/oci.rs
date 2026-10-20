@@ -400,6 +400,100 @@ pub async fn resolve(registry: &Registry, reference: &Reference) -> anyhow::Resu
     Ok(Some(Resolved { digest, media_type, platforms }))
 }
 
+/// An image's manifest for one platform, as a pull reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pulled {
+    /// The manifest's own digest (not its index's).
+    pub digest: String,
+    /// Its config blob's digest.
+    pub config: String,
+    /// Its layers, bottom first: digest, media type, size.
+    pub layers: Vec<(String, String, u64)>,
+}
+
+/// The manifest `reference` names for `os`/`arch` (Go's names: `amd64`, `arm64`): an index's
+/// entry for that platform, else the manifest itself. Each is checked against its digest.
+pub async fn manifest_for(registry: &Registry, reference: &Reference, os: &str, arch: &str) -> anyhow::Result<Pulled> {
+    let scope = format!("repository:{}:pull", reference.repository);
+    let (digest, media_type, bytes) = manifest_bytes(registry, &reference.repository, reference.target(), &scope).await?;
+    if let Some(pinned) = &reference.digest {
+        anyhow::ensure!(*pinned == digest, "{} answered {digest} for {reference}", registry.name);
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| format!("{reference}'s manifest doesn't read"))?;
+    let (digest, v) = if media_type.contains("index") || media_type.contains("manifest.list") || v.get("manifests").is_some() {
+        let entry = v
+            .get("manifests")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|m| m.pointer("/platform/os").and_then(serde_json::Value::as_str) == Some(os) && m.pointer("/platform/architecture").and_then(serde_json::Value::as_str) == Some(arch))
+            .and_then(|m| m.get("digest").and_then(serde_json::Value::as_str))
+            .with_context(|| format!("{reference} has no image for {os}/{arch} (it has {})", platforms_of(&bytes).join(", ")))?
+            .to_owned();
+        let (got, _, bytes) = manifest_bytes(registry, &reference.repository, &entry, &scope).await?;
+        anyhow::ensure!(got == entry, "{} answered {got} for {reference}'s {os}/{arch} manifest {entry}", registry.name);
+        (got, serde_json::from_slice::<serde_json::Value>(&bytes).with_context(|| format!("{reference}'s {os}/{arch} manifest doesn't read"))?)
+    } else {
+        (digest, v)
+    };
+    let config = v.pointer("/config/digest").and_then(serde_json::Value::as_str).filter(|d| valid_digest(d)).with_context(|| format!("{reference}'s manifest names no config"))?.to_owned();
+    let mut layers = Vec::new();
+    for l in v.get("layers").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        let d = l.get("digest").and_then(serde_json::Value::as_str).filter(|d| valid_digest(d)).with_context(|| format!("{reference}'s manifest has a layer without a digest"))?;
+        let media = l.get("mediaType").and_then(serde_json::Value::as_str).unwrap_or_default();
+        layers.push((d.to_owned(), media.to_owned(), l.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0)));
+    }
+    Ok(Pulled { digest, config, layers })
+}
+
+/// A manifest as the registry has it: its digest (of the bytes read), media type and bytes.
+async fn manifest_bytes(registry: &Registry, repository: &str, target: &str, scope: &str) -> anyhow::Result<(String, String, Vec<u8>)> {
+    let resp = call(registry, Method::Get, &format!("/v2/{repository}/manifests/{target}"), scope).await?;
+    match resp.status() {
+        404 => anyhow::bail!("{} has no {repository}:{target}", registry.name),
+        401 | 403 => anyhow::bail!("{} refused {repository}:{target} ({}): it's private, or the credentials can't pull it", registry.name, resp.status()),
+        s if !(200..300).contains(&s) => anyhow::bail!("{} answered {s} for {repository}:{target}", registry.name),
+        _ => {}
+    }
+    let media_type = resp.header("content-type").unwrap_or_default().split(';').next().unwrap_or_default().trim().to_owned();
+    let bytes = resp.bytes(MANIFEST_LIMIT).await?.to_vec();
+    Ok((format!("sha256:{}", crate::util::sha256_hex(&bytes)), media_type, bytes))
+}
+
+/// A blob of `repository` written to `path` (through a file beside it), checked against its
+/// digest as it comes; a redirect to the registry's storage followed. Its size.
+pub async fn blob_to(registry: &Registry, repository: &str, digest: &str, path: &std::path::Path) -> anyhow::Result<u64> {
+    use sha2::Digest as _;
+    anyhow::ensure!(valid_digest(digest), "`{digest}` is not a digest");
+    let scope = format!("repository:{repository}:pull");
+    let mut resp = call(registry, Method::Get, &format!("/v2/{repository}/blobs/{digest}"), &scope).await?;
+    for _ in 0..5 {
+        if !matches!(resp.status(), 301 | 302 | 303 | 307 | 308) {
+            break;
+        }
+        let to = resp.header("location").map(|l| absolute(registry, l)).context("a redirect without a location")?;
+        // Storage's own signed URL: no registry credentials go there.
+        resp = client()?.get(&to).timeout(Duration::from_secs(3600)).send().await.with_context(|| format!("GET {to}"))?;
+    }
+    anyhow::ensure!(resp.is_success(), "{} answered {} for {repository}'s blob {digest}", registry.name, resp.status());
+    let part = path.with_extension("part");
+    let (tx, done) = crate::rt::file_sink(&part, u64::MAX)?;
+    let mut hash = sha2::Sha256::new();
+    while let Some(chunk) = resp.chunk().await? {
+        hash.update(&chunk);
+        tx.send(chunk).await.map_err(|_| anyhow::anyhow!("writing {} stopped", part.display()))?;
+    }
+    drop(tx);
+    let size = done.await?;
+    let got = format!("sha256:{}", hex::encode(hash.finalize()));
+    if got != digest {
+        let _ = std::fs::remove_file(&part);
+        anyhow::bail!("{repository}'s blob {digest} came as {got}");
+    }
+    std::fs::rename(&part, path)?;
+    Ok(size)
+}
+
 /// A repository's tags, as far as ten pages of a thousand go.
 pub async fn tags(registry: &Registry, repository: &str) -> anyhow::Result<Vec<String>> {
     let scope = format!("repository:{repository}:pull");

@@ -238,6 +238,19 @@ impl Layout {
     }
 }
 
+/// In a microVM's leg (W13-R05): its forwarder to the host's egress proxy, and what that proxy
+/// refuses, as the host says it.
+fn microvm_egress() -> Option<(String, async_channel::Receiver<String>)> {
+    #[cfg(target_os = "linux")]
+    {
+        super::guest::blocked().map(|b| (format!("http://127.0.0.1:{}", super::guest::LOCAL_PROXY), b))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// `p` with `.` and `..` resolved by name, as .NET's `GetFullPath` does.
 fn lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -1202,8 +1215,24 @@ impl Leg {
             }
             return Ok(Status::Failed);
         }
-        // A network policy with the leg's steps on the host (W18-R08): the proxy on loopback.
-        if let (Some(n), None) = (&a.network, &st.egress) {
+        // In a microVM (W13-R05) its host's egress proxy, with the leg's policy, is the one way
+        // out: steps go to it through the guest's forwarder, and what it refuses comes from there.
+        if let Some((url, blocked)) = microvm_egress() {
+            for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                st.env.insert(k.into(), url.clone());
+            }
+            for k in ["NO_PROXY", "no_proxy"] {
+                st.env.insert(k.into(), "localhost,127.0.0.1,::1".into());
+            }
+            st.egress = Some(std::sync::Arc::new(super::egress::Pool::remote(blocked)));
+            if let Some(n) = &a.network {
+                self.note(
+                    0,
+                    &format!("The leg's network is contained: out only through kiln's egress proxy, to kiln and {}", if n.allow.is_empty() { "nothing else".to_owned() } else { n.allow.join(", ") }),
+                )
+                .await;
+            }
+        } else if let (Some(n), None) = (&a.network, &st.egress) {
             match super::egress::Pool::local(self.egress_policy(n)).await {
                 Ok((pool, port)) => {
                     let url = format!("http://127.0.0.1:{port}");
@@ -2048,9 +2077,7 @@ impl Leg {
 
     /// What the leg's network policy lets it reach: kiln's server always, as this runner reaches it.
     fn egress_policy(&self, n: &kiln_ci::wire::Network) -> super::egress::Policy {
-        let r = &self.a.runtime;
-        let urls: Vec<&str> = [r.results_url.as_str(), r.cache_url.as_str(), r.facade_url.as_str(), r.api_url.as_str(), r.graphql_url.as_str()].into_iter().chain(r.id_token_url.as_deref()).collect();
-        super::egress::Policy::new(n.allow.clone(), &urls)
+        super::egress::Policy::for_leg(&self.a.runtime, n.allow.clone())
     }
 
     async fn start(&self, idx: u32, name: &str, kind: &str, action: Option<String>) {

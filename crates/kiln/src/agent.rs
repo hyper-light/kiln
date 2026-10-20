@@ -685,6 +685,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("server QUIC address unknown (pass --quic)"))?;
     // HTTP(S) to the server (source archives, artifacts): public roots plus kiln's own CA.
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
+    // A microVM's leg reaches the server as this runner does, so it trusts the same CA (W13-R05).
+    #[cfg(target_os = "linux")]
+    let microvm_ca = ca.clone();
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -2273,7 +2276,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         };
                         let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
+                        // On the `firecracker` executor, in a microVM of its own (W13-R05).
+                        #[cfg(target_os = "linux")]
+                        let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
                         crate::rt::spawn(async move {
+                            #[cfg(target_os = "linux")]
+                            let result = match microvm {
+                                Some(ca) => crate::runner::firecracker::run(leg, Some(ca)).await,
+                                None => leg.run().await,
+                            };
+                            #[cfg(not(target_os = "linux"))]
                             let result = leg.run().await;
                             let _ = done.send(result).await;
                         });

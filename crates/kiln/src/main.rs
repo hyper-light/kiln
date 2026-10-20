@@ -428,6 +428,11 @@ fn thread_stacks() {
 
 fn main() -> ExitCode {
     thread_stacks();
+    // A microVM's init (docs/ci.md W13-R05): before anything else starts, as PID 1 forks.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("guest") {
+        return kiln::runner::guest::main(&std::env::args().nth(2).unwrap_or_default());
+    }
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();

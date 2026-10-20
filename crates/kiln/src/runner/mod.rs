@@ -12,9 +12,15 @@ pub mod credential;
 pub mod docker;
 pub mod pool;
 pub mod egress;
+#[cfg(target_os = "linux")]
+pub mod firecracker;
+#[cfg(target_os = "linux")]
+pub mod guest;
 pub mod hashfiles;
 pub mod kept;
 pub mod probe;
+#[cfg(target_os = "linux")]
+pub mod rootfs;
 pub mod runtime;
 pub mod setup;
 pub mod workspaces;

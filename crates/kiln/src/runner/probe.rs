@@ -79,12 +79,19 @@ async fn tools() -> BTreeMap<String, String> {
     found.into_iter().flatten().collect()
 }
 
-/// The executors this runner can run legs on right now, each probed: the host always; Docker (or
-/// Podman) when its engine answers, with its version and whether it runs rootless. Firecracker and
-/// shards are reported as tools until this runner can run legs on them.
+/// The executors this runner can run legs on right now, each probed: the host always; Firecracker
+/// when its microVMs can run here (KVM, Firecracker, its guest kernel and e2fsprogs: W13-R05), with
+/// its version and kernel; Docker (or Podman) when its engine answers, with its version and whether
+/// it runs rootless. shards is reported as a tool until this runner can run legs on it.
 async fn executors() -> BTreeMap<String, Executor> {
     let mut out = BTreeMap::new();
     out.insert("host".to_owned(), Executor::default());
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(m)) = crate::rt::blocking(super::firecracker::Machine::find).await {
+        let kernel = m.kernel.to_string_lossy().into_owned();
+        let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
+        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel)].into() });
+    }
     let Ok(Some(bin)) = crate::rt::blocking(super::docker::find).await else { return out };
     let engine = if bin.ends_with("podman") { "podman" } else { "docker" };
     let mut version = None;

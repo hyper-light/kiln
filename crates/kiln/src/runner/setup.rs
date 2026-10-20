@@ -55,6 +55,8 @@ pub enum Step {
     Do(String),
     /// Firecracker and its jailer, fetched into `to`.
     Fetch { to: PathBuf },
+    /// A guest kernel for its microVMs, fetched to `to`.
+    FetchKernel { to: PathBuf },
 }
 
 /// What this machine looks like, as the plan needs it.
@@ -69,6 +71,10 @@ pub struct Machine {
     pub groups: Vec<String>,
     /// Firecracker, where it is.
     pub firecracker: Option<PathBuf>,
+    /// The guest kernel its microVMs boot, where it is.
+    pub kernel: Option<PathBuf>,
+    /// e2fsprogs' `mke2fs`, which makes the microVMs' disks.
+    pub mkfs: Option<PathBuf>,
     /// shards, where it is.
     pub shards: Option<PathBuf>,
 }
@@ -121,7 +127,15 @@ pub fn plan(executor: &str, m: &Machine, bin: &Path) -> Vec<Step> {
                 Some(p) => out.push(Step::Ok(format!("Firecracker is at {}.", p.display()))),
                 None => out.push(Step::Fetch { to: bin.to_path_buf() }),
             }
-            out.push(Step::Ok("Its microVMs' networking (tap devices out through the leg's egress proxy) comes with kiln's Firecracker executor, which isn't built yet (docs/ci.md W13-R05).".into()));
+            match &m.kernel {
+                Some(p) => out.push(Step::Ok(format!("Its microVMs boot {}.", p.display()))),
+                None => out.push(Step::FetchKernel { to: kernel_path() }),
+            }
+            match &m.mkfs {
+                Some(p) => out.push(Step::Ok(format!("mke2fs is at {}.", p.display()))),
+                None => out.push(Step::Do("There's no mke2fs here, which makes the microVMs' disks: install e2fsprogs (your distribution's `e2fsprogs` package).".into())),
+            }
+            out.push(Step::Ok("Its microVMs have no network device: their one way out is the leg's egress proxy here, over vsock (docs/ci.md W13-R05).".into()));
         }
         _ => match &m.shards {
             Some(p) => out.push(Step::Ok(format!("shards is at {}.", p.display()))),
@@ -149,6 +163,8 @@ pub fn look(bin: &Path) -> Machine {
     });
     let kvm = Path::new("/dev/kvm").exists().then(|| std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok());
     let firecracker = Some(bin.join("firecracker")).filter(|p| p.is_file()).or_else(|| on_path("firecracker"));
+    let kernel = std::env::var_os("KILN_FIRECRACKER_KERNEL").map(PathBuf::from).or_else(|| Some(kernel_path())).filter(|p| p.is_file());
+    let mkfs = on_path("mke2fs").or_else(|| ["/usr/sbin/mke2fs", "/sbin/mke2fs"].into_iter().map(PathBuf::from).find(|p| p.is_file()));
     Machine {
         user: std::env::var("USER").ok().filter(|u| !u.is_empty()).or_else(|| output("id", &["-un"])).unwrap_or_default(),
         linux: cfg!(target_os = "linux"),
@@ -156,8 +172,45 @@ pub fn look(bin: &Path) -> Machine {
         kvm,
         groups: output("id", &["-Gn"]).map(|g| g.split_whitespace().map(str::to_owned).collect()).unwrap_or_default(),
         firecracker,
+        kernel,
+        mkfs,
         shards: on_path("shards"),
     }
+}
+
+/// Where the microVMs' guest kernel goes, and where the executor looks for it.
+fn kernel_path() -> PathBuf {
+    crate::os::home_dir().join(".kiln").join("firecracker").join("vmlinux")
+}
+
+/// The guest kernel for this machine's architecture: one of Firecracker's own CI kernels (6.1, with
+/// virtio block devices, vsock, ext4 and overlayfs built in), pinned by its SHA-256.
+const KERNELS: &[(&str, &str, &str)] = &[
+    ("x86_64", "firecracker-ci/v1.15/x86_64/vmlinux-6.1.155", "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"),
+    ("aarch64", "firecracker-ci/v1.15/aarch64/vmlinux-6.1.155", "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591"),
+];
+
+/// The guest kernel, fetched to `to` and checked against its pinned SHA-256.
+async fn fetch_kernel(to: &Path) -> anyhow::Result<String> {
+    let arch = std::env::consts::ARCH;
+    let (_, key, want) = KERNELS.iter().find(|(a, _, _)| *a == arch).with_context(|| format!("there's no guest kernel for {arch}"))?;
+    let http = crate::http::client::Client::public()?;
+    let url = format!("https://s3.amazonaws.com/spec.ccfc.min/{key}");
+    let bytes = download(&http, &url).await?;
+    let got = crate::util::sha256_hex(&bytes);
+    anyhow::ensure!(got == *want, "{url}: SHA-256 {got}, where kiln expects {want}");
+    let to = to.to_path_buf();
+    crate::rt::blocking(move || -> anyhow::Result<()> {
+        if let Some(dir) = to.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = to.with_extension("partial");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &to)?;
+        Ok(())
+    })
+    .await??;
+    Ok(key.rsplit('/').next().unwrap_or(key).to_owned())
 }
 
 fn ask(question: &str) -> bool {
@@ -261,6 +314,14 @@ pub async fn cli(a: RunnerArgs) -> anyhow::Result<()> {
                 let tag = fetch_firecracker(&to).await?;
                 println!("  Firecracker {tag} is at {}.", to.join("firecracker").display());
             }
+            Step::FetchKernel { to } => {
+                println!("→ A guest kernel for its microVMs, Firecracker's own (checked against kiln's SHA-256 for it), to {}", to.display());
+                if s.dry_run {
+                    continue;
+                }
+                let name = fetch_kernel(&to).await?;
+                println!("  {name} is at {}.", to.display());
+            }
         }
     }
     if s.dry_run {
@@ -294,8 +355,12 @@ mod tests {
         assert!(matches!(steps.first(), Some(Step::Run { args, .. }) if args == &["-aG", "kvm", "ada"]), "{steps:?}");
         assert_eq!(steps.get(1), Some(&Step::Fetch { to: bin.to_path_buf() }));
         assert!(matches!(steps.get(2), Some(Step::Ok(t)) if t.contains("W13-R05")));
-        let ready = Machine { kvm: Some(true), firecracker: Some(bin.join("firecracker")), ..base.clone() };
+        let ready = Machine { kvm: Some(true), firecracker: Some(bin.join("firecracker")), kernel: Some(bin.join("vmlinux")), mkfs: Some("/usr/bin/mke2fs".into()), ..base.clone() };
         assert!(plan("firecracker", &ready, bin).iter().all(|s| matches!(s, Step::Ok(_))));
+        // Its guest kernel fetched when there's none, and e2fsprogs asked for.
+        let bare = plan("firecracker", &Machine { kernel: None, mkfs: None, ..ready.clone() }, bin);
+        assert!(bare.iter().any(|s| matches!(s, Step::FetchKernel { .. })), "{bare:?}");
+        assert!(bare.iter().any(|s| matches!(s, Step::Do(t) if t.contains("e2fsprogs"))), "{bare:?}");
         assert!(matches!(plan("firecracker", &Machine { linux: false, ..base.clone() }, bin).as_slice(), [Step::Do(t)] if t.contains("isn't Linux")));
         // shards: found, or a person's to install.
         assert!(matches!(plan("shards", &base, bin).as_slice(), [Step::Do(t)] if t.contains("install it")));
