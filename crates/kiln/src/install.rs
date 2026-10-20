@@ -248,10 +248,13 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
             // administrator rights; its Scheduled Task never gives it those.
             say("started     no: not from an elevated shell; it starts at the next sign-in or boot");
         } else {
-            let mut cmd = Command::new(&bin);
-            cmd.arg("supervise").arg("--detach").args(sup_args.iter().skip(1));
-            run(&mut cmd)?;
-            say("started     kiln supervise (detached)");
+            start_replacing(&boot, || {
+                let mut cmd = Command::new(&bin);
+                cmd.arg("supervise").arg("--detach").args(sup_args.iter().skip(1));
+                run(&mut cmd)?;
+                say("started     kiln supervise (detached)");
+                Ok(true)
+            })?;
         }
     }
 
@@ -483,6 +486,80 @@ fn shell_quote(s: &str) -> String {
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+// ----------------------------------------------------------------- an earlier install's runner
+
+/// Start the service (`start`), stopping what an earlier install of it left running with other
+/// arguments (another name, labels or server): a supervisor only keeps out those started with its
+/// own arguments, so it would go on beside the new one, two runners on one state directory.
+/// Stopped first; after, when this process runs under one of them (from that runner's terminal
+/// or agent), as stopping it ends this process too.
+fn start_replacing(i: &Install<'_>, start: impl FnOnce() -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    let ours: Vec<String> = i.args.iter().skip_while(|a| *a != "--").skip(1).cloned().collect();
+    let (stale, inside) = stale_supervisors(&ours);
+    if stale.is_empty() {
+        return start();
+    }
+    let pids = stale.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    say(format!("stopping    kiln an earlier install started with other arguments (pid {pids})"));
+    if !inside {
+        crate::os::supervise::stop(&stale);
+        return start();
+    }
+    let started = start()?;
+    say("            this terminal runs under it, and ends with it");
+    crate::os::supervise::stop(&stale);
+    Ok(started)
+}
+
+/// This user's supervisors of the service `ours` (what follows `supervise --`) that run other
+/// arguments ([`stale_in`]), and whether this process runs under one of them.
+fn stale_supervisors(ours: &[String]) -> (Vec<u32>, bool) {
+    use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_user(UpdateKind::Always));
+    let me = sysinfo::get_current_pid().ok();
+    let user = me.and_then(|p| sys.process(p)).and_then(Process::user_id).cloned();
+    let procs: Vec<(u32, Vec<String>)> = sys
+        .processes()
+        .iter()
+        .filter(|(pid, p)| Some(**pid) != me && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
+        .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
+        .collect();
+    let stale = stale_in(&procs, ours, &crate::config::default_data_dir().join("agent"));
+    let mut up = me.and_then(|p| sys.process(p)).and_then(Process::parent);
+    let mut inside = false;
+    for _ in 0..64 {
+        let Some(p) = up else { break };
+        if stale.contains(&p.as_u32()) {
+            inside = true;
+            break;
+        }
+        up = sys.process(p).and_then(Process::parent);
+    }
+    (stale, inside)
+}
+
+/// Of `procs` (`(pid, command line)`), the supervisors of the service `ours` (what follows
+/// `supervise --`) that run other arguments: `<kiln> supervise [--exe <kiln>] -- <its subcommand> …`
+/// on the same state directory (`--state-dir`, else `default_state`). Never a runner set up beside
+/// it (`--instance`: `kiln install --agent --upgrade`), which is meant to run beside it.
+fn stale_in(procs: &[(u32, Vec<String>)], ours: &[String], default_state: &Path) -> Vec<u32> {
+    let state = |args: &[String]| {
+        let dir = crate::upgrade::arg_value(args, "--state-dir").map_or_else(|| default_state.to_path_buf(), PathBuf::from);
+        dir.canonicalize().unwrap_or(dir)
+    };
+    let our_state = state(ours);
+    procs
+        .iter()
+        .filter_map(|(pid, argv)| {
+            let sep = argv.iter().position(|w| w == "--")?;
+            let (before, after) = (argv.get(1..sep)?, argv.get(sep + 1..)?);
+            let same_service = before.iter().any(|w| w == "supervise") && after.first() == ours.first() && !after.iter().any(|w| w == "--instance") && state(after) == our_state;
+            (same_service && after != ours).then_some(*pid)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------- launchd
@@ -1008,30 +1085,24 @@ fn scheduled_task(i: &Install<'_>, start: TaskStart) -> anyhow::Result<bool> {
         match created {
             Ok(()) => {
                 say(format!("boot        Scheduled Task \"{}\" at boot, as {user}, whether or not anyone signs in", i.unit));
-                return Ok(task_now(i.unit));
+                return task_now(i);
             }
             Err(why) => not_at_boot = Some(why),
         }
     }
-    let started = match create_task(i, TaskStart::SignIn, false) {
-        Ok(()) => {
-            say(format!("boot        Scheduled Task \"{}\" at {user}'s sign-in", i.unit));
-            task_now(i.unit)
-        }
+    match create_task(i, TaskStart::SignIn, false) {
+        Ok(()) => say(format!("boot        Scheduled Task \"{}\" at {user}'s sign-in", i.unit)),
         // A task of this name registered with administrator rights, which only an administrator
         // can replace: kept when it starts this same kiln, as another would run beside it.
         Err(why) => match task_definition(i.unit) {
-            Some(task) if task.runs(i) => {
-                say(format!("boot        Scheduled Task \"{}\" {} (kept: set up with administrator rights)", i.unit, task.when()));
-                task_now(i.unit)
-            }
+            Some(task) if task.runs(i) => say(format!("boot        Scheduled Task \"{}\" {} (kept: set up with administrator rights)", i.unit, task.when())),
             Some(_) => anyhow::bail!(
                 "the Scheduled Task \"{}\" starts kiln differently, and only an administrator can change it ({why}): run this again in an administrator PowerShell",
                 i.unit
             ),
             None => return startup_folder(i, &why),
         },
-    };
+    }
     if let Some(why) = not_at_boot {
         say(if elevated {
             format!("            not at boot: {why}")
@@ -1039,7 +1110,7 @@ fn scheduled_task(i: &Install<'_>, start: TaskStart) -> anyhow::Result<bool> {
             format!("            not at boot ({why}); for that, run once in an administrator PowerShell: {}", install_command(i))
         });
     }
-    Ok(started)
+    task_now(i)
 }
 
 /// Where `schtasks.exe` is (by its full path, as an administrator runs it).
@@ -1087,12 +1158,13 @@ fn create_task_elevated(unit: &str, xml_path: &Path, written: &[u8]) -> Result<(
     if code == 0 { Ok(()) } else { Err(format!("schtasks exited with {code}")) }
 }
 
-/// Have Scheduled Task `unit` start kiln now (it launches a detached supervisor and exits;
-/// nothing happens while one runs), and drop the Startup-folder fallback an earlier install may
-/// have left, which would start it a second way.
-fn task_now(unit: &str) -> bool {
-    let _ = std::fs::remove_file(startup_script(unit));
-    quiet(Command::new("schtasks").args(["/Run", "/TN", unit]))
+/// Have Scheduled Task `i.unit` start kiln now (it launches a detached supervisor and exits;
+/// nothing happens while one with the same arguments runs, and one with others is stopped), and
+/// drop the Startup-folder fallback an earlier install may have left, which would start it a
+/// second way.
+fn task_now(i: &Install<'_>) -> anyhow::Result<bool> {
+    let _ = std::fs::remove_file(startup_script(i.unit));
+    start_replacing(i, || Ok(quiet(Command::new("schtasks").args(["/Run", "/TN", i.unit]))))
 }
 
 /// What a Scheduled Task runs, as Task Scheduler has it.
@@ -1262,6 +1334,56 @@ mod tests {
         // (104), another machine's runner (105, 109), something else of kiln's (108), or this process.
         assert_eq!(strays_in(ps, state, &[], 0), [101, 103, 106, 107]);
         assert_eq!(strays_in(ps, state, &[103], 106), [101, 107]);
+    }
+
+    #[test]
+    fn an_earlier_installs_runner_with_other_arguments_is_found() {
+        let state = Path::new("/nonexistent/kiln/agent");
+        let ours = ["agent", "--server", "http://h:7070", "--name", "box", "--labels", "a,b"].map(str::to_owned);
+        let p = |pid: u32, cmd: &str| (pid, cmd.split(' ').map(str::to_owned).collect::<Vec<_>>());
+        let procs = [
+            p(101, "/k/kiln supervise -- agent --server http://h:7070 --name box --labels a,b"),
+            p(102, "/k/kiln supervise -- agent --server http://h:7070 --name old --labels a"),
+            p(103, "/k/kiln agent --server http://h:7070 --name old --labels a"),
+            p(104, "/k/kiln supervise -- agent --server http://h:7070 --name box --labels a,b --instance 0199a2b3"),
+            p(105, "/k/kiln supervise -- agent --name box --state-dir /elsewhere"),
+            p(106, "/k/kiln supervise -- server"),
+            p(107, "/k/launcher/kiln-agent supervise --exe /k/kiln -- agent --name old --state-dir /nonexistent/kiln/agent"),
+            p(108, "/k/kiln install --agent --server http://h:7070 --name old"),
+        ];
+        // 102 and 107: this service with other arguments. Never the service as installed (101),
+        // a runner (103), a runner set up beside it (104), another state directory (105), the
+        // server (106), nor what isn't a supervisor (108).
+        assert_eq!(stale_in(&procs, &ours, state), [102, 107]);
+    }
+
+    /// The process table for real: a stand-in for an earlier install's supervisor (a shell whose
+    /// command line reads as one, on a state directory of its own) is found and stopped.
+    #[test]
+    fn an_earlier_installs_runner_is_found_and_stopped() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().display().to_string();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "ping", "-n", "60", "127.0.0.1", ">nul", "&", "rem"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 60; :", "kiln"]);
+            c
+        };
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.args(["supervise", "--", "agent", "--name", "old", "--state-dir", &state]).stdin(Stdio::null()).stdout(Stdio::null()).spawn()?;
+        let pid = child.id();
+        // Waited for meanwhile: dead and unwaited, it would look alive to `stop` for its grace.
+        let reaper = std::thread::spawn(move || child.wait());
+        let ours = ["agent", "--name", "new", "--state-dir", &state].map(str::to_owned);
+        let (stale, inside) = stale_supervisors(&ours);
+        crate::os::supervise::stop(&[pid]);
+        reaper.join().map_err(|_| anyhow::anyhow!("the reaper panicked"))??;
+        assert_eq!((stale, inside), (vec![pid], false));
+        Ok(())
     }
 
     /// launchd for real (macOS, by hand): a one-shot job reloads another and stops a process
