@@ -1328,6 +1328,8 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     note(&mut view, "degraded_at", json!(since));
                     r.provider = view;
                     if now - since >= grace {
+                        // Said object by object where the provider says it (Kubernetes' reason).
+                        let why = degraded_objects(d, &r).await.unwrap_or(why);
                         return failed(d, r, format!("it is Degraded: {why}")).await;
                     }
                     r.message = Some(format!("Degraded: {why} (it fails in {}s unless it recovers)", grace - (now - since)));
@@ -1711,6 +1713,27 @@ const REVERT_TRAILER: &str = "Kiln-Reverts";
 
 /// What a release that couldn't land leaves in git: kiln's own commit is undone; a commit kiln
 /// didn't make is someone's, and stays.
+/// What's Degraded of a release's registration, object by object as its provider says it: the
+/// evidence it failed on (`Deployment web: ReplicaSet "web-6f9d" has timed out progressing`).
+async fn degraded_objects(d: &Deploy, r: &Release) -> Option<String> {
+    let a = store::app(&d.hub.store, &r.app).await.ok()??;
+    let env = store::environment(&d.hub.store, &r.environment).await.ok()??;
+    let read = super::reads::read(d, &a, &env, super::reads::Read::Resources).await.ok()?;
+    let text = |o: &Value, k: &str| o.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
+    let objects: Vec<String> = read
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|o| o.get("health").and_then(Value::as_str) == Some("Degraded"))
+        .map(|o| {
+            let said = text(o, "message").or_else(|| text(o, "why")).unwrap_or_else(|| "Degraded".to_owned());
+            format!("{} {}: {said}", text(o, "kind").unwrap_or_default(), text(o, "name").unwrap_or_default())
+        })
+        .collect();
+    (!objects.is_empty()).then(|| objects.join("; "))
+}
+
 /// What follows a release that failed after its commit (§8.1).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Aftermath {
