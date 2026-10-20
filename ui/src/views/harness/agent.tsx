@@ -16,7 +16,7 @@ import { lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt, typ
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
-import { errorMessage, useMediaQuery } from "@/lib/hooks";
+import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
@@ -27,6 +27,7 @@ import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
+import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
@@ -77,6 +78,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
   const task = taskId ? taskInfo?.tool_id || taskId : null;
   const wide = useMediaQuery("(min-width: 1100px)");
+  const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   const [tab, setTab] = React.useState<InspectorTab>("changes");
   const [phoneTab, setPhoneTab] = React.useState<PhoneTab>("work");
   const [confirmStop, setConfirmStop] = React.useState(false);
@@ -181,10 +183,12 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   };
   const find = React.useMemo(() => (findOpen ? { q, now: findAt } : undefined), [findOpen, q, findAt]);
   const showTools = React.useCallback(() => {
+    setTrayCollapsed(false);
     setTab("tools");
     setPhoneTab("tools");
-  }, []);
+  }, [setTrayCollapsed]);
   const showPlan = () => {
+    setTrayCollapsed(false);
     setTab("plan");
     setPhoneTab("plan");
   };
@@ -206,6 +210,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     else if (view === "goals") showPlan();
     else if (view === "tasks") showTools();
     else if (view === "changes") {
+      setTrayCollapsed(false);
       setTab("changes");
       setPhoneTab("changes");
     } else if (view === "new_agent") navigate("/agents?new=1");
@@ -324,10 +329,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           </Link>
         </div>
       ) : wide ? (
-        <div className="hx-agent-body">
+        <DesktopLayout collapsed={trayCollapsed} onCollapsed={setTrayCollapsed} side={(actions) => (
+          <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" actions={actions} />
+        )}>
           {work}
-          <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" />
-        </div>
+        </DesktopLayout>
       ) : (
         <div className="hx-agent-phone">
           <PhoneTabs store={store} tab={phoneTab} onTab={setPhoneTab} />
@@ -533,6 +539,7 @@ function Settings({ store, open, onOpenChange, send }: { store: SessionStore; op
  */
 function AgentLoading({ id }: { id: string }) {
   const wide = useMediaQuery("(min-width: 1100px)");
+  const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   const draft = useDrafts((s) => s.drafts[id] ?? "");
   const sizeDraft = React.useCallback(
     (el: HTMLTextAreaElement | null) => {
@@ -590,18 +597,20 @@ function AgentLoading({ id }: { id: string }) {
         </div>
       </header>
       {wide ? (
-        <div className="hx-agent-body">
-          {work}
+        <DesktopLayout collapsed={trayCollapsed} onCollapsed={setTrayCollapsed} side={(actions) => (
           <div className="hx-inspector hx-side">
-            <div className="hx-tabs" aria-hidden="true">
-              {["Changes", "Plan", "Tools"].map((t) => (
-                <span key={t} className="hx-tab">
-                  {t}
-                </span>
-              ))}
+            <div className="hx-inspector-head">
+              <div className="hx-tabs" aria-hidden="true">
+                {["Changes", "Plan", "Tools"].map((t) => (
+                  <span key={t} className="hx-tab">{t}</span>
+                ))}
+              </div>
+              {actions}
             </div>
           </div>
-        </div>
+        )}>
+          {work}
+        </DesktopLayout>
       ) : (
         <div className="hx-agent-phone">
           <div className="pt" aria-hidden="true">
