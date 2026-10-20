@@ -275,6 +275,7 @@ export function Inspector({
   onOpenTask,
   className,
   hideTabs,
+  actions,
   agentId,
   harness,
   send,
@@ -286,6 +287,8 @@ export function Inspector({
   send?: (c: Command) => void;
   /** The page shows its own tabs (phones). */
   hideTabs?: boolean;
+  /** Desktop side tray controls, beside its tabs. */
+  actions?: React.ReactNode;
   tab: InspectorTab;
   onTab: (t: InspectorTab) => void;
   /** The agent's live session: what's shown here is read from it. */
@@ -321,13 +324,16 @@ export function Inspector({
   ];
   return (
     <div className={cn("hx-inspector", className)}>
-      <div className="hx-tabs" role="tablist" hidden={hideTabs}>
-        {tabs.map((t) => (
-          <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
-            {t.label}
-            {t.count && <span className="hx-tab-count">{t.count}</span>}
-          </button>
-        ))}
+      <div className="hx-inspector-head" hidden={hideTabs}>
+        <div className="hx-tabs" role="tablist">
+          {tabs.map((t) => (
+            <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
+              {t.label}
+              {t.count && <span className="hx-tab-count">{t.count}</span>}
+            </button>
+          ))}
+        </div>
+        {actions}
       </div>
       <div className="hx-inspector-body">
         {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} />}
