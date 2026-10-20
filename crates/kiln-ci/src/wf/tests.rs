@@ -214,6 +214,21 @@ fn actions() {
     assert!(codes(&d).contains(&"KCI1014"));
 }
 
+/// W09-AC06: an action reading a secret it doesn't declare is told so (`KCI4041`, a warning:
+/// inside it the secret is nothing), where it reads it; what it declares, and `GITHUB_TOKEN`,
+/// are fine.
+#[test]
+fn actions_read_only_the_secrets_they_declare() {
+    let (_, d) = parse_action(
+        "name: deploy\nsecrets:\n  DEPLOY_KEY: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ${{ secrets.deploy_key }} ${{ secrets.GITHUB_TOKEN }}\n    - shell: bash\n      env:\n        O: ${{ secrets.OTHER }}\n      run: echo $O\n",
+    );
+    let found: Vec<&Diag> = d.iter().filter(|x| x.code == "KCI4041").collect();
+    assert_eq!(found.len(), 1, "{d:?}");
+    assert!(found.iter().all(|x| x.severity == Severity::Warning && x.message.contains("`OTHER`") && x.path == "runs.steps[1].env.O" && x.range.start.line == 11), "{found:?}");
+    let (_, d) = parse_action("name: plain\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ${{ secrets.TOKEN }}\n");
+    assert!(d.iter().any(|x| x.code == "KCI4041" && x.message.contains("`TOKEN`")), "declaring none, it reads none: {d:?}");
+}
+
 #[test]
 fn schemas_are_generated() {
     for k in [SchemaKind::Gha, SchemaKind::Kiln, SchemaKind::Overlay, SchemaKind::Action] {

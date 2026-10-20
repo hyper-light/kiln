@@ -16,8 +16,19 @@ use std::time::{Duration, Instant};
 use common::{Options, http, start};
 use serde_json::Value;
 
+/// git, as nobody's: no machine's own settings (a signed tag would want an editor).
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let o = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_AUTHOR_NAME", "T").env("GIT_AUTHOR_EMAIL", "t@example.com").env("GIT_COMMITTER_NAME", "T").env("GIT_COMMITTER_EMAIL", "t@example.com").output()?;
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()?;
     anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
     Ok(())
 }
@@ -297,15 +308,17 @@ fn w07_ac02_pins() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A kiln action declaring the secret it needs (W07-R11, W09-R07).
+/// A kiln action declaring the secret it needs (W07-R11, W09-R07), and reading one it doesn't.
 const DEPLOY: &[(&str, &str)] = &[(
     "action.yml",
-    "name: deploy\nsecrets:\n  DEPLOY_KEY: { required: true, description: \"Key for the deploy host\" }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"deploying with ${{ secrets.DEPLOY_KEY }}\"\n",
+    "name: deploy\nsecrets:\n  DEPLOY_KEY: { required: true, description: \"Key for the deploy host\" }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"deploying with ${{ secrets.DEPLOY_KEY }}\"\n    - shell: bash\n      run: echo \"other is [${{ secrets.OTHER }}]\"\n",
 )];
 
-/// AC06: an action declaring a required secret fails the run as it starts (`KCI4040`, saying
-/// where it looked and how to add it) while the secret isn't set, and runs once it is, the
-/// secret there inside it and masked.
+/// W07-AC06 and W09-AC06: an action declaring a required secret fails the run as it starts
+/// (`KCI4040`, saying the scopes it searched and how to add it) while the secret isn't set, and
+/// runs once it is, the secret there inside it and masked. A secret it reads without declaring
+/// gets nothing, though the repository has it, and the validator says so (`KCI4041`), as it does
+/// for a workflow that declares its secrets and uses another.
 #[test]
 fn w07_ac06_declared_secrets() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -317,15 +330,39 @@ fn w07_ac06_declared_secrets() -> anyhow::Result<()> {
     let (run, _) = finished(&s, 0)?;
     assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("startup_failure"), "{run}");
     let why = run.get("error").and_then(Value::as_str).unwrap_or_default();
-    assert!(why.contains("KCI4040") && why.contains("`kinds/deploy@v1` in job `ship` needs the secret DEPLOY_KEY") && why.contains("kiln secrets set DEPLOY_KEY --scope repo:acme/kinds"), "{why}");
-    let (st, body) = http(s.port, "PUT", "/api/ci/secrets/DEPLOY_KEY?scope=repo:acme/kinds", &s.admin, Some(&serde_json::json!({ "value": "hunter2-deploy-key" })))?;
-    anyhow::ensure!(st < 300, "set the secret: {st} {body}");
+    assert!(
+        why.contains("KCI4040")
+            && why.contains("`kinds/deploy@v1` in job `ship` needs the secret DEPLOY_KEY")
+            && why.contains("searched")
+            && why.contains("kiln secrets set DEPLOY_KEY --scope repo:acme/kinds"),
+        "{why}"
+    );
+    for (name, value) in [("DEPLOY_KEY", "hunter2-deploy-key"), ("OTHER", "not-for-the-action")] {
+        let (st, body) = http(s.port, "PUT", &format!("/api/ci/secrets/{name}?scope=repo:acme/kinds"), &s.admin, Some(&serde_json::json!({ "value": value })))?;
+        anyhow::ensure!(st < 300, "set {name}: {st} {body}");
+    }
     commit(&repo, &[("README.md", "again\n")], None)?;
     let (run, legs) = finished(&s, 1)?;
     assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("success"), "{run}");
     let leg = legs.first().and_then(|l| l.pointer("/leg/id")).and_then(Value::as_str).unwrap_or_default();
     let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step=0"), &s.admin, None)?;
     assert!(log.contains("deploying with ***") && !log.contains("hunter2-deploy-key"), "the action has the secret, masked: {log}");
+    assert!(log.contains("other is []") && !log.contains("not-for-the-action"), "an undeclared secret is nothing inside: {log}");
+    // The validator says so, for the action and for a workflow that declares its secrets.
+    let validate = |path: &str, content: &str| -> anyhow::Result<Value> {
+        let (st, body) = http(s.port, "POST", "/api/ci/validate", &s.admin, Some(&serde_json::json!({ "path": path, "content": content })))?;
+        anyhow::ensure!(st == 200, "validate {path}: {st} {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    let action = DEPLOY.first().map(|(_, c)| *c).unwrap_or_default();
+    let said = validate(".kiln/actions/deploy/action.yml", action)?.to_string();
+    assert!(said.contains("KCI4041") && said.contains("`OTHER`") && !said.contains("`DEPLOY_KEY`"), "{said}");
+    let said = validate(
+        ".kiln/ship.yaml",
+        "on: push\nsecrets:\n  NPM_TOKEN: { required: true }\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo ${{ secrets.OTHER }} ${{ secrets.npm_token }}\n",
+    )?
+    .to_string();
+    assert!(said.contains("KCI4041") && said.contains("`OTHER` isn't one of them") && !said.contains("`npm_token` isn't"), "{said}");
     Ok(())
 }
 
