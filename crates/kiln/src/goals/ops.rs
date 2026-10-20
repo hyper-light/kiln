@@ -153,8 +153,9 @@ mod tests {
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
         within(async {
-            // No conversation store: what's steered is goals and plans, not conversations.
-            let hub = crate::hub::tests::scratch_hub_with(|c| {
+            // On a simulated clock (goals' times are its), with no conversation store: what's
+            // steered is goals and plans, not conversations.
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
                 c.terminal.enabled = true;
                 c.conversations.off = true;
             })
