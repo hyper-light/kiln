@@ -98,6 +98,12 @@ knows the app, release it this way; the tools are `deploy_*` (code mode: `kiln.d
 5. **Look before and after.** `kiln.deploy.registrations.diff({ app, environment })` (on Argo CD
    with `version`: what deploying it would change), `.resources` (each object's sync and health),
    `.manifests`, `.logs({ app, environment, kind: "Deployment", name })`.
+6. **Act on what runs.** `kiln.deploy.registrations.actions({ app, environment, kind, name })`
+   lists what its provider can do to an object now (`restart`, `pause`, `resume`, `scale`,
+   `suspend`, `create-job`, `delete` for a pod), each with `disabled` and the `params` it takes;
+   `kiln.deploy.registrations.action({ ..., action, params: { replicas: "3" } })` does one. A
+   restart or a deleted pod fixes a stuck process; it changes no version and no values (a
+   release does), and a sync may undo a scale.
 
 ```js
 // code_run: release a version to staging and wait for it to land
@@ -123,6 +129,8 @@ being delivered (a delivery is reverted).
   (409), or queued where the environment says so. Wait for it, or cancel it if that's what the
   person asked.
 - A frozen environment holds every release until a person lifts the freeze: don't lift it.
+- An environment moving to another provider (`kiln.deploy.environments.move_status`) holds every
+  release there (409) until the move is done or cancelled: wait for it. Moving one is a person's.
 - Secrets (a password, an API key) are a person's to set: `kiln.deploy.secrets.list({ app,
   environment })` says which exist and their versions, never values. When an app needs one that
   isn't there, ask the person to run `kiln app secret set <app> <NAME> --env <env>` (its value

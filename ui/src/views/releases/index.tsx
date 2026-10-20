@@ -22,7 +22,7 @@ import "@/views/deployments/deployments.css";
 import "./releases.css";
 
 /** Server events after which what this section shows is out of date. */
-export const DEPLOY_EVENTS = ["deploy", "deploy_registration"] as const;
+export const DEPLOY_EVENTS = ["deploy", "deploy_registration", "deploy_move"] as const;
 
 export const boardRes: Res<Board> = { key: "deploy/board", fetch: (s) => deployApi.board(s), opts: { on: DEPLOY_EVENTS, pollMs: 30_000 } };
 export const environmentsRes: Res<Environment[]> = { key: "deploy/environments", fetch: (s) => deployApi.environments(s), opts: { on: DEPLOY_EVENTS } };

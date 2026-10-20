@@ -345,6 +345,30 @@ impl Cluster {
         }
     }
 
+    /// A JSON merge patch of one object, as `manager` (a person's action on it: a restart, a pause).
+    pub async fn merge_patch(&self, key: &ResKey, patch: &Value, manager: &str) -> Result<Value> {
+        let r = self.resource(&key.group, &key.kind)?;
+        let path = format!("{}?fieldManager={}", k::object_path(&r, key), k::enc(manager));
+        let (status, bytes) = self.request(Method::PATCH, &path, Some("application/merge-patch+json"), Some(Bytes::from(serde_json::to_vec(patch)?))).await?;
+        match status {
+            200..=299 => Ok(serde_json::from_slice(&bytes)?),
+            404 => bail!("{key} not found"),
+            _ => bail!("{}", k::status_message(status, &bytes)),
+        }
+    }
+
+    /// Creates an object, as `manager`.
+    pub async fn create(&self, object: &Value, manager: &str) -> Result<Value> {
+        let r = self.resource(obj::group(object), obj::kind(object))?;
+        let ns = obj::namespace(object);
+        let path = format!("{}?fieldManager={}", k::collection_path(&r, (!ns.is_empty()).then_some(ns)), k::enc(manager));
+        let (status, bytes) = self.request(Method::POST, &path, Some("application/json"), Some(Bytes::from(serde_json::to_vec(object)?))).await?;
+        if !(200..300).contains(&status) {
+            bail!("{}", k::status_message(status, &bytes));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// Whether objects of a kind live in namespaces, as discovery says (`None`: not served).
     pub fn namespaced(&self, group: &str, kind: &str) -> Option<bool> {
         self.discovery.read().get(group, kind).map(|r| r.namespaced)

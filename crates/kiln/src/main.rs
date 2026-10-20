@@ -455,6 +455,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
             shutdown_on_signals(shutdown.clone());
+            // The agents it starts have their processes held together (`os::contain`).
+            kiln::os::contain::hold_agents();
             boxed(|| kiln::server::run(cfg, shutdown)).await
         }
         Cmd::Agent(a) => {
@@ -462,6 +464,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             // here starts a process that could inherit it.
             kiln::os::supervise::claim_inherited();
             shutdown_on_signals(shutdown.clone());
+            // The agents it starts have their processes held together (`os::contain`).
+            kiln::os::contain::hold_agents();
             let base = config::default_data_dir().join("agent");
             let state_dir = a.state_dir.clone().unwrap_or_else(|| base.clone());
             let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

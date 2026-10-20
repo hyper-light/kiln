@@ -237,6 +237,9 @@ mod tests {
             at: String::new(),
             rollback_of: None,
             secrets: String::new(),
+            namespace: None,
+            set: BTreeMap::new(),
+            helm: None,
         };
         assert_eq!(artifact_images(&file), ["ghcr.io/acme/web:1.4.2", "ghcr.io/acme/worker@sha256:9f"]);
         let deployment = json!({"apiVersion": "apps/v1", "kind": "Deployment", "spec": {"template": {"spec": {

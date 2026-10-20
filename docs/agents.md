@@ -41,7 +41,9 @@ every process it starts, however it's parented later: where the system holds not
 (cgroup v1, a read-only cgroup filesystem, a cgroup another user owns), and for sessions whose
 harness started before the runner had groups, that mark is how their processes are found, which
 takes looking at every process on the machine. The runner logs how it holds them as it starts
-(`agents' processes are held together by`).
+(`agents' processes are held together by`). Only the runner and the server, which start agents,
+hold them together: a test or a tool that links kiln and starts a harness leaves its processes
+where they are, so a test run in a kiln terminal makes no groups in the runner's cgroup.
 
 Every ten seconds the runner notes what runs under each harness and what else is the agent's (in
 its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's
