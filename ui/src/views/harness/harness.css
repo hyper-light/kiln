@@ -286,8 +286,7 @@ textarea.hx-input {
   height: 2px;
   border-radius: 16px 16px 0 0;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .hx-card[data-status="waiting"]::before {
   background: linear-gradient(90deg, transparent, var(--color-warn), transparent);
@@ -3227,8 +3226,6 @@ textarea.hx-input {
   height: 2px;
   margin-bottom: 12px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 .hx-outcome-foot {
   border-top-color: #1d1f24;

@@ -160,6 +160,26 @@ const fleet: AgentInfo[] = !FLEET
       { ...base("fleet-done", "Trim the release notes", "agent:metal-ryzen-02", "claude", 15), summary: "Trimmed the notes to the five changes that matter." },
       { ...base("fleet-bench", "Benchmark the codec", "agent:metal-epyc-01", "claude", 10), status: "running", doing: "Running cargo bench" },
     ];
+/**
+ * `MOCK_BUSY=N`: N more agents, all working, each saying what it does next every 0.7 s or so: a
+ * fleet as busy as a real one, for measuring the pages under it.
+ */
+const BUSY = Number(process.env.MOCK_BUSY ?? 0);
+const STEPS = ["Reading src/lib.rs", "Running cargo test", "Editing src/api.rs", "Thinking", "Running npm run build", "Searching for usages", "Writing tests", "Reviewing the diff"];
+for (let i = 0; i < BUSY; i++) {
+  fleet.push({ ...base(`busy-${i}`, `Busy agent ${i + 1}`, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 9 - (i % 9)), status: "running", doing: STEPS[i % STEPS.length] });
+}
+if (BUSY > 0)
+  setInterval(() => {
+    for (let i = 0; i < fleet.length; i++) {
+      const a = fleet[i];
+      if (!a?.id.startsWith("busy-") || Math.random() > 0.7) continue;
+      const doing = STEPS[Math.floor(Math.random() * STEPS.length)];
+      fleet[i] = { ...a, doing, activity: doing, last_activity: Date.now(), cost_usd: a.cost_usd + 0.002 };
+      emitFleet(fleet[i]!);
+    }
+  }, 500);
+
 /** The fleet's agents, beside the mock's own (`GET /api/harness/sessions`). */
 export const fleetInfos = () => fleet;
 
