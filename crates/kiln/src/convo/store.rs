@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::rows::{self, EventRow, Row};
+use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkeeping};
 use crate::harness::core::Update;
 use crate::harness::session::Sink;
 
@@ -44,6 +45,10 @@ pub const COMPACT_MIN_FREE: u64 = 256 << 20;
 /// takes, and about how long the writer is held (a copy of the whole file in one go took more
 /// memory than the first server had, which killed it over and over, 2026-10-18).
 const COMPACT_STEP: usize = 4 << 20;
+/// This often the writer looks at its file for its telemetry ([`Engine::look`]), whatever else it
+/// does; its sessions it counts every `COUNT_EVERY`.
+const LOOK_FILE: Duration = Duration::from_secs(2);
+const COUNT_EVERY: Duration = Duration::from_secs(30);
 
 /// How a store looks after its file while it has nothing else to do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -177,6 +182,21 @@ pub struct Took {
     pub wrote: Option<(u64, u64)>,
 }
 
+/// Where a store's file stands ([`Engine::look`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Look {
+    /// The file's size, the part of it free for what comes next, and its log's size.
+    pub bytes: u64,
+    pub free: u64,
+    pub wal: u64,
+    /// The last number the store gave a write.
+    pub top: u64,
+    /// Its sessions, when asked to count them.
+    pub sessions: Option<u64>,
+    /// How far making it compact has got (None: it isn't being made compact).
+    pub compacting: Option<CompactView>,
+}
+
 /// A database the store keeps conversations in.
 pub trait Engine: Send + 'static {
     /// Who the store is to its peers: made once, kept in the database.
@@ -202,6 +222,9 @@ pub trait Engine: Send + 'static {
     fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took>;
     /// Through where this store has taken `peer`'s feed (0: none of it).
     fn peer(&mut self, peer: &str) -> anyhow::Result<u64>;
+    /// Every peer whose feed it took: its name, through where, and when it last took from it
+    /// (unix ms).
+    fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>>;
     /// Each file of `session`'s record kept, with its last line.
     fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>>;
     /// `limit` lines of `session`'s record from `source`, from line `from` on: `(n, line)`.
@@ -233,6 +256,9 @@ pub trait Engine: Send + 'static {
     /// error: the engine is gone (the compact file couldn't be opened; the next start finishes
     /// putting it in place).
     fn compact_some(self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)>;
+    /// Where its file stands, for its telemetry: cheap (the file's header, its log's size), as
+    /// the writer looks every few seconds. `count`: its sessions counted too.
+    fn look(&mut self, count: bool) -> anyhow::Result<Look>;
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -255,7 +281,7 @@ fn notify(watchers: &Watchers) {
 pub struct Store {
     tx: mpsc::SyncSender<Msg>,
     id: Arc<str>,
-    dropped: Arc<std::sync::atomic::AtomicU64>,
+    meter: Arc<Meter>,
     watchers: Watchers,
 }
 
@@ -265,14 +291,21 @@ impl Store {
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
-        let w = watchers.clone();
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep))?;
-        Ok(Self { tx, id, dropped: Arc::default(), watchers })
+        let meter: Arc<Meter> = Arc::default();
+        let (w, m) = (watchers.clone(), meter.clone());
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m))?;
+        Ok(Self { tx, id, meter, watchers })
     }
 
     /// Who this store is to its peers.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// What the store has done since kiln started, and its file as the writer last saw it. Never
+    /// waits for the writer.
+    pub fn report(&self) -> StoreReport {
+        self.meter.report(&self.id)
     }
 
     /// What `update` of `session` makes, to be committed with the next batch.
@@ -287,9 +320,9 @@ impl Store {
             return;
         }
         if let Err(mpsc::TrySendError::Full(_)) = self.tx.try_send(Msg::Rows(rows)) {
-            let n = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_power_of_two() {
-                tracing::warn!(dropped = n + 1, "conversation store: the writer can't keep up; updates were dropped");
+            let n = self.meter.dropped();
+            if (n - 1).is_power_of_two() {
+                tracing::warn!(dropped = n, "conversation store: the writer can't keep up; updates were dropped");
             }
         }
     }
@@ -304,12 +337,22 @@ impl Store {
     /// most.
     fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
         let (rtx, rrx) = mpsc::channel();
+        let asked = Instant::now();
         self.tx
             .send_wait(Msg::Run(Box::new(move |e| {
                 let _ = rtx.send(f(e));
             })))
             .map_err(|()| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
-        rrx.recv_timeout(READ_WAIT).map_err(|_| anyhow::anyhow!("the conversation store didn't answer in time"))?
+        match rrx.recv_timeout(READ_WAIT) {
+            Ok(answer) => {
+                self.meter.waited(asked.elapsed());
+                answer
+            }
+            Err(_) => {
+                self.meter.timed_out();
+                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+            }
+        }
     }
 
     /// What is kept of `session`, with at most its last `last` events. Blocking.
@@ -415,6 +458,11 @@ impl Store {
         self.run(move |e| e.peer(&p))
     }
 
+    /// Every peer whose feed this store took ([`Engine::peers`]). Blocking.
+    pub fn peers(&self) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        self.run(|e| e.peers())
+    }
+
     /// Each file of `session`'s record kept, with its last line. Blocking.
     pub fn marks(&self, session: &str) -> anyhow::Result<Vec<Mark>> {
         let s = session.to_owned();
@@ -472,7 +520,7 @@ impl SendWait for mpsc::SyncSender<Msg> {
 
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter) {
     let keep_closed = upkeep.keep_closed;
     let mut pending: Vec<Row> = Vec::new();
     let mut since: Option<Instant> = None;
@@ -482,21 +530,28 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go, then the
     // file is made compact if enough of it is free, a step at a time.
     let (mut looking, mut pruned, mut look_at) = (false, 0usize, Instant::now());
-    let mut compacting = false;
+    let mut compacting: Option<Instant> = None;
+    // When it last looked at its file for its telemetry, and counted its sessions.
+    let (mut looked, mut counted): (Option<Instant>, Option<Instant>) = (None, None);
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
         match engine.apply(&rows) {
-            Ok(()) => notify(watchers),
+            Ok(()) => {
+                meter.committed(rows.len());
+                notify(watchers);
+            }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), rows = rows.len(), "conversation store: a batch couldn't be written"),
         }
     };
     loop {
-        let idle = if squeezing || looking || compacting { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY) };
+        let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
         let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
-        match rx.recv_timeout(wait) {
+        let got = rx.recv_timeout(wait);
+        let began = Instant::now();
+        match got {
             Ok(Msg::Rows(rows)) => {
                 pending.extend(rows);
                 since.get_or_insert_with(Instant::now);
@@ -509,6 +564,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 commit(&mut engine, &mut pending);
                 since = None;
                 f(engine.as_mut());
+                meter.ran();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let had = !pending.is_empty();
@@ -523,14 +579,16 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             squeezing = false;
                         }
                     }
-                } else if compacting && !had {
+                } else if let Some(compact_began) = compacting.filter(|_| !had) {
                     engine = match engine.compact_some(upkeep.compact.unwrap_or(COMPACT_MIN_FREE), COMPACT_STEP) {
                         Ok((e, Compacting::Going)) => e,
                         Ok((e, done)) => {
                             if let Compacting::Done { before, after } = done {
                                 tracing::info!(before, after, "conversation store: its file was made compact");
+                                let ms = u64::try_from(compact_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+                                meter.saw(|f| f.compacted = Some(Compacted { at: crate::util::now_ms(), before, after, ms }));
                             }
-                            (compacting, look_at) = (false, Instant::now() + LOOK_EVERY);
+                            (compacting, look_at, looked) = (None, Instant::now() + LOOK_EVERY, None);
                             e
                         }
                         Err(e) => {
@@ -547,11 +605,12 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                         Ok(0) => {
                             if pruned > 0 {
                                 tracing::info!(lines = pruned, days = keep_closed.map_or(0, |k| k.as_secs() / 86_400), "conversation store: the records of sessions that ended long ago were let go");
+                                meter.saw(|f| f.pruned = Some(Pruned { at: crate::util::now_ms(), lines: pruned as u64 }));
                             }
                             (looking, pruned) = (false, 0);
                             // Then the file is made compact, if that is worth it.
                             if upkeep.compact.is_some() {
-                                compacting = true;
+                                compacting = Some(Instant::now());
                             } else {
                                 look_at = Instant::now() + LOOK_EVERY;
                             }
@@ -569,6 +628,37 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 return;
             }
         }
+        // Its telemetry: every `LOOK_FILE`, whatever else it does, where its file stands; and how
+        // long what it did held it.
+        if looked.is_none_or(|t| t.elapsed() >= LOOK_FILE) {
+            let count = counted.is_none_or(|t| t.elapsed() >= COUNT_EVERY);
+            match engine.look(count) {
+                Ok(l) => {
+                    let upkeep = match (&l.compacting, squeezing, looking) {
+                        (Some(c), ..) => Upkeeping::Compacting(c.clone()),
+                        (None, true, _) => Upkeeping::Squeezing,
+                        (None, false, true) => Upkeeping::Pruning { lines: pruned as u64 },
+                        _ => Upkeeping::Idle,
+                    };
+                    meter.saw(|f| {
+                        let now = crate::util::now_ms();
+                        if f.at != 0 && f.top != l.top {
+                            f.wrote_at = now;
+                        }
+                        (f.at, f.bytes, f.free, f.wal, f.top, f.upkeep) = (now, l.bytes, l.free, l.wal, l.top, upkeep);
+                        if l.sessions.is_some() {
+                            f.sessions = l.sessions;
+                        }
+                    });
+                    if count {
+                        counted = Some(Instant::now());
+                    }
+                }
+                Err(e) => tracing::debug!(error = %format!("{e:#}"), "conversation store: its file couldn't be looked at"),
+            }
+            looked = Some(Instant::now());
+        }
+        meter.held(began.elapsed());
     }
 }
 
@@ -599,7 +689,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::sync_channel(1);
-    Store { tx, id: "stopped".into(), dropped: Arc::default(), watchers: Arc::default() }
+    Store { tx, id: "stopped".into(), meter: Arc::default(), watchers: Arc::default() }
 }
 
 #[cfg(test)]

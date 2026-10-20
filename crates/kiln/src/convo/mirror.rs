@@ -215,6 +215,27 @@ impl Mirrors {
         }
     }
 
+    /// Where the feed to each chosen mirror stands, for telemetry.
+    pub fn feeds(&self) -> Vec<(MirrorView, super::telemetry::ShipView)> {
+        let feeds = self.feeds.lock().unwrap_or_else(PoisonError::into_inner);
+        self.chosen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|c| {
+                let f = feeds.get(&c.machine);
+                let connected = f.is_some_and(|f| f.peer.lock().unwrap_or_else(PoisonError::into_inner).is_some());
+                let view = MirrorView { machine: c.machine.clone(), connected, chosen_at: c.chosen_at, last_seen: c.last_seen };
+                (view, f.map(|f| f.shipper.stats()).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// How many mirrors the server keeps.
+    pub fn wanted(&self) -> usize {
+        self.want
+    }
+
     pub fn view(&self) -> Vec<MirrorView> {
         let feeds = self.feeds.lock().unwrap_or_else(PoisonError::into_inner);
         let connected = |m: &str| feeds.get(m).is_some_and(|f| f.peer.lock().unwrap_or_else(PoisonError::into_inner).is_some());

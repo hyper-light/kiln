@@ -11,6 +11,7 @@ import * as React from "react";
 import { ExternalLink, File as FileIcon, FileText, Film, Image as ImageIcon, Music } from "lucide-react";
 import type { KeptFile } from "@/api/harness";
 import { formatBytes } from "@/lib/format";
+import { apiPath } from "@/lib/peer-base";
 import "./files.css";
 
 /** The conversation whose messages are being drawn: its id, its folder, what's kept of its files. */
@@ -50,7 +51,7 @@ export function keptFor(files: KeptFile[], path: string, seq: number | undefined
 /** Where a viewer gets it: the kept copy (for good), else the agent's machine, now. */
 export function fileUrl(session: string, path: string, kept?: KeptFile): string {
   const id = encodeURIComponent(session);
-  return kept?.sha ? `/api/harness/sessions/${id}/files/${kept.sha}` : `/api/harness/sessions/${id}/file?path=${encodeURIComponent(path)}`;
+  return apiPath(kept?.sha ? `/api/harness/sessions/${id}/files/${kept.sha}` : `/api/harness/sessions/${id}/file?path=${encodeURIComponent(path)}`);
 }
 
 type Kind = "image" | "video" | "audio" | "pdf" | "text" | "file";

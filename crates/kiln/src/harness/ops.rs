@@ -53,11 +53,7 @@ pub fn starter(cx: &Cx) -> Result<Starter, Fail> {
 
 /// An agent calling may steer, interrupt or end only itself and the agents it started (and theirs).
 fn may_steer(cx: &Cx, id: &str) -> Result<(), Fail> {
-    let Some(me) = cx.caller.agent.as_deref() else { return Ok(()) };
-    if me == id || lineage::descends(&cx.hub.harness.list(), id, me) {
-        return Ok(());
-    }
-    Err((StatusCode::FORBIDDEN, format!("an agent steers and ends only the agents it started (and theirs): {} isn't one of {}'s", lineage::short(id), lineage::short(me))))
+    lineage::may_steer(&cx.hub, &cx.caller, id)
 }
 
 async fn list(cx: Cx, v: Value) -> Out {

@@ -13,6 +13,7 @@ fn fail(e: Error) -> Fail {
     match e {
         Error::Bad(m) => (StatusCode::BAD_REQUEST, m),
         Error::Missing => (StatusCode::NOT_FOUND, "no such plan".into()),
+        Error::Refused(c, m) => (c, m),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -91,12 +92,27 @@ async fn runs_get(cx: Cx, v: Value) -> Out {
     json_of(&super::agents::view(&cx.hub, &run_of(&v)?).await.map_err(fail)?)
 }
 
+/// Whether `cx`'s caller may stop or retry plan run `run` (its steps' agents are steered): a person
+/// any run; an agent only the runs it ran, or that the agents it started ran.
+async fn may_steer_run(cx: &Cx, run: &str) -> Result<(), Fail> {
+    let Some(me) = cx.caller.agent.as_deref() else { return Ok(()) };
+    let ran_by = super::agents::view(&cx.hub, run).await.map_err(fail)?.config.parent;
+    match ran_by.as_deref() {
+        Some(p) if p == me || crate::harness::lineage::descends(&cx.hub.harness.list(), p, me) => Ok(()),
+        _ => Err((StatusCode::FORBIDDEN, "an agent stops and retries only the plan runs it ran (or the agents it started ran)".to_owned())),
+    }
+}
+
 async fn runs_stop(cx: Cx, v: Value) -> Out {
-    json_of(&super::agents::stop(&cx.hub, &run_of(&v)?, &cx.caller.name).await.map_err(fail)?)
+    let run = run_of(&v)?;
+    may_steer_run(&cx, &run).await?;
+    json_of(&super::agents::stop(&cx.hub, &run, &cx.caller.name).await.map_err(fail)?)
 }
 
 async fn runs_retry(cx: Cx, v: Value) -> Out {
-    json_of(&super::agents::retry(&cx.hub, &run_of(&v)?, step_of(&v)?, &cx.caller.name).await.map_err(fail)?)
+    let run = run_of(&v)?;
+    may_steer_run(&cx, &run).await?;
+    json_of(&super::agents::retry(&cx.hub, &run, step_of(&v)?, &cx.caller.name).await.map_err(fail)?)
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
@@ -127,14 +143,19 @@ async fn run(cx: Cx, v: Value) -> Out {
         return json_of(&started);
     }
     let target = match (v.get("session").and_then(Value::as_str), v.get("new")) {
-        (Some(s), _) => Target::Session(s.to_owned()),
+        // Running it on an agent that runs is steering that agent: an agent steers only itself and
+        // the agents it started.
+        (Some(s), _) => {
+            crate::harness::lineage::may_steer(&cx.hub, &cx.caller, s)?;
+            Target::Session(s.to_owned())
+        }
         (None, Some(n)) => {
             let s = |k: &str| n.get(k).and_then(Value::as_str).map(str::to_owned);
             Target::New { target: s("target").unwrap_or_else(|| "local".into()), kind: s("kind").ok_or_else(|| (StatusCode::BAD_REQUEST, "`new.kind` is required".to_owned()))?, cwd: s("cwd") }
         }
         (None, None) => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
     };
-    let ran = super::run(&cx.hub, &id, target, mode, &cx.caller.name).await.map_err(fail)?;
+    let ran = super::run(&cx.hub, &id, target, mode, &crate::harness::ops::starter(&cx)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
     json_of(&ran)
 }

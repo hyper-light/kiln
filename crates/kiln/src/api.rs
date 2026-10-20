@@ -168,6 +168,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         let secure = is_secure(&hub, &req);
         return Ok(f.serve(&slug, req, secure).await);
     }
+    // A peered cluster under this one's own address (`/.kiln-peer/<slug>/`, kiln reached by
+    // address): its API forwarded, its pages this cluster's app (in the browser) drawing it.
+    if let Some((f, slug, page)) = crate::peers::route_path(&hub, &req) {
+        if page {
+            return Ok(crate::ui::shell(&req));
+        }
+        let secure = is_secure(&hub, &req);
+        return Ok(f.serve_path(&slug, req, secure).await);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let seg = segments(&path);
@@ -706,9 +715,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             }
         }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
-        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, id, req).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, id, action).await,
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, &caller, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, &caller, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, &caller, id, action).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -722,6 +731,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
         (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
         (&Method::POST, ["api", "conversations", "restore"]) => conversation_restore(&hub, req).await,
+        // Every conversation store, as the server sees it, and one store's series (the System
+        // page; docs/conversations.md, "Telemetry").
+        (&Method::GET, ["api", "conversations", "status"]) => Ok(srv::json(StatusCode::OK, &crate::harness::stores::status(&hub))),
+        (&Method::GET, ["api", "conversations", "series"]) => conversation_series(&hub, &q),
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => harness_kept_file(&hub, id, sha, &req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => harness_file(&hub, id, q.get("path").cloned(), &req).await,
@@ -1499,6 +1512,7 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
     match e {
         crate::plans::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
         crate::plans::Error::Missing => err(StatusCode::NOT_FOUND, "no such plan"),
+        crate::plans::Error::Refused(c, m) => err(c, m),
         crate::plans::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -3368,6 +3382,16 @@ async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
     Ok(srv::json(StatusCode::OK, &json!({ "hits": hits })))
 }
 
+/// `GET /api/conversations/series?key=&window=`: store `key`'s series over the last `window`
+/// seconds (3600 unless said; up to a day), a column each; none yet (a store the board hasn't
+/// sampled since the server started): empty.
+fn conversation_series(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let key = q.get("key").map(String::as_str).unwrap_or(crate::convo::board::SERVER);
+    let window = q.get("window").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600).clamp(60, 86_400);
+    let series = hub.harness.board.series(key, window, crate::util::now_ms()).unwrap_or_else(|| crate::convo::board::SeriesView { key: key.to_owned(), ..Default::default() });
+    Ok(srv::json(StatusCode::OK, &series))
+}
+
 fn goals_err(e: crate::goals::Error) -> ApiError {
     match e {
         crate::goals::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
@@ -3381,11 +3405,18 @@ struct GoalsSet {
     goals: Vec<crate::goals::Given>,
 }
 
+/// Whether `caller` may change agent `id`'s goals: a person any agent's, an agent its own and those
+/// of the agents it started (`crate::harness::lineage::may_steer`).
+fn may_steer_goals(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), ApiError> {
+    crate::harness::lineage::may_steer(hub, caller, id).map_err(|(c, m)| err(c, m))
+}
+
 /// An agent's goals not yet started, as they should be (`crate::goals::set`).
-async fn goals_set(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.set".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
@@ -3397,18 +3428,20 @@ struct GoalsAdd {
 }
 
 /// Goals lined up after the agent's others (`crate::goals::add`).
-async fn goals_add(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.add".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
 /// Start, pause, skip or clear an agent's goal stack.
-async fn goals_control(hub: &Hub, id: &str, action: &str) -> R {
+async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
     let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
+    may_steer_goals(hub, caller, id)?;
     let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.control".into(), format!("{id}: {action}")).await;
+    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
@@ -3706,6 +3739,12 @@ async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
 /// stream's chunks (binary, as its runner sent them: `crate::browser::stream::frame`) and events
 /// (text, JSON); it sends `{"input": [...]}` (what its person does) and `{"control": {...}}`
 /// (resize, pause, keyframe, go, reload, back, forward).
+///
+/// With the server's WebRTC on (`crate::harness::webrtc`) it's told `{"webrtc": {"can": true}}`,
+/// and may send `{"webrtc": {"offer": sdp}}`, answered `{"webrtc": {"answer": sdp}}` (or
+/// `{"error"}`); once its peer shows the stream it sends `{"webrtc": {"playing": true}}` and the
+/// chunks go to the peer alone, until it says `{"playing": false}` or `{"close": true}`, or the
+/// peer goes (`{"webrtc": {"gone": why}}`).
 fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
     let me = person(&req);
     let live = hub.harness.streams.get(sid).filter(|l| l.session == id && l.for_whom(me.as_deref())).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
@@ -3721,34 +3760,116 @@ fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
 
 async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, socket: ws::WebSocket) -> anyhow::Result<()> {
     use crate::harness::streams::ToViewer;
+    use crate::harness::webrtc::{Peer, Said};
     use futures::FutureExt as _;
+    /// A key frame asked for a peer's loss at most this often.
+    const KEY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    enum Next {
+        Socket(Option<Result<Message, tungstenite::Error>>),
+        Said(Option<Said>),
+        Stream(Result<ToViewer, async_channel::RecvError>),
+    }
     let (mut tx, mut rx) = socket.split();
     let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
+    let rtc = &hub.harness.webrtc;
+    // The viewer's WebRTC peer, and whether it shows the stream (its chunks then go there alone).
+    let mut peer: Option<Peer> = None;
+    let mut playing = false;
+    let mut keyed: Option<std::time::Instant> = None;
     let r: anyhow::Result<()> = async {
+        if rtc.on() {
+            tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
+        }
         loop {
-            futures::select_biased! {
-                m = rx.next().fuse() => match m {
-                    Some(Ok(Message::Text(t))) => {
-                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
-                        if let Some(events) = v.get("input").filter(|e| e.is_array()) {
-                            live.input(&hub, events).await;
-                        }
-                        if let Some(c) = v.get("control").filter(|c| c.is_object()) {
-                            live.control(&hub, c).await;
-                        }
+            let next = {
+                let said = async {
+                    match &peer {
+                        Some(p) => p.said.recv().await.ok(),
+                        None => futures::future::pending().await,
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                    _ => {}
-                },
-                m = from_stream.recv().fuse() => match m {
-                    Ok(ToViewer::Chunk(b)) => tx.send(ws::binary(b)).await?,
-                    Ok(ToViewer::Event(e)) => tx.send(ws::text(e)).await?,
-                    Err(_) => return Ok(()),
-                },
+                };
+                futures::select_biased! {
+                    m = rx.next().fuse() => Next::Socket(m),
+                    s = said.fuse() => Next::Said(s),
+                    m = from_stream.recv().fuse() => Next::Stream(m),
+                }
+            };
+            match next {
+                Next::Socket(Some(Ok(Message::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
+                    if let Some(events) = v.get("input").filter(|e| e.is_array()) {
+                        live.input(&hub, events).await;
+                    }
+                    if let Some(c) = v.get("control").filter(|c| c.is_object()) {
+                        live.control(&hub, c).await;
+                    }
+                    let Some(w) = v.get("webrtc") else { continue };
+                    let was = playing;
+                    if let Some(sdp) = w.get("offer").and_then(serde_json::Value::as_str) {
+                        // A new peer, in place of one there was.
+                        peer = None;
+                        playing = false;
+                        let said = match rtc.offer(&live.codec(), sdp) {
+                            Ok((p, answer)) => {
+                                peer = Some(p);
+                                serde_json::json!({"webrtc": {"answer": answer}})
+                            }
+                            Err(e) => serde_json::json!({"webrtc": {"error": format!("{e:#}")}}),
+                        };
+                        tx.send(ws::text(said.to_string())).await?;
+                    }
+                    if let Some(on) = w.get("playing").and_then(serde_json::Value::as_bool) {
+                        playing = on && peer.is_some();
+                    }
+                    if w.get("close").and_then(serde_json::Value::as_bool) == Some(true) {
+                        peer = None;
+                        playing = false;
+                    }
+                    // Back on this socket: its decoder starts again from a key frame.
+                    if was && !playing {
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                }
+                Next::Socket(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => return Ok(()),
+                Next::Socket(_) => {}
+                // Connected, it starts from a key frame; one lost, a key frame mends it.
+                Next::Said(Some(Said::Connected)) => {
+                    keyed = Some(std::time::Instant::now());
+                    live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                }
+                Next::Said(Some(Said::Keyframe)) => {
+                    if keyed.is_none_or(|k| k.elapsed() >= KEY_EVERY) {
+                        keyed = Some(std::time::Instant::now());
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                }
+                Next::Said(gone) => {
+                    let why = match gone {
+                        Some(Said::Gone(why)) => why,
+                        _ => "WebRTC stopped on this server".to_owned(),
+                    };
+                    peer = None;
+                    if playing {
+                        playing = false;
+                        live.control(&hub, &serde_json::json!({"keyframe": true})).await;
+                    }
+                    tx.send(ws::text(serde_json::json!({"webrtc": {"gone": why}}).to_string())).await?;
+                }
+                Next::Stream(Ok(ToViewer::Chunk(b))) => {
+                    if let Some(p) = &peer {
+                        p.chunk(&b);
+                    }
+                    if !playing {
+                        tx.send(ws::binary(b)).await?;
+                    }
+                }
+                Next::Stream(Ok(ToViewer::Event(e))) => tx.send(ws::text(e)).await?,
+                Next::Stream(Err(_)) => return Ok(()),
             }
         }
     }
     .await;
+    drop(peer);
     hub.harness.streams.leave(&hub, &live, me).await;
     r
 }

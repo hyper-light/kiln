@@ -295,6 +295,9 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/system", "runners.read", At::Server),
     r("GET", "/api/events", "runs.read", At::Server),
     r("GET", "/api/metrics/history", "runners.read", At::Server),
+    // Every conversation store and its series (docs/conversations.md, "Telemetry").
+    r("GET", "/api/conversations/status", "runners.read", At::Server),
+    r("GET", "/api/conversations/series", "runners.read", At::Server),
     r("GET", "/api/audit", "audit.read", At::Server),
     // Repositories, runs and jobs (v1's routes; the engine's legs are jobs too).
     r("GET", "/api/repos", "runs.read", At::Anywhere),

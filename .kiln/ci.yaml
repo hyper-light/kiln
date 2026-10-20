@@ -20,6 +20,7 @@ jobs:
     resources: { cpu: "4", memory: 16Gi }
     env:
       CARGO_BUILD_JOBS: "4"
+      RUST_TEST_THREADS: "4"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     timeout-minutes: 45
     steps:

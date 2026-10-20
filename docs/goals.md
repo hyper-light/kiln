@@ -127,8 +127,9 @@ holds across restarts.
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | as above |
 
 Agents use the same through kiln's MCP tools (`goals_get`, `goals_add`, `goals_set`,
-`goals_control`) or `kiln.goals.*` in code mode: an agent can line goals up for itself or for
-another agent. `plans_run` takes `mode: "goals"`.
+`goals_control`) or `kiln.goals.*` in code mode: an agent can line goals up for itself and for
+the agents it started (and theirs), and change or clear only theirs (docs/agents.md, "No more than
+its parent"). `plans_run` takes `mode: "goals"`; on a new agent, that agent is the caller's child.
 
 How the harness's own goal stands is in the agent's state as `objective` (`{text, status:
 "active" | "met" | "unmet" | "paused" | "cleared", reason?, at}`), for Claude Code and Codex.

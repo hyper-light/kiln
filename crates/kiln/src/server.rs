@@ -140,6 +140,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
         }
         child!("sampler", h => h.sampler_loop());
+        child!("conversation-stores", h => crate::harness::stores::run(h));
         child!("retention", h => h.retention_loop());
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
@@ -166,6 +167,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));
         child!("fleet", h => crate::fleet::follow_loop(h));
+        // WebRTC to streams' viewers, on its own UDP port (docs/previews.md, "Streams").
+        if cfg.server.webrtc_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+            child!("webrtc", h => crate::harness::webrtc::run(h));
+        }
     }
     // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
     if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {

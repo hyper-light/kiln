@@ -12,9 +12,10 @@ import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
 import { MoveDialog } from "./move";
-import { ReachDialog } from "./reach";
-import { SpawnDialog } from "./spawn";
 import { useEndWithChildren } from "./family";
+
+const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
+const SpawnDialog = React.lazy(() => import("./spawn").then((m) => ({ default: m.SpawnDialog })));
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
@@ -132,18 +133,20 @@ export function useAgentActions(
         onConfirm={end}
       />
       {act === "move" && <MoveDialog agent={a} onClose={() => setAct(null)} />}
-      {act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}
-      {act === "duplicate" && (
-        <SpawnDialog
-          open
-          onOpenChange={(o) => !o && setAct(null)}
-          defaults={{ target: a.target, cwd: a.cwd, kind: a.kind }}
-          onStarted={(started) => {
-            setAct(null);
-            if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
-          }}
-        />
-      )}
+      <React.Suspense fallback={null}>
+        {act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}
+        {act === "duplicate" && (
+          <SpawnDialog
+            open
+            onOpenChange={(o) => !o && setAct(null)}
+            defaults={{ target: a.target, cwd: a.cwd, kind: a.kind }}
+            onStarted={(started) => {
+              setAct(null);
+              if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
+            }}
+          />
+        )}
+      </React.Suspense>
     </>
   );
   return {
