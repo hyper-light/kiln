@@ -1534,6 +1534,8 @@ mod tests {
                 }
             }
             let window = s.page.eval("[innerWidth, innerHeight]").await?;
+            // Safari's own (no other WebDriver named): its Mac's display is kept awake meanwhile.
+            let awake = std::env::var_os("KILN_WEBDRIVER").is_some() || std::process::Command::new("pmset").args(["-g", "assertions"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("caffeinate"));
             s.input(vec![Input::Pointer { k: "down".into(), x: 120.0, y: 90.0, button: 0, buttons: 1, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }, Input::Pointer { k: "up".into(), x: 120.0, y: 90.0, button: 0, buttons: 0, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 }]).await?;
             let clicked = std::time::Instant::now();
             let mut title = s.page.eval("document.title").await?;
@@ -1547,6 +1549,7 @@ mod tests {
             super::super::driven::stop_all().await;
             assert!(keys >= 1 && keys + frames >= 5, "key frames {keys}, frames {frames}");
             assert_eq!(window, json!([400, 300]), "its window, as asked");
+            assert!(awake, "Safari's Mac kept awake while it streams (caffeinate)");
             assert_eq!(title, json!("clicked 120,90"));
             assert!(said.iter().any(|e| e.contains("\"navigated\"")) && said.iter().any(|e| e.contains("\"loaded\"") && e.contains("driven")), "{said:?}");
             Ok(())

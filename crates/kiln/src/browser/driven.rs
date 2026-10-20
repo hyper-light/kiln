@@ -186,6 +186,8 @@ pub struct Remote {
     scratch: Option<PathBuf>,
     /// The display of its own a WebKitGTK browser draws on (Linux), stopped with it.
     display: Mutex<Option<Display>>,
+    /// Safari's Mac kept awake while it runs (`keep_awake`), stopped with it.
+    awake: Mutex<Option<std::process::Child>>,
     pages: AtomicUsize,
 }
 
@@ -202,6 +204,9 @@ impl Remote {
         }
         if let Some(d) = self.display.lock().take() {
             d.stop();
+        }
+        if let Some(p) = self.awake.lock().take() {
+            stop_process(p);
         }
         if let Some(d) = &self.scratch {
             let _ = std::fs::remove_dir_all(d);
@@ -378,7 +383,7 @@ async fn start_firefox(dir: &Path, profile: &str) -> anyhow::Result<Remote> {
     if bidi.call("session.subscribe", json!({"events": all})).await.is_err() {
         bidi.call("session.subscribe", json!({"events": wanted})).await?;
     }
-    Ok(Remote { conn: Conn::Bidi(bidi), process: Mutex::new(started.take()), scratch: clean.then_some(folder), display: Mutex::new(None), pages: AtomicUsize::new(0) })
+    Ok(Remote { conn: Conn::Bidi(bidi), process: Mutex::new(started.take()), scratch: clean.then_some(folder), display: Mutex::new(None), awake: Mutex::new(None), pages: AtomicUsize::new(0) })
 }
 
 /// The engines this machine has, besides Chromium: whether it has Firefox, and a WebDriver for
@@ -454,6 +459,8 @@ async fn start_webdriver(dir: &Path, sim: Option<&super::simulators::Sim>) -> an
         cmd.process_group(0);
     }
     let mut started = Started(Some(cmd.spawn().map_err(|e| anyhow::anyhow!("{} didn't start: {e}", bin.display()))?));
+    // Safari's own window, on its Mac's screen: kept seen while it runs.
+    let awake = if safari && sim.is_none() { started.0.as_ref().and_then(|c| keep_awake(c.id())) } else { None };
     let root = format!("http://127.0.0.1:{port}");
     let mut up = false;
     for _ in 0..50 {
@@ -479,7 +486,25 @@ async fn start_webdriver(dir: &Path, sim: Option<&super::simulators::Sim>) -> an
         }
     })?;
     let id = made.pointer("/value/sessionId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("the WebDriver started no session: {made}"))?;
-    Ok(Remote { conn: Conn::Classic(format!("{root}/session/{id}")), process: Mutex::new(started.take()), scratch: None, display: Mutex::new(display), pages: AtomicUsize::new(0) })
+    Ok(Remote { conn: Conn::Classic(format!("{root}/session/{id}")), process: Mutex::new(started.take()), scratch: None, display: Mutex::new(display), awake: Mutex::new(awake), pages: AtomicUsize::new(0) })
+}
+
+/// Safari throttles a window it can't show (its Mac asleep, locked, the window out of sight):
+/// pictures a second apart, clicks lost. While its WebDriver (`pid`) runs, the Mac's display is
+/// woken and kept awake, as for a video call (`caffeinate`, in a process group of its own; it ends
+/// with that process).
+fn keep_awake(pid: u32) -> Option<std::process::Child> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut cmd = std::process::Command::new("/usr/bin/caffeinate");
+    cmd.args(["-d", "-i", "-u", "-w", &pid.to_string()]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    cmd.spawn().ok()
 }
 
 /// A display of its own for the WebKitGTK browser a WebDriver starts (Linux), so no window of it
@@ -733,7 +758,8 @@ impl Driven {
             }
             Conn::Classic(base) => {
                 anyhow::ensure!(remote.pages.load(Ordering::Relaxed) == 0, "Safari takes one automated window at a time: close the other WebKit stream first");
-                crate::rt::spawn(poll(base.clone(), Arc::downgrade(&remote), said_tx.clone()));
+                // Whether its window can be seen, said for Safari's own on a Mac (a simulator has none).
+                crate::rt::spawn(poll(base.clone(), Arc::downgrade(&remote), said_tx.clone(), cfg!(target_os = "macos") && sim.is_none()));
                 String::new()
             }
         };
@@ -1030,8 +1056,9 @@ async fn events(bidi: std::sync::Weak<Bidi>, context: String, rx: async_channel:
 
 /// A WebDriver session's page, asked what it does (it says nothing by itself): where it is, its
 /// title, what its script said, a dialog.
-async fn poll(base: String, remote: std::sync::Weak<Remote>, said: async_channel::Sender<Value>) {
+async fn poll(base: String, remote: std::sync::Weak<Remote>, said: async_channel::Sender<Value>, seen: bool) {
     let (mut url, mut title) = (String::new(), String::new());
+    let mut hidden = false;
     let script = format!("({})(s => (window.__kilnSaid = window.__kilnSaid || []).push(s))", focus_script());
     let mut unanswered = 0;
     loop {
@@ -1067,14 +1094,27 @@ async fn poll(base: String, remote: std::sync::Weak<Remote>, said: async_channel
                 let _ = said.send(json!({"loaded": {"title": t}})).await;
             }
         }
-        if let Ok(v) = http(&format!("{base}/execute/sync"), Some(json!({"script": "const s = window.__kilnSaid || []; window.__kilnSaid = []; return s;", "args": []}))).await {
-            for s in v.get("value").and_then(Value::as_array).into_iter().flatten() {
-                if let Some(ev) = s.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                    let _ = said.send(ev).await;
-                }
+        if let Ok(v) = http(&format!("{base}/execute/sync"), Some(json!({"script": DRAIN, "args": []}))).await {
+            let (events, now_hidden) = drained(&v);
+            for ev in events {
+                let _ = said.send(ev).await;
+            }
+            if seen && now_hidden.is_some_and(|h| h != hidden) {
+                hidden = !hidden;
+                let _ = said.send(json!({"hidden": hidden})).await;
             }
         }
     }
+}
+
+/// What the page said since the last time (`focus_script`), and whether it can be seen.
+const DRAIN: &str = "const s = window.__kilnSaid || []; window.__kilnSaid = []; return [s, document.visibilityState === 'hidden'];";
+
+/// `DRAIN`'s answer: the page's events, and whether it's hidden (when it says).
+fn drained(answer: &Value) -> (Vec<Value>, Option<bool>) {
+    let v = answer.get("value");
+    let events = v.and_then(|v| v.get(0)).and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok())).collect();
+    (events, v.and_then(|v| v.get(1)).and_then(Value::as_bool))
 }
 
 // ------------------------------------------------------------------------------ actions
@@ -1173,6 +1213,18 @@ mod tests {
         assert_eq!(Engine::parse("safari")?, Engine::Webkit);
         assert!(Engine::parse("lynx").is_err());
         Ok(())
+    }
+
+    /// What a WebDriver's page said since the poll before, and whether it's out of sight (Safari's
+    /// window on a locked Mac); an answer from before it said so has no say about it.
+    #[test]
+    fn a_drained_page_says_its_events_and_whether_it_can_be_seen() {
+        let (events, hidden) = drained(&json!({"value": [["{\"focus\":{\"editable\":true}}", "not json"], true]}));
+        assert_eq!(events, vec![json!({"focus": {"editable": true}})]);
+        assert_eq!(hidden, Some(true));
+        assert_eq!(drained(&json!({"value": [[], false]})), (vec![], Some(false)));
+        assert_eq!(drained(&json!({"value": ["{\"focus\":{}}"]})), (vec![], None));
+        assert!(DRAIN.contains("visibilityState"));
     }
 
     #[test]
