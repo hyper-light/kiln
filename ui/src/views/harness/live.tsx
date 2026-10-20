@@ -729,7 +729,8 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           {recording !== null ? <Since at={recording} /> : agentDid || word}
         </span>
         <span className="pg-actions">
-          {plays && (
+          {/* Its sound comes over WebRTC, or over its socket where WebCodecs' AudioDecoder plays it. */}
+          {(plays || rtcs) && (
             <button
               type="button"
               className="pg-action"
