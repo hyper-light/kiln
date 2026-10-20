@@ -1,0 +1,336 @@
+/* Sync (views/repos/sync-activity.tsx), a section of the Repositories page that opens and closes:
+   closed, one line; open, each synced repo's copies and what happened, in the page's flow. On a
+   phone the tables keep their few key columns and everything else wraps: nothing scrolls sideways. */
+
+.sact {
+  margin: 0 0 20px;
+  border-top: 1px solid var(--color-line);
+  border-bottom: 1px solid var(--color-line);
+}
+
+.sact-toggle {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 10px 2px;
+  color: var(--color-secondary);
+  text-align: left;
+}
+.sact-toggle:hover {
+  color: var(--color-foreground);
+}
+.sact-toggle:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+.sact-eyebrow {
+  flex: none;
+}
+.sact-line {
+  display: inline-flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: 12.5px;
+}
+.sact-when {
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sact-chev {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-left: auto;
+  color: var(--color-meta);
+  transition: transform 0.2s;
+}
+.sact[data-open] .sact-chev {
+  transform: rotate(180deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sact-chev {
+    transition: none;
+  }
+}
+
+.sact-body {
+  display: grid;
+  gap: 14px;
+  padding: 4px 0 18px;
+}
+.sact-empty {
+  margin: 0;
+  color: var(--color-meta);
+  font-size: 12.5px;
+}
+
+.sact-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.sact-select {
+  min-width: 0;
+  flex: 1 1 160px;
+  max-width: 240px;
+}
+
+/* ---------------------------------------------------------------- a repo's copies */
+
+.sact-repo {
+  display: grid;
+  gap: 6px;
+}
+.sact-repo-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+.sact-repo-head h3 {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 14px;
+  font-weight: 500;
+}
+.sact-meta {
+  min-width: 0;
+  flex: 1 1 260px;
+  color: var(--color-meta);
+  font-size: 12px;
+}
+.sact-spark {
+  display: inline-flex;
+  height: 16px;
+  flex: none;
+  align-items: flex-end;
+  gap: 1px;
+  align-self: center;
+}
+.sact-spark i {
+  display: block;
+  width: 3px;
+  background: var(--color-line-strong);
+}
+.sact-spark i[data-on] {
+  background: var(--prism);
+  background-size: 1200% 100%;
+}
+
+.sact-copies {
+  table-layout: auto;
+}
+.sact-copies tbody td {
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+.sact-copy {
+  max-width: 260px;
+}
+.sact-machine {
+  color: var(--color-foreground);
+  font-size: 12.5px;
+}
+.sact-path {
+  display: block;
+  overflow: hidden;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sact-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.sact-copy-error {
+  margin-top: 2px;
+  color: var(--color-fail);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- what happened */
+
+.sact-feed-title {
+  margin: 4px 0 0;
+}
+.sact-feed {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sact-event {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid #1d1f23;
+}
+.sact-time {
+  padding-top: 1px;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.sact-what {
+  min-width: 0;
+}
+.sact-text,
+.sact-step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  margin: 0;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+/* A note: its dot beside the first line, its words wrapping beside it. */
+.sact-text {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+.sact-text > .dot {
+  flex: none;
+  margin-top: 6px;
+}
+.sact-text > span:last-child {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.sact-event[data-tone="warn"] .sact-text {
+  color: var(--color-warn);
+}
+.sact-event[data-tone="fail"] .sact-text {
+  color: var(--color-fail);
+}
+.sact-repo-name {
+  color: var(--color-slate);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sact-dim {
+  color: var(--color-meta);
+}
+.sact-warn {
+  color: var(--color-warn);
+}
+.sact-fail {
+  color: var(--color-fail);
+}
+
+.sact-delivery {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  margin-left: auto;
+}
+.sact-to {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.sact-to i {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--color-pending);
+  border-radius: 50%;
+}
+.sact-to[data-got] {
+  color: var(--color-secondary);
+}
+.sact-to[data-got] i {
+  border-color: transparent;
+  background: var(--color-ok-dot);
+}
+
+.sact-files {
+  display: grid;
+  gap: 1px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.sact-file {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 8px;
+  font-size: 11.5px;
+}
+.sact-sign {
+  width: 10px;
+  flex: none;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  text-align: center;
+}
+.sact-file[data-kind="added"] .sact-sign {
+  color: var(--color-ok);
+}
+.sact-file[data-kind="deleted"] .sact-sign {
+  color: var(--color-fail);
+}
+.sact-file-path {
+  min-width: 0;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.sact-file[data-kind="deleted"] .sact-file-path {
+  color: var(--color-meta);
+  text-decoration: line-through;
+  text-decoration-color: rgb(255 255 255 / 25%);
+}
+.sact-rest summary {
+  margin-top: 2px;
+  color: var(--color-muted);
+  cursor: pointer;
+  font-size: 11.5px;
+}
+.sact-more {
+  justify-self: start;
+  color: var(--color-link);
+  font-size: 12px;
+}
+.sact-more:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+@media (max-width: 639px) {
+  .sact-event {
+    grid-template-columns: 48px minmax(0, 1fr);
+    gap: 8px;
+  }
+  .sact-copy {
+    max-width: 150px;
+  }
+  .sact-delivery {
+    margin-left: 0;
+  }
+  .sact-select {
+    max-width: none;
+  }
+}

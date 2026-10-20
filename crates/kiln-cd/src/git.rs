@@ -304,6 +304,8 @@ impl Mirror {
         let mut archive = tar::Archive::new(stdout);
         archive.set_preserve_permissions(false);
         archive.unpack(dest).context("unpacking git archive")?;
+        // Git may still be writing padding after tar's end marker.
+        std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).context("reading git archive")?;
         let status = child.wait()?;
         if !status.success() {
             let mut err = String::new();
