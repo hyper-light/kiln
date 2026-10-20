@@ -96,8 +96,10 @@ impl Tracker {
             let n = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, events.as_mut_ptr(), cap, &raw const wait) };
             for ev in events.iter().take(usize::try_from(n).unwrap_or(0)) {
                 let Ok(pid) = i32::try_from(ev.ident) else { continue };
+                // Whose it is, the lock let go before its children are followed (`watch` takes it).
+                let session = self.members.lock().get(&pid).cloned();
                 if ev.fflags & libc::NOTE_FORK != 0
-                    && let Some(session) = self.members.lock().get(&pid).cloned()
+                    && let Some(session) = session
                 {
                     for c in children(pid) {
                         self.watch(c, &session, DEPTH);
@@ -131,10 +133,10 @@ impl Tracker {
                 continue;
             }
             let Some(session) = p.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str()))) else { continue };
-            if sessions.contains(session)
-                && let Ok(pid) = i32::try_from(pid.as_u32())
-                && !self.members.lock().contains_key(&pid)
-            {
+            let Ok(pid) = i32::try_from(pid.as_u32()) else { continue };
+            // Looked up and let go of before it's followed (`watch` takes the lock).
+            let followed = self.members.lock().contains_key(&pid);
+            if sessions.contains(session) && !followed {
                 self.watch(pid, session, DEPTH);
             }
         }
