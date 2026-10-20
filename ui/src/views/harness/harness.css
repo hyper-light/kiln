@@ -2665,23 +2665,70 @@ textarea.hx-input {
   color: #f4e0e1;
 }
 
-/* Paused for a usage limit (pause.tsx): one calm block above the composer, what it waits for and
-   what you can do, in the page's flow. */
+/* Paused for a usage limit: the same disclosure line as the work around it. Actions can be
+   folded away; their own scroll area leaves room for the conversation and composer on a phone. */
 .hx-paused {
+  min-width: 0;
+  border-block: 1px solid #25272c;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-secondary);
+}
+.hx-paused-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 9px 4px;
+  text-align: left;
+}
+.hx-paused-head:hover {
+  color: var(--color-bright);
+}
+.hx-paused-head:focus-visible {
+  outline: 2px solid #b8add8;
+  outline-offset: 2px;
+}
+.hx-paused-head > svg {
+  flex: none;
+  color: #a6b2c6;
+}
+.hx-paused-summary {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  min-width: 0;
+}
+.hx-paused-title {
+  font-weight: 500;
+  color: var(--color-bright);
+}
+.hx-paused-until {
+  color: var(--color-subtle);
+  font-size: 12px;
+}
+.hx-paused-head .hx-paused-chev {
+  margin-left: auto;
+  color: #8f929b;
+}
+.hx-paused[data-open] .hx-paused-chev {
+  transform: rotate(90deg);
+}
+.hx-paused-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid rgb(166 178 198 / 32%);
-  border-radius: 10px;
-  background: rgb(166 178 198 / 6%);
-  font-size: 13px;
-  line-height: 1.5;
-  color: #d3d9e3;
+  max-height: min(240px, calc(var(--window-h, 100dvh) * 0.32));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 4px 12px 29px;
 }
-.hx-paused b {
-  font-weight: 500;
-  color: #e6eaf1;
+.hx-paused-body[hidden] {
+  display: none;
 }
 .hx-paused-what,
 .hx-paused-kept {
@@ -2691,15 +2738,33 @@ textarea.hx-input {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px 16px;
+  gap: 8px;
 }
 .hx-paused-auto {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   font-size: 12.5px;
-  color: #c3c8d2;
   cursor: pointer;
+}
+.hx-paused-auto input {
+  flex: none;
+  margin-top: 2px;
+}
+@media (pointer: coarse) {
+  .hx-paused-do > button {
+    min-height: 40px;
+  }
+  .hx-paused-auto {
+    min-height: 36px;
+    align-items: center;
+  }
+  .hx-paused-auto input {
+    margin-top: 0;
+  }
+  .hx-paused .hx-pick select {
+    font-size: 16px;
+  }
 }
 /* A select in a line of words (pausing, at a limit, going on now): the size of the words. */
 .hx-pick {

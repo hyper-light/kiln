@@ -461,7 +461,7 @@ function Dock({
           )}
         </div>
       ) : null}
-      <PausedLine store={store} send={send} />
+      <PausedLine store={store} send={send} onLogin={() => onView("login")} />
       <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} />
     </div>
   );

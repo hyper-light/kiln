@@ -90,11 +90,14 @@
   padding: 18px 24px 14px;
   border-bottom: 1px solid #1d1f23;
 }
-/* A phone's keyboard is up for the composer: the conversation gets the room the agent's name and
-   state took. Only for the composer: up for renaming, hiding them would close the field, and once
-   the name is in, the keyboard is still on its way down, so they'd blink out and back (the page
-   jumping up and down) as it went. */
-html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
+/* Typing a prompt or answering a question gives the conversation the room the agent's name and
+   state took. Renaming keeps the head visible because it holds that field. */
+html[data-window="short"] .hx-agent:has(.hx-dock:focus-within, .ch :is(input, textarea, select):focus) > .ag-head {
+  display: none;
+}
+/* While answering a question, the answer field is the composer. Leave its options and Submit
+   room above the keyboard; the normal prompt returns as soon as the field is left. */
+html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) > .hx-dock {
   display: none;
 }
 .ag-top {

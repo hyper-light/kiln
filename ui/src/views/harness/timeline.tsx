@@ -755,6 +755,18 @@ function useKeeper(key: string) {
       // Something changed size (it came in, loaded, opened, the view resized): before it's painted,
       // the end stays at the end, or what you were reading stays where it was.
       const hold = () => {
+        // A keyboard or a growing answer can resize the pane while a question is being answered.
+        // Keep that field visible instead of pinning an unrelated row (or the transcript's end).
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement && root.contains(focused) && focused.matches("input, textarea, [contenteditable='true']")) {
+          const field = focused.getBoundingClientRect();
+          const pane = root.getBoundingClientRect();
+          if (field.top < pane.top + 12) root.scrollTop += field.top - pane.top - 12;
+          else if (field.bottom > pane.bottom - 12) root.scrollTop += field.bottom - pane.bottom + 12;
+          s.touched = null;
+          read();
+          return;
+        }
         const t = s.touched;
         if (t && performance.now() - t.t < TOUCH_MS && t.el.isConnected && t.el.offsetHeight !== t.h) {
           // What you just opened (or closed) opens in place; where that leaves you is where you are.

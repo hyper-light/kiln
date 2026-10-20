@@ -88,21 +88,28 @@ function fitTheWindow(el: HTMLElement | null) {
   const view = window.visualViewport;
   root.classList.add("fills-window");
   const fit = () => {
-    if (view && Math.abs(view.scale - 1) > 0.01) return;
-    const h = Math.round(view?.height ?? window.innerHeight);
+    // Zoom changes the visual viewport's CSS pixels too. Keep measuring the available height in
+    // unzoomed pixels: otherwise a keyboard resize during zoom freezes the last, shorter height.
+    const scale = view?.scale ?? 1;
+    const h = Math.round(view ? view.height * scale : window.innerHeight);
     root.style.setProperty("--window-h", `${h}px`);
     if (h < SHORT_PX) root.dataset.window = "short";
     else delete root.dataset.window;
     // The page, or the window's visible part over it (iOS pans that with its keyboard up), moved.
-    if (window.scrollY !== 0 || window.scrollX !== 0 || (view?.offsetTop ?? 0) > 0) window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    // Leave deliberate zooming and panning alone.
+    if (Math.abs(scale - 1) <= 0.01 && (window.scrollY !== 0 || window.scrollX !== 0 || (view?.offsetTop ?? 0) > 0)) window.scrollTo({ top: 0, left: 0, behavior: "instant" });
   };
   fit();
   view?.addEventListener("resize", fit);
   view?.addEventListener("scroll", fit);
+  window.addEventListener("resize", fit);
+  window.addEventListener("pageshow", fit);
   window.addEventListener("scroll", fit, { passive: true });
   return () => {
     view?.removeEventListener("resize", fit);
     view?.removeEventListener("scroll", fit);
+    window.removeEventListener("resize", fit);
+    window.removeEventListener("pageshow", fit);
     window.removeEventListener("scroll", fit);
     root.classList.remove("fills-window");
     root.style.removeProperty("--window-h");
