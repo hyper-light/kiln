@@ -214,12 +214,16 @@ def mode_of(st_mode: int) -> int:
 
 def read_vendored(root: Path, project: Project) -> Tree:
     """The project's folder as git would commit it (tracked and untracked files, ignored ones
-    left out), less kiln's own files."""
+    left out), less kiln's own files. Where the root isn't a git work tree (kiln's pipelines check
+    a commit out without its .git), the folder's files as they are."""
     folder = root / project.path
     if not folder.is_dir():
         return {}
-    r = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", project.path], cwd=root)
     own = set(project.own)
+    inside = git(["rev-parse", "--is-inside-work-tree"], cwd=root, ok=True)
+    if inside.returncode != 0 or inside.stdout.strip() != b"true":
+        return {rel: entry for rel, entry in read_folder(folder).items() if rel not in own}
+    r = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", project.path], cwd=root)
     tree: Tree = {}
     total = 0
     prefix = project.path + "/"

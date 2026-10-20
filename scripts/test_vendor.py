@@ -184,6 +184,29 @@ class GitProjects(VendorTestCase):
         self.assertIn("dropped 0001-f2-says-kiln.patch", err)
         self.assertFalse((lab.kiln / "vendor/patches/demo/0001-f2-says-kiln.patch").exists())
 
+    def test_check_works_on_a_tree_without_git_as_ci_checks_one_out(self) -> None:
+        """kiln's pipelines check a commit out without its .git: check reads the files as they are."""
+        self.vendored_with_a_change()
+        lab = self.lab
+        export = lab.tmp / "export"
+        sh_git(lab.kiln, "add", "-A")
+        sh_git(lab.kiln, "commit", "-q", "-m", "vendored")
+        archive = subprocess.run(["git", "archive", "HEAD"], cwd=lab.kiln, env=GIT_ENV, capture_output=True, check=True).stdout
+        export.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tf:
+            tf.extractall(export, filter="data")
+        self.assertFalse((export / ".git").exists())
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = vendor.main(["--root", str(export), "check"])
+        self.assertEqual(code, 0, out.getvalue())
+        (export / "vendor/demo/LICENSE").write_text("MIT, edited\n")
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            code = vendor.main(["--root", str(export), "check"])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("differs: LICENSE", out.getvalue())
+
     def test_every_recorded_change_must_have_its_row_in_upstream_md(self) -> None:
         self.vendored_with_a_change()
         lab = self.lab
