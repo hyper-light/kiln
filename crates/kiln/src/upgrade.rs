@@ -339,7 +339,7 @@ pub fn parse_plist(body: &str, unit: &str, system: bool) -> Option<Existing> {
     })
 }
 
-fn xml_unescape(s: &str) -> String {
+pub(crate) fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 

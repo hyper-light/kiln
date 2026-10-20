@@ -16,7 +16,7 @@ import { CodeLine, OsWords, Wrapped, useCopy } from "./parts";
 const SERVICE: Record<InstallOs, string> = {
   linux: "a service (systemd)",
   macos: "a service (launchd)",
-  windows: "a scheduled task (no admin needed)",
+  windows: "a scheduled task that starts it at boot (Windows asks for admin rights once; say no and it starts at sign-in)",
 };
 
 const K8S_GUIDE = "https://github.com/hyper-light/kiln/blob/main/deploy/README.md#mode-2--kubernetes";
