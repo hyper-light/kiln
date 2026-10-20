@@ -54,7 +54,7 @@ interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
-  emit: (ev: { type: "push" }) => void;
+  emit: (ev: { type: "push" } | { type: "harness"; info: AgentInfo }) => void;
   noContent: (res: http.ServerResponse) => void;
 }
 let emitPush: () => void = () => {};
@@ -170,6 +170,18 @@ export async function handlePush(req: http.IncomingMessage, res: http.ServerResp
   const m = req.method ?? "GET";
   emitPush = () => ctx.emit({ type: "push" });
   if (p === "/api/mock/push/outbox" && m === "GET") return (ctx.json(res, 200, { sent: outbox }), true);
+  // For trying Mission control: one of the fleet as it comes to stand otherwise (what changes, as
+  // the agent's own fields), told to the pages as the server tells them.
+  const fl = p.match(/^\/api\/mock\/fleet\/([^/]+)$/);
+  if (fl && m === "POST") {
+    const i = fleet.findIndex((a) => a.id === fl[1]);
+    const was = fleet[i];
+    if (!was) return (ctx.err(res, 404, "no agent of the fleet by that id"), true);
+    const changed: AgentInfo = { ...was, ...(await ctx.body<Partial<AgentInfo>>(req)), last_activity: Date.now() };
+    fleet[i] = changed;
+    ctx.emit({ type: "harness", info: changed });
+    return (ctx.json(res, 200, changed), true);
+  }
   if (!p.startsWith("/api/push")) return false;
   let mm: RegExpMatchArray | null;
   if (p === "/api/push" && m === "GET") {

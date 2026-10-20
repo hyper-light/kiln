@@ -1,13 +1,14 @@
 /**
- * Mission control: one list of your agents, newest first, each keeping its place: a row says in one
- * line what that agent is doing — or what it wants, or what it finished — and you answer it right
- * there. Nothing moves as agents update; only their words and marks change.
+ * Mission control: one list of your agents, the ones that need you first: a row says in one line
+ * what that agent is doing — or what it wants, or what it finished — and you answer it right there.
+ * An agent that comes to need you rises as it does; while you're using the list, rows hold still,
+ * then glide to their places.
  */
 import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
-import { ArrowUpRight, ChevronRight, Plus, RotateCcw } from "lucide-react";
+import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
@@ -23,7 +24,7 @@ import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
-import { DEFAULT_VIEW, isFiltered, ListBar, useShownList, type ListView } from "./list-tools";
+import { DEFAULT_VIEW, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
@@ -144,7 +145,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: A
     </span>
   );
   return (
-    <li className="ms-row" data-stand={stand} data-selected={selected || undefined}>
+    <li className="ms-row" data-stand={stand} data-selected={selected || undefined} data-glide={a.id}>
       <label className="ms-check">
         <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
       </label>
@@ -439,12 +440,14 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
 
   const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
-  // to find a name are not. The list holds still while agents work: see useShownList.
-  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.list", DEFAULT_VIEW);
-  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored }), [stored]);
+  // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
+  // the list, or have agents selected, it holds still: see useListHold.
+  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
+  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored, sort: sortOf(stored.sort ?? DEFAULT_VIEW.sort) }), [stored]);
   const [q, setQ] = React.useState("");
-  const shown = useShownList(all, q, view, true);
-  const { live, ended } = shown;
+  const { held, bind } = useListHold(selected.size > 0);
+  const { live, ended } = useShownList(all, q, view, held);
+  const glide = useGlide(live.map((r) => `${r.a.id}:${r.stand}`).join());
   const filtered = isFiltered(q, view.facets);
 
   const select = React.useCallback((id: string, on: boolean) => {
@@ -527,11 +530,6 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 Clear selection
               </button>
             )}
-            {shown.stale && (
-              <button type="button" className="ms-link ms-refresh" onClick={shown.refresh} title="The list stays as it was while agents work. Refresh to sort and filter it again.">
-                <RotateCcw size={12} aria-hidden="true" /> Refresh list
-              </button>
-            )}
             {folds && (
               <button type="button" className="ms-link ms-msg-open" aria-expanded={messaging} onClick={() => setMessaging(!messaging)}>
                 <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
@@ -541,9 +539,11 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           </div>
           {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
-            <ul className="ms-list">
-              <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
-            </ul>
+            <div {...bind} data-held={held || undefined}>
+              <ul className="ms-list" ref={glide}>
+                <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
+              </ul>
+            </div>
           ) : filtered && ended.length === 0 ? (
             <p className="ms-quiet">
               No agent matches.{" "}

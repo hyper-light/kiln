@@ -1,7 +1,7 @@
 /**
  * Agents and the agents they started (docs/agents.md, "Agents that run agents"). In Mission
  * control a parent's children sit under it, indented, folding in the page's flow; a child that
- * needs you keeps its own place at the top, naming its parent. A plan run's agents (one per step)
+ * needs you (or stopped) keeps its own place in the list, at the top, naming its parent. A plan run's agents (one per step)
  * sit under the run ("Plan: … · 2 of 3 met"), and the agents an attachment woke under it
  * (docs/ci.md W20-R08). Ending a parent offers to end what it started too.
  */
@@ -15,6 +15,9 @@ import { plansApi, runHref, type PlanRunBrief } from "@/api/plans";
 import { useLocalStorage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { agentLabel, taskDot } from "./derive";
+
+/** Where an agent stands that takes it out from under its parent, run or attachment: it waits on you. */
+const urgent = (stand: string) => stand === "needs" || stand === "crashed";
 
 /** A row of the list and the rows that go under it; or a plan run, or an attachment, and its agents. */
 export interface Family<T> {
@@ -41,7 +44,7 @@ function byAttachment<T extends { a: AgentInfo; stand: string }>(list: Family<T>
       out.push(f);
       continue;
     }
-    if (f.row.stand === "needs") {
+    if (urgent(f.row.stand)) {
       out.push({ ...f, of: f.of ?? `${inc.name}, attached to ${onWords(inc.on)}` });
       continue;
     }
@@ -71,7 +74,7 @@ function byRun<T extends { a: AgentInfo; stand: string }>(list: Family<T>[], run
       out.push(node);
       continue;
     }
-    if (f.row.stand === "needs") {
+    if (urgent(f.row.stand)) {
       out.push({ ...node, of: node.of ?? `the plan ${run.title}` });
       continue;
     }
@@ -88,7 +91,7 @@ function byRun<T extends { a: AgentInfo; stand: string }>(list: Family<T>[], run
 
 /**
  * The list as families, in the list's own order: an agent whose parent is in the list goes under
- * it, unless it needs you (then it keeps its place, and says whose it is).
+ * it, unless it needs you or stopped (then it keeps its place, and says whose it is).
  */
 export function families<T extends { a: AgentInfo; stand: string }>(rows: T[], all: AgentInfo[]): Family<T>[] {
   const nodes = new Map<string, Family<T>>(rows.map((r) => [r.a.id, { row: r, kids: [] }]));
@@ -101,7 +104,7 @@ export function families<T extends { a: AgentInfo; stand: string }>(rows: T[], a
     const n = nodes.get(r.a.id);
     if (!n) continue;
     const parent = r.a.parent ? nodes.get(r.a.parent) : undefined;
-    if (parent && r.stand !== "needs") parent.kids.push(n);
+    if (parent && !urgent(r.stand)) parent.kids.push(n);
     else {
       if (r.a.parent) n.of = name(r.a.parent);
       top.push(n);
@@ -124,7 +127,7 @@ function standing<T extends { stand: string }>(kids: Family<T>[], tasks: Subagen
 /** Native subagents open their existing thread; they have no independent session controls. */
 function NativeChild({ agent, task }: { agent: string; task: SubagentBrief }) {
   return (
-    <li className="fam-task">
+    <li className="fam-task" data-glide={`task-${agent}-${task.id}`}>
       <Link to={`/agents/${encodeURIComponent(agent)}?task=${encodeURIComponent(task.id)}`} className="fam-task-link">
         <span className="fam-task-name">{task.description || "Subagent"}</span>
         <span className="fam-task-status">
@@ -150,7 +153,7 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
         const run = f.run;
         const open = !folded.includes(run.id);
         return (
-          <li key={`run-${run.id}`} className="fam fam-run">
+          <li key={`run-${run.id}`} className="fam fam-run" data-glide={`run-${run.id}`}>
             <div className="fam-run-head">
               <button type="button" className="fam-fold fam-run-fold" aria-expanded={open} aria-label={open ? "Fold the run's agents" : "Show the run's agents"} onClick={() => toggle(run.id)}>
                 <ChevronRight size={13} className="fam-chev" aria-hidden="true" />
@@ -171,7 +174,7 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
         const key = `attached-${at.id}`;
         const open = !folded.includes(key);
         return (
-          <li key={key} className="fam fam-run">
+          <li key={key} className="fam fam-run" data-glide={key}>
             <div className="fam-run-head">
               <button type="button" className="fam-fold fam-run-fold" aria-expanded={open} aria-label={open ? "Fold its agents" : "Show its agents"} onClick={() => toggle(key)}>
                 <ChevronRight size={13} className="fam-chev" aria-hidden="true" />
@@ -193,7 +196,7 @@ export function Families<T extends { a: AgentInfo; stand: string }>({ items, ren
         <React.Fragment key={id}>
           {render(f.row, f.of)}
           {count > 0 && (
-            <li className="fam">
+            <li className="fam" data-glide={`fam-${id}`}>
               <button type="button" className="fam-fold" aria-expanded={open} aria-label={`${open ? "Fold" : "Show"} ${agentLabel(f.row.a)}'s ${count} subagent${count === 1 ? "" : "s"}`} onClick={() => toggle(id)}>
                 <ChevronRight size={13} className="fam-chev" aria-hidden="true" />
                 <span className="fam-count">{count} agent{count === 1 ? "" : "s"} it started</span>
