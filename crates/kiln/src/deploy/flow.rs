@@ -1704,7 +1704,7 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     }
     if env.gates.via == Via::PullRequest {
         let gh = at.github().ok_or("gates.via: pull-request needs a release repository on GitHub")?;
-        let p = gh.propose(r.id, changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
+        let p = gh.propose(&github::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
         let kept = json!({ "number": p.number, "url": p.url, "branch": p.branch, "secrets": changed, "irreversible": found.irreversible });
         return Ok(Committed::Proposed(kept, waits_for(p.number, &p.url)));
     }

@@ -451,9 +451,11 @@ fn p3_release_repositories_on_github() -> anyhow::Result<()> {
     })?;
     let r = release(s.port, &s.admin, id2)?;
     assert_eq!((r.get("state"), r.get("commit")), (Some(&json!("committing")), None), "{r}");
-    let branch = format!("kiln/release-{id2}");
+    // Its branch: its id and when it was asked for, so another kiln's release 2 is never taken for it.
+    let branch = format!("kiln/release-{id2}-{}", r.get("created_at").and_then(Value::as_i64).unwrap_or(0));
     let pull = fake.lock().map(|g| g.pulls.first().cloned().unwrap_or_default()).unwrap_or_default();
     assert_eq!((pull.pointer("/head/ref"), pull.pointer("/base/ref")), (Some(&json!(branch)), Some(&json!("main"))), "{pull}");
+    assert_eq!(r.pointer("/provider/pull_request/branch"), Some(&json!(branch)), "{r}");
     assert!(pull.get("body").and_then(Value::as_str).is_some_and(|b| b.contains("Merging this pull request releases it")), "{pull}");
     let head = git(&releases, &["rev-parse", &branch])?;
     assert!(git(&releases, &["log", "-1", "--format=%B", &head])?.contains(&format!("Kiln-Release: {id2}")));
@@ -494,7 +496,8 @@ fn p3_release_repositories_on_github() -> anyhow::Result<()> {
     // A pull request closed unmerged on GitHub: its release cancelled, its branch gone.
     let id3 = ask(s.port, &s.admin, "production")?;
     until(60, "the second pull request", || Ok((fake.lock().map(|g| g.pulls.len()).unwrap_or(0) < 2).then(|| s.log())))?;
-    let b3 = format!("kiln/release-{id3}");
+    let b3 = fake.lock().map(|g| g.pulls.get(1).and_then(|p| p.pointer("/head/ref")).and_then(Value::as_str).unwrap_or_default().to_owned()).unwrap_or_default();
+    assert!(b3.starts_with(&format!("kiln/release-{id3}-")), "{b3}");
     if let Ok(mut g) = fake.lock()
         && let Some(o) = g.pulls.get_mut(1).and_then(Value::as_object_mut)
     {

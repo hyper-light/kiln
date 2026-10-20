@@ -6,8 +6,8 @@
 //! - **Written** by a push of a commit made in the mirror, with a lease on the head it was made
 //!   on: a commit someone made beside it is never lost.
 //! - **Pull requests**, where an environment says `via: pull-request`: a release is proposed from
-//!   a branch of its own (`kiln/release-<id>`); merged, its merge is delivered; closed unmerged,
-//!   it's cancelled.
+//!   a branch of its own (`kiln/release-<id>-<when it was asked for>`); merged, its merge is
+//!   delivered; closed unmerged, it's cancelled.
 //! - **Deployments**: each release is a deployment of its commit to `<environment>/<app>`, its
 //!   status following the release.
 //! - **Webhooks**: a push has the mirror fetched at once, a pull request moves its release at once;
@@ -38,8 +38,15 @@ const NETWORK: Duration = Duration::from_secs(300);
 pub const POLL: Duration = Duration::from_secs(60);
 /// How fresh a head must be that a commit is made on.
 const FRESH: Duration = Duration::from_secs(2);
-/// The branch a release proposed as a pull request comes from.
+/// The branches releases proposed as pull requests come from.
 pub const PROPOSAL_PREFIX: &str = "kiln/release-";
+
+/// The branch a release is proposed from: its id, and when it was asked for, so a release of
+/// another kiln (or of this one before its data was made again) with the same id is never taken
+/// for it.
+pub fn proposal_branch(r: &Release) -> String {
+    format!("{PROPOSAL_PREFIX}{}-{}", r.id, r.created_at)
+}
 
 /// What the service keeps for GitHub's release repositories: when each mirror was fetched (none:
 /// due now), one fetch or push at a time in each, and one report of a release at a time.
@@ -138,10 +145,13 @@ impl Github {
         ])
     }
 
-    /// git in the mirror, talking to GitHub: what it said, whether it succeeded or not.
+    /// git in the mirror, talking to GitHub: what it said, whether it succeeded or not. It reads no
+    /// global or system configuration: a URL rewrite or a credential helper there would have it
+    /// fetch or push as whoever runs kiln rather than as the App.
     async fn remote(&self, args: &[&str], write: bool) -> anyhow::Result<std::process::Output> {
         let mut cmd = std::process::Command::new("git");
         crate::os::git_no_prompts(&mut cmd);
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.arg("-C").arg(self.dir()?).args(args).stdin(std::process::Stdio::null());
         for (k, v) in self.auth(write).await? {
             cmd.env(k, v);
@@ -270,11 +280,11 @@ impl Github {
 
     // ------------------------------------------------------------------ pull requests
 
-    /// Proposes a release as a pull request: `changes` committed on the branch's head, on a branch
-    /// of the release's own, and a pull request from it. One proposed before (a restart between
-    /// the two) is found, not made again.
-    pub async fn propose(&self, id: i64, changes: Vec<Change>, message: String, author: Author, body: &str) -> anyhow::Result<Proposal> {
-        let branch = format!("{PROPOSAL_PREFIX}{id}");
+    /// Proposes a release as a pull request: `changes` committed on the branch's head, on the
+    /// release's own `branch` ([`proposal_branch`]), and a pull request from it. One proposed before
+    /// (a restart between the two) is found, not made again.
+    pub async fn propose(&self, branch: &str, changes: Vec<Change>, message: String, author: Author, body: &str) -> anyhow::Result<Proposal> {
+        let branch = branch.to_owned();
         let row = self.row();
         if let Some((pr, state)) = self.app.find_change(&row, &branch).await? {
             return Ok(Proposal { number: pr.number, url: pr.url, branch, state });
@@ -459,8 +469,10 @@ pub async fn on_event(d: &Deploy, event: &str, v: &Value) {
         d.github.scan.store(true, std::sync::atomic::Ordering::Release);
     }
     if event == "pull_request"
-        && let Some(id) = v.pointer("/pull_request/head/ref").and_then(Value::as_str).and_then(|b| b.strip_prefix(PROPOSAL_PREFIX)).and_then(|n| n.parse::<i64>().ok())
+        && let Some(head) = v.pointer("/pull_request/head/ref").and_then(Value::as_str)
+        && let Some(id) = head.strip_prefix(PROPOSAL_PREFIX).and_then(|rest| rest.split('-').next()).and_then(|n| n.parse::<i64>().ok())
         && let Ok(Some(r)) = super::store::release(&d.hub.store, id).await
+        && proposal_branch(&r) == head
         && ours.iter().any(|e| e.name == r.environment)
     {
         let _ = super::store::schedule(&d.hub.store, id, crate::util::now_unix()).await;
