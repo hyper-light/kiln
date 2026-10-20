@@ -8,7 +8,7 @@
 import * as React from "react";
 import "./approval-toasts.css";
 import { ArrowUpRight, X } from "lucide-react";
-import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import type { AgentInfo, ApprovalBrief } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Link, useLocation, useNavigate } from "@/lib/router";
@@ -16,6 +16,7 @@ import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { agentLabel } from "./derive";
 import { machineName } from "./parts";
 import { getNoneWaiting, getWaiting, subscribeWaiting } from "./waiting";
+import { answer, useAnswered } from "./answered";
 
 /** Cards at once (one on a phone); past these, one line says how many more agents wait. */
 const MAX = 2;
@@ -109,14 +110,13 @@ function Card({ a, ap, more }: { a: AgentInfo; ap: ApprovalBrief; more: number }
   const label = agentLabel(a);
   const { lead, line } = what(ap);
   const asks = ap.tool === "question" || ap.tool === "plan";
-  const decide = async (decision: "allow" | "deny") => {
+  // Answered at once (answered.ts): the card goes now, and is back if the answer doesn't go.
+  const decide = (decision: "allow" | "deny") => {
     setBusy(true);
-    try {
-      await harnessApi.command(a.id, { type: "approve", id: ap.id, decision });
-    } catch (e) {
+    void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => {
       toast.error(`Couldn't answer ${label}`, errorMessage(e));
       setBusy(false);
-    }
+    });
   };
   return (
     <li className="toast rq" aria-busy={busy || undefined} {...swipe(() => putAway(a.approvals.map((p) => p.id)))}>
@@ -163,11 +163,12 @@ function Card({ a, ap, more }: { a: AgentInfo; ap: ApprovalBrief; more: number }
 export default function RequestToasts() {
   const waiting = React.useSyncExternalStore(subscribeWaiting, getWaiting, getNoneWaiting);
   const gone = React.useSyncExternalStore(subscribeAway, getAway, getAway);
+  const done = useAnswered();
   const path = useLocation().pathname;
   const max = useMediaQuery(PHONE) ? 1 : MAX;
   const asking = waiting.flatMap((a) => {
     if (showsItsOwn(path, a.id)) return [];
-    const open = a.approvals.filter((p) => !gone.has(p.id));
+    const open = a.approvals.filter((p) => !gone.has(p.id) && !done.has(p.id));
     return open[0] ? [{ a, ap: open[0], more: open.length - 1 }] : [];
   });
   if (asking.length === 0) return null;

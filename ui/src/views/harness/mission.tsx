@@ -34,6 +34,7 @@ import { AgentFamilies } from "./family";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
+import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
 
@@ -94,18 +95,9 @@ function lineOf(a: AgentInfo, stand: Stand): string {
   }
 }
 
+/** Answered at once (answered.ts): the row moves on now; if the answer doesn't go, it's back. */
 function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
-  const [busy, setBusy] = React.useState(false);
-  const decide = async (decision: "allow" | "deny") => {
-    setBusy(true);
-    try {
-      await harnessApi.command(a.id, { type: "approve", id: ap.id, decision });
-    } catch (e) {
-      toast.error("Couldn't answer", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const decide = (decision: "allow" | "deny") => void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error("Couldn't answer", errorMessage(e)));
   if (ap.tool === "question" || ap.tool === "plan")
     return (
       <Button size="xs" asChild>
@@ -114,10 +106,10 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
     );
   return (
     <>
-      <Button size="xs" disabled={busy} onClick={() => decide("allow")}>
+      <Button size="xs" onClick={() => decide("allow")}>
         Allow
       </Button>
-      <Button size="xs" variant="secondary" disabled={busy} onClick={() => decide("deny")}>
+      <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
         Deny
       </Button>
       <Link to={`/agents/${a.id}`} className="ms-link">
@@ -211,9 +203,12 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect, of 
   );
 });
 
-/** Where each agent stands, and how many stand where (the page's lead says so). */
-function standsOf(list: AgentInfo[], seen: Record<string, number>) {
-  return list.map((a) => ({ a, stand: standOf(a, seen[a.id]) }));
+/** Where each agent stands (what you answered here counted as taken), and how many stand where (the page's lead says so). */
+function standsOf(list: AgentInfo[], seen: Record<string, number>, done: ReadonlyMap<string, number>) {
+  return list.map((agent) => {
+    const a = asAnswered(agent, done);
+    return { a, stand: standOf(a, seen[a.id]) };
+  });
 }
 
 /** What the page's lead says before the agents are known. */
@@ -223,7 +218,8 @@ const LEAD = "Every coding agent kiln runs, on every machine.";
 function Lead({ short }: { short?: boolean }) {
   const list = useAgentList();
   const seen = useSeen();
-  const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  const done = useAnswered();
+  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
   const n = (s: Stand) => all.filter((r) => r.stand === s).length;
   const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
   const status = [
@@ -451,7 +447,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const phone = useMediaQuery(PHONE);
   const [messaging, setMessaging] = React.useState(false);
 
-  const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  const done = useAnswered();
+  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
   // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
   // the list, or have agents selected, it holds still: see useListHold.

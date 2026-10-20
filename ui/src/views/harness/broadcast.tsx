@@ -24,6 +24,7 @@ import { useAttachments } from "./controls";
 import { agentLabel } from "./derive";
 import { machineName } from "./parts";
 import { MicButton } from "./voice";
+import { markAnswered, unmark } from "./answered";
 
 const machineLabel = (m: string) => (m === "local" ? "server" : m);
 /** Enter sends with a keyboard and pointer; on a touch screen it is a new line (as in the composer). */
@@ -115,6 +116,8 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
   const [ask, setAsk] = React.useState<Ask | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
+  /** On its way to this many agents (0: nothing is). */
+  const [sending, setSending] = React.useState(0);
   const [reportOpen, setReportOpen] = React.useState(false);
   const [index, setIndex] = React.useState(0);
   const [focused, setFocused] = React.useState(false);
@@ -152,6 +155,12 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
     }
   };
   const command = (c: Command) => send({ command: c });
+  // Every tool call waiting on them, answered: shown so at once (answered.ts), back if it didn't go.
+  const answerAll = async (decision: "allow" | "deny") => {
+    const asked = agents.flatMap((a) => a.approvals.filter((p) => p.tool !== "question" && p.tool !== "plan").map((p) => p.id));
+    markAnswered(asked);
+    if (!(await send({ approvals: decision }))) unmark(asked);
+  };
 
   // The slash palette: what the agents understand, marked where only some do.
   const slash = parseSlash(text);
@@ -177,7 +186,15 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
   const sendText = () => {
     const body = text.trim();
     if ((!body && files.length === 0) || pending > 0 || n === 0 || busy) return;
-    const go = () => send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined }).then((ok) => ok && setText(""));
+    // The field empties at once (the line under it says it's on its way); the words come back
+    // if it didn't go and nothing new was typed meanwhile.
+    const go = async () => {
+      setText("");
+      setSending(n);
+      const ok = await send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined });
+      setSending(0);
+      if (!ok) setText((t) => t || body);
+    };
     if (mode === "now" && working > 0)
       setAsk({
         ask: `Stop the turn of ${count(working, "working agent")} and send this now?`,
@@ -236,13 +253,13 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
       setAsk({
         ask: `Allow ${count(waiting, "tool call")} waiting on you?`,
         label: "Allow",
-        run: () => send({ approvals: "allow" }),
+        run: () => answerAll("allow"),
       });
     else if (what === "deny")
       setAsk({
         ask: `Deny ${count(waiting, "tool call")} waiting on you?`,
         label: "Deny",
-        run: () => send({ approvals: "deny" }),
+        run: () => answerAll("deny"),
       });
     else if (what === "end")
       setAsk({
@@ -512,6 +529,10 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
           >
             Cancel
           </Button>
+        </div>
+      ) : sending > 0 ? (
+        <div className="ms-msg-line" role="status">
+          <span className="ms-msg-ask">Sending to {count(sending, "agent")}…</span>
         </div>
       ) : report ? (
         <div className="ms-msg-line">
